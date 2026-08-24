@@ -10,6 +10,7 @@ PRESENT  subc-protocol    Frame
 PRESENT  subc-protocol    Frame::build
 PRESENT  subc-protocol    FrameBuildError
 PRESENT  subc-protocol    FrameType
+PRESENT  subc-protocol    FrameType::Ping
 PRESENT  subc-protocol    EnvelopeHeader
 PRESENT  subc-protocol    Priority::Interactive
 PRESENT  subc-protocol    PROTOCOL_VERSION
@@ -21,7 +22,7 @@ PRESENT  subc-protocol    manifest::ModuleManifest
 PRESENT  subc-protocol    ModuleManifest.scheduled_tasks
 PRESENT  subc-protocol    manifest::TrustTier
 PRESENT  subc-protocol    manifest::ProviderRole
-PRESENT  subc-protocol    manifest::ConsumerRole
+PRESENT  subc-protocol    manifest::ConsumerRole (incl. PartialEq)
 PRESENT  subc-protocol    ConsumerRole::ServiceClient
 PRESENT  subc-protocol    manifest::Bindings
 PRESENT  subc-protocol    manifest::StorageBinding

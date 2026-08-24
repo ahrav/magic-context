@@ -1,0 +1,2865 @@
+# subc compiler-closure combined log
+# worktree: /local/home/ahrav/scratch/mc-closure-wt @ e1a09a549e6560543b906e73521f484c01010fb8
+# toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) / cargo 1.97.1 (c980f4866 2026-06-30)
+# date: 2026-08-24T05:31:56Z
+
+==== [baseline] $ cargo build -p mc-module --lib ====
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling version_check v0.9.5
+   Compiling memchr v2.8.2
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling serde v1.0.228
+   Compiling zmij v1.0.21
+   Compiling serde_json v1.0.150
+   Compiling typenum v1.20.1
+   Compiling zerocopy v0.8.52
+   Compiling itoa v1.0.18
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling subtle v2.6.1
+   Compiling vcpkg v0.2.15
+   Compiling regex-syntax v0.8.11
+   Compiling once_cell v1.21.4
+   Compiling pkg-config v0.3.33
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.0
+   Compiling autocfg v1.5.1
+   Compiling bit-vec v0.8.0
+   Compiling crc32fast v1.5.0
+   Compiling anyhow v1.0.103
+   Compiling cpufeatures v0.2.17
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling smallvec v1.15.2
+   Compiling adler2 v2.0.1
+   Compiling futures-core v0.3.32
+   Compiling slab v0.4.12
+   Compiling futures-task v0.3.32
+   Compiling bitflags v2.13.0
+   Compiling simd-adler32 v0.3.9
+   Compiling fallible-iterator v0.3.0
+   Compiling base64 v0.22.1
+   Compiling lazy_static v1.5.0
+   Compiling rustc-hash v1.1.0
+   Compiling futures-sink v0.3.32
+   Compiling md5 v0.7.0
+   Compiling iana-time-zone v0.1.65
+   Compiling cc v1.2.65
+   Compiling miniz_oxide v0.8.9
+   Compiling generic-array v0.14.7
+   Compiling ahash v0.8.12
+   Compiling bit-set v0.8.0
+   Compiling num-traits v0.2.19
+   Compiling aho-corasick v1.1.4
+   Compiling flate2 v1.1.9
+   Compiling syn v2.0.118
+   Compiling libsqlite3-sys v0.30.1
+   Compiling chrono v0.4.45
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
+   Compiling fs2 v0.4.3
+   Compiling getrandom v0.2.17
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling cortexkit-lease v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-lease)
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling regex-automata v0.4.14
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling async-trait v0.1.89
+   Compiling hashbrown v0.14.5
+   Compiling tokio v1.52.3
+   Compiling futures-util v0.3.32
+   Compiling regex v1.12.4
+   Compiling fancy-regex v0.17.0
+   Compiling bstr v1.12.3
+   Compiling hashlink v0.9.1
+   Compiling tiktoken-rs v0.11.0
+   Compiling mc-tokenizer v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-tokenizer)
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subconscious/crates/subc-protocol)
+   Compiling cortexkit-store-types v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store-types)
+   Compiling cortexkit-cache-core v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-cache-core)
+   Compiling mc-core v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-core)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subconscious/crates/subc-control)
+   Compiling tokio-util v0.7.18
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subconscious/crates/subc-transport)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subconscious/crates/subc-client-rs)
+   Compiling rusqlite v0.32.1
+   Compiling cortexkit-store v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store)
+   Compiling mc-store v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-store)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.41s
+==== [baseline] exit=0 ====
+
+==== [baseline] $ cargo build -p mc-module --bin ck-mc ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.35s
+==== [baseline] exit=0 ====
+
+==== [baseline] $ cargo test -p mc-module --lib --no-run ====
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.3.4
+   Compiling bitflags v2.13.0
+   Compiling crossbeam-utils v0.8.22
+   Compiling smallvec v1.15.2
+   Compiling fnv v1.0.7
+   Compiling strsim v0.11.1
+   Compiling rustix v1.1.4
+   Compiling ident_case v1.0.1
+   Compiling crossbeam-epoch v0.9.20
+   Compiling linux-raw-sys v0.12.1
+   Compiling crossbeam-deque v0.8.7
+   Compiling rustversion v1.0.23
+   Compiling rayon-core v1.13.0
+   Compiling aho-corasick v1.1.4
+   Compiling num-traits v0.2.19
+   Compiling ahash v0.8.12
+   Compiling matrixmultiply v0.3.11
+   Compiling log v0.4.33
+   Compiling either v1.17.0
+   Compiling getrandom v0.4.3
+   Compiling esaxx-rs v0.1.10
+   Compiling paste v1.0.15
+   Compiling minimal-lexical v0.2.1
+   Compiling rawpointer v0.2.1
+   Compiling ort-sys v2.0.0-rc.13
+   Compiling thiserror v2.0.20
+   Compiling unicode-segmentation v1.13.3
+   Compiling fastrand v2.4.1
+   Compiling static_assertions v1.1.0
+   Compiling foldhash v0.2.0
+   Compiling pastey v0.2.3
+   Compiling macro_rules_attribute-proc_macro v0.2.3
+   Compiling ryu v1.0.23
+   Compiling allocator-api2 v0.2.21
+   Compiling equivalent v1.0.2
+   Compiling base64 v0.13.1
+   Compiling libloading v0.9.0
+   Compiling rlimit v0.11.0
+   Compiling siphasher v1.0.3
+   Compiling unicode_categories v0.1.1
+   Compiling thread_local v1.1.10
+   Compiling chrono-tz v0.10.4
+   Compiling nu-ansi-term v0.50.3
+   Compiling cortexkit-paths v0.1.1
+   Compiling subc-jsonc v0.0.0 (/local/home/ahrav/scratch/subconscious/crates/subc-jsonc)
+   Compiling onig_sys v69.9.3
+   Compiling tracing-core v0.1.36
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling sharded-slab v0.1.7
+   Compiling syn v2.0.118
+   Compiling errno v0.3.14
+   Compiling ppv-lite86 v0.2.21
+   Compiling syn v3.0.3
+   Compiling filetime v0.2.29
+   Compiling nom v7.1.3
+   Compiling itertools v0.14.0
+   Compiling phf_shared v0.12.1
+   Compiling signal-hook-registry v1.4.8
+   Compiling phf v0.12.1
+   Compiling rand_core v0.9.5
+   Compiling macro_rules_attribute v0.2.3
+   Compiling tracing-log v0.2.0
+   Compiling rand_chacha v0.9.0
+   Compiling castaway v0.2.4
+   Compiling rand v0.9.5
+   Compiling regex-automata v0.4.14
+   Compiling num-integer v0.1.47
+   Compiling num-complex v0.4.6
+   Compiling chrono v0.4.45
+   Compiling ndarray v0.17.2
+   Compiling rayon v1.12.0
+   Compiling thiserror-impl v2.0.20
+   Compiling hashbrown v0.16.1
+   Compiling darling_core v0.20.11
+   Compiling rayon-cond v0.4.0
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling monostate-impl v0.1.18
+   Compiling tracing-attributes v0.1.31
+   Compiling async-trait v0.1.89
+   Compiling tempfile v3.27.0
+   Compiling fs4 v1.1.0
+   Compiling terminal_size v0.4.4
+   Compiling regex v1.12.4
+   Compiling matchers v0.2.0
+   Compiling bstr v1.12.3
+   Compiling fancy-regex v0.17.0
+   Compiling monostate v0.1.18
+   Compiling tokio v1.52.3
+   Compiling futures-util v0.3.32
+   Compiling tracing v0.1.44
+   Compiling tiktoken-rs v0.11.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling ort v2.0.0-rc.13
+   Compiling darling_macro v0.20.11
+   Compiling mc-tokenizer v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-tokenizer)
+   Compiling onig v6.5.3
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subconscious/crates/subc-protocol)
+   Compiling compact_str v0.9.1
+   Compiling subc-protocol v0.10.0
+   Compiling dary_heap v0.3.9
+   Compiling spm_precompiled v0.1.4
+   Compiling cortexkit-cache-core v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-cache-core)
+   Compiling safetensors v0.8.0
+   Compiling cortexkit-store-types v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store-types)
+   Compiling hashbrown v0.14.5
+   Compiling mc-core v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-core)
+   Compiling tokenizers v0.22.2
+   Compiling hashlink v0.9.1
+   Compiling rusqlite v0.32.1
+   Compiling subc-control v0.1.1
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subconscious/crates/subc-control)
+   Compiling cortexkit-store v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store)
+   Compiling mc-store v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-store)
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subconscious/crates/subc-transport)
+   Compiling tokio-util v0.7.18
+   Compiling subc-transport v0.5.0
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subconscious/crates/subc-client-rs)
+   Compiling subc-core v0.3.1 (/local/home/ahrav/scratch/subconscious/crates/subc-core)
+   Compiling fastembed v6.0.0
+   Compiling mc-host v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-host)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 36.32s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-812b900cdaaf6235)
+==== [baseline] exit=0 ====
+
+==== [baseline] $ cargo test -p mc-module --test boundary_counter_durability --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.55s
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-fe5fa91f2ded4b82)
+==== [baseline] exit=0 ====
+
+==== [baseline] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.20s
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-ea35e21df05e1b7e)
+==== [baseline] exit=0 ====
+
+==== [baseline] $ cargo test -p mc-module --test real_daemon --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.98s
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-664934fcc8a632a9)
+==== [baseline] exit=0 ====
+
+==== [stub-redirect] five workspace.dependencies edges -> ../subc-closure-stubs/<crate> (worktree Cargo.toml only) ====
+==== [stub-redirect] $ cargo metadata | subc-* package sources ====
+subc-client-rs 0.3.1 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs/Cargo.toml
+subc-control 0.1.1 :: registry+https://github.com/rust-lang/crates.io-index
+subc-control 0.1.2 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-control/Cargo.toml
+subc-core 0.3.1 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-core/Cargo.toml
+subc-protocol 0.10.0 :: registry+https://github.com/rust-lang/crates.io-index
+subc-protocol 0.12.0 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol/Cargo.toml
+subc-transport 0.5.0 :: registry+https://github.com/rust-lang/crates.io-index
+subc-transport 0.5.1 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-transport/Cargo.toml
+
+==== [stub-pass] $ cargo build -p mc-module --lib ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+==== [stub-pass] exit=0 ====
+
+==== [stub-pass] $ cargo build -p mc-module --bin ck-mc ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.64s
+==== [stub-pass] exit=0 ====
+
+==== [stub-pass ledger-2 (pre-fix)] $ cargo test -p mc-module --lib --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1529:28
+     |
+1529 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2081:88
+     |
+2081 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+error[E0369]: binary operation `==` cannot be applied to type `Vec<subc_protocol::manifest::ConsumerRole>`
+     --> crates/mc-module/src/lib.rs:16853:9
+      |
+16853 | /         assert_eq!(
+16854 | |             m.consumes,
+16855 | |             vec![ConsumerRole::ServiceClient {
+16856 | |                 of: vec!["thalamus".to_string()]
+16857 | |             }]
+16858 | |         );
+      | |         ^
+      | |         |
+      | |_________Vec<subc_protocol::manifest::ConsumerRole>
+      |           Vec<subc_protocol::manifest::ConsumerRole>
+      |
+note: `subc_protocol::manifest::ConsumerRole` does not implement `PartialEq`
+     --> /local/home/ahrav/scratch/subc-closure-stubs/subc-protocol/src/lib.rs:181:5
+      |
+  181 |     pub enum ConsumerRole {
+      |     ^^^^^^^^^^^^^^^^^^^^^ `subc_protocol::manifest::ConsumerRole` is defined in another crate
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25317:78
+      |
+25317 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+For more information about this error, try `rustc --explain E0369`.
+warning: `mc-module` (lib test) generated 4 warnings
+error: could not compile `mc-module` (lib test) due to 1 previous error; 4 warnings emitted
+==== [stub-pass ledger-2 (pre-fix)] exit=101 ====
+
+==== [stub-pass post-ledger-2] $ cargo test -p mc-module --lib --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1529:28
+     |
+1529 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2081:88
+     |
+2081 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:16859:71
+      |
+16859 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25317:78
+      |
+25317 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib test) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-923eb38fff9b441b)
+==== [stub-pass post-ledger-2] exit=0 ====
+
+==== [stub-pass] $ cargo test -p mc-module --test boundary_counter_durability --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.48s
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-be3da2270de003e9)
+==== [stub-pass] exit=0 ====
+
+==== [stub-pass ledger-1 Ping positive control (pre-fix)] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+error[E0599]: no variant, associated function, or constant named `Ping` found for enum `FrameType` in the current scope
+   --> crates/mc-module/tests/broca_roundtrip.rs:544:54
+    |
+544 |                     && frame.header.ty != FrameType::Ping
+    |                                                      ^^^^ variant, associated function, or constant not found in `FrameType`
+
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:588:13
+    |
+584 | /             ClientControlResponse::RouteOpen {
+585 | |                 route_channel,
+586 | |                 route_epoch,
+587 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+588 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+error: could not compile `mc-module` (test "broca_roundtrip") due to 1 previous error; 1 warning emitted
+==== [stub-pass ledger-1 Ping positive control (pre-fix)] exit=101 ====
+
+==== [stub-pass post-ledger-1] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-transport)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subc-closure-stubs/subc-control)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:588:13
+    |
+584 | /             ClientControlResponse::RouteOpen {
+585 | |                 route_channel,
+586 | |                 route_epoch,
+587 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+588 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.31s
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-329a02f6785273cd)
+==== [stub-pass post-ledger-1] exit=0 ====
+
+==== [stub-pass] $ cargo test -p mc-module --test real_daemon --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.89s
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-53aaea6a8d05a7b0)
+==== [stub-pass] exit=0 ====
+
+==== [feature-closure] $ cargo test -p mc-module --all-targets --all-features --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1529:28
+     |
+1529 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2081:88
+     |
+2081 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib) generated 1 warning
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:588:13
+    |
+584 | /             ClientControlResponse::RouteOpen {
+585 | |                 route_channel,
+586 | |                 route_epoch,
+587 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+588 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:16859:71
+      |
+16859 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25317:78
+      |
+25317 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+warning: `mc-module` (lib test) generated 5 warnings (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.14s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-a3b23678d9c5f0e4)
+  Executable unittests src/main.rs (target/debug/deps/ck_mc-fe87f2f0f7184cf2)
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-39bfac452f8c2da6)
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-db43435e4f1eaff5)
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-87ceff22c81cc932)
+==== [feature-closure] exit=0 ====
+
+==== [final-matrix] $ cargo build -p mc-module --lib ====
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subc-closure-stubs/subc-control)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-transport)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.49s
+==== [final-matrix] exit=0 ====
+
+==== [final-matrix] $ cargo build -p mc-module --bin ck-mc ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.57s
+==== [final-matrix] exit=0 ====
+
+==== [final-matrix] $ cargo test -p mc-module --lib --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1529:28
+     |
+1529 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2081:88
+     |
+2081 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:16859:71
+      |
+16859 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25317:78
+      |
+25317 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib test) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.07s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-923eb38fff9b441b)
+==== [final-matrix] exit=0 ====
+
+==== [final-matrix] $ cargo test -p mc-module --test boundary_counter_durability --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-be3da2270de003e9)
+==== [final-matrix] exit=0 ====
+
+==== [final-matrix] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:588:13
+    |
+584 | /             ClientControlResponse::RouteOpen {
+585 | |                 route_channel,
+586 | |                 route_epoch,
+587 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+588 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-329a02f6785273cd)
+==== [final-matrix] exit=0 ====
+
+==== [final-matrix] $ cargo test -p mc-module --test real_daemon --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-53aaea6a8d05a7b0)
+==== [final-matrix] exit=0 ====
+
+==== [final-matrix] $ cargo test -p mc-module --all-targets --all-features --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:947:20
+    |
+947 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+948 | |                     route_channel,
+949 | |                     route_epoch,
+950 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:588:13
+    |
+584 | /             ClientControlResponse::RouteOpen {
+585 | |                 route_channel,
+586 | |                 route_epoch,
+587 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+588 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1529:28
+     |
+1529 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2081:88
+     |
+2081 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:16859:71
+      |
+16859 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25317:78
+      |
+25317 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+warning: `mc-module` (lib test) generated 5 warnings (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-a3b23678d9c5f0e4)
+  Executable unittests src/main.rs (target/debug/deps/ck_mc-fe87f2f0f7184cf2)
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-39bfac452f8c2da6)
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-db43435e4f1eaff5)
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-87ceff22c81cc932)
+==== [final-matrix] exit=0 ====
+
+==== [probe-gate] $ cargo check --all-targets --manifest-path docs/evidence/subc-surface-probe/Cargo.toml ====
+warning: unused import: `BindDecision`
+ --> src/lib.rs:9:18
+  |
+9 |     async_trait, BindDecision, CallError, CallOptions, CloseRouteOptions, ConsumerOptions,
+  |                  ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `subc-surface-probe` (lib) generated 1 warning (run `cargo fix --lib -p subc-surface-probe` to apply 1 suggestion)
+warning: `subc-surface-probe` (lib test) generated 1 warning (1 duplicate)
+    Checking subc-surface-probe v0.0.0 (/local/home/ahrav/scratch/magic-context/docs/evidence/subc-surface-probe)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+==== [probe-gate] exit=0 ====
+
+==== [rerun@574569d5] main advanced past e1a09a54 (PR #28 merge); full pass repeated at current tip ====
+# worktree: /local/home/ahrav/scratch/mc-closure-wt @ 574569d503cf55d72c8a0c4720824e079e472f3f
+# toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) / cargo 1.97.1 (c980f4866 2026-06-30)
+# date: 2026-08-24T20:52:19Z
+
+==== [rerun-baseline] $ cargo build -p mc-module --lib ====
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling version_check v0.9.5
+   Compiling memchr v2.8.2
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling serde v1.0.228
+   Compiling zmij v1.0.21
+   Compiling typenum v1.20.1
+   Compiling serde_json v1.0.150
+   Compiling zerocopy v0.8.52
+   Compiling itoa v1.0.18
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling regex-syntax v0.8.11
+   Compiling vcpkg v0.2.15
+   Compiling subtle v2.6.1
+   Compiling pkg-config v0.3.33
+   Compiling once_cell v1.21.4
+   Compiling pin-project-lite v0.2.17
+   Compiling autocfg v1.5.1
+   Compiling bit-vec v0.8.0
+   Compiling anyhow v1.0.103
+   Compiling crc32fast v1.5.0
+   Compiling cpufeatures v0.2.17
+   Compiling bytes v1.12.0
+   Compiling adler2 v2.0.1
+   Compiling smallvec v1.15.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling simd-adler32 v0.3.9
+   Compiling slab v0.4.12
+   Compiling futures-core v0.3.32
+   Compiling futures-task v0.3.32
+   Compiling bitflags v2.13.0
+   Compiling fallible-iterator v0.3.0
+   Compiling futures-sink v0.3.32
+   Compiling base64 v0.22.1
+   Compiling lazy_static v1.5.0
+   Compiling rustc-hash v1.1.0
+   Compiling iana-time-zone v0.1.65
+   Compiling md5 v0.7.0
+   Compiling cc v1.2.65
+   Compiling miniz_oxide v0.8.9
+   Compiling generic-array v0.14.7
+   Compiling ahash v0.8.12
+   Compiling bit-set v0.8.0
+   Compiling num-traits v0.2.19
+   Compiling aho-corasick v1.1.4
+   Compiling flate2 v1.1.9
+   Compiling syn v2.0.118
+   Compiling libsqlite3-sys v0.30.1
+   Compiling chrono v0.4.45
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling fs2 v0.4.3
+   Compiling getrandom v0.2.17
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling cortexkit-lease v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-lease)
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling regex-automata v0.4.14
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling async-trait v0.1.89
+   Compiling hashbrown v0.14.5
+   Compiling tokio v1.52.3
+   Compiling futures-util v0.3.32
+   Compiling regex v1.12.4
+   Compiling bstr v1.12.3
+   Compiling fancy-regex v0.17.0
+   Compiling hashlink v0.9.1
+   Compiling tiktoken-rs v0.11.0
+   Compiling mc-tokenizer v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-tokenizer)
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subconscious/crates/subc-protocol)
+   Compiling cortexkit-cache-core v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-cache-core)
+   Compiling cortexkit-store-types v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store-types)
+   Compiling mc-core v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-core)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subconscious/crates/subc-control)
+   Compiling tokio-util v0.7.18
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subconscious/crates/subc-transport)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subconscious/crates/subc-client-rs)
+   Compiling rusqlite v0.32.1
+   Compiling cortexkit-store v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store)
+   Compiling mc-store v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-store)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.83s
+==== [rerun-baseline] exit=0 ====
+
+==== [rerun-baseline] $ cargo build -p mc-module --bin ck-mc ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.40s
+==== [rerun-baseline] exit=0 ====
+
+==== [rerun-baseline] $ cargo test -p mc-module --lib --no-run ====
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.3.4
+   Compiling bitflags v2.13.0
+   Compiling smallvec v1.15.2
+   Compiling crossbeam-utils v0.8.22
+   Compiling strsim v0.11.1
+   Compiling crossbeam-epoch v0.9.20
+   Compiling rustix v1.1.4
+   Compiling fnv v1.0.7
+   Compiling ident_case v1.0.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling crossbeam-deque v0.8.7
+   Compiling rustversion v1.0.23
+   Compiling rayon-core v1.13.0
+   Compiling log v0.4.33
+   Compiling either v1.17.0
+   Compiling getrandom v0.4.3
+   Compiling thiserror v2.0.20
+   Compiling ort-sys v2.0.0-rc.13
+   Compiling esaxx-rs v0.1.10
+   Compiling minimal-lexical v0.2.1
+   Compiling rawpointer v0.2.1
+   Compiling paste v1.0.15
+   Compiling macro_rules_attribute-proc_macro v0.2.3
+   Compiling aho-corasick v1.1.4
+   Compiling num-traits v0.2.19
+   Compiling ahash v0.8.12
+   Compiling matrixmultiply v0.3.11
+   Compiling allocator-api2 v0.2.21
+   Compiling pastey v0.2.3
+   Compiling fastrand v2.4.1
+   Compiling base64 v0.13.1
+   Compiling unicode-segmentation v1.13.3
+   Compiling foldhash v0.2.0
+   Compiling equivalent v1.0.2
+   Compiling static_assertions v1.1.0
+   Compiling ryu v1.0.23
+   Compiling libloading v0.9.0
+   Compiling rlimit v0.11.0
+   Compiling siphasher v1.0.3
+   Compiling unicode_categories v0.1.1
+   Compiling thread_local v1.1.10
+   Compiling sharded-slab v0.1.7
+   Compiling chrono-tz v0.10.4
+   Compiling nu-ansi-term v0.50.3
+   Compiling cortexkit-paths v0.1.1
+   Compiling subc-jsonc v0.0.0 (/local/home/ahrav/scratch/subconscious/crates/subc-jsonc)
+   Compiling onig_sys v69.9.3
+   Compiling tracing-core v0.1.36
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling syn v2.0.118
+   Compiling errno v0.3.14
+   Compiling syn v3.0.3
+   Compiling ppv-lite86 v0.2.21
+   Compiling filetime v0.2.29
+   Compiling nom v7.1.3
+   Compiling itertools v0.14.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling phf_shared v0.12.1
+   Compiling rand_core v0.9.5
+   Compiling phf v0.12.1
+   Compiling macro_rules_attribute v0.2.3
+   Compiling tracing-log v0.2.0
+   Compiling rand_chacha v0.9.0
+   Compiling castaway v0.2.4
+   Compiling rand v0.9.5
+   Compiling regex-automata v0.4.14
+   Compiling num-complex v0.4.6
+   Compiling num-integer v0.1.47
+   Compiling chrono v0.4.45
+   Compiling ndarray v0.17.2
+   Compiling rayon v1.12.0
+   Compiling thiserror-impl v2.0.20
+   Compiling hashbrown v0.16.1
+   Compiling darling_core v0.20.11
+   Compiling rayon-cond v0.4.0
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling monostate-impl v0.1.18
+   Compiling tracing-attributes v0.1.31
+   Compiling async-trait v0.1.89
+   Compiling regex v1.12.4
+   Compiling matchers v0.2.0
+   Compiling bstr v1.12.3
+   Compiling fancy-regex v0.17.0
+   Compiling tempfile v3.27.0
+   Compiling fs4 v1.1.0
+   Compiling terminal_size v0.4.4
+   Compiling monostate v0.1.18
+   Compiling tokio v1.52.3
+   Compiling futures-util v0.3.32
+   Compiling tiktoken-rs v0.11.0
+   Compiling tracing v0.1.44
+   Compiling tracing-subscriber v0.3.23
+   Compiling darling_macro v0.20.11
+   Compiling ort v2.0.0-rc.13
+   Compiling mc-tokenizer v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-tokenizer)
+   Compiling onig v6.5.3
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subconscious/crates/subc-protocol)
+   Compiling subc-protocol v0.10.0
+   Compiling spm_precompiled v0.1.4
+   Compiling compact_str v0.9.1
+   Compiling dary_heap v0.3.9
+   Compiling cortexkit-cache-core v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-cache-core)
+   Compiling safetensors v0.8.0
+   Compiling cortexkit-store-types v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store-types)
+   Compiling hashbrown v0.14.5
+   Compiling mc-core v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-core)
+   Compiling tokenizers v0.22.2
+   Compiling hashlink v0.9.1
+   Compiling subc-control v0.1.1
+   Compiling rusqlite v0.32.1
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subconscious/crates/subc-control)
+   Compiling cortexkit-store v0.1.0 (/local/home/ahrav/scratch/commons/crates/cortexkit-store)
+   Compiling mc-store v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-store)
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subconscious/crates/subc-transport)
+   Compiling tokio-util v0.7.18
+   Compiling subc-transport v0.5.0
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subconscious/crates/subc-client-rs)
+   Compiling subc-core v0.3.1 (/local/home/ahrav/scratch/subconscious/crates/subc-core)
+   Compiling fastembed v6.0.0
+   Compiling mc-host v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-host)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 37.07s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-812b900cdaaf6235)
+==== [rerun-baseline] exit=0 ====
+
+==== [rerun-baseline] $ cargo test -p mc-module --test boundary_counter_durability --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.45s
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-fe5fa91f2ded4b82)
+==== [rerun-baseline] exit=0 ====
+
+==== [rerun-baseline] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.25s
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-ea35e21df05e1b7e)
+==== [rerun-baseline] exit=0 ====
+
+==== [rerun-baseline] $ cargo test -p mc-module --test real_daemon --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.96s
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-664934fcc8a632a9)
+==== [rerun-baseline] exit=0 ====
+
+==== [rerun-stub-redirect] $ cargo metadata | subc-* package sources ====
+subc-client-rs 0.3.1 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs/Cargo.toml
+subc-control 0.1.1 :: registry+https://github.com/rust-lang/crates.io-index
+subc-control 0.1.2 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-control/Cargo.toml
+subc-core 0.3.1 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-core/Cargo.toml
+subc-protocol 0.10.0 :: registry+https://github.com/rust-lang/crates.io-index
+subc-protocol 0.12.0 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol/Cargo.toml
+subc-transport 0.5.0 :: registry+https://github.com/rust-lang/crates.io-index
+subc-transport 0.5.1 :: path:/local/home/ahrav/scratch/subc-closure-stubs/subc-transport/Cargo.toml
+
+==== [rerun-stub-matrix] $ cargo build -p mc-module --lib ====
+   Compiling digest v0.10.7
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol)
+   Compiling sha2 v0.10.9
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-transport)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subc-closure-stubs/subc-control)
+   Compiling mc-store v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-store)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.08s
+==== [rerun-stub-matrix] exit=0 ====
+
+==== [rerun-stub-matrix] $ cargo build -p mc-module --bin ck-mc ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.66s
+==== [rerun-stub-matrix] exit=0 ====
+
+==== [rerun-stub-matrix] $ cargo test -p mc-module --lib --no-run ====
+   Compiling rustix v1.1.4
+   Compiling log v0.4.33
+   Compiling subc-core v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-core)
+   Compiling tokio v1.52.3
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol)
+   Compiling tokenizers v0.22.2
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subc-closure-stubs/subc-control)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+   Compiling tempfile v3.27.0
+   Compiling safetensors v0.8.0
+   Compiling subc-transport v0.5.0
+   Compiling tokio-util v0.7.18
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-transport)
+   Compiling fastembed v6.0.0
+   Compiling mc-host v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-host)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1559:28
+     |
+1559 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2117:88
+     |
+2117 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:17099:71
+      |
+17099 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25558:78
+      |
+25558 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib test) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.96s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-923eb38fff9b441b)
+==== [rerun-stub-matrix] exit=0 ====
+
+==== [rerun-stub-matrix] $ cargo test -p mc-module --test boundary_counter_durability --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.58s
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-be3da2270de003e9)
+==== [rerun-stub-matrix] exit=0 ====
+
+==== [rerun-stub-matrix] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:591:13
+    |
+587 | /             ClientControlResponse::RouteOpen {
+588 | |                 route_channel,
+589 | |                 route_epoch,
+590 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+591 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.33s
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-329a02f6785273cd)
+==== [rerun-stub-matrix] exit=0 ====
+
+==== [rerun-stub-matrix] $ cargo test -p mc-module --test real_daemon --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.90s
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-53aaea6a8d05a7b0)
+==== [rerun-stub-matrix] exit=0 ====
+
+==== [rerun-feature-closure] $ cargo test -p mc-module --all-targets --all-features --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1559:28
+     |
+1559 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2117:88
+     |
+2117 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib) generated 1 warning
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:591:13
+    |
+587 | /             ClientControlResponse::RouteOpen {
+588 | |                 route_channel,
+589 | |                 route_epoch,
+590 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+591 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:17099:71
+      |
+17099 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25558:78
+      |
+25558 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+warning: `mc-module` (lib test) generated 5 warnings (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.00s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-a3b23678d9c5f0e4)
+  Executable unittests src/main.rs (target/debug/deps/ck_mc-fe87f2f0f7184cf2)
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-39bfac452f8c2da6)
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-db43435e4f1eaff5)
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-87ceff22c81cc932)
+==== [rerun-feature-closure] exit=0 ====
+
+==== [strict-derives] review finding: stubs over-derived vs inventory rows; all un-demanded derives stripped, pass repeated so rustc demands the real trait surface ====
+==== [strict-derives iter-1 (pre-fix)] $ cargo build -p mc-module --lib ====
+   Compiling rusqlite v0.32.1
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+error[E0277]: `ErrorBody` doesn't implement `Debug`
+   --> /local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs/src/lib.rs:147:12
+    |
+145 | #[derive(Debug)]
+    |          ----- in this derive macro expansion
+146 | pub enum CallError {
+147 |     Module(ErrorBody),
+    |            ^^^^^^^^^ the trait `Debug` is not implemented for `ErrorBody`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `subc-client-rs` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+==== [strict-derives iter-1 (pre-fix)] exit=101 ====
+
+==== [strict-derives iter-2 (pre-fix)] $ cargo build -p mc-module --lib ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+error[E0599]: no method named `clone` found for enum `RouteTarget` in the current scope
+   --> crates/mc-module/src/session_resolver.rs:100:24
+    |
+100 |                 target.clone(),
+    |                        ^^^^^ method not found in `RouteTarget`
+
+error[E0599]: no method named `clone` found for struct `BindIdentity` in the current scope
+   --> crates/mc-module/src/session_resolver.rs:101:26
+    |
+101 |                 identity.clone(),
+    |                          ^^^^^ method not found in `BindIdentity`
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `mc-module` (lib) generated 1 warning
+error: could not compile `mc-module` (lib) due to 2 previous errors; 1 warning emitted
+==== [strict-derives iter-2 (pre-fix)] exit=101 ====
+
+==== [strict-derives iter-3] $ cargo build -p mc-module --lib ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+==== [strict-derives iter-3] exit=0 ====
+
+==== [strict-derives] $ cargo build -p mc-module --bin ck-mc ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.67s
+==== [strict-derives] exit=0 ====
+
+==== [strict-derives iter-4 unit harness (pre-fix)] $ cargo test -p mc-module --lib --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1559:28
+     |
+1559 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2117:88
+     |
+2117 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:17261:57
+      |
+17261 |                         println!("[replay] {name} OTHER {other:?} ms={ms}");
+      |                                                         ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18283:58
+      |
+18283 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18302:58
+      |
+18302 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:25947:64
+      |
+25947 |                 other => panic!("first {name}/{action} failed: {other:?}"),
+      |                                                                ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_protocol::manifest::ExecutionMode` doesn't implement `Debug`
+   --> crates/mc-module/src/prompt_surface.rs:338:13
+    |
+338 |             assert_eq!(light.execution_mode, full.execution_mode);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_protocol::manifest::ExecutionMode`
+
+error[E0277]: `subc_protocol::manifest::ExecutionMode` doesn't implement `Debug`
+   --> crates/mc-module/src/prompt_surface.rs:361:13
+    |
+361 |             assert_eq!(actual.execution_mode, expected.execution_mode);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_protocol::manifest::ExecutionMode`
+
+error[E0369]: binary operation `==` cannot be applied to type `subc_protocol::RouteTarget`
+   --> crates/mc-module/src/session_resolver.rs:255:9
+    |
+255 | /         assert_eq!(
+256 | |             resolver.route_target(),
+257 | |             RouteTarget::ManagementSurface {
+258 | |                 module_id: "thalamus".to_string(),
+259 | |             }
+260 | |         );
+    | |         ^
+    | |         |
+    | |_________subc_protocol::RouteTarget
+    |           subc_protocol::RouteTarget
+    |
+note: `subc_protocol::RouteTarget` does not implement `PartialEq`
+   --> /local/home/ahrav/scratch/subc-closure-stubs/subc-protocol/src/lib.rs:41:1
+    |
+ 41 | pub enum RouteTarget {
+    | ^^^^^^^^^^^^^^^^^^^^ `subc_protocol::RouteTarget` is defined in another crate
+
+error[E0277]: `subc_protocol::RouteTarget` doesn't implement `Debug`
+   --> crates/mc-module/src/session_resolver.rs:255:9
+    |
+255 | /         assert_eq!(
+256 | |             resolver.route_target(),
+257 | |             RouteTarget::ManagementSurface {
+258 | |                 module_id: "thalamus".to_string(),
+259 | |             }
+260 | |         );
+    | |_________^ the trait `Debug` is not implemented for `subc_protocol::RouteTarget`
+
+error[E0277]: `subc_client_rs::HealthStatus` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:17067:9
+      |
+17067 |         assert_eq!(first.status, HealthStatus::Degraded);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_client_rs::HealthStatus`
+
+error[E0277]: `subc_client_rs::HealthStatus` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:17068:9
+      |
+17068 |         assert_eq!(second.status, HealthStatus::Degraded);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_client_rs::HealthStatus`
+
+error[E0277]: `subc_protocol::manifest::ConsumerRole` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:17093:9
+      |
+17093 | /         assert_eq!(
+17094 | |             m.consumes,
+17095 | |             vec![ConsumerRole::ServiceClient {
+17096 | |                 of: vec!["thalamus".to_string()]
+17097 | |             }]
+17098 | |         );
+      | |_________^ the trait `Debug` is not implemented for `subc_protocol::manifest::ConsumerRole`
+      |
+help: the trait `Debug` is implemented for `Vec<T, A>`
+     --> /local/home/ahrav/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:4303:1
+      |
+ 4303 | impl<T: fmt::Debug, A: Allocator> fmt::Debug for Vec<T, A> {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: `subc_protocol::manifest::ExecutionMode` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:17135:9
+      |
+17135 | /         assert_eq!(
+17136 | |             by_name["ctx_memory"].execution_mode,
+17137 | |             ExecutionMode::Mutating
+17138 | |         );
+      | |_________^ the trait `Debug` is not implemented for `subc_protocol::manifest::ExecutionMode`
+
+error[E0277]: `subc_protocol::manifest::ExecutionMode` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:17139:9
+      |
+17139 |         assert_eq!(by_name["ctx_search"].execution_mode, ExecutionMode::Pure);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_protocol::manifest::ExecutionMode`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18309:58
+      |
+18309 |             other => panic!("expected error outcome, got {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18335:58
+      |
+18335 |             other => panic!("expected tool response, got {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18628:52
+      |
+18628 |             panic!("module status did not respond: {outcome:?}");
+      |                                                    ^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HealthStatus` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18695:9
+      |
+18695 |         assert_eq!(report.status, HealthStatus::Ok);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_client_rs::HealthStatus`
+
+error[E0277]: `subc_client_rs::HealthStatus` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18723:9
+      |
+18723 |         assert_eq!(report.status, HealthStatus::Degraded);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_client_rs::HealthStatus`
+
+error[E0277]: `subc_client_rs::HealthStatus` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18743:9
+      |
+18743 |         assert_eq!(normal_report.status, HealthStatus::Ok);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_client_rs::HealthStatus`
+
+error[E0277]: `subc_client_rs::HealthStatus` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18754:9
+      |
+18754 |         assert_eq!(error_report.status, HealthStatus::Ok);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_client_rs::HealthStatus`
+
+error[E0277]: `subc_client_rs::HealthStatus` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:18781:9
+      |
+18781 |         assert_eq!(report.status, HealthStatus::Degraded);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_client_rs::HealthStatus`
+
+error[E0277]: `subc_protocol::manifest::ExecutionMode` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:22622:17
+      |
+22622 |                 assert_eq!(actual.execution_mode, expected.execution_mode);
+      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `subc_protocol::manifest::ExecutionMode`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:22847:50
+      |
+22847 |             other => panic!("unexpected outcome: {other:?}"),
+      |                                                  ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:24268:14
+      |
+24268 |             "{state_sync:?}"
+      |              ^^^^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:25087:60
+      |
+25087 |             other => panic!("transform should respond, got {other:?}"),
+      |                                                            ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:25097:55
+      |
+25097 |             other => panic!("echo should respond, got {other:?}"),
+      |                                                       ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:25122:58
+      |
+25122 |             other => panic!("expected error outcome, got {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:25132:58
+      |
+25132 |             other => panic!("expected error outcome, got {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:25158:61
+      |
+25158 |             other => panic!("expected unresolved error, got {other:?}"),
+      |                                                             ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26154:60
+      |
+26154 |             other => panic!("classification facade failed: {other:?}"),
+      |                                                            ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26206:58
+      |
+26206 |             other => panic!("verification facade failed: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26226:58
+      |
+26226 |             other => panic!("verification replay failed: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26249:52
+      |
+26249 |             other => panic!("update facade failed: {other:?}"),
+      |                                                    ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26548:50
+      |
+26548 |             other => panic!("dreamer run failed: {other:?}"),
+      |                                                  ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26696:76
+      |
+26696 |             other => panic!("the chain must recover from a capped attempt: {other:?}"),
+      |                                                                            ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26741:77
+      |
+26741 |                 other => panic!("expected invalid_params for {payload}, got {other:?}"),
+      |                                                                             ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26771:50
+      |
+26771 |             other => panic!("dreamer run failed: {other:?}"),
+      |                                                  ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26827:50
+      |
+26827 |             other => panic!("dreamer run failed: {other:?}"),
+      |                                                  ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26882:81
+      |
+26882 |             other => panic!("a recorded success must survive a cleanup failure: {other:?}"),
+      |                                                                                 ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:26995:82
+      |
+26995 |             other => panic!("the command slot must remain open after a conflict: {other:?}"),
+      |                                                                                  ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:27778:60
+      |
+27778 |             other => panic!("expected status response, got {other:?}"),
+      |                                                            ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:27790:60
+      |
+27790 |             other => panic!("expected status response, got {other:?}"),
+      |                                                            ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:27817:60
+      |
+27817 |             other => panic!("expected status response, got {other:?}"),
+      |                                                            ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:27907:60
+      |
+27907 |             other => panic!("expected status response, got {other:?}"),
+      |                                                            ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:28134:58
+      |
+28134 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:29384:58
+      |
+29384 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:29500:58
+      |
+29500 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:29517:58
+      |
+29517 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:29532:57
+      |
+29532 |             other => panic!("expected bad_request, got: {other:?}"),
+      |                                                         ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:29564:58
+      |
+29564 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:29578:58
+      |
+29578 |             other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                          ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:30019:64
+      |
+30019 |             other => panic!("empty command_id must reject, got {other:?}"),
+      |                                                                ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32405:14
+      |
+32405 |             "{outcome:?}"
+      |              ^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32434:14
+      |
+32434 |             "{outcome:?}"
+      |              ^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32472:14
+      |
+32472 |             "{outcome:?}"
+      |              ^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32685:65
+      |
+32685 |         assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
+      |                                                                 ^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32792:14
+      |
+32792 |             "{present:?}"
+      |              ^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32808:65
+      |
+32808 |         assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
+      |                                                                 ^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32837:14
+      |
+32837 |             "{explicit_empty:?}"
+      |              ^^^^^^^^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32920:65
+      |
+32920 |         assert!(matches!(seeded, HandlerOutcome::Response(_)), "{seeded:?}");
+      |                                                                 ^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:32992:14
+      |
+32992 |             "{second_seed:?}"
+      |              ^^^^^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:33118:61
+      |
+33118 |             panic!("authority page assembly should execute: {response:?}");
+      |                                                             ^^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:33191:52
+      |
+33191 |             panic!("first delta page should stage: {first_ack:?}");
+      |                                                    ^^^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:33199:60
+      |
+33199 |             panic!("reassembled tail delta should execute: {response:?}");
+      |                                                            ^^^^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:33622:62
+      |
+33622 |                 other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                              ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:33638:62
+      |
+33638 |                 other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                              ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:33648:62
+      |
+33648 |                 other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                              ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+error[E0277]: `subc_client_rs::HandlerOutcome` doesn't implement `Debug`
+     --> crates/mc-module/src/lib.rs:33659:62
+      |
+33659 |                 other => panic!("unexpected handler outcome: {other:?}"),
+      |                                                              ^^^^^^^^^ `subc_client_rs::HandlerOutcome` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+      |
+      = help: the trait `Debug` is not implemented for `subc_client_rs::HandlerOutcome`
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25558:78
+      |
+25558 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+Some errors have detailed explanations: E0277, E0369.
+For more information about an error, try `rustc --explain E0277`.
+warning: `mc-module` (lib test) generated 4 warnings
+error: could not compile `mc-module` (lib test) due to 82 previous errors; 4 warnings emitted
+==== [strict-derives iter-4 unit harness (pre-fix)] exit=101 ====
+
+==== [strict-derives iter-5 unit harness] $ cargo test -p mc-module --lib --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1559:28
+     |
+1559 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2117:88
+     |
+2117 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:17099:71
+      |
+17099 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25558:78
+      |
+25558 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib test) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-923eb38fff9b441b)
+==== [strict-derives iter-5 unit harness] exit=0 ====
+
+==== [strict-derives] $ cargo test -p mc-module --test boundary_counter_durability --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.69s
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-be3da2270de003e9)
+==== [strict-derives] exit=0 ====
+
+==== [strict-derives iter-6 broca_roundtrip (pre-fix)] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+error[E0277]: `FrameType` doesn't implement `Debug`
+   --> crates/mc-module/tests/broca_roundtrip.rs:583:9
+    |
+583 |         assert_eq!(frame.header.ty, FrameType::Response, "route.open succeeds");
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `FrameType`
+
+error[E0277]: `ClientControlResponse` doesn't implement `Debug`
+   --> crates/mc-module/tests/broca_roundtrip.rs:591:58
+    |
+591 |             other => panic!("unexpected control response {other:?}"),
+    |                                                          ^^^^^^^^^ `ClientControlResponse` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+    = help: the trait `Debug` is not implemented for `ClientControlResponse`
+
+error[E0277]: `FrameType` doesn't implement `Debug`
+    --> crates/mc-module/tests/broca_roundtrip.rs:1364:9
+     |
+1364 |         assert_eq!(frame.header.ty, FrameType::Response);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `FrameType`
+
+error[E0277]: `FrameType` doesn't implement `Debug`
+    --> crates/mc-module/tests/broca_roundtrip.rs:1429:5
+     |
+1429 |     assert_eq!(overflow.header.ty, FrameType::Error);
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `FrameType`
+
+error[E0277]: `FrameType` doesn't implement `Debug`
+    --> crates/mc-module/tests/broca_roundtrip.rs:1437:5
+     |
+1437 |     assert_eq!(echo.header.ty, FrameType::Response);
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Debug` is not implemented for `FrameType`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `mc-module` (test "broca_roundtrip") due to 9 previous errors
+==== [strict-derives iter-6 broca_roundtrip (pre-fix)] exit=101 ====
+
+==== [strict-derives iter-7 broca_roundtrip] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subc-closure-stubs/subc-control)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-transport)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:591:13
+    |
+587 | /             ClientControlResponse::RouteOpen {
+588 | |                 route_channel,
+589 | |                 route_epoch,
+590 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+591 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.45s
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-329a02f6785273cd)
+==== [strict-derives iter-7 broca_roundtrip] exit=0 ====
+
+==== [strict-derives] $ cargo test -p mc-module --test real_daemon --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-53aaea6a8d05a7b0)
+==== [strict-derives] exit=0 ====
+
+==== [strict-derives feature-closure] $ cargo test -p mc-module --all-targets --all-features --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1559:28
+     |
+1559 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2117:88
+     |
+2117 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib) generated 1 warning
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:591:13
+    |
+587 | /             ClientControlResponse::RouteOpen {
+588 | |                 route_channel,
+589 | |                 route_epoch,
+590 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+591 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:17099:71
+      |
+17099 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25558:78
+      |
+25558 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+warning: `mc-module` (lib test) generated 5 warnings (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.89s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-a3b23678d9c5f0e4)
+  Executable unittests src/main.rs (target/debug/deps/ck_mc-fe87f2f0f7184cf2)
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-39bfac452f8c2da6)
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-db43435e4f1eaff5)
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-87ceff22c81cc932)
+==== [strict-derives feature-closure] exit=0 ====
+
+==== [strict-derives iter-8 Error impls (pre-fix)] $ cargo build -p mc-module --lib ====
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subc-closure-stubs/subc-control)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-transport)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+error[E0277]: the trait bound `ConnectionFileError: StdError` is not satisfied
+   --> crates/mc-module/src/historian_producer.rs:522:75
+    |
+522 |             HistorianProducerError::ConnectionFile { source, .. } => Some(source),
+    |                                                                           ^^^^^^ the trait `StdError` is not implemented for `ConnectionFileError`
+    |
+    = note: required for the cast from `&ConnectionFileError` to `&dyn StdError`
+
+error[E0277]: the trait bound `AuthError: StdError` is not satisfied
+   --> crates/mc-module/src/historian_producer.rs:524:53
+    |
+524 |             HistorianProducerError::Auth(e) => Some(e),
+    |                                                     ^ the trait `StdError` is not implemented for `AuthError`
+    |
+    = note: required for the cast from `&AuthError` to `&dyn StdError`
+
+error[E0277]: the trait bound `FrameIoError: StdError` is not satisfied
+   --> crates/mc-module/src/historian_producer.rs:525:56
+    |
+525 |             HistorianProducerError::FrameIo(e) => Some(e),
+    |                                                        ^ the trait `StdError` is not implemented for `FrameIoError`
+    |
+    = note: required for the cast from `&FrameIoError` to `&dyn StdError`
+
+error[E0277]: the trait bound `FrameBuildError: StdError` is not satisfied
+   --> crates/mc-module/src/historian_producer.rs:526:59
+    |
+526 |             HistorianProducerError::FrameBuild(e) => Some(e),
+    |                                                           ^ the trait `StdError` is not implemented for `FrameBuildError`
+    |
+    = note: required for the cast from `&FrameBuildError` to `&dyn StdError`
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `mc-module` (lib) generated 1 warning
+error: could not compile `mc-module` (lib) due to 4 previous errors; 1 warning emitted
+==== [strict-derives iter-8 Error impls (pre-fix)] exit=101 ====
+
+==== [strict-derives final-matrix] $ cargo build -p mc-module --lib ====
+   Compiling subc-protocol v0.12.0 (/local/home/ahrav/scratch/subc-closure-stubs/subc-protocol)
+   Compiling subc-client-rs v0.3.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-client-rs)
+   Compiling subc-transport v0.5.1 (/local/home/ahrav/scratch/subc-closure-stubs/subc-transport)
+   Compiling subc-control v0.1.2 (/local/home/ahrav/scratch/subc-closure-stubs/subc-control)
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.11s
+==== [strict-derives final-matrix] exit=0 ====
+
+==== [strict-derives final-matrix] $ cargo build -p mc-module --bin ck-mc ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.64s
+==== [strict-derives final-matrix] exit=0 ====
+
+==== [strict-derives final-matrix] $ cargo test -p mc-module --lib --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1559:28
+     |
+1559 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2117:88
+     |
+2117 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:17099:71
+      |
+17099 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25558:78
+      |
+25558 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: `mc-module` (lib test) generated 5 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.44s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-923eb38fff9b441b)
+==== [strict-derives final-matrix] exit=0 ====
+
+==== [strict-derives final-matrix] $ cargo test -p mc-module --test boundary_counter_durability --no-run ====
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.27s
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-be3da2270de003e9)
+==== [strict-derives final-matrix] exit=0 ====
+
+==== [strict-derives final-matrix] $ cargo test -p mc-module --test broca_roundtrip --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:591:13
+    |
+587 | /             ClientControlResponse::RouteOpen {
+588 | |                 route_channel,
+589 | |                 route_epoch,
+590 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+591 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.87s
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-329a02f6785273cd)
+==== [strict-derives final-matrix] exit=0 ====
+
+==== [strict-derives final-matrix] $ cargo test -p mc-module --test real_daemon --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+   Compiling mc-module v0.1.0 (/local/home/ahrav/scratch/mc-closure-wt/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.77s
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-53aaea6a8d05a7b0)
+==== [strict-derives final-matrix] exit=0 ====
+
+==== [strict-derives final-matrix] $ cargo test -p mc-module --all-targets --all-features --no-run ====
+warning: irrefutable `if let` pattern
+   --> crates/mc-module/src/historian_producer.rs:974:20
+    |
+974 |                   if let ClientControlResponse::RouteOpen {
+    |  ____________________^
+975 | |                     route_channel,
+976 | |                     route_epoch,
+977 | |                 } = response
+    | |____________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: `mc-module` (lib) generated 1 warning
+warning: irrefutable `if let` pattern
+    --> crates/mc-module/src/historian_producer.rs:1559:28
+     |
+1559 |                         if let ClientControlRequest::RouteOpen { identity, .. } = req {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable `else` clause
+    --> crates/mc-module/src/historian_producer.rs:2117:88
+     |
+2117 | ...                   let ClientControlRequest::RouteOpen { identity, .. } = req else {
+     |                       ---------------------------------------------------------- ^^^^
+     |                       |
+     |                       assigning to binding pattern will always succeed
+     |
+     = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:17099:71
+      |
+17099 |         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
+      |         ------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable `else` clause
+     --> crates/mc-module/src/lib.rs:25558:78
+      |
+25558 |         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
+      |         -------------------------------------------------------------------- ^^^^
+      |         |
+      |         assigning to binding pattern will always succeed
+      |
+      = note: this pattern always matches, so the else clause is unreachable
+
+warning: unreachable pattern
+   --> crates/mc-module/tests/broca_roundtrip.rs:591:13
+    |
+587 | /             ClientControlResponse::RouteOpen {
+588 | |                 route_channel,
+589 | |                 route_epoch,
+590 | |             } => (route_channel, route_epoch),
+    | |_____________- matches all the relevant values
+591 |               other => panic!("unexpected control response {other:?}"),
+    |               ^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-module` (lib test) generated 5 warnings (1 duplicate)
+warning: `mc-module` (test "broca_roundtrip") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+  Executable unittests src/lib.rs (target/debug/deps/mc_module-a3b23678d9c5f0e4)
+  Executable unittests src/main.rs (target/debug/deps/ck_mc-fe87f2f0f7184cf2)
+  Executable tests/boundary_counter_durability.rs (target/debug/deps/boundary_counter_durability-39bfac452f8c2da6)
+  Executable tests/broca_roundtrip.rs (target/debug/deps/broca_roundtrip-db43435e4f1eaff5)
+  Executable tests/real_daemon.rs (target/debug/deps/real_daemon-87ceff22c81cc932)
+==== [strict-derives final-matrix] exit=0 ====
+
+==== [probe-gate (final)] $ cargo check --all-targets --manifest-path docs/evidence/subc-surface-probe/Cargo.toml ====
+    Updating crates.io index
+     Locking 54 packages to latest compatible versions
+      Adding generic-array v0.14.7 (available: v0.14.9)
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling libc v0.2.189
+   Compiling version_check v0.9.5
+    Checking typenum v1.20.1
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+    Checking cfg-if v1.0.4
+    Checking subtle v2.6.1
+    Checking itoa v1.0.18
+    Checking memchr v2.8.3
+    Checking pin-project-lite v0.2.17
+    Checking bytes v1.12.1
+    Checking slab v0.4.12
+    Checking cpufeatures v0.2.17
+   Compiling getrandom v0.4.3
+    Checking futures-task v0.3.34
+    Checking futures-core v0.3.34
+   Compiling rustix v1.1.4
+    Checking linux-raw-sys v0.12.1
+    Checking futures-sink v0.3.34
+    Checking bitflags v2.13.1
+    Checking fastrand v2.5.0
+    Checking once_cell v1.21.4
+   Compiling generic-array v0.14.7
+   Compiling syn v3.0.4
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking mio v1.2.2
+    Checking socket2 v0.6.5
+    Checking getrandom v0.2.17
+    Checking digest v0.10.7
+    Checking sha2 v0.10.9
+    Checking hmac v0.12.1
+    Checking tempfile v3.27.0
+   Compiling serde_derive v1.0.229
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling async-trait v0.1.92
+    Checking tokio v1.53.1
+    Checking futures-util v0.3.34
+    Checking subc-protocol v0.10.0
+    Checking subc-control v0.1.1
+    Checking subc-transport v0.5.0
+    Checking tokio-util v0.7.19
+    Checking subc-client-rs v0.3.0
+    Checking subc-surface-probe v0.0.0 (/local/home/ahrav/scratch/magic-context/docs/evidence/subc-surface-probe)
+warning: unused import: `BindDecision`
+ --> src/lib.rs:9:18
+  |
+9 |     async_trait, BindDecision, CallError, CallOptions, CloseRouteOptions, ConsumerOptions,
+  |                  ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `subc-surface-probe` (lib) generated 1 warning (run `cargo fix --lib -p subc-surface-probe` to apply 1 suggestion)
+warning: `subc-surface-probe` (lib test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.41s
+==== [probe-gate (final)] exit=0 ====
+
+==== [probe-gate (post-nit)] $ cargo check --all-targets --manifest-path docs/evidence/subc-surface-probe/Cargo.toml ====
+    Updating crates.io index
+     Locking 54 packages to latest compatible versions
+      Adding generic-array v0.14.7 (available: v0.14.9)
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling libc v0.2.189
+   Compiling version_check v0.9.5
+   Compiling serde_core v1.0.229
+    Checking typenum v1.20.1
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.229
+    Checking cfg-if v1.0.4
+   Compiling serde_json v1.0.151
+    Checking memchr v2.8.3
+    Checking subtle v2.6.1
+    Checking itoa v1.0.18
+    Checking pin-project-lite v0.2.17
+    Checking bytes v1.12.1
+    Checking futures-task v0.3.34
+    Checking cpufeatures v0.2.17
+    Checking futures-core v0.3.34
+    Checking slab v0.4.12
+   Compiling rustix v1.1.4
+   Compiling getrandom v0.4.3
+    Checking futures-sink v0.3.34
+    Checking bitflags v2.13.1
+    Checking linux-raw-sys v0.12.1
+    Checking fastrand v2.5.0
+    Checking once_cell v1.21.4
+   Compiling generic-array v0.14.7
+   Compiling syn v3.0.4
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+    Checking socket2 v0.6.5
+    Checking mio v1.2.2
+    Checking getrandom v0.2.17
+    Checking digest v0.10.7
+    Checking sha2 v0.10.9
+    Checking hmac v0.12.1
+    Checking tempfile v3.27.0
+   Compiling serde_derive v1.0.229
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling async-trait v0.1.92
+    Checking tokio v1.53.1
+    Checking futures-util v0.3.34
+    Checking subc-protocol v0.10.0
+    Checking subc-control v0.1.1
+    Checking tokio-util v0.7.19
+    Checking subc-transport v0.5.0
+    Checking subc-client-rs v0.3.0
+    Checking subc-surface-probe v0.0.0 (/local/home/ahrav/scratch/magic-context/docs/evidence/subc-surface-probe)
+warning: unused import: `BindDecision`
+ --> src/lib.rs:9:18
+  |
+9 |     async_trait, BindDecision, CallError, CallOptions, CloseRouteOptions, ConsumerOptions,
+  |                  ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `subc-surface-probe` (lib) generated 1 warning (run `cargo fix --lib -p subc-surface-probe` to apply 1 suggestion)
+warning: `subc-surface-probe` (lib test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.44s
+==== [probe-gate (post-nit)] exit=0 ====
+

@@ -6,11 +6,19 @@ Plan: `2026-08-17-0505-subc-api-surface-spike-plan.md`
 
 ## Decision
 
+> **Superseded (2026-08-22).** The shim-adoption decision below is the original
+> c50.1 analysis, preserved as the record of that spike. `magic-context-c50.1`
+> has since decided the boundary is ported directly to the mc-host SDK with no
+> `subc-*` compatibility shims (executed by `magic-context-c50.4`). The
+> inventory and its compiler-closure proof
+> (`docs/evidence/subc-compiler-closure/`) remain the authoritative enumeration
+> of the surface that port must cover.
+
 **Option (a): compatible local `subc-*` crates, so `mc-module` compiles unmodified.**
 Option (b), rewriting the `mc-module` boundary against a repo-owned SDK, is rejected.
 
 The decisive fact is that four of the five crates are **MIT-licensed and published on
-crates.io**, and their published source is shape-compatible with 83 of the 85 enumerated
+crates.io**, and their published source is shape-compatible with 83 of the 86 enumerated
 `mc-module` requirements. The compatible-crate path therefore does not require *writing*
 a compatible client SDK; it requires **adopting** one (vendored into this repo, or
 depended on from crates.io) and patching three compiler-confirmed deltas. Only
@@ -54,7 +62,8 @@ checkout at all.
 Reproduction artifacts in this repository:
 
 - `docs/evidence/verify-rust-surface.py` + `.out` — per-row presence check against the
-  published crate sources (83 present, 2 absent).
+  published crate sources (86 results, one per published-crate row: 84 present,
+  2 absent).
 - `docs/evidence/verify-ts-surface.py` + `.out` — per-row presence check against the exact
   npm 0.4.1 declarations (34 present, 0 absent).
 - `docs/evidence/subc-surface-probe/` — a compiling Rust probe that replays every
@@ -63,33 +72,43 @@ Reproduction artifacts in this repository:
 - `docs/evidence/subc-surface-probe/delta-ledger.txt` — the compiler output when the probe
   is flipped to `mc-module`'s exact forms, isolating the deltas to exactly three errors.
 
-## Compiler Closure: Blocked
+## Compiler Closure: Complete (2026-08-24)
 
-`../subconscious` and `../commons` are both absent from this checkout. `cargo metadata
---no-deps` fails at `../commons/crates/cortexkit-cache-core/Cargo.toml`, so **no**
-`mc-module` target can be compiled here, with or without stub `subc-*` crates. Per the
-plan's contingency, the disposable-stub compiler pass (plan step 4) is reported blocked
-rather than claimed. Its purpose — proving the enumeration is *complete* — is unmet; the
-enumeration below rests on a repository-wide static sweep.
+The disposable-stub compiler pass (plan step 4) ran on 2026-08-24 with the `../commons`
+and `../subconscious` siblings restored, at revision
+`e1a09a549e6560543b906e73521f484c01010fb8` (task `magic-context-c50.12`, plan
+`2026-08-24-0115-fix-subc-compiler-closure-plan.md`). Every Cargo-discovered `mc-module`
+target (lib, `ck-mc`, the lib unit-test harness, `boundary_counter_durability`,
+`broca_roundtrip`, `real_daemon`) compiled first against the real sibling dependencies
+and then against strict stubs seeded from this inventory, finishing with
+`cargo test -p mc-module --all-targets --all-features --no-run`. After `main` advanced
+(PR #28 merge), the full pass was repeated clean at the current tip `574569d5` with no
+additional demanded items. Evidence — combined compiler log, per-diagnostic ledger, and
+the final stubs — lives in `docs/evidence/subc-compiler-closure/`.
 
-What *is* mechanically proven is the enumeration's *correctness*: every enumerated row was
-replayed through `rustc` against published sources in
-`docs/evidence/subc-surface-probe/`, which is stronger than a source grep for shape
-questions but says nothing about items the sweep may have missed. Closure remains a gate
-on `magic-context-c50.4`.
+The pass demanded exactly two items beyond the seeded surface, both satisfied by the
+published MIT sources (see the ledger): `FrameType::Ping` (new row, the deliberate
+positive control) and `PartialEq` on `manifest::ConsumerRole` (amended row). A follow-up
+derive-strictness sweep (ledger entry 3) stripped every un-demanded derive from the
+stubs and re-ran the pass, folding the compiler-demanded trait surface (`Clone`,
+`Debug`, `PartialEq`, `std::error::Error` on specific rows) into the row shapes — all
+present in the published sources, so no status changed. The enumeration below is
+therefore mechanically proven **complete** for the current code, not just correct
+per-row: with those reconciliations the inventory *is* the compile footprint. The
+completeness gate on `magic-context-c50.4` is cleared.
 
 ## Rust Inventory
 
-85 API rows across four crates, plus one declared-only dependency edge. Every row's build
+86 API rows across four crates, plus one declared-only dependency edge. Every row's build
 target is the `mc_module` lib unless noted. Weight legend: **T** type-only, **P**
 protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 
-### `subc-protocol` (35 rows) — locked 0.12.0, compared against 0.10.0
+### `subc-protocol` (36 rows) — locked 0.12.0, compared against 0.10.0
 
 | Item | Site | Class | Required shape / behavior | Status | Weight |
 | --- | --- | --- | --- | --- | --- |
-| `BindIdentity` | `historian_producer.rs`, `session_resolver.rs`, `tests/real_daemon.rs` | prod + test | struct `{ project_root: PathBuf, harness: String, session: String }`; daemon validates `project_root` against the real tree | exact | P |
-| `RouteTarget` | same | prod + test | serde `tag = "kind"`, snake_case | exact | P |
+| `BindIdentity` | `historian_producer.rs`, `session_resolver.rs`, `tests/real_daemon.rs` | prod + test | struct `{ project_root: PathBuf, harness: String, session: String }`; `Clone` (the resolver clones it per call); daemon validates `project_root` against the real tree | exact | P |
+| `RouteTarget` | same | prod + test | serde `tag = "kind"`, snake_case; `Clone`; `PartialEq + Debug` (unit-test `assert_eq!`) | exact | P |
 | `RouteTarget::ManagementSurface` | `historian_producer.rs`, `session_resolver.rs` | prod | `{ module_id }`; routes the thalamus and broca management surfaces | exact | P |
 | `RouteTarget::ToolProvider` | `tests/real_daemon.rs` | test | `{ module_id }` | exact | P |
 | `ErrorBody` | `historian_producer.rs` | prod | pub `code`, `message` read by `From<ErrorBody> for ProducerErrorBody` | exact | E |
@@ -97,8 +116,9 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | `Flags` / `Flags::new` | `historian_producer.rs` | prod | `new(binary: bool, priority: Priority, last: bool)` | exact | P |
 | `Frame` | `historian_producer.rs` | prod | `{ header, body }`, both pub | exact | P |
 | `Frame::build` | `historian_producer.rs` | prod | `(ty, flags, channel, epoch, corr, body) -> Result<Frame, FrameBuildError>`; must reject bodies over the max so no unreadable frame is emitted | exact | P |
-| `FrameBuildError` | `historian_producer.rs` | prod | `From` source for the producer error enum | exact | E |
-| `FrameType` | `historian_producer.rs` | prod | variants `Request`, `Response`, `Error`, `StreamData`, `StreamEnd`, `Goodbye` used; `Copy + PartialEq` for matching | exact | P |
+| `FrameBuildError` | `historian_producer.rs` | prod | `From` source for the producer error enum; `std::error::Error` (returned from `source()`) | exact | E |
+| `FrameType` | `historian_producer.rs` | prod | variants `Request`, `Response`, `Error`, `StreamData`, `StreamEnd`, `Goodbye` used; `Copy + PartialEq` for matching; `Debug` for test assertions | exact | P |
+| `FrameType::Ping` | `tests/broca_roundtrip.rs:544` | test | the fake daemon's frame filter compares `frame.header.ty != FrameType::Ping` | exact | P |
 | `EnvelopeHeader` fields | `historian_producer.rs` | prod | `frame.header.{ty, channel, epoch, corr}` drive corr/route demultiplexing | exact | P |
 | `Priority::Interactive` | `historian_producer.rs` | prod | stamped on every producer frame | exact | P |
 | `PROTOCOL_VERSION` | `lib.rs` manifest, `historian_producer.rs` test | prod + test | `u8`, sent in the manifest and the fake connection file | exact | P |
@@ -109,7 +129,7 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | `manifest::ModuleManifest` | `lib.rs::manifest` | prod | struct literal with `module_id, module_version, protocol_ver, trust_tier, provides, consumes, bindings` and **no** `scheduled_tasks` | **changed** (0.10.0 requires `scheduled_tasks`) | P |
 | `manifest::TrustTier::FirstParty` | `lib.rs` | prod | — | exact | T |
 | `manifest::ProviderRole::ToolProvider` | `lib.rs` | prod | `{ tools, identity_scope, concurrency, emits_push, sub_supervises }` | exact | P |
-| `manifest::ConsumerRole::ServiceClient` | `lib.rs` | prod | `{ of: Vec<String> }` = `["thalamus"]` | exact | P |
+| `manifest::ConsumerRole::ServiceClient` | `lib.rs` | prod + test | `{ of: Vec<String> }` = `["thalamus"]`; `PartialEq + Debug` needed — a unit test compares `manifest().consumes` with `assert_eq!` (lib.rs:16853) | exact | P |
 | `manifest::Bindings` | `lib.rs` | prod | `{ storage, vault_grants, identity }` | exact | P |
 | `manifest::StorageBinding` | `lib.rs` | prod | `{ kind, scope, owns_schema: true }` | exact | P |
 | `manifest::StorageKind::Sqlite` | `lib.rs` | prod | — | exact | T |
@@ -118,7 +138,7 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | `manifest::IdentityScope` | `lib.rs` | prod | `Project`, `Session` | exact | T |
 | `manifest::Concurrency::ModuleManaged` | `lib.rs` | prod | the module, not the daemon, serializes its lanes | exact | L |
 | `manifest::Tool` | `prompt_surface.rs` (6 literals), `lib.rs:20945` | prod | `{ name, description: Option<String>, execution_mode, schema: Value }`; **also deserialized** back off a module response, so serde must round-trip | exact | P |
-| `manifest::ExecutionMode` | `prompt_surface.rs` | prod | `Pure`, `Mutating`; `PartialEq` needed by prompt-surface tests. The advertised shape is the Thalamus authorization contract | exact | P |
+| `manifest::ExecutionMode` | `prompt_surface.rs` | prod | `Pure`, `Mutating`; `PartialEq + Debug` needed by prompt-surface test `assert_eq!`. The advertised shape is the Thalamus authorization contract | exact | P |
 
 ### `subc-transport` (14 rows) — locked 0.5.1, compared against 0.5.0
 
@@ -129,9 +149,9 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | `ConnectionInfo` (read side) | `historian_producer.rs` | prod | `.endpoints.first()`, `endpoint.host`, `endpoint.port` | exact | P |
 | `read_frame` | `historian_producer.rs` | prod | `-> Result<Option<Frame>, FrameIoError>`; `None` = peer closed, which the producer maps to `UnexpectedStreamEnd` | exact | E |
 | `write_frame` | `historian_producer.rs` | prod | `(&mut stream, &Frame)` | exact | P |
-| `AuthError` | `historian_producer.rs` | prod | producer error variant | exact | E |
-| `ConnectionFileError` | `historian_producer.rs` | prod | producer error variant, carried with the path | exact | E |
-| `FrameIoError` | `historian_producer.rs` | prod | `From` source for the producer error enum | exact | E |
+| `AuthError` | `historian_producer.rs` | prod | producer error variant; `std::error::Error` (returned from `source()`) | exact | E |
+| `ConnectionFileError` | `historian_producer.rs` | prod | producer error variant, carried with the path; `std::error::Error` (returned from `source()`) | exact | E |
+| `FrameIoError` | `historian_producer.rs` | prod | `From` source for the producer error enum; `std::error::Error` (returned from `source()`) | exact | E |
 | `authenticate_server` | `historian_producer.rs` unit tests | test | `(&mut stream, &key, &daemon_id, ver, Duration)` | exact | L |
 | `generate_key` | `historian_producer.rs` unit tests | test | `-> Result<Vec<u8>, _>` | exact | T |
 | `generate_daemon_id` | `historian_producer.rs` unit tests | test | `-> Result<[u8; 16], _>` | exact | T |
@@ -145,7 +165,7 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | --- | --- | --- | --- | --- | --- |
 | `ClientControlRequest` | `historian_producer.rs` (+ its unit-test fake daemon) | prod + test | serde-tagged control envelope on channel 0 | exact | P |
 | `ClientControlRequest::RouteOpen` | same | prod + test | `{ target, identity, consumer_identity, consumer_capabilities, admission_facts }` | exact | P |
-| `ClientControlResponse::RouteOpen` | same | prod + test | `{ route_channel: u16, route_epoch: u32 }`; the producer binds every later frame to that pair | exact | L |
+| `ClientControlResponse::RouteOpen` | same | prod + test | `{ route_channel: u16, route_epoch: u32 }`; the producer binds every later frame to that pair; `Debug` (test `panic!("… {other:?}")` at `tests/broca_roundtrip.rs:591:58`) | exact | L |
 | `ConsumerIdentity` | `historian_producer.rs` | prod | `{ module_id, launch_nonce }`, sent only when both env vars are non-empty | exact | L |
 | `RouteOpen.admission_facts` | `historian_producer.rs` | prod | `Option<Value>`, sent as `None` | exact | T |
 
@@ -160,21 +180,21 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | `ModuleHandler::on_bind` | `lib.rs:11265` | prod | decision-only, must not emit route traffic; records `{project_root, harness, session}` per channel | exact | L |
 | `ModuleHandler::on_route_gone` | `lib.rs:11285` | prod | drops the channel's binding so a reused channel cannot resolve a stale project | exact | L |
 | `ModuleHandler::health` | `lib.rs:11255` | prod | invoked on a **separate channel-0 health task**; must be atomics-only (no store, no handler lock, no disk) | exact | L |
-| `HandlerOutcome` | `lib.rs` (350 occurrences) | prod + test | the module's entire response type | exact | L |
+| `HandlerOutcome` | `lib.rs` (350 occurrences) | prod + test | the module's entire response type; `Debug` (unit tests format `{other:?}`) | exact | L |
 | `HandlerOutcome::Response(Vec<u8>)` | `lib.rs` (86) | prod + test | opaque response bytes | exact | P |
 | `HandlerOutcome::Error { code, message }` | `lib.rs` (174) | prod + test | becomes a wire Error frame carrying `ErrorBody` | exact | E |
 | `HandlerOutcome::ErrorWithDetail { code, .. }` | `lib.rs` (5 match arms, never constructed) | prod + test | matched for exhaustiveness only; a `code: String` field is the sole proven requirement | **changed** (absent in 0.3.0; remaining fields `private/unknown`) | E |
 | `HandlerOutcome::Streamed` | `lib.rs` (5) | prod + test | unit variant; the serve code sends the StreamEnd terminal | exact | P |
 | `HealthReport` | `lib.rs:284, 412` | prod | `{ status, detail: Option<String>, metrics: Option<Value> }`; `detail` is display-only, `metrics` is the lane snapshot | exact | L |
-| `HealthStatus` | `lib.rs` (11) | prod + test | `Ok`, `Degraded` used; `PartialEq` needed by tests | exact | L |
+| `HealthStatus` | `lib.rs` (11) | prod + test | `Ok`, `Degraded` used; `PartialEq + Debug` needed by test `assert_eq!` | exact | L |
 | `RequestCtx` | `lib.rs:11289` | prod | opaque; **not constructible outside the transport**, which is why `dispatch_value` exists as the testable seam | exact | L |
 | `RequestCtx::route_handle()` | `lib.rs:11295` | prod | `-> RouteHandle` (by value) | exact | P |
 | `RouteBindRequest` | `lib.rs:11265` | prod | `.handle.channel`, `.identity.{project_root, harness, session}` | exact | P |
 | `RouteHandle` | `lib.rs:11285` | prod | `.channel: u16` | exact | P |
 | `BindDecision` / `::accept()` | `lib.rs:11280` | prod | accept every route; project resolution, not authorization | exact | L |
-| `serve_with` | `main.rs` (bin `ck-mc`) | prod | `(&Path, ModuleManifest, H) -> Result<(), _>`; owns `--subc` connect, auth, HELLO{manifest}, HELLO_ACK, and dispatch | exact | L |
+| `serve_with` | `main.rs` (bin `ck-mc`) | prod | `(&Path, ModuleManifest, H) -> Result<(), E>` where the opaque error `E` must implement `std::error::Error + Send + Sync` — `main` propagates it with `?` into `Box<dyn Error + Send + Sync>` (published `SubcModuleError` satisfies this); owns `--subc` connect, auth, HELLO{manifest}, HELLO_ACK, and dispatch | exact | L |
 | `SubcConsumer` | `session_resolver.rs`, `tests/real_daemon.rs` | prod + test | consumer role | exact | L |
-| `SubcConsumer::connect` | same | prod + test | `(&Path, ConsumerOptions)` | exact | L |
+| `SubcConsumer::connect` | same | prod + test | `(&Path, ConsumerOptions)`; the opaque error must implement `Display` — `session_resolver.rs:97` maps it with `error.to_string()` (published `ConsumerError` implements `Display` + `Error`) | exact | L |
 | `SubcConsumer::call` | same | prod + test | `(RouteTarget, BindIdentity, Vec<u8>, CallOptions) -> Result<Vec<u8>, CallError>`; managed route.open + request + terminal wait, with route-open retry | exact | E |
 | `SubcConsumer::close_route` | `session_resolver.rs` | prod | `(RouteTarget, BindIdentity, CloseRouteOptions)` | exact | L |
 | `SubcConsumer::close` | `session_resolver.rs`, `tests/real_daemon.rs` | prod + test | `async`, no result | exact | L |
@@ -262,12 +282,12 @@ config keys, or prose.
 
 | | Rows | exact | changed | absent | private/unknown |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `subc-protocol` | 35 | 33 | 2 | 0 | 0 |
+| `subc-protocol` | 36 | 34 | 2 | 0 | 0 |
 | `subc-transport` | 14 | 14 | 0 | 0 | 0 |
 | `subc-control` | 5 | 5 | 0 | 0 | 0 |
 | `subc-client-rs` | 31 | 30 | 1 | 0 | 0 |
 | `subc-core` | 1 | 0 | 0 | 0 | 1 |
-| **Rust total** | **86** | **82** | **3** | **0** | **1** |
+| **Rust total** | **87** | **83** | **3** | **0** | **1** |
 | `@cortexkit/subc-client` | 34 | 34 | 0 | 0 | 0 |
 
 The three deltas, each isolated to one `rustc` error in
@@ -286,11 +306,11 @@ The three deltas, each isolated to one `rustc` error in
 
 | Criterion | Finding | Favors |
 | --- | --- | --- |
-| Surface breadth | 86 Rust rows, but 82 are shape-identical to MIT source we can take as-is; the module never touches daemon-internal APIs | shims |
+| Surface breadth | 87 Rust rows, but 83 are shape-identical to MIT source we can take as-is; the module never touches daemon-internal APIs | shims |
 | Semantic depth | The heavy semantics (route.open control plane, epoch/channel demux, at-most-once classification, health probing, bind lifecycle) live on the **daemon** side, which `mc-host` must implement under *either* option. Adoption moves zero semantics into a compatibility layer | shims |
-| Published-source delta | 82 exact / 3 changed / 0 absent; all three deltas are additive one-liners | shims |
+| Published-source delta | 83 exact / 3 changed / 0 absent; all three deltas are one-liners, but they point in different directions: `HandlerOutcome::ErrorWithDetail` and `ErrorBody::new` are additive (add a variant, add a constructor), while `ModuleManifest` is subtractive (the ported struct must omit `scheduled_tasks`, which published 0.10.0 requires) | shims |
 | Ownership boundary | `subc` types are load-bearing inside core module logic — `HandlerOutcome` at 350 sites in `lib.rs`, and `subc_client_rs::async_trait` applied to `mc-module`'s **own** traits in `historian.rs`. Rewriting the boundary means editing core logic that has nothing to do with transport | shims |
-| Verification cost | Compiler closure is blocked either way (missing `../commons`), so a rewrite would be verified no better than adoption — while adoption keeps the existing `mc-module` test suite as the regression oracle instead of invalidating it | shims |
+| Verification cost | The compiler-closure pass (`docs/evidence/subc-compiler-closure/`) verified adoption's surface directly against rustc, and adoption keeps the existing `mc-module` test suite as the regression oracle instead of invalidating it — a rewrite would be verified no better | shims |
 
 Rejected-option rationale: a boundary rewrite would require re-deriving the wire contract
 that the MIT `subc-protocol` source already states exactly, renaming `HandlerOutcome` and
@@ -334,16 +354,25 @@ directly from `historian_producer.rs` rather than only through the SDK:
 MIT source for all of the above is in the four published crates, so c50.2 is a
 *confirm-and-trim* exercise rather than a design-from-scratch one.
 
-### `magic-context-c50.4` (Rust compatibility work)
+### `magic-context-c50.4` (Rust boundary port)
 
-- Vendor or depend on published `subc-protocol` 0.10.0, `subc-transport` 0.5.0,
-  `subc-control` 0.1.1, `subc-client-rs` 0.3.0 (all MIT, one upstream commit).
+> Superseded alongside the Decision section above: c50.4 now ports `mc-module`
+> directly to the mc-host SDK with **no** `subc-*` compatibility crates — do not
+> vendor or depend on the published crates as the implementation. The bullets
+> below are preserved as the original adoption-path analysis; what carries over
+> to the direct port is the inventory itself (the port's coverage checklist),
+> the three deltas as wire-behavior facts, and the `subc-core` analysis.
+
+- ~~Vendor or depend on published~~ `subc-protocol` 0.10.0, `subc-transport` 0.5.0,
+  `subc-control` 0.1.1, `subc-client-rs` 0.3.0 (all MIT, one upstream commit)
+  remain the reference sources for wire semantics only.
 - Apply exactly the three deltas above.
 - Do **not** treat `docs/evidence/subc-surface-probe/` as the implementation; it is
   evidence and stays excluded from the workspace.
-- Gate: run the disposable-stub compiler pass once `../commons` is restored. Until then,
-  enumeration *completeness* is unproven, and an unenumerated item is the main residual
-  risk to this decision.
+- Gate cleared 2026-08-24: the disposable-stub compiler pass ran with `../commons`
+  restored (`docs/evidence/subc-compiler-closure/`). Enumeration *completeness* is now
+  compiler-proven for the current code; the two demanded items (`FrameType::Ping`,
+  `PartialEq` on `ConsumerRole`) are additive and present in the published sources.
 - `subc-core` cannot be adopted. `tests/real_daemon.rs` needs a spawnable
   daemon binary that answers `--version`, writes `subc-connection.json` under
   `XDG_RUNTIME_DIR`, honors `SUBC_PORT=0`, and reads `cortexkit/subc.jsonc` under
@@ -373,8 +402,9 @@ MIT source for all of the above is in the four published crates, so c50.2 is a
 
 ## Unresolved Unknowns
 
-1. **Enumeration completeness** — static sweep only; the compiler pass is blocked on the
-   absent `../commons` sibling.
+1. **Enumeration completeness** — resolved 2026-08-24 by the compiler-closure pass
+   (`docs/evidence/subc-compiler-closure/`): every current `mc-module` target compiles
+   against inventory-only stubs, so the enumeration is complete for the current code.
 2. **`HandlerOutcome::ErrorWithDetail`'s full shape** — only `code: String` is proven.
 3. **`subc-core` internals** — unpublished; deliberately not inferred.
 4. **`subc-protocol` 0.10.0 → 0.12.0 drift beyond the used surface** — two minor versions

@@ -18,6 +18,7 @@ between the locked private crates and the published reference source.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 CRATES = (
@@ -27,7 +28,10 @@ CRATES = (
     "subc-client-rs-0.3.0",
 )
 
-# (inventory row, source probe that must appear in that crate's src/).
+# (inventory row, source probe that must appear in that crate's src/). Probes
+# prefixed with "re:" are regular expressions (searched with re.DOTALL); the
+# rest are literal substrings. Every probe maps one-to-one onto an inventory
+# row, so the PRESENT/ABSENT count reconciles against the row totals.
 ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
     "subc-protocol": (
         ("BindIdentity", "pub struct BindIdentity"),
@@ -42,6 +46,7 @@ ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
         ("Frame::build", "    pub fn build("),
         ("FrameBuildError", "pub enum FrameBuildError"),
         ("FrameType", "pub enum FrameType"),
+        ("FrameType::Ping", "    Ping = 7,"),
         ("EnvelopeHeader", "pub struct EnvelopeHeader"),
         ("Priority::Interactive", "    Interactive"),
         ("PROTOCOL_VERSION", "pub const PROTOCOL_VERSION"),
@@ -53,7 +58,15 @@ ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
         ("ModuleManifest.scheduled_tasks", "pub scheduled_tasks:"),
         ("manifest::TrustTier", "pub enum TrustTier"),
         ("manifest::ProviderRole", "pub enum ProviderRole"),
-        ("manifest::ConsumerRole", "pub enum ConsumerRole"),
+        (
+            # Amended row: presence plus the test-demanded PartialEq derive
+            # (one row, one result). The regex tolerates attribute order,
+            # formatting, and CRLF differences in the published source, and
+            # skips any mix of attributes and `//`-style (incl. doc) comment
+            # lines between the derive and the enum keyword.
+            "manifest::ConsumerRole (incl. PartialEq)",
+            r"re:#\[derive\([^)]*\bPartialEq\b[^)]*\)\]\s*(?:#\[[^\]]*\]\s*|//[^\n]*\n\s*)*pub enum ConsumerRole",
+        ),
         ("ConsumerRole::ServiceClient", "ServiceClient { of: Vec<String> }"),
         ("manifest::Bindings", "pub struct Bindings"),
         ("manifest::StorageBinding", "pub struct StorageBinding"),
@@ -159,7 +172,10 @@ def main() -> int:
     absent: list[tuple[str, str, str]] = []
     for crate, rows in ITEMS.items():
         for name, probe in rows:
-            present = probe in sources[crate]
+            if probe.startswith("re:"):
+                present = re.search(probe[3:], sources[crate], re.DOTALL) is not None
+            else:
+                present = probe in sources[crate]
             if not present:
                 absent.append((crate, name, probe))
             status = "PRESENT" if present else "ABSENT "
