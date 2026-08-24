@@ -95,7 +95,7 @@ Then create `magic-context.jsonc` with the one setting the historian needs:
 
 - **Required:** `historian.model` must be a real `provider/model-id`. Without it, the plugin loads but historian runs fail, older history is not summarized, and repeated failures show a `Magic Context — history comparting needs attention` notice.
 - **Optional:** `dreamer` and `sidekick` model/disable blocks. Omit them to leave periodic memory consolidation and `/ctx-aug` off.
-- **Optional:** `embedding`. Omit it to use the local `Xenova/all-MiniLM-L6-v2`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
+- **Optional:** `embedding`. Omit it to use the local `Xenova/bge-small-en-v1.5`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
 
 User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users can use the dashboard's config editor or hand-edit that file; Desktop does not include the CLI setup wizard.
 
@@ -266,7 +266,7 @@ Magic Context also writes to a few other locations:
 | Path | What | Persistence |
 |---|---|---|
 | `~/.local/share/cortexkit/magic-context/context.db` | SQLite database — tags, compartments, memories, all durable state (XDG-equivalent on Windows) | **Must persist.** Losing it loses your memory/history. |
-| `~/.local/share/cortexkit/magic-context/models/` | Local embedding model cache (~90 MB `Xenova/all-MiniLM-L6-v2` ONNX), downloaded on first use when local embeddings are enabled | Should persist, else re-downloaded each run. Not used when `memory.enabled: false` or an `openai_compatible`/`ollama` embedding backend is configured. |
+| `~/.local/share/cortexkit/magic-context/models/` | Local embedding model cache (~130 MB `Xenova/bge-small-en-v1.5` ONNX), downloaded on first use when local embeddings are enabled | Should persist, else re-downloaded each run. Not used when `memory.enabled: false` or an `openai_compatible`/`ollama` embedding backend is configured. |
 | `$MAGIC_CONTEXT_LOG_PATH` (default: `${TMPDIR}/opencode/magic-context/magic-context.log`, `pi/` for Pi) | Diagnostic log. Set `MAGIC_CONTEXT_LOG_PATH` to redirect it (e.g. to a persistent path in a container). | Disposable. |
 
 **Sandboxed / ephemeral environments (Docker, CI, disposable containers):** mount the `~/.local/share/cortexkit/magic-context/` directory on a persistent volume so the database and model cache survive between runs. If only the model cache is ephemeral, the model is simply re-downloaded; if the database is ephemeral, memory and history don't accumulate. To avoid the ~90 MB model download entirely, set `memory.enabled: false` or point `embedding` at a remote `openai_compatible`/`ollama` backend.

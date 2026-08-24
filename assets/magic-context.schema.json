@@ -1368,7 +1368,7 @@
       "properties": {
         "provider": {
           "default": "local",
-          "description": "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
+          "description": "Embedding provider. 'local' uses Xenova/bge-small-en-v1.5, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
           "type": "string",
           "enum": [
             "local",

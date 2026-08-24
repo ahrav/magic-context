@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Speed benchmark: bundled local MiniLM lane vs Synapse over the subc daemon,
- * embedding real compartment texts pulled read-only from context.db.
+ * Speed benchmark: the default local embedding lane vs Synapse over the subc
+ * daemon, embedding real compartment texts pulled read-only from context.db.
  *
  * Usage: bun packages/plugin/scripts/bench-synapse-vs-local.ts [--n 100]
  */
@@ -60,12 +60,12 @@ const items = rows.map((r) => ({
     );
 }
 
-// Lane 2: bundled local MiniLM (all-MiniLM-L6-v2 ONNX, 512-token truncation).
+// Lane 2: the default local embedding model (ONNX, 512-token truncation).
 {
     const provider = new LocalEmbeddingProvider();
     const warm = await provider.embed("warmup");
     if (!warm) {
-        console.error("local MiniLM unavailable (onnxruntime missing?)");
+        console.error("local embedding lane unavailable (onnxruntime missing?)");
         process.exit(1);
     }
     const t = Date.now();
@@ -73,7 +73,7 @@ const items = rows.map((r) => ({
     const ms = Date.now() - t;
     const ok = vectors.filter((v) => v !== null).length;
     console.log(
-        `local (all-MiniLM-L6-v2 onnx): ${ok}/${items.length} vectors in ${ms}ms  (${(ms / items.length).toFixed(1)}ms/item, ${((totalChars / 1000) / (ms / 1000)).toFixed(0)}k chars/s)`,
+        `local (${provider.modelId}): ${ok}/${items.length} vectors in ${ms}ms  (${(ms / items.length).toFixed(1)}ms/item, ${((totalChars / 1000) / (ms / 1000)).toFixed(0)}k chars/s)`,
     );
 }
 

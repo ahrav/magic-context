@@ -28,6 +28,35 @@ export type LocalEmbeddingDtype =
     | "q1"
     | "q1f16";
 
+export type LocalEmbeddingPooling = "mean" | "cls";
+
+/** How a model's card says its vectors must be produced. Wrong pooling or a
+ *  missing query instruction still yields plausible-looking vectors, just
+ *  quietly bad rankings, so the recipe is bound to the model id here instead of
+ *  being left to configuration. The recipe is a pure function of the model id,
+ *  which is why it needs no separate fold into the provider identity. */
+export interface LocalEmbeddingRecipe {
+    pooling: LocalEmbeddingPooling;
+    /** Prepended to `"query"`-purpose inputs only; passages embed unprefixed. */
+    queryPrefix: string;
+}
+
+/** Models without an entry embed symmetrically: mean pooling, no instruction. */
+const SYMMETRIC_RECIPE: LocalEmbeddingRecipe = { pooling: "mean", queryPrefix: "" };
+
+const MODEL_RECIPES: Record<string, LocalEmbeddingRecipe> = {
+    // BGE v1.5 CLS-pools and expects this exact retrieval instruction on short
+    // queries: https://huggingface.co/BAAI/bge-small-en-v1.5#model-usage
+    "Xenova/bge-small-en-v1.5": {
+        pooling: "cls",
+        queryPrefix: "Represent this sentence for searching relevant passages: ",
+    },
+};
+
+export function getLocalEmbeddingRecipe(model: string): LocalEmbeddingRecipe {
+    return MODEL_RECIPES[model] ?? SYMMETRIC_RECIPE;
+}
+
 /**
  * Cross-process mutex for embedding-model load. When two OpenCode processes
  * spawn simultaneously (typical Desktop sidecar + TUI + dashboard setup), they
@@ -244,7 +273,7 @@ type EmbeddingPipelineResult = {
 type EmbeddingPipeline = {
     (
         input: string | string[],
-        options: { pooling: "mean"; normalize: true },
+        options: { pooling: LocalEmbeddingPooling; normalize: true },
     ): Promise<EmbeddingPipelineResult>;
     dispose?: () => Promise<void> | void;
 };
@@ -413,6 +442,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
     private readonly model: string;
     private readonly dtype: LocalEmbeddingDtype;
+    private readonly recipe: LocalEmbeddingRecipe;
     private pipeline: EmbeddingPipeline | null = null;
     private initPromise: Promise<void> | null = null;
     private inFlight = 0;
@@ -428,6 +458,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         this.model = model;
         this.maxInputTokens = maxInputTokens;
         this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
+        this.recipe = getLocalEmbeddingRecipe(model);
         this.modelId = getEmbeddingProviderIdentity({
             provider: "local",
             model,
@@ -644,7 +675,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     async embed(
         text: string,
         signal?: AbortSignal,
-        _purpose?: EmbeddingPurpose,
+        purpose?: EmbeddingPurpose,
     ): Promise<Float32Array | null> {
         // Local inference is fast (typically <100ms) and can't be cancelled
         // mid-compute with transformers.js, so we honor `signal` only as a
@@ -665,9 +696,13 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 return null;
             }
 
+            const input =
+                purpose === "query" && this.recipe.queryPrefix
+                    ? `${this.recipe.queryPrefix}${text}`
+                    : text;
             const result = await withQuietConsole(() =>
-                pipeline(text, {
-                    pooling: "mean",
+                pipeline(input, {
+                    pooling: this.recipe.pooling,
                     normalize: true,
                 }),
             );
@@ -684,7 +719,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     async embedBatch(
         texts: string[],
         signal?: AbortSignal,
-        _purpose?: EmbeddingPurpose,
+        purpose?: EmbeddingPurpose,
     ): Promise<(Float32Array | null)[]> {
         if (texts.length === 0) {
             return [];
@@ -710,9 +745,13 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 return Array.from({ length: texts.length }, () => null);
             }
 
+            const inputs =
+                purpose === "query" && this.recipe.queryPrefix
+                    ? texts.map((text) => `${this.recipe.queryPrefix}${text}`)
+                    : texts;
             const result = await withQuietConsole(() =>
-                pipeline(texts, {
-                    pooling: "mean",
+                pipeline(inputs, {
+                    pooling: this.recipe.pooling,
                     normalize: true,
                 }),
             );
