@@ -11,9 +11,9 @@ Retained evidence: `runs/ipc-budget-20260823T202243Z-ed82528a/`
 (60 complete manifests, 20 structured cross-NUMA skips, checksummed
 HdrHistogram sidecars, byte-stable `summary.json`), kept on the
 measurement host. `docs/perf/runs/` is git-ignored, so the run
-directory is not in repository history; on a checkout that holds a copy
-of it, `scripts/perf-mc-host.sh <run-dir> budget-summarize` reproduces
-every table below from the sidecars without rerunning the benchmark.
+directory is not in repository history; its committed `summary.json`
+is the retained aggregate, and re-summarizing it requires the harness
+at its collection commit (see Reproducing).
 
 ## Measurement contract
 
@@ -149,11 +149,14 @@ loss check.
 
 # frozen final contract (this document's numbers)
 ./scripts/perf-mc-host.sh docs/perf/runs/ipc-budget-<UTC>-<commit> budget-final
-
-# regenerate this document's tables from retained sidecars (requires a
-# local copy of the git-ignored run directory)
-./scripts/perf-mc-host.sh docs/perf/runs/ipc-budget-20260823T202243Z-ed82528a budget-summarize
 ```
+
+Re-summarizing an existing run directory (`budget-summarize`) works for
+runs collected at this commit or later. The retained `ed82528a`
+directory predates the record sidecars and plan file the current
+harness requires at aggregation; regenerating its tables needs the
+harness at its collection commit, and its committed `summary.json` is
+the retained aggregate.
 
 Explicit pairs (`BUDGET_PAIR=a,b`, `BUDGET_CROSS_PAIR=a,b`) fail
 preflight on any violation; auto-selection produces structured skips

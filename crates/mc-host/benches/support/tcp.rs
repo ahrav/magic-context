@@ -309,6 +309,9 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
             }
             if !is_request_terminal(decoded.ty) {
                 if is_connection_frame(decoded.ty) {
+                    if let Some(violation) = connection_frame_violation(&decoded) {
+                        return Err(format!("wire-protocol violation: {violation}"));
+                    }
                     continue;
                 }
                 return Err(format!(
@@ -616,6 +619,27 @@ fn is_connection_frame(ty: u8) -> bool {
     )
 }
 
+/// Validates a skippable connection frame against the wire contract:
+/// supported version, and the pure-header shape (len 0) for ping and
+/// goodbye. A push legitimately carries a body. Accepting a malformed
+/// frame solely by type would let a wire regression coexist with an
+/// otherwise successful attempt.
+fn connection_frame_violation(frame: &raw_client::RawFrame) -> Option<String> {
+    if frame.ver != raw_client::WIRE_VERSION {
+        return Some(format!(
+            "connection frame type {} with unsupported wire version {}",
+            frame.ty, frame.ver
+        ));
+    }
+    if matches!(frame.ty, raw_client::TY_PING | raw_client::TY_GOODBYE) && frame.len != 0 {
+        return Some(format!(
+            "pure-header frame type {} carries body length {}",
+            frame.ty, frame.len
+        ));
+    }
+    None
+}
+
 /// How one open-loop receive failed: transport failures resolve pending
 /// requests as connection loss, while a wire-protocol violation from a
 /// live host fails the whole attempt with its own reason.
@@ -645,6 +669,9 @@ impl OpenLoopState {
         }
         if !is_request_terminal(frame.ty) {
             if is_connection_frame(frame.ty) {
+                if let Some(violation) = connection_frame_violation(&frame) {
+                    return Err(ConsumeFailure::Protocol(violation));
+                }
                 return Ok(());
             }
             return Err(ConsumeFailure::Protocol(format!(
@@ -835,6 +862,9 @@ async fn run_throughput_inner(
         };
         if !is_request_terminal(decoded.ty) {
             if is_connection_frame(decoded.ty) {
+                if let Some(violation) = connection_frame_violation(&decoded) {
+                    return Err(format!("wire-protocol violation: {violation}"));
+                }
                 continue;
             }
             return Err(format!(
@@ -955,6 +985,10 @@ async fn run_throughput_inner(
                                 decoded.corr
                             ));
                         }
+                    } else if let Some(violation) = connection_frame_violation(&decoded) {
+                        return Err(format!("wire-protocol violation: {violation}"));
+                    }
+                    if is_request_terminal(decoded.ty) {
                         // Every drained response passes the same terminal
                         // validation as an in-window frame: the window
                         // boundary does not exempt the final measured

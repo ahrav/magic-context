@@ -500,6 +500,20 @@ async fn run_conn(
                 frame.ty,
                 raw_client::TY_PING | raw_client::TY_PUSH | raw_client::TY_GOODBYE
             ) {
+                // A skippable connection frame must still be shaped per
+                // the wire contract: supported version, and pure-header
+                // (len 0) for ping and goodbye. Push carries a body.
+                if frame.ver != raw_client::WIRE_VERSION
+                    || (matches!(frame.ty, raw_client::TY_PING | raw_client::TY_GOODBYE)
+                        && frame.len != 0)
+                {
+                    result.protocol_violation = Some(format!(
+                        "malformed connection frame type {} (ver {}, len {})",
+                        frame.ty, frame.ver, frame.len
+                    ));
+                    result.closed_early = true;
+                    break;
+                }
                 continue;
             }
             result.protocol_violation = Some(format!("server-illegal frame type {}", frame.ty));

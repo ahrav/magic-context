@@ -87,6 +87,7 @@ fn main() {
             return;
         }
         Some("aggregate") => std::process::exit(run_aggregate()),
+        Some("record-plan") => std::process::exit(run_record_plan()),
         Some("finalize-interrupted") => std::process::exit(run_finalize_interrupted()),
         Some(other) => {
             eprintln!("unknown MC_IPC_BUDGET_MODE {other:?}");
@@ -929,6 +930,71 @@ pub fn plan_block_entries(same_l3: &[String], cross: &[String], rates: &[u64]) -
     entries
 }
 
+/// Attempt directory names the standard schedule produces for one run:
+/// every same-L3 arm per block (one open-loop attempt per rate) plus the
+/// cross-NUMA paired tail. The names mirror `attempt_name` exactly so
+/// aggregation can verify the planned set is fully present.
+fn expected_attempt_names(blocks: u32, rates: &[u64]) -> Vec<String> {
+    let mut names = Vec::new();
+    for block in 1..=blocks {
+        for arm in [ARM_ATOMIC, ARM_TCP_SERIAL, ARM_TCP_THROUGHPUT] {
+            names.push(format!("{arm}-same-l3-b{block:02}"));
+        }
+        for rate in rates {
+            names.push(format!("{ARM_TCP_OPEN}-same-l3-b{block:02}-r{rate}"));
+        }
+        for arm in CROSS_ARMS {
+            names.push(format!("{arm}-cross-numa-b{block:02}"));
+        }
+    }
+    names
+}
+
+/// Persists the planned attempt set at run creation, so aggregation can
+/// detect a deleted or omitted attempt directory: a missing repetition
+/// leaves no residue for the manifest checks to reject, and a partial
+/// run would otherwise summarize as a valid smaller experiment.
+fn run_record_plan() -> i32 {
+    let out = PathBuf::from(match env_var("MC_IPC_BUDGET_OUT") {
+        Some(out) => out,
+        None => {
+            eprintln!("MC_IPC_BUDGET_OUT unset");
+            return 1;
+        }
+    });
+    let plan = (|| -> Result<serde_json::Value, String> {
+        let blocks = env_parse("MC_IPC_BUDGET_BLOCKS", 10u32)?;
+        let rates: Vec<u64> = env_var("MC_IPC_BUDGET_RATES")
+            .unwrap_or_else(|| DEFAULT_RATES.to_owned())
+            .split_whitespace()
+            .map(|token| {
+                token
+                    .parse()
+                    .map_err(|_| format!("MC_IPC_BUDGET_RATES: malformed rate {token:?}"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(serde_json::json!({
+            "attempts": expected_attempt_names(blocks, &rates),
+        }))
+    })();
+    match plan {
+        Ok(plan) => {
+            let path = out.join("run-plan.json");
+            let mut text = serde_json::to_string_pretty(&plan).expect("serialize plan");
+            text.push('\n');
+            if let Err(err) = std::fs::write(&path, text) {
+                eprintln!("{}: {err}", path.display());
+                return 1;
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("configuration: {err}");
+            1
+        }
+    }
+}
+
 fn render_plan() -> Result<String, String> {
     let blocks = env_parse("MC_IPC_BUDGET_BLOCKS", 10u32)?;
     let rates: Vec<u64> = env_var("MC_IPC_BUDGET_RATES")
@@ -1014,6 +1080,30 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             "{unfinalized} attempt(s) hold only a running manifest; run \
              MC_IPC_BUDGET_MODE=finalize-interrupted over this directory first"
         ));
+    }
+    // Script-driven runs persist their planned attempt set at creation;
+    // a deleted or omitted attempt directory leaves no residue for the
+    // manifest checks above, and a partial run would otherwise
+    // summarize as a valid smaller experiment.
+    let plan_path = run_dir.join("run-plan.json");
+    if plan_path.is_file() {
+        let raw =
+            std::fs::read(&plan_path).map_err(|err| format!("{}: {err}", plan_path.display()))?;
+        let plan: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|err| format!("{}: {err}", plan_path.display()))?;
+        let expected = plan["attempts"]
+            .as_array()
+            .ok_or_else(|| format!("{}: missing attempts array", plan_path.display()))?;
+        for name in expected {
+            let name = name
+                .as_str()
+                .ok_or_else(|| format!("{}: non-string attempt name", plan_path.display()))?;
+            if !run_dir.join(name).join(evidence::FINAL_MANIFEST).is_file() {
+                return Err(format!(
+                    "planned attempt {name} has no finalized manifest; the run is incomplete"
+                ));
+            }
+        }
     }
     let attempts: Vec<evidence::LoadedAttempt> = evidence::load_attempts(run_dir)?;
     if attempts.is_empty() {

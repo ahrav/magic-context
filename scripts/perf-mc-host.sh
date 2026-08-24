@@ -127,6 +127,12 @@ budget_run() {
     exit 1
   }
   mkdir -p "$BUDGET_OUT"
+  # The planned attempt set is persisted first: aggregation verifies
+  # every planned attempt has a finalized manifest, so a deleted or
+  # omitted attempt directory cannot summarize as a smaller experiment.
+  MC_IPC_BUDGET_MODE=record-plan MC_IPC_BUDGET_OUT="$BUDGET_OUT" \
+    MC_IPC_BUDGET_BLOCKS="$blocks" MC_IPC_BUDGET_RATES="$BUDGET_RATES" \
+    "$BUDGET_BENCH"
   budget_trap
   for block in $(seq 1 "$blocks"); do
     budget_block "$block" "$@"
