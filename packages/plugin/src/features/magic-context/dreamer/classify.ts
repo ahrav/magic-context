@@ -208,30 +208,41 @@ function toPromptMemory(candidate: ClassifyCandidate): ClassifyPromptMemory {
     };
 }
 
-/** Stratified sample of already-classified memories across importance bands, so
- *  Stage-3 anchors span the full distribution rather than clustering. */
-function stratifiedAnchors(classified: ClassifyCandidate[], count: number): ClassifyAnchorMemory[] {
-    if (classified.length <= count) {
-        return classified.map((candidate) => ({
+/** A calibration anchor plus the context row backing it: anchors carry memory
+ *  content into every chunk's prompt, so the per-chunk policy recheck needs
+ *  the context id (`anchor.id` is the authority's id space on the module
+ *  route). */
+interface AnchorCandidate {
+    anchor: ClassifyAnchorMemory;
+    contextId: number;
+}
+
+function toAnchorCandidate(candidate: ClassifyCandidate): AnchorCandidate {
+    return {
+        anchor: {
             id: candidate.id,
             category: candidate.contextMemory.category,
             content: candidate.contextMemory.content,
             importance: candidate.contextMemory.importance ?? 50,
-        }));
+        },
+        contextId: candidate.contextMemory.id,
+    };
+}
+
+/** Stratified sample of already-classified memories across importance bands, so
+ *  Stage-3 anchors span the full distribution rather than clustering. */
+function stratifiedAnchors(classified: ClassifyCandidate[], count: number): AnchorCandidate[] {
+    if (classified.length <= count) {
+        return classified.map(toAnchorCandidate);
     }
     const sorted = [...classified].sort(
         (a, b) => (a.contextMemory.importance ?? 50) - (b.contextMemory.importance ?? 50),
     );
     const step = sorted.length / count;
-    const out: ClassifyAnchorMemory[] = [];
+    const out: AnchorCandidate[] = [];
     for (let i = 0; i < count; i += 1) {
         const candidate = sorted[Math.min(sorted.length - 1, Math.floor(i * step))];
-        out.push({
-            id: candidate.id,
-            category: candidate.contextMemory.category,
-            content: candidate.contextMemory.content,
-            importance: candidate.contextMemory.importance ?? 50,
-        });
+        out.push(toAnchorCandidate(candidate));
     }
     return out;
 }
@@ -253,7 +264,7 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
 
     let stage: 2 | 3;
     let toClassify: ClassifyCandidate[];
-    let anchors: ClassifyAnchorMemory[] = [];
+    let anchors: AnchorCandidate[] = [];
     if (active.length <= FULL_POOL_CEILING) {
         // Stage 2: classify the whole pool every run.
         stage = 2;
@@ -335,30 +346,36 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
 async function classifyOneChunk(
     args: ClassifyArgs,
     chunk: ClassifyCandidate[],
-    anchors: ClassifyAnchorMemory[],
+    anchors: AnchorCandidate[],
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<{ classified: number; changed: number }> {
-    // The candidate pool was frozen once at run start; later chunks can wait
-    // behind several provider calls, and a memory quarantined, rejected, or
-    // superseded in the meantime must not reach the child-model prompt.
-    // `candidate.id` is the authority's id space (the module id on the module
-    // route); the policy recheck keys on the context row's id.
+    // The candidate pool and the stage-3 anchor sample were frozen once at
+    // run start; later chunks can wait behind several provider calls, and a
+    // memory quarantined, rejected, or superseded in the meantime must not
+    // reach the child-model prompt — anchors carry memory content into every
+    // prompt exactly like chunk members. `candidate.id`/`anchor.id` are the
+    // authority's id space (the module id on the module route); the policy
+    // recheck keys on the context row's id.
     const stillEligible = maintenanceEligibleIdSet(
         args.db,
-        chunk.map((candidate) => candidate.contextMemory.id),
+        [
+            ...chunk.map((candidate) => candidate.contextMemory.id),
+            ...anchors.map((candidate) => candidate.contextId),
+        ],
         "hygiene",
     );
     const eligibleChunk = chunk.filter((candidate) =>
         stillEligible.has(candidate.contextMemory.id),
     );
-    if (eligibleChunk.length < chunk.length) {
-        log(
-            `[dreamer] classify chunk dropped ${chunk.length - eligibleChunk.length} member(s) hidden since pool selection`,
-        );
+    const eligibleAnchors = anchors.filter((candidate) => stillEligible.has(candidate.contextId));
+    const dropped = chunk.length - eligibleChunk.length + anchors.length - eligibleAnchors.length;
+    if (dropped > 0) {
+        log(`[dreamer] classify chunk dropped ${dropped} member(s) hidden since pool selection`);
     }
     if (eligibleChunk.length === 0) return { classified: 0, changed: 0 };
     chunk = eligibleChunk;
+    const promptAnchors = eligibleAnchors.map((candidate) => candidate.anchor);
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);
@@ -366,10 +383,10 @@ async function classifyOneChunk(
         const prompt = buildClassifyPrompt({
             projectPath: args.projectIdentity,
             memories: chunk.map(toPromptMemory),
-            anchors,
+            anchors: promptAnchors,
         });
         if (moduleRoute) {
-            const run = await runClassifyThroughModule(args, chunk, anchors, signal);
+            const run = await runClassifyThroughModule(args, chunk, promptAnchors, signal);
             recordInvocation(args, startedAt, { status: "completed" });
             return run;
         }
