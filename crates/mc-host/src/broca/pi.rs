@@ -165,14 +165,14 @@ async fn run_pi_with_provider_fallback(
         aliased,
     )
     .await;
-    // "cleanup failed" is the spelling `merge_cleanup` pins (and its
-    // contract test asserts): an attempt that left private prompt material
-    // on disk must surface that failure, not be replaced by a retry's
-    // unqualified success.
+    // An attempt that left private prompt material on disk must surface
+    // that failure, not be replaced by a retry's unqualified success. The
+    // marker is the shared constant `merge_cleanup`'s text is built from,
+    // so a rewording cannot silently change this gate.
     let credential_failure = matches!(
         &first,
         BackendTerminal::Failed(error) if error.class == ErrorClass::AuthRequired
-            && !error.message.contains("cleanup failed")
+            && !error.message.contains(subprocess::CLEANUP_FAILURE_MARKER)
     );
     if !credential_failure || cancel.is_cancelled() {
         return first;

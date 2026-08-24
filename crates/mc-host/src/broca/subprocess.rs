@@ -445,11 +445,14 @@ async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Durat
             | rustix::process::WaitIdOptions::NOHANG;
         match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
             Ok(Some(_)) => return true,
-            // An error means the pid is not our waitable child anymore;
-            // report exited so the caller proceeds to the final reap
-            // instead of spinning on a pid it can never observe.
-            Err(_) => return true,
-            Ok(None) => {}
+            // Only "not our waitable child anymore" proves the leader is
+            // gone. Any other errno (EINTR under concurrent SIGCHLD, for
+            // instance) proves nothing: reporting exited there would skip
+            // the documented SIGTERM-then-grace path for a child that is
+            // still shutting down cleanly, so keep polling until the
+            // deadline decides.
+            Err(rustix::io::Errno::CHILD | rustix::io::Errno::SRCH) => return true,
+            Err(_) | Ok(None) => {}
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -490,9 +493,16 @@ pub struct CleanupFailure {
     pub kind: io::ErrorKind,
 }
 
+/// The one spelling of a cleanup failure inside a terminal's message. Both
+/// the producer of that text ([`CleanupFailure`]'s `Display`) and its only
+/// consumer (the Pi provider-fallback gate, which must not retry over a run
+/// that left private prompt material on disk) name this constant, so a
+/// rewording cannot silently change retry behavior.
+pub(crate) const CLEANUP_FAILURE_MARKER: &str = "cleanup failed";
+
 impl std::fmt::Display for CleanupFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sensitive temp cleanup failed ({})", self.kind)
+        write!(f, "sensitive temp {CLEANUP_FAILURE_MARKER} ({})", self.kind)
     }
 }
 
@@ -556,7 +566,14 @@ impl PrivateDir {
             .mode(0o600)
             .open(&path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        // Deliberately no fsync: this file exists only for the child that
+        // reads it moments later and is unlinked when the run ends, so
+        // durability across power loss is worthless here — while fsync is
+        // the one operation on this path that can genuinely stall an async
+        // worker under I/O pressure. A later open(2) in another process
+        // sees these bytes without it. The remaining operations are
+        // bounded metadata syscalls (create, chmod, statx, and at most two
+        // unlinks plus an rmdir at cleanup).
         drop(file);
         // The open(2) mode is umask-filtered; force exactly 0600 (R17).
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -729,12 +746,33 @@ pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
         "401",
         "forbidden",
     ];
-    const OVERFLOW: [&str; 5] = [
+    // Broca-path provider text never leaves this process (the wire message
+    // is host-authored, R19), so this list — not the module scheduler's
+    // regex set, which only sees text on its own non-Broca paths — is the
+    // sole classifier for these failures. It therefore mirrors every
+    // phrasing that set recognizes, as plain substrings: the `\d+` patterns
+    // reduce to their literal prefixes, which is what actually discriminates.
+    const OVERFLOW: [&str; 20] = [
         "context length",
         "context window",
         "prompt is too long",
+        "prompt too long",
         "maximum context",
         "context_length",
+        "context length exceeded",
+        "input is too long",
+        "input token count",
+        "maximum prompt length is",
+        "reduce the length of the messages",
+        "maximum model length is",
+        "exceeds the limit of",
+        "exceeds the available context size",
+        "greater than the context length",
+        "exceeded model token limit",
+        "request entity too large",
+        "too large for model with",
+        "model_context_window_exceeded",
+        "context size has been exceeded",
     ];
     const TRANSIENT: [&str; 10] = [
         "rate limit",

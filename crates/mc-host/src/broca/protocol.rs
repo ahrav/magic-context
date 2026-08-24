@@ -249,6 +249,17 @@ fn parse_send(params: SendParams) -> Result<Request, RequestError> {
     if model.provider.contains('/') {
         return Err(schema("provider must not contain '/'"));
     }
+    // Both fields become one argv token (`--model provider/model`) for the
+    // harness CLI. A leading '-' would make that token flag-shaped to the
+    // child's own argument parser, turning request data into an option —
+    // rejected here, before any adapter builds argv, so no adapter can
+    // forget the rule.
+    if model.provider.starts_with('-') {
+        return Err(schema("provider must not start with '-'"));
+    }
+    if model.model.starts_with('-') {
+        return Err(schema("model must not start with '-'"));
+    }
     let system = match params.system {
         None => None,
         Some(system) => {

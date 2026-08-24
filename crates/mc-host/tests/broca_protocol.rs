@@ -202,6 +202,22 @@ fn every_malformed_shape_is_rejected_with_schema_violation() {
             mutate(&ok_text, "\"provider\":\"prov\"", "\"provider\":\"\""),
             false,
         ),
+        // Both fields become one argv token for the harness CLI; a leading
+        // '-' would make that token flag-shaped to the child's own parser.
+        (
+            "flag-shaped provider",
+            mutate(
+                &ok_text,
+                "\"provider\":\"prov\"",
+                "\"provider\":\"--config\"",
+            ),
+            false,
+        ),
+        (
+            "flag-shaped model",
+            mutate(&ok_text, "\"model\":\"model-a\"", "\"model\":\"-x\""),
+            false,
+        ),
         (
             "nonempty tools",
             mutate(&ok_text, "\"tools\":[]", "\"tools\":[{\"name\":\"x\"}]"),
