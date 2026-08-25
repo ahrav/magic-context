@@ -5,6 +5,8 @@ import { parseIncidentCatalog } from "../contract";
 import { E2E_ROOT } from "../evidence";
 import * as auditBackgroundLifecycle from "./audit-background-lifecycle";
 import * as auditMemorySearch from "./audit-memory-search";
+import * as parityPiTodo from "./parity-pi-todo";
+import * as paritySyntheticTodo from "./parity-synthetic-todo";
 import * as regressions from "./source-linked-regressions";
 import {
     failedCheckIds,
@@ -287,6 +289,10 @@ describe("registry binding surface", () => {
                 auditBackgroundLifecycle as Record<string, unknown>,
             "src/incident-pool/scenarios/audit-memory-search.ts":
                 auditMemorySearch as Record<string, unknown>,
+            "src/incident-pool/scenarios/parity-pi-todo.ts":
+                parityPiTodo as Record<string, unknown>,
+            "src/incident-pool/scenarios/parity-synthetic-todo.ts":
+                paritySyntheticTodo as Record<string, unknown>,
         };
         let liveBindings = 0;
         for (const family of catalog.families) {
@@ -306,7 +312,7 @@ describe("registry binding surface", () => {
                 liveBindings++;
             }
         }
-        expect(liveBindings).toBe(12);
+        expect(liveBindings).toBe(21);
     });
 
     it("keeps the committed normative checks equal to the verifier-emitted check ids", () => {

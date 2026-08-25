@@ -104,6 +104,14 @@ export interface RustPassLine {
     raw: string;
 }
 
+export interface RustModuleTodoState {
+    lastTodoState: string | null;
+    syntheticCallId: string | null;
+    syntheticAnchorMessageId: string | null;
+    currentTotalInputTokens: number;
+    contextLimitTokens: number;
+}
+
 export class RustTestHarness {
     readonly mock: MockProvider;
     readonly env: IsolatedEnv;
@@ -661,6 +669,46 @@ export class RustTestHarness {
         return existsSync(this.contextDbPath());
     }
 
+    readModuleTodoState(sessionId: string): RustModuleTodoState | null {
+        const path = join(this.env.dataDir, "cortexkit", "magic-context", "store.db");
+        if (!existsSync(path)) return null;
+        const db = new Database(path, { readonly: true });
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            const row = db
+                .prepare("SELECT meta FROM mc_cache_state WHERE session_id = ?")
+                .get(sessionId) as { meta: string } | null;
+            if (!row) return null;
+            const meta = JSON.parse(row.meta) as Record<string, unknown>;
+            const synthetic =
+                meta.synthetic_todo && typeof meta.synthetic_todo === "object"
+                    ? (meta.synthetic_todo as Record<string, unknown>)
+                    : null;
+            const usage =
+                meta.last_usage && typeof meta.last_usage === "object"
+                    ? (meta.last_usage as Record<string, unknown>)
+                    : null;
+            return {
+                lastTodoState:
+                    typeof meta.last_todo_state === "string" ? meta.last_todo_state : null,
+                syntheticCallId:
+                    typeof synthetic?.call_id === "string" ? synthetic.call_id : null,
+                syntheticAnchorMessageId:
+                    typeof synthetic?.anchor_mid === "string" ? synthetic.anchor_mid : null,
+                currentTotalInputTokens:
+                    typeof usage?.current_total_input_tokens === "number"
+                        ? usage.current_total_input_tokens
+                        : 0,
+                contextLimitTokens:
+                    typeof usage?.context_limit_tokens === "number"
+                        ? usage.context_limit_tokens
+                        : 0,
+            };
+        } finally {
+            db.close();
+        }
+    }
+
     countTagsByStatus(sessionId: string, status: string): number {
         try {
             const row = this.contextDb()
@@ -760,9 +808,18 @@ function stageField(body: string, key: string): string {
     return match ? match[1]! : "";
 }
 
+type StableSerializable =
+    | string
+    | number
+    | boolean
+    | null
+    | undefined
+    | StableSerializable[]
+    | { [key: string]: StableSerializable };
+
 /** Serialize a value with every `cache_control` key stripped, for byte-identity checks. */
 export function stableSerialize(value: unknown): string {
-    return JSON.stringify(stripCacheControl(value));
+    return JSON.stringify(stripCacheControl(value)) ?? "";
 }
 
 type CacheStrippedValue =

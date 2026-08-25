@@ -9,7 +9,10 @@
         "test:validate-manifest": "bun test scripts/validate-mode-manifest.test.ts scripts/check-rust-prerequisites.test.ts",
         "validate-mode-manifest": "bun scripts/validate-mode-manifest.ts --mode ts",
         "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
+        "test:incident-unit": "bun test src/incident-pool scripts/validate-incident-history.test.ts",
         "test:incidents": "bun scripts/run-incident-pool.ts",
+        "test:incidents:pi": "bun scripts/run-incident-pool.ts --harness pi --lane known-red",
+        "test:incidents:rust": "bun scripts/run-incident-pool.ts --harness rust --lane known-red",
         "test:rust-e2e": "bun test --timeout 600000 --max-concurrency=1 tests/rust-*.test.ts",
         "mutation:rust-historian": "bun scripts/run-rust-historian-producer-mutation.ts",
         "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts"

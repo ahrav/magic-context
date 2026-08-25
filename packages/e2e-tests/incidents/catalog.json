@@ -526,8 +526,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-todo-1-1",
-                        "fingerprint": "07eff0a4d81ac6f7b1130edcfc44474ce0d5460749a62bed2460cf92a68e55a3"
+                        "id": "rev-todo-1-2",
+                        "fingerprint": "66312d79258d8b0f6cec784b8c6afbcb1202efa97bb6e278f19fad8287529809"
                     },
                     "normative_checks": [
                         "check-todo1-synthetic-pair-present",
@@ -536,7 +536,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoSyntheticInjection",
                         "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoSyntheticInjection",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "no todowrite tool execution so the reproduction precondition fails",
                             "synthetic pair injected with the wrong deterministic call id"
@@ -565,8 +565,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-todo-2-1",
-                        "fingerprint": "3258f5318bfee3c9262e1760b7c2bc63bdc7f343b7dce37736b79e9c88490e10"
+                        "id": "rev-todo-2-2",
+                        "fingerprint": "cde45723d3eb9a70c8d8807cf8660a0d7349c174d68f573c716c005f885b3f8b"
                     },
                     "normative_checks": [
                         "check-todo2-byte-identical-replay"
@@ -574,7 +574,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoDeferReplay",
                         "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoDeferReplay",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "replay bytes compared against a mutated synthetic pair"
                         ]
@@ -604,8 +604,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-todo-3-1",
-                        "fingerprint": "ee1a0e2405dc2260cd17abf1d9d74dace09bf1e678fa5c387a8a269592895cf5"
+                        "id": "rev-todo-3-2",
+                        "fingerprint": "9d37e2371ee8e406a5cd65ffa5b25b09d4fe0b077d77d3d0903caed1e0a642d9"
                     },
                     "normative_checks": [
                         "check-todo3-newer-todo-deferred"
@@ -613,7 +613,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoNewerDeferral",
                         "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoNewerDeferral",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "newer real todo folded early presented as correct deferral"
                         ]
@@ -643,8 +643,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-todo-4-1",
-                        "fingerprint": "dd844808cb5a261cebc9449872fadbf163c7b865d4c865ed48b76b46ea96935c"
+                        "id": "rev-todo-4-2",
+                        "fingerprint": "55bb6f171183cfe15150593daed661dffdcec6ce4bda938a4243d40e4aeef092"
                     },
                     "normative_checks": [
                         "check-todo4-legacy-anchor-self-heal"
@@ -652,7 +652,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoLegacyAnchorHeal",
                         "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoLegacyAnchorHeal",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "anchor row with correct bytes but wrong persisted state linkage"
                         ]
@@ -682,8 +682,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-todo-5-1",
-                        "fingerprint": "119981d8a6177243285465974238f741a1bb8ada89869ea19f621f197451a3ca"
+                        "id": "rev-todo-5-2",
+                        "fingerprint": "824d87beb880231cb33e74a194e114a6100445ff274f0a65d9204a04fcf0d088"
                     },
                     "normative_checks": [
                         "check-todo5-terminal-state-clears-anchor"
@@ -691,7 +691,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoTerminalClear",
                         "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoTerminalClear",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "terminal clearing simulated while no active pair ever existed"
                         ]
@@ -730,18 +730,20 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-pi-todo-capture-1",
-                        "fingerprint": "fca7ef177a3d3ab76a19cea07a62203b00dc40434f0212265a2920635eed2869"
+                        "id": "rev-pi-todo-capture-2",
+                        "fingerprint": "185b61701b82ae671e9cff3124d4e77312591b1d91b10ed7e9b2da48a850c5c9"
                     },
                     "normative_checks": [
-                        "check-pi-todo-capture-last-state"
+                        "check-pi-todo-capture-last-state",
+                        "check-pi-todo-missing-priority-default"
                     ],
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoCapture",
                         "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoCapture",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
-                            "subagent todowrite captured as parent session state"
+                            "no todowrite tool execution so the reproduction precondition fails",
+                            "missing priority does not normalize to medium"
                         ]
                     },
                     "blocked_by": [],
@@ -767,8 +769,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-pi-todo-injection-1",
-                        "fingerprint": "3fb9172caa4f22a875bd4230ce32cb9cdc3128b2700e64637d1910084f0f7398"
+                        "id": "rev-pi-todo-injection-2",
+                        "fingerprint": "dce306579e552b18d57b60bb07f3803b7bf344f12f9ceac14792cd19dd0c73b1"
                     },
                     "normative_checks": [
                         "check-pi-todo-synthetic-pair-injected"
@@ -776,9 +778,10 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoInjection",
                         "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoInjection",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
-                            "synthetic pair injected without a captured snapshot"
+                            "synthetic pair injected without a captured snapshot",
+                            "correct provider bytes linked to the wrong persisted anchor"
                         ]
                     },
                     "blocked_by": [],
@@ -804,18 +807,21 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-pi-todo-replay-1",
-                        "fingerprint": "211009b292f8894b9ed2f5576c3b3a0d63ae5d2d2fa43017d764a5104aad942f"
+                        "id": "rev-pi-todo-replay-2",
+                        "fingerprint": "28f56fb34a70d661e32e9a8a21d6a0784418d6c63539d522c5f0cddfe05964be"
                     },
                     "normative_checks": [
-                        "check-pi-todo-byte-identical-replay"
+                        "check-pi-todo-byte-identical-replay",
+                        "check-pi-todo-newer-state-deferred",
+                        "check-pi-todo-legacy-anchor-self-heal"
                     ],
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoDeferReplay",
                         "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoDeferReplay",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
-                            "replay compared while no synthetic anchor was persisted"
+                            "replay compared while no synthetic anchor was persisted",
+                            "byte-identical pair linked to the wrong durable state"
                         ]
                     },
                     "blocked_by": [],
@@ -841,18 +847,20 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-pi-todo-anchor-1",
-                        "fingerprint": "1b277097b9e351ce7862fd254c3d767fd5e48beb8f13f82f7666cd2dfac44902"
+                        "id": "rev-pi-todo-anchor-2",
+                        "fingerprint": "db7c760f3ceb7caf2830bca4796f30d8f986c2b4221cab456bc1117cd9a4627e"
                     },
                     "normative_checks": [
-                        "check-pi-todo-anchor-clear-and-subagent-gate"
+                        "check-pi-todo-subagent-gated",
+                        "check-pi-todo-terminal-anchor-clear"
                     ],
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoAnchorLifecycle",
                         "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoAnchorLifecycle",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
-                            "terminal-only state leaves the synthetic anchor in place"
+                            "terminal-only state clears no previously active anchor",
+                            "subagent todowrite mutates parent-only synthetic state"
                         ]
                     },
                     "blocked_by": [],

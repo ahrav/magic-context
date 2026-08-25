@@ -640,14 +640,14 @@
         },
         {
             "id": "src-pi-todo-declared-red-suite",
-            "source_path": "packages/e2e-tests/tests/pi-todo-synthesis.test.ts",
-            "content_digest": "fd688ed47580797723f1493872fe17833678a7af15a0830c01d4d007b81933d8",
+            "source_path": "packages/e2e-tests/src/incident-pool/scenarios/parity-pi-todo.ts",
+            "content_digest": "100369ded930fddc1fd017013610857ba969ea60a4026cb625308ec4e5d5e9da",
             "claims": [
                 {
                     "id": "claim-pi-todo-synthesis-gap",
-                    "content_digest": "fd688ed47580797723f1493872fe17833678a7af15a0830c01d4d007b81933d8",
+                    "content_digest": "100369ded930fddc1fd017013610857ba969ea60a4026cb625308ec4e5d5e9da",
                     "disposition": "executable_known_defect",
-                    "rationale": "Pi synthetic todowrite is unimplemented; the declared-red suite documents the interface-specific gap and must stay outside the Pi green selection",
+                    "rationale": "U6 preserves every declared-red Pi assertion in four live incident variants outside the Pi green selection; current passing observations remain resolution candidates until reviewed adjudication",
                     "family_links": [
                         "fam-pi-todo-gap"
                     ]

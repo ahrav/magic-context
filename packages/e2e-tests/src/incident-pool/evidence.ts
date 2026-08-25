@@ -48,7 +48,7 @@ export const PARITY_SOURCE_PATH = "packages/e2e-tests/parity-findings-s2.md";
 export const THINKING_BLOCK_SOURCE_PATH =
     "packages/e2e-tests/mutations/thinking-block-adjudication.md";
 export const PI_TODO_SOURCE_PATH =
-    "packages/e2e-tests/tests/pi-todo-synthesis.test.ts";
+    "packages/e2e-tests/src/incident-pool/scenarios/parity-pi-todo.ts";
 export const BEAD_SOURCE_PATH = "bead:magic-context-x4l.9";
 
 /** Task-level provenance-mismatch wording recorded from `magic-context-x4l.9`;

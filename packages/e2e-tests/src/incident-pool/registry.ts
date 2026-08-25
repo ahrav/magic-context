@@ -26,6 +26,8 @@ import {
 import { rowDigest } from "./history";
 import { auditBackgroundLifecycleIncidentCases } from "./scenarios/audit-background-lifecycle";
 import { auditMemorySearchIncidentCases } from "./scenarios/audit-memory-search";
+import { parityPiTodoIncidentCases } from "./scenarios/parity-pi-todo";
+import { paritySyntheticTodoIncidentCases } from "./scenarios/parity-synthetic-todo";
 
 export const SEMANTIC_FINGERPRINT_CONTRACT = "incident-semantic-fingerprint/v1";
 export const IMPLEMENTATION_BUNDLE_CONTRACT =
@@ -136,6 +138,8 @@ export function builtinIncidentCaseRegistry(): IncidentCaseRegistry {
     for (const entry of [
         ...auditMemorySearchIncidentCases(),
         ...auditBackgroundLifecycleIncidentCases(),
+        ...paritySyntheticTodoIncidentCases(),
+        ...parityPiTodoIncidentCases(),
     ]) {
         registerIncidentCase(registry, entry);
     }
