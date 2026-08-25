@@ -71,7 +71,7 @@ Owner-only attachment establishes same-user authentication. R19 still trusts pee
 ## Platform status
 
 - **Linux:** ring host/addon/native and TypeScript lifetime tests run locally. Provider remains explicit and non-selectable. iceoryx2 `0.9.3` is a source-built candidate, not a selected backend.
-- **macOS:** transport crate contains a file-backed fixed-size ring primitive, but current host grant and native attachment paths intentionally omit ring capability. CI must prove clean omission. No local macOS runtime or hardware campaign has run.
+- **macOS:** transport crate contains a file-backed fixed-size ring candidate, but hosted `Ring::create` currently returns `ObjectSetupFailed`. Host and native preflight therefore omit ring capability. CI source-builds all components and proves clean omission; no macOS hardware campaign has run.
 - **Bun:** native mechanism and lease propagation activate on Linux. This is correctness evidence only.
 - **Node 24:** the addon source-builds and loads, but hosted Node aborts inside `napi_detach_arraybuffer`. Preflight therefore omits shared memory before creating an external alias. It never falls back to copying.
 

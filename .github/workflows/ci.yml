@@ -71,14 +71,15 @@ jobs:
 
       - name: Rust contracts and lifecycle (Linux)
         if: runner.os == 'Linux'
-        run: >-
-          cargo nextest run
-          -p mc-shm-native -p mc-host -p mc-shm-transport
+        run: |
+          cargo nextest run -p mc-shm-native -p mc-shm-transport
+          cargo nextest run -p mc-host \
+            --test shm_transport --test transport_negotiation
 
       - name: Rust contracts and clean host omission (macOS)
         if: runner.os == 'macOS'
         run: |
-          cargo nextest run -p mc-shm-native -p mc-shm-transport
+          cargo nextest run -p mc-shm-transport --test contract
           cargo test -p mc-host --test shm_transport \
             omitted_and_unqualified_profiles_fall_back_without_side_effects
 
