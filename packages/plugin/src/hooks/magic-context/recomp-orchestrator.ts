@@ -3,11 +3,6 @@ import {
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
 import {
-    isMemoryMigrationDone,
-    runMemoryMigration,
-} from "../../features/magic-context/memory/memory-migration";
-import { resolveProjectIdentity } from "../../features/magic-context/project-identity";
-import {
     clearEmergencyRecovery,
     isWrapupInProgress,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -72,8 +67,6 @@ export interface ManagedRecompContext {
      *  this explicitly so it can include its OpenCode-DB fallback (the live map can
      *  be empty when `/ctx-recomp` runs before the first transform pass). */
     fallbackModelId?: string;
-    /** Gate the upgrade's memory-migration step (memory enabled + historian model set). */
-    runMigration: boolean;
     userMemoriesEnabled: boolean;
     /** Two-pass historian (editor cleanup) — config `historian.two_pass`. */
     historianTwoPass?: boolean;
@@ -268,33 +261,6 @@ function buildRecompDeps(ctx: ManagedRecompContext, sessionId: string) {
     };
 }
 
-/** Resolve the SESSION's real directory (not the plugin-startup cwd) so memory
- *  migration rewrites the correct project. Mirrors the cache+SDK fallback used
- *  elsewhere; never throws. */
-async function resolveSessionDirectory(
-    ctx: ManagedRecompContext,
-    sessionId: string,
-): Promise<string> {
-    const cached = ctx.liveSessionState.sessionDirectoryBySession.get(sessionId);
-    if (cached) return cached;
-    try {
-        const info = await (
-            ctx.client as {
-                session?: {
-                    get?: (a: unknown) => Promise<{ data?: { directory?: string } }>;
-                };
-            }
-        )?.session?.get?.({ path: { id: sessionId } });
-        const dir = info?.data?.directory;
-        if (typeof dir === "string" && dir.length > 0) {
-            ctx.liveSessionState.sessionDirectoryBySession.set(sessionId, dir);
-            return dir;
-        }
-    } catch {
-        // non-fatal — fall through to plugin directory
-    }
-    return ctx.directory;
-}
 
 /**
  * Run a recomp (full or partial), with fallback + live progress + terminal state.
@@ -391,28 +357,15 @@ export async function runManagedUpgrade(
             } catch {
                 /* best-effort GC */
             }
-            const migrationDirectory = await resolveSessionDirectory(ctx, sessionId);
-            const projectPath = resolveProjectIdentity(migrationDirectory);
-            const migrationPending =
-                ctx.runMigration && !isMemoryMigrationDone(ctx.db, projectPath);
-
-            if (!migrationPending) {
-                // Fully upgraded already — nothing to do.
-                setRecompTerminal(ctx.liveSessionState, sessionId, "done", "Already upgraded");
-                return [
-                    "## Session Upgrade — Already Up To Date",
-                    "",
-                    compartments.length === 0
-                        ? "This session has no compartment history to upgrade yet."
-                        : "This session's compartments are already in the current format.",
-                ].join("\n");
-            }
-
-            // Compartments are current, but this project's memories were never
-            // migrated — run migration only, skip the pointless recomp.
-            const summary = await runUpgradeMemoryMigration(ctx, sessionId, migrationDirectory);
-            setRecompTerminal(ctx.liveSessionState, sessionId, "done", "Memories migrated");
-            return ["## Session Upgrade — Complete", "", summary].join("\n");
+            // Fully upgraded already — nothing to do.
+            setRecompTerminal(ctx.liveSessionState, sessionId, "done", "Already upgraded");
+            return [
+                "## Session Upgrade — Already Up To Date",
+                "",
+                compartments.length === 0
+                    ? "This session has no compartment history to upgrade yet."
+                    : "This session's compartments are already in the current format.",
+            ].join("\n");
         }
 
         // ── Full upgrade: compartment recomp (NO facts) → memory migration ───
@@ -445,20 +398,8 @@ export async function runManagedUpgrade(
             return `## Session Upgrade — Incomplete\n\n${reason}`;
         }
 
-        // Step 2 — once-per-project memory migration (idempotent, project-scoped).
-        let migrationSummary = "";
-        if (ctx.runMigration) {
-            const migrationDirectory = await resolveSessionDirectory(ctx, sessionId);
-            migrationSummary = await runUpgradeMemoryMigration(ctx, sessionId, migrationDirectory);
-        }
-
         setRecompTerminal(ctx.liveSessionState, sessionId, "done", "Upgrade complete");
-        return [
-            "## Session Upgrade — Complete",
-            "",
-            recompResult.message,
-            migrationSummary ? `\n${migrationSummary}` : "",
-        ].join("\n");
+        return ["## Session Upgrade — Complete", "", recompResult.message].join("\n");
     } catch (error) {
         setRecompTerminal(
             ctx.liveSessionState,
@@ -470,47 +411,3 @@ export async function runManagedUpgrade(
     }
 }
 
-/** Run the once-per-project memory migration with the progress bar in its
- *  indeterminate "migration" phase. Returns the summary line (or an error note
- *  on failure — migration failure must not fail the whole upgrade). */
-async function runUpgradeMemoryMigration(
-    ctx: ManagedRecompContext,
-    sessionId: string,
-    migrationDirectory: string,
-): Promise<string> {
-    const prev = ctx.liveSessionState.recompProgressBySession.get(sessionId);
-    ctx.liveSessionState.recompProgressBySession.set(sessionId, {
-        sessionId,
-        // Memory migration only runs inside the upgrade flow.
-        kind: prev?.kind ?? "upgrade",
-        phase: "migration",
-        processedMessages: prev?.processedMessages ?? 0,
-        totalMessages: prev?.totalMessages ?? 0,
-        passCount: prev?.passCount ?? 0,
-        compartmentsCreated: prev?.compartmentsCreated ?? 0,
-        startedAt: prev?.startedAt ?? Date.now(),
-        updatedAt: Date.now(),
-        note: "Re-organizing project memories…",
-    });
-    try {
-        const outcome = await runMemoryMigration({
-            client: ctx.client as Parameters<typeof runMemoryMigration>[0]["client"],
-            db: ctx.db,
-            directory: migrationDirectory,
-            parentSessionId: sessionId,
-            // Run the migration on the session's live MAIN model (the user's
-            // working interactive model — typically stronger and guaranteed
-            // present, vs a possibly-misconfigured historian model). Historian
-            // fallbacks remain the safety net behind it.
-            primaryModelId:
-                ctx.fallbackModelId ?? resolveLiveModelKey(ctx.liveSessionState, sessionId),
-            fallbackModels: ctx.fallbackModels,
-            timeoutMs: ctx.historianTimeoutMs,
-            userMemoriesEnabled: ctx.userMemoriesEnabled,
-            language: ctx.language,
-        });
-        return outcome.summary;
-    } catch (error) {
-        return `Memory migration skipped (error): ${String(error)}`;
-    }
-}

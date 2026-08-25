@@ -493,7 +493,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         })(),
         historianTwoPass: deps.config.historian?.two_pass === true,
-        runMigration: deps.config.memory?.enabled !== false && !!deps.config.historian?.model,
         // Option C privacy gate: behavioral observation candidates are collected
         // during historian runs only when the user has SCHEDULED the
         // review-user-memories task (schedule != ""). Replaces the v1
