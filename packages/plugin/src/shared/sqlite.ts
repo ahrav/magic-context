@@ -215,47 +215,74 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
             const self = this as any;
             const execute = (
                 mode: "" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE",
-                receiver: unknown,
-                args: unknown[],
-            ) => {
+                receiver: ThisParameterType<F>,
+                args: Parameters<F>,
+            ): ReturnType<F> => {
                 const nested = self.isTransaction === true;
                 self.exec(nested ? `SAVEPOINT ${SAVEPOINT}` : `BEGIN${mode ? ` ${mode}` : ""}`);
                 try {
-                    const result = fn.apply(receiver, args);
+                    // SAFETY: Parameters<F> and ThisParameterType<F> preserve fn's call contract.
+                    const result = fn.apply(receiver, args) as ReturnType<F>;
                     self.exec(nested ? `RELEASE ${SAVEPOINT}` : "COMMIT");
                     return result;
                 } catch (error) {
-                    if (nested) {
-                        // ROLLBACK TO unwinds the savepoint's changes but leaves
-                        // it on the stack; RELEASE then pops it (better-sqlite3
-                        // does both).
-                        self.exec(`ROLLBACK TO ${SAVEPOINT}`);
-                        self.exec(`RELEASE ${SAVEPOINT}`);
-                    } else {
-                        self.exec("ROLLBACK");
+                    // RAISE(ROLLBACK) can end the transaction before control
+                    // returns here. Cleanup errors must not replace `error`.
+                    if (self.isTransaction === true) {
+                        if (nested) {
+                            try {
+                                self.exec("ROLLBACK TO mc_tx_sp");
+                                if (self.isTransaction === true) self.exec("RELEASE mc_tx_sp");
+                            } catch {
+                                // Rollback failures must not replace the callback exception.
+                            }
+                        } else {
+                            try {
+                                self.exec("ROLLBACK");
+                            } catch {
+                                // Rollback failures must not replace the callback exception.
+                            }
+                        }
                     }
                     throw error;
                 }
             };
-            const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+            const wrapped = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("", this, args);
             };
-            wrapped.default = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.default = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("", this, args);
             };
-            wrapped.deferred = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.deferred = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("DEFERRED", this, args);
             };
-            wrapped.immediate = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.immediate = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("IMMEDIATE", this, args);
             };
-            wrapped.exclusive = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.exclusive = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("EXCLUSIVE", this, args);
             };
+            // SAFETY: attached mode methods match better-sqlite3's transaction wrapper contract.
             return wrapped as unknown as F;
         }
     }
 
+    // SAFETY: NodeSqliteDatabase implements the BetterSqlite3 constructor surface used here.
     return NodeSqliteDatabase as unknown as typeof BetterSqlite3;
 }
 
@@ -305,6 +332,7 @@ export function hasClaimCompatibilityWriteState(db: Database): boolean {
  * better-sqlite3 expose `inTransaction`; node:sqlite exposes `isTransaction`.
  */
 export function isInTransaction(db: Database): boolean {
+    // SAFETY: this assertion permits probing transaction-state properties absent from Database.
     const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
     return candidate.inTransaction === true || candidate.isTransaction === true;
 }

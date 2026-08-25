@@ -5,8 +5,8 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
 import {
-    parseIdShapedQuery,
-    resolveMemoriesByIdsForSearch,
+    parseLocatorShapedQuery,
+    resolveClaimsByLocatorsForSearch,
     type UnifiedSearchResult,
     unifiedSearch,
 } from "../../features/magic-context/search";
@@ -14,7 +14,7 @@ import {
     describeQueryBoundsViolation,
     normalizeSearchResultLimit,
 } from "../../features/magic-context/search-bounds";
-import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
+import { getVisibleRevisionLocators } from "../../hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION, CTX_SEARCH_TOOL_NAME } from "./constants";
 import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
 import { type ExplicitDeliveryReason, packSearchResults } from "./render";
@@ -131,10 +131,10 @@ export async function executeCtxSearch(
     const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, toolContext.sessionID);
     const messageOrdinalCutoff = lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
 
-    // Hard-filter memories already rendered in <session-history>.
+    // Hard-filter claims already rendered in the injected baseline.
     // They're visible in message[0], so returning them wastes output
     // tokens and crowds out high-signal raw-history hits.
-    const visibleMemoryIds = getVisibleMemoryIds(deps.db, toolContext.sessionID);
+    const visibleRevisionLocators = getVisibleRevisionLocators(deps.db, toolContext.sessionID);
 
     // Resolve the session's actual project from `toolContext.directory`
     // each call. OpenCode's top-level `ctx.directory` (the launch dir)
@@ -166,28 +166,25 @@ export async function executeCtxSearch(
         };
     };
 
-    // ID-shaped short-circuit: when the whole query is one or more
-    // memory ids, bypass the lexical+semantic lanes and look the ids
-    // up directly. The agent is given memory ids everywhere
-    // (<project-memory> shows `#id:` lines, dashboard, guidance) and
-    // ctx_search was the only tool that could surface content for
-    // an id but it did so through text matching. Whole-query id list
-    // only — `parseIdShapedQuery` returns null for "fix bug 1234" so
-    // numeric phrases still search text. If no ids resolve (foreign
-    // hidden, missing, hard-deleted) the call falls through to the
-    // normal lanes so a query like "7234" with no such memory still
-    // returns the corpus text matches.
-    const idShape = parseIdShapedQuery(query);
-    if (idShape && memoryEnabled) {
-        const idResults = resolveMemoriesByIdsForSearch({
+    // Exact-locator short-circuit: when the whole query is one or more
+    // claim/revision locators, bypass the lexical+semantic lanes and
+    // resolve them through the current-state provider. The agent is given
+    // locators everywhere (<project-memory> lines, dashboard, guidance).
+    // Whole-query locator list only — `parseLocatorShapedQuery` returns
+    // null for ordinary text so it still searches the corpus. If no
+    // locator resolves (foreign hidden, missing) the call falls through
+    // to the normal lanes.
+    const locatorShape = parseLocatorShapedQuery(query);
+    if (locatorShape && memoryEnabled) {
+        const locatorResults = resolveClaimsByLocatorsForSearch({
             db: deps.db,
             projectPath,
-            ids: idShape,
-            limit: Math.max(normalizeSearchResultLimit(args.limit), idShape.length),
-            visibleMemoryIds,
+            locators: locatorShape,
+            limit: Math.max(normalizeSearchResultLimit(args.limit), locatorShape.length),
+            visibleRevisionLocators,
         });
-        if (idResults !== null) {
-            return completeFrom(idResults);
+        if (locatorResults !== null) {
+            return completeFrom(locatorResults);
         }
     }
 
@@ -204,7 +201,6 @@ export async function executeCtxSearch(
         maxMessageOrdinal: messageOrdinalCutoff,
         gitCommitsEnabled,
         sources: normalizeSources(args.sources),
-        visibleMemoryIds,
         // Explicit agent search → enable literal-probe multi-query
         // recall for symbol/command/path lookups. Auto-search hints
         // (the hot path) leave this off to protect their latency.

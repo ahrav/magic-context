@@ -32,6 +32,9 @@ export interface SessionMetaRow {
     cached_m0_mural_data_url: string | null;
     cached_m0_mural_hash: string | null;
     cached_m1_bytes: Buffer | Uint8Array | null;
+    cached_m0_claim_format_epoch: number | null;
+    cached_m0_claim_snapshot_vector: string | null;
+    cached_m0_rendered_revision_locators: string | null;
     cached_m0_project_memory_epoch: number | null;
     cached_m0_workspace_fingerprint: string | null;
     cached_m0_project_user_profile_version: number | null;
@@ -90,6 +93,9 @@ export const SESSION_META_SELECT_COLUMNS = [
     "cached_m0_mural_data_url",
     "cached_m0_mural_hash",
     "cached_m1_bytes",
+    "cached_m0_claim_format_epoch",
+    "cached_m0_claim_snapshot_vector",
+    "cached_m0_rendered_revision_locators",
     "cached_m0_project_memory_epoch",
     "cached_m0_workspace_fingerprint",
     "cached_m0_project_user_profile_version",
@@ -147,6 +153,9 @@ export const META_COLUMNS: Record<string, string> = {
     cachedM0MuralDataUrl: "cached_m0_mural_data_url",
     cachedM0MuralHash: "cached_m0_mural_hash",
     cachedM1Bytes: "cached_m1_bytes",
+    cachedM0ClaimFormatEpoch: "cached_m0_claim_format_epoch",
+    cachedM0ClaimSnapshotVector: "cached_m0_claim_snapshot_vector",
+    cachedM0RenderedRevisionLocators: "cached_m0_rendered_revision_locators",
     cachedM0ProjectMemoryEpoch: "cached_m0_project_memory_epoch",
     cachedM0WorkspaceFingerprint: "cached_m0_workspace_fingerprint",
     cachedM0ProjectUserProfileVersion: "cached_m0_project_user_profile_version",
@@ -195,6 +204,9 @@ export const NULL_BIND_META_KEYS = new Set([
     "cachedM0MuralDataUrl",
     "cachedM0MuralHash",
     "cachedM1Bytes",
+    "cachedM0ClaimFormatEpoch",
+    "cachedM0ClaimSnapshotVector",
+    "cachedM0RenderedRevisionLocators",
     "cachedM0ProjectMemoryEpoch",
     "cachedM0WorkspaceFingerprint",
     "cachedM0ProjectUserProfileVersion",
@@ -272,6 +284,9 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
         isStringOrNull(r.cached_m0_mural_data_url) &&
         isStringOrNull(r.cached_m0_mural_hash) &&
         isBlobOrNull(r.cached_m1_bytes) &&
+        isNumberOrNull(r.cached_m0_claim_format_epoch) &&
+        isStringOrNull(r.cached_m0_claim_snapshot_vector) &&
+        isStringOrNull(r.cached_m0_rendered_revision_locators) &&
         isNumberOrNull(r.cached_m0_project_memory_epoch) &&
         isStringOrNull(r.cached_m0_workspace_fingerprint) &&
         isNumberOrNull(r.cached_m0_project_user_profile_version) &&
@@ -331,6 +346,9 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
         cachedM0MuralDataUrl: null,
         cachedM0MuralHash: null,
         cachedM1Bytes: null,
+        cachedM0ClaimFormatEpoch: null,
+        cachedM0ClaimSnapshotVector: null,
+        cachedM0RenderedRevisionLocators: null,
         cachedM0ProjectMemoryEpoch: null,
         cachedM0WorkspaceFingerprint: null,
         cachedM0ProjectUserProfileVersion: null,
@@ -451,6 +469,9 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
         cachedM0MuralDataUrl: stringOrNull(row.cached_m0_mural_data_url),
         cachedM0MuralHash: stringOrNull(row.cached_m0_mural_hash),
         cachedM1Bytes: toBufferOrNull(row.cached_m1_bytes),
+        cachedM0ClaimFormatEpoch: numOrNull(row.cached_m0_claim_format_epoch),
+        cachedM0ClaimSnapshotVector: stringOrNull(row.cached_m0_claim_snapshot_vector),
+        cachedM0RenderedRevisionLocators: stringOrNull(row.cached_m0_rendered_revision_locators),
         cachedM0ProjectMemoryEpoch: numOrNull(row.cached_m0_project_memory_epoch),
         cachedM0WorkspaceFingerprint: stringOrNull(row.cached_m0_workspace_fingerprint),
         cachedM0ProjectUserProfileVersion: numOrNull(row.cached_m0_project_user_profile_version),
@@ -486,11 +507,14 @@ export interface PersistCachedM0Payload {
     m0Bytes: Buffer;
     muralDataUrl?: string | null;
     muralHash?: string | null;
-    projectMemoryEpoch: number | null;
+    claimFormatEpoch?: number | null;
+    claimSnapshotVector?: string | null;
+    renderedRevisionLocators?: string | null;
+    projectMemoryEpoch?: number | null;
     workspaceFingerprint?: string | null;
     projectUserProfileVersion: number | null;
     maxCompartmentSeq: number;
-    maxMemoryId: number | null;
+    maxMemoryId?: number | null;
     maxMutationId: number | null;
     maxMemoryMutationId?: number | null;
     m1Bytes?: Buffer | null;
@@ -514,6 +538,9 @@ export function persistCachedM0(
             cached_m0_bytes = ?,
             cached_m0_mural_data_url = ?,
             cached_m0_mural_hash = ?,
+            cached_m0_claim_format_epoch = ?,
+            cached_m0_claim_snapshot_vector = ?,
+            cached_m0_rendered_revision_locators = ?,
             cached_m0_project_memory_epoch = ?,
             cached_m0_workspace_fingerprint = ?,
             cached_m0_project_user_profile_version = ?,
@@ -534,11 +561,14 @@ export function persistCachedM0(
         Buffer.from(payload.m0Bytes),
         payload.muralDataUrl ?? null,
         payload.muralHash ?? null,
-        payload.projectMemoryEpoch,
+        payload.claimFormatEpoch ?? null,
+        payload.claimSnapshotVector ?? null,
+        payload.renderedRevisionLocators ?? null,
+        payload.projectMemoryEpoch ?? null,
         payload.workspaceFingerprint ?? null,
         payload.projectUserProfileVersion,
         payload.maxCompartmentSeq,
-        payload.maxMemoryId,
+        payload.maxMemoryId ?? null,
         payload.maxMutationId,
         payload.maxMemoryMutationId ?? null,
         payload.m1Bytes ? Buffer.from(payload.m1Bytes) : null,
@@ -565,6 +595,9 @@ export function clearCachedM0M1(db: Database, sessionId: string): void {
         ["cached_m0_mural_data_url", null],
         ["cached_m0_mural_hash", null],
         ["cached_m1_bytes", null],
+        ["cached_m0_claim_format_epoch", null],
+        ["cached_m0_claim_snapshot_vector", null],
+        ["cached_m0_rendered_revision_locators", null],
         ["cached_m0_project_memory_epoch", null],
         ["cached_m0_workspace_fingerprint", null],
         ["cached_m0_project_user_profile_version", null],

@@ -7,6 +7,7 @@ import type {
     DreamTaskBacklogMap,
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
+import type { SnapshotVector } from "../features/magic-context/memory/claim-operation-contract";
 import type { LoggerDiagnostics } from "./logger";
 
 export interface TailHygieneStatus {
@@ -44,6 +45,8 @@ export interface SidebarSnapshot {
     /** Historical compartment rows retained while native compaction owns the window. */
     archivedCompartmentCount?: number;
     memoryCount: number;
+    memoryClaims: Array<{ publicClaimId: string; revisionLocator: string }>;
+    memorySnapshotVector: SnapshotVector | null;
     memoryBlockCount: number;
     pendingOpsCount: number;
     historianRunning: boolean;

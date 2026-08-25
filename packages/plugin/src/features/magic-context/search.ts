@@ -6,32 +6,17 @@ import {
 } from "./compartment-chunk-embedding";
 import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
-import {
-    ensureMemoryEmbeddings,
-    getMemoriesByProject,
-    getMemoriesByProjects,
-    getMemoriesByRequestedIds,
-    getProjectEmbeddings,
-    type Memory,
-    ModuleMemoryAuthorityError,
-    peekProjectEmbeddings,
-    searchMemoriesFTSWithinIds,
-    updateMemoryRetrievalCount,
-} from "./memory";
+import { readProjectIdentityMap } from "./memory/claim-memory-render";
+import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-operation-contract";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
 import {
-    bindMemoriesToCurrentRevision,
-    decideMemoryPolicy,
-    exactMemoryContentDigests,
-    filterMemoriesByPolicy,
-    hasClaimEffectivePolicy,
-    type MemoryPolicyRow,
-    type MemoryPolicySurface,
-    readMemoryPolicyRows,
-} from "./memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "./memory/storage-claims";
+    type ProjectMemoryClaimSnapshot,
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "./memory/storage-claim-current-state";
+import { recordClaimUsage } from "./memory/storage-claim-operations";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
@@ -64,8 +49,8 @@ import {
 } from "./storage-notes";
 import { getActivePrimers, type Primer } from "./storage-primers";
 import {
+    computeWorkspaceEpochFingerprint,
     expandWorkspaceIdentitySetWithAliases,
-    resolveStoredPathWorkspaceIdentity,
     resolveWorkspaceIdentitySet,
     resolveWorkspaceShareCategories,
     sourceNameForMemory,
@@ -166,12 +151,6 @@ export interface UnifiedSearchOptions {
      *  Facts are NOT a source — they're already always rendered in the
      *  <session-history> block injected into message[0]. */
     sources?: SearchSource[];
-    /** Hard-filter memories already rendered in <session-history>. The agent
-     *  can see them in message[0] — surfacing them via ctx_search wastes
-     *  tokens and crowds out high-signal raw-history hits. Pass null or omit
-     *  to disable filtering (for callers outside the transform context that
-     *  can't resolve the visible set). */
-    visibleMemoryIds?: Set<number> | null;
     /** Abort signal — if provided, cancels in-flight embedding requests
      *  (and any downstream HTTP calls) when the caller gives up. Used by
      *  transform-hot-path callers like auto-search whose own 3s timeout
@@ -210,15 +189,15 @@ export interface MemorySearchResult {
     source: "memory";
     content: string;
     score: number;
-    memoryId: number;
+    /** Opaque public claim identity (`mcm_<32hex>`). */
+    publicClaimId: string;
+    /** Canonical current revision locator the content was read from. */
+    revisionLocator: string;
     category: string;
-    matchType: "semantic" | "fts" | "hybrid";
+    matchType: "exact";
     sourceName?: string;
     policyLabel?: string;
-    /** Exact SHA-256 digest of the LOADED memory bytes this result was ranked
-     * from. Consumers that persist replay state (auto-search hints) bind to
-     * this digest so a rewrite committed after the lane's recheck cannot pair
-     * the old packed text with the new revision's identity. */
+    /** Exact SHA-256 digest of the served revision's content bytes. */
     contentDigest?: string;
 }
 
@@ -285,8 +264,6 @@ export type UnifiedSearchResult =
     | PrimerSearchResult
     | NoteSearchResult;
 
-const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
-
 export { ID_SHAPED_QUERY_MAX_TOKENS, parseIdShapedQuery } from "./search-bounds";
 
 function normalizeCosineScore(score: number): number {
@@ -339,34 +316,6 @@ function resolveSearchWorkspaceContext(
         canonicalIdentityByStoredPath,
         isWorkspaced,
     };
-}
-
-function memoryWorkspaceIdentity(memory: Memory, workspace: SearchWorkspaceContext): string | null {
-    return resolveStoredPathWorkspaceIdentity(
-        memory.projectPath,
-        workspace.identities,
-        workspace.canonicalIdentityByStoredPath,
-    );
-}
-
-function sourceNamesForSearchMemories(args: {
-    memories: readonly Memory[];
-    projectPath: string;
-    workspace: SearchWorkspaceContext;
-}): Map<number, string> | undefined {
-    if (!args.workspace.isWorkspaced) return undefined;
-    const sourceNames = new Map<number, string>();
-    for (const memory of args.memories) {
-        const source = sourceNameForMemory(
-            memory.projectPath,
-            args.projectPath,
-            args.workspace.identities,
-            args.workspace.namesByIdentity,
-            args.workspace.canonicalIdentityByStoredPath,
-        );
-        if (source) sourceNames.set(memory.id, source);
-    }
-    return sourceNames.size > 0 ? sourceNames : undefined;
 }
 
 function getMessageSearchStatement(db: Database): PreparedStatement {
@@ -473,505 +422,6 @@ function getMessageOrdinal(value: number | string | undefined): number | null {
     }
 
     return null;
-}
-
-/** R37: post-score lane ceiling. Brute-force semantic scoring must visit
- *  every cached vector, but only the strongest MAX_LANE_CANDIDATES scores may
- *  enter fusion so downstream merge and sort work is bounded by the lane cap
- *  rather than the corpus. Ties break toward the lower memory id, matching
- *  the deterministic tie-break in `mergeMemoryResults`. */
-function pruneToLaneCeiling(scores: Map<number, number>): Map<number, number> {
-    if (scores.size <= MAX_LANE_CANDIDATES) return scores;
-    const top = [...scores.entries()]
-        .sort((left, right) => right[1] - left[1] || left[0] - right[0])
-        .slice(0, MAX_LANE_CANDIDATES);
-    return new Map(top);
-}
-
-/** Total vector-buffer bytes held by a loaded embedding map — what a cache
- *  miss actually decoded, as opposed to the candidate subset compared. */
-function totalEmbeddingBytes(embeddings: ReadonlyMap<number, { embedding: Float32Array }>): number {
-    let bytes = 0;
-    for (const entry of embeddings.values()) bytes += entry.embedding.byteLength;
-    return bytes;
-}
-
-async function getSemanticScores(args: {
-    db: Database;
-    projectPath: string;
-    memories: Memory[];
-    /** Pre-computed query embedding. Pass `null` to skip semantic scoring
-     *  (e.g. embedding disabled, query embed failed, runtime not ready).
-     *  unifiedSearch is responsible for computing this once and passing the
-     *  same vector to memory + git-commit searches so we never embed the
-     *  same query twice in parallel. */
-    queryEmbedding: Float32Array | null;
-    queryModelId?: string | null;
-    workspace?: SearchWorkspaceContext;
-    /** Memories already rendered in <session-history>. They are excluded
-     *  BEFORE scoring and the lane ceiling: merge drops them anyway, so
-     *  letting them occupy pruned lane slots would evict eligible
-     *  lower-scored matches from the bounded lane entirely. */
-    visibleMemoryIds?: Set<number> | null;
-    /** Reports the exact vector-buffer bytes compared by the scan. */
-    onVectorLoad?: VectorLoadObserver;
-}): Promise<Map<number, number>> {
-    const semanticScores = new Map<number, number>();
-
-    if (
-        !args.queryEmbedding ||
-        args.memories.length === 0 ||
-        !args.queryModelId ||
-        args.queryModelId === "off"
-    ) {
-        return semanticScores;
-    }
-
-    if (!args.workspace?.isWorkspaced) {
-        const wasCached = args.onVectorLoad
-            ? peekProjectEmbeddings(args.projectPath, args.queryModelId) !== null
-            : false;
-        const cachedEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
-        const embeddings = await ensureMemoryEmbeddings({
-            db: args.db,
-            projectIdentity: args.projectPath,
-            memories: args.memories,
-            existingEmbeddings: cachedEmbeddings,
-        });
-
-        let touchedBytes = 0;
-        let touchedVectors = 0;
-        for (const memory of args.memories) {
-            if (args.visibleMemoryIds?.has(memory.id)) continue;
-            const memoryEmbedding = embeddings.get(memory.id);
-            if (!memoryEmbedding) {
-                continue;
-            }
-            touchedBytes += memoryEmbedding.embedding.byteLength;
-            touchedVectors += 1;
-
-            const score = normalizeCosineScore(
-                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-            );
-            // A nonpositive score is "no semantic signal", not a semantic
-            // match: keeping it would label an FTS hit hybrid (and downweight
-            // it) or not based on which zero entries survive the lane
-            // ceiling. Mirrors the git-commit lane's admission rule.
-            if (score > 0) semanticScores.set(memory.id, score);
-        }
-
-        args.onVectorLoad?.({
-            // A cache miss decodes the WHOLE project's embedding table, not
-            // just the candidates compared afterwards; the counters must
-            // attribute the bytes the load actually decoded.
-            decodedBytes: wasCached ? 0 : totalEmbeddingBytes(embeddings),
-            cachedBytes: wasCached ? touchedBytes : 0,
-            vectorCount: wasCached ? touchedVectors : embeddings.size,
-            cacheHit: wasCached,
-        });
-        return pruneToLaneCeiling(semanticScores);
-    }
-
-    const workspace = args.workspace;
-    const memoriesByIdentity = new Map<string, Memory[]>();
-    for (const memory of args.memories) {
-        const identity = memoryWorkspaceIdentity(memory, workspace);
-        if (!identity) continue;
-        const list = memoriesByIdentity.get(identity) ?? [];
-        list.push(memory);
-        memoriesByIdentity.set(identity, list);
-    }
-
-    const ownMemories = memoriesByIdentity.get(args.projectPath) ?? [];
-    // getProjectEmbeddings below primes the process cache for the own
-    // project, so its cached-before state must be captured first or the
-    // loop would report every cold own-project load as a cache hit.
-    let ownWasCachedBeforePrime: boolean | null = null;
-    if (ownMemories.length > 0) {
-        ownWasCachedBeforePrime =
-            peekProjectEmbeddings(args.projectPath, args.queryModelId) !== null;
-        const ownEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
-        await ensureMemoryEmbeddings({
-            db: args.db,
-            projectIdentity: args.projectPath,
-            memories: ownMemories,
-            existingEmbeddings: ownEmbeddings,
-        });
-    }
-
-    for (const identity of workspace.identities) {
-        const memberMemories = memoriesByIdentity.get(identity) ?? [];
-        if (memberMemories.length === 0) continue;
-        const identityWasCached = args.onVectorLoad
-            ? identity === args.projectPath && ownWasCachedBeforePrime !== null
-                ? ownWasCachedBeforePrime
-                : peekProjectEmbeddings(identity, args.queryModelId) !== null
-            : false;
-        const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
-        // A cold identity decodes its whole embedding table on load; warm
-        // identities are billed at touched-byte granularity. The whole-map
-        // scan only feeds the observer, so skip it on untraced searches.
-        const identityIsCold = args.onVectorLoad !== undefined && !identityWasCached;
-        let identityTouchedBytes = 0;
-        let identityTouchedVectors = 0;
-        for (const memory of memberMemories) {
-            if (args.visibleMemoryIds?.has(memory.id)) continue;
-            const memoryEmbedding = cachedEmbeddings.get(memory.id);
-            if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
-            if (!identityIsCold) {
-                identityTouchedBytes += memoryEmbedding.embedding.byteLength;
-                identityTouchedVectors += 1;
-            }
-            const score = normalizeCosineScore(
-                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-            );
-            if (score > 0) semanticScores.set(memory.id, score);
-        }
-        // One all-or-nothing event per identity load (the v1 VectorLoadEvent
-        // contract): a mixed warm/cold workspace emits one event per side
-        // instead of a single event with both byte fields nonzero.
-        args.onVectorLoad?.(
-            identityIsCold
-                ? {
-                      decodedBytes: totalEmbeddingBytes(cachedEmbeddings),
-                      cachedBytes: 0,
-                      vectorCount: cachedEmbeddings.size,
-                      cacheHit: false,
-                  }
-                : {
-                      decodedBytes: 0,
-                      cachedBytes: identityTouchedBytes,
-                      vectorCount: identityTouchedVectors,
-                      cacheHit: true,
-                  },
-        );
-    }
-
-    return pruneToLaneCeiling(semanticScores);
-}
-
-function getFtsEligibleMatches(args: {
-    db: Database;
-    memoryIds: readonly number[];
-    query: string;
-    limit: number;
-}): Memory[] {
-    try {
-        return searchMemoriesFTSWithinIds(args.db, args.memoryIds, args.query, args.limit);
-    } catch (error) {
-        log(
-            `[search] FTS query failed for "${args.query}": ${error instanceof Error ? error.message : String(error)}`,
-        );
-        return [];
-    }
-}
-
-function getFtsScores(matches: Memory[]): Map<number, number> {
-    return new Map(matches.map((memory, rank) => [memory.id, 1 / (rank + 1)]));
-}
-
-function selectSemanticCandidates(args: {
-    memories: Memory[];
-    projectPath: string;
-    ftsMatches: Memory[];
-    queryModelId?: string | null;
-    workspace?: SearchWorkspaceContext;
-}): Memory[] {
-    if (args.ftsMatches.length === 0) {
-        return args.memories;
-    }
-
-    const candidateIds = new Set(args.ftsMatches.map((memory) => memory.id));
-    if (args.queryModelId && args.queryModelId !== "off") {
-        const embeddingProjects = args.workspace?.isWorkspaced
-            ? args.workspace.identities
-            : [args.projectPath];
-        for (const projectPath of embeddingProjects) {
-            const cachedEmbeddings = peekProjectEmbeddings(projectPath, args.queryModelId);
-            if (!cachedEmbeddings) continue;
-            for (const memoryId of cachedEmbeddings.keys()) {
-                candidateIds.add(memoryId);
-            }
-        }
-    }
-
-    return args.memories.filter((memory) => candidateIds.has(memory.id));
-}
-
-function mergeMemoryResults(args: {
-    memories: Memory[];
-    semanticScores: Map<number, number>;
-    ftsScores: Map<number, number>;
-    limit: number;
-    visibleMemoryIds?: Set<number> | null;
-    sourceNameByMemoryId?: ReadonlyMap<number, string>;
-}): MemorySearchResult[] {
-    const memoryById = new Map(args.memories.map((memory) => [memory.id, memory]));
-    const candidateIds = new Set<number>([...args.semanticScores.keys(), ...args.ftsScores.keys()]);
-    const results: MemorySearchResult[] = [];
-
-    for (const id of candidateIds) {
-        // Hard-filter: memory is already rendered in <session-history>, so the
-        // agent sees it in message[0]. Returning it from ctx_search wastes
-        // output tokens and displaces high-signal raw-history hits.
-        if (args.visibleMemoryIds?.has(id)) {
-            continue;
-        }
-
-        const memory = memoryById.get(id);
-        if (!memory) {
-            continue;
-        }
-
-        const semanticScore = args.semanticScores.get(id);
-        const ftsScore = args.ftsScores.get(id);
-        let score = 0;
-        let matchType: MemorySearchResult["matchType"] = "fts";
-
-        if (semanticScore !== undefined && ftsScore !== undefined) {
-            score = SEMANTIC_WEIGHT * semanticScore + FTS_WEIGHT * ftsScore;
-            matchType = "hybrid";
-        } else if (semanticScore !== undefined) {
-            score = semanticScore * SINGLE_SOURCE_PENALTY;
-            matchType = "semantic";
-        } else if (ftsScore !== undefined) {
-            score = ftsScore * SINGLE_SOURCE_PENALTY;
-            matchType = "fts";
-        }
-
-        if (score <= 0) {
-            continue;
-        }
-
-        results.push({
-            source: "memory",
-            content: previewText(memory.content),
-            score,
-            memoryId: memory.id,
-            category: memory.category,
-            matchType,
-            sourceName: args.sourceNameByMemoryId?.get(memory.id),
-        });
-    }
-
-    return results
-        .sort((left, right) => {
-            if (right.score !== left.score) {
-                return right.score - left.score;
-            }
-            return left.memoryId - right.memoryId;
-        })
-        .slice(0, args.limit);
-}
-
-async function searchMemories(args: {
-    db: Database;
-    projectPath: string;
-    query: string;
-    limit: number;
-    /** Explicit per-lane candidate bound (from `options.candidateDepth`).
-     *  When absent the lane keeps its fixed lexical candidate ceiling, so
-     *  production behavior is unchanged; an explicit depth is executed as
-     *  the lexical fetch bound so K sweeps measure a real workload change. */
-    candidateLimit?: number | null;
-    memoryEnabled: boolean;
-    /** Pre-computed query embedding (or null if embedding is disabled / failed).
-     *  unifiedSearch embeds once and passes the same vector here and to
-     *  searchGitCommitsAsync — never embed twice for one query. */
-    queryEmbedding: Float32Array | null;
-    queryModelId?: string | null;
-    workspace?: SearchWorkspaceContext;
-    visibleMemoryIds?: Set<number> | null;
-    trace?: SearchTraceRecorder | null;
-    rootSpanId?: number | null;
-    /** The span gating the query vector this lane consumes — the generation
-     *  lookup when tracing records one, else the query-inference span — so
-     *  the vector scan's causal chain includes the generation check. */
-    semanticGateSpanId?: number | null;
-    /** The unified filter span; the lane's first span depends on it so the
-     *  causal chain includes filter and workspace-resolution cost. */
-    filterSpanId?: number | null;
-    policySurface: MemoryPolicySurface;
-}): Promise<{ results: MemorySearchResult[]; laneSpanId: number | null }> {
-    if (!args.memoryEnabled) {
-        return { results: [], laneSpanId: null };
-    }
-
-    const trace = args.trace ?? null;
-    const rootSpanId = args.rootSpanId ?? null;
-    const hydrationSpan =
-        trace?.begin("metadata_hydration", "memory", {
-            parent: rootSpanId,
-            dependsOn: args.filterSpanId != null ? [args.filterSpanId] : [],
-        }) ?? null;
-    const loaded = args.workspace?.isWorkspaced
-        ? getMemoriesByProjects(
-              args.db,
-              args.workspace.expandedIdentities,
-              ["active", "permanent"],
-              Date.now(),
-              args.workspace.ownIdentities,
-              args.workspace.shareCategories,
-          )
-        : getMemoriesByProject(args.db, args.projectPath);
-    // Policy eligibility applies before candidate limits and scoring, so an
-    // ineligible row never consumes a result slot.
-    const policyFilter = filterMemoriesByPolicy(args.db, loaded, args.policySurface);
-    const memories = policyFilter.memories;
-    hydrationSpan?.end("ok", { rows: memories.length });
-    if (memories.length === 0) {
-        return { results: [], laneSpanId: hydrationSpan?.id ?? null };
-    }
-
-    // Hydration completes synchronously before the lexical and vector work
-    // starts, so both downstream spans depend on it; otherwise the critical
-    // path treats a costly hydration as an isolated branch.
-    const hydrationDeps = hydrationSpan ? [hydrationSpan.id] : [];
-    const lexicalSpan =
-        trace?.begin("lexical_scan", "memory", {
-            parent: rootSpanId,
-            dependsOn: hydrationDeps,
-        }) ?? null;
-    const candidateLimit = args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT;
-    // The FTS query ranks WITHIN the eligible id set, so hidden matches can
-    // neither consume candidate slots nor force a widening scan: one bounded
-    // fetch returns the top-ranked eligible matches exactly, however many
-    // hidden rows outrank them, and pins the semantic lane to rows that
-    // survive the policy filter.
-    const ftsMatches = getFtsEligibleMatches({
-        db: args.db,
-        memoryIds: memories.map((memory) => memory.id),
-        query: args.query,
-        limit: candidateLimit,
-    });
-    lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
-    const ftsScores = getFtsScores(ftsMatches);
-    const semanticCandidates = selectSemanticCandidates({
-        memories,
-        projectPath: args.projectPath,
-        ftsMatches,
-        queryModelId: args.queryModelId,
-        workspace: args.workspace,
-    });
-    let memoryLoad: VectorLoadEvent | null = null;
-    const scanSpan =
-        trace?.begin("vector_scan", "memory", {
-            parent: rootSpanId,
-            dependsOn: [
-                ...hydrationDeps,
-                ...(args.semanticGateSpanId != null ? [args.semanticGateSpanId] : []),
-            ],
-        }) ?? null;
-    const semanticScores = await getSemanticScores({
-        db: args.db,
-        projectPath: args.projectPath,
-        memories: semanticCandidates,
-        queryEmbedding: args.queryEmbedding,
-        queryModelId: args.queryModelId,
-        workspace: args.workspace,
-        visibleMemoryIds: args.visibleMemoryIds,
-        onVectorLoad: scanSpan
-            ? (event) => {
-                  memoryLoad = accumulateVectorLoad(memoryLoad, event);
-              }
-            : undefined,
-    });
-    scanSpan?.end("ok", {
-        ...vectorLoadCounters(memoryLoad),
-        candidatesIn: semanticCandidates.length,
-        candidatesOut: semanticScores.size,
-        // Same plumbing-identity convention as the top_k span below, so the
-        // candidate-depth assertion covers this lane's scan instead of
-        // skipping a span with no depth evidence.
-        requestedK: args.limit,
-        effectiveK: args.candidateLimit ?? args.limit,
-    });
-
-    const topKSpan =
-        trace?.begin("top_k", "memory", {
-            parent: rootSpanId,
-            dependsOn: [
-                ...(lexicalSpan ? [lexicalSpan.id] : []),
-                ...(scanSpan ? [scanSpan.id] : []),
-            ],
-        }) ?? null;
-    const merged = mergeMemoryResults({
-        memories,
-        semanticScores,
-        ftsScores,
-        limit: args.limit,
-        visibleMemoryIds: args.visibleMemoryIds,
-        sourceNameByMemoryId: sourceNamesForSearchMemories({
-            memories,
-            projectPath: args.projectPath,
-            workspace: args.workspace ?? {
-                identities: [args.projectPath],
-                expandedIdentities: [args.projectPath],
-                namesByIdentity: new Map(),
-                canonicalIdentityByStoredPath: new Map([[args.projectPath, args.projectPath]]),
-                ownIdentities: [args.projectPath],
-                shareCategories: null,
-                isWorkspaced: false,
-            },
-        }),
-    });
-    topKSpan?.end("ok", {
-        candidatesIn: new Set([...semanticScores.keys(), ...ftsScores.keys()]).size,
-        candidatesOut: merged.length,
-        requestedK: args.limit,
-        // With an explicit candidate bound the lexical fetch executed it;
-        // otherwise both counters carry the caller's limit (plumbing
-        // identity only, not an executed lane bound).
-        effectiveK: args.candidateLimit ?? args.limit,
-    });
-    // Policy recheck before results leave the lane: a transition committed
-    // during scoring must not publish newly hidden content.
-    const hasPolicy = hasClaimEffectivePolicy(args.db);
-    const recheckRows = hasPolicy
-        ? readMemoryPolicyRows(
-              args.db,
-              merged.map((result) => result.memoryId),
-          )
-        : new Map<number, MemoryPolicyRow>();
-    // The recheck must bind to the LOADED bytes, not just the id: a rewrite
-    // committed during the scoring yields makes the unchanged memory id
-    // resolve through the new revision, whose eligibility would otherwise
-    // admit the superseded content this lane loaded. Exact SHA-256 digests —
-    // the normalized hash lowercases and collapses whitespace, so it cannot
-    // tell a rewritten revision from its predecessor. Only the merged
-    // results' rows are hashed (bounded by the lane limit).
-    const loadedMemoriesById = new Map(memories.map((memory) => [memory.id, memory]));
-    const currentHashById = hasPolicy
-        ? exactMemoryContentDigests(
-              args.db,
-              merged.map((result) => result.memoryId),
-          )
-        : new Map<number, string>();
-    const rechecked: MemorySearchResult[] = [];
-    for (const result of merged) {
-        if (!hasPolicy) {
-            rechecked.push(result);
-            continue;
-        }
-        const loaded = loadedMemoriesById.get(result.memoryId);
-        if (loaded === undefined) continue;
-        const loadedDigest = sha256Utf8Hex(loaded.content);
-        if (currentHashById.get(result.memoryId) !== loadedDigest) {
-            continue;
-        }
-        const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);
-        if (!decision.eligible) continue;
-        // The digest of the LOADED bytes rides the result so hint persistence
-        // binds to exactly what was ranked and packed, not a later reload.
-        rechecked.push({
-            ...result,
-            contentDigest: loadedDigest,
-            ...(decision.label ? { policyLabel: decision.label } : {}),
-        });
-    }
-    // The lane's terminal span: the unified fusion span depends on it so
-    // critical-path analysis can follow the memory lane.
-    return { results: rechecked, laneSpanId: topKSpan?.id ?? null };
 }
 
 /** Linear decay message scoring.
@@ -1809,7 +1259,7 @@ function compareUnifiedResults(left: UnifiedSearchResult, right: UnifiedSearchRe
     }
 
     if (left.source === "memory" && right.source === "memory") {
-        return left.memoryId - right.memoryId;
+        return left.publicClaimId < right.publicClaimId ? -1 : 1;
     }
 
     if (left.source === "message" && right.source === "message") {
@@ -1985,91 +1435,131 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
     return set;
 }
 
-/** Turn memories already filtered through the visibility predicate into
- *  MemorySearchResult rows. Used by the ctx_search ID short-circuit so the
- *  direct-by-id path can return the same shape the normal search lanes emit
- *  (and reuse formatResult without a second code path). */
-function memoriesToIdLookupResults(args: {
-    memories: readonly Memory[];
-    limit: number;
-    sourceNameByMemoryId?: ReadonlyMap<number, string>;
-}): MemorySearchResult[] {
-    // Preserve the caller's order so a `parseIdShapedQuery` result like
-    // `["#12", "34"]` renders hits in the same order the user typed them.
-    const ordered = args.memories.slice(0, args.limit);
-    return ordered.map((memory, rank) => ({
-        source: "memory",
-        content: previewText(memory.content),
-        score: 1 - rank * 0.01,
-        memoryId: memory.id,
-        category: memory.category,
-        matchType: "fts" as const,
-        sourceName: args.sourceNameByMemoryId?.get(memory.id),
-    }));
+/**
+ * Parse a whole-query exact-locator list: every whitespace-separated token
+ * must be a public claim ID (`mcm_<32hex>`) or a full revision locator
+ * (`mcm_<32hex>/r<n>/<sha256>`). Returns null for anything else so ordinary
+ * text queries fall through to the normal lanes.
+ */
+export function parseLocatorShapedQuery(query: string): string[] | null {
+    const tokens = query
+        .trim()
+        .split(/[\s,]+/)
+        .filter(Boolean);
+    if (tokens.length === 0) return null;
+    const publicClaimIds: string[] = [];
+    for (const token of tokens) {
+        if (isValidPublicClaimId(token)) {
+            publicClaimIds.push(token);
+            continue;
+        }
+        const locator = parseRevisionLocator(token);
+        if (locator === null) return null;
+        publicClaimIds.push(locator.publicClaimId);
+    }
+    return publicClaimIds;
 }
 
-/** Resolve a parsed id list through the session's visibility scope. Returns
- *  MemorySearchResult rows in the caller's id order, or `null` when nothing
- *  resolved (signals the caller to fall through to the normal search lanes). */
-export function resolveMemoriesByIdsForSearch(args: {
+/**
+ * Exact claim/revision-locator lookup through the current-state provider —
+ * the only search path that serves project-memory claims while the retrieval
+ * projection is inactive. A revision locator resolves to the claim's CURRENT
+ * visible revision. Workspace authorization applies before the limit: a
+ * foreign member's claim is visible only when shareable in a shared
+ * category, and a nonmember cannot distinguish hidden from missing. Returns
+ * null when nothing resolved so callers fall through to the normal lanes.
+ */
+export function resolveClaimsByLocatorsForSearch(args: {
     db: Database;
     projectPath: string;
-    ids: readonly number[];
+    locators: readonly string[];
     limit: number;
-    /** Optional filter mirroring the m[0] hard-filter — already-rendered
-     *  memories are skipped so the agent doesn't see the same content twice. */
-    visibleMemoryIds?: Set<number> | null;
+    /** Revision locators already rendered in the injected baseline. */
+    visibleRevisionLocators?: ReadonlySet<string> | null;
+    /** Bump claim retrieval telemetry (explicit agent lookups). */
+    countRetrievals?: boolean;
 }): MemorySearchResult[] | null {
-    if (args.ids.length === 0) {
-        return null;
+    if (args.locators.length === 0) return null;
+    const publicClaimIds: string[] = [];
+    for (const raw of args.locators) {
+        if (isValidPublicClaimId(raw)) {
+            publicClaimIds.push(raw);
+            continue;
+        }
+        const parsed = parseRevisionLocator(raw);
+        if (parsed !== null) publicClaimIds.push(parsed.publicClaimId);
     }
+    if (publicClaimIds.length === 0) return null;
     const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
-    const fetched = getMemoriesByRequestedIds(args.db, {
-        ids: args.ids,
-        identities: workspace.isWorkspaced ? workspace.expandedIdentities : [args.projectPath],
-        statuses: ["active", "permanent", "archived"],
-        expiryCutoff: Date.now(),
-        ownIdentities: workspace.isWorkspaced ? workspace.ownIdentities : undefined,
-        shareCategories: workspace.isWorkspaced ? workspace.shareCategories : null,
-    });
-    // Direct-ID lookup routes through the same explicit-surface decision as
-    // text search: hard-hidden rows return uniform absence. The binder then
-    // drops rows rewritten between load and policy read, so revision B's
-    // eligibility (and label) can never lend itself to superseded revision A
-    // bytes — including revealing A after a hidden target was rewritten.
-    const policyFilter = filterMemoriesByPolicy(args.db, fetched, "explicit_search");
-    // Reapply the policy on the BOUND rows: a quarantine or label transition
-    // committed between the first policy read and the binding must not
-    // publish the hidden row or a stale label — this lane short-circuits
-    // before executeUnifiedSearch's final recheck.
-    const recheck = filterMemoriesByPolicy(
-        args.db,
-        bindMemoriesToCurrentRevision(args.db, policyFilter.memories),
-        "explicit_search",
+    const authorizedIdentities = workspace.isWorkspaced
+        ? workspace.expandedIdentities
+        : [args.projectPath];
+    const authorizedProjectIds = new Set(
+        resolveProjectIdsForIdentities(args.db, authorizedIdentities),
     );
-    const bound = recheck.memories;
-    const ordered: Memory[] = [];
-    for (const memory of bound) {
-        if (args.visibleMemoryIds?.has(memory.id)) continue;
-        ordered.push(memory);
+    const ownProjectIds = new Set(
+        resolveProjectIdsForIdentities(
+            args.db,
+            workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
+        ),
+    );
+    let items: ProjectMemoryClaimSnapshot[] | null = null;
+    for (let attempt = 0; attempt < 2 && items === null; attempt += 1) {
+        const result = readProjectMemoryCurrentState(args.db, {
+            publicClaimIds: [...new Set(publicClaimIds)],
+            projectIds: [...authorizedProjectIds],
+            workspaceAuthorization: {
+                ownProjectIds: [...ownProjectIds],
+                sharedCategories: workspace.shareCategories ?? [],
+            },
+            workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+            surface: "explicit_search",
+            lifecycleStates: ["active", "archived"],
+        });
+        if (result.status === "ok") items = result.items;
+    }
+    if (items === null) return null;
+    const visible = items;
+    const identityByProjectId = readProjectIdentityMap(
+        args.db,
+        visible.map((item) => item.projectId),
+    );
+    const ordered: MemorySearchResult[] = [];
+    for (const item of visible) {
+        if (args.visibleRevisionLocators?.has(item.revisionLocator)) continue;
+        const identity = identityByProjectId.get(item.projectId);
+        const sourceName =
+            workspace.isWorkspaced && identity
+                ? (sourceNameForMemory(
+                      identity,
+                      args.projectPath,
+                      workspace.identities,
+                      workspace.namesByIdentity,
+                      workspace.canonicalIdentityByStoredPath,
+                  ) ?? undefined)
+                : undefined;
+        ordered.push({
+            source: "memory",
+            content: item.content,
+            score: 1,
+            publicClaimId: item.publicClaimId,
+            revisionLocator: item.revisionLocator,
+            category: item.category,
+            matchType: "exact",
+            ...(sourceName === undefined ? {} : { sourceName }),
+            ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+            contentDigest: item.contentDigest,
+        });
         if (ordered.length >= args.limit) break;
     }
-    if (ordered.length === 0) {
-        return null;
+    if (ordered.length === 0) return null;
+    if (args.countRetrievals !== false) {
+        recordClaimUsage(args.db, {
+            publicClaimIds: ordered.map((result) => result.publicClaimId),
+            kind: "retrieved",
+        });
     }
-    const results = memoriesToIdLookupResults({
-        memories: ordered,
-        limit: args.limit,
-        sourceNameByMemoryId: sourceNamesForSearchMemories({
-            memories: ordered,
-            projectPath: args.projectPath,
-            workspace,
-        }),
-    });
-    return results.map((result) => {
-        const label = recheck.labels.get(result.memoryId);
-        return label ? { ...result, policyLabel: label } : result;
-    });
+    return ordered;
 }
 
 export async function unifiedSearch(
@@ -2155,7 +1645,6 @@ async function executeUnifiedSearch(args: {
     const activeSources = resolveSources(options.sources);
 
     const memoryFeatureEnabled = options.memoryEnabled ?? true;
-    const runMemory = activeSources.has("memory") && memoryFeatureEnabled;
     const runMessages = activeSources.has("message");
     const runGitCommits = activeSources.has("git_commit") && gitCommitsEnabled;
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
@@ -2185,7 +1674,7 @@ async function executeUnifiedSearch(args: {
     // that BEFORE the embed call meant the embed fetch couldn't start
     // until indexing finished.
     const needsEmbedding =
-        (runMemory || runGitCommits || runCompartmentChunks || runPrimers) &&
+        (runGitCommits || runCompartmentChunks || runPrimers) &&
         embeddingEnabled &&
         isEmbeddingRuntimeEnabled();
 
@@ -2220,20 +1709,6 @@ async function executeUnifiedSearch(args: {
     // before the embed fetch is processed, and the embedding HTTP request
     // doesn't actually leave the process until we await later.
     await Promise.resolve();
-
-    // Workspace resolution is filter work — the identity/alias/sharing
-    // lookups deciding what the memory lane may read — but placing its
-    // synchronous SQLite reads before the embed dispatch above would delay
-    // the outbound fetch, the exact latency regression the searchMessages
-    // placement below exists to avoid. It runs post-dispatch under its own
-    // filter span; the memory lane's causal chain gates on it.
-    const workspaceSpan =
-        trace?.begin("filter_construction", "unified", {
-            parent: rootId,
-            dependsOn: filterDeps,
-        }) ?? null;
-    const workspace = resolveSearchWorkspaceContext(db, projectPath);
-    workspaceSpan?.end("ok");
 
     // Run the synchronous message-FTS SELECT now that the embed fetch is
     // in flight. Message indexing is event-driven and never runs here;
@@ -2458,46 +1933,17 @@ async function executeUnifiedSearch(args: {
         return lane;
     };
 
-    const [memoryLane, gitCommitResults, primerResults, noteResults] = await Promise.all([
-        runMemory
-            ? searchMemories({
-                  db,
-                  projectPath,
-                  query: trimmedQuery,
-                  limit: tierLimit,
-                  candidateLimit: args.candidateDepth,
-                  memoryEnabled: true,
-                  queryEmbedding,
-                  queryModelId:
-                      embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                  workspace,
-                  visibleMemoryIds: options.visibleMemoryIds,
-                  trace,
-                  rootSpanId: rootId,
-                  semanticGateSpanId: semanticDeps.length > 0 ? semanticDeps[0] : null,
-                  filterSpanId: workspaceSpan?.id ?? filterSpan?.id ?? null,
-                  policySurface: options.memoryPolicySurface ?? "explicit_search",
-              })
-            : Promise.resolve({
-                  results: [] as MemorySearchResult[],
-                  laneSpanId: null as number | null,
-              }),
+    const [gitCommitResults, primerResults, noteResults] = await Promise.all([
         runGitCommits
             ? Promise.resolve(runGitCommitLane())
             : Promise.resolve([] as GitCommitSearchResult[]),
         runPrimers ? Promise.resolve(runPrimerLane()) : Promise.resolve([] as PrimerSearchResult[]),
         runNotes ? Promise.resolve(runNoteLane()) : Promise.resolve([] as NoteSearchResult[]),
     ]);
-    const memoryResults = memoryLane.results;
-    // The memory lane runs inside searchMemories, so its terminal span joins
-    // the fusion dependency set here; without it criticalPathMs understates
-    // queries whose longest path is the memory lane.
-    if (memoryLane.laneSpanId !== null) laneSpanIds.push(memoryLane.laneSpanId);
 
     const fusionSpan =
         trace?.begin("fusion", "unified", { parent: rootId, dependsOn: laneSpanIds }) ?? null;
     const fused = [
-        ...memoryResults,
         ...primerResults,
         ...messageLikeResults,
         ...gitCommitResults,
@@ -2505,7 +1951,6 @@ async function executeUnifiedSearch(args: {
     ].sort(compareUnifiedResults);
     fusionSpan?.end("ok", {
         candidatesIn:
-            memoryResults.length +
             primerResults.length +
             messageLikeResults.length +
             gitCommitResults.length +
@@ -2536,77 +1981,6 @@ async function executeUnifiedSearch(args: {
             primaryLatencyMs: Date.now() - args.measurementStartedAt,
             search: unifiedSearch,
         });
-    }
-
-    // Only count retrievals for explicit agent-driven searches. Plugin-internal
-    // automatic surfacing (auto-search hints) should not inflate retrieval_count
-    // because the agent may never actually consume the hint.
-    // retrieval_count is telemetry, not correctness: under MODULE authority the
-    // TS write path is fenced, so skip the bump rather than failing the search.
-    const countRetrievals = options.countRetrievals ?? true;
-    {
-        const memoryIds = results
-            .filter((result): result is MemorySearchResult => result.source === "memory")
-            .map((result) => result.memoryId);
-
-        if (memoryIds.length > 0) {
-            if (countRetrievals) {
-                db.transaction(() => {
-                    for (const memoryId of memoryIds) {
-                        try {
-                            updateMemoryRetrievalCount(db, memoryId);
-                        } catch (error) {
-                            // Telemetry only — module-managed rows must not fail the search.
-                            if (error instanceof ModuleMemoryAuthorityError) continue;
-                            throw error;
-                        }
-                    }
-                })();
-            }
-            // This is the LAST database boundary before publication — and it
-            // runs for EVERY caller, telemetry or not: the auto-search lane
-            // passes countRetrievals: false, and the lane-level recheck can
-            // still read the old policy when a concurrent writer's commit
-            // (which the telemetry transaction may have waited on) hides one
-            // of these rows. Reapply the policy and exact-digest gate so the
-            // returned set reflects every transition that committed before
-            // publication.
-            if (hasClaimEffectivePolicy(db)) {
-                const surface = options.memoryPolicySurface ?? "explicit_search";
-                // ONE snapshot for both facts: as separate autocommit
-                // statements, a transition committing between them pairs a
-                // stale eligible decision with an unchanged digest (hide
-                // after digest) or a fresh decision with superseded bytes
-                // (rewrite after digest). A deferred read transaction pins
-                // one WAL snapshot, so the decision and the digest describe
-                // the same revision — and the loaded bytes must match it.
-                const { policyRows, digestsNow } = db.transaction(() => ({
-                    policyRows: readMemoryPolicyRows(db, memoryIds),
-                    digestsNow: exactMemoryContentDigests(db, memoryIds),
-                }))();
-                // Drop rows the final policy read hides AND refresh every
-                // survivor's trust label from that same read: a memory
-                // marked stale/flagged while the telemetry write waited
-                // stays eligible for explicit search but must carry the new
-                // label (and a row that became clean must shed its old one).
-                return results.flatMap<(typeof results)[number]>((result) => {
-                    if (result.source !== "memory") return [result];
-                    const decision = decideMemoryPolicy(policyRows.get(result.memoryId), surface);
-                    if (
-                        !decision.eligible ||
-                        (result.contentDigest !== undefined &&
-                            digestsNow.get(result.memoryId) !== result.contentDigest)
-                    ) {
-                        return [];
-                    }
-                    const { policyLabel: _stale, ...rest } = result;
-                    const refreshed: MemorySearchResult = decision.label
-                        ? { ...rest, policyLabel: decision.label }
-                        : rest;
-                    return [refreshed];
-                });
-            }
-        }
     }
 
     return results;

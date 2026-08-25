@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory } from "../../features/magic-context/memory";
 import { indexMessagesAfterOrdinal } from "../../features/magic-context/message-index";
-import { runMigrations } from "../../features/magic-context/migrations";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import * as searchModule from "../../features/magic-context/search";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
-import { Database } from "../../shared/sqlite";
+import {
+    createClaimReaderTestDatabase,
+    seedProjectMemoryClaim,
+} from "../../features/magic-context/test-claim-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createCtxSearchTools, executeCtxSearch } from "./tools";
 
@@ -17,10 +19,7 @@ const NOTE_EXPAND_HINT =
     "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
-    return db;
+    return createClaimReaderTestDatabase();
 }
 
 describe("createCtxSearchTools", () => {
@@ -209,21 +208,21 @@ describe("createCtxSearchTools", () => {
     });
 
     it("omits the consolidated expand hint for memory-only results", async () => {
-        insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:repo-project",
             content: "Alpha memory only search result.",
+            category: "ARCHITECTURE",
         });
         const tools = createCtxSearchTools({
             db,
-            resolveProjectPath: () => "/repo/project",
+            resolveProjectPath: () => "git:repo-project",
             memoryEnabled: true,
             embeddingEnabled: false,
             readMessages: () => [],
         });
 
         const result = await tools.ctx_search.execute(
-            { query: "alpha", sources: ["memory"] },
+            { query: claim.publicClaimId, sources: ["memory"] },
             toolContext(),
         );
 
@@ -309,32 +308,32 @@ describe("createCtxSearchTools", () => {
         }
     });
 
-    it("resolves a `#1234` query directly to the matching memory without calling unifiedSearch", async () => {
-        const memory = insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "Direct id hit for the short-circuit.",
+    it("resolves a locator query directly to the matching claim without calling unifiedSearch", async () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:repo-project",
+            content: "Direct locator hit for the short-circuit.",
+            category: "ARCHITECTURE",
         });
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
-            throw new Error("unifiedSearch must not run for ID-shaped queries");
+            throw new Error("unifiedSearch must not run for locator-shaped queries");
         });
         try {
             const tools = createCtxSearchTools({
                 db,
-                resolveProjectPath: () => "/repo/project",
+                resolveProjectPath: () => "git:repo-project",
                 memoryEnabled: true,
                 embeddingEnabled: false,
                 readMessages: () => [],
             });
 
             const result = await tools.ctx_search.execute(
-                { query: `#${memory.id}` },
+                { query: claim.revisionLocator },
                 toolContext(),
             );
 
             expect(result).toContain("[1] [memory]");
-            expect(result).toContain(`id=${memory.id}`);
-            expect(result).toContain("Direct id hit for the short-circuit.");
+            expect(result).toContain(`id=${claim.publicClaimId}`);
+            expect(result).toContain("Direct locator hit for the short-circuit.");
         } finally {
             spy.mockRestore();
         }
@@ -348,9 +347,10 @@ describe("createCtxSearchTools", () => {
                         source: "memory",
                         content: "Numeric query that survived into text search.",
                         score: 0.5,
-                        memoryId: 1,
+                        publicClaimId: "mcm_1",
+                        revisionLocator: `mcm_1/r1/${"0".repeat(64)}`,
                         category: "USER_DIRECTIVES",
-                        matchType: "fts",
+                        matchType: "exact",
                     },
                 ] as UnifiedSearchResult[],
         );
@@ -388,9 +388,10 @@ describe("createCtxSearchTools", () => {
                     source: "memory",
                     content: "Fallback text search hit.",
                     score: 0.5,
-                    memoryId: 1,
+                    publicClaimId: "mcm_1",
+                    revisionLocator: `mcm_1/r1/${"0".repeat(64)}`,
                     category: "USER_DIRECTIVES",
-                    matchType: "fts",
+                    matchType: "exact",
                 },
             ] as UnifiedSearchResult[];
         });
@@ -430,9 +431,10 @@ describe("createCtxSearchTools", () => {
                         source: "memory",
                         content: "Text search hit, not an id lookup.",
                         score: 0.6,
-                        memoryId: 1,
+                        publicClaimId: "mcm_1",
+                        revisionLocator: `mcm_1/r1/${"0".repeat(64)}`,
                         category: "USER_DIRECTIVES",
-                        matchType: "fts",
+                        matchType: "exact",
                     },
                 ] as UnifiedSearchResult[],
         );
@@ -481,19 +483,19 @@ describe("executeCtxSearch", () => {
         );
     });
 
-    it("keeps direct-ID lookup byte-identical between the tool and the structured helper", async () => {
-        const memory = insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
+    it("keeps direct-locator lookup byte-identical between the tool and the structured helper", async () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:repo-project",
             content: "Direct id hit for the structured helper.",
+            category: "ARCHITECTURE",
         });
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
-            throw new Error("unifiedSearch must not run for ID-shaped queries");
+            throw new Error("unifiedSearch must not run for locator-shaped queries");
         });
         try {
-            const sharedDeps = deps();
+            const sharedDeps = { ...deps(), resolveProjectPath: () => "git:repo-project" };
             const tools = createCtxSearchTools(sharedDeps);
-            const args = { query: `#${memory.id}` };
+            const args = { query: claim.publicClaimId };
             const execution = await executeCtxSearch(sharedDeps, args, toolContext());
             expect(execution.status).toBe("complete");
             if (execution.status !== "complete") return;
@@ -504,7 +506,7 @@ describe("executeCtxSearch", () => {
             expect(execution.prePack).toHaveLength(1);
             expect(execution.delivered).toEqual(execution.prePack);
             expect(execution.omittedCount).toBe(0);
-            expect(execution.text).toContain(`id=${memory.id}`);
+            expect(execution.text).toContain(`id=${claim.publicClaimId}`);
         } finally {
             spy.mockRestore();
         }
@@ -516,9 +518,10 @@ describe("executeCtxSearch", () => {
                 source: "memory",
                 content: "multi-probe explicit search hit",
                 score: 0.7,
-                memoryId: 5,
+                publicClaimId: "mcm_5",
+                revisionLocator: `mcm_5/r1/${"0".repeat(64)}`,
                 category: "USER_DIRECTIVES",
-                matchType: "fts",
+                matchType: "exact",
             },
         ];
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
@@ -553,9 +556,10 @@ describe("executeCtxSearch", () => {
             source: "memory",
             content: `${filler} tail-${index}`,
             score: 0.9,
-            memoryId: index + 1,
+            publicClaimId: `mcm_${index + 1}`,
+            revisionLocator: `mcm_${index + 1}/r1/${"0".repeat(64)}`,
             category: "USER_DIRECTIVES",
-            matchType: "fts",
+            matchType: "exact",
         }));
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
         try {

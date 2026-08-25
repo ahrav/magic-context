@@ -9,10 +9,10 @@ import {
     type AuthorityStatus,
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
-import { insertMemory } from "../../features/magic-context/memory";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
+import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
 import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import {
@@ -22,6 +22,7 @@ import {
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
 } from "../../features/magic-context/storage-meta-persisted";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
 import {
     scheduleOpenCodeTransformDecisionWrite,
     __test as transformDecisionTest,
@@ -36,7 +37,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
-import { getVisibleMemoryIds } from "./inject-compartments";
+import { getVisibleRevisionLocators, readProjectClaimLaneSnapshot } from "./inject-compartments";
 import { getSlot } from "./lkg-slot";
 import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
@@ -1247,16 +1248,19 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
-    it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
-        const sessionId = `rust-memory-visibility-${Date.now()}`;
+    it("mirrors canonical revision locators and snapshot vectors for ctx_search", async () => {
+        const sessionId = `rust-claim-visibility-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
+        db.transaction(() => createClaimMemorySchema(db)).immediate();
         installRawProvider(sessionId);
-        const memory = insertMemory(db, {
-            projectPath: "/tmp/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "The rust-rendered memory must not be returned twice.",
+        const firstClaim = seedProjectMemoryClaim(db, {
+            projectIdentity: "dir:/tmp/project",
+            category: "ARCHITECTURE",
+            content: "The rust-rendered claim must not be returned twice.",
         });
+        const firstLane = readProjectClaimLaneSnapshot(db, "dir:/tmp/project");
+        if (!firstLane) throw new Error("missing first claim lane");
         const meta = makeMeta(db, sessionId);
         db.exec(`
             CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
@@ -1267,13 +1271,15 @@ describe("Rust mode authority adapter", () => {
                 UPDATE memory_manifest_updates SET count = count + 1;
             END;
         `);
-        let renderedMemoryIds = [memory.id];
+        let renderedRevisionLocators = [firstClaim.revisionLocator];
+        let memorySnapshotVector = firstLane.snapshotVector;
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) =>
                 method === "transform"
                     ? {
                           native_messages: makeMessages(sessionId),
-                          rendered_memory_ids: renderedMemoryIds,
+                          rendered_revision_locators: renderedRevisionLocators,
+                          memory_snapshot_vector: memorySnapshotVector,
                       }
                     : { ok: true },
         };
@@ -1284,16 +1290,18 @@ describe("Rust mode authority adapter", () => {
         };
 
         await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id]));
+        expect(getVisibleRevisionLocators(db, sessionId)).toEqual(
+            new Set([firstClaim.revisionLocator]),
+        );
         const tools = createCtxSearchTools({
             db,
-            resolveProjectPath: () => "/tmp/project",
+            resolveProjectPath: () => "dir:/tmp/project",
             memoryEnabled: true,
             embeddingEnabled: false,
             readMessages: () => [],
         });
         const search = await tools.ctx_search.execute(
-            { query: `#${memory.id}`, sources: ["memory"] },
+            { query: firstClaim.publicClaimId, sources: ["memory"] },
             { sessionID: sessionId, directory: "/tmp/project" } as never,
         );
         expect(search).toContain("No results found");
@@ -1303,12 +1311,28 @@ describe("Rust mode authority adapter", () => {
             db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
         ).toEqual({ count: 1 });
 
-        renderedMemoryIds = [memory.id + 1];
+        const secondClaim = seedProjectMemoryClaim(db, {
+            projectIdentity: "dir:/tmp/project",
+            category: "ARCHITECTURE",
+            content: "A new rust-rendered claim replaces the host manifest.",
+        });
+        const secondLane = readProjectClaimLaneSnapshot(db, "dir:/tmp/project");
+        if (!secondLane) throw new Error("missing second claim lane");
+        renderedRevisionLocators = [secondClaim.revisionLocator];
+        memorySnapshotVector = secondLane.snapshotVector;
         await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id + 1]));
+        expect(getVisibleRevisionLocators(db, sessionId)).toEqual(
+            new Set([secondClaim.revisionLocator]),
+        );
         expect(
             db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
         ).toEqual({ count: 2 });
+        const mirrored = db
+            .prepare(
+                "SELECT cached_m0_claim_snapshot_vector AS vector FROM session_meta WHERE session_id = ?",
+            )
+            .get(sessionId) as { vector: string };
+        expect(JSON.parse(mirrored.vector)).toEqual(secondLane.snapshotVector);
     });
 
     it("preserves the receiver for a class-backed compartment mirror client", async () => {

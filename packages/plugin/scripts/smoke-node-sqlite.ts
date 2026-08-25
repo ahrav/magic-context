@@ -130,6 +130,34 @@ try {
     }
     check("transaction() rolls back on throw", (db.prepare("SELECT COUNT(*) c FROM t").get() as { c: number }).c === 2);
 
+    // RAISE(ROLLBACK) ends the transaction inside SQLite. The wrapper must
+    // preserve that trigger error instead of masking it with a second ROLLBACK.
+    db.exec(`
+        CREATE TRIGGER rollback_t_insert
+        BEFORE INSERT ON t
+        WHEN NEW.v = 'abort-whole'
+        BEGIN
+            SELECT RAISE(ROLLBACK, 'trigger rollback');
+        END
+    `);
+    let triggerRollbackMessage = "";
+    try {
+        db.transaction(() => {
+            db.prepare("INSERT INTO t(v, flag) VALUES(?, ?)").run("abort-whole", 0);
+        })();
+    } catch (error) {
+        triggerRollbackMessage = error instanceof Error ? error.message : String(error);
+    }
+    check(
+        "transaction() preserves trigger RAISE(ROLLBACK) error",
+        triggerRollbackMessage.includes("trigger rollback") && !triggerRollbackMessage.includes("no transaction"),
+        triggerRollbackMessage,
+    );
+    db.transaction(() => {
+        db.prepare("INSERT INTO t(v, flag) VALUES(?, ?)").run("after-trigger-rollback", 0);
+    })();
+    db.prepare("DELETE FROM t WHERE v = ?").run("after-trigger-rollback");
+
     // Nested transaction — outer commits, inner savepoint rolls back.
     db.transaction(() => {
         db.prepare("INSERT INTO t(v, flag) VALUES(?, ?)").run("outer", 0);

@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
@@ -16,20 +14,15 @@ import type { Database } from "../../../shared/sqlite";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
 import { assertManifestCoversExactly } from "../dreamer/manifest-parser";
 import {
-    DreamerModuleFailureError,
-    type DreamerModuleRoute,
-    getModuleMemoryIdentities,
-} from "../dreamer/module-apply";
-import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
 } from "../dreamer/provider-output-failure";
-import { getMemoriesByProject, type Memory } from "../memory";
+import type { ProjectMemoryClaimSnapshot } from "../memory/storage-claim-current-state";
 import {
-    exactMemoryContentDigests,
-    filterMemoriesByPolicy,
-} from "../memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "../memory/storage-claims";
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "../memory/storage-claim-current-state";
+import { computeWorkspaceEpochFingerprint } from "../workspaces";
 import {
     buildCompressCuesPrompt,
     COMPRESS_CUES_SYSTEM_PROMPT,
@@ -39,11 +32,10 @@ import {
 } from "./compress-cues-prompt";
 import { validateCue } from "./cue-validation";
 import {
-    computeCueContentHash,
-    getMuralCueState,
-    memoryNeedsCue,
-    recordMuralCueRejection,
-    setMuralCue,
+    claimNeedsCue,
+    getClaimMuralCueStates,
+    recordClaimMuralCueRejection,
+    setClaimMuralCue,
 } from "./storage-mural-cues";
 
 /**
@@ -103,8 +95,6 @@ export interface CompressCuesArgs {
     model?: string;
     fallbackModels?: readonly string[];
     onProgress?: (processed: number) => void;
-    /** Present only when MODULE owns memories; cue columns must be written through the facade. */
-    moduleRoute?: DreamerModuleRoute;
 }
 
 /** How a chunk failed, used by the run loop to decide whether to keep going.
@@ -136,29 +126,27 @@ export interface CompressCuesResult {
     complete: boolean;
 }
 
-/** A memory selected for (re)compression plus the content hash captured at
- *  SELECTION time. Storing this hash (not a re-hash at write time) is the race
- *  guard: if the memory is edited between selection and write, the stored hash
- *  won't match the new content, so resolveMural excludes the cue and the gate
- *  re-selects the memory next run — it never adopts a cue for content it wasn't
- *  compressed from. */
+/** A claim selected for (re)compression. The revision locator captured at
+ *  SELECTION time is the race guard: if the claim is revised between
+ *  selection and write, the stored locator won't match the new revision, so
+ *  resolveMural excludes the cue and the gate re-selects the claim next run
+ *  — it never adopts a cue for content it wasn't compressed from. */
 interface CueCandidate {
-    memory: Memory;
-    contentHash: string;
+    item: ProjectMemoryClaimSnapshot;
 }
 
 function toPromptMemory(candidate: CueCandidate): CompressCuesPromptMemory {
-    const memory = candidate.memory;
+    const item = candidate.item;
     return {
-        id: memory.id,
-        category: memory.category,
-        importance: memory.importance ?? 50,
-        content: memory.content,
+        id: item.publicClaimId,
+        category: item.category,
+        importance: item.importance,
+        content: item.content,
     };
 }
 
-function stripOwnIdToken(value: string, ownId: number): string {
-    return value.replace(new RegExp(`#${ownId}\\b`, "g"), "");
+function stripOwnIdToken(value: string, ownId: string): string {
+    return value.replaceAll(ownId, "");
 }
 
 /** Truncate by codepoint budget, preferring a complete word when one exists. */
@@ -173,8 +161,8 @@ function truncateCue(value: string, budget: number): string {
 
 function sanitizeCue(value: string, candidate: CueCandidate): string {
     return truncateCue(
-        stripOwnIdToken(value, candidate.memory.id),
-        cueBudgetFor(candidate.memory.importance ?? 50),
+        stripOwnIdToken(value, candidate.item.publicClaimId),
+        cueBudgetFor(candidate.item.importance),
     );
 }
 
@@ -184,15 +172,15 @@ function sanitizeCue(value: string, candidate: CueCandidate): string {
  * second choice so a bad polarity or mechanism cannot keep the gate open.
  */
 function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string): string {
-    const importance = candidate.memory.importance ?? 50;
+    const importance = candidate.item.importance;
     const budget = cueBudgetFor(importance);
     const sanitizedCandidate = sanitizeCue(lastCandidate, candidate);
-    if (validateCue(sanitizedCandidate, importance, candidate.memory.id) === null) {
+    if (validateCue(sanitizedCandidate, importance, candidate.item.publicClaimId) === null) {
         return sanitizedCandidate;
     }
 
-    const sourceSlice = sanitizeCue(candidate.memory.content, candidate);
-    if (validateCue(sourceSlice, importance, candidate.memory.id) === null) {
+    const sourceSlice = sanitizeCue(candidate.item.content, candidate);
+    if (validateCue(sourceSlice, importance, candidate.item.publicClaimId) === null) {
         return sourceSlice;
     }
 
@@ -207,7 +195,7 @@ function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string
             .replace(/\s+/g, " "),
         budget,
     );
-    if (validateCue(grammarSafe, importance, candidate.memory.id) === null) {
+    if (validateCue(grammarSafe, importance, candidate.item.publicClaimId) === null) {
         return grammarSafe;
     }
 
@@ -216,26 +204,32 @@ function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string
     return "memory";
 }
 
-/** Select the memories whose cue is missing or stale (content hash mismatch). */
+/** Select the claims whose cue is missing or stale (locator or renderer-epoch
+ * mismatch). Cue compression sends claim CONTENT to a child-model prompt — an
+ * automatic surface — so the pool comes from the provider's `auto_inject`
+ * decision, which applies policy before any limit. */
 function selectCandidates(db: Database, projectIdentity: string): CueCandidate[] {
-    // Cue compression sends memory CONTENT to a child-model prompt — an
-    // automatic surface — so the pool passes the same automatic policy gate
-    // as injection. A currently hidden row gets its cue on the pass after it
-    // becomes eligible; the render gate (`getMuralCoverage`/`resolveMural`)
-    // stays the injection-time authority.
-    const memories = filterMemoriesByPolicy(
+    const projectIds = resolveProjectIdsForIdentities(db, [projectIdentity]);
+    if (projectIds.length === 0) return [];
+    const workspaceEpoch = computeWorkspaceEpochFingerprint(db, [projectIdentity]);
+    let items: ProjectMemoryClaimSnapshot[] | null = null;
+    for (let attempt = 0; attempt < 2 && items === null; attempt += 1) {
+        const result = readProjectMemoryCurrentState(db, {
+            projectIds,
+            workspaceEpoch,
+            surface: "auto_inject",
+        });
+        if (result.status === "ok") items = result.items;
+    }
+    if (items === null) return [];
+    const cueState = getClaimMuralCueStates(
         db,
-        getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
-        "auto_inject",
-    ).memories;
-    const cueState = getMuralCueState(
-        db,
-        memories.map((memory) => memory.id),
+        items.map((item) => item.publicClaimId),
     );
     const candidates: CueCandidate[] = [];
-    for (const memory of memories) {
-        if (memoryNeedsCue(cueState.get(memory.id), memory.content)) {
-            candidates.push({ memory, contentHash: computeCueContentHash(memory.content) });
+    for (const item of items) {
+        if (claimNeedsCue(cueState.get(item.publicClaimId), item.revisionLocator)) {
+            candidates.push({ item });
         }
     }
     return candidates;
@@ -379,42 +373,36 @@ async function compressOneChunk(
 
         // The candidate pool was frozen once at run start; later chunks wait
         // behind provider calls, and child-session creation above is itself
-        // an await. A memory quarantined, rejected, or superseded in the
+        // an await. A claim quarantined, rejected, or superseded in the
         // meantime must not have its content sent to the child-model prompt,
-        // and a REWRITTEN member's frozen bytes must not be disclosed
-        // either. Re-apply the automatic-surface policy and bind each member
-        // to its loaded bytes immediately before the prompt is built.
-        const stillEligible = new Set(
-            filterMemoriesByPolicy(
-                args.db,
-                chunk.map((candidate) => candidate.memory),
-                "auto_inject",
-            ).memories.map((memory) => memory.id),
+        // and a member revised after selection must not have its frozen
+        // bytes disclosed. Re-read the chunk through the provider immediately
+        // before the prompt is built: the provider applies policy before
+        // limits and rechecks its snapshot vector, and the revision-locator
+        // comparison drops members revised since selection.
+        const projectIds = resolveProjectIdsForIdentities(args.db, [args.projectIdentity]);
+        const recheck = readProjectMemoryCurrentState(args.db, {
+            publicClaimIds: chunk.map((candidate) => candidate.item.publicClaimId),
+            projectIds,
+            workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, [args.projectIdentity]),
+            surface: "auto_inject",
+        });
+        const currentLocators = new Map(
+            recheck.status === "ok"
+                ? recheck.items.map((item) => [item.publicClaimId, item.revisionLocator])
+                : [],
         );
-        const digestsAtPrompt = exactMemoryContentDigests(
-            args.db,
-            chunk.map((candidate) => candidate.memory.id),
-        );
-        // Policy again AFTER the digest read: the two reads are separate
-        // autocommit snapshots, and a hide committed between them leaves
-        // the digest unchanged.
-        const stillEligibleAfter = new Set(
-            filterMemoriesByPolicy(
-                args.db,
-                chunk.map((candidate) => candidate.memory),
-                "auto_inject",
-            ).memories.map((memory) => memory.id),
-        );
-        const eligibleChunk = chunk.filter(
-            (candidate) =>
-                stillEligible.has(candidate.memory.id) &&
-                digestsAtPrompt.get(candidate.memory.id) ===
-                    sha256Utf8Hex(candidate.memory.content) &&
-                stillEligibleAfter.has(candidate.memory.id),
-        );
+        const eligibleChunk =
+            recheck.status === "ok"
+                ? chunk.filter(
+                      (candidate) =>
+                          currentLocators.get(candidate.item.publicClaimId) ===
+                          candidate.item.revisionLocator,
+                  )
+                : [];
         if (eligibleChunk.length < chunk.length) {
             log(
-                `[dreamer] compress-cues chunk dropped ${chunk.length - eligibleChunk.length} member(s) hidden or rewritten since pool selection`,
+                `[dreamer] compress-cues chunk dropped ${chunk.length - eligibleChunk.length} member(s) hidden or revised since pool selection`,
             );
         }
         if (eligibleChunk.length === 0) return { compressed: 0, skipped: 0 };
@@ -474,9 +462,7 @@ async function compressOneChunk(
             },
         );
 
-        return args.moduleRoute
-            ? await applyCuesThroughModule(args, chunk, run.validated, signal)
-            : applyCues(args, chunk, run.validated);
+        return applyCues(args, chunk, run.validated);
     } catch (error) {
         const desc = describeError(error);
         log(
@@ -514,19 +500,19 @@ async function compressOneChunk(
 }
 
 /**
- * Validate each returned cue independently and write the valid ones as
- * column-only updates. The first validation failures are skipped (the memory keeps
- * a NULL cue); after the rejection latch trips, a deterministic fallback is
- * written instead of retrying forever. The stored hash is the SELECTION-time
- * content hash, so a memory
- * edited mid-run doesn't adopt a cue compressed from its old content.
+ * Validate each returned cue independently and write the valid ones into the
+ * derived cue table. The first validation failures are skipped (the claim
+ * keeps a NULL cue); after the rejection latch trips, a deterministic
+ * fallback is written instead of retrying forever. The stored key is the
+ * SELECTION-time revision locator, so a claim revised mid-run doesn't adopt
+ * a cue compressed from its old content.
  */
 export function applyCues(
     args: CompressCuesArgs,
     chunk: CueCandidate[],
     manifestText: string,
 ): { compressed: number; skipped: number } {
-    const byId = new Map(chunk.map((candidate) => [candidate.memory.id, candidate]));
+    const byId = new Map(chunk.map((candidate) => [candidate.item.publicClaimId, candidate]));
     const parsed = parseCuesManifest(manifestText);
     assertManifestCoversExactly(
         parsed.map((entry) => entry.id),
@@ -539,202 +525,39 @@ export function applyCues(
         for (const entry of parsed) {
             const candidate = byId.get(entry.id);
             if (!candidate) throw new Error(`cues manifest contains unknown id ${entry.id}`);
-            const importance = candidate.memory.importance ?? 50;
-            const failure = validateCue(entry.cue, importance, candidate.memory.id);
+            const importance = candidate.item.importance;
+            const failure = validateCue(entry.cue, importance, candidate.item.publicClaimId);
             if (failure) {
-                const rejectionCount = recordMuralCueRejection(
-                    args.db,
-                    args.projectIdentity,
-                    entry.id,
-                    candidate.contentHash,
-                );
+                const rejectionCount = recordClaimMuralCueRejection(args.db, {
+                    publicClaimId: candidate.item.publicClaimId,
+                    revisionLocator: candidate.item.revisionLocator,
+                });
                 if (rejectionCount >= CUE_REJECTION_LATCH_THRESHOLD) {
                     const fallback = deterministicFallbackCue(candidate, entry.cue);
-                    setMuralCue(
-                        args.db,
-                        args.projectIdentity,
-                        entry.id,
-                        fallback,
-                        candidate.contentHash,
-                    );
+                    setClaimMuralCue(args.db, {
+                        publicClaimId: candidate.item.publicClaimId,
+                        revisionLocator: candidate.item.revisionLocator,
+                        cue: fallback,
+                    });
                     compressed += 1;
                     log(
-                        `[dreamer] compress-cues: fallback cue for memory ${entry.id} (${failure.reason}; ${rejectionCount} rejections; fallback)`,
+                        `[dreamer] compress-cues: fallback cue for claim ${entry.id} (${failure.reason}; ${rejectionCount} rejections; fallback)`,
                     );
                     continue;
                 }
                 skipped += 1;
                 log(
-                    `[dreamer] compress-cues: skipped cue for memory ${entry.id} (${failure.reason}; rejection ${rejectionCount}/${CUE_REJECTION_LATCH_THRESHOLD})`,
+                    `[dreamer] compress-cues: skipped cue for claim ${entry.id} (${failure.reason}; rejection ${rejectionCount}/${CUE_REJECTION_LATCH_THRESHOLD})`,
                 );
                 continue;
             }
-            setMuralCue(
-                args.db,
-                args.projectIdentity,
-                entry.id,
-                entry.cue.trim(),
-                candidate.contentHash,
-            );
+            setClaimMuralCue(args.db, {
+                publicClaimId: candidate.item.publicClaimId,
+                revisionLocator: candidate.item.revisionLocator,
+                cue: entry.cue.trim(),
+            });
             compressed += 1;
         }
     });
     return { compressed, skipped };
-}
-
-interface PlannedCueUpdate {
-    contextId: number;
-    moduleId: number;
-    contentHash: string;
-    cue: string | null;
-    rejectionCount: number;
-    kind: "compressed" | "skipped";
-}
-
-/** Use the same validation and rejection-counter behavior as the local writer, but send every
- * derived-column update to the module authority. Read only the last mirrored rejection count
- * from the context database; the module rechecks that the content is still current and performs
- * the durable write. */
-async function applyCuesThroughModule(
-    args: CompressCuesArgs,
-    chunk: CueCandidate[],
-    manifestText: string,
-    signal: AbortSignal,
-): Promise<{ compressed: number; skipped: number }> {
-    const route = args.moduleRoute;
-    if (!route) throw new Error("module cue apply called without a module route");
-    const byId = new Map(chunk.map((candidate) => [candidate.memory.id, candidate]));
-    const parsed = parseCuesManifest(manifestText);
-    assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
-        new Set(byId.keys()),
-        "cues",
-    );
-    const state = getMuralCueState(
-        args.db,
-        chunk.map((candidate) => candidate.memory.id),
-    );
-    const identities = getModuleMemoryIdentities(
-        args.db,
-        args.projectIdentity,
-        chunk.map((candidate) => candidate.memory.id),
-    );
-    const updates: PlannedCueUpdate[] = [];
-    for (const entry of parsed) {
-        const candidate = byId.get(entry.id);
-        if (!candidate) throw new Error(`cues manifest contains unknown id ${entry.id}`);
-        const identity = identities.get(candidate.memory.id);
-        if (!identity) {
-            throw new Error(`module mirror identity missing for memory ${candidate.memory.id}`);
-        }
-        const failure = validateCue(
-            entry.cue,
-            candidate.memory.importance ?? 50,
-            candidate.memory.id,
-        );
-        if (!failure) {
-            updates.push({
-                contextId: candidate.memory.id,
-                moduleId: identity.moduleId,
-                contentHash: candidate.contentHash,
-                cue: entry.cue.trim(),
-                rejectionCount: 0,
-                kind: "compressed",
-            });
-            continue;
-        }
-        const previous = state.get(candidate.memory.id);
-        const rejectionCount =
-            previous?.hash === candidate.contentHash ? (previous.rejectionCount ?? 0) + 1 : 1;
-        if (rejectionCount >= CUE_REJECTION_LATCH_THRESHOLD) {
-            updates.push({
-                contextId: candidate.memory.id,
-                moduleId: identity.moduleId,
-                contentHash: candidate.contentHash,
-                cue: deterministicFallbackCue(candidate, entry.cue),
-                rejectionCount: 0,
-                kind: "compressed",
-            });
-            log(
-                `[dreamer] compress-cues: fallback cue for memory ${entry.id} (${failure.reason}; ${rejectionCount} rejections; fallback)`,
-            );
-        } else {
-            updates.push({
-                contextId: candidate.memory.id,
-                moduleId: identity.moduleId,
-                contentHash: candidate.contentHash,
-                cue: null,
-                rejectionCount,
-                kind: "skipped",
-            });
-            log(
-                `[dreamer] compress-cues: skipped cue for memory ${entry.id} (${failure.reason}; rejection ${rejectionCount}/${CUE_REJECTION_LATCH_THRESHOLD})`,
-            );
-        }
-    }
-
-    const commandId = `mural-cues:${route.moduleCommandId}:${createHash("sha256")
-        .update(chunk.map((candidate) => candidate.memory.id).join(","))
-        .digest("hex")
-        .slice(0, 24)}`;
-    let response: unknown;
-    try {
-        response = await route.moduleClient.call({
-            sessionId: route.moduleSessionId,
-            projectRoot: route.moduleProjectRoot,
-            method: "memory.set_mural_cue",
-            body: {
-                name: "memory.set_mural_cue",
-                arguments: {
-                    memory_project: args.projectIdentity,
-                    context_store_uuid: route.moduleContextStoreUuid,
-                    authority_generation: route.moduleAuthorityGeneration,
-                    command_id: commandId,
-                    rows: updates.map((update) => ({
-                        memory_id: update.moduleId,
-                        content_hash_at_prompt: update.contentHash,
-                        cue: update.cue,
-                        rejection_count: update.rejectionCount,
-                    })),
-                },
-            },
-            signal,
-        });
-    } catch (error) {
-        throw new DreamerModuleFailureError("mural cue apply", error);
-    }
-    const result = (response as { result?: unknown } | null)?.result ?? response;
-    if (!result || typeof result !== "object") {
-        throw new Error("module returned invalid mural cue apply result");
-    }
-    const accepted = (result as { accepted?: unknown }).accepted;
-    if (!Array.isArray(accepted) || !accepted.every((id) => Number.isInteger(id))) {
-        throw new Error("module returned no mural cue acceptance list");
-    }
-    const acceptedIds = new Set(accepted as number[]);
-    const rejected = (result as { rejected?: unknown }).rejected;
-    const rejectedReasons = new Map<string, number>();
-    for (const row of Array.isArray(rejected) ? rejected : []) {
-        const reason =
-            row &&
-            typeof row === "object" &&
-            typeof (row as { reason?: unknown }).reason === "string"
-                ? (row as { reason: string }).reason
-                : "unknown";
-        rejectedReasons.set(reason, (rejectedReasons.get(reason) ?? 0) + 1);
-    }
-    if ([...rejectedReasons].some(([reason]) => reason !== "stale")) {
-        throw new Error(
-            `module rejected mural cues (${[...rejectedReasons]
-                .map(([reason, count]) => `${reason}=${count}`)
-                .join(", ")})`,
-        );
-    }
-    return updates.reduce(
-        (counts, update) => {
-            if (acceptedIds.has(update.moduleId)) counts[update.kind] += 1;
-            return counts;
-        },
-        { compressed: 0, skipped: 0 },
-    );
 }

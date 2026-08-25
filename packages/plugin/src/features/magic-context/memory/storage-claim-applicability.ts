@@ -56,17 +56,28 @@ export function hasClaimApplicabilitySchema(db: Database): boolean {
  * Recursively key-sorted clone so the digest is independent of object-key
  * insertion order: semantically identical sources always hash to one value.
  */
-function sortKeysDeep(value: unknown): unknown {
+interface DigestArray extends Array<DigestValue> {}
+interface DigestObject {
+    [key: string]: DigestValue | undefined;
+}
+type DigestValue = null | boolean | number | string | DigestArray | DigestObject | undefined;
+
+function sortKeysDeep(value: unknown): DigestValue {
     if (Array.isArray(value)) return value.map(sortKeysDeep);
     if (value !== null && typeof value === "object") {
         const record = value as Record<string, unknown>;
         return Object.fromEntries(
             Object.keys(record)
-                .sort()
+                .sort((left, right) => left.localeCompare(right))
                 .map((key) => [key, sortKeysDeep(record[key])]),
         );
     }
-    return value;
+    if (value === null || ["boolean", "number", "string", "undefined"].includes(typeof value)) {
+        return value as null | boolean | number | string | undefined;
+    }
+    if (typeof value === "bigint")
+        throw new TypeError("Cannot serialize bigint applicability source");
+    return undefined;
 }
 
 /** Canonical SHA-256 digest over a JSON-serializable source description. */

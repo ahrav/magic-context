@@ -139,7 +139,6 @@ import {
 	resolveExecuteThreshold,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
-import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
 	markNoteNudgeDelivered,
 	onNoteTrigger,
@@ -3055,8 +3054,6 @@ export function registerPiContextHandler(
 							scoreThreshold: options.autoSearch.scoreThreshold,
 							minPromptChars: options.autoSearch.minPromptChars,
 							projectPath: projectIdentity,
-							visibleMemoryIds:
-								getVisibleMemoryIds(options.db, sessionId) ?? null,
 						},
 					});
 				} catch (err) {

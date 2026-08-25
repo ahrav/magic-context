@@ -38,6 +38,7 @@ export const CLAIM_MEMORY_TABLES = [
     "claim_memory_lifecycle_events",
     "claim_memory_current_heads",
     "claim_usage_stats",
+    "claim_mural_cues",
     "claim_derivations",
     "claim_operation_receipts",
     "claim_operation_effects",
@@ -205,6 +206,23 @@ export function createClaimMemorySchema(db: Database): void {
         ),
         last_seen_at INTEGER,
         last_retrieved_at INTEGER,
+        updated_at INTEGER NOT NULL
+    );
+
+    -- Derived mural cue cache (KTD4): one row per claim, keyed to the exact
+    -- revision locator and renderer epoch the cue was compressed for. A
+    -- locator or epoch mismatch reads as "no cue" and regenerates; a NULL cue
+    -- with a nonzero rejection count is the validation-rejection latch.
+    CREATE TABLE claim_mural_cues (
+        claim_id INTEGER PRIMARY KEY REFERENCES claims(id) ON DELETE RESTRICT,
+        revision_locator TEXT NOT NULL CHECK (length(revision_locator) > 0),
+        renderer_epoch INTEGER NOT NULL CHECK (
+            typeof(renderer_epoch) = 'integer' AND renderer_epoch >= 1
+        ),
+        cue TEXT CHECK (cue IS NULL OR length(cue) > 0),
+        rejection_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            typeof(rejection_count) = 'integer' AND rejection_count >= 0
+        ),
         updated_at INTEGER NOT NULL
     );
 

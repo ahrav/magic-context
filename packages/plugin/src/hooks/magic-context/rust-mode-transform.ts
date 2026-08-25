@@ -12,6 +12,11 @@ import {
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
+import {
+    canonicalSnapshotVector,
+    parseRevisionLocator,
+    type SnapshotVector,
+} from "../../features/magic-context/memory/claim-operation-contract";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import {
     hasMemoryStatsTable,
@@ -639,28 +644,89 @@ function isTransformPageAttemptMismatch(error: unknown): boolean {
     return false;
 }
 
-function mirrorRustRenderedMemoryIds(args: {
+function isRustGenerationRecord(value: unknown): value is Record<string, number> {
+    return (
+        isRecord(value) &&
+        Object.entries(value).every(
+            ([projectId, generation]) =>
+                /^\d+$/.test(projectId) &&
+                typeof generation === "number" &&
+                Number.isSafeInteger(generation) &&
+                generation >= 0,
+        )
+    );
+}
+
+function rustSnapshotVector(value: unknown): SnapshotVector | null {
+    if (
+        !isRecord(value) ||
+        value.vectorVersion !== 1 ||
+        typeof value.databaseIncarnationId !== "string" ||
+        typeof value.workspaceEpoch !== "string" ||
+        !isRustGenerationRecord(value.projectGenerations) ||
+        !isRustGenerationRecord(value.policyGenerations)
+    ) {
+        return null;
+    }
+    return {
+        vectorVersion: 1,
+        databaseIncarnationId: value.databaseIncarnationId,
+        workspaceEpoch: value.workspaceEpoch,
+        projectGenerations: value.projectGenerations,
+        policyGenerations: value.policyGenerations,
+    };
+}
+
+function mirrorRustRenderedClaimState(args: {
     db: TransformDeps["db"];
     sessionId: string;
     response: Record<string, unknown>;
 }): void {
-    if (!("rendered_memory_ids" in args.response)) return;
-    const rawIds = args.response.rendered_memory_ids;
+    const hasLocators = "rendered_revision_locators" in args.response;
+    const hasVector = "memory_snapshot_vector" in args.response;
+    if (!hasLocators && !hasVector) return;
+    const rawLocators = args.response.rendered_revision_locators;
+    const vector = rustSnapshotVector(args.response.memory_snapshot_vector);
     if (
-        !Array.isArray(rawIds) ||
-        rawIds.some((id) => typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0)
+        !hasLocators ||
+        !hasVector ||
+        !Array.isArray(rawLocators) ||
+        rawLocators.some(
+            (locator) => typeof locator !== "string" || parseRevisionLocator(locator) === null,
+        ) ||
+        vector === null
     ) {
-        throw new Error("module transform returned an invalid rendered-memory manifest");
+        throw new Error("module transform returned an invalid rendered-claim state");
     }
-    const serialized = JSON.stringify(rawIds);
+    const locators = [...new Set(rawLocators as string[])].sort();
+    const serializedLocators = JSON.stringify(locators);
+    const serializedVector = canonicalSnapshotVector(vector);
     args.db
         .prepare(
             `UPDATE session_meta
-                SET memory_block_ids = ?, memory_block_count = ?
+                SET memory_block_ids = ?,
+                    memory_block_count = ?,
+                    cached_m0_rendered_revision_locators = ?,
+                    cached_m0_claim_snapshot_vector = ?
               WHERE session_id = ?
-                AND (COALESCE(memory_block_ids, '') <> ? OR COALESCE(memory_block_count, -1) <> ?)`,
+                AND (
+                    COALESCE(memory_block_ids, '') <> ?
+                    OR COALESCE(memory_block_count, -1) <> ?
+                    OR COALESCE(cached_m0_rendered_revision_locators, '') <> ?
+                    OR COALESCE(cached_m0_claim_snapshot_vector, '') <> ?
+                )`,
         )
-        .run(serialized, rawIds.length, args.sessionId, serialized, rawIds.length);
+        .run(
+            serializedLocators,
+            locators.length,
+            serializedLocators,
+            serializedVector,
+            args.sessionId,
+            serializedLocators,
+            locators.length,
+            serializedLocators,
+            serializedVector,
+        );
 }
 
 function noteDeliveryPassIds(response: Record<string, unknown>): string[] {
@@ -859,9 +925,27 @@ function isNeedFullSync(response: Record<string, unknown>): boolean {
     return response.status === "need_full_sync" || response.action === "NEED_FULL_SYNC";
 }
 
-function canonicalizeForChecksum(value: unknown): unknown {
+type ChecksumValue =
+    | null
+    | boolean
+    | number
+    | string
+    | undefined
+    | ChecksumValue[]
+    | { [key: string]: ChecksumValue };
+
+function canonicalizeForChecksum(value: unknown): ChecksumValue {
+    if (
+        value === null ||
+        value === undefined ||
+        typeof value === "boolean" ||
+        typeof value === "number" ||
+        typeof value === "string"
+    ) {
+        return value;
+    }
     if (Array.isArray(value)) return value.map(canonicalizeForChecksum);
-    if (!isRecord(value)) return value;
+    if (!isRecord(value)) throw new TypeError("checksum input is not JSON-compatible");
     return Object.fromEntries(
         Object.keys(value)
             .sort()
@@ -2683,7 +2767,7 @@ export function createRustModeTransform(
                 throw error;
             }
             try {
-                mirrorRustRenderedMemoryIds({ db: deps.db, sessionId, response });
+                mirrorRustRenderedClaimState({ db: deps.db, sessionId, response });
             } catch (error) {
                 sessionLog(sessionId, "rust rendered-memory mirror write failed (ignored):", error);
             }

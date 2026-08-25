@@ -1,6 +1,10 @@
 import type { Database } from "../../../shared/sqlite";
-import { hasMemoryClassifiedAtColumn, hasMemoryStatsTable } from "../memory/storage-memory";
-import { hasMuralCueColumns } from "../mural/storage-mural-cues";
+import {
+    countProjectMemoryClaims,
+    hasClaimMemoryFragment,
+    resolveProjectIdsForIdentities,
+} from "../memory/storage-claim-current-state";
+import { MURAL_CUE_RENDERER_EPOCH } from "../mural/storage-mural-cues";
 import { getProjectEmbeddingSnapshot } from "../project-embedding-registry";
 import {
     getSmartNotesNeedingCompilation,
@@ -44,28 +48,72 @@ export interface TaskGateContext {
 }
 
 export function countActiveMemories(db: Database, projectPath: string): number {
+    return countProjectMemoryClaims(db, {
+        projectIds: resolveProjectIdsForIdentities(db, [projectPath]),
+    });
+}
+
+const ACTIVE_CLAIM_BASE_SQL = `
+    FROM claim_public_ids cpi
+    JOIN claims ON claims.id = cpi.claim_id
+    JOIN claim_memory_lifecycle_heads heads
+      ON heads.claim_id = claims.id AND heads.state = 'active'
+   WHERE claims.project_id = ?`;
+
+/** Latest baseline assertion with `paths_state = 'known'` and at least one
+ * path selector. */
+const MAPPED_CLAIM_SQL = `
+    EXISTS (
+        SELECT 1
+          FROM claim_revision_applicability_streams stream
+          JOIN claim_revision_applicability_assertions assertion
+            ON assertion.stream_id = stream.id
+         WHERE stream.revision_id = claims.current_revision_id
+           AND stream.stream_key = 'baseline:v1'
+           AND assertion.seq = (
+               SELECT MAX(history.seq) FROM claim_revision_applicability_assertions history
+               WHERE history.stream_id = stream.id
+           )
+           AND assertion.paths_state = 'known'
+           AND EXISTS (
+               SELECT 1 FROM claim_revision_applicability_paths paths
+               WHERE paths.assertion_id = assertion.id
+           )
+    )`;
+
+function countActiveClaimsWhere(db: Database, projectPath: string, condition: string): number {
+    if (!hasClaimMemoryFragment(db)) return 0;
+    const projectIds = resolveProjectIdsForIdentities(db, [projectPath]);
+    if (projectIds.length === 0) return 0;
     const row = db
-        .prepare<[string], { cnt: number }>(
-            "SELECT COUNT(*) AS cnt FROM memories WHERE project_path = ? AND status IN ('active','permanent')",
+        .prepare(
+            // Interpolation composes compile-time SQL fragments, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT COUNT(*) AS cnt ${ACTIVE_CLAIM_BASE_SQL} AND ${condition}`,
         )
-        .get(projectPath);
+        .get(...projectIds) as { cnt: number } | undefined;
     return row?.cnt ?? 0;
 }
 
-/** Active/permanent memories with NO mapping row yet — the map-memories scope. */
+/** Active claims whose latest baseline assertion has no `paths_state = 'known'`. */
 export function countUnmappedActiveMemories(db: Database, projectPath: string): number {
-    const row = db
-        .prepare<[string], { cnt: number }>(
-            `SELECT COUNT(*) AS cnt
-               FROM memories m
-              WHERE m.project_path = ?
-                AND m.status IN ('active','permanent')
-                AND NOT EXISTS (
-                    SELECT 1 FROM memory_verifications v WHERE v.memory_id = m.id
-                )`,
-        )
-        .get(projectPath);
-    return row?.cnt ?? 0;
+    return countActiveClaimsWhere(
+        db,
+        projectPath,
+        `NOT EXISTS (
+            SELECT 1
+              FROM claim_revision_applicability_streams stream
+              JOIN claim_revision_applicability_assertions assertion
+                ON assertion.stream_id = stream.id
+             WHERE stream.revision_id = claims.current_revision_id
+               AND stream.stream_key = 'baseline:v1'
+               AND assertion.seq = (
+                   SELECT MAX(history.seq) FROM claim_revision_applicability_assertions history
+                   WHERE history.stream_id = stream.id
+               )
+               AND assertion.paths_state = 'known'
+        )`,
+    );
 }
 
 export function countCompartmentsSince(db: Database, projectPath: string, since: number): number {
@@ -102,32 +150,18 @@ export function countProjectSessionsSince(
 }
 
 function countMappedMemories(db: Database, projectPath: string): number {
-    const row = db
-        .prepare<[string], { cnt: number }>(
-            `SELECT COUNT(DISTINCT m.id) AS cnt
-               FROM memories m
-               JOIN memory_verifications v ON v.memory_id = m.id
-              WHERE m.project_path = ?
-                AND m.status IN ('active','permanent')
-                AND v.file_path <> ''`,
-        )
-        .get(projectPath);
-    return row?.cnt ?? 0;
+    return countActiveClaimsWhere(db, projectPath, MAPPED_CLAIM_SQL);
 }
 
 function countUnverifiedMappedMemories(db: Database, projectPath: string): number {
-    const row = db
-        .prepare<[string], { cnt: number }>(
-            `SELECT COUNT(DISTINCT m.id) AS cnt
-               FROM memories m
-               JOIN memory_verifications v ON v.memory_id = m.id
-              WHERE m.project_path = ?
-                AND m.status IN ('active','permanent')
-                AND v.file_path <> ''
-                AND v.verified_at = 0`,
-        )
-        .get(projectPath);
-    return row?.cnt ?? 0;
+    return countActiveClaimsWhere(
+        db,
+        projectPath,
+        `${MAPPED_CLAIM_SQL} AND NOT EXISTS (
+            SELECT 1 FROM verification_events
+            WHERE verification_events.revision_id = claims.current_revision_id
+        )`,
+    );
 }
 
 function countBroadCycleCandidates(
@@ -135,42 +169,44 @@ function countBroadCycleCandidates(
     projectPath: string,
     cycleStartAt: number,
 ): number {
+    if (!hasClaimMemoryFragment(db)) return 0;
+    const projectIds = resolveProjectIdsForIdentities(db, [projectPath]);
+    if (projectIds.length === 0) return 0;
     const row = db
-        .prepare<[string, number], { cnt: number }>(
-            `SELECT COUNT(*) AS cnt
-               FROM memories m
-              WHERE m.project_path = ?
-                AND m.status IN ('active','permanent')
-                AND (
-                    SELECT MAX(v.verified_at)
-                      FROM memory_verifications v
-                     WHERE v.memory_id = m.id
-                       AND v.file_path <> ''
-                ) < ?`,
+        .prepare(
+            // Interpolation composes compile-time SQL fragments, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT COUNT(*) AS cnt ${ACTIVE_CLAIM_BASE_SQL} AND ${MAPPED_CLAIM_SQL}
+                AND COALESCE((
+                    SELECT MAX(created_at) FROM verification_events
+                    WHERE verification_events.revision_id = claims.current_revision_id
+                ), 0) < ?`,
         )
-        .get(projectPath, cycleStartAt);
+        .get(...projectIds, cycleStartAt) as { cnt: number } | undefined;
     return row?.cnt ?? 0;
 }
 
 function countCueCandidates(db: Database, projectPath: string): number {
-    if (!hasMuralCueColumns(db)) return countActiveMemories(db, projectPath);
-    // COALESCE to the base timestamp when the stats row is missing: a NULL
-    // subquery would make `NULL > mural_cue_at` falsy and silently drop the
-    // memory from this gate count. This is a scheduling heuristic, not a
-    // telemetry read — keeping the row counted leaves the corruption visible
-    // to the downstream work, which surfaces it via memoryRowsFromQuery.
-    const effectiveUpdatedAt = hasMemoryStatsTable(db)
-        ? "COALESCE((SELECT MAX(memories.updated_at, s.updated_at) FROM memory_stats s WHERE s.memory_id = memories.id), memories.updated_at)"
-        : "updated_at";
+    if (!hasClaimMemoryFragment(db)) return 0;
+    const projectIds = resolveProjectIdsForIdentities(db, [projectPath]);
+    if (projectIds.length === 0) return 0;
     const row = db
-        .prepare<[string], { cnt: number }>(
-            `SELECT COUNT(*) AS cnt
-               FROM memories
-              WHERE project_path = ?
-                AND status IN ('active','permanent')
-                AND (mural_cue IS NULL OR mural_cue_hash IS NULL OR ${effectiveUpdatedAt} > mural_cue_at)`,
+        .prepare(
+            // Interpolation composes compile-time SQL fragments, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT COUNT(*) AS cnt ${ACTIVE_CLAIM_BASE_SQL}
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM claim_mural_cues cues
+                      JOIN claim_revisions revision ON revision.id = claims.current_revision_id
+                     WHERE cues.claim_id = claims.id
+                       AND cues.cue IS NOT NULL
+                       AND cues.renderer_epoch = ?
+                       AND cues.revision_locator =
+                           cpi.public_id || '/r' || revision.revision || '/' || revision.content_sha256
+                )`,
         )
-        .get(projectPath);
+        .get(...projectIds, MURAL_CUE_RENDERER_EPOCH) as { cnt: number } | undefined;
     return row?.cnt ?? 0;
 }
 
@@ -189,17 +225,8 @@ function countStalePrimers(db: Database, projectPath: string): number {
 }
 
 function countUnclassifiedActiveMemories(db: Database, projectPath: string): number {
-    if (!hasMemoryClassifiedAtColumn(db)) return countActiveMemories(db, projectPath);
-    const row = db
-        .prepare<[string], { cnt: number }>(
-            `SELECT COUNT(*) AS cnt
-               FROM memories
-              WHERE project_path = ?
-                AND status IN ('active','permanent')
-                AND classified_at IS NULL`,
-        )
-        .get(projectPath);
-    return row?.cnt ?? 0;
+    // When gate status is uncertain, treat every active claim as pending.
+    return countActiveMemories(db, projectPath);
 }
 
 function countPendingSmartNotes(db: Database, projectPath: string): number {

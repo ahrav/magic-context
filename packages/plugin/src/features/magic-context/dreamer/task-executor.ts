@@ -440,7 +440,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseAcquisition,
                     model: config.model ?? deps.mural.model ?? deps.dreamerModel,
                     fallbackModels: config.fallbackModels,
-                    moduleRoute,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(

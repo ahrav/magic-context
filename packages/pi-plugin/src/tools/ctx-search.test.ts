@@ -263,23 +263,26 @@ describe("createCtxSearchTool", () => {
 		}
 	});
 
-	it("resolves a `#1234` query directly without calling unifiedSearch (Pi parity)", async () => {
+	it("resolves a locator query directly without calling unifiedSearch (Pi parity)", async () => {
 		const db = createTestDb();
-		// Dynamically import `insertMemory` to seed a memory for this test,
-		// then verify that an ID-shaped query uses `resolveMemoriesByIdsForSearch`
-		// instead of `unifiedSearch`.
-		const { insertMemory } = await import(
-			"@magic-context/core/features/magic-context/memory"
+		const { createClaimMemorySchema } = await import(
+			"@magic-context/core/features/magic-context/storage-claim-memory-schema"
+		);
+		db.transaction(() => createClaimMemorySchema(db)).immediate();
+		const { seedProjectMemoryClaim } = await import(
+			"@magic-context/core/features/magic-context/test-claim-database"
 		);
 		const projectIdentity = resolveProjectIdentity(process.cwd());
-		const memory = insertMemory(db, {
-			projectPath: projectIdentity,
+		const claim = seedProjectMemoryClaim(db, {
+			projectIdentity,
 			category: "USER_DIRECTIVES",
 			content: "Direct id hit for the short-circuit.",
 		});
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () => {
-				throw new Error("unifiedSearch must not run for ID-shaped queries");
+				throw new Error(
+					"unifiedSearch must not run for locator-shaped queries",
+				);
 			},
 		);
 		try {
@@ -292,7 +295,7 @@ describe("createCtxSearchTool", () => {
 
 			const result = await tool.execute(
 				"call-id",
-				{ query: `#${memory.id}` },
+				{ query: claim.publicClaimId },
 				new AbortController().signal,
 				undefined,
 				fakeContext("ses-search", process.cwd()) as never,
@@ -300,7 +303,7 @@ describe("createCtxSearchTool", () => {
 
 			const text = result.content[0]?.text ?? "";
 			expect(text).toContain("[1] [memory]");
-			expect(text).toContain(`id=${memory.id}`);
+			expect(text).toContain(`id=${claim.publicClaimId}`);
 			expect(text).toContain("Direct id hit for the short-circuit.");
 		} finally {
 			spy.mockRestore();

@@ -3,7 +3,7 @@ import { getCompartments } from "@magic-context/core/features/magic-context/comp
 import { getMostRecentTaskRunAt } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import { CANONICAL_DREAM_TASKS } from "@magic-context/core/features/magic-context/dreamer/task-registry";
-import { getMemoryCount } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import type { SnapshotVector } from "@magic-context/core/features/magic-context/memory/claim-operation-contract";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getPendingOps } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
@@ -11,6 +11,7 @@ import { getOverflowState } from "@magic-context/core/features/magic-context/sto
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
+import { readProjectClaimLaneSnapshot } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { resolveTailHygieneStatus } from "@magic-context/core/shared/tail-hygiene-status";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
@@ -56,6 +57,8 @@ export interface CtxStatusDetails {
 	compartmentCount: number;
 	lastCompartmentRange: string | null;
 	memoryCount: number;
+	memoryClaims: Array<{ publicClaimId: string; revisionLocator: string }>;
+	memorySnapshotVector: SnapshotVector | null;
 	noteCount: number;
 	dreamer: {
 		enabled: boolean;
@@ -171,6 +174,11 @@ function buildStatusDetails(
 	const compartments = getCompartments(deps.db, sessionId);
 	const lastCompartment = compartments[compartments.length - 1];
 	const totalBytes = activeTags.reduce((sum, tag) => sum + tag.byteSize, 0);
+	const claimLane = readProjectClaimLaneSnapshot(deps.db, deps.projectIdentity);
+	const memoryClaims = (claimLane?.items ?? []).map((item) => ({
+		publicClaimId: item.publicClaimId,
+		revisionLocator: item.revisionLocator,
+	}));
 
 	return {
 		sessionId,
@@ -184,7 +192,9 @@ function buildStatusDetails(
 		lastCompartmentRange: lastCompartment
 			? `${lastCompartment.startMessage}-${lastCompartment.endMessage}`
 			: null,
-		memoryCount: getMemoryCount(deps.db, deps.projectIdentity),
+		memoryCount: memoryClaims.length,
+		memoryClaims,
+		memorySnapshotVector: claimLane?.snapshotVector ?? null,
 		noteCount:
 			getNotes(deps.db, { sessionId, type: "session", status: "active" })
 				.length +

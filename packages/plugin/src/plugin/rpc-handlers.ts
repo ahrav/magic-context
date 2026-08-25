@@ -37,6 +37,7 @@ import {
 } from "../hooks/magic-context/event-resolvers";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
+import { readProjectClaimLaneSnapshot } from "../hooks/magic-context/inject-compartments";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
 import {
@@ -269,15 +270,15 @@ export function buildSidebarSnapshot(
                 ? moduleStatus.compartment_count
                 : archivedCompartmentCount;
 
-        let memoryCount = 0;
-        if (projectIdentity) {
-            const memRow = db
-                .prepare<[string], { count: number }>(
-                    "SELECT COUNT(*) as count FROM memories WHERE project_path = ? AND status = 'active'",
-                )
-                .get(projectIdentity);
-            memoryCount = memRow?.count ?? 0;
-        }
+        const claimLane = projectIdentity
+            ? readProjectClaimLaneSnapshot(db, projectIdentity)
+            : null;
+        const memoryClaims = (claimLane?.items ?? []).map((item) => ({
+            publicClaimId: item.publicClaimId,
+            revisionLocator: item.revisionLocator,
+        }));
+        const memoryCount = memoryClaims.length;
+        const memorySnapshotVector = claimLane?.snapshotVector ?? null;
 
         let pendingOpsCount = 0;
         try {
@@ -511,6 +512,8 @@ export function buildSidebarSnapshot(
             compartmentCount,
             archivedCompartmentCount,
             memoryCount,
+            memoryClaims,
+            memorySnapshotVector,
             memoryBlockCount,
             pendingOpsCount,
             historianRunning: moduleStatus?.wrapup_active === true || compartmentInProgress,

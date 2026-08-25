@@ -65,6 +65,7 @@
                     "claim_memory_lifecycle_events",
                     "claim_memory_current_heads",
                     "claim_usage_stats",
+                    "claim_mural_cues",
                     "claim_derivations",
                     "claim_operation_receipts",
                     "claim_operation_effects",
@@ -77,13 +78,13 @@
         ]
     },
     "goldens": {
-        "manifestDigest": "d04f2447c2d2d690b3b5bbc014f55fcb8346944f2359554651869267f6716700",
+        "manifestDigest": "b42201a1617760e89cd84487e6789a9d0531413141f755aa471aefe8761a3944",
         "marker": {
             "formatEpoch": 1,
             "databaseIncarnationId": "00112233445566778899aabbccddeeff",
-            "componentManifestDigest": "d04f2447c2d2d690b3b5bbc014f55fcb8346944f2359554651869267f6716700",
+            "componentManifestDigest": "b42201a1617760e89cd84487e6789a9d0531413141f755aa471aefe8761a3944",
             "createdAtMs": 1755900000000,
-            "markerDigest": "4c16f12dfe0bed85e2f401cad2b1a75509013f691a47a6a433b1117772981f3f"
+            "markerDigest": "71e7c2147d24a9689a8b08ecc64f042ba2edeb427cdf7d88ed226d5bf87624e0"
         }
     }
 }

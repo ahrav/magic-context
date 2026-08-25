@@ -27,6 +27,10 @@ import {
     type SnapshotVector,
 } from "./claim-operation-contract.ts";
 import {
+    type ActiveDispositions,
+    explicitSearchLabelFromFields,
+} from "./claim-visibility-policy.ts";
+import {
     type ApplicabilityAssertionRecord,
     readCurrentApplicabilityAssertions,
 } from "./storage-claim-applicability.ts";
@@ -34,16 +38,26 @@ import {
     ClaimOperationInputError,
     computeProjectMemoryMutationToken,
 } from "./storage-claim-operations.ts";
-import { ClaimGraphCorruptionError } from "./storage-claims.ts";
+import { readActiveDispositions } from "./storage-claim-policy.ts";
+import { ClaimGraphCorruptionError, resolveProjectId } from "./storage-claims.ts";
 import type { MemoryScope } from "./types.ts";
 
 export type ProjectMemorySurface = "auto_inject" | "explicit_search";
+
+export interface ProjectMemoryWorkspaceAuthorization {
+    /** Projects owned by the active workspace member. */
+    ownProjectIds: readonly number[];
+    /** Foreign workspace categories explicitly shared with this member. */
+    sharedCategories: readonly string[];
+}
 
 export interface ProjectMemoryCurrentStateRequest {
     /** Exact public locator lookup; combined with projectIds when both set. */
     publicClaimIds?: readonly string[];
     /** Authorized project set: only claims in these projects hydrate. */
     projectIds?: readonly number[];
+    /** Optional workspace sharing filter, applied before the candidate limit. */
+    workspaceAuthorization?: ProjectMemoryWorkspaceAuthorization;
     /** Policy surface applied before any candidate limit. */
     surface?: ProjectMemorySurface;
     /** Lifecycle states to include; defaults to live claims only. */
@@ -52,6 +66,8 @@ export interface ProjectMemoryCurrentStateRequest {
     limit?: number;
     /** Opaque workspace-epoch signature bound into the SnapshotVector. */
     workspaceEpoch?: string;
+    /** Expiry evaluation instant; defaults to Date.now(). */
+    nowMs?: number;
 }
 
 export interface ProjectMemoryPolicyView {
@@ -80,6 +96,13 @@ export interface ProjectMemoryClaimSnapshot {
     evidence: { observationCount: number; independenceKeys: string[] };
     applicability: ApplicabilityAssertionRecord[];
     policy: ProjectMemoryPolicyView;
+    /** Authoritative disposition facts read from conflict/disposition/
+     * verification rows, not the projection, so uniform absence holds even
+     * when the projection lags a policy-unaware writer. */
+    dispositions: ActiveDispositions;
+    /** Sanitized evidence label for labeled explicit-search rendering; null
+     * for clean rows. Never set on the auto_inject surface. */
+    explicitLabel: string | null;
     telemetry: { seenCount: number; retrievalCount: number };
     mutationToken: ClaimMutationToken;
     projectId: number;
@@ -242,6 +265,7 @@ function hydrateClaim(db: Database, candidate: CandidateRow): ProjectMemoryClaim
         revision: revision.revision,
         contentDigest: revision.contentDigest,
     };
+    const dispositions = readActiveDispositions(db, candidate.currentRevisionId);
     return {
         publicClaimId: candidate.publicId,
         revisionLocator: formatRevisionLocator(locator),
@@ -271,6 +295,8 @@ function hydrateClaim(db: Database, candidate: CandidateRow): ProjectMemoryClaim
             policyVersion: policy?.policyVersion ?? 0,
             generation: policy?.generation ?? 0,
         },
+        dispositions,
+        explicitLabel: null,
         telemetry: {
             seenCount: telemetry?.seenCount ?? 0,
             retrievalCount: telemetry?.retrievalCount ?? 0,
@@ -280,9 +306,57 @@ function hydrateClaim(db: Database, candidate: CandidateRow): ProjectMemoryClaim
     };
 }
 
-function policyEligible(item: ProjectMemoryClaimSnapshot, surface: ProjectMemorySurface): boolean {
-    if (item.policy.hardHidden) return false;
-    return surface === "auto_inject" ? item.policy.autoEligible : item.policy.explicitEligible;
+/**
+ * The shared surface matrix (R10; U3 scenario 4). Expired claims and the
+ * uniform-absence class (hard-hidden / contradicted / quarantined /
+ * rejected) are ineligible everywhere. Authoritative soft-hide facts
+ * (stale / disputed / superseded) outrank projected eligibility on the
+ * automatic surface; explicit search keeps them as labeled rows.
+ */
+function workspaceAuthorized(
+    item: ProjectMemoryClaimSnapshot,
+    authorization: ProjectMemoryWorkspaceAuthorization | undefined,
+): boolean {
+    if (authorization === undefined) return true;
+    if (authorization.ownProjectIds.includes(item.projectId)) return true;
+    return (
+        item.sharing === "shareable" &&
+        ["project", "ecosystem", "universe"].includes(item.memoryScope) &&
+        authorization.sharedCategories.includes(item.category)
+    );
+}
+
+function surfaceDecision(
+    item: ProjectMemoryClaimSnapshot,
+    surface: ProjectMemorySurface,
+    nowMs: number,
+): { eligible: boolean; label: string | null } {
+    if (item.expiresAt !== null && item.expiresAt <= nowMs) {
+        return { eligible: false, label: null };
+    }
+    const facts = item.dispositions;
+    if (item.policy.hardHidden || facts.contradicted || facts.quarantined || facts.rejected) {
+        return { eligible: false, label: null };
+    }
+    const softHidden = facts.stale || facts.disputed || facts.superseded;
+    if (surface === "auto_inject") {
+        return { eligible: item.policy.autoEligible && !softHidden, label: null };
+    }
+    if (!item.policy.explicitEligible) return { eligible: false, label: null };
+    const dispositions: string[] = [];
+    if (facts.stale) dispositions.push("stale");
+    if (facts.disputed) dispositions.push("disputed");
+    if (facts.superseded) dispositions.push("superseded");
+    return {
+        eligible: true,
+        label: explicitSearchLabelFromFields({
+            effectiveMaturity: item.policy.effectiveMaturity,
+            originTaint: item.policy.originTaint,
+            dispositions,
+            policyMissing: false,
+            autoEligible: item.policy.autoEligible && !softHidden,
+        }),
+    };
 }
 
 function readGenerations(db: Database, projectIds: readonly number[]): Record<string, number> {
@@ -339,6 +413,32 @@ function snapshotVectorMismatches(before: SnapshotVector, after: SnapshotVector)
 
 const DEFAULT_LIFECYCLE_STATES: readonly ClaimMemoryLifecycleState[] = ["active"];
 
+const claimMemoryFragmentPresent = new WeakMap<Database, true>();
+
+export function hasClaimMemoryFragment(db: Database): boolean {
+    if (claimMemoryFragmentPresent.has(db)) return true;
+    const present =
+        db
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_public_ids'",
+            )
+            .get() != null;
+    if (present) claimMemoryFragmentPresent.set(db, true);
+    return present;
+}
+
+export function readProjectMemorySnapshotVector(
+    db: Database,
+    projectIds: readonly number[],
+    workspaceEpoch: string,
+): SnapshotVector {
+    return readSnapshotVector(db, projectIds, workspaceEpoch);
+}
+
+export function snapshotVectorChanges(before: SnapshotVector, after: SnapshotVector): string[] {
+    return snapshotVectorMismatches(before, after);
+}
+
 /**
  * Hydrate the requested current claim set under one snapshot, close it, then
  * revalidate the SnapshotVector from a fresh snapshot. Returns `stale`
@@ -351,6 +451,7 @@ export function readProjectMemoryCurrentState(
     const surface = request.surface ?? "explicit_search";
     const lifecycleStates = request.lifecycleStates ?? DEFAULT_LIFECYCLE_STATES;
     const workspaceEpoch = request.workspaceEpoch ?? "";
+    const nowMs = request.nowMs ?? Date.now();
     let items: ProjectMemoryClaimSnapshot[] = [];
     let vector: SnapshotVector | undefined;
     // One deferred transaction = one hydration snapshot.
@@ -359,14 +460,21 @@ export function readProjectMemoryCurrentState(
         const hydrated = candidates.map((candidate) => hydrateClaim(db, candidate));
         // Visibility before limits: lifecycle and policy filters run over
         // the full candidate set so a hidden claim cannot consume a slot.
-        const visible = hydrated
-            .filter((item) => lifecycleStates.includes(item.lifecycleState))
-            .filter((item) => policyEligible(item, surface));
+        const visible: ProjectMemoryClaimSnapshot[] = [];
+        for (const item of hydrated) {
+            if (!lifecycleStates.includes(item.lifecycleState)) continue;
+            if (!workspaceAuthorized(item, request.workspaceAuthorization)) continue;
+            const decision = surfaceDecision(item, surface, nowMs);
+            if (!decision.eligible) continue;
+            visible.push(
+                decision.label === null ? item : { ...item, explicitLabel: decision.label },
+            );
+        }
         items = request.limit === undefined ? visible : visible.slice(0, request.limit);
-        const touchedProjects = [...new Set(candidates.map((row) => row.projectId))].sort(
-            (left, right) => left - right,
-        );
-        vector = readSnapshotVector(db, touchedProjects, workspaceEpoch);
+        const vectorProjects = [
+            ...new Set(request.projectIds ?? candidates.map((row) => row.projectId)),
+        ].sort((left, right) => left - right);
+        vector = readSnapshotVector(db, vectorProjects, workspaceEpoch);
     })();
     if (vector === undefined) throw new Error("hydration produced no snapshot vector");
     const fresh = readSnapshotVector(
@@ -377,4 +485,54 @@ export function readProjectMemoryCurrentState(
     const mismatches = snapshotVectorMismatches(vector, fresh);
     if (mismatches.length > 0) return { status: "stale", reasons: mismatches };
     return { status: "ok", items, snapshotVector: vector };
+}
+
+/**
+ * Resolve canonical project identities to numeric project IDs, skipping
+ * identities with no registered project. Readers hold identity strings; the
+ * provider keys on numeric project IDs.
+ */
+export function resolveProjectIdsForIdentities(
+    db: Database,
+    identities: readonly string[],
+): number[] {
+    const ids: number[] = [];
+    for (const identity of identities) {
+        if (identity.length === 0) continue;
+        const id = resolveProjectId(db, identity);
+        if (id !== null) ids.push(id);
+    }
+    return [...new Set(ids)].sort((left, right) => left - right);
+}
+
+/**
+ * Cheap lifecycle-state count of project-memory claims for status and gate
+ * surfaces. Counts the claim set the provider would hydrate (public-ID rows
+ * with a matching lifecycle head), without hydration or policy filtering —
+ * counts gate scheduling and status displays, not content publication.
+ */
+export function countProjectMemoryClaims(
+    db: Database,
+    request: {
+        projectIds: readonly number[];
+        lifecycleStates?: readonly ClaimMemoryLifecycleState[];
+    },
+): number {
+    if (request.projectIds.length === 0) return 0;
+    if (!hasClaimMemoryFragment(db)) return 0;
+    const lifecycleStates = request.lifecycleStates ?? DEFAULT_LIFECYCLE_STATES;
+    if (lifecycleStates.length === 0) return 0;
+    const row = db
+        .prepare(
+            // Interpolation is a compile-time placeholder list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT COUNT(*) AS cnt
+               FROM claim_public_ids
+               JOIN claims ON claims.id = claim_public_ids.claim_id
+               JOIN claim_memory_lifecycle_heads heads ON heads.claim_id = claims.id
+              WHERE claims.project_id IN (${request.projectIds.map(() => "?").join(", ")})
+                AND heads.state IN (${lifecycleStates.map(() => "?").join(", ")})`,
+        )
+        .get(...request.projectIds, ...lifecycleStates) as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
 }

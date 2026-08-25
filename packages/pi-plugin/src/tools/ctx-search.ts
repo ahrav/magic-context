@@ -22,8 +22,8 @@ import {
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
-	parseIdShapedQuery,
-	resolveMemoriesByIdsForSearch,
+	parseLocatorShapedQuery,
+	resolveClaimsByLocatorsForSearch,
 	unifiedSearch,
 } from "@magic-context/core/features/magic-context/search";
 import {
@@ -32,7 +32,7 @@ import {
 	prepareExplicitQuery,
 } from "@magic-context/core/features/magic-context/search-bounds";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
+import { getVisibleRevisionLocators } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
 import { formatSearchResults } from "@magic-context/core/tools/ctx-search/render";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
@@ -173,32 +173,35 @@ export function createCtxSearchTool(
 			const messageOrdinalCutoff =
 				lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
 
-			// Hard-filter memories already rendered in <session-history>.
-			const visibleMemoryIds = getVisibleMemoryIds(deps.db, sessionId);
+			// Hard-filter claims already rendered in the injected baseline.
+			const visibleRevisionLocators = getVisibleRevisionLocators(
+				deps.db,
+				sessionId,
+			);
 
-			// ID-shaped short-circuit (parity with OpenCode ctx_search): when the
-			// whole query is one or more memory ids, bypass the lexical+semantic
-			// lanes and look the ids up directly. If nothing resolves we fall
-			// through to the normal lanes so a numeric query with no matching
-			// memory still searches text.
-			const idShape = parseIdShapedQuery(query);
-			if (idShape && memoryEnabled) {
-				const idResults = resolveMemoriesByIdsForSearch({
+			// Exact-locator short-circuit (parity with OpenCode ctx_search):
+			// when the whole query is one or more claim/revision locators,
+			// bypass the lexical+semantic lanes and resolve them through the
+			// current-state provider. If nothing resolves we fall through to
+			// the normal lanes so ordinary text still searches the corpus.
+			const locatorShape = parseLocatorShapedQuery(query);
+			if (locatorShape && memoryEnabled) {
+				const locatorResults = resolveClaimsByLocatorsForSearch({
 					db: deps.db,
 					projectPath: projectIdentity,
-					ids: idShape,
+					locators: locatorShape,
 					limit: Math.max(
 						normalizeSearchResultLimit(params.limit),
-						idShape.length,
+						locatorShape.length,
 					),
-					visibleMemoryIds,
+					visibleRevisionLocators,
 				});
-				if (idResults !== null) {
+				if (locatorResults !== null) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: formatSearchResults(query, idResults, sessionId),
+								text: formatSearchResults(query, locatorResults, sessionId),
 							},
 						],
 						details: undefined,
@@ -228,7 +231,6 @@ export function createCtxSearchTool(
 					maxMessageOrdinal: messageOrdinalCutoff,
 					gitCommitsEnabled,
 					sources: params.sources,
-					visibleMemoryIds,
 					// Explicit agent search → literal-probe multi-query recall
 					// (parity with OpenCode's ctx_search). Pi auto-search leaves
 					// this off to protect its latency budget.

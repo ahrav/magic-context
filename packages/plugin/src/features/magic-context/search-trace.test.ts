@@ -595,12 +595,6 @@ describe("vector byte counters", () => {
                 baseSearchOptions({ trace: { sink: cold.sink } }),
             );
 
-            const memoryCold = spanOf(cold.spans, "vector_scan", "memory");
-            expect(memoryCold.counters.cacheHit).toBe(false);
-            expect(memoryCold.counters.decodedVectorBytes).toBe(VECTOR_BYTES);
-            expect(memoryCold.counters.cachedVectorBytes).toBe(0);
-            expect(memoryCold.counters.vectorCount).toBe(1);
-
             const compartmentCold = spanOf(cold.spans, "vector_scan", "compartment");
             expect(compartmentCold.counters.cacheHit).toBe(false);
             expect(compartmentCold.counters.decodedVectorBytes).toBe(compartmentBytes);
@@ -624,11 +618,6 @@ describe("vector byte counters", () => {
                 QUERY,
                 baseSearchOptions({ trace: { sink: warm.sink } }),
             );
-
-            const memoryWarm = spanOf(warm.spans, "vector_scan", "memory");
-            expect(memoryWarm.counters.cacheHit).toBe(true);
-            expect(memoryWarm.counters.decodedVectorBytes).toBe(0);
-            expect(memoryWarm.counters.cachedVectorBytes).toBe(VECTOR_BYTES);
 
             const compartmentWarm = spanOf(warm.spans, "vector_scan", "compartment");
             expect(compartmentWarm.counters.cacheHit).toBe(true);

@@ -245,9 +245,9 @@ export function decideMemoryPolicy(
     // append a stale/flagged verification or a supersedes conflict without
     // refreshing the projection, and the stored `autoEligible` must not keep
     // injecting that revision.
-    const authoritativeStale = row != null && row.stale;
-    const authoritativeDisputed = row != null && row.disputed;
-    const authoritativeSuperseded = row != null && row.superseded;
+    const authoritativeStale = Boolean(row?.stale);
+    const authoritativeDisputed = Boolean(row?.disputed);
+    const authoritativeSuperseded = Boolean(row?.superseded);
     const authoritativeSoftHide =
         authoritativeStale || authoritativeDisputed || authoritativeSuperseded;
     if (surface === "explicit_search") {
