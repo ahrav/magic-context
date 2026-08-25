@@ -224,6 +224,13 @@ const BOUNDED_CHANNEL_CODES = new Set([
 ]);
 
 /**
+ * Upper bound on segments one provider frame may carry. The ring transport
+ * delivers at most two spans (wrap), so this is generous headroom; its job
+ * is to cap the array allocation a provider-controlled count drives.
+ */
+const MAX_PROVIDER_SEGMENTS = 64;
+
+/**
  * Wrap a provider's candidate construction so every provider-originated
  * error surface — constructor throw, `start()` rejection, channel-detected
  * close errors — is sanitized per R14 before it can enter generation error
@@ -369,9 +376,21 @@ export function sanitizedCandidateFactory(
                     if (!Number.isSafeInteger(reported) || reported > args.maxBodyLen) {
                         throw new Error("oversize provider frame");
                     }
-                    const segments = Array.from(
-                        { length: providerLease.segmentCount },
-                        (_, index) => providerLease.segment(index),
+                    // The segment count is provider-controlled and drives an
+                    // allocation, so it is read once and bounded BEFORE the
+                    // array exists: a lying getter could otherwise allocate
+                    // gigabytes ahead of every byte-level validation and the
+                    // budget charge.
+                    const segmentCount = Number(providerLease.segmentCount);
+                    if (
+                        !Number.isSafeInteger(segmentCount) ||
+                        segmentCount < 0 ||
+                        segmentCount > MAX_PROVIDER_SEGMENTS
+                    ) {
+                        throw new Error("provider segment count exceeds the supported bound");
+                    }
+                    const segments = Array.from({ length: segmentCount }, (_, index) =>
+                        providerLease.segment(index),
                     );
                     const segmentBytes = segments.reduce(
                         (total, segment) => total + segment.byteLength,

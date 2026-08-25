@@ -308,6 +308,33 @@ describe("sanitized provider channel", () => {
         expect(budget.used).toBe(5);
     });
 
+    test("a hostile segment count is rejected before any allocation or charge", () => {
+        const budget = new ByteBudget(1024);
+        const dispatched: unknown[] = [];
+        const { handlers, closes } = wrap(fakeProviderChannel({}), budget, (frame) =>
+            dispatched.push(frame),
+        );
+        const segment = new Uint8Array(new ArrayBuffer(5));
+        const lease = new ReceiveLease([segment], () => {}, new CopyCounter(), () => "released");
+        Object.defineProperty(lease, "segmentCount", { get: () => 2 ** 40 });
+        handlers.onFrame({
+            header: {
+                len: 5,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType.Response,
+                flags: 0,
+                channel: 7,
+                epoch: 1,
+                corr: 1n,
+            },
+            body: lease,
+        });
+        expect(dispatched).toEqual([]);
+        expect(closes.map((entry) => entry.reason)).toEqual(["protocol_violation"]);
+        expect(budget.used).toBe(0);
+        expect(lease.isReleased()).toBe(true);
+    });
+
     test("frames delivered after close are dropped without charging the frozen budget", () => {
         const budget = new ByteBudget(1024);
         const dispatched: unknown[] = [];
