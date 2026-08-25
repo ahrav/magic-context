@@ -137,8 +137,6 @@ export interface McHostClientOptions extends ConnectOptions {
     requestTimeoutMs?: number;
     routeOpenDeadlineMs?: number;
     shutdownDeadlineMs?: number;
-    /** Opt-in for the trusted-symlink connection-file form (wire doc 4.2). */
-    trustedSymlink?: boolean;
     /**
      * Test seam forwarded to the connection-file read's `afterOpen` hook;
      * lets tests race a snapshot against deadlines deterministically.
@@ -390,7 +388,6 @@ export class McHostClient {
     private readonly defaultTargetKind: ManagedRouteKind;
     private readonly clock: MonotonicClock | undefined;
     private readonly sleep: (ms: number) => Promise<void>;
-    private readonly trustedSymlink: boolean;
     private readonly connectionFileAfterOpen: (() => void | Promise<void>) | undefined;
     private readonly generationOptions: McHostClientOptions["generationOptions"];
     private readonly diagnostics: McHostDiagnosticsObserver | undefined;
@@ -420,7 +417,6 @@ export class McHostClient {
         this.clock = options.clock;
         this.sleep =
             options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-        this.trustedSymlink = options.trustedSymlink ?? false;
         this.connectionFileAfterOpen = options.connectionFileAfterOpen;
         this.generationOptions = options.generationOptions;
         this.diagnostics = options.diagnostics;
@@ -681,7 +677,6 @@ export class McHostClient {
         try {
             snapshot = await readConnectionFile(this.connectionFile, {
                 deadline: stage,
-                trustedSymlink: this.trustedSymlink,
                 afterOpen: this.connectionFileAfterOpen,
             });
         } catch (error) {

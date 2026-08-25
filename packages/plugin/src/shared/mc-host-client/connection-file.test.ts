@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -128,7 +128,7 @@ describe("direct-file snapshot", () => {
         await expectFailure(fifoPath, "not_regular_file");
     });
 
-    test("rejects a symlink outside the trusted exception", async () => {
+    test("rejects a symlink at the connection-file path", async () => {
         const target = freshPath("link-target.json");
         await writePrivateFile(target, JSON.stringify(validJson()));
         const linkPath = freshPath("untrusted-link.json");
@@ -192,66 +192,6 @@ describe("direct-file snapshot", () => {
         await writePrivateFile(filePath, JSON.stringify(validJson()));
         await expectFailure(filePath, "deadline_expired", {
             deadline: Deadline.start(0, () => 0),
-        });
-    });
-});
-
-describe("trusted-symlink snapshot", () => {
-    async function makeLinkedFile(): Promise<{ linkPath: string; targetPath: string }> {
-        const targetPath = freshPath("trusted-target.json");
-        await writePrivateFile(targetPath, JSON.stringify(validJson()));
-        const linkPath = freshPath("trusted-link.json");
-        await symlink(targetPath, linkPath);
-        return { linkPath, targetPath };
-    }
-
-    test("accepts a stable owner-controlled symlink to a private target", async () => {
-        const { linkPath } = await makeLinkedFile();
-        const snapshot = await readConnectionFile(linkPath, options({ trustedSymlink: true }));
-        expect(snapshot.endpoint.port).toBe(43_123);
-    });
-
-    test("rejects a regular file supplied as the trusted-symlink form", async () => {
-        const filePath = freshPath("not-a-link.json");
-        await writePrivateFile(filePath, JSON.stringify(validJson()));
-        await expectFailure(filePath, "not_symlink", { trustedSymlink: true });
-    });
-
-    test("rejects a target with group/other permission bits", async () => {
-        const targetPath = freshPath("loose-target.json");
-        await writeFile(targetPath, JSON.stringify(validJson()), { mode: 0o644 });
-        const linkPath = freshPath("loose-link.json");
-        await symlink(targetPath, linkPath);
-        await expectFailure(linkPath, "insecure_permissions", { trustedSymlink: true });
-    });
-
-    test("fails closed when the link is replaced mid-validation, with no restart", async () => {
-        const { linkPath } = await makeLinkedFile();
-        let attempts = 0;
-        const afterOpen = async (): Promise<void> => {
-            attempts += 1;
-            const otherTarget = freshPath("other-target.json");
-            await writePrivateFile(otherTarget, JSON.stringify(validJson()));
-            await unlink(linkPath);
-            await symlink(otherTarget, linkPath);
-        };
-        await expectFailure(linkPath, "replaced_during_read", {
-            trustedSymlink: true,
-            afterOpen,
-        });
-        expect(attempts).toBe(1);
-    });
-
-    test("fails closed when the target is replaced mid-validation", async () => {
-        const { linkPath, targetPath } = await makeLinkedFile();
-        const afterOpen = async (): Promise<void> => {
-            const replacement = freshPath("target-replacement.json");
-            await writePrivateFile(replacement, JSON.stringify(validJson()));
-            await rename(replacement, targetPath);
-        };
-        await expectFailure(linkPath, "replaced_during_read", {
-            trustedSymlink: true,
-            afterOpen,
         });
     });
 });

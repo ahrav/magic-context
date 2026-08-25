@@ -766,6 +766,21 @@ impl HistorianProducer {
         max_output_tokens: u32,
         temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
+        // Nothing here observes the token until the request itself, and
+        // `ensure_command_route` sits in front of it carrying `open_route`'s own
+        // 30-second retry budget. Without this gate a handler that is already
+        // shutting down waits through route admission and can bind a route for a
+        // firing that was cancelled before it started. `NotSent` is exact: no
+        // frame has been queued on any route yet.
+        if self.stop_requested() {
+            return Err(HistorianProducerError::Call(
+                HistorianCallFailure::untagged(
+                    HistorianSendOutcome::NotSent,
+                    "cancelled",
+                    "historian firing was cancelled before it started".to_owned(),
+                ),
+            ));
+        }
         self.bind_session(session_id.to_owned());
         let (provider, model_name) = model.split_once('/').ok_or_else(|| {
             HistorianProducerError::Call(HistorianCallFailure::untagged(
@@ -1774,22 +1789,23 @@ mod tests {
 
     #[tokio::test]
     async fn caller_cancellation_prevents_replay_but_transport_loss_still_replays() {
-        // A caller cancellation and an ambiguous transport loss are both
-        // OutcomeUnknown for the same reason — the bytes may already be gone —
+        // A cancellation and an ambiguous transport loss can both end a firing,
         // but they need opposite handling. Replaying a cancellation dials a new
         // connection and re-sends `session.send` after the caller said stop,
         // starting a run if the original never went out, and during handler
         // shutdown makes a cancelled task do connection setup instead of
         // draining. The token is the authority, so the transport replay below
-        // must survive the gate.
+        // must survive the gate while the cancelled firing never reaches it.
         async fn start_with_token(
             token: Option<CancellationToken>,
         ) -> (
             Arc<FakeConnector>,
             Arc<Mutex<FakeState>>,
+            Arc<Mutex<FakeState>>,
             Result<RunHandle, HistorianProducerError>,
         ) {
             let first = connection(9, [Err(cancelled_unknown())]);
+            let first_state = Arc::clone(&first.state);
             let second = connection(9, [Ok(br#"{"run_id":"replayed"}"#.to_vec())]);
             let second_state = Arc::clone(&second.state);
             let connector = Arc::new(FakeConnector {
@@ -1809,15 +1825,31 @@ mod tests {
             let result = producer
                 .start("session", "", "prompt", "provider/model")
                 .await;
-            (connector, second_state, result)
+            (connector, first_state, second_state, result)
         }
 
-        // Cancelled: the failure surfaces to the caller and nothing is resent.
+        // Already cancelled before the firing starts: nothing is sent at all, so
+        // no route is opened and no replay is considered. `NotSent` is the exact
+        // classification here — unlike a cancellation that lands mid-send, this
+        // one is provably before any frame was queued.
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        let (connector, replay_state, result) = start_with_token(Some(cancelled)).await;
-        let error = result.expect_err("a cancelled start does not succeed by replaying");
-        assert!(is_outcome_unknown(&error), "{error:?}");
+        let (connector, first_state, replay_state, result) =
+            start_with_token(Some(cancelled)).await;
+        let error = result.expect_err("a cancelled start does not succeed");
+        assert_eq!(
+            error.send_outcome(),
+            Some(HistorianSendOutcome::NotSent),
+            "a firing cancelled before it started queued nothing: {error:?}"
+        );
+        assert!(
+            first_state.lock().unwrap().requests.is_empty(),
+            "a pre-cancelled firing must not send session.send at all"
+        );
+        assert!(
+            first_state.lock().unwrap().opened_routes.is_empty(),
+            "a pre-cancelled firing must not bind a route"
+        );
         assert_eq!(
             connector.reconnect_calls.load(Ordering::SeqCst),
             0,
@@ -1830,7 +1862,7 @@ mod tests {
 
         // Live token: the intentional transport-loss replay is unaffected.
         for token in [None, Some(CancellationToken::new())] {
-            let (connector, replay_state, result) = start_with_token(token).await;
+            let (connector, _first_state, replay_state, result) = start_with_token(token).await;
             assert_eq!(result.expect("transport loss replays").run_id, "replayed");
             assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 1);
             assert_eq!(replay_state.lock().unwrap().requests.len(), 1);

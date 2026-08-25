@@ -11,7 +11,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc, Mutex, MutexGuard, Weak,
+        Arc, LazyLock, Mutex, MutexGuard, Weak,
     },
     time::Duration,
 };
@@ -80,6 +80,17 @@ pub const CLIENT_INBOUND_FRAME_BYTES: usize = MAX_BODY_LEN as usize;
 /// admit one maximum-sized item plus headroom; the worst-case resident total for
 /// one connection is this plus `CLIENT_INBOUND_FRAME_BYTES`.
 pub const CLIENT_RETAINED_RESPONSE_BYTES: usize = MAX_BODY_LEN as usize + 1_048_576;
+
+/// Concurrent connection-file snapshots allowed across this process.
+///
+/// A snapshot runs on the blocking pool and cannot be cancelled, so this caps how
+/// many blocking workers a wedged mount can strand; see `Client::connect`.
+const CLIENT_DISCOVERY_SLOTS: usize = 4;
+
+/// Permits for [`CLIENT_DISCOVERY_SLOTS`], held by the blocking closure itself so
+/// a detached worker still counts against the cap.
+static DISCOVERY_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(CLIENT_DISCOVERY_SLOTS)));
 
 const NEGOTIATION_CORRELATION: u64 = 1;
 const FIRST_APPLICATION_CORRELATION: u64 = 2;
@@ -286,9 +297,28 @@ impl Client {
         // async worker for as long as the mount takes.
         let deadline = Instant::now() + CLIENT_HANDSHAKE_TIMEOUT;
         let path = path.as_ref().to_path_buf();
+        // Bound how many discovery snapshots can be in flight at once.
+        // `spawn_blocking` work is not cancellable: when the timeout below fires,
+        // dropping the join handle only detaches the closure, and a snapshot
+        // wedged in a filesystem syscall keeps its blocking worker for as long as
+        // the mount takes. Repeated connect and reconnect attempts would each
+        // strand another worker until the blocking pool is gone and unrelated
+        // blocking work queues behind mounts nobody is waiting on. The permit is
+        // moved into the closure, so a detached worker keeps holding it and the
+        // cap counts the workers that actually exist rather than the callers that
+        // gave up. Waiting for a permit spends the same handshake budget the
+        // snapshot itself would have, so exhaustion surfaces as the timeout it
+        // already is instead of a new failure mode.
+        let permit = timeout_at(deadline, Arc::clone(&DISCOVERY_SLOTS).acquire_owned())
+            .await
+            .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
+            .expect("discovery semaphore is never closed");
         let info = timeout_at(
             deadline,
-            tokio::task::spawn_blocking(move || read_for_client(path)),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                read_for_client(path)
+            }),
         )
         .await
         .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?

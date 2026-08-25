@@ -4,6 +4,7 @@
 
 #[cfg(unix)]
 mod unix {
+    use std::collections::VecDeque;
     use std::error::Error;
     use std::fs;
     use std::io::{self, Write};
@@ -25,6 +26,7 @@ mod unix {
     use sha2::Digest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{UnixListener, UnixStream};
+    use tokio::sync::oneshot;
 
     const CONTROL_FILE: &str = "direct-host-control.sock";
     const STORE_FILE: &str = "mc-store.db";
@@ -73,9 +75,20 @@ mod unix {
         }
     }
 
+    /// One release channel per blocked invocation, oldest first.
+    ///
+    /// A counting semaphore cannot express this: a permit added just before
+    /// cancellation wins the `biased` race in `execute` stays in the semaphore,
+    /// and the next `Block` run consumes it immediately and completes without a
+    /// matching `release-blocked-call`. That silently rewrites the fault schedule
+    /// an E2E scenario is asserting against. Addressing a specific invocation
+    /// makes an unconsumed release impossible to mistake for a pending one.
+    type BlockedQueue = Arc<Mutex<VecDeque<(u64, oneshot::Sender<()>)>>>;
+
     struct ControlledBackend {
         next: Mutex<NextBehavior>,
-        release: Arc<tokio::sync::Semaphore>,
+        blocked: BlockedQueue,
+        next_blocked_id: Arc<AtomicU64>,
         shutdown: CancellationToken,
         counters: Arc<BackendCounters>,
     }
@@ -84,7 +97,8 @@ mod unix {
         fn new(shutdown: CancellationToken) -> Arc<Self> {
             Arc::new(Self {
                 next: Mutex::new(NextBehavior::Success),
-                release: Arc::new(tokio::sync::Semaphore::new(0)),
+                blocked: Arc::new(Mutex::new(VecDeque::new())),
+                next_blocked_id: Arc::new(AtomicU64::new(0)),
                 shutdown,
                 counters: Arc::new(BackendCounters::default()),
             })
@@ -94,13 +108,27 @@ mod unix {
             *self.next.lock().expect("fixture backend behavior mutex") = behavior;
         }
 
+        /// Hands one release to the oldest still-waiting blocked invocation.
+        ///
+        /// Senders whose invocation already lost the race to cancellation are
+        /// discarded rather than counted, so a release is reported accepted only
+        /// when a live run actually received it.
         fn release_blocked(&self) -> bool {
-            if !take_blocked_slot(&self.counters) {
-                return false;
+            loop {
+                let Some((_id, sender)) = self
+                    .blocked
+                    .lock()
+                    .expect("fixture blocked queue mutex")
+                    .pop_front()
+                else {
+                    return false;
+                };
+                if sender.send(()).is_ok() {
+                    take_blocked_slot(&self.counters);
+                    self.counters.released.fetch_add(1, Ordering::SeqCst);
+                    return true;
+                }
             }
-            self.counters.released.fetch_add(1, Ordering::SeqCst);
-            self.release.add_permits(1);
-            true
         }
 
         fn terminal_error(message: &str) -> BackendTerminal {
@@ -122,6 +150,26 @@ mod unix {
             .is_ok()
     }
 
+    /// Registers one blocked invocation and returns its id and release channel.
+    fn register_blocked(queue: &BlockedQueue, next_id: &AtomicU64) -> (u64, oneshot::Receiver<()>) {
+        let id = next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        queue
+            .lock()
+            .expect("fixture blocked queue mutex")
+            .push_back((id, tx));
+        (id, rx)
+    }
+
+    /// Withdraws a blocked invocation that ended without consuming a release, so
+    /// its slot cannot be handed a release no run is waiting for.
+    fn withdraw_blocked(queue: &BlockedQueue, id: u64) {
+        queue
+            .lock()
+            .expect("fixture blocked queue mutex")
+            .retain(|(queued, _)| *queued != id);
+    }
+
     impl LlmExecutionBackend for ControlledBackend {
         fn execute(
             &self,
@@ -134,7 +182,8 @@ mod unix {
                 &mut *self.next.lock().expect("fixture backend behavior mutex"),
                 NextBehavior::Success,
             );
-            let release = Arc::clone(&self.release);
+            let blocked = Arc::clone(&self.blocked);
+            let next_blocked_id = Arc::clone(&self.next_blocked_id);
             let shutdown = self.shutdown.clone();
             let counters = Arc::clone(&self.counters);
             Box::pin(async move {
@@ -156,20 +205,33 @@ mod unix {
                     NextBehavior::Block => {
                         counters.blocked.fetch_add(1, Ordering::SeqCst);
                         counters.active_blocked.fetch_add(1, Ordering::SeqCst);
+                        // Registered before the race so a release issued while
+                        // this run is waiting reaches this run and no other.
+                        let (id, release) = register_blocked(&blocked, &next_blocked_id);
                         tokio::select! {
                             biased;
                             () = shutdown.cancelled() => {
+                                withdraw_blocked(&blocked, id);
                                 take_blocked_slot(&counters);
                                 counters.cancelled.fetch_add(1, Ordering::SeqCst);
                                 ControlledBackend::terminal_error("fixture shutting down")
                             }
                             () = cancel.cancelled() => {
+                                withdraw_blocked(&blocked, id);
                                 take_blocked_slot(&counters);
                                 counters.cancelled.fetch_add(1, Ordering::SeqCst);
                                 ControlledBackend::terminal_error("fixture run cancelled")
                             }
-                            permit = release.acquire() => {
-                                permit.expect("fixture release semaphore stays open").forget();
+                            released = release => {
+                                // `release_blocked` already accounted this run;
+                                // a dropped sender means the fixture is going
+                                // away, which the cancellation branches own.
+                                if released.is_err() {
+                                    withdraw_blocked(&blocked, id);
+                                    take_blocked_slot(&counters);
+                                    counters.cancelled.fetch_add(1, Ordering::SeqCst);
+                                    return ControlledBackend::terminal_error("fixture release dropped");
+                                }
                                 events.emit(BackendEvent::AssistantText {
                                     text: "fixture-released".to_owned(),
                                     finish_reason: None,
