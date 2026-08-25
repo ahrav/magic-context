@@ -341,6 +341,11 @@ export class TcpFrameChannel implements FrameChannel {
         this.reservedDataBytes += reservedBytes;
         this.chargeQueue(reservedBytes);
         let held = true;
+        // The compatibility-copy charge taken in prepareCommit, until a
+        // publish transfers its ownership to the queued item. Releasing it
+        // with the reservation keeps commit failures between prepareCommit
+        // and publish (alias detachment) from stranding the charge.
+        let copyCharge = 0;
         let producer: BoundedFrameProducer | undefined;
         const release = (): void => {
             if (!held) return;
@@ -349,6 +354,10 @@ export class TcpFrameChannel implements FrameChannel {
             this.reservedDataFrames--;
             this.reservedDataBytes -= reservedBytes;
             this.releaseQueue(reservedBytes);
+            if (copyCharge > 0) {
+                this.releaseQueue(copyCharge);
+                copyCharge = 0;
+            }
         };
         const spans: Uint8Array[] = [];
         let remaining = capacity;
@@ -374,6 +383,7 @@ export class TcpFrameChannel implements FrameChannel {
                     // overshoot is bounded to one frame body.
                     if (exactLength > 0) {
                         this.chargeQueue(exactLength);
+                        copyCharge = exactLength;
                     }
                     let body: Buffer;
                     try {
@@ -384,7 +394,10 @@ export class TcpFrameChannel implements FrameChannel {
                             offset += segment.byteLength;
                         }
                     } catch (error) {
-                        if (exactLength > 0) this.releaseQueue(exactLength);
+                        if (copyCharge > 0) {
+                            this.releaseQueue(copyCharge);
+                            copyCharge = 0;
+                        }
                         throw error;
                     }
                     this.copyCounter.record();
@@ -399,7 +412,8 @@ export class TcpFrameChannel implements FrameChannel {
                     return {
                         publish: () => {
                             if (!held || this.closed) {
-                                if (exactLength > 0) this.releaseQueue(exactLength);
+                                // release() also returns the copy charge
+                                // still owned by the reservation.
                                 release();
                                 throw new SubcCallError(
                                     "not_sent",
@@ -416,6 +430,7 @@ export class TcpFrameChannel implements FrameChannel {
                             // charge plus the retained header now cover the
                             // queued item until the socket drains it.
                             if (capacity > 0) this.releaseQueue(capacity);
+                            copyCharge = 0;
                             this.enqueueReservedItem(item);
                             return { cancel: () => this.cancelQueuedItem(item) };
                         },
@@ -432,6 +447,9 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
+        if (this.closed) {
+            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+        }
         if (frame.header.len !== frame.body.length) {
             // A mismatched declaration would desynchronize the peer's frame
             // parser and corrupt every later frame on the connection.

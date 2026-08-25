@@ -265,13 +265,29 @@ function consumeJsonBody(lease: ReceiveLease): JsonReceiveBody {
     } catch {
         return { kind: "json", byteLength, text: null, value: undefined, valid: false };
     } finally {
+        releaseQuietly(lease);
+    }
+}
+
+/**
+ * Releases a lease without letting a quarantined outcome unwind the caller.
+ * The outcome is already reported through the lease's `onRelease` before
+ * `release()` throws, so the throw is a redundant signal that dispatch,
+ * retirement, and body-consumption paths must contain: escaping there would
+ * abort teardown mid-way or convert a known terminal into a channel close.
+ */
+function releaseQuietly(lease: ReceiveLease): void {
+    if (lease.isReleased()) return;
+    try {
         lease.release();
+    } catch {
+        // Quarantine is already accounted by onRelease before the throw.
     }
 }
 
 function releaseReceiveBodies(bodies: readonly RequestReceiveBody[]): void {
     for (const body of bodies) {
-        if (body instanceof ReceiveLease && !body.isReleased()) body.release();
+        if (body instanceof ReceiveLease) releaseQuietly(body);
     }
 }
 
@@ -725,11 +741,11 @@ export class ConnectionGeneration {
         });
         switch (header.ty) {
             case FrameType.Ping:
-                body.release();
+                releaseQuietly(body);
                 this.enqueueControlHeader({ ...header, ty: FrameType.Pong });
                 return;
             case FrameType.Goodbye:
-                body.release();
+                releaseQuietly(body);
                 if (header.channel === 0) {
                     this.retire(
                         "connection_goodbye",
@@ -740,7 +756,7 @@ export class ConnectionGeneration {
                 }
                 return;
             case FrameType.Push:
-                body.release();
+                releaseQuietly(body);
                 this.droppedFrameCount++;
                 return;
             case FrameType.Response:
@@ -750,25 +766,25 @@ export class ConnectionGeneration {
                 this.dispatchToPending(header, body);
                 return;
             default:
-                body.release();
+                releaseQuietly(body);
         }
     }
 
     private dispatchToPending(header: EnvelopeHeader, lease: ReceiveLease): void {
         const entry = this.pending.get(pendingKey(header.channel, header.epoch, header.corr));
         if (!entry) {
-            lease.release();
+            releaseQuietly(lease);
             this.droppedFrameCount++;
             return;
         }
         if (header.ty === FrameType.StreamData) {
             if (entry.callerSettled) {
-                lease.release();
+                releaseQuietly(lease);
                 return;
             }
             entry.sawStream = true;
             if (entry.mode === "unary") {
-                lease.release();
+                releaseQuietly(lease);
                 return;
             }
             let body: RequestReceiveBody;
@@ -787,7 +803,7 @@ export class ConnectionGeneration {
             return;
         }
         if (entry.callerSettled) {
-            lease.release();
+            releaseQuietly(lease);
             this.finishEntry(entry);
             return;
         }
@@ -801,7 +817,7 @@ export class ConnectionGeneration {
                 sawStream: entry.sawStream,
             });
         } else if (header.ty === FrameType.StreamEnd) {
-            lease.release();
+            releaseQuietly(lease);
             if (entry.mode === "stream") {
                 this.settleCallerResolve(entry, {
                     kind: "stream_end",
@@ -830,7 +846,7 @@ export class ConnectionGeneration {
                 return;
             }
             if (entry.mode === "unary" && entry.sawStream) {
-                if (body instanceof ReceiveLease) body.release();
+                if (body instanceof ReceiveLease) releaseQuietly(body);
                 this.settleCallerReject(
                     entry,
                     new SubcCallError(
@@ -859,7 +875,7 @@ export class ConnectionGeneration {
     ): RequestReceiveBody {
         if (flagsBinary(header.flags)) {
             if (entry.responseMode === "binary") return lease;
-            lease.release();
+            releaseQuietly(lease);
             throw new SubcCallError(
                 "terminal",
                 "request received an unexpected binary body",

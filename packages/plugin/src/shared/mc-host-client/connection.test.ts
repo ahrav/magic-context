@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { ConnectionGeneration, type RetirementInfo } from "./connection";
 import { Deadline } from "./deadline";
-import { ReceiveLease } from "./frame-channel";
-import { MAX_CORRELATION, MAX_FRAME_BODY_LEN } from "./protocol";
+import { CopyCounter, type FrameChannelHandlers, ReceiveLease } from "./frame-channel";
+import { FrameType, MAX_CORRELATION, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "./protocol";
 import { adversarialScenarios, runAdversarialScenario } from "./test-support/adversarial-scenarios";
 import { encodePeerFrame, type FakePeerConnection, PeerFrameType } from "./test-support/fake-peer";
 import {
@@ -628,6 +628,79 @@ describe("stream handling (KTD11)", () => {
             "s2",
         ]);
         await waitUntil(() => generation.stats().memoryUsed === 0);
+    });
+
+    test("retirement settles even when a retained stream lease quarantines on release", async () => {
+        let handlers: FrameChannelHandlers | undefined;
+        const generation = new ConnectionGeneration({
+            host: "127.0.0.1",
+            port: 1,
+            credentials: { key: new Uint8Array(32), daemonId: new Uint8Array(16) },
+            channelFactory: (args) => {
+                handlers = args.handlers;
+                return {
+                    start: async () => ({ daemonVer: "test" }),
+                    beginFrames: () => {},
+                    produce: () => ({ cancel: () => true }),
+                    reserve: () => {
+                        throw new Error("unused");
+                    },
+                    send: () => ({ cancel: () => true }),
+                    sendControl: () => {},
+                    flush: async () => {},
+                    close: () => {},
+                    isClosed: () => false,
+                    stats: () => ({
+                        readerHeldBytes: 0,
+                        queueHeldBytes: 0,
+                        queuedDataFrames: 0,
+                        queuedControlFrames: 0,
+                        readPaused: false,
+                        activeTimers: 0,
+                        activeReceiveLeases: 0,
+                        quarantinedBytes: 0,
+                        ownedAdapterCopies: 0,
+                    }),
+                };
+            },
+        });
+        await generation.start(Deadline.start(2_000));
+        const request = generation.request({
+            channel: CHANNEL,
+            epoch: EPOCH,
+            body: Buffer.from("stream"),
+            deadline: Deadline.start(5_000),
+            mode: "stream",
+            responseMode: "binary",
+        });
+        // A binary stream item is retained as its lease; failing alias
+        // detachment makes that lease quarantine (and throw) on release.
+        const lease = new ReceiveLease(
+            [new Uint8Array(new ArrayBuffer(4))],
+            () => {},
+            new CopyCounter(),
+            () => {
+                throw new Error("native detach failed");
+            },
+        );
+        handlers?.onFrame({
+            header: {
+                len: 4,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType.StreamData,
+                flags: 1, // binary
+                channel: CHANNEL,
+                epoch: EPOCH,
+                corr: request.correlation,
+            },
+            body: lease,
+        });
+        generation.retire("owner_close");
+        expect(lease.isReleased()).toBe(true);
+        expect(generation.isRetired()).toBe(true);
+        expect((await generation.retired).reason).toBe("owner_close");
+        expectCallError(await rejection(request.result), "not_sent", "generation_retired");
+        expect(generation.stats().pendingRequests).toBe(0);
     });
 });
 

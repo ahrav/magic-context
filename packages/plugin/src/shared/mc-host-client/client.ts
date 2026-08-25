@@ -1534,7 +1534,15 @@ type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string
 
 function requireJsonReceiveBody(body: RequestTerminal["body"]): JsonReceiveBody {
     if (body instanceof ReceiveLease) {
-        if (!body.isReleased()) body.release();
+        // A quarantined release throws after onRelease has already accounted
+        // the outcome; the unexpected_binary_response error must win here.
+        if (!body.isReleased()) {
+            try {
+                body.release();
+            } catch {
+                // Quarantine is already accounted by onRelease before the throw.
+            }
+        }
         throw new SubcCallError(
             "terminal",
             "response body was unexpectedly binary",

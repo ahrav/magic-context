@@ -13,18 +13,17 @@
 //! settlement path in `dispatch` instead (protocol §6.3).
 
 use subc_protocol::{
-    decode_header, AdmissionClass, DecodeError, EnvelopeHeader, FrameType, FROZEN_PREFIX_LEN,
-    HEADER_LEN,
+    decode_header, DecodeError, EnvelopeHeader, FrameType, FROZEN_PREFIX_LEN, HEADER_LEN,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::{timeout_at, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::frame_channel::{
-    frame_sender, CopyCounter, FrameReceiver, FrameSender, InboundEvent, InboundFrame, ReadClose,
-    RejectedFrame, SenderQueue,
+    frame_sender, validate_inbound_header, CopyCounter, FrameReceiver, FrameSender, InboundEvent,
+    InboundFrame, ReadClose, RejectedFrame, SenderQueue,
 };
-use crate::wire::{ByteBudget, ByteCharge, MAX_BODY_LEN, MAX_CONTROL_BODY_LEN};
+use crate::wire::{ByteBudget, ByteCharge, MAX_CONTROL_BODY_LEN};
 
 /// Read-side buffering for coalesced small frames.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -191,26 +190,7 @@ where
         })
     })?;
 
-    if header.len > MAX_BODY_LEN {
-        return Err(ReadClose::Corrupt("body over interoperability cap"));
-    }
-    if header.ty.is_pure_header()
-        && (header.flags.is_binary()
-            || header.flags.is_last()
-            || header.flags.admission_class() != Some(AdmissionClass::Normal))
-    {
-        return Err(ReadClose::Corrupt("invalid pure-header flags"));
-    }
-    // Consumer-role classification from the header alone, BEFORE any body
-    // admission: a role-invalid type with a large declared body must not
-    // hold ingress budget or an allocation through the frame deadline —
-    // the type already proves the generation closes (protocol §6.2).
-    if !matches!(
-        header.ty,
-        FrameType::Request | FrameType::Cancel | FrameType::Pong | FrameType::Goodbye
-    ) {
-        return Err(ReadClose::Corrupt("role-invalid frame type"));
-    }
+    validate_inbound_header(header)?;
 
     if header.ty == FrameType::Request && header.channel == 0 && header.len > MAX_CONTROL_BODY_LEN {
         // The header alone proves the violation; never buffer the body
@@ -551,7 +531,7 @@ mod tests {
     use subc_protocol::PROTOCOL_VERSION;
     use tokio::io::{duplex, AsyncWriteExt};
 
-    use crate::wire::{encode_frame, response_flags, FrameId};
+    use crate::wire::{encode_frame, response_flags, FrameId, MAX_BODY_LEN};
 
     fn budget() -> ByteBudget {
         ByteBudget::new(crate::config::MIN_RESIDENT_BYTES)

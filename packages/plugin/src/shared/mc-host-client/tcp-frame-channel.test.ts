@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Deadline } from "./deadline";
+import { SubcCallError } from "./errors";
 import { ByteBudget, type FrameChannelCloseReason, utf8FrameBody } from "./frame-channel";
 import { type EnvelopeHeader, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "./protocol";
 import { TcpFrameChannel } from "./tcp-frame-channel";
@@ -219,6 +220,31 @@ describe("TCP adapter specifics", () => {
         expect(h.channel.stats().queuedDataFrames).toBe(0);
     });
 
+    test("send() on a closed channel reports channel_closed even with a length mismatch", async () => {
+        const h = await createHarness();
+        h.channel.close();
+        let refused: unknown;
+        try {
+            h.channel.send({
+                header: {
+                    len: 5,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType.Request,
+                    flags: 0,
+                    channel: CHANNEL,
+                    epoch: EPOCH,
+                    corr: 1n,
+                },
+                body: Buffer.from("abc"),
+            });
+        } catch (error) {
+            refused = error;
+        }
+        expect(refused).toBeInstanceOf(SubcCallError);
+        expect((refused as SubcCallError).kind).toBe("not_sent");
+        expect((refused as SubcCallError).code).toBe("channel_closed");
+    });
+
     test("a body stalled mid-transfer hits the frame deadline", async () => {
         const h = await createHarness({ frameDeadlineMs: 100 });
         const full = responseFrame(1n, Buffer.alloc(256, 5));
@@ -247,6 +273,37 @@ describe("TCP adapter specifics", () => {
         // Spans (capacity) and the queued copy (capacity) are both charged at
         // the commit boundary, so peak reflects the true double residency.
         expect(h.budget.peak).toBeGreaterThanOrEqual(2 * capacity);
+    });
+
+    test("a failed alias detachment during commit releases the copy charge", async () => {
+        const h = await createHarness();
+        const capacity = 512;
+        const producer = h.channel.reserve(
+            {
+                ver: PROTOCOL_VERSION,
+                ty: FrameType.Request,
+                flags: 0,
+                channel: CHANNEL,
+                epoch: EPOCH,
+                corr: 1n,
+            },
+            capacity,
+        );
+        producer.write(Buffer.alloc(capacity, 7));
+        // Committed spans detach through structuredClone transfer; refusing
+        // the transfer fails commit after the compatibility copy is charged,
+        // exercising the abort path between prepareCommit and publish.
+        const originalClone = globalThis.structuredClone;
+        globalThis.structuredClone = (() => {
+            throw new Error("alias detachment refused");
+        }) as typeof structuredClone;
+        try {
+            expect(() => producer.commit(capacity)).toThrow("alias detachment refused");
+        } finally {
+            globalThis.structuredClone = originalClone;
+        }
+        expect(h.channel.stats().queueHeldBytes).toBe(0);
+        expect(h.budget.used).toBe(0);
     });
 
     test("the built-in UTF-8 producer queues its final TCP buffer directly", async () => {

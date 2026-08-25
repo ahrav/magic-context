@@ -499,7 +499,19 @@ pub fn produce(
             return Err(build_error);
         }
         let written = fill.call(views);
-        cleanup_created_refs(env, &channel.to_host, &mut channel.stranded, refs)?;
+        // The callback error carries the actionable diagnosis; a cleanup
+        // failure is appended rather than replacing it.
+        if let Err(cleanup_error) =
+            cleanup_created_refs(env, &channel.to_host, &mut channel.stranded, refs)
+        {
+            return Err(match written {
+                Err(callback_error) => Error::new(
+                    Status::GenericFailure,
+                    format!("{callback_error}; producer cleanup also failed: {cleanup_error}"),
+                ),
+                Ok(_) => cleanup_error,
+            });
+        }
         let written = written? as usize;
         reservation
             .advance(written)
@@ -573,7 +585,17 @@ pub fn reserve(
             },
         );
         if let Err(callback_error) = deliver.call(FnArgs::from((token, views))) {
-            detach_producer(env, channel, token)?.abort();
+            // The callback error carries the actionable diagnosis; a cleanup
+            // failure is appended rather than replacing it.
+            match detach_producer(env, channel, token) {
+                Ok(reservation) => reservation.abort(),
+                Err(cleanup_error) => {
+                    return Err(Error::new(
+                        Status::GenericFailure,
+                        format!("{callback_error}; producer cleanup also failed: {cleanup_error}"),
+                    ));
+                }
+            }
             return Err(callback_error);
         }
         Ok(())

@@ -25,19 +25,19 @@ use mc_shm_transport::profile::{
     AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
     ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
 };
-use subc_protocol::{decode_header, AdmissionClass, EnvelopeHeader, FrameType};
+use subc_protocol::{decode_header, EnvelopeHeader, FrameType};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::frame_channel::{
-    frame_sender, BoxedReceiver, CopyCounter, DirectFrame, FrameReceiver, InboundEvent,
-    InboundFrame, OutboundFrame, ReadClose, RejectedFrame, SenderQueue, COMPLETE,
+    frame_sender, validate_inbound_header, BoxedReceiver, CopyCounter, DirectFrame, FrameReceiver,
+    InboundEvent, InboundFrame, OutboundFrame, ReadClose, RejectedFrame, SenderQueue, COMPLETE,
 };
 use crate::transport_provider::{
     Candidate, InjectedProvider, PreparedCandidate, ProviderContext, ProviderFailure,
 };
-use crate::wire::{ByteBudget, MAX_BODY_LEN, MAX_CONTROL_BODY_LEN};
+use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
 /// Explicit transport name used by the qualified provider.
 pub const SHM_TRANSPORT: &str = "shm";
@@ -490,26 +490,6 @@ async fn receive_one(
         .await
         .map_err(|_| ReadClose::Cancelled)?;
     Ok(true)
-}
-
-fn validate_inbound_header(header: EnvelopeHeader) -> Result<(), ReadClose> {
-    if header.len > MAX_BODY_LEN {
-        return Err(ReadClose::Corrupt("body over interoperability cap"));
-    }
-    if header.ty.is_pure_header()
-        && (header.flags.is_binary()
-            || header.flags.is_last()
-            || header.flags.admission_class() != Some(AdmissionClass::Normal))
-    {
-        return Err(ReadClose::Corrupt("invalid pure-header flags"));
-    }
-    if !matches!(
-        header.ty,
-        FrameType::Request | FrameType::Cancel | FrameType::Pong | FrameType::Goodbye
-    ) {
-        return Err(ReadClose::Corrupt("role-invalid frame type"));
-    }
-    Ok(())
 }
 
 fn publish_one(

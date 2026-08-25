@@ -16,10 +16,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use subc_protocol::EnvelopeHeader;
+use subc_protocol::{AdmissionClass, EnvelopeHeader, FrameType};
 use tokio::sync::mpsc;
 use tokio::time::{timeout_at, Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+use crate::wire::MAX_BODY_LEN;
 
 #[cfg(test)]
 pub(crate) mod contract_tests;
@@ -38,6 +40,34 @@ pub enum ReadClose {
     Io(std::io::Error),
     /// Realignment after a rejected frame failed.
     RejectedDrainFailed,
+}
+
+/// Structural consumer-role validation of one inbound header, shared by
+/// every transport's read path so a protocol-rule change lands in exactly
+/// one place.
+///
+/// Classification uses the header alone, BEFORE any body admission: a
+/// role-invalid type with a large declared body must not hold ingress budget
+/// or an allocation through the frame deadline — the type already proves the
+/// generation closes (protocol §6.2).
+pub(crate) fn validate_inbound_header(header: EnvelopeHeader) -> Result<(), ReadClose> {
+    if header.len > MAX_BODY_LEN {
+        return Err(ReadClose::Corrupt("body over interoperability cap"));
+    }
+    if header.ty.is_pure_header()
+        && (header.flags.is_binary()
+            || header.flags.is_last()
+            || header.flags.admission_class() != Some(AdmissionClass::Normal))
+    {
+        return Err(ReadClose::Corrupt("invalid pure-header flags"));
+    }
+    if !matches!(
+        header.ty,
+        FrameType::Request | FrameType::Cancel | FrameType::Pong | FrameType::Goodbye
+    ) {
+        return Err(ReadClose::Corrupt("role-invalid frame type"));
+    }
+    Ok(())
 }
 
 /// Observable count of explicit transport-byte copies.
