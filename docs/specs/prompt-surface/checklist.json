@@ -12,184 +12,1268 @@
   ],
   "mappingStatus": "PRE-LIGHT-AUTHORING",
   "variants": {
-    "primary-full-reduce-memory-on": { "kind": "guidance", "features": { "reduce": true, "memory": true, "dreamer": true, "temporal": true, "caveman": false, "language": false, "subagent": false } },
-    "primary-full-reduce-memory-off": { "kind": "guidance", "features": { "reduce": true, "memory": false, "dreamer": true, "temporal": true, "caveman": false, "language": false, "subagent": false } },
-    "primary-full-no-reduce-memory-on": { "kind": "guidance", "features": { "reduce": false, "memory": true, "dreamer": true, "temporal": true, "caveman": false, "language": false, "subagent": false } },
-    "primary-full-no-reduce-memory-off": { "kind": "guidance", "features": { "reduce": false, "memory": false, "dreamer": true, "temporal": true, "caveman": false, "language": false, "subagent": false } },
-    "primary-full-reduce-dreamer-off": { "kind": "guidance", "features": { "reduce": true, "memory": true, "dreamer": false, "temporal": true, "caveman": false, "language": false, "subagent": false } },
-    "primary-full-reduce-temporal-off": { "kind": "guidance", "features": { "reduce": true, "memory": true, "dreamer": true, "temporal": false, "caveman": false, "language": false, "subagent": false } },
-    "primary-full-reduce-caveman-on": { "kind": "guidance", "features": { "reduce": true, "memory": true, "dreamer": true, "temporal": true, "caveman": true, "language": false, "subagent": false } },
-    "primary-full-reduce-language-on": { "kind": "guidance", "features": { "reduce": true, "memory": true, "dreamer": true, "temporal": true, "caveman": false, "language": true, "subagent": false } },
-    "subagent-reduce": { "kind": "guidance", "features": { "reduce": true, "memory": false, "dreamer": false, "temporal": false, "caveman": false, "language": false, "subagent": true } },
-    "tool-all-active": { "kind": "tools", "features": { "ctx_reduce": true, "ctx_expand": true, "ctx_note": true, "ctx_memory": true, "ctx_search": true } },
-    "tool-memory-disabled": { "kind": "tools", "features": { "ctx_reduce": true, "ctx_expand": true, "ctx_note": true, "ctx_memory": false, "ctx_search": true } }
+    "primary-full-reduce-memory-on": {
+      "kind": "guidance",
+      "features": {
+        "reduce": true,
+        "memory": true,
+        "dreamer": true,
+        "temporal": true,
+        "caveman": false,
+        "language": false,
+        "subagent": false
+      }
+    },
+    "primary-full-reduce-memory-off": {
+      "kind": "guidance",
+      "features": {
+        "reduce": true,
+        "memory": false,
+        "dreamer": true,
+        "temporal": true,
+        "caveman": false,
+        "language": false,
+        "subagent": false
+      }
+    },
+    "primary-full-no-reduce-memory-on": {
+      "kind": "guidance",
+      "features": {
+        "reduce": false,
+        "memory": true,
+        "dreamer": true,
+        "temporal": true,
+        "caveman": false,
+        "language": false,
+        "subagent": false
+      }
+    },
+    "primary-full-no-reduce-memory-off": {
+      "kind": "guidance",
+      "features": {
+        "reduce": false,
+        "memory": false,
+        "dreamer": true,
+        "temporal": true,
+        "caveman": false,
+        "language": false,
+        "subagent": false
+      }
+    },
+    "primary-full-reduce-dreamer-off": {
+      "kind": "guidance",
+      "features": {
+        "reduce": true,
+        "memory": true,
+        "dreamer": false,
+        "temporal": true,
+        "caveman": false,
+        "language": false,
+        "subagent": false
+      }
+    },
+    "primary-full-reduce-temporal-off": {
+      "kind": "guidance",
+      "features": {
+        "reduce": true,
+        "memory": true,
+        "dreamer": true,
+        "temporal": false,
+        "caveman": false,
+        "language": false,
+        "subagent": false
+      }
+    },
+    "primary-full-reduce-caveman-on": {
+      "kind": "guidance",
+      "features": {
+        "reduce": true,
+        "memory": true,
+        "dreamer": true,
+        "temporal": true,
+        "caveman": true,
+        "language": false,
+        "subagent": false
+      }
+    },
+    "primary-full-reduce-language-on": {
+      "kind": "guidance",
+      "features": {
+        "reduce": true,
+        "memory": true,
+        "dreamer": true,
+        "temporal": true,
+        "caveman": false,
+        "language": true,
+        "subagent": false
+      }
+    },
+    "subagent-reduce": {
+      "kind": "guidance",
+      "features": {
+        "reduce": true,
+        "memory": false,
+        "dreamer": false,
+        "temporal": false,
+        "caveman": false,
+        "language": false,
+        "subagent": true
+      }
+    },
+    "tool-all-active": {
+      "kind": "tools",
+      "features": {
+        "ctx_reduce": true,
+        "ctx_expand": true,
+        "ctx_note": true,
+        "ctx_memory": true,
+        "ctx_search": true
+      }
+    },
+    "tool-memory-disabled": {
+      "kind": "tools",
+      "features": {
+        "ctx_reduce": true,
+        "ctx_expand": true,
+        "ctx_note": true,
+        "ctx_memory": false,
+        "ctx_search": true
+      }
+    }
   },
   "fragments": {
     "guidance-long-term-frame": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "LONG_TERM_PARTNER_FRAME", "lines": "17-25", "evidence": "Your context is continuously managed and effectively unbounded." },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "LONG_TERM_PARTNER_FRAME",
+        "lines": "17-25",
+        "evidence": "Your context is continuously managed and effectively unbounded."
+      },
       "sharedAcrossPresets": true,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-reduce-memory-off", "primary-full-no-reduce-memory-on", "primary-full-no-reduce-memory-off", "primary-full-reduce-dreamer-off", "primary-full-reduce-temporal-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "shared", "primary-full-reduce-memory-off": "shared", "primary-full-no-reduce-memory-on": "shared", "primary-full-no-reduce-memory-off": "shared", "primary-full-reduce-dreamer-off": "shared", "primary-full-reduce-temporal-off": "shared", "primary-full-reduce-caveman-on": "shared", "primary-full-reduce-language-on": "shared", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-reduce-memory-off",
+        "primary-full-no-reduce-memory-on",
+        "primary-full-no-reduce-memory-off",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-temporal-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "shared",
+        "primary-full-reduce-memory-off": "shared",
+        "primary-full-no-reduce-memory-on": "shared",
+        "primary-full-no-reduce-memory-off": "shared",
+        "primary-full-reduce-dreamer-off": "shared",
+        "primary-full-reduce-temporal-off": "shared",
+        "primary-full-reduce-caveman-on": "shared",
+        "primary-full-reduce-language-on": "shared",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-reduce-closer": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "PARTNER_FRAME_CLOSER_REDUCE", "lines": "27-28", "evidence": "never let context size change *what* work you take on or *how thoroughly*" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "PARTNER_FRAME_CLOSER_REDUCE",
+        "lines": "27-28",
+        "evidence": "never let context size change *what* work you take on or *how thoroughly*"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-reduce-memory-off", "primary-full-reduce-dreamer-off", "primary-full-reduce-temporal-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "compressed", "primary-full-reduce-memory-off": "compressed", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "compressed", "primary-full-reduce-temporal-off": "compressed", "primary-full-reduce-caveman-on": "compressed", "primary-full-reduce-language-on": "compressed", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-reduce-memory-off",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-temporal-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "compressed",
+        "primary-full-reduce-memory-off": "compressed",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "compressed",
+        "primary-full-reduce-temporal-off": "compressed",
+        "primary-full-reduce-caveman-on": "compressed",
+        "primary-full-reduce-language-on": "compressed",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-no-reduce-closer": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "PARTNER_FRAME_CLOSER_NO_REDUCE", "lines": "30-31", "evidence": "there's nothing to prune and no warnings to act on" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "PARTNER_FRAME_CLOSER_NO_REDUCE",
+        "lines": "30-31",
+        "evidence": "there's nothing to prune and no warnings to act on"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["primary-full-no-reduce-memory-on", "primary-full-no-reduce-memory-off"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "compressed", "primary-full-no-reduce-memory-off": "compressed", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-no-reduce-memory-on",
+        "primary-full-no-reduce-memory-off"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "compressed",
+        "primary-full-no-reduce-memory-off": "compressed",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-ctx-note": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "CTX_NOTE_GUIDANCE", "lines": "33-42", "evidence": "ONLY for genuinely future concerns" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "CTX_NOTE_GUIDANCE",
+        "lines": "33-42",
+        "evidence": "ONLY for genuinely future concerns"
+      },
       "sharedAcrossPresets": true,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-reduce-memory-off", "primary-full-no-reduce-memory-on", "primary-full-no-reduce-memory-off", "primary-full-reduce-dreamer-off", "primary-full-reduce-temporal-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "shared", "primary-full-reduce-memory-off": "shared", "primary-full-no-reduce-memory-on": "shared", "primary-full-no-reduce-memory-off": "shared", "primary-full-reduce-dreamer-off": "shared", "primary-full-reduce-temporal-off": "shared", "primary-full-reduce-caveman-on": "shared", "primary-full-reduce-language-on": "shared", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-reduce-memory-off",
+        "primary-full-no-reduce-memory-on",
+        "primary-full-no-reduce-memory-off",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-temporal-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "shared",
+        "primary-full-reduce-memory-off": "shared",
+        "primary-full-no-reduce-memory-on": "shared",
+        "primary-full-no-reduce-memory-off": "shared",
+        "primary-full-reduce-dreamer-off": "shared",
+        "primary-full-reduce-temporal-off": "shared",
+        "primary-full-reduce-caveman-on": "shared",
+        "primary-full-reduce-language-on": "shared",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-tool-history": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "TOOL_HISTORY_GUIDANCE", "lines": "44-47", "evidence": "NEVER simulate, hallucinate or claim tool calls" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "TOOL_HISTORY_GUIDANCE",
+        "lines": "44-47",
+        "evidence": "NEVER simulate, hallucinate or claim tool calls"
+      },
       "sharedAcrossPresets": true,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-reduce-memory-off", "primary-full-no-reduce-memory-on", "primary-full-no-reduce-memory-off", "primary-full-reduce-dreamer-off", "primary-full-reduce-temporal-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "shared", "primary-full-reduce-memory-off": "shared", "primary-full-no-reduce-memory-on": "shared", "primary-full-no-reduce-memory-off": "shared", "primary-full-reduce-dreamer-off": "shared", "primary-full-reduce-temporal-off": "shared", "primary-full-reduce-caveman-on": "shared", "primary-full-reduce-language-on": "shared", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-reduce-memory-off",
+        "primary-full-no-reduce-memory-on",
+        "primary-full-no-reduce-memory-off",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-temporal-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "shared",
+        "primary-full-reduce-memory-off": "shared",
+        "primary-full-no-reduce-memory-on": "shared",
+        "primary-full-no-reduce-memory-off": "shared",
+        "primary-full-reduce-dreamer-off": "shared",
+        "primary-full-reduce-temporal-off": "shared",
+        "primary-full-reduce-caveman-on": "shared",
+        "primary-full-reduce-language-on": "shared",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-memory": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "MEMORY_GUIDANCE", "lines": "49-60", "evidence": "Memories are grouped by category" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "MEMORY_GUIDANCE",
+        "lines": "49-60",
+        "evidence": "Claims use opaque"
+      },
       "sharedAcrossPresets": true,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-no-reduce-memory-on", "primary-full-reduce-dreamer-off", "primary-full-reduce-temporal-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "shared", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "shared", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "shared", "primary-full-reduce-temporal-off": "shared", "primary-full-reduce-caveman-on": "shared", "primary-full-reduce-language-on": "shared", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-no-reduce-memory-on",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-temporal-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "shared",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "shared",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "shared",
+        "primary-full-reduce-temporal-off": "shared",
+        "primary-full-reduce-caveman-on": "shared",
+        "primary-full-reduce-language-on": "shared",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-reduce-intro": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "BASE_INTRO", "lines": "70-90", "evidence": "Messages and tool outputs are tagged with §N§ identifiers" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "BASE_INTRO",
+        "lines": "70-90",
+        "evidence": "Messages and tool outputs are tagged with \u00a7N\u00a7 identifiers"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-reduce-memory-off", "primary-full-reduce-dreamer-off", "primary-full-reduce-temporal-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "compressed", "primary-full-reduce-memory-off": "compressed", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "compressed", "primary-full-reduce-temporal-off": "compressed", "primary-full-reduce-caveman-on": "compressed", "primary-full-reduce-language-on": "compressed", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-reduce-memory-off",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-temporal-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "compressed",
+        "primary-full-reduce-memory-off": "compressed",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "compressed",
+        "primary-full-reduce-temporal-off": "compressed",
+        "primary-full-reduce-caveman-on": "compressed",
+        "primary-full-reduce-language-on": "compressed",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-no-reduce-intro": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "BASE_INTRO_NO_REDUCE", "lines": "92-108", "evidence": "when ctx_reduce is unavailable" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "BASE_INTRO_NO_REDUCE",
+        "lines": "92-108",
+        "evidence": "when ctx_reduce is unavailable"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["primary-full-no-reduce-memory-on", "primary-full-no-reduce-memory-off"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "compressed", "primary-full-no-reduce-memory-off": "compressed", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-no-reduce-memory-on",
+        "primary-full-no-reduce-memory-off"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "compressed",
+        "primary-full-no-reduce-memory-off": "compressed",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-generic-reduction": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "GENERIC_SECTION", "lines": "110-125", "evidence": "After reading files or search results you already acted on" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "GENERIC_SECTION",
+        "lines": "110-125",
+        "evidence": "After reading files or search results you already acted on"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-reduce-memory-off", "primary-full-reduce-dreamer-off", "primary-full-reduce-temporal-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "compressed", "primary-full-reduce-memory-off": "compressed", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "compressed", "primary-full-reduce-temporal-off": "compressed", "primary-full-reduce-caveman-on": "compressed", "primary-full-reduce-language-on": "compressed", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-reduce-memory-off",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-temporal-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "compressed",
+        "primary-full-reduce-memory-off": "compressed",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "compressed",
+        "primary-full-reduce-temporal-off": "compressed",
+        "primary-full-reduce-caveman-on": "compressed",
+        "primary-full-reduce-language-on": "compressed",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-temporal": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "TEMPORAL_AWARENESS_GUIDANCE", "lines": "127-127", "evidence": "Temporal awareness" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "TEMPORAL_AWARENESS_GUIDANCE",
+        "lines": "127-127",
+        "evidence": "Temporal awareness"
+      },
       "sharedAcrossPresets": true,
-      "composedIn": ["primary-full-reduce-memory-on", "primary-full-reduce-memory-off", "primary-full-no-reduce-memory-on", "primary-full-no-reduce-memory-off", "primary-full-reduce-dreamer-off", "primary-full-reduce-caveman-on", "primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "shared", "primary-full-reduce-memory-off": "shared", "primary-full-no-reduce-memory-on": "shared", "primary-full-no-reduce-memory-off": "shared", "primary-full-reduce-dreamer-off": "shared", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "shared", "primary-full-reduce-language-on": "shared", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-memory-on",
+        "primary-full-reduce-memory-off",
+        "primary-full-no-reduce-memory-on",
+        "primary-full-no-reduce-memory-off",
+        "primary-full-reduce-dreamer-off",
+        "primary-full-reduce-caveman-on",
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "shared",
+        "primary-full-reduce-memory-off": "shared",
+        "primary-full-no-reduce-memory-on": "shared",
+        "primary-full-no-reduce-memory-off": "shared",
+        "primary-full-reduce-dreamer-off": "shared",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "shared",
+        "primary-full-reduce-language-on": "shared",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-caveman": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "CAVEMAN_COMPRESSION_WARNING", "lines": "145-145", "evidence": "DO NOT mimic this style in new turns" },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "CAVEMAN_COMPRESSION_WARNING",
+        "lines": "145-145",
+        "evidence": "DO NOT mimic this style in new turns"
+      },
       "sharedAcrossPresets": true,
-      "composedIn": ["primary-full-reduce-caveman-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "shared", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-caveman-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "shared",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-language": {
-      "source": { "file": "packages/plugin/src/agents/language-directive.ts", "symbol": "buildPrimaryLanguageDirective", "lines": "116-121", "evidence": "Keep code, identifiers, file paths, commands, logs, and quoted text verbatim" },
+      "source": {
+        "file": "packages/plugin/src/agents/language-directive.ts",
+        "symbol": "buildPrimaryLanguageDirective",
+        "lines": "116-121",
+        "evidence": "Keep code, identifiers, file paths, commands, logs, and quoted text verbatim"
+      },
       "sharedAcrossPresets": true,
-      "composedIn": ["primary-full-reduce-language-on"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "shared", "subagent-reduce": "not-present", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "primary-full-reduce-language-on"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "shared",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "guidance-subagent-reduce": {
-      "source": { "file": "packages/plugin/src/agents/magic-context-prompt.ts", "symbol": "SUBAGENT_REDUCE_INTRO", "lines": "138-143", "evidence": "not a pattern to copy." },
+      "source": {
+        "file": "packages/plugin/src/agents/magic-context-prompt.ts",
+        "symbol": "SUBAGENT_REDUCE_INTRO",
+        "lines": "138-143",
+        "evidence": "not a pattern to copy."
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["subagent-reduce"],
+      "composedIn": [
+        "subagent-reduce"
+      ],
       "asymmetryNote": "The explicit dropped-sentinel imitation ban is emitted by SUBAGENT_REDUCE_INTRO only; BASE_INTRO has metadata non-reproduction language but does not emit this exact sentinel-pattern clause.",
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "compressed", "tool-all-active": "not-present", "tool-memory-disabled": "not-present" }
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "compressed",
+        "tool-all-active": "not-present",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "tool-ctx-reduce": {
-      "source": { "file": "packages/plugin/src/tools/ctx-reduce/constants.ts", "symbol": "CTX_REDUCE_DESCRIPTION", "lines": "1-10", "evidence": "Marking QUEUES content for release" },
+      "source": {
+        "file": "packages/plugin/src/tools/ctx-reduce/constants.ts",
+        "symbol": "CTX_REDUCE_DESCRIPTION",
+        "lines": "1-10",
+        "evidence": "Marking QUEUES content for release"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["tool-all-active", "tool-memory-disabled"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "compressed", "tool-memory-disabled": "compressed" }
+      "composedIn": [
+        "tool-all-active",
+        "tool-memory-disabled"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "compressed",
+        "tool-memory-disabled": "compressed"
+      }
     },
     "tool-ctx-expand": {
-      "source": { "file": "packages/plugin/src/tools/ctx-expand/constants.ts", "symbol": "CTX_EXPAND_DESCRIPTION", "lines": "1-11", "evidence": "Returns the raw transcript as [N] U:/A: lines, capped at ~15K tokens" },
+      "source": {
+        "file": "packages/plugin/src/tools/ctx-expand/constants.ts",
+        "symbol": "CTX_EXPAND_DESCRIPTION",
+        "lines": "1-11",
+        "evidence": "Returns the raw transcript as [N] U:/A: lines, capped at ~15K tokens"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["tool-all-active", "tool-memory-disabled"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "compressed", "tool-memory-disabled": "compressed" }
+      "composedIn": [
+        "tool-all-active",
+        "tool-memory-disabled"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "compressed",
+        "tool-memory-disabled": "compressed"
+      }
     },
     "tool-ctx-note": {
-      "source": { "file": "packages/plugin/src/tools/ctx-note/constants.ts", "symbol": "CTX_NOTE_DESCRIPTION", "lines": "1-16", "evidence": "Don't use notes for active multi-step work" },
+      "source": {
+        "file": "packages/plugin/src/tools/ctx-note/constants.ts",
+        "symbol": "CTX_NOTE_DESCRIPTION",
+        "lines": "1-16",
+        "evidence": "Don't use notes for active multi-step work"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["tool-all-active", "tool-memory-disabled"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "compressed", "tool-memory-disabled": "compressed" }
+      "composedIn": [
+        "tool-all-active",
+        "tool-memory-disabled"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "compressed",
+        "tool-memory-disabled": "compressed"
+      }
     },
     "tool-ctx-memory": {
-      "source": { "file": "packages/plugin/src/tools/ctx-memory/constants.ts", "symbol": "CTX_MEMORY_DESCRIPTION", "lines": "2-13", "evidence": "one standalone fact, phrased to make sense without this session's context" },
+      "source": {
+        "file": "packages/plugin/src/tools/ctx-memory/constants.ts",
+        "symbol": "CTX_MEMORY_DESCRIPTION",
+        "lines": "2-13",
+        "evidence": "Claims use public IDs (mcm_<32hex>)"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["tool-all-active"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "compressed", "tool-memory-disabled": "not-present" }
+      "composedIn": [
+        "tool-all-active"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "compressed",
+        "tool-memory-disabled": "not-present"
+      }
     },
     "tool-ctx-search": {
-      "source": { "file": "packages/plugin/src/tools/ctx-search/constants.ts", "symbol": "CTX_SEARCH_DESCRIPTION", "lines": "2-16", "evidence": "Results only contain things you CANNOT currently see" },
+      "source": {
+        "file": "packages/plugin/src/tools/ctx-search/constants.ts",
+        "symbol": "CTX_SEARCH_DESCRIPTION",
+        "lines": "2-16",
+        "evidence": "Results only contain things you CANNOT currently see"
+      },
       "sharedAcrossPresets": false,
-      "composedIn": ["tool-all-active", "tool-memory-disabled"],
-      "statusByVariant": { "primary-full-reduce-memory-on": "not-present", "primary-full-reduce-memory-off": "not-present", "primary-full-no-reduce-memory-on": "not-present", "primary-full-no-reduce-memory-off": "not-present", "primary-full-reduce-dreamer-off": "not-present", "primary-full-reduce-temporal-off": "not-present", "primary-full-reduce-caveman-on": "not-present", "primary-full-reduce-language-on": "not-present", "subagent-reduce": "not-present", "tool-all-active": "compressed", "tool-memory-disabled": "compressed" }
+      "composedIn": [
+        "tool-all-active",
+        "tool-memory-disabled"
+      ],
+      "statusByVariant": {
+        "primary-full-reduce-memory-on": "not-present",
+        "primary-full-reduce-memory-off": "not-present",
+        "primary-full-no-reduce-memory-on": "not-present",
+        "primary-full-no-reduce-memory-off": "not-present",
+        "primary-full-reduce-dreamer-off": "not-present",
+        "primary-full-reduce-temporal-off": "not-present",
+        "primary-full-reduce-caveman-on": "not-present",
+        "primary-full-reduce-language-on": "not-present",
+        "subagent-reduce": "not-present",
+        "tool-all-active": "compressed",
+        "tool-memory-disabled": "compressed"
+      }
     }
   },
   "requiredRuleIds": [
-    "G-001", "G-002", "G-003", "G-004", "G-005", "G-006", "G-007", "G-008", "G-009", "G-010", "G-011", "G-012", "G-013", "G-014", "G-015", "G-016", "G-017", "G-018", "G-019", "G-020", "G-021", "G-022", "G-023", "G-024", "G-025", "G-026", "G-027", "G-028", "G-029", "G-030", "G-031", "G-032", "G-033", "G-034", "G-035", "T-001", "T-002", "T-003", "T-004", "T-005", "T-006", "T-007", "T-008", "T-009", "T-010", "T-011", "T-012", "T-013", "T-014", "T-015", "T-016", "T-017"
+    "G-001",
+    "G-002",
+    "G-003",
+    "G-004",
+    "G-005",
+    "G-006",
+    "G-007",
+    "G-008",
+    "G-009",
+    "G-010",
+    "G-011",
+    "G-012",
+    "G-013",
+    "G-014",
+    "G-015",
+    "G-016",
+    "G-017",
+    "G-018",
+    "G-019",
+    "G-020",
+    "G-021",
+    "G-022",
+    "G-023",
+    "G-024",
+    "G-025",
+    "G-026",
+    "G-027",
+    "G-028",
+    "G-029",
+    "G-030",
+    "G-031",
+    "G-032",
+    "G-033",
+    "G-034",
+    "G-035",
+    "T-001",
+    "T-002",
+    "T-003",
+    "T-004",
+    "T-005",
+    "T-006",
+    "T-007",
+    "T-008",
+    "T-009",
+    "T-010",
+    "T-011",
+    "T-012",
+    "T-013",
+    "T-014",
+    "T-015",
+    "T-016",
+    "T-017"
   ],
   "rules": [
-    { "id": "G-001", "title": "Tagged conversation contract", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "A primary session can see tagged messages or tool outputs.", "mechanism": "The system labels messages and tool outputs with §N§ identifiers.", "consequence": "Tag references are the only valid handles for reduction.", "evidence": "Messages and tool outputs are tagged with §N§ identifiers" },
-    { "id": "G-002", "title": "Reduction is queued reclamation", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "Tagged content is spent and its useful information has been extracted.", "mechanism": "ctx_reduce marks content discardable and queues it for release instead of deleting it immediately.", "consequence": "The agent can reclaim space without treating the action as immediate erasure.", "evidence": "mark spent tagged content as discardable and reclaim space" },
-    { "id": "G-003", "title": "Protected recent tail", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "mechanism", "operativeCondition": "A requested tag is within the newest protected window.", "mechanism": "The last protectedTags tags remain protected; marking only queues them until they age out.", "consequence": "A recent mark is harmless and cannot immediately release the protected tail.", "evidence": "The last ${protectedTags} tags are protected" },
-    { "id": "G-004", "title": "Reduction range grammar", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "The agent calls ctx_reduce.", "mechanism": "The drop argument uses comma-separated IDs and inclusive ranges such as 3-5, 1,2,9, or 1-5,8,12-15.", "consequence": "Other range spellings are not part of the documented contract.", "evidence": "Syntax: \"3-5\", \"1,2,9\", or \"1-5,8,12-15\"" },
-    { "id": "G-005", "title": "Drops are silent", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "prohibition", "operativeCondition": "The agent decides to queue a reduction.", "mechanism": "Call ctx_reduce without narrating the drop in assistant prose.", "consequence": "The conversation contains no redundant drop announcement.", "evidence": "Do not announce or narrate" },
-    { "id": "G-006", "title": "Review before broad drops", "sourceFragment": "guidance-reduce-intro", "scope": "all sessions with reduction guidance", "polarity": "prohibition", "operativeCondition": "A large range could be dropped.", "mechanism": "Inspect each tag before selecting a range; never blanket-mark a large range.", "consequence": "Unreviewed evidence is not discarded accidentally.", "evidence": "NEVER drop large ranges blindly" },
-    { "id": "G-007", "title": "Drop only extracted material", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "A tag is being considered for discard.", "mechanism": "Keep unresolved errors, unextracted raw evidence, and wording whose exact form may matter; drop only genuinely finished outputs.", "consequence": "Reduction preserves information that still affects the task.", "evidence": "only large tool outputs are worth dropping" },
-    { "id": "G-008", "title": "Preserve user intent", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "prohibition", "operativeCondition": "An old user message contains instructions or intent.", "mechanism": "Never drop a user message for its directive; only an extracted large pasted block may be marked.", "consequence": "Historical user requirements remain authoritative.", "evidence": "Keep your user's instructions and intent" },
-    { "id": "G-009", "title": "Retain assistant conversation text", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "Assistant prose is present in context.", "mechanism": "Keep assistant text unless it is exceptionally large; prioritize large tool outputs for reduction.", "consequence": "Conversation reasoning remains available while tool bloat is reclaimed.", "evidence": "NEVER drop assistant text messages unless they are exceptionally large" },
-    { "id": "G-010", "title": "Routine reduction timing", "sourceFragment": "guidance-generic-reduction", "scope": "primary sessions with ctx_reduce", "polarity": "mechanism", "operativeCondition": "The agent has finished using a large output, logical step, or context area.", "mechanism": "Consider ctx_reduce after acted-on reads, completed logical steps, before major context switches, and before the turn ends.", "consequence": "The working set stays lean without changing task scope.", "evidence": "After completing a logical step — drop intermediate outputs from that step." },
-    { "id": "G-011", "title": "Long-term continuity", "sourceFragment": "guidance-long-term-frame", "scope": "primary sessions", "polarity": "contract", "operativeCondition": "The session continues after one task or across compaction.", "mechanism": "Treat the session as a durable project relationship with retrievable history and persistent knowledge.", "consequence": "Finishing one task does not terminate the working relationship.", "evidence": "This session is a durable working relationship" },
-    { "id": "G-012", "title": "No context-scarcity behavior", "sourceFragment": "guidance-long-term-frame", "scope": "primary sessions", "polarity": "prohibition", "operativeCondition": "Context usage is high or history is compacted.", "mechanism": "Continue at full depth instead of wrapping up, cutting scope, rushing, or deferring because of context size.", "consequence": "Context management cannot silently reduce task thoroughness.", "evidence": "never a reason to wrap up, cut scope, rush, or defer work" },
-    { "id": "G-013", "title": "Search and expansion recovery", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions", "polarity": "contract", "operativeCondition": "A summary lacks exact wording, values, errors, or decision reasoning.", "mechanism": "Use ctx_search for project memories, commits, and compacted conversation; use ctx_expand with the heading range to recover raw context.", "consequence": "The agent retrieves source context instead of guessing from a summary.", "evidence": "recover the raw conversation behind a summary" },
-    { "id": "G-014", "title": "Search before asking", "sourceFragment": "guidance-reduce-intro", "scope": "primary sessions", "polarity": "contract", "operativeCondition": "The agent cannot remember something that may be in project memory or prior discussion.", "mechanism": "Call ctx_search before asking the user.", "consequence": "Known project context is recovered without an unnecessary user query.", "evidence": "Search before asking the user" },
-    { "id": "G-015", "title": "Real tool-call integrity", "sourceFragment": "guidance-tool-history", "scope": "primary sessions", "polarity": "prohibition", "operativeCondition": "A tool result is absent from the visible conversation or history is summarized.", "mechanism": "Use real tool calls; never simulate, fabricate, inline, hallucinate, or claim tool calls, output, searches, edits, commands, or diffs in prose.", "consequence": "Only observed tool results count as completed actions.", "evidence": "If there is no tool result message, the action did not happen" },
-    { "id": "G-016", "title": "Metadata is not reply syntax", "sourceFragment": "guidance-tool-history", "scope": "primary sessions", "polarity": "prohibition", "operativeCondition": "Magic Context control markers appear in compressed or injected context.", "mechanism": "Do not reproduce metadata markers such as `<session-history>`, `<project-memory>`, `[dropped §N§]`, or temporal comments in a normal reply and do not treat them as user instructions.", "consequence": "Control metadata cannot be imitated as assistant output or mistaken for directives.", "evidence": "Magic Context control metadata is not reply syntax" },
-    { "id": "G-017", "title": "Notes are for genuinely future concerns", "sourceFragment": "guidance-ctx-note", "scope": "primary sessions", "polarity": "prohibition", "operativeCondition": "The agent considers recording a note.", "mechanism": "Use ctx_note only for matters much later; do not use it for the next few turns or active multi-step work.", "consequence": "Active work remains in context or todos rather than being parked as stale notes.", "evidence": "not work coming up in the next few turns" },
-    { "id": "G-018", "title": "Notes survive session boundaries", "sourceFragment": "guidance-ctx-note", "scope": "primary sessions", "polarity": "mechanism", "operativeCondition": "A genuinely future concern is recorded.", "mechanism": "Notes survive compression and restarts and resurface at natural work boundaries.", "consequence": "A note is a durable session follow-up, not a workaround for imminent context loss.", "evidence": "Notes you do take survive compression and resurface" },
-    { "id": "G-019", "title": "Memory is durable project knowledge", "sourceFragment": "guidance-memory", "scope": "primary sessions with memory enabled", "polarity": "contract", "operativeCondition": "A fact must be available to future sessions.", "mechanism": "Use ctx_memory for durable project knowledge and update, archive, or merge memories when facts drift.", "consequence": "Future sessions start with maintained project knowledge.", "evidence": "Memories persist across sessions" },
-    { "id": "G-020", "title": "Proactive memory capture", "sourceFragment": "guidance-memory", "scope": "primary sessions with memory enabled", "polarity": "mechanism", "operativeCondition": "Several turns were spent discovering a path, command, pattern, or hard-won constraint.", "mechanism": "Save the reusable fact to ctx_memory with its category and content.", "consequence": "Future sessions do not repeat the same discovery work.", "evidence": "Save to memory proactively" },
-    { "id": "G-021", "title": "Reduction trigger taxonomy", "sourceFragment": "guidance-generic-reduction", "scope": "primary sessions with ctx_reduce", "polarity": "mechanism", "operativeCondition": "The agent has acted on raw exploration or changes task area.", "mechanism": "Reduce after acted-on reads/searches, completed logical steps, and before major context switches.", "consequence": "Intermediate evidence is reclaimed at meaningful boundaries.", "evidence": "Between major context switches" },
-    { "id": "G-022", "title": "Drop large consumed outputs", "sourceFragment": "guidance-generic-reduction", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "A large read, search, diagnostic, build, or test output has already been analyzed.", "mechanism": "Drop the raw output after acting on it; retain unresolved errors and current work context.", "consequence": "Useful evidence remains while redundant volume is removed.", "evidence": "Large build/test output after you analyzed and acted on it" },
-    { "id": "G-023", "title": "Keep active task context", "sourceFragment": "guidance-generic-reduction", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "The agent is selecting content to retain.", "mechanism": "Keep task requirements, constraints, recent errors, unresolved decisions, active work, and files being edited.", "consequence": "The current task remains grounded after reduction.", "evidence": "Your current task requirements and constraints" },
-    { "id": "G-024", "title": "Prefer targeted operations", "sourceFragment": "guidance-generic-reduction", "scope": "primary sessions with ctx_reduce", "polarity": "contract", "operativeCondition": "The agent can choose between broad and focused context operations.", "mechanism": "Prefer many small targeted operations and keep the working set tidy as routine maintenance.", "consequence": "Reduction avoids broad irreversible-looking guesses.", "evidence": "Prefer many small targeted operations over one large blanket operation" },
-    { "id": "G-025", "title": "Memory guidance is feature-gated", "sourceFragment": "guidance-memory", "scope": "primary sessions with memory enabled", "polarity": "mechanism", "operativeCondition": "The memory block is enabled and project-memory is injected.", "mechanism": "Compose the memory instructions only when memory is enabled; omit them when disabled.", "consequence": "The prompt does not advertise a memory surface that is unavailable.", "evidence": "Gated out when `memory.enabled: false`" },
-    { "id": "G-026", "title": "Temporal boundary interpretation", "sourceFragment": "guidance-temporal", "scope": "primary sessions with temporal awareness enabled", "polarity": "contract", "operativeCondition": "Temporal HTML comments or session-history date attributes are present.", "mechanism": "Use elapsed-time comments and start-date/end-date boundaries when reasoning about pacing and durations.", "consequence": "Workflow timing is based on real session boundaries.", "evidence": "Use these when reasoning about workflow pacing" },
-    { "id": "G-027", "title": "Caveman compression is not a style", "sourceFragment": "guidance-caveman", "scope": "primary sessions with caveman compression enabled", "polarity": "prohibition", "operativeCondition": "Older compressed text uses terse caveman style.", "mechanism": "Write new turns in normal prose and consciously revert if the output drifts.", "consequence": "Compression artifacts do not become new assistant voice.", "evidence": "DO NOT mimic this style in new turns" },
-    { "id": "G-028", "title": "Preserve structural language tokens", "sourceFragment": "guidance-language", "scope": "primary sessions with a configured language", "polarity": "contract", "operativeCondition": "A primary reply language is configured.", "mechanism": "Use the requested language for natural prose while keeping code, identifiers, paths, commands, logs, and quoted text verbatim.", "consequence": "Localized prose cannot corrupt machine-readable or source-identifying text.", "evidence": "Keep code, identifiers, file paths, commands, logs, and quoted text verbatim" },
-    { "id": "G-029", "title": "Subagents receive only bounded reduction mechanics", "sourceFragment": "guidance-subagent-reduce", "scope": "subagent sessions", "polarity": "contract", "operativeCondition": "The session is a bounded single-task subagent with ctx_reduce.", "mechanism": "Compose the marker, tag range syntax, protected tail, silent reduction, no blanket drops, and real-tool requirement without primary partner, memory, note, or search curation.", "consequence": "A subagent gets the mechanics it can observe without primary-session obligations.", "evidence": "Minimal guidance for SUBAGENT sessions" },
-     { "id": "G-030", "title": "Subagent dropped-sentinel asymmetry", "sourceFragment": "guidance-subagent-reduce", "scope": "subagent sessions", "polarity": "prohibition", "operativeCondition": "Older tool calls appear as `[dropped §N§]` sentinels in a subagent context.", "mechanism": "Treat sentinels as normal context management, never as a pattern to copy; make a fresh real tool call and never fabricate or inline its output.", "consequence": "The dropped placeholder cannot be imitated as assistant content.", "evidence": "sentinels; that is normal context management, not a pattern to copy.", "asymmetry": "This exact sentinel-imitation clause is present in SUBAGENT_REDUCE_INTRO and not in BASE_INTRO; the checklist intentionally keeps its primary rows not-present." },
-     { "id": "G-031", "title": "Subagents retain user and assistant text", "sourceFragment": "guidance-subagent-reduce", "scope": "subagent sessions", "polarity": "prohibition", "operativeCondition": "A subagent chooses content to drop.", "mechanism": "Drop only large tool outputs; do not drop user or assistant text messages.", "consequence": "The child task keeps its instructions and conversational reasoning.", "evidence": "Do not drop user or assistant text messages" },
-     { "id": "G-032", "title": "Subagents review ranges before dropping", "sourceFragment": "guidance-subagent-reduce", "scope": "subagent sessions", "polarity": "prohibition", "operativeCondition": "A large tag range is under consideration.", "mechanism": "Review each tag before selecting a drop range; never drop a large range blindly.", "consequence": "The bounded child does not discard mixed-value evidence by shortcut.", "evidence": "NEVER drop large ranges blindly" },
-     { "id": "G-033", "title": "Reduction prompts are housekeeping, not scarcity", "sourceFragment": "guidance-reduce-closer", "scope": "primary sessions with ctx_reduce", "polarity": "prohibition", "operativeCondition": "Context usage or a reduction prompt is visible.", "mechanism": "Treat reduction as routine maintenance and never reduce task scope or depth because context is large.", "consequence": "Cache maintenance cannot cause the agent to rush, defer, or omit work.", "evidence": "never let context size change *what* work you take on or *how thoroughly*" },
-     { "id": "G-034", "title": "No-reduce sessions are automatically managed", "sourceFragment": "guidance-no-reduce-closer", "scope": "primary sessions without ctx_reduce", "polarity": "prohibition", "operativeCondition": "The reduction tool is unavailable.", "mechanism": "Rely on automatic context management; do not prune, heed reduction warnings, or cut task scope or depth.", "consequence": "An unavailable reduction tool cannot create false manual housekeeping obligations.", "evidence": "there's nothing to prune and no warnings to act on" },
-     { "id": "G-035", "title": "No-reduce sessions retain recovery guidance without pruning instructions", "sourceFragment": "guidance-no-reduce-intro", "scope": "primary sessions without ctx_reduce", "polarity": "contract", "operativeCondition": "Prior project or compacted-session context is needed while ctx_reduce is unavailable.", "mechanism": "Keep note, memory, search, expansion, and real-tool guidance while omitting tag and reduction mechanics.", "consequence": "The agent can recover hidden context without being told to call an unavailable tool.", "evidence": "when ctx_reduce is unavailable" },
-     { "id": "T-001", "title": "ctx_reduce queues release", "sourceFragment": "tool-ctx-reduce", "scope": "ctx_reduce tool users", "polarity": "contract", "operativeCondition": "A spent tagged output should leave the working set.", "mechanism": "Mark it discardable; release is queued and delayed until context space is needed.", "consequence": "The original remains visible until the system releases it.", "evidence": "Marking QUEUES content for release" },
-    { "id": "T-002", "title": "ctx_reduce protects newest tags", "sourceFragment": "tool-ctx-reduce", "scope": "ctx_reduce tool users", "polarity": "mechanism", "operativeCondition": "A requested tag is in the recent window.", "mechanism": "The newest tags are protected and age out before release.", "consequence": "Marking recent output is harmless.", "evidence": "The newest tags are protected" },
-    { "id": "T-003", "title": "ctx_reduce recovery is explicit", "sourceFragment": "tool-ctx-reduce", "scope": "ctx_reduce tool users", "polarity": "contract", "operativeCondition": "Content has finally been released.", "mechanism": "It becomes a short placeholder; rerun the recovery tool to get it back, and mark only content that is genuinely done.", "consequence": "The agent does not treat an unrecovered output as safely disposable.", "evidence": "re-running the tool is the only way to get it back" },
-    { "id": "T-004", "title": "ctx_reduce eligible output boundary", "sourceFragment": "tool-ctx-reduce", "scope": "ctx_reduce tool users", "polarity": "contract", "operativeCondition": "Choosing output to mark.", "mechanism": "Prefer summarized, repeated, redundant, persisted, or merely confirmatory status output; keep user messages, unresolved errors, raw evidence, and exact wording that matters.", "consequence": "Reduction preserves unresolved and authoritative evidence.", "evidence": "Keep: user messages, unresolved errors, raw evidence you haven't extracted yet" },
-    { "id": "T-005", "title": "ctx_reduce rejects blind ranges", "sourceFragment": "tool-ctx-reduce", "scope": "ctx_reduce tool users", "polarity": "prohibition", "operativeCondition": "A large range is under consideration.", "mechanism": "Review every tag before calling the drop parameter.", "consequence": "A blanket range cannot silently discard mixed-value content.", "evidence": "Never blanket-mark large ranges" },
-    { "id": "T-006", "title": "ctx_expand uses compacted headings", "sourceFragment": "tool-ctx-expand", "scope": "ctx_expand tool users", "polarity": "contract", "operativeCondition": "A summary under session-history lacks required detail.", "mechanism": "Pass the heading's start/end ordinal range to recover the original conversation.", "consequence": "Exact historical context can be restored from the summary boundary.", "evidence": "expand the range" },
-    { "id": "T-007", "title": "ctx_expand has a bounded range result", "sourceFragment": "tool-ctx-expand", "scope": "ctx_expand tool users", "polarity": "mechanism", "operativeCondition": "The requested transcript exceeds the recovery budget.", "mechanism": "Return a raw transcript capped at about 15K tokens and identify where to continue.", "consequence": "The agent can continue recovery without receiving an unbounded result.", "evidence": "capped at ~15K tokens; an oversized range returns the head" },
-    { "id": "T-008", "title": "ctx_expand verbose mode identifies parts", "sourceFragment": "tool-ctx-expand", "scope": "ctx_expand tool users", "polarity": "contract", "operativeCondition": "The agent needs to choose one message or tool call from a range.", "mechanism": "Use verbose mode to list each message ordinal separately with per-part previews and tool output sizes.", "consequence": "The agent can select a precise ordinal before full recovery.", "evidence": "lists each message SEPARATELY with its ordinal" },
-    { "id": "T-009", "title": "ctx_expand ordinal mode recovers one message", "sourceFragment": "tool-ctx-expand", "scope": "ctx_expand tool users", "polarity": "contract", "operativeCondition": "One exact message or dropped tool output is needed.", "mechanism": "Pass message=N to return all text parts and complete tool input/output for that ordinal.", "consequence": "A previously dropped output is recovered from storage rather than fabricated.", "evidence": "returns the FULL untruncated content of the message" },
-    { "id": "T-010", "title": "ctx_expand does not reread the live tail", "sourceFragment": "tool-ctx-expand", "scope": "ctx_expand tool users", "polarity": "contract", "operativeCondition": "A requested range is after the last compacted compartment.", "mechanism": "Treat that range as already visible live context and do not expand it.", "consequence": "The tool does not duplicate visible content and burn output tokens.", "evidence": "Ranges after the last compartment are your live tail" },
-    { "id": "T-011", "title": "ctx_note action contract", "sourceFragment": "tool-ctx-note", "scope": "ctx_note tool users", "polarity": "contract", "operativeCondition": "The agent has a future session concern.", "mechanism": "write saves, read lists, update changes, and dismiss retires notes; smart notes use surface_condition.", "consequence": "Each note action has an explicit lifecycle operation.", "evidence": "Actions:" },
-    { "id": "T-012", "title": "ctx_note smart conditions are external-only", "sourceFragment": "tool-ctx-note", "scope": "ctx_note tool users", "polarity": "prohibition", "operativeCondition": "A smart note is requested.", "mechanism": "Use only externally verifiable signals from GitHub, disk, git history, or web pages; never a condition that depends on this conversation or an unobservable future action.", "consequence": "The background checker can evaluate the condition without conversation access.", "evidence": "using ONLY externally verifiable signals" },
-    { "id": "T-013", "title": "ctx_memory stores standalone durable facts", "sourceFragment": "tool-ctx-memory", "scope": "ctx_memory tool users", "polarity": "contract", "operativeCondition": "A fact must survive this session.", "mechanism": "Write one standalone fact that makes sense without session context, with a category and content.", "consequence": "Future sessions can use the memory without reconstructing this conversation.", "evidence": "one standalone fact, phrased to make sense without this session's context" },
-    { "id": "T-014", "title": "ctx_memory action and privilege boundary", "sourceFragment": "tool-ctx-memory", "scope": "ctx_memory tool users", "polarity": "contract", "operativeCondition": "A memory must be changed or fetched.", "mechanism": "Use write, update, archive, merge, or get; list remains dreamer-only.", "consequence": "Primary agents cannot assume the dreamer-only list action is available.", "evidence": "remains dreamer-only" },
-     { "id": "T-015", "title": "ctx_search returns only hidden history", "sourceFragment": "tool-ctx-search", "scope": "ctx_search tool users", "polarity": "contract", "operativeCondition": "The agent needs project recall.", "mechanism": "Search memories, compacted messages, git commits, and notes while filtering memories already rendered in project-memory and the live conversation tail.", "consequence": "Search fills missing context rather than duplicating visible context.", "evidence": "Results only contain things you CANNOT currently see" },
-     { "id": "T-016", "title": "ctx_memory retrieval and source privilege", "sourceFragment": "tool-ctx-memory", "scope": "ctx_memory tool users", "polarity": "contract", "operativeCondition": "A known memory ID must be retrieved or a list operation is considered.", "mechanism": "Use get with numeric IDs; fetched memories are readable in every status, while list remains dreamer-only.", "consequence": "Primary agents use the supported retrieval path and do not assume dreamer browsing privileges.", "evidence": "readable in every status" },
-     { "id": "T-017", "title": "ctx_search source routing and ID lookup", "sourceFragment": "tool-ctx-search", "scope": "ctx_search tool users", "polarity": "contract", "operativeCondition": "A recall query needs a source boundary or direct memory lookup.", "mechanism": "Omit sources for broad search, select memory/message/git_commit/note sources for targeted retrieval, or pass memory IDs to bypass text search; message hits continue through ctx_expand.", "consequence": "Search scope and exact-memory lookup are explicit rather than guessed.", "evidence": "Sources (omit for a broad search across all):" }
-   ]
+    {
+      "id": "G-001",
+      "title": "Tagged conversation contract",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "A primary session can see tagged messages or tool outputs.",
+      "mechanism": "The system labels messages and tool outputs with \u00a7N\u00a7 identifiers.",
+      "consequence": "Tag references are the only valid handles for reduction.",
+      "evidence": "Messages and tool outputs are tagged with \u00a7N\u00a7 identifiers"
+    },
+    {
+      "id": "G-002",
+      "title": "Reduction is queued reclamation",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "Tagged content is spent and its useful information has been extracted.",
+      "mechanism": "ctx_reduce marks content discardable and queues it for release instead of deleting it immediately.",
+      "consequence": "The agent can reclaim space without treating the action as immediate erasure.",
+      "evidence": "mark spent tagged content as discardable and reclaim space"
+    },
+    {
+      "id": "G-003",
+      "title": "Protected recent tail",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "mechanism",
+      "operativeCondition": "A requested tag is within the newest protected window.",
+      "mechanism": "The last protectedTags tags remain protected; marking only queues them until they age out.",
+      "consequence": "A recent mark is harmless and cannot immediately release the protected tail.",
+      "evidence": "The last ${protectedTags} tags are protected"
+    },
+    {
+      "id": "G-004",
+      "title": "Reduction range grammar",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "The agent calls ctx_reduce.",
+      "mechanism": "The drop argument uses comma-separated IDs and inclusive ranges such as 3-5, 1,2,9, or 1-5,8,12-15.",
+      "consequence": "Other range spellings are not part of the documented contract.",
+      "evidence": "Syntax: \"3-5\", \"1,2,9\", or \"1-5,8,12-15\""
+    },
+    {
+      "id": "G-005",
+      "title": "Drops are silent",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "prohibition",
+      "operativeCondition": "The agent decides to queue a reduction.",
+      "mechanism": "Call ctx_reduce without narrating the drop in assistant prose.",
+      "consequence": "The conversation contains no redundant drop announcement.",
+      "evidence": "Do not announce or narrate"
+    },
+    {
+      "id": "G-006",
+      "title": "Review before broad drops",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "all sessions with reduction guidance",
+      "polarity": "prohibition",
+      "operativeCondition": "A large range could be dropped.",
+      "mechanism": "Inspect each tag before selecting a range; never blanket-mark a large range.",
+      "consequence": "Unreviewed evidence is not discarded accidentally.",
+      "evidence": "NEVER drop large ranges blindly"
+    },
+    {
+      "id": "G-007",
+      "title": "Drop only extracted material",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "A tag is being considered for discard.",
+      "mechanism": "Keep unresolved errors, unextracted raw evidence, and wording whose exact form may matter; drop only genuinely finished outputs.",
+      "consequence": "Reduction preserves information that still affects the task.",
+      "evidence": "only large tool outputs are worth dropping"
+    },
+    {
+      "id": "G-008",
+      "title": "Preserve user intent",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "prohibition",
+      "operativeCondition": "An old user message contains instructions or intent.",
+      "mechanism": "Never drop a user message for its directive; only an extracted large pasted block may be marked.",
+      "consequence": "Historical user requirements remain authoritative.",
+      "evidence": "Keep your user's instructions and intent"
+    },
+    {
+      "id": "G-009",
+      "title": "Retain assistant conversation text",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "Assistant prose is present in context.",
+      "mechanism": "Keep assistant text unless it is exceptionally large; prioritize large tool outputs for reduction.",
+      "consequence": "Conversation reasoning remains available while tool bloat is reclaimed.",
+      "evidence": "NEVER drop assistant text messages unless they are exceptionally large"
+    },
+    {
+      "id": "G-010",
+      "title": "Routine reduction timing",
+      "sourceFragment": "guidance-generic-reduction",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "mechanism",
+      "operativeCondition": "The agent has finished using a large output, logical step, or context area.",
+      "mechanism": "Consider ctx_reduce after acted-on reads, completed logical steps, before major context switches, and before the turn ends.",
+      "consequence": "The working set stays lean without changing task scope.",
+      "evidence": "After completing a logical step \u2014 drop intermediate outputs from that step."
+    },
+    {
+      "id": "G-011",
+      "title": "Long-term continuity",
+      "sourceFragment": "guidance-long-term-frame",
+      "scope": "primary sessions",
+      "polarity": "contract",
+      "operativeCondition": "The session continues after one task or across compaction.",
+      "mechanism": "Treat the session as a durable project relationship with retrievable history and persistent knowledge.",
+      "consequence": "Finishing one task does not terminate the working relationship.",
+      "evidence": "This session is a durable working relationship"
+    },
+    {
+      "id": "G-012",
+      "title": "No context-scarcity behavior",
+      "sourceFragment": "guidance-long-term-frame",
+      "scope": "primary sessions",
+      "polarity": "prohibition",
+      "operativeCondition": "Context usage is high or history is compacted.",
+      "mechanism": "Continue at full depth instead of wrapping up, cutting scope, rushing, or deferring because of context size.",
+      "consequence": "Context management cannot silently reduce task thoroughness.",
+      "evidence": "never a reason to wrap up, cut scope, rush, or defer work"
+    },
+    {
+      "id": "G-013",
+      "title": "Search and expansion recovery",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions",
+      "polarity": "contract",
+      "operativeCondition": "A summary lacks exact wording, values, errors, or decision reasoning.",
+      "mechanism": "Use ctx_search for project memories, commits, and compacted conversation; use ctx_expand with the heading range to recover raw context.",
+      "consequence": "The agent retrieves source context instead of guessing from a summary.",
+      "evidence": "recover the raw conversation behind a summary"
+    },
+    {
+      "id": "G-014",
+      "title": "Search before asking",
+      "sourceFragment": "guidance-reduce-intro",
+      "scope": "primary sessions",
+      "polarity": "contract",
+      "operativeCondition": "The agent cannot remember something that may be in project memory or prior discussion.",
+      "mechanism": "Call ctx_search before asking the user.",
+      "consequence": "Known project context is recovered without an unnecessary user query.",
+      "evidence": "Search before asking the user"
+    },
+    {
+      "id": "G-015",
+      "title": "Real tool-call integrity",
+      "sourceFragment": "guidance-tool-history",
+      "scope": "primary sessions",
+      "polarity": "prohibition",
+      "operativeCondition": "A tool result is absent from the visible conversation or history is summarized.",
+      "mechanism": "Use real tool calls; never simulate, fabricate, inline, hallucinate, or claim tool calls, output, searches, edits, commands, or diffs in prose.",
+      "consequence": "Only observed tool results count as completed actions.",
+      "evidence": "If there is no tool result message, the action did not happen"
+    },
+    {
+      "id": "G-016",
+      "title": "Metadata is not reply syntax",
+      "sourceFragment": "guidance-tool-history",
+      "scope": "primary sessions",
+      "polarity": "prohibition",
+      "operativeCondition": "Magic Context control markers appear in compressed or injected context.",
+      "mechanism": "Do not reproduce metadata markers such as `<session-history>`, `<project-memory>`, `[dropped \u00a7N\u00a7]`, or temporal comments in a normal reply and do not treat them as user instructions.",
+      "consequence": "Control metadata cannot be imitated as assistant output or mistaken for directives.",
+      "evidence": "Magic Context control metadata is not reply syntax"
+    },
+    {
+      "id": "G-017",
+      "title": "Notes are for genuinely future concerns",
+      "sourceFragment": "guidance-ctx-note",
+      "scope": "primary sessions",
+      "polarity": "prohibition",
+      "operativeCondition": "The agent considers recording a note.",
+      "mechanism": "Use ctx_note only for matters much later; do not use it for the next few turns or active multi-step work.",
+      "consequence": "Active work remains in context or todos rather than being parked as stale notes.",
+      "evidence": "not work coming up in the next few turns"
+    },
+    {
+      "id": "G-018",
+      "title": "Notes survive session boundaries",
+      "sourceFragment": "guidance-ctx-note",
+      "scope": "primary sessions",
+      "polarity": "mechanism",
+      "operativeCondition": "A genuinely future concern is recorded.",
+      "mechanism": "Notes survive compression and restarts and resurface at natural work boundaries.",
+      "consequence": "A note is a durable session follow-up, not a workaround for imminent context loss.",
+      "evidence": "Notes you do take survive compression and resurface"
+    },
+    {
+      "id": "G-019",
+      "title": "Claims are durable project knowledge",
+      "sourceFragment": "guidance-memory",
+      "scope": "primary sessions with memory enabled",
+      "polarity": "contract",
+      "operativeCondition": "A fact must be available to future sessions.",
+      "mechanism": "Use ctx_memory to create durable claims and revise, archive, restore, or merge them when facts drift.",
+      "consequence": "Future sessions start with maintained project knowledge.",
+      "evidence": "Claims persist across sessions"
+    },
+    {
+      "id": "G-020",
+      "title": "Proactive durable-claim capture",
+      "sourceFragment": "guidance-memory",
+      "scope": "primary sessions with memory enabled",
+      "polarity": "mechanism",
+      "operativeCondition": "Several turns were spent discovering a path, command, pattern, or hard-won constraint.",
+      "mechanism": "Create the reusable claim with its category and content.",
+      "consequence": "Future sessions do not repeat the same discovery work.",
+      "evidence": "Save durable knowledge proactively"
+    },
+    {
+      "id": "G-021",
+      "title": "Reduction trigger taxonomy",
+      "sourceFragment": "guidance-generic-reduction",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "mechanism",
+      "operativeCondition": "The agent has acted on raw exploration or changes task area.",
+      "mechanism": "Reduce after acted-on reads/searches, completed logical steps, and before major context switches.",
+      "consequence": "Intermediate evidence is reclaimed at meaningful boundaries.",
+      "evidence": "Between major context switches"
+    },
+    {
+      "id": "G-022",
+      "title": "Drop large consumed outputs",
+      "sourceFragment": "guidance-generic-reduction",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "A large read, search, diagnostic, build, or test output has already been analyzed.",
+      "mechanism": "Drop the raw output after acting on it; retain unresolved errors and current work context.",
+      "consequence": "Useful evidence remains while redundant volume is removed.",
+      "evidence": "Large build/test output after you analyzed and acted on it"
+    },
+    {
+      "id": "G-023",
+      "title": "Keep active task context",
+      "sourceFragment": "guidance-generic-reduction",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "The agent is selecting content to retain.",
+      "mechanism": "Keep task requirements, constraints, recent errors, unresolved decisions, active work, and files being edited.",
+      "consequence": "The current task remains grounded after reduction.",
+      "evidence": "Your current task requirements and constraints"
+    },
+    {
+      "id": "G-024",
+      "title": "Prefer targeted operations",
+      "sourceFragment": "guidance-generic-reduction",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "The agent can choose between broad and focused context operations.",
+      "mechanism": "Prefer many small targeted operations and keep the working set tidy as routine maintenance.",
+      "consequence": "Reduction avoids broad irreversible-looking guesses.",
+      "evidence": "Prefer many small targeted operations over one large blanket operation"
+    },
+    {
+      "id": "G-025",
+      "title": "Memory guidance is feature-gated",
+      "sourceFragment": "guidance-memory",
+      "scope": "primary sessions with memory enabled",
+      "polarity": "mechanism",
+      "operativeCondition": "The memory block is enabled and project-memory is injected.",
+      "mechanism": "Compose the memory instructions only when memory is enabled; omit them when disabled.",
+      "consequence": "The prompt does not advertise a memory surface that is unavailable.",
+      "evidence": "Gated out when `memory.enabled: false`"
+    },
+    {
+      "id": "G-026",
+      "title": "Temporal boundary interpretation",
+      "sourceFragment": "guidance-temporal",
+      "scope": "primary sessions with temporal awareness enabled",
+      "polarity": "contract",
+      "operativeCondition": "Temporal HTML comments or session-history date attributes are present.",
+      "mechanism": "Use elapsed-time comments and start-date/end-date boundaries when reasoning about pacing and durations.",
+      "consequence": "Workflow timing is based on real session boundaries.",
+      "evidence": "Use these when reasoning about workflow pacing"
+    },
+    {
+      "id": "G-027",
+      "title": "Caveman compression is not a style",
+      "sourceFragment": "guidance-caveman",
+      "scope": "primary sessions with caveman compression enabled",
+      "polarity": "prohibition",
+      "operativeCondition": "Older compressed text uses terse caveman style.",
+      "mechanism": "Write new turns in normal prose and consciously revert if the output drifts.",
+      "consequence": "Compression artifacts do not become new assistant voice.",
+      "evidence": "DO NOT mimic this style in new turns"
+    },
+    {
+      "id": "G-028",
+      "title": "Preserve structural language tokens",
+      "sourceFragment": "guidance-language",
+      "scope": "primary sessions with a configured language",
+      "polarity": "contract",
+      "operativeCondition": "A primary reply language is configured.",
+      "mechanism": "Use the requested language for natural prose while keeping code, identifiers, paths, commands, logs, and quoted text verbatim.",
+      "consequence": "Localized prose cannot corrupt machine-readable or source-identifying text.",
+      "evidence": "Keep code, identifiers, file paths, commands, logs, and quoted text verbatim"
+    },
+    {
+      "id": "G-029",
+      "title": "Subagents receive only bounded reduction mechanics",
+      "sourceFragment": "guidance-subagent-reduce",
+      "scope": "subagent sessions",
+      "polarity": "contract",
+      "operativeCondition": "The session is a bounded single-task subagent with ctx_reduce.",
+      "mechanism": "Compose the marker, tag range syntax, protected tail, silent reduction, no blanket drops, and real-tool requirement without primary partner, memory, note, or search curation.",
+      "consequence": "A subagent gets the mechanics it can observe without primary-session obligations.",
+      "evidence": "Minimal guidance for SUBAGENT sessions"
+    },
+    {
+      "id": "G-030",
+      "title": "Subagent dropped-sentinel asymmetry",
+      "sourceFragment": "guidance-subagent-reduce",
+      "scope": "subagent sessions",
+      "polarity": "prohibition",
+      "operativeCondition": "Older tool calls appear as `[dropped \u00a7N\u00a7]` sentinels in a subagent context.",
+      "mechanism": "Treat sentinels as normal context management, never as a pattern to copy; make a fresh real tool call and never fabricate or inline its output.",
+      "consequence": "The dropped placeholder cannot be imitated as assistant content.",
+      "evidence": "sentinels; that is normal context management, not a pattern to copy.",
+      "asymmetry": "This exact sentinel-imitation clause is present in SUBAGENT_REDUCE_INTRO and not in BASE_INTRO; the checklist intentionally keeps its primary rows not-present."
+    },
+    {
+      "id": "G-031",
+      "title": "Subagents retain user and assistant text",
+      "sourceFragment": "guidance-subagent-reduce",
+      "scope": "subagent sessions",
+      "polarity": "prohibition",
+      "operativeCondition": "A subagent chooses content to drop.",
+      "mechanism": "Drop only large tool outputs; do not drop user or assistant text messages.",
+      "consequence": "The child task keeps its instructions and conversational reasoning.",
+      "evidence": "Do not drop user or assistant text messages"
+    },
+    {
+      "id": "G-032",
+      "title": "Subagents review ranges before dropping",
+      "sourceFragment": "guidance-subagent-reduce",
+      "scope": "subagent sessions",
+      "polarity": "prohibition",
+      "operativeCondition": "A large tag range is under consideration.",
+      "mechanism": "Review each tag before selecting a drop range; never drop a large range blindly.",
+      "consequence": "The bounded child does not discard mixed-value evidence by shortcut.",
+      "evidence": "NEVER drop large ranges blindly"
+    },
+    {
+      "id": "G-033",
+      "title": "Reduction prompts are housekeeping, not scarcity",
+      "sourceFragment": "guidance-reduce-closer",
+      "scope": "primary sessions with ctx_reduce",
+      "polarity": "prohibition",
+      "operativeCondition": "Context usage or a reduction prompt is visible.",
+      "mechanism": "Treat reduction as routine maintenance and never reduce task scope or depth because context is large.",
+      "consequence": "Cache maintenance cannot cause the agent to rush, defer, or omit work.",
+      "evidence": "never let context size change *what* work you take on or *how thoroughly*"
+    },
+    {
+      "id": "G-034",
+      "title": "No-reduce sessions are automatically managed",
+      "sourceFragment": "guidance-no-reduce-closer",
+      "scope": "primary sessions without ctx_reduce",
+      "polarity": "prohibition",
+      "operativeCondition": "The reduction tool is unavailable.",
+      "mechanism": "Rely on automatic context management; do not prune, heed reduction warnings, or cut task scope or depth.",
+      "consequence": "An unavailable reduction tool cannot create false manual housekeeping obligations.",
+      "evidence": "there's nothing to prune and no warnings to act on"
+    },
+    {
+      "id": "G-035",
+      "title": "No-reduce sessions retain recovery guidance without pruning instructions",
+      "sourceFragment": "guidance-no-reduce-intro",
+      "scope": "primary sessions without ctx_reduce",
+      "polarity": "contract",
+      "operativeCondition": "Prior project or compacted-session context is needed while ctx_reduce is unavailable.",
+      "mechanism": "Keep note, memory, search, expansion, and real-tool guidance while omitting tag and reduction mechanics.",
+      "consequence": "The agent can recover hidden context without being told to call an unavailable tool.",
+      "evidence": "when ctx_reduce is unavailable"
+    },
+    {
+      "id": "T-001",
+      "title": "ctx_reduce queues release",
+      "sourceFragment": "tool-ctx-reduce",
+      "scope": "ctx_reduce tool users",
+      "polarity": "contract",
+      "operativeCondition": "A spent tagged output should leave the working set.",
+      "mechanism": "Mark it discardable; release is queued and delayed until context space is needed.",
+      "consequence": "The original remains visible until the system releases it.",
+      "evidence": "Marking QUEUES content for release"
+    },
+    {
+      "id": "T-002",
+      "title": "ctx_reduce protects newest tags",
+      "sourceFragment": "tool-ctx-reduce",
+      "scope": "ctx_reduce tool users",
+      "polarity": "mechanism",
+      "operativeCondition": "A requested tag is in the recent window.",
+      "mechanism": "The newest tags are protected and age out before release.",
+      "consequence": "Marking recent output is harmless.",
+      "evidence": "The newest tags are protected"
+    },
+    {
+      "id": "T-003",
+      "title": "ctx_reduce recovery is explicit",
+      "sourceFragment": "tool-ctx-reduce",
+      "scope": "ctx_reduce tool users",
+      "polarity": "contract",
+      "operativeCondition": "Content has finally been released.",
+      "mechanism": "It becomes a short placeholder; rerun the recovery tool to get it back, and mark only content that is genuinely done.",
+      "consequence": "The agent does not treat an unrecovered output as safely disposable.",
+      "evidence": "re-running the tool is the only way to get it back"
+    },
+    {
+      "id": "T-004",
+      "title": "ctx_reduce eligible output boundary",
+      "sourceFragment": "tool-ctx-reduce",
+      "scope": "ctx_reduce tool users",
+      "polarity": "contract",
+      "operativeCondition": "Choosing output to mark.",
+      "mechanism": "Prefer summarized, repeated, redundant, persisted, or merely confirmatory status output; keep user messages, unresolved errors, raw evidence, and exact wording that matters.",
+      "consequence": "Reduction preserves unresolved and authoritative evidence.",
+      "evidence": "Keep: user messages, unresolved errors, raw evidence you haven't extracted yet"
+    },
+    {
+      "id": "T-005",
+      "title": "ctx_reduce rejects blind ranges",
+      "sourceFragment": "tool-ctx-reduce",
+      "scope": "ctx_reduce tool users",
+      "polarity": "prohibition",
+      "operativeCondition": "A large range is under consideration.",
+      "mechanism": "Review every tag before calling the drop parameter.",
+      "consequence": "A blanket range cannot silently discard mixed-value content.",
+      "evidence": "Never blanket-mark large ranges"
+    },
+    {
+      "id": "T-006",
+      "title": "ctx_expand uses compacted headings",
+      "sourceFragment": "tool-ctx-expand",
+      "scope": "ctx_expand tool users",
+      "polarity": "contract",
+      "operativeCondition": "A summary under session-history lacks required detail.",
+      "mechanism": "Pass the heading's start/end ordinal range to recover the original conversation.",
+      "consequence": "Exact historical context can be restored from the summary boundary.",
+      "evidence": "expand the range"
+    },
+    {
+      "id": "T-007",
+      "title": "ctx_expand has a bounded range result",
+      "sourceFragment": "tool-ctx-expand",
+      "scope": "ctx_expand tool users",
+      "polarity": "mechanism",
+      "operativeCondition": "The requested transcript exceeds the recovery budget.",
+      "mechanism": "Return a raw transcript capped at about 15K tokens and identify where to continue.",
+      "consequence": "The agent can continue recovery without receiving an unbounded result.",
+      "evidence": "capped at ~15K tokens; an oversized range returns the head"
+    },
+    {
+      "id": "T-008",
+      "title": "ctx_expand verbose mode identifies parts",
+      "sourceFragment": "tool-ctx-expand",
+      "scope": "ctx_expand tool users",
+      "polarity": "contract",
+      "operativeCondition": "The agent needs to choose one message or tool call from a range.",
+      "mechanism": "Use verbose mode to list each message ordinal separately with per-part previews and tool output sizes.",
+      "consequence": "The agent can select a precise ordinal before full recovery.",
+      "evidence": "lists each message SEPARATELY with its ordinal"
+    },
+    {
+      "id": "T-009",
+      "title": "ctx_expand ordinal mode recovers one message",
+      "sourceFragment": "tool-ctx-expand",
+      "scope": "ctx_expand tool users",
+      "polarity": "contract",
+      "operativeCondition": "One exact message or dropped tool output is needed.",
+      "mechanism": "Pass message=N to return all text parts and complete tool input/output for that ordinal.",
+      "consequence": "A previously dropped output is recovered from storage rather than fabricated.",
+      "evidence": "returns the FULL untruncated content of the message"
+    },
+    {
+      "id": "T-010",
+      "title": "ctx_expand does not reread the live tail",
+      "sourceFragment": "tool-ctx-expand",
+      "scope": "ctx_expand tool users",
+      "polarity": "contract",
+      "operativeCondition": "A requested range is after the last compacted compartment.",
+      "mechanism": "Treat that range as already visible live context and do not expand it.",
+      "consequence": "The tool does not duplicate visible content and burn output tokens.",
+      "evidence": "Ranges after the last compartment are your live tail"
+    },
+    {
+      "id": "T-011",
+      "title": "ctx_note action contract",
+      "sourceFragment": "tool-ctx-note",
+      "scope": "ctx_note tool users",
+      "polarity": "contract",
+      "operativeCondition": "The agent has a future session concern.",
+      "mechanism": "write saves, read lists, update changes, and dismiss retires notes; smart notes use surface_condition.",
+      "consequence": "Each note action has an explicit lifecycle operation.",
+      "evidence": "Actions:"
+    },
+    {
+      "id": "T-012",
+      "title": "ctx_note smart conditions are external-only",
+      "sourceFragment": "tool-ctx-note",
+      "scope": "ctx_note tool users",
+      "polarity": "prohibition",
+      "operativeCondition": "A smart note is requested.",
+      "mechanism": "Use only externally verifiable signals from GitHub, disk, git history, or web pages; never a condition that depends on this conversation or an unobservable future action.",
+      "consequence": "The background checker can evaluate the condition without conversation access.",
+      "evidence": "using ONLY externally verifiable signals"
+    },
+    {
+      "id": "T-013",
+      "title": "ctx_memory stores durable project claims",
+      "sourceFragment": "tool-ctx-memory",
+      "scope": "ctx_memory tool users",
+      "polarity": "contract",
+      "operativeCondition": "A fact must survive this session.",
+      "mechanism": "Create one durable project claim with category and content.",
+      "consequence": "Future sessions can use the memory without reconstructing this conversation.",
+      "evidence": "create a claim (content + category)"
+    },
+    {
+      "id": "T-014",
+      "title": "ctx_memory action and privilege boundary",
+      "sourceFragment": "tool-ctx-memory",
+      "scope": "ctx_memory tool users",
+      "polarity": "contract",
+      "operativeCondition": "A memory must be changed or fetched.",
+      "mechanism": "Use create, get, revise, archive, restore, or merge; list remains dreamer-only.",
+      "consequence": "Primary agents cannot assume the dreamer-only list action is available.",
+      "evidence": "list: enumerate visible active claims (dreamer maintenance only)"
+    },
+    {
+      "id": "T-015",
+      "title": "ctx_search returns only hidden history",
+      "sourceFragment": "tool-ctx-search",
+      "scope": "ctx_search tool users",
+      "polarity": "contract",
+      "operativeCondition": "The agent needs project recall.",
+      "mechanism": "Search memories, compacted messages, git commits, and notes while filtering memories already rendered in project-memory and the live conversation tail.",
+      "consequence": "Search fills missing context rather than duplicating visible context.",
+      "evidence": "Results only contain things you CANNOT currently see"
+    },
+    {
+      "id": "T-016",
+      "title": "ctx_memory identity and mutation boundary",
+      "sourceFragment": "tool-ctx-memory",
+      "scope": "ctx_memory tool users",
+      "polarity": "contract",
+      "operativeCondition": "A known claim must be fetched or changed.",
+      "mechanism": "Use get with opaque public IDs and the current mutation token for changes; list remains dreamer-only.",
+      "consequence": "Primary agents use canonical claim identities and cannot assume dreamer browsing privileges.",
+      "evidence": "Reuse the exact token returned by create/get/list"
+    },
+    {
+      "id": "T-017",
+      "title": "ctx_search source routing and ID lookup",
+      "sourceFragment": "tool-ctx-search",
+      "scope": "ctx_search tool users",
+      "polarity": "contract",
+      "operativeCondition": "A recall query needs a source boundary or direct memory lookup.",
+      "mechanism": "Omit sources for broad search, select memory/message/git_commit/note sources for targeted retrieval, or pass memory IDs to bypass text search; message hits continue through ctx_expand.",
+      "consequence": "Search scope and exact-memory lookup are explicit rather than guessed.",
+      "evidence": "Sources (omit for a broad search across all):"
+    }
+  ]
 }

@@ -463,15 +463,15 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **not-present** |
 | `tool-memory-disabled` | **not-present** |
 
-### G-019 — Memory is durable project knowledge
+### G-019 — Claims are durable project knowledge
 
 - **Source fragment:** `guidance-memory`
 - **Scope:** primary sessions with memory enabled
 - **Polarity:** contract
 - **Operative condition:** A fact must be available to future sessions.
-- **Mechanism:** Use ctx_memory for durable project knowledge and update, archive, or merge memories when facts drift.
+- **Mechanism:** Use ctx_memory to create durable claims and revise, archive, restore, or merge them when facts drift.
 - **Consequence:** Future sessions start with maintained project knowledge.
-- **Source evidence:** `Memories persist across sessions`
+- **Source evidence:** `Claims persist across sessions`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -487,15 +487,15 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **not-present** |
 | `tool-memory-disabled` | **not-present** |
 
-### G-020 — Proactive memory capture
+### G-020 — Proactive durable-claim capture
 
 - **Source fragment:** `guidance-memory`
 - **Scope:** primary sessions with memory enabled
 - **Polarity:** mechanism
 - **Operative condition:** Several turns were spent discovering a path, command, pattern, or hard-won constraint.
-- **Mechanism:** Save the reusable fact to ctx_memory with its category and content.
+- **Mechanism:** Create the reusable claim with its category and content.
 - **Consequence:** Future sessions do not repeat the same discovery work.
-- **Source evidence:** `Save to memory proactively`
+- **Source evidence:** `Save durable knowledge proactively`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1164,15 +1164,15 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **compressed** |
 | `tool-memory-disabled` | **compressed** |
 
-### T-013 — ctx_memory stores standalone durable facts
+### T-013 — ctx_memory stores durable project claims
 
 - **Source fragment:** `tool-ctx-memory`
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
 - **Operative condition:** A fact must survive this session.
-- **Mechanism:** Write one standalone fact that makes sense without session context, with a category and content.
+- **Mechanism:** Create one durable project claim with category and content.
 - **Consequence:** Future sessions can use the memory without reconstructing this conversation.
-- **Source evidence:** `one standalone fact, phrased to make sense without this session's context`
+- **Source evidence:** `create a claim (content + category)`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1194,9 +1194,9 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
 - **Operative condition:** A memory must be changed or fetched.
-- **Mechanism:** Use write, update, archive, merge, or get; list remains dreamer-only.
+- **Mechanism:** Use create, get, revise, archive, restore, or merge; list remains dreamer-only.
 - **Consequence:** Primary agents cannot assume the dreamer-only list action is available.
-- **Source evidence:** `remains dreamer-only`
+- **Source evidence:** `list: enumerate visible active claims (dreamer maintenance only)`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1236,15 +1236,15 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **compressed** |
 | `tool-memory-disabled` | **compressed** |
 
-### T-016 — ctx_memory retrieval and source privilege
+### T-016 — ctx_memory identity and mutation boundary
 
 - **Source fragment:** `tool-ctx-memory`
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
-- **Operative condition:** A known memory ID must be retrieved or a list operation is considered.
-- **Mechanism:** Use get with numeric IDs; fetched memories are readable in every status, while list remains dreamer-only.
-- **Consequence:** Primary agents use the supported retrieval path and do not assume dreamer browsing privileges.
-- **Source evidence:** `readable in every status`
+- **Operative condition:** A known claim must be fetched or changed.
+- **Mechanism:** Use get with opaque public IDs and the current mutation token for changes; list remains dreamer-only.
+- **Consequence:** Primary agents use canonical claim identities and cannot assume dreamer browsing privileges.
+- **Source evidence:** `Reuse the exact token returned by create/get/list`
 
 | Variant | Applicability status |
 | --- | --- |
