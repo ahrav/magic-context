@@ -227,4 +227,25 @@ describe("TCP adapter specifics", () => {
         expect(h.closes[0]?.reason).toBe("frame_deadline");
         expect(h.channel.stats().activeTimers).toBe(0);
     });
+
+    test("the producer compatibility copy is charged while spans are still resident", async () => {
+        const h = await createHarness();
+        const capacity = 1000;
+        const producer = h.channel.reserve(
+            {
+                ver: PROTOCOL_VERSION,
+                ty: FrameType.Request,
+                flags: 0,
+                channel: CHANNEL,
+                epoch: EPOCH,
+                corr: 1n,
+            },
+            capacity,
+        );
+        producer.write(Buffer.alloc(capacity, 7));
+        producer.commit(capacity);
+        // Spans (capacity) and the queued copy (capacity) are both charged at
+        // the commit boundary, so peak reflects the true double residency.
+        expect(h.budget.peak).toBeGreaterThanOrEqual(2 * capacity);
+    });
 });

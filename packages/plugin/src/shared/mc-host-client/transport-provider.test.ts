@@ -41,7 +41,11 @@ function fakeProviderChannel(overrides: Partial<SetupFrameChannel>): SetupFrameC
     };
 }
 
-function wrap(channel: SetupFrameChannel, budget = new ByteBudget(1024)) {
+function wrap(
+    channel: SetupFrameChannel,
+    budget = new ByteBudget(1024),
+    onFrame: FrameChannelHandlers["onFrame"] = () => {},
+) {
     const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
     let captured: FrameChannelHandlers | undefined;
     const provider: ClientTransportProvider = {
@@ -60,7 +64,7 @@ function wrap(channel: SetupFrameChannel, budget = new ByteBudget(1024)) {
         budget,
         maxBodyLen: 1024,
         handlers: {
-            onFrame: () => {},
+            onFrame,
             onClosed: (reason, error) => closes.push({ reason, error }),
         },
     });
@@ -229,5 +233,77 @@ describe("sanitized provider channel", () => {
         expect(closes.map((entry) => entry.reason)).toEqual(["protocol_violation"]);
         expect(budget.used).toBe(5);
         expect(wrapped.stats().quarantinedBytes).toBe(5);
+    });
+
+    test("a duplicate still-active source lease is rejected without touching the original", () => {
+        const budget = new ByteBudget(1024);
+        const dispatched: unknown[] = [];
+        const { handlers, closes } = wrap(fakeProviderChannel({}), budget, (frame) =>
+            dispatched.push(frame),
+        );
+        const segment = new Uint8Array(new ArrayBuffer(5));
+        const sourceLease = new ReceiveLease(
+            [segment],
+            () => {},
+            new CopyCounter(),
+            () => true,
+        );
+        const frame = {
+            header: {
+                len: 5,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType.Response,
+                flags: 0,
+                channel: 7,
+                epoch: 1,
+                corr: 1n,
+            },
+            body: sourceLease,
+        };
+        handlers.onFrame(frame);
+        expect(dispatched.length).toBe(1);
+        // Same still-active lease delivered again: two wrappers over the same
+        // segments would let either release detach the other's body.
+        handlers.onFrame(frame);
+        expect(dispatched.length).toBe(1);
+        expect(closes.map((entry) => entry.reason)).toEqual(["protocol_violation"]);
+        // The rejection must not release the lease the first wrapper owns.
+        expect(sourceLease.isReleased()).toBe(false);
+        expect(budget.used).toBe(5);
+    });
+
+    test("frames delivered after close are dropped without charging the frozen budget", () => {
+        const budget = new ByteBudget(1024);
+        const dispatched: unknown[] = [];
+        const { handlers, wrapped, closes } = wrap(fakeProviderChannel({}), budget, (frame) =>
+            dispatched.push(frame),
+        );
+        // Retirement order: the owner freezes and zeroes the budget, then
+        // closes the channel; a late provider frame must not re-charge it.
+        budget.freeze();
+        wrapped.close(undefined);
+        const segment = new Uint8Array(new ArrayBuffer(5));
+        const lateLease = new ReceiveLease(
+            [segment],
+            () => {},
+            new CopyCounter(),
+            () => true,
+        );
+        handlers.onFrame({
+            header: {
+                len: 5,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType.Response,
+                flags: 0,
+                channel: 7,
+                epoch: 1,
+                corr: 1n,
+            },
+            body: lateLease,
+        });
+        expect(dispatched).toEqual([]);
+        expect(closes).toEqual([]);
+        expect(budget.used).toBe(0);
+        expect(lateLease.isReleased()).toBe(true);
     });
 });

@@ -348,11 +348,26 @@ export class TcpFrameChannel implements FrameChannel {
                 (segments, exactLength) => {
                     const fullHeader: EnvelopeHeader = { ...header, len: exactLength };
                     const headerBytes = Buffer.from(encodeHeader(fullHeader));
-                    const body = Buffer.allocUnsafeSlow(exactLength);
-                    let offset = 0;
-                    for (const segment of segments) {
-                        body.set(segment, offset);
-                        offset += segment.byteLength;
+                    // The compatibility copy is double-resident with the
+                    // reserved spans until publication detaches them, so it
+                    // takes its own charge and shows up in memoryUsed and
+                    // memoryPeak. No cap refusal here: a successful reserve
+                    // guarantees commit (the producer contract), and the
+                    // overshoot is bounded to one frame body.
+                    if (exactLength > 0) {
+                        this.chargeQueue(exactLength);
+                    }
+                    let body: Buffer;
+                    try {
+                        body = Buffer.allocUnsafeSlow(exactLength);
+                        let offset = 0;
+                        for (const segment of segments) {
+                            body.set(segment, offset);
+                            offset += segment.byteLength;
+                        }
+                    } catch (error) {
+                        if (exactLength > 0) this.releaseQueue(exactLength);
+                        throw error;
                     }
                     this.copyCounter.record();
                     const bytes = HEADER_LEN + exactLength;
@@ -366,6 +381,7 @@ export class TcpFrameChannel implements FrameChannel {
                     return {
                         publish: () => {
                             if (!held || this.closed) {
+                                if (exactLength > 0) this.releaseQueue(exactLength);
                                 release();
                                 throw new SubcCallError(
                                     "not_sent",
@@ -377,8 +393,11 @@ export class TcpFrameChannel implements FrameChannel {
                             if (producer) this.producerReservations.delete(producer);
                             this.reservedDataFrames--;
                             this.reservedDataBytes -= reservedBytes;
-                            const excess = reservedBytes - bytes;
-                            if (excess > 0) this.releaseQueue(excess);
+                            // Commit detached the span buffers, so their whole
+                            // charge (capacity) releases here; the copy's own
+                            // charge plus the retained header now cover the
+                            // queued item until the socket drains it.
+                            if (capacity > 0) this.releaseQueue(capacity);
                             this.enqueueReservedItem(item);
                             return { cancel: () => this.cancelQueuedItem(item) };
                         },

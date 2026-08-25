@@ -241,8 +241,18 @@ export function sanitizedCandidateFactory(
         // FrameChannel contract, instead of waiting out their deadlines.
         const flushWaiters = new Set<() => void>();
         const receiveLeases = new Set<ReceiveLease>();
+        // Source-lease identity: a provider delivering the same still-active
+        // lease twice would get two wrappers over the same segments, where
+        // releasing either detaches the shared lease and silently invalidates
+        // the other caller's body.
+        const activeSourceLeases = new Set<ReceiveLease>();
         const copyCounter = new CopyCounter();
         let quarantinedBytes = 0;
+        // Set before the provider learns about any close, so a provider that
+        // synchronously delivers a final frame from close(), or replays a
+        // queued callback after retirement, is fenced out of charging the
+        // frozen budget or dispatching past the owner.
+        let wrapperClosed = false;
         // Single close path: EVERY channel close — provider-reported or
         // wrapper-detected — drains the flush waiters first, so no pending
         // flush outlives the close that should have settled it.
@@ -250,6 +260,8 @@ export function sanitizedCandidateFactory(
             reason: FrameChannelCloseReason,
             phase: "channel" | "send",
         ): void => {
+            if (wrapperClosed) return;
+            wrapperClosed = true;
             for (const settle of [...flushWaiters]) settle();
             args.handlers.onClosed(reason, sanitizedProviderError(transport, phase));
         };
@@ -269,6 +281,21 @@ export function sanitizedCandidateFactory(
         const upstreamDiagnostic = args.handlers.onDiagnostic;
         const handlers: FrameChannelHandlers = {
             onFrame: (frame) => {
+                // A frame arriving after close — a provider close() delivering
+                // synchronously, or a queued callback running after owner
+                // retirement — must not charge the frozen budget or dispatch:
+                // its lease is released and the delivery dropped.
+                if (wrapperClosed) {
+                    try {
+                        const lateBody = frame.body;
+                        if (lateBody instanceof ReceiveLease && !lateBody.isReleased()) {
+                            lateBody.release();
+                        }
+                    } catch {
+                        // Best-effort: the channel is already closed either way.
+                    }
+                    return;
+                }
                 // Snapshot and structurally validate the provider frame: a
                 // throwing getter or malformed shape becomes one bounded
                 // channel close, never an exception unwinding through the
@@ -306,7 +333,15 @@ export function sanitizedCandidateFactory(
                     ) {
                         throw new Error("malformed provider frame");
                     }
+                    // A lease already wrapped by an earlier delivery stays
+                    // owned by its wrapper: releasing it here would detach the
+                    // segments under that wrapper's caller. sourceLease stays
+                    // null so the catch below cannot touch it.
+                    if (activeSourceLeases.has(providerLease)) {
+                        throw new Error("duplicate provider lease");
+                    }
                     sourceLease = providerLease;
+                    activeSourceLeases.add(providerLease);
                     // Wire widths: `validateHeader` checks flag semantics and
                     // identity rules but NOT field ranges (those live in
                     // `encodeHeader`, which an inbound frame never reaches),
@@ -368,6 +403,7 @@ export function sanitizedCandidateFactory(
                         segments,
                         (outcome) => {
                             receiveLeases.delete(safeLease);
+                            activeSourceLeases.delete(providerLease);
                             if (outcome === "released") {
                                 if (charged > 0) args.budget.release(charged);
                             } else {
@@ -383,12 +419,15 @@ export function sanitizedCandidateFactory(
                     snapshot = { header: safeHeader, body: safeLease };
                 } catch {
                     let retained = false;
-                    if (sourceLease && !sourceLease.isReleased()) {
-                        try {
-                            sourceLease.release();
-                        } catch {
-                            quarantinedBytes += charged;
-                            retained = true;
+                    if (sourceLease) {
+                        activeSourceLeases.delete(sourceLease);
+                        if (!sourceLease.isReleased()) {
+                            try {
+                                sourceLease.release();
+                            } catch {
+                                quarantinedBytes += charged;
+                                retained = true;
+                            }
                         }
                     }
                     if (charged > 0 && !retained) args.budget.release(charged);
@@ -722,6 +761,10 @@ export function sanitizedCandidateFactory(
                     }
                 }),
             close: (error) => {
+                // Fenced before the provider observes the close: a final
+                // frame delivered synchronously from channel.close() must not
+                // charge the frozen budget or dispatch past retirement.
+                wrapperClosed = true;
                 for (const lease of [...receiveLeases]) {
                     try {
                         lease.release();
