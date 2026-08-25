@@ -111,6 +111,9 @@ export function probeCapabilities(): NativeCapabilities {
     if (process.platform !== "linux") {
         return { available: false, ...base, reason: "platform_unsupported" };
     }
+    if (!("Bun" in globalThis) && process.release.name === "node") {
+        return { available: false, ...base, reason: "node_detachment_unavailable" };
+    }
     const native = addon();
     if (!native) return { available: false, ...base, reason: "addon_unavailable" };
     try {

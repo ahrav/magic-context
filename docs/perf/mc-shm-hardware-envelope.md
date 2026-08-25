@@ -16,7 +16,7 @@ Current disqualification reasons are exact and cumulative:
 4. Cold native wake behavior has not qualified against a paired H2 control.
 5. macOS has not run on the current Linux host.
 
-Native addon mechanisms and TypeScript lease propagation pass locally under Bun 1.4.0 and Node 24.14.0. Those tests remove the earlier runtime-mechanism availability gap. They do not substitute for H2 paired measurements and do not change the verdict.
+Native addon mechanisms and TypeScript lease propagation activate under Bun 1.4.0. Hosted Node 24 aborts inside `napi_detach_arraybuffer`, so Node preflight omits shared memory before alias creation and records the runtime as unavailable. This clean omission does not substitute for H2 paired measurements and does not change the verdict.
 
 ## Smoke evidence
 
@@ -97,7 +97,7 @@ Preparation on each designated Linux or macOS host:
 2. Freeze A/A-derived equivalence margin before candidate runs.
 3. Verify core placement, park state, prefault state, and all counter collectors.
 4. Source-build Rust host, transport, iceoryx2 0.9.3, and native addon.
-5. Run native and plugin lifetime suites under Bun and Node 24.
+5. Run native and plugin lifetime suites under Bun. Under Node 24, require either a subprocess-proven safe detach mechanism or clean preflight omission.
 6. Run every manifest workload class, payload boundary, depth, scheduling family, seed, and ABBA/BAAB period without changing the frozen manifest.
 7. Retain failed and interrupted attempts. Do not delete them from the aggregate.
 8. Apply simultaneous paired intervals and the preregistered `WINNER`, `HARDWARE_EQUIVALENT`, or `INCONCLUSIVE` predicates.

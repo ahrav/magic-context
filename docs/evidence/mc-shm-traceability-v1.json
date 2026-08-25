@@ -27,7 +27,7 @@
         "packages/mc-shm-native/tests/mechanism.ts",
         "packages/mc-shm-native/tests/capability.ts"
       ],
-      "note": "Linux Bun/Node mechanism checks pass locally; macOS source-build job is authored but has not run here."
+      "note": "Linux Bun mechanisms activate. Hosted Node 24 aborts in napi_detach_arraybuffer, so Node preflight cleanly omits before alias creation. macOS source-build coverage is pending."
     },
     {
       "id": "R3",
@@ -265,11 +265,13 @@
     },
     {
       "id": "AE10",
-      "status": "PASS",
+      "status": "PARTIAL",
       "evidence": [
         "packages/mc-shm-native/tests/runtime.ts",
         "packages/plugin/scripts/check-mc-shm.ts"
-      ]
+      ],
+      "note": "Bun proves alias revocation and teardown. Hosted Node 24 omits before alias creation because detachment aborts the runtime."
+
     },
     {
       "id": "AE11",
