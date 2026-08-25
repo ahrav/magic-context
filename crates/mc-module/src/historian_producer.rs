@@ -1000,7 +1000,28 @@ impl HistorianProducer {
         Ok(serde_json::from_slice(&response)?)
     }
 
+    /// Bounds the whole attempt, not just the drain.
+    ///
+    /// Opening the subscription route is itself a request carrying the client's
+    /// own 30-second route-open timeout, so a per-request bound alone lets one
+    /// attempt overshoot the margin reserved for cleanup and leaves an outer
+    /// cancel to land during `session.delete`. Expiry must also stay
+    /// distinguishable: the firing, reattach, and classify paths grant their
+    /// recovery re-drain only on `TimedOut`, and a per-request deadline
+    /// surfaces as a `Call` failure instead, so a run that would finish inside
+    /// the recovery window gets cancelled and discarded.
     async fn subscribe_from_start(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        match tokio::time::timeout(timeout, self.subscribe_and_drain(run_id, timeout)).await {
+            Ok(result) => result,
+            Err(_) => Err(HistorianProducerError::TimedOut),
+        }
+    }
+
+    async fn subscribe_and_drain(
         &mut self,
         run_id: &str,
         timeout: Duration,
@@ -1356,6 +1377,7 @@ mod tests {
         close_route_errors: VecDeque<HistorianProducerError>,
         close_calls: usize,
         next_channel: u16,
+        stall_stream: bool,
     }
 
     #[async_trait]
@@ -1400,6 +1422,9 @@ mod tests {
             _body: Vec<u8>,
             _options: RequestOptions,
         ) -> Result<Box<dyn ProducerStream>, HistorianProducerError> {
+            if self.state.lock().unwrap().stall_stream {
+                return Ok(Box::new(StallingStream));
+            }
             Ok(Box::new(FakeStream(VecDeque::new())))
         }
 
@@ -1424,6 +1449,17 @@ mod tests {
     impl ProducerStream for FakeStream {
         async fn next(&mut self) -> Result<Option<StreamItem>, HistorianProducerError> {
             self.0.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    /// A subscription that never yields an item and never ends, so only the
+    /// attempt's own bound can end the wait.
+    struct StallingStream;
+
+    #[async_trait]
+    impl ProducerStream for StallingStream {
+        async fn next(&mut self) -> Result<Option<StreamItem>, HistorianProducerError> {
+            std::future::pending().await
         }
     }
 
@@ -1763,6 +1799,35 @@ mod tests {
         }
         assert!(classify_run_state("run", &json!({"run_id":"run", "state":"paused"})).is_err());
         assert!(classify_run_state("run", &json!({"run_id":"other", "state":"missing"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_attempt_that_outlives_its_budget_reports_timed_out() {
+        // `TimedOut` is not interchangeable with a `Call` failure carrying
+        // `deadline_expired`: only the former earns the recovery re-drain, so a
+        // stalled attempt must keep reporting the variant its callers match on.
+        // A stalled subscription can never win the race, so a short real budget
+        // is deterministic.
+        let connection = connection(1, [Ok(br#"{"run_id":"run"}"#.to_vec())]);
+        connection.state.lock().unwrap().stall_stream = true;
+        let (mut producer, _) = producer(connection, None).await;
+        producer.bind_session("session");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            producer.await_output_with_timeout("run", Duration::from_millis(20)),
+        )
+        .await
+        // The fake connection does not honor `RequestOptions`, so nothing but
+        // the attempt's own bound can end this wait. Without that bound the call
+        // never returns, and this outer guard turns the regression into a
+        // failure instead of a hung suite.
+        .expect("the attempt's own bound must end the wait")
+        .expect_err("a stalled subscription cannot complete");
+        assert!(
+            matches!(error, HistorianProducerError::TimedOut),
+            "expected TimedOut, got {error:?}"
+        );
     }
 
     #[test]
