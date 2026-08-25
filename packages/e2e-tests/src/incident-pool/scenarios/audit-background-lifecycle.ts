@@ -747,13 +747,20 @@ export async function driveLeaseLossResidualWrite(
             taskResult.status === "failed" &&
             taskResult.error?.includes("lease lost") === true;
         const archiveResultText = findToolResultText(h, toolCallId);
-        // A tool_result block alone proves nothing: the lease fence rejects the
-        // racing write with an `Error: ...` payload, and treating that as an
-        // observed archive would let the reproduction score without ever
-        // attempting the residual write it is about.
+        // A tool_result block alone proves nothing about WHICH write landed, but
+        // requiring SUCCESS conflates the setup with the behavior under test.
+        // Once the fence is extended to cover the archive itself, the racing
+        // write is correctly rejected with an `Error: ...` payload and the
+        // memory stays active with no mutation row — the resolution this case
+        // exists to detect. Demanding "Archived " fails the precondition there,
+        // so the durable no-write checks never get to score it. The attempt is
+        // required separately through `guardedWriteAttempted`, so either
+        // terminal response shape satisfies this field while an absent
+        // invocation still fails it.
         const providerToolResultObserved =
             archiveResultText !== null &&
-            archiveResultText.startsWith("Archived ");
+            (archiveResultText.startsWith("Archived ") ||
+                archiveResultText.startsWith("Error:"));
         return {
             kind: "a47-lease-loss-residual-write",
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),

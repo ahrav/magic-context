@@ -963,6 +963,18 @@ const SOURCE_LINKED_IMPLEMENTATION_FILES = [
     "packages/plugin/src/hooks/magic-context/strip-content.ts",
 ];
 
+// A1 and A3 declare `applicability.harness: "rust"`, so the prefix they judge is
+// produced by the Rust transform, not the TypeScript pipeline above: under
+// `MC_E2E_MODE=rust` the shared harness boots the direct host. Rust tag
+// activation, defer replay, and ctx_reduce retention all live in that file, so
+// without it either verdict can change while the implementation and selected-set
+// digests stay constant. The three thinking variants are canonically OpenCode and
+// keep the shared bundle.
+const RUST_CACHE_IMPLEMENTATION_FILES = [
+    ...SOURCE_LINKED_IMPLEMENTATION_FILES,
+    "crates/mc-module/src/transform.rs",
+];
+
 export const FIRST_RENDER_A1_FIXTURE = {
     scenario: "pure-defer-growth",
     turns: 6,
@@ -1173,7 +1185,7 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
     return [
         {
             variantId: "var-parity-a1-pure-defer-stability",
-            implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
+            implementationFiles: RUST_CACHE_IMPLEMENTATION_FILES,
             fixtures: { ...FIRST_RENDER_A1_FIXTURE },
             driver: adaptBoundSymbol(
                 driveFirstRenderPureDeferStability,
@@ -1198,7 +1210,7 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
         },
         {
             variantId: "var-parity-a3-ctx-reduce-survival",
-            implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
+            implementationFiles: RUST_CACHE_IMPLEMENTATION_FILES,
             fixtures: { ...FIRST_RENDER_A3_FIXTURE },
             driver: adaptBoundSymbol(
                 driveAgedCtxReduceSurvival,

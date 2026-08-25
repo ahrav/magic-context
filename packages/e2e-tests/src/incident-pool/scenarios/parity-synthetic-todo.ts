@@ -1319,12 +1319,19 @@ async function driveDependent(
             const deferBytes = defer
                 ? syntheticPairBytes(defer, root.callId)
                 : null;
+            // Byte-comparing the frozen call id cannot see a SECOND injected
+            // pair emitted for the newer state beside it, and the durable
+            // fields stay frozen in that case too. Require the frozen pair to
+            // be the only injected pair on this wire.
+            const deferInjectedPairs = defer ? injectedTodoPairs(defer).length : 0;
             const state = root.h.readModuleTodoState(root.sessionId);
             return {
                 ...base,
                 ownActionExecuted: newerProbe.executed,
                 providerTransitionCorrect:
-                    baselineBytes !== null && deferBytes === baselineBytes,
+                    baselineBytes !== null &&
+                    deferBytes === baselineBytes &&
+                    deferInjectedPairs === 1,
                 durableTransitionCorrect:
                     newerCaptured &&
                     state?.lastTodoState === newerState &&

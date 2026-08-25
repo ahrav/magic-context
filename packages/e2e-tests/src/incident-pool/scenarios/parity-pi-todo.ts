@@ -691,8 +691,20 @@ export async function drivePiTodoDeferReplay(
                 legacy.body !== null,
             firstReplayPresent: bytes0 !== null && bytes1 !== null,
             byteIdenticalReplay: bytes0 !== null && bytes1 === bytes0,
+            // Comparing the two reads only to each other is satisfied by two
+            // nulls, so an implementation that replays the deterministic pair
+            // while persisting no anchor at all reads as stable — the catalog's
+            // invalid "replay compared while no synthetic anchor was persisted"
+            // shape. Two identical but wrong state values pass for the same
+            // reason. Anchor both reads to the expected values, then require
+            // T1 to still equal T0.
             durableReplayIdentityStable:
                 metaT0?.todo_synthetic_call_id === replay.callId &&
+                replay.expectedAnchorId !== null &&
+                metaT0.todo_synthetic_anchor_message_id ===
+                    replay.expectedAnchorId &&
+                metaT0.todo_synthetic_state_json ===
+                    normalizedTodoJson(STATE_X_TODOS) &&
                 metaT1?.todo_synthetic_call_id ===
                     metaT0.todo_synthetic_call_id &&
                 metaT1?.todo_synthetic_anchor_message_id ===
