@@ -27,7 +27,7 @@
         "packages/mc-shm-native/tests/mechanism.ts",
         "packages/mc-shm-native/tests/capability.ts"
       ],
-      "note": "Linux Bun mechanisms activate. Hosted Node 24 aborts in napi_detach_arraybuffer, so Node preflight cleanly omits before alias creation. macOS source-build coverage is pending."
+      "note": "Linux Bun mechanisms activate. Hosted Node 24 aborts in napi_detach_arraybuffer, so Node preflight cleanly omits before alias creation. Hosted macOS source-build and omission checks pass in CI run 32809287468."
     },
     {
       "id": "R3",
@@ -148,12 +148,14 @@
     },
     {
       "id": "R16",
-      "status": "BLOCKED",
+      "status": "PASS",
       "evidence": [
         ".github/workflows/ci.yml#shm-source-build",
-        "packages/mc-shm-native/tests/capability.ts"
+        "packages/mc-shm-native/tests/capability.ts",
+        "https://github.com/ahrav/magic-context/actions/runs/32809287468"
       ],
-      "note": "Ubuntu/macOS matrix is defined; macOS cannot run on this Linux host."
+      "note": "Ubuntu activates every advertised Bun capability and proves Node omission. macOS source-builds all components and proves host/native omission. No prebuilt addon is retained."
+
     },
     {
       "id": "R17",
