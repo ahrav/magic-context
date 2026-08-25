@@ -17,19 +17,13 @@ export {
 } from "./historian-state-file";
 
 import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
-import {
-    embedPromotedFacts,
-    promoteSessionFactsDurable,
-} from "../../features/magic-context/memory";
+import { promoteSessionFactsDurable } from "../../features/magic-context/memory";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import {
     bindMemoriesToCurrentRevision,
     filterMemoriesByPolicy,
 } from "../../features/magic-context/memory/storage-claim-visibility";
-import {
-    getMemoriesByProject,
-    ModuleMemoryAuthorityError,
-} from "../../features/magic-context/memory/storage-memory";
+import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
 import {
     clearEmergencyDrainLatch,
@@ -655,7 +649,6 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             }
             return true;
         });
-        let promotedFactRefs: Array<{ memoryId: number; content: string }> = [];
         let persistedIds: number[] = [];
 
         // Append new compartments (existing stay untouched in DB) and publish all
@@ -696,30 +689,21 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             // floor below so a crash cannot advance past facts that never became
             // project memories.
             if (promotionActive && !skipUnanchoredPromotion) {
-                try {
-                    promotedFactRefs = promoteSessionFactsDurable(
-                        db,
-                        sessionId,
-                        promotionProjectIdentity,
-                        validatedPass.facts ?? [],
-                    );
-                } catch (error) {
-                    if (error instanceof ModuleMemoryAuthorityError) {
-                        // A project flipped back to the TS transform can still have
-                        // MODULE memory authority (authority does not follow the
-                        // transform-mode knob). Fact promotion is a side channel;
-                        // failing the whole publish here blocks history compaction
-                        // entirely, which starves overflow recovery. Skip the facts,
-                        // keep the compartments.
-                        promotedFactRefs = [];
-                        sessionLog(
-                            sessionId,
-                            "fact promotion skipped: project memory is module-managed; compartments publish without facts",
-                        );
-                    } else {
-                        throw error;
-                    }
-                }
+                promoteSessionFactsDurable(
+                    db,
+                    sessionId,
+                    promotionProjectIdentity,
+                    validatedPass.facts ?? [],
+                    {
+                        producer: "opencode-historian",
+                        runId: String(
+                            validatedPass.invocationId ??
+                                `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
+                        ),
+                        leaseGeneration: holderId,
+                        batchId: `${chunk.startIndex}-${lastCompartmentEnd}`,
+                    },
+                );
             }
 
             // v2 (E2): persist historian-extracted events (stored, NOT rendered).
@@ -843,16 +827,6 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                     await deps.ensureProjectRegistered?.(promotionDirectory, db);
                 } catch (error) {
                     sessionLog(sessionId, "project registration after publish failed:", error);
-                }
-                try {
-                    await embedPromotedFacts(
-                        db,
-                        sessionId,
-                        promotionProjectIdentity,
-                        promotedFactRefs,
-                    );
-                } catch (error) {
-                    sessionLog(sessionId, "promoted fact embedding dispatch failed:", error);
                 }
                 try {
                     await embedAndStoreCompartmentChunks(

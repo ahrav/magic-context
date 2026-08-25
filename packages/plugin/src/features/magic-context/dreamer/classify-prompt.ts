@@ -20,7 +20,7 @@ import {
 } from "./manifest-parser";
 
 export interface ClassifyPromptMemory {
-    id: number;
+    publicClaimId: string;
     category: string;
     content: string;
     importance: number;
@@ -32,7 +32,7 @@ export interface ClassifyPromptMemory {
  *  pools), so the model calibrates the new/changed memories against the existing
  *  distribution instead of re-scoring in a vacuum. */
 export interface ClassifyAnchorMemory {
-    id: number;
+    publicClaimId: string;
     category: string;
     content: string;
     importance: number;
@@ -63,8 +63,8 @@ Keep \`shareable="false"\` only for what is tied to the USER or their machine ra
 
 const OUTPUT_CONTRACT = `Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <classify>
-<memory id="N" importance="75" scope="project" shareable="true"/>
-<memory id="M" importance="20" scope="universe" shareable="false"/>
+<memory claim="clm_..." importance="75" scope="project" shareable="true"/>
+<memory claim="clm_..." importance="20" scope="universe" shareable="false"/>
 </classify>
 
 Rules:
@@ -81,7 +81,7 @@ function renderPool(memories: ClassifyPromptMemory[]): string {
     return memories
         .map(
             (m) =>
-                `[${m.id}] ${m.category} (current: importance=${m.importance} scope=${m.scope} shareable=${Boolean(m.shareable)})\n${m.content}`,
+                `[${m.publicClaimId}] ${m.category} (current: importance=${m.importance} scope=${m.scope} shareable=${Boolean(m.shareable)})\n${m.content}`,
         )
         .join("\n\n");
 }
@@ -89,7 +89,10 @@ function renderPool(memories: ClassifyPromptMemory[]): string {
 function renderAnchors(anchors: ClassifyAnchorMemory[]): string {
     if (anchors.length === 0) return "";
     const list = anchors
-        .map((a) => `[${a.id}] ${a.category} importance=${a.importance}\n${a.content}`)
+        .map(
+            (a) =>
+                `[${a.publicClaimId}] ${a.category} importance=${a.importance}\n${a.content}`,
+        )
         .join("\n\n");
     return `### Already-classified reference memories (calibrate against these — do NOT re-score them, they are NOT in your output)
 ${list}
@@ -118,7 +121,7 @@ ${renderPool(args.memories)}`;
 }
 
 export interface ParsedClassification {
-    id: number;
+    publicClaimId: string;
     importance?: number;
     scope?: "project" | "ecosystem" | "universe";
     shareable?: boolean;
@@ -144,12 +147,11 @@ export function parseClassifyManifest(text: string): ParsedClassification[] {
     const body = classifyBody(text);
     for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
         const attrs = m[1];
-        const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
-        if (!idMatch) throw new Error("classify manifest entry missing numeric id");
-        const id = Number.parseInt(idMatch[1], 10);
-        if (!Number.isInteger(id)) throw new Error("classify manifest entry missing numeric id");
+        const claimMatch = attrs.match(/\bclaim\s*=\s*"([^"]+)"/);
+        if (!claimMatch) throw new Error("classify manifest entry missing public claim id");
+        const publicClaimId = claimMatch[1];
 
-        const entry: ParsedClassification = { id };
+        const entry: ParsedClassification = { publicClaimId };
         const impMatch = attrs.match(/\bimportance\s*=\s*"(\d+)"/);
         if (impMatch) {
             const imp = Number.parseInt(impMatch[1], 10);
@@ -167,7 +169,9 @@ export function parseClassifyManifest(text: string): ParsedClassification[] {
             entry.shareable = v === "true" || v === "1";
         }
         if (entry.importance === undefined && !entry.scope && entry.shareable === undefined) {
-            throw new Error(`classify manifest entry ${id} missing classification fields`);
+            throw new Error(
+                `classify manifest entry ${publicClaimId} missing classification fields`,
+            );
         }
         out.push(entry);
     }
@@ -175,7 +179,7 @@ export function parseClassifyManifest(text: string): ParsedClassification[] {
         throw new Error(describeUnrecognizedManifestShape(text, "classify", "memory"));
     }
     assertNoDuplicateManifestIds(
-        out.map((entry) => entry.id),
+        out.map((entry) => entry.publicClaimId),
         "classify",
     );
     return out;
@@ -185,12 +189,12 @@ export function parseClassifyManifest(text: string): ParsedClassification[] {
  *  re-asserts coverage as the final belt. */
 export function validateClassifyManifest(
     text: string,
-    expectedIds: ReadonlySet<number>,
+    expectedIds: ReadonlySet<string>,
 ): ParsedClassification[] {
     const parsed = parseClassifyManifest(text);
     assertParsedManifestNonEmpty(parsed.length, expectedIds.size, text, "classify", "memory");
     assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
+        parsed.map((entry) => entry.publicClaimId),
         expectedIds,
         "classify",
     );

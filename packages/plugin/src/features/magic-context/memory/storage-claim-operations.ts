@@ -460,6 +460,9 @@ export function runClaimOperationInCurrentTransaction(
     stage: (db: Database) => ClaimOperationStageOutcome,
     nowMs: number = Date.now(),
 ): ClaimOperationRunResult {
+    if (!isInTransaction(db)) {
+        throw new Error("runClaimOperationInCurrentTransaction requires an active transaction");
+    }
     const existing = readStoredReceipt(db, envelope);
     if (existing) {
         if (existing.requestDigest !== envelope.requestDigest) {
@@ -1017,6 +1020,114 @@ function createPolicySubjectForRevision(
     });
 }
 
+/** Transaction-local domain stage for composition inside one outer claim operation. */
+export function stageCreateProjectMemoryClaimInCurrentTransaction(
+    db: Database,
+    input: CreateProjectMemoryClaimInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const attributes = resolveAttributes(input);
+    const normalizedHash = computeNormalizedHash(input.content);
+    const holder = db
+        .prepare(
+            `SELECT public_id AS publicClaimId FROM claim_memory_current_heads
+               JOIN claim_public_ids USING (claim_id)
+              WHERE project_id = ? AND category = ? AND normalized_hash = ?
+                AND lifecycle_state = 'active'`,
+        )
+        .get(input.projectId, attributes.category, normalizedHash) as
+        | { publicClaimId: string }
+        | undefined;
+    if (holder) {
+        const claim = getProjectMemoryClaimByPublicId(db, holder.publicClaimId);
+        if (!claim) {
+            throw new ClaimGraphCorruptionError(
+                `current-head row points at unknown claim ${holder.publicClaimId}`,
+            );
+        }
+        return attachEvidenceStage(db, claim, input.provenance, nowMs);
+    }
+
+    const publicClaimId = generatePublicClaimId();
+    const observationId = writeEvidenceChain(
+        db,
+        input.projectId,
+        input.provenance,
+        input.content,
+    );
+    const created = createClaimInCurrentTransaction(db, {
+        projectId: input.projectId,
+        subject: publicClaimId,
+        predicate: PROJECT_MEMORY_CLAIM_PREDICATE,
+        scope: PROJECT_MEMORY_CLAIM_SCOPE,
+        content: input.content,
+        evidence: [{ observationId }],
+        sourceSessionId: input.provenance.sourceSessionId ?? null,
+    });
+    if (created.status !== "applied") {
+        throw new ClaimOperationInputError(
+            `project-memory claim creation failed: ${created.status === "invalid" ? created.reason : created.status}`,
+        );
+    }
+    db.prepare(
+        "INSERT INTO claim_public_ids (claim_id, public_id, created_at) VALUES (?, ?, ?)",
+    ).run(created.claimId, publicClaimId, nowMs);
+    insertAttributesRow(db, {
+        revisionId: created.revisionId,
+        claimId: created.claimId,
+        projectId: input.projectId,
+        attributes,
+        normalizedHash,
+        nowMs,
+    });
+    appendLifecycleEvent(db, {
+        claimId: created.claimId,
+        state: "active",
+        actor: input.actor,
+        nowMs,
+    });
+    upsertCurrentHead(db, {
+        claimId: created.claimId,
+        projectId: input.projectId,
+        category: attributes.category,
+        normalizedHash,
+        revisionId: created.revisionId,
+        lifecycleState: "active",
+        nowMs,
+    });
+    db.prepare("INSERT INTO claim_usage_stats (claim_id, updated_at) VALUES (?, ?)").run(
+        created.claimId,
+        nowMs,
+    );
+    createPolicySubjectForRevision(db, {
+        revisionId: created.revisionId,
+        projectId: input.projectId,
+        originObservationId: observationId,
+        provenance: input.provenance,
+        userInferred: input.userInferred ?? false,
+        nowMs,
+    });
+    const locator = {
+        publicClaimId,
+        revision: 1,
+        contentDigest: sha256Utf8Hex(input.content),
+    };
+    return {
+        kind: "effects",
+        payload: { claim: claimPayloadLocator(locator), kind: "created" },
+        effects: [
+            {
+                effectKey: `upsert:${publicClaimId}:r1`,
+                projectId: input.projectId,
+                claimId: created.claimId,
+                revisionId: created.revisionId,
+                changeKind: "upsert",
+            },
+        ],
+        policyRevisionIds: [created.revisionId],
+    };
+}
+
 /**
  * Create a project-memory claim, or — when a live claim already owns the
  * (project, category, normalized hash) slot — attach the independent
@@ -1044,107 +1155,7 @@ export function createProjectMemoryClaim(
     return runClaimOperation(
         db,
         envelope,
-        () => {
-            const normalizedHash = computeNormalizedHash(input.content);
-            const holder = db
-                .prepare(
-                    `SELECT public_id AS publicClaimId FROM claim_memory_current_heads
-                       JOIN claim_public_ids USING (claim_id)
-                      WHERE project_id = ? AND category = ? AND normalized_hash = ?
-                        AND lifecycle_state = 'active'`,
-                )
-                .get(input.projectId, attributes.category, normalizedHash) as
-                | { publicClaimId: string }
-                | undefined;
-            if (holder) {
-                const claim = getProjectMemoryClaimByPublicId(db, holder.publicClaimId);
-                if (!claim) {
-                    throw new ClaimGraphCorruptionError(
-                        `current-head row points at unknown claim ${holder.publicClaimId}`,
-                    );
-                }
-                return attachEvidenceStage(db, claim, input.provenance, nowMs);
-            }
-
-            const publicClaimId = generatePublicClaimId();
-            const observationId = writeEvidenceChain(
-                db,
-                input.projectId,
-                input.provenance,
-                input.content,
-            );
-            const created = createClaimInCurrentTransaction(db, {
-                projectId: input.projectId,
-                subject: publicClaimId,
-                predicate: PROJECT_MEMORY_CLAIM_PREDICATE,
-                scope: PROJECT_MEMORY_CLAIM_SCOPE,
-                content: input.content,
-                evidence: [{ observationId }],
-                sourceSessionId: input.provenance.sourceSessionId ?? null,
-            });
-            if (created.status !== "applied") {
-                throw new ClaimOperationInputError(
-                    `project-memory claim creation failed: ${created.status === "invalid" ? created.reason : created.status}`,
-                );
-            }
-            db.prepare(
-                "INSERT INTO claim_public_ids (claim_id, public_id, created_at) VALUES (?, ?, ?)",
-            ).run(created.claimId, publicClaimId, nowMs);
-            insertAttributesRow(db, {
-                revisionId: created.revisionId,
-                claimId: created.claimId,
-                projectId: input.projectId,
-                attributes,
-                normalizedHash,
-                nowMs,
-            });
-            appendLifecycleEvent(db, {
-                claimId: created.claimId,
-                state: "active",
-                actor: input.actor,
-                nowMs,
-            });
-            upsertCurrentHead(db, {
-                claimId: created.claimId,
-                projectId: input.projectId,
-                category: attributes.category,
-                normalizedHash,
-                revisionId: created.revisionId,
-                lifecycleState: "active",
-                nowMs,
-            });
-            db.prepare("INSERT INTO claim_usage_stats (claim_id, updated_at) VALUES (?, ?)").run(
-                created.claimId,
-                nowMs,
-            );
-            createPolicySubjectForRevision(db, {
-                revisionId: created.revisionId,
-                projectId: input.projectId,
-                originObservationId: observationId,
-                provenance: input.provenance,
-                userInferred: input.userInferred ?? false,
-                nowMs,
-            });
-            const locator = {
-                publicClaimId,
-                revision: 1,
-                contentDigest: sha256Utf8Hex(input.content),
-            };
-            return {
-                kind: "effects",
-                payload: { claim: claimPayloadLocator(locator), kind: "created" },
-                effects: [
-                    {
-                        effectKey: `upsert:${publicClaimId}:r1`,
-                        projectId: input.projectId,
-                        claimId: created.claimId,
-                        revisionId: created.revisionId,
-                        changeKind: "upsert",
-                    },
-                ],
-                policyRevisionIds: [created.revisionId],
-            };
-        },
+        () => stageCreateProjectMemoryClaimInCurrentTransaction(db, input, nowMs),
         nowMs,
     );
 }
@@ -1162,6 +1173,115 @@ export interface ReviseProjectMemoryClaimInput {
     actor: string;
     userInferred?: boolean;
     nowMs?: number;
+}
+
+/** Transaction-local domain stage for composition inside one outer claim operation. */
+export function stageReviseProjectMemoryClaimInCurrentTransaction(
+    db: Database,
+    input: ReviseProjectMemoryClaimInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const validation = validateProjectMemoryMutationToken(db, input.token);
+    if (!validation.ok) {
+        return {
+            kind: "stale",
+            reason: `${validation.stalePart}: ${validation.reason}`,
+        };
+    }
+    const claim = validation.claim;
+    const current = readRevisionAttributes(db, claim.currentRevisionId);
+    if (!current) {
+        throw new ClaimGraphCorruptionError(
+            `claim revision ${claim.currentRevisionId} has no attributes row; direct-SQL corruption`,
+        );
+    }
+    const nextContent = input.content ?? claim.content;
+    const nextAttributes: ProjectMemoryAttributes = {
+        category: input.category ?? current.category,
+        importance: input.importance ?? current.importance,
+        memoryScope: input.memoryScope ?? current.memoryScope,
+        sharing: input.sharing ?? current.sharing,
+        expiresAt: input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
+    };
+    const unchanged =
+        sha256Utf8Hex(nextContent) === claim.contentDigest &&
+        nextAttributes.category === current.category &&
+        nextAttributes.importance === current.importance &&
+        nextAttributes.memoryScope === current.memoryScope &&
+        nextAttributes.sharing === current.sharing &&
+        nextAttributes.expiresAt === current.expiresAt;
+    if (unchanged) {
+        return attachEvidenceStage(db, claim, input.provenance, nowMs);
+    }
+    const normalizedHash = computeNormalizedHash(nextContent);
+    assertNoLiveDuplicate(db, {
+        projectId: claim.projectId,
+        category: nextAttributes.category,
+        normalizedHash,
+        claimId: claim.claimId,
+    });
+    const observationId = writeEvidenceChain(
+        db,
+        claim.projectId,
+        input.provenance,
+        nextContent,
+    );
+    const appended = appendClaimRevisionInCurrentTransaction(db, {
+        claimId: claim.claimId,
+        expectedCurrentRevisionId: claim.currentRevisionId,
+        content: nextContent,
+        evidence: [{ observationId }],
+        sourceSessionId: input.provenance.sourceSessionId ?? null,
+    });
+    if (appended.status !== "applied") {
+        throw new ClaimOperationInputError(
+            `project-memory revision append failed: ${appended.status === "invalid" ? appended.reason : appended.status}`,
+        );
+    }
+    insertAttributesRow(db, {
+        revisionId: appended.revisionId,
+        claimId: claim.claimId,
+        projectId: claim.projectId,
+        attributes: nextAttributes,
+        normalizedHash,
+        nowMs,
+    });
+    upsertCurrentHead(db, {
+        claimId: claim.claimId,
+        projectId: claim.projectId,
+        category: nextAttributes.category,
+        normalizedHash,
+        revisionId: appended.revisionId,
+        lifecycleState: lifecycleHead(db, claim.claimId)?.state ?? "active",
+        nowMs,
+    });
+    createPolicySubjectForRevision(db, {
+        revisionId: appended.revisionId,
+        projectId: claim.projectId,
+        originObservationId: observationId,
+        provenance: input.provenance,
+        userInferred: input.userInferred ?? false,
+        nowMs,
+    });
+    const locator = {
+        publicClaimId: claim.publicClaimId,
+        revision: appended.revision,
+        contentDigest: sha256Utf8Hex(nextContent),
+    };
+    return {
+        kind: "effects",
+        payload: { claim: claimPayloadLocator(locator), kind: "revised" },
+        effects: [
+            {
+                effectKey: `upsert:${claim.publicClaimId}:r${appended.revision}`,
+                projectId: claim.projectId,
+                claimId: claim.claimId,
+                revisionId: appended.revisionId,
+                changeKind: "upsert",
+            },
+        ],
+        policyRevisionIds: [appended.revisionId],
+    };
 }
 
 /**
@@ -1194,109 +1314,7 @@ export function reviseProjectMemoryClaim(
     return runClaimOperation(
         db,
         envelope,
-        () => {
-            const validation = validateProjectMemoryMutationToken(db, input.token);
-            if (!validation.ok) {
-                return {
-                    kind: "stale",
-                    reason: `${validation.stalePart}: ${validation.reason}`,
-                };
-            }
-            const claim = validation.claim;
-            const current = readRevisionAttributes(db, claim.currentRevisionId);
-            if (!current) {
-                throw new ClaimGraphCorruptionError(
-                    `claim revision ${claim.currentRevisionId} has no attributes row; direct-SQL corruption`,
-                );
-            }
-            const nextContent = input.content ?? claim.content;
-            const nextAttributes: ProjectMemoryAttributes = {
-                category: input.category ?? current.category,
-                importance: input.importance ?? current.importance,
-                memoryScope: input.memoryScope ?? current.memoryScope,
-                sharing: input.sharing ?? current.sharing,
-                expiresAt: input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
-            };
-            const unchanged =
-                sha256Utf8Hex(nextContent) === claim.contentDigest &&
-                nextAttributes.category === current.category &&
-                nextAttributes.importance === current.importance &&
-                nextAttributes.memoryScope === current.memoryScope &&
-                nextAttributes.sharing === current.sharing &&
-                nextAttributes.expiresAt === current.expiresAt;
-            if (unchanged) {
-                return attachEvidenceStage(db, claim, input.provenance, nowMs);
-            }
-            const normalizedHash = computeNormalizedHash(nextContent);
-            assertNoLiveDuplicate(db, {
-                projectId: claim.projectId,
-                category: nextAttributes.category,
-                normalizedHash,
-                claimId: claim.claimId,
-            });
-            const observationId = writeEvidenceChain(
-                db,
-                claim.projectId,
-                input.provenance,
-                nextContent,
-            );
-            const appended = appendClaimRevisionInCurrentTransaction(db, {
-                claimId: claim.claimId,
-                expectedCurrentRevisionId: claim.currentRevisionId,
-                content: nextContent,
-                evidence: [{ observationId }],
-                sourceSessionId: input.provenance.sourceSessionId ?? null,
-            });
-            if (appended.status !== "applied") {
-                throw new ClaimOperationInputError(
-                    `project-memory revision append failed: ${appended.status === "invalid" ? appended.reason : appended.status}`,
-                );
-            }
-            insertAttributesRow(db, {
-                revisionId: appended.revisionId,
-                claimId: claim.claimId,
-                projectId: claim.projectId,
-                attributes: nextAttributes,
-                normalizedHash,
-                nowMs,
-            });
-            upsertCurrentHead(db, {
-                claimId: claim.claimId,
-                projectId: claim.projectId,
-                category: nextAttributes.category,
-                normalizedHash,
-                revisionId: appended.revisionId,
-                lifecycleState: lifecycleHead(db, claim.claimId)?.state ?? "active",
-                nowMs,
-            });
-            createPolicySubjectForRevision(db, {
-                revisionId: appended.revisionId,
-                projectId: claim.projectId,
-                originObservationId: observationId,
-                provenance: input.provenance,
-                userInferred: input.userInferred ?? false,
-                nowMs,
-            });
-            const locator = {
-                publicClaimId: claim.publicClaimId,
-                revision: appended.revision,
-                contentDigest: sha256Utf8Hex(nextContent),
-            };
-            return {
-                kind: "effects",
-                payload: { claim: claimPayloadLocator(locator), kind: "revised" },
-                effects: [
-                    {
-                        effectKey: `upsert:${claim.publicClaimId}:r${appended.revision}`,
-                        projectId: claim.projectId,
-                        claimId: claim.claimId,
-                        revisionId: appended.revisionId,
-                        changeKind: "upsert",
-                    },
-                ],
-                policyRevisionIds: [appended.revisionId],
-            };
-        },
+        () => stageReviseProjectMemoryClaimInCurrentTransaction(db, input, nowMs),
         nowMs,
     );
 }
@@ -1311,6 +1329,82 @@ export interface SetProjectMemoryLifecycleInput {
     actor: string;
     reason?: string | null;
     nowMs?: number;
+}
+
+/** Transaction-local domain stage for composition inside one outer claim operation. */
+export function stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
+    db: Database,
+    input: SetProjectMemoryLifecycleInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const validation = validateProjectMemoryMutationToken(db, input.token);
+    if (!validation.ok) {
+        return { kind: "stale", reason: `${validation.stalePart}: ${validation.reason}` };
+    }
+    const claim = validation.claim;
+    const head = lifecycleHead(db, claim.claimId);
+    if (!head) {
+        throw new ClaimGraphCorruptionError(
+            `project-memory claim ${claim.publicClaimId} has no lifecycle ledger`,
+        );
+    }
+    if (head.state === input.state) {
+        return {
+            kind: "noop",
+            payload: {
+                claim: claimPayloadLocator(claim),
+                kind: "lifecycle",
+                state: head.state,
+            },
+        };
+    }
+    const attributes = readRevisionAttributes(db, claim.currentRevisionId);
+    if (!attributes) {
+        throw new ClaimGraphCorruptionError(
+            `claim revision ${claim.currentRevisionId} has no attributes row; direct-SQL corruption`,
+        );
+    }
+    if (input.state === "active") {
+        assertNoLiveDuplicate(db, {
+            projectId: claim.projectId,
+            category: attributes.category,
+            normalizedHash: attributes.normalizedHash,
+            claimId: claim.claimId,
+        });
+    }
+    appendLifecycleEvent(db, {
+        claimId: claim.claimId,
+        state: input.state,
+        actor: input.actor,
+        reason: input.reason ?? null,
+        nowMs,
+    });
+    upsertCurrentHead(db, {
+        claimId: claim.claimId,
+        projectId: claim.projectId,
+        category: attributes.category,
+        normalizedHash: attributes.normalizedHash,
+        revisionId: claim.currentRevisionId,
+        lifecycleState: input.state,
+        nowMs,
+    });
+    return {
+        kind: "effects",
+        payload: {
+            claim: claimPayloadLocator(claim),
+            kind: "lifecycle",
+            state: input.state,
+        },
+        effects: [
+            {
+                effectKey: `lifecycle:${claim.publicClaimId}:${input.state}`,
+                projectId: claim.projectId,
+                claimId: claim.claimId,
+                revisionId: claim.currentRevisionId,
+                changeKind: "lifecycle",
+            },
+        ],
+    };
 }
 
 /** Append one lifecycle event; the revision identity is untouched. Setting
@@ -1334,76 +1428,7 @@ export function setProjectMemoryClaimLifecycle(
     return runClaimOperation(
         db,
         envelope,
-        () => {
-            const validation = validateProjectMemoryMutationToken(db, input.token);
-            if (!validation.ok) {
-                return { kind: "stale", reason: `${validation.stalePart}: ${validation.reason}` };
-            }
-            const claim = validation.claim;
-            const head = lifecycleHead(db, claim.claimId);
-            if (!head) {
-                throw new ClaimGraphCorruptionError(
-                    `project-memory claim ${claim.publicClaimId} has no lifecycle ledger`,
-                );
-            }
-            if (head.state === input.state) {
-                return {
-                    kind: "noop",
-                    payload: {
-                        claim: claimPayloadLocator(claim),
-                        kind: "lifecycle",
-                        state: head.state,
-                    },
-                };
-            }
-            const attributes = readRevisionAttributes(db, claim.currentRevisionId);
-            if (!attributes) {
-                throw new ClaimGraphCorruptionError(
-                    `claim revision ${claim.currentRevisionId} has no attributes row; direct-SQL corruption`,
-                );
-            }
-            if (input.state === "active") {
-                assertNoLiveDuplicate(db, {
-                    projectId: claim.projectId,
-                    category: attributes.category,
-                    normalizedHash: attributes.normalizedHash,
-                    claimId: claim.claimId,
-                });
-            }
-            appendLifecycleEvent(db, {
-                claimId: claim.claimId,
-                state: input.state,
-                actor: input.actor,
-                reason: input.reason ?? null,
-                nowMs,
-            });
-            upsertCurrentHead(db, {
-                claimId: claim.claimId,
-                projectId: claim.projectId,
-                category: attributes.category,
-                normalizedHash: attributes.normalizedHash,
-                revisionId: claim.currentRevisionId,
-                lifecycleState: input.state,
-                nowMs,
-            });
-            return {
-                kind: "effects",
-                payload: {
-                    claim: claimPayloadLocator(claim),
-                    kind: "lifecycle",
-                    state: input.state,
-                },
-                effects: [
-                    {
-                        effectKey: `lifecycle:${claim.publicClaimId}:${input.state}`,
-                        projectId: claim.projectId,
-                        claimId: claim.claimId,
-                        revisionId: claim.currentRevisionId,
-                        changeKind: "lifecycle",
-                    },
-                ],
-            };
-        },
+        () => stageSetProjectMemoryClaimLifecycleInCurrentTransaction(db, input, nowMs),
         nowMs,
     );
 }
@@ -1415,6 +1440,176 @@ export interface MergeProjectMemoryClaimsInput {
     mergedContent?: string;
     actor: string;
     nowMs?: number;
+}
+
+/** Transaction-local domain stage for composition inside one outer claim operation. */
+export function stageMergeProjectMemoryClaimsInCurrentTransaction(
+    db: Database,
+    input: MergeProjectMemoryClaimsInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    // Every claim-local token validates before the first effect.
+    const targetValidation = validateProjectMemoryMutationToken(db, input.targetToken);
+    if (!targetValidation.ok) {
+        return {
+            kind: "stale",
+            reason: `target ${targetValidation.stalePart}: ${targetValidation.reason}`,
+        };
+    }
+    const target = targetValidation.claim;
+    const sources: ProjectMemoryClaimRef[] = [];
+    for (const token of input.sourceTokens) {
+        const validation = validateProjectMemoryMutationToken(db, token);
+        if (!validation.ok) {
+            return {
+                kind: "stale",
+                reason: `source ${token.publicClaimId} ${validation.stalePart}: ${validation.reason}`,
+            };
+        }
+        if (validation.claim.claimId === target.claimId) {
+            throw new ClaimOperationInputError("merge target cannot be its own source");
+        }
+        if (validation.claim.projectId !== target.projectId) {
+            throw new ClaimOperationInputError(
+                "cross-project merge is refused; use derivation copy/move instead",
+            );
+        }
+        sources.push(validation.claim);
+    }
+
+    const mergedContent = input.mergedContent ?? target.content;
+    const targetAttributes = readRevisionAttributes(db, target.currentRevisionId);
+    if (!targetAttributes) {
+        throw new ClaimGraphCorruptionError(
+            `claim revision ${target.currentRevisionId} has no attributes row; direct-SQL corruption`,
+        );
+    }
+    const normalizedHash = computeNormalizedHash(mergedContent);
+    assertNoLiveDuplicate(db, {
+        projectId: target.projectId,
+        category: targetAttributes.category,
+        normalizedHash,
+        claimId: target.claimId,
+    });
+
+    const sourceObservations = sources.flatMap((source) =>
+        (
+            db
+                .prepare(
+                    `SELECT observation_id AS observationId FROM claim_evidence
+                      WHERE revision_id = ? AND relation = 'supports'
+                      ORDER BY observation_id`,
+                )
+                .all(source.currentRevisionId) as Array<{ observationId: number }>
+        ).map((row) => row.observationId),
+    );
+    if (sourceObservations.length === 0) {
+        throw new ClaimGraphCorruptionError(
+            "merge sources carry no supporting evidence; direct-SQL corruption",
+        );
+    }
+    const appended = appendClaimRevisionInCurrentTransaction(db, {
+        claimId: target.claimId,
+        expectedCurrentRevisionId: target.currentRevisionId,
+        content: mergedContent,
+        evidence: [...new Set(sourceObservations)].map((observationId) => ({
+            observationId,
+            relation: "merged_from" as const,
+        })),
+    });
+    if (appended.status !== "applied") {
+        throw new ClaimOperationInputError(
+            `merge target revision append failed: ${appended.status === "invalid" ? appended.reason : appended.status}`,
+        );
+    }
+    insertAttributesRow(db, {
+        revisionId: appended.revisionId,
+        claimId: target.claimId,
+        projectId: target.projectId,
+        attributes: { ...targetAttributes, category: targetAttributes.category },
+        normalizedHash,
+        nowMs,
+    });
+    upsertCurrentHead(db, {
+        claimId: target.claimId,
+        projectId: target.projectId,
+        category: targetAttributes.category,
+        normalizedHash,
+        revisionId: appended.revisionId,
+        lifecycleState: lifecycleHead(db, target.claimId)?.state ?? "active",
+        nowMs,
+    });
+    createPolicySubjectForRevision(db, {
+        revisionId: appended.revisionId,
+        projectId: target.projectId,
+        originObservationId: null,
+        provenance: null,
+        userInferred: false,
+        nowMs,
+    });
+
+    const effects: ClaimEffectDescriptor[] = [
+        {
+            effectKey: `upsert:${target.publicClaimId}:r${appended.revision}`,
+            projectId: target.projectId,
+            claimId: target.claimId,
+            revisionId: appended.revisionId,
+            changeKind: "upsert",
+        },
+    ];
+    const policyRevisionIds = [appended.revisionId];
+    for (const source of sources) {
+        addClaimConflictInCurrentTransaction(db, {
+            relation: "supersedes",
+            leftRevisionId: appended.revisionId,
+            rightRevisionId: source.currentRevisionId,
+        });
+        const sourceAttributes = readRevisionAttributes(db, source.currentRevisionId);
+        if (!sourceAttributes) {
+            throw new ClaimGraphCorruptionError(
+                `claim revision ${source.currentRevisionId} has no attributes row; direct-SQL corruption`,
+            );
+        }
+        appendLifecycleEvent(db, {
+            claimId: source.claimId,
+            state: "retired",
+            actor: input.actor,
+            reason: `merged into ${target.publicClaimId}`,
+            nowMs,
+        });
+        upsertCurrentHead(db, {
+            claimId: source.claimId,
+            projectId: source.projectId,
+            category: sourceAttributes.category,
+            normalizedHash: sourceAttributes.normalizedHash,
+            revisionId: source.currentRevisionId,
+            lifecycleState: "retired",
+            nowMs,
+        });
+        effects.push({
+            effectKey: `lifecycle:${source.publicClaimId}:retired`,
+            projectId: source.projectId,
+            claimId: source.claimId,
+            revisionId: source.currentRevisionId,
+            changeKind: "lifecycle",
+        });
+        policyRevisionIds.push(source.currentRevisionId);
+    }
+    const locator = {
+        publicClaimId: target.publicClaimId,
+        revision: appended.revision,
+        contentDigest: sha256Utf8Hex(mergedContent),
+    };
+    return {
+        kind: "effects",
+        payload: {
+            claim: claimPayloadLocator(locator),
+            kind: "merged",
+            retiredSources: sources.map((source) => source.publicClaimId),
+        },
+        effects,
+        policyRevisionIds,
+    };
 }
 
 /**
@@ -1445,170 +1640,7 @@ export function mergeProjectMemoryClaims(
     return runClaimOperation(
         db,
         envelope,
-        () => {
-            // Every claim-local token validates before the first effect.
-            const targetValidation = validateProjectMemoryMutationToken(db, input.targetToken);
-            if (!targetValidation.ok) {
-                return {
-                    kind: "stale",
-                    reason: `target ${targetValidation.stalePart}: ${targetValidation.reason}`,
-                };
-            }
-            const target = targetValidation.claim;
-            const sources: ProjectMemoryClaimRef[] = [];
-            for (const token of input.sourceTokens) {
-                const validation = validateProjectMemoryMutationToken(db, token);
-                if (!validation.ok) {
-                    return {
-                        kind: "stale",
-                        reason: `source ${token.publicClaimId} ${validation.stalePart}: ${validation.reason}`,
-                    };
-                }
-                if (validation.claim.claimId === target.claimId) {
-                    throw new ClaimOperationInputError("merge target cannot be its own source");
-                }
-                if (validation.claim.projectId !== target.projectId) {
-                    throw new ClaimOperationInputError(
-                        "cross-project merge is refused; use derivation copy/move instead",
-                    );
-                }
-                sources.push(validation.claim);
-            }
-
-            const mergedContent = input.mergedContent ?? target.content;
-            const targetAttributes = readRevisionAttributes(db, target.currentRevisionId);
-            if (!targetAttributes) {
-                throw new ClaimGraphCorruptionError(
-                    `claim revision ${target.currentRevisionId} has no attributes row; direct-SQL corruption`,
-                );
-            }
-            const normalizedHash = computeNormalizedHash(mergedContent);
-            assertNoLiveDuplicate(db, {
-                projectId: target.projectId,
-                category: targetAttributes.category,
-                normalizedHash,
-                claimId: target.claimId,
-            });
-
-            const sourceObservations = sources.flatMap((source) =>
-                (
-                    db
-                        .prepare(
-                            `SELECT observation_id AS observationId FROM claim_evidence
-                              WHERE revision_id = ? AND relation = 'supports'
-                              ORDER BY observation_id`,
-                        )
-                        .all(source.currentRevisionId) as Array<{ observationId: number }>
-                ).map((row) => row.observationId),
-            );
-            if (sourceObservations.length === 0) {
-                throw new ClaimGraphCorruptionError(
-                    "merge sources carry no supporting evidence; direct-SQL corruption",
-                );
-            }
-            const appended = appendClaimRevisionInCurrentTransaction(db, {
-                claimId: target.claimId,
-                expectedCurrentRevisionId: target.currentRevisionId,
-                content: mergedContent,
-                evidence: [...new Set(sourceObservations)].map((observationId) => ({
-                    observationId,
-                    relation: "merged_from" as const,
-                })),
-            });
-            if (appended.status !== "applied") {
-                throw new ClaimOperationInputError(
-                    `merge target revision append failed: ${appended.status === "invalid" ? appended.reason : appended.status}`,
-                );
-            }
-            insertAttributesRow(db, {
-                revisionId: appended.revisionId,
-                claimId: target.claimId,
-                projectId: target.projectId,
-                attributes: { ...targetAttributes, category: targetAttributes.category },
-                normalizedHash,
-                nowMs,
-            });
-            upsertCurrentHead(db, {
-                claimId: target.claimId,
-                projectId: target.projectId,
-                category: targetAttributes.category,
-                normalizedHash,
-                revisionId: appended.revisionId,
-                lifecycleState: lifecycleHead(db, target.claimId)?.state ?? "active",
-                nowMs,
-            });
-            createPolicySubjectForRevision(db, {
-                revisionId: appended.revisionId,
-                projectId: target.projectId,
-                originObservationId: null,
-                provenance: null,
-                userInferred: false,
-                nowMs,
-            });
-
-            const effects: ClaimEffectDescriptor[] = [
-                {
-                    effectKey: `upsert:${target.publicClaimId}:r${appended.revision}`,
-                    projectId: target.projectId,
-                    claimId: target.claimId,
-                    revisionId: appended.revisionId,
-                    changeKind: "upsert",
-                },
-            ];
-            const policyRevisionIds = [appended.revisionId];
-            for (const source of sources) {
-                addClaimConflictInCurrentTransaction(db, {
-                    relation: "supersedes",
-                    leftRevisionId: appended.revisionId,
-                    rightRevisionId: source.currentRevisionId,
-                });
-                const sourceAttributes = readRevisionAttributes(db, source.currentRevisionId);
-                if (!sourceAttributes) {
-                    throw new ClaimGraphCorruptionError(
-                        `claim revision ${source.currentRevisionId} has no attributes row; direct-SQL corruption`,
-                    );
-                }
-                appendLifecycleEvent(db, {
-                    claimId: source.claimId,
-                    state: "retired",
-                    actor: input.actor,
-                    reason: `merged into ${target.publicClaimId}`,
-                    nowMs,
-                });
-                upsertCurrentHead(db, {
-                    claimId: source.claimId,
-                    projectId: source.projectId,
-                    category: sourceAttributes.category,
-                    normalizedHash: sourceAttributes.normalizedHash,
-                    revisionId: source.currentRevisionId,
-                    lifecycleState: "retired",
-                    nowMs,
-                });
-                effects.push({
-                    effectKey: `lifecycle:${source.publicClaimId}:retired`,
-                    projectId: source.projectId,
-                    claimId: source.claimId,
-                    revisionId: source.currentRevisionId,
-                    changeKind: "lifecycle",
-                });
-                policyRevisionIds.push(source.currentRevisionId);
-            }
-            const locator = {
-                publicClaimId: target.publicClaimId,
-                revision: appended.revision,
-                contentDigest: sha256Utf8Hex(mergedContent),
-            };
-            return {
-                kind: "effects",
-                payload: {
-                    claim: claimPayloadLocator(locator),
-                    kind: "merged",
-                    retiredSources: sources.map((source) => source.publicClaimId),
-                },
-                effects,
-                policyRevisionIds,
-            };
-        },
+        () => stageMergeProjectMemoryClaimsInCurrentTransaction(db, input, nowMs),
         nowMs,
     );
 }
@@ -1624,6 +1656,54 @@ export interface ApplyProjectMemoryMappingInput {
     paths: ApplicabilityPathsInput;
     knownFrom?: number;
     nowMs?: number;
+}
+
+/** Transaction-local domain stage for composition inside one outer claim operation. */
+export function stageApplyProjectMemoryMappingInCurrentTransaction(
+    db: Database,
+    input: ApplyProjectMemoryMappingInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const validation = validateProjectMemoryMutationToken(db, input.token);
+    if (!validation.ok) {
+        return { kind: "stale", reason: `${validation.stalePart}: ${validation.reason}` };
+    }
+    const claim = validation.claim;
+    const expectedLocator = formatRevisionLocator(claim);
+    if (input.revisionLocator !== expectedLocator) {
+        return {
+            kind: "stale",
+            reason: `revision: mapping targets ${input.revisionLocator} but current is ${expectedLocator}`,
+        };
+    }
+    const sync = syncRevisionApplicabilityPathsInCurrentTransaction(db, {
+        revisionId: claim.currentRevisionId,
+        projectId: claim.projectId,
+        streamKey: APPLICABILITY_BASELINE_STREAM_KEY,
+        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
+        sourceDigest: claim.contentDigest,
+        paths: input.paths,
+        knownFrom: input.knownFrom ?? nowMs,
+    });
+    if (!sync.appended) {
+        return {
+            kind: "noop",
+            payload: { claim: claimPayloadLocator(claim), kind: "mapping" },
+        };
+    }
+    return {
+        kind: "effects",
+        payload: { claim: claimPayloadLocator(claim), kind: "mapping" },
+        effects: [
+            {
+                effectKey: `applicability:${claim.publicClaimId}:r${claim.revision}`,
+                projectId: claim.projectId,
+                claimId: claim.claimId,
+                revisionId: claim.currentRevisionId,
+                changeKind: "applicability",
+            },
+        ],
+    };
 }
 
 /** Append path knowledge onto the exact current revision's baseline
@@ -1653,48 +1733,7 @@ export function applyProjectMemoryMapping(
     return runClaimOperation(
         db,
         envelope,
-        () => {
-            const validation = validateProjectMemoryMutationToken(db, input.token);
-            if (!validation.ok) {
-                return { kind: "stale", reason: `${validation.stalePart}: ${validation.reason}` };
-            }
-            const claim = validation.claim;
-            const expectedLocator = formatRevisionLocator(claim);
-            if (input.revisionLocator !== expectedLocator) {
-                return {
-                    kind: "stale",
-                    reason: `revision: mapping targets ${input.revisionLocator} but current is ${expectedLocator}`,
-                };
-            }
-            const sync = syncRevisionApplicabilityPathsInCurrentTransaction(db, {
-                revisionId: claim.currentRevisionId,
-                projectId: claim.projectId,
-                streamKey: APPLICABILITY_BASELINE_STREAM_KEY,
-                keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
-                sourceDigest: claim.contentDigest,
-                paths: input.paths,
-                knownFrom: input.knownFrom ?? nowMs,
-            });
-            if (!sync.appended) {
-                return {
-                    kind: "noop",
-                    payload: { claim: claimPayloadLocator(claim), kind: "mapping" },
-                };
-            }
-            return {
-                kind: "effects",
-                payload: { claim: claimPayloadLocator(claim), kind: "mapping" },
-                effects: [
-                    {
-                        effectKey: `applicability:${claim.publicClaimId}:r${claim.revision}`,
-                        projectId: claim.projectId,
-                        claimId: claim.claimId,
-                        revisionId: claim.currentRevisionId,
-                        changeKind: "applicability",
-                    },
-                ],
-            };
-        },
+        () => stageApplyProjectMemoryMappingInCurrentTransaction(db, input, nowMs),
         nowMs,
     );
 }
@@ -1705,6 +1744,48 @@ export interface RecordProjectMemoryVerificationInput {
     outcome: "verified" | "update" | "archive" | "stale" | "flagged";
     verifier: string;
     nowMs?: number;
+}
+
+/** Transaction-local domain stage for composition inside one outer claim operation. */
+export function stageRecordProjectMemoryVerificationInCurrentTransaction(
+    db: Database,
+    input: RecordProjectMemoryVerificationInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const validation = validateProjectMemoryMutationToken(db, input.token);
+    if (!validation.ok) {
+        return { kind: "stale", reason: `${validation.stalePart}: ${validation.reason}` };
+    }
+    const claim = validation.claim;
+    const expectedLocator = formatRevisionLocator(claim);
+    if (input.revisionLocator !== expectedLocator) {
+        return {
+            kind: "stale",
+            reason: `revision: verification targets ${input.revisionLocator} but current is ${expectedLocator}`,
+        };
+    }
+    db.prepare(
+        `INSERT INTO verification_events (revision_id, observation_id, outcome, verifier, created_at)
+         VALUES (?, NULL, ?, ?, ?)`,
+    ).run(claim.currentRevisionId, input.outcome, input.verifier, nowMs);
+    return {
+        kind: "effects",
+        payload: {
+            claim: claimPayloadLocator(claim),
+            kind: "verification",
+            outcome: input.outcome,
+        },
+        effects: [
+            {
+                effectKey: `verification:${claim.publicClaimId}:r${claim.revision}:${input.outcome}`,
+                projectId: claim.projectId,
+                claimId: claim.claimId,
+                revisionId: claim.currentRevisionId,
+                changeKind: "verification",
+            },
+        ],
+        policyRevisionIds: [claim.currentRevisionId],
+    };
 }
 
 /** Append one verification event against the exact current revision and
@@ -1728,42 +1809,7 @@ export function recordProjectMemoryVerification(
     return runClaimOperation(
         db,
         envelope,
-        () => {
-            const validation = validateProjectMemoryMutationToken(db, input.token);
-            if (!validation.ok) {
-                return { kind: "stale", reason: `${validation.stalePart}: ${validation.reason}` };
-            }
-            const claim = validation.claim;
-            const expectedLocator = formatRevisionLocator(claim);
-            if (input.revisionLocator !== expectedLocator) {
-                return {
-                    kind: "stale",
-                    reason: `revision: verification targets ${input.revisionLocator} but current is ${expectedLocator}`,
-                };
-            }
-            db.prepare(
-                `INSERT INTO verification_events (revision_id, observation_id, outcome, verifier, created_at)
-                 VALUES (?, NULL, ?, ?, ?)`,
-            ).run(claim.currentRevisionId, input.outcome, input.verifier, nowMs);
-            return {
-                kind: "effects",
-                payload: {
-                    claim: claimPayloadLocator(claim),
-                    kind: "verification",
-                    outcome: input.outcome,
-                },
-                effects: [
-                    {
-                        effectKey: `verification:${claim.publicClaimId}:r${claim.revision}:${input.outcome}`,
-                        projectId: claim.projectId,
-                        claimId: claim.claimId,
-                        revisionId: claim.currentRevisionId,
-                        changeKind: "verification",
-                    },
-                ],
-                policyRevisionIds: [claim.currentRevisionId],
-            };
-        },
+        () => stageRecordProjectMemoryVerificationInCurrentTransaction(db, input, nowMs),
         nowMs,
     );
 }

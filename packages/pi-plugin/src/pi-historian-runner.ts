@@ -46,10 +46,7 @@ import {
 	appendCompartments,
 	getCompartments,
 } from "@magic-context/core/features/magic-context/compartment-storage";
-import {
-	embedPromotedFacts,
-	promoteSessionFactsDurable,
-} from "@magic-context/core/features/magic-context/memory";
+import { promoteSessionFactsDurable } from "@magic-context/core/features/magic-context/memory";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	bindMemoriesToCurrentRevision,
@@ -1183,7 +1180,6 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					return false;
 				return true;
 			});
-			let promotedFactRefs: Array<{ memoryId: number; content: string }> = [];
 			let persistedIds: number[] = [];
 
 			// Atomic publication: append + durable facts/events/drop queue + clear failure state.
@@ -1226,11 +1222,17 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// renderer's m[1] new-memories watermark. Promotion is in the SAME
 				// transaction as the boundary floor below, so both commit or both roll back.
 				if (promotionActive && !skipUnanchoredPromotion) {
-					promotedFactRefs = promoteSessionFactsDurable(
+					promoteSessionFactsDurable(
 						db,
 						sessionId,
 						projectPath,
 						validatedPass.facts ?? [],
+						{
+							producer: "pi-historian",
+							runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
+							leaseGeneration: compartmentLeaseHolderId,
+							batchId: `${chunk.startIndex}-${lastNewEnd}`,
+						},
 					);
 				}
 
@@ -1412,20 +1414,6 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						sessionLog(
 							sessionId,
 							"project registration after publish failed:",
-							error,
-						);
-					}
-					try {
-						await embedPromotedFacts(
-							db,
-							sessionId,
-							projectPath,
-							promotedFactRefs,
-						);
-					} catch (error) {
-						sessionLog(
-							sessionId,
-							"promoted fact embedding dispatch failed:",
 							error,
 						);
 					}
