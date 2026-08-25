@@ -19,6 +19,11 @@ use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
+use mc_core::claim_operation::{
+    canonical_json_encode, compute_claim_operation_request_digest, decode_claim_operation_result,
+    ClaimCommandIdentity, ClaimIntentAckKind, ClaimIntentBinding, ClaimIntentState,
+    ClaimResultOutcome, CLAIM_REQUEST_ENCODING_VERSION,
+};
 use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -2677,6 +2682,44 @@ const MIGRATIONS: &[Migration] = &[
             WHERE status IN ('active', 'permanent');
         ",
     },
+    Migration {
+        version: 56,
+        statements: "
+        CREATE TABLE mc_claim_intents (
+            producer TEXT NOT NULL CHECK (length(producer) BETWEEN 1 AND 256),
+            operation_key TEXT NOT NULL CHECK (length(operation_key) BETWEEN 1 AND 256),
+            database_incarnation_id TEXT NOT NULL CHECK (length(database_incarnation_id) = 32),
+            format_epoch INTEGER NOT NULL CHECK (format_epoch > 0),
+            authority_project TEXT NOT NULL CHECK (length(authority_project) > 0),
+            authority_generation INTEGER NOT NULL CHECK (authority_generation >= 0),
+            request_encoding_version INTEGER NOT NULL CHECK (request_encoding_version = 1),
+            request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+            state TEXT NOT NULL CHECK (state IN (
+                'staged', 'context-committed', 'acknowledged', 'terminal-rejected'
+            )),
+            result_json TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (producer, operation_key),
+            CHECK (
+                (state = 'staged' AND result_json IS NULL)
+                OR (state <> 'staged' AND result_json IS NOT NULL)
+            )
+        );
+        CREATE INDEX idx_mc_claim_intents_unresolved
+            ON mc_claim_intents(state, created_at_ms, producer, operation_key);
+        CREATE TABLE mc_claim_intent_controls (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            database_incarnation_id TEXT NOT NULL
+                CHECK (length(database_incarnation_id) = 32),
+            authority_generation INTEGER NOT NULL CHECK (authority_generation >= 0),
+            transition_state TEXT NOT NULL CHECK (transition_state IN (
+                'accepting', 'draining', 'resetting'
+            )),
+            updated_at_ms INTEGER NOT NULL
+        );
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4698,6 +4741,24 @@ pub struct StoredNoteSearchRow {
     pub updated_at_ms: i64,
 }
 
+/// Persists one claim command intent and its committed result JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimIntentRecord {
+    pub binding: ClaimIntentBinding,
+    pub command: ClaimCommandIdentity,
+    pub request_digest: String,
+    pub state: ClaimIntentState,
+    pub result_json: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimIntentMutationOutcome {
+    pub record: ClaimIntentRecord,
+    pub replayed: bool,
+}
+
 /// Durable authority state for one context store, project, and owned domain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityRow {
@@ -5174,6 +5235,30 @@ pub enum McStoreError {
         write_project: String,
         domain: String,
     },
+    ClaimIntentInvalid(String),
+    ClaimIntentIdentityConflict {
+        producer: String,
+        operation_key: String,
+    },
+    ClaimIntentBindingMismatch {
+        field: &'static str,
+        expected: String,
+        found: String,
+    },
+    ClaimIntentAuthorityFrozen {
+        state: String,
+    },
+    ClaimIntentNotFound {
+        producer: String,
+        operation_key: String,
+    },
+    ClaimIntentTransition {
+        expected: String,
+        found: String,
+    },
+    ClaimIntentResetBlocked {
+        unresolved: usize,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -5232,6 +5317,39 @@ impl std::fmt::Display for McStoreError {
             } => write!(
                 f,
                 "{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}"
+            ),
+            McStoreError::ClaimIntentInvalid(reason) => {
+                write!(f, "invalid claim intent: {reason}")
+            }
+            McStoreError::ClaimIntentIdentityConflict {
+                producer,
+                operation_key,
+            } => write!(
+                f,
+                "claim command identity {producer}/{operation_key} was reused with a different request digest"
+            ),
+            McStoreError::ClaimIntentBindingMismatch {
+                field,
+                expected,
+                found,
+            } => write!(
+                f,
+                "claim intent {field} mismatch: expected {expected}, found {found}"
+            ),
+            McStoreError::ClaimIntentAuthorityFrozen { state } => {
+                write!(f, "claim intent writes are frozen during authority state {state}")
+            }
+            McStoreError::ClaimIntentNotFound {
+                producer,
+                operation_key,
+            } => write!(f, "claim intent {producer}/{operation_key} was not found"),
+            McStoreError::ClaimIntentTransition { expected, found } => write!(
+                f,
+                "claim intent state mismatch: expected {expected}, found {found}"
+            ),
+            McStoreError::ClaimIntentResetBlocked { unresolved } => write!(
+                f,
+                "store rebuild refused while {unresolved} claim intents remain unresolved"
             ),
         }
     }
@@ -5377,6 +5495,24 @@ enum AuthorityFinishDrainOutcome {
     FeedHeadAdvanced { captured: i64, found: i64 },
 }
 
+enum ClaimIntentTxnOutcome {
+    Applied(ClaimIntentMutationOutcome),
+    IdentityConflict,
+    BindingMismatch {
+        field: &'static str,
+        expected: String,
+        found: String,
+    },
+    Frozen(String),
+    NotFound,
+    Transition {
+        expected: String,
+        found: String,
+    },
+    ResetBlocked(usize),
+    ResetGranted,
+}
+
 enum PublishTxnOutcome {
     Committed(HistorianPublishResult),
     CasConflict {
@@ -5474,6 +5610,192 @@ const AUTHORITY_SELECT_SQL: &str = "SELECT context_store_uuid, project, domain, 
     checksum_expected, checksum_actual, checksum_ok
     FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3";
 
+const CLAIM_INTENT_COLUMNS: &str = "producer, operation_key, database_incarnation_id,
+    format_epoch, authority_project, authority_generation, request_digest, state,
+    result_json, created_at_ms, updated_at_ms";
+
+fn claim_intent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimIntentRecord> {
+    let state: String = row.get(7)?;
+    let Some(state) = ClaimIntentState::parse(&state) else {
+        return Err(rusqlite::Error::InvalidColumnType(
+            7,
+            "state".to_string(),
+            rusqlite::types::Type::Text,
+        ));
+    };
+    let authority_generation: i64 = row.get(5)?;
+    Ok(ClaimIntentRecord {
+        command: ClaimCommandIdentity {
+            producer: row.get(0)?,
+            operation_key: row.get(1)?,
+        },
+        binding: ClaimIntentBinding {
+            database_incarnation_id: row.get(2)?,
+            format_epoch: row.get(3)?,
+            authority_project: row.get(4)?,
+            authority_generation: authority_generation as u64,
+        },
+        request_digest: row.get(6)?,
+        state,
+        result_json: row.get(8)?,
+        created_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+    })
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_claim_intent_fields(
+    binding: &ClaimIntentBinding,
+    command: &ClaimCommandIdentity,
+) -> Result<(), McStoreError> {
+    if !is_lower_hex(&binding.database_incarnation_id, 32) {
+        return Err(McStoreError::ClaimIntentInvalid(
+            "database incarnation ID must be 32 lowercase hex characters".to_string(),
+        ));
+    }
+    if binding.format_epoch < 1 {
+        return Err(McStoreError::ClaimIntentInvalid(
+            "format epoch must be positive".to_string(),
+        ));
+    }
+    if binding.authority_project.is_empty() {
+        return Err(McStoreError::ClaimIntentInvalid(
+            "authority project is required".to_string(),
+        ));
+    }
+    i64::try_from(binding.authority_generation).map_err(|_| {
+        McStoreError::ClaimIntentInvalid("authority generation exceeds SQLite i64".to_string())
+    })?;
+    for (name, value) in [
+        ("producer", command.producer.as_str()),
+        ("operation key", command.operation_key.as_str()),
+    ] {
+        if value.is_empty() || value.len() > 256 {
+            return Err(McStoreError::ClaimIntentInvalid(format!(
+                "{name} must contain 1..=256 bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_claim_intent_binding(
+    stored: &ClaimIntentRecord,
+    binding: &ClaimIntentBinding,
+) -> Result<(), McStoreError> {
+    for (field, expected, found) in [
+        (
+            "database incarnation",
+            stored.binding.database_incarnation_id.clone(),
+            binding.database_incarnation_id.clone(),
+        ),
+        (
+            "format epoch",
+            stored.binding.format_epoch.to_string(),
+            binding.format_epoch.to_string(),
+        ),
+        (
+            "authority project",
+            stored.binding.authority_project.clone(),
+            binding.authority_project.clone(),
+        ),
+        (
+            "authority generation",
+            stored.binding.authority_generation.to_string(),
+            binding.authority_generation.to_string(),
+        ),
+    ] {
+        if expected != found {
+            return Err(McStoreError::ClaimIntentBindingMismatch {
+                field,
+                expected,
+                found,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn claim_intent_mutation_result(
+    outcome: ClaimIntentTxnOutcome,
+    command: &ClaimCommandIdentity,
+) -> Result<ClaimIntentMutationOutcome, McStoreError> {
+    match outcome {
+        ClaimIntentTxnOutcome::Applied(outcome) => Ok(outcome),
+        ClaimIntentTxnOutcome::IdentityConflict => Err(McStoreError::ClaimIntentIdentityConflict {
+            producer: command.producer.clone(),
+            operation_key: command.operation_key.clone(),
+        }),
+        ClaimIntentTxnOutcome::BindingMismatch {
+            field,
+            expected,
+            found,
+        } => Err(McStoreError::ClaimIntentBindingMismatch {
+            field,
+            expected,
+            found,
+        }),
+        ClaimIntentTxnOutcome::Frozen(state) => {
+            Err(McStoreError::ClaimIntentAuthorityFrozen { state })
+        }
+        ClaimIntentTxnOutcome::NotFound => Err(McStoreError::ClaimIntentNotFound {
+            producer: command.producer.clone(),
+            operation_key: command.operation_key.clone(),
+        }),
+        ClaimIntentTxnOutcome::Transition { expected, found } => {
+            Err(McStoreError::ClaimIntentTransition { expected, found })
+        }
+        ClaimIntentTxnOutcome::ResetBlocked(_) | ClaimIntentTxnOutcome::ResetGranted => {
+            unreachable!("claim mutation transaction cannot return a rebuild outcome")
+        }
+    }
+}
+
+fn validate_claim_result_json(
+    result_json: &str,
+    kind: ClaimIntentAckKind,
+) -> Result<(), McStoreError> {
+    let result = decode_claim_operation_result(result_json)
+        .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
+    let value: Value = serde_json::from_str(result_json)
+        .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
+    let canonical = canonical_json_encode(&value)
+        .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
+    if canonical.as_bytes() != result_json.as_bytes() {
+        return Err(McStoreError::ClaimIntentInvalid(
+            "result_json is not canonical".to_string(),
+        ));
+    }
+    match kind {
+        ClaimIntentAckKind::ContextCommitted
+            if !matches!(
+                result.outcome,
+                ClaimResultOutcome::Applied | ClaimResultOutcome::Noop
+            ) =>
+        {
+            Err(McStoreError::ClaimIntentInvalid(
+                "context-committed result must be applied or noop".to_string(),
+            ))
+        }
+        ClaimIntentAckKind::TerminalRejected
+            if result.outcome != ClaimResultOutcome::Stale
+                || !result.effects.is_empty()
+                || !result.generations.is_empty() =>
+        {
+            Err(McStoreError::ClaimIntentInvalid(
+                "terminal-rejected result must be stale with zero effects".to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[derive(Debug)]
 enum AuthorityTransitionError {
     State { expected: String, found: String },
@@ -5539,6 +5861,35 @@ fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
             "unknown authority domain {domain}"
         )))
     }
+}
+
+fn set_claim_intent_transition_tx(
+    tx: &rusqlite::Transaction<'_>,
+    database_incarnation_id: &str,
+    authority_generation: u64,
+    transition_state: &str,
+) -> rusqlite::Result<()> {
+    if !is_lower_hex(database_incarnation_id, 32) {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO mc_claim_intent_controls(
+            id, database_incarnation_id, authority_generation,
+            transition_state, updated_at_ms
+         ) VALUES (1, ?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+            database_incarnation_id = excluded.database_incarnation_id,
+            authority_generation = excluded.authority_generation,
+            transition_state = excluded.transition_state,
+            updated_at_ms = excluded.updated_at_ms",
+        params![
+            database_incarnation_id,
+            authority_generation as i64,
+            transition_state,
+            current_time_ms(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn authority_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorityRow> {
@@ -14526,6 +14877,345 @@ impl McStore {
 }
 
 impl McStore {
+    pub fn stage_claim_intent(
+        &self,
+        binding: &ClaimIntentBinding,
+        command: &ClaimCommandIdentity,
+        request: &Value,
+        now_ms: i64,
+    ) -> Result<ClaimIntentMutationOutcome, McStoreError> {
+        validate_claim_intent_fields(binding, command)?;
+        let request_digest = compute_claim_operation_request_digest(request)
+            .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
+        let authority_generation = i64::try_from(binding.authority_generation).map_err(|_| {
+            McStoreError::ClaimIntentInvalid("authority generation exceeds SQLite i64".to_string())
+        })?;
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let existing = tx
+                .query_row(
+                    &format!(
+                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                          WHERE producer = ?1 AND operation_key = ?2"
+                    ),
+                    params![command.producer, command.operation_key],
+                    claim_intent_record_from_row,
+                )
+                .optional()?;
+            if let Some(record) = existing {
+                if record.request_digest != request_digest {
+                    return Ok(ClaimIntentTxnOutcome::IdentityConflict);
+                }
+                if let Err(McStoreError::ClaimIntentBindingMismatch {
+                    field,
+                    expected,
+                    found,
+                }) = require_claim_intent_binding(&record, binding)
+                {
+                    return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        field,
+                        expected,
+                        found,
+                    });
+                }
+                return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                    record,
+                    replayed: true,
+                }));
+            }
+
+            let transition: Option<String> = tx
+                .query_row(
+                    "SELECT transition_state FROM mc_claim_intent_controls WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(state) = transition.filter(|state| state != "accepting") {
+                return Ok(ClaimIntentTxnOutcome::Frozen(state));
+            }
+            let authority: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT state, generation FROM mc_authority
+                      WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+                    params![binding.database_incarnation_id, binding.authority_project],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((state, generation)) = authority {
+                if state != "MODULE" {
+                    return Ok(ClaimIntentTxnOutcome::Frozen(state));
+                }
+                if generation != authority_generation {
+                    return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        field: "authority generation",
+                        expected: generation.to_string(),
+                        found: authority_generation.to_string(),
+                    });
+                }
+            }
+            tx.execute(
+                "INSERT INTO mc_claim_intents(
+                    producer, operation_key, database_incarnation_id, format_epoch,
+                    authority_project, authority_generation, request_encoding_version,
+                    request_digest, state, result_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'staged', NULL, ?9, ?9)",
+                params![
+                    command.producer,
+                    command.operation_key,
+                    binding.database_incarnation_id,
+                    binding.format_epoch,
+                    binding.authority_project,
+                    authority_generation,
+                    CLAIM_REQUEST_ENCODING_VERSION,
+                    request_digest,
+                    now_ms,
+                ],
+            )?;
+            let record = tx.query_row(
+                &format!(
+                    "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                      WHERE producer = ?1 AND operation_key = ?2"
+                ),
+                params![command.producer, command.operation_key],
+                claim_intent_record_from_row,
+            )?;
+            Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                record,
+                replayed: false,
+            }))
+        })?;
+        claim_intent_mutation_result(outcome, command)
+    }
+
+    pub fn inspect_claim_intent(
+        &self,
+        command: &ClaimCommandIdentity,
+    ) -> Result<Option<ClaimIntentRecord>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                          WHERE producer = ?1 AND operation_key = ?2"
+                    ),
+                    params![command.producer, command.operation_key],
+                    claim_intent_record_from_row,
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn list_claim_intents(
+        &self,
+        unresolved_only: bool,
+        limit: usize,
+    ) -> Result<Vec<ClaimIntentRecord>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                let where_clause = if unresolved_only {
+                    "WHERE state IN ('staged', 'context-committed')"
+                } else {
+                    ""
+                };
+                let sql = format!(
+                    "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                     {where_clause}
+                     ORDER BY created_at_ms, producer, operation_key LIMIT ?1"
+                );
+                let mut statement = conn.prepare_cached(&sql)?;
+                let rows =
+                    statement.query_map(params![limit as i64], claim_intent_record_from_row)?;
+                rows.collect()
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn acknowledge_claim_intent(
+        &self,
+        binding: &ClaimIntentBinding,
+        command: &ClaimCommandIdentity,
+        request_digest: &str,
+        kind: ClaimIntentAckKind,
+        result_json: Option<&str>,
+        now_ms: i64,
+    ) -> Result<ClaimIntentMutationOutcome, McStoreError> {
+        validate_claim_intent_fields(binding, command)?;
+        if !is_lower_hex(request_digest, 64) {
+            return Err(McStoreError::ClaimIntentInvalid(
+                "request digest must be 64 lowercase hex characters".to_string(),
+            ));
+        }
+        match (kind, result_json) {
+            (ClaimIntentAckKind::Acknowledged, None) => {}
+            (ClaimIntentAckKind::Acknowledged, Some(_)) => {
+                return Err(McStoreError::ClaimIntentInvalid(
+                    "acknowledged transition must not supply result_json".to_string(),
+                ));
+            }
+            (_, Some(result)) => validate_claim_result_json(result, kind)?,
+            (_, None) => {
+                return Err(McStoreError::ClaimIntentInvalid(
+                    "result_json is required for this transition".to_string(),
+                ));
+            }
+        }
+
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let Some(record) = tx
+                .query_row(
+                    &format!(
+                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                          WHERE producer = ?1 AND operation_key = ?2"
+                    ),
+                    params![command.producer, command.operation_key],
+                    claim_intent_record_from_row,
+                )
+                .optional()?
+            else {
+                return Ok(ClaimIntentTxnOutcome::NotFound);
+            };
+            if record.request_digest != request_digest {
+                return Ok(ClaimIntentTxnOutcome::IdentityConflict);
+            }
+            if let Err(McStoreError::ClaimIntentBindingMismatch {
+                field,
+                expected,
+                found,
+            }) = require_claim_intent_binding(&record, binding)
+            {
+                return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                    field,
+                    expected,
+                    found,
+                });
+            }
+
+            let next_state = match (kind, record.state) {
+                (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Staged) => {
+                    Some(ClaimIntentState::ContextCommitted)
+                }
+                (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::Staged) => {
+                    Some(ClaimIntentState::TerminalRejected)
+                }
+                (ClaimIntentAckKind::Acknowledged, ClaimIntentState::ContextCommitted) => {
+                    Some(ClaimIntentState::Acknowledged)
+                }
+                (ClaimIntentAckKind::Acknowledged, ClaimIntentState::Acknowledged)
+                | (ClaimIntentAckKind::Acknowledged, ClaimIntentState::TerminalRejected) => None,
+                (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::ContextCommitted)
+                | (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Acknowledged)
+                | (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::TerminalRejected)
+                    if record.result_json.as_deref() == result_json =>
+                {
+                    None
+                }
+                _ => {
+                    return Ok(ClaimIntentTxnOutcome::Transition {
+                        expected: match kind {
+                            ClaimIntentAckKind::ContextCommitted
+                            | ClaimIntentAckKind::TerminalRejected => "staged",
+                            ClaimIntentAckKind::Acknowledged => "context-committed",
+                        }
+                        .to_string(),
+                        found: record.state.as_str().to_string(),
+                    });
+                }
+            };
+            if let Some(next_state) = next_state {
+                tx.execute(
+                    "UPDATE mc_claim_intents
+                        SET state = ?1, result_json = COALESCE(?2, result_json), updated_at_ms = ?3
+                      WHERE producer = ?4 AND operation_key = ?5",
+                    params![
+                        next_state.as_str(),
+                        result_json,
+                        now_ms,
+                        command.producer,
+                        command.operation_key,
+                    ],
+                )?;
+                let record = tx.query_row(
+                    &format!(
+                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                          WHERE producer = ?1 AND operation_key = ?2"
+                    ),
+                    params![command.producer, command.operation_key],
+                    claim_intent_record_from_row,
+                )?;
+                return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                    record,
+                    replayed: false,
+                }));
+            }
+            Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                record,
+                replayed: true,
+            }))
+        })?;
+        claim_intent_mutation_result(outcome, command)
+    }
+
+    pub fn unresolved_claim_intent_count(&self) -> Result<usize, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_claim_intents
+                      WHERE state IN ('staged', 'context-committed')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .map(|count| count as usize)
+            .map_err(Into::into)
+    }
+
+    pub fn begin_claim_store_rebuild(
+        &self,
+        database_incarnation_id: &str,
+        authority_generation: u64,
+        now_ms: i64,
+    ) -> Result<(), McStoreError> {
+        if !is_lower_hex(database_incarnation_id, 32) {
+            return Err(McStoreError::ClaimIntentInvalid(
+                "database incarnation ID must be 32 lowercase hex characters".to_string(),
+            ));
+        }
+        let generation = i64::try_from(authority_generation).map_err(|_| {
+            McStoreError::ClaimIntentInvalid("authority generation exceeds SQLite i64".to_string())
+        })?;
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let unresolved: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM mc_claim_intents
+                  WHERE state IN ('staged', 'context-committed')",
+                [],
+                |row| row.get(0),
+            )?;
+            if unresolved > 0 {
+                return Ok(ClaimIntentTxnOutcome::ResetBlocked(unresolved as usize));
+            }
+            tx.execute(
+                "INSERT INTO mc_claim_intent_controls(
+                    id, database_incarnation_id, authority_generation,
+                    transition_state, updated_at_ms
+                 ) VALUES (1, ?1, ?2, 'resetting', ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    database_incarnation_id = excluded.database_incarnation_id,
+                    authority_generation = excluded.authority_generation,
+                    transition_state = 'resetting', updated_at_ms = excluded.updated_at_ms",
+                params![database_incarnation_id, generation, now_ms],
+            )?;
+            Ok(ClaimIntentTxnOutcome::ResetGranted)
+        })?;
+        match outcome {
+            ClaimIntentTxnOutcome::ResetGranted => Ok(()),
+            ClaimIntentTxnOutcome::ResetBlocked(unresolved) => {
+                Err(McStoreError::ClaimIntentResetBlocked { unresolved })
+            }
+            _ => unreachable!("rebuild transaction returns only granted or blocked"),
+        }
+    }
+
     /// Read the durable authority row. A missing row is normal for a store that has
     /// never opted a project into module ownership.
     pub fn authority_status(
@@ -14614,11 +15304,20 @@ impl McStore {
                         },
                     )));
                 }
-                tx.query_row(
+                let row = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
-                )
+                )?;
+                if domain == "memories" {
+                    set_claim_intent_transition_tx(
+                        tx,
+                        context_store_uuid,
+                        row.generation,
+                        "resetting",
+                    )?;
+                }
+                Ok(row)
             })
     }
 
@@ -14824,11 +15523,24 @@ impl McStore {
                         domain
                     ],
                 )?;
-                tx.query_row(
+                let row = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
-                )
+                )?;
+                if domain == "memories" {
+                    set_claim_intent_transition_tx(
+                        tx,
+                        context_store_uuid,
+                        row.generation,
+                        if row.state == "MODULE" {
+                            "accepting"
+                        } else {
+                            "resetting"
+                        },
+                    )?;
+                }
+                Ok(row)
             })
             .map_err(map_authority_sql_error)
     }
@@ -14909,11 +15621,20 @@ impl McStore {
                             domain
                         ],
                     )?;
-                    return tx.query_row(
+                    let row = tx.query_row(
                         AUTHORITY_SELECT_SQL,
                         params![context_store_uuid, project, domain],
                         authority_row_from_sql,
-                    );
+                    )?;
+                    if domain == "memories" {
+                        set_claim_intent_transition_tx(
+                            tx,
+                            context_store_uuid,
+                            row.generation,
+                            "draining",
+                        )?;
+                    }
+                    return Ok(row);
                 }
                 if current.state != "MODULE" {
                     return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -14952,11 +15673,20 @@ impl McStore {
                         domain
                     ],
                 )?;
-                tx.query_row(
+                let row = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
-                )
+                )?;
+                if domain == "memories" {
+                    set_claim_intent_transition_tx(
+                        tx,
+                        context_store_uuid,
+                        row.generation,
+                        "draining",
+                    )?;
+                }
+                Ok(row)
             })
             .map_err(map_authority_sql_error)
     }
