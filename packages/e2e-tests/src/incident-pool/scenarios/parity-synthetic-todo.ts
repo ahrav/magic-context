@@ -1314,7 +1314,14 @@ async function driveDependent(
                     bustBytes !== null && deferBytes === bustBytes,
                 durableTransitionCorrect:
                     after?.syntheticCallId === root.callId &&
-                    after?.lastTodoState === normalizedTodoJson(STATE_X_TODOS),
+                    after?.lastTodoState ===
+                        normalizedTodoJson(STATE_X_TODOS) &&
+                    // Healing must persist the anchor linkage too. The provider
+                    // bytes cannot stand in: they can be byte-identical while
+                    // `anchor_mid` stays null, which is exactly the catalog's
+                    // invalid "wrong persisted state linkage" shape this
+                    // known-red case is supposed to keep reproducing.
+                    after?.syntheticAnchorMessageId !== null,
             };
         }
         const terminalProbe = await captureTodoState(
