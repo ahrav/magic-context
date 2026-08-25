@@ -1,14 +1,16 @@
 export const CTX_MEMORY_TOOL_NAME = "ctx_memory";
-export const CTX_MEMORY_DESCRIPTION = `Durable project knowledge shared across every session on this project.
+export const CTX_MEMORY_DESCRIPTION = `Durable project claims shared across sessions.
 
-Your active memories are already visible in <project-memory> (each with its id), and every future session starts with them — write one when you learn something future sessions must know: a project rule, an architectural fact, a hard-won constraint, a config value, or a naming convention. Keep each memory one standalone fact, phrased to make sense without this session's context.
+Claims use public IDs (mcm_<32hex>), immutable revision locators, and claim-local mutation tokens. Reuse the exact token returned by create/get/list when revising or changing lifecycle state.
 
 Actions:
-- write: save a new memory (content + category).
-- update: rewrite one memory whose fact changed (ids: [one], content).
-- archive: retire wrong or obsolete memories (ids: [one or more], optional reason).
-- merge: collapse duplicates into one memory (ids: [two or more], content).
-- get: fetch memories by id (ids: [1-20]); readable in every status. \`list\` remains dreamer-only.
+- create: create a claim (content + category).
+- get: fetch up to 20 public claim IDs; hidden and missing claims have the same result.
+- list: enumerate visible active claims (dreamer maintenance only).
+- revise: append a revision (publicClaimId + mutationToken + content and/or category).
+- archive / restore: append lifecycle state (publicClaimId + mutationToken).
+- merge: same-project merge; mutationTokens are ordered [target, ...sources].
 
-Example: ctx_memory(action="write", category="CONSTRAINTS", content="Pi stores sessions as JSONL under ~/.pi/agent/sessions/, not SQLite")`;
+Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands. Agent calls to approve/enforce are rejected.`;
 export const DEFAULT_SEARCH_LIMIT = 10;
+export const GET_MAX_CLAIMS = 20;

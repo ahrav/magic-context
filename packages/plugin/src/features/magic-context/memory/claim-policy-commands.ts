@@ -12,8 +12,22 @@ import { createHash, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Database } from "../../../shared/sqlite";
-import { getAuthorityManagedMarker } from "../context-authority";
 import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
+import {
+    type CanonicalJsonValue,
+    canonicalClaimMutationToken,
+    computeClaimOperationRequestDigest,
+    formatRevisionLocator,
+    isValidPublicClaimId,
+    type ClaimMutationToken,
+} from "./claim-operation-contract";
+import {
+    type ClaimEffectDescriptor,
+    computeProjectMemoryMutationToken,
+    getProjectMemoryClaimByPublicId,
+    runClaimOperation,
+    validateProjectMemoryMutationToken,
+} from "./storage-claim-operations";
 import {
     appendMaturityAssertionInCurrentTransaction,
     currentApprovalActionId,
@@ -22,19 +36,9 @@ import {
     readPolicySubject,
     recordApprovalActionInCurrentTransaction,
     recordEnforcementArtifactInCurrentTransaction,
-    refreshEffectivePolicyInCurrentTransaction,
     revokeEnforcementArtifactInCurrentTransaction,
 } from "./storage-claim-policy";
-import { sha256Utf8Hex } from "./storage-claims";
-import {
-    bumpEpochForClaimProjectInCurrentTransaction,
-    type MemoryClaimEffect,
-    readMemoryClaimLink,
-    resolveMemoryClaimProjectInCurrentTransaction,
-    runInMemoryClaimsWriteTransaction,
-    runMemoryClaimOperationInCurrentTransaction,
-    withMemoryClaimGenerationContextInCurrentTransaction,
-} from "./storage-memory-claims";
+import { resolveProjectId } from "./storage-claims";
 import { isWithin, safeRealpath, sha256FileSync } from "./verification-paths";
 
 export interface ClaimCommandResult {
@@ -74,6 +78,7 @@ interface PendingConfirmation {
     argsKey: string;
     revisionId: number;
     digest: string;
+    token: string;
     nonce: string;
 }
 
@@ -85,85 +90,42 @@ export function clearClaimCommandConfirmationsForTests(): void {
 }
 
 interface ResolvedTarget {
-    memoryId: number;
+    publicClaimId: string;
     claimId: number;
     projectId: number;
+    currentRevisionId: number;
     revisionId: number;
+    revision: number;
+    revisionLocator: string;
     digest: string;
+    mutationToken: ClaimMutationToken;
     preview: string;
 }
 
-/** Translate an agent-visible memory id into context row space. Under
- * MODULE memory authority the ids the agent sees are the native store's row
- * ids, and mirror-back may map a module id to a DIFFERENT context row
- * (collision renumbering, module-created rows). Runs ONCE at command entry:
- * `resolveTarget` itself stays context-space pure, so the confirmation-time
- * recheck can re-resolve an already-translated id without a second mapping
- * pass redirecting it to an unrelated row. */
-function translateAgentVisibleMemoryId(
-    deps: ClaimCommandDeps,
-    memoryId: number,
-): number | { error: string } {
-    if (!getAuthorityManagedMarker(deps.db, deps.projectPath)) return memoryId;
-    const mapped = deps.db
-        .prepare(
-            `SELECT context_row_id AS contextRowId FROM mirror_identity
-              WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?`,
-        )
-        .get(deps.projectPath, memoryId) as { contextRowId?: number } | null | undefined;
-    if (mapped != null && Number.isInteger(mapped.contextRowId)) {
-        return mapped.contextRowId as number;
-    }
-    // FAIL CLOSED on a missing mapping: while MODULE authority is active the
-    // agent-visible id space IS the module's, and a native row mirror-back
-    // has not yet mapped has no claim row to act on. Falling back to the raw
-    // number would present — and record authority for — whatever context row
-    // happens to carry it.
-    return {
-        error: `Memory ${memoryId} has no mirrored claim row yet; retry after the next sync completes.`,
-    };
-}
-
-/** Resolve a memory id to its claim revision INSIDE the active project only:
- * foreign and workspace-shared rows are rejected before any confirmation
- * detail is revealed (R10). */
 function resolveTarget(
     deps: ClaimCommandDeps,
-    memoryId: number,
+    publicClaimId: string,
 ): ResolvedTarget | { error: string } {
-    const link = readMemoryClaimLink(deps.db, memoryId);
-    if (!link) return { error: `Memory ${memoryId} has no claim link in this project.` };
-    // Membership is decided by resolved project id, not stored-path bytes: a
-    // legacy raw path or an older alias maps to the same numeric project
-    // through `project_aliases`, and the crosswalk's project id carries that
-    // resolution. Foreign and workspace-shared rows still fail the id
-    // comparison (R10).
-    const projectId = runInMemoryClaimsWriteTransaction(deps.db, () =>
-        resolveMemoryClaimProjectInCurrentTransaction(deps.db, deps.projectPath),
-    );
-    if (projectId === null || projectId !== link.projectId) {
-        return { error: `Memory ${memoryId} does not belong to the active project.` };
+    if (!isValidPublicClaimId(publicClaimId)) {
+        return { error: "The claim ID is malformed." };
     }
-    const revision = deps.db
-        .prepare(
-            `SELECT claim_revisions.id AS revisionId, claim_revisions.content_sha256 AS digest,
-                    claim_revisions.content AS content
-             FROM claims JOIN claim_revisions ON claim_revisions.id = claims.current_revision_id
-             WHERE claims.id = ?`,
-        )
-        .get(link.claimId) as
-        | { revisionId: number; digest: string; content: string }
-        | null
-        | undefined;
-    if (!revision) return { error: `Claim ${link.claimId} has no current revision.` };
+    const projectId = resolveProjectId(deps.db, deps.projectPath);
+    const claim = getProjectMemoryClaimByPublicId(deps.db, publicClaimId);
+    if (!claim || projectId === null || claim.projectId !== projectId) {
+        return { error: "The claim does not belong to the active project." };
+    }
     const preview =
-        revision.content.length > 200 ? `${revision.content.slice(0, 200)}…` : revision.content;
+        claim.content.length > 200 ? `${claim.content.slice(0, 200)}…` : claim.content;
     return {
-        memoryId,
-        claimId: link.claimId,
+        publicClaimId,
+        claimId: claim.claimId,
         projectId,
-        revisionId: revision.revisionId,
-        digest: revision.digest,
+        currentRevisionId: claim.currentRevisionId,
+        revisionId: claim.currentRevisionId,
+        revision: claim.revision,
+        revisionLocator: formatRevisionLocator(claim),
+        digest: claim.contentDigest,
+        mutationToken: computeProjectMemoryMutationToken(deps.db, publicClaimId),
         preview,
     };
 }
@@ -178,7 +140,8 @@ function confirmationText(
         `## ⚠️ ${action} Confirmation Required`,
         "",
         `- Project: \`${deps.projectPath}\``,
-        `- Memory: ${target.memoryId} (claim ${target.claimId}, revision ${target.revisionId})`,
+        `- Claim: \`${target.publicClaimId}\``,
+        `- Revision: \`${target.revisionLocator}\``,
         `- Content digest: \`${target.digest}\``,
         "",
         `> ${target.preview.replaceAll("\n", "\n> ")}`,
@@ -187,61 +150,49 @@ function confirmationText(
     ].join("\n");
 }
 
+interface ConfirmedMutationValue {
+    payload: CanonicalJsonValue;
+    effects: ClaimEffectDescriptor[];
+    policyRevisionIds: number[];
+}
+
 interface ConfirmedMutationArgs<T> {
     command: "ctx-approve" | "ctx-enforce";
     argsKey: string;
     target: ResolvedTarget;
     producer: string;
     operationKey: (nonce: string) => string;
-    request: (nonce: string) => unknown;
-    /** Runs on the confirming invocation BEFORE the write transaction opens:
-     * expensive work (artifact evaluation runs a test process with a
-     * 120-second budget) must not hold the immediate transaction that every
-     * memory, claim, and backfill writer serializes on — and must not block
-     * the host event loop that serves every other hook. `mutate` re-verifies
-     * its inputs transactionally afterwards. */
+    request: (nonce: string) => CanonicalJsonValue;
+    decode: (payload: CanonicalJsonValue | null) => T;
     beforeMutate?: () => void | Promise<void>;
-    /** Runs inside the write transaction after the stale-safe recheck. */
-    mutate: (nonce: string) => { result: T; effects: MemoryClaimEffect[] };
+    mutate: (nonce: string) => ConfirmedMutationValue;
 }
 
-/**
- * Shared two-step confirmed mutation: the first invocation stores a nonce
- * bound to session, args, revision, and digest and returns `pending`; a
- * matching repeat within the window rechecks the target inside the write
- * transaction, runs the mutation under the idempotent operation envelope,
- * and bumps the claim project's memory epoch — across every identity
- * attached to the project, canonical and aliases alike — in the same
- * transaction so no stale m0
- * cache keeps serving the old decision (R27).
- */
 async function runConfirmedClaimMutation<T>(
     deps: ClaimCommandDeps,
     args: ConfirmedMutationArgs<T>,
 ): Promise<{ pending: true } | { pending: false; result: T }> {
     const key = `${deps.host}:${deps.sessionId}:${args.command}`;
     const now = deps.nowMs ?? Date.now();
-    // Opportunistic eviction: an abandoned confirmation (started, never
-    // repeated) is otherwise only removed by a successful repeat, so a
-    // long-lived host would retain an entry per abandoned session forever.
-    // The map stays small (two commands per active session), so a full sweep
-    // on each command invocation is cheap.
     for (const [staleKey, entry] of pendingByKey) {
         if (now - entry.timestamp >= CONFIRMATION_WINDOW_MS) pendingByKey.delete(staleKey);
     }
+    const token = canonicalClaimMutationToken(args.target.mutationToken);
     const pendingBefore = pendingByKey.get(key);
     const confirmed =
         pendingBefore != null &&
         now - pendingBefore.timestamp < CONFIRMATION_WINDOW_MS &&
         pendingBefore.argsKey === args.argsKey &&
-        pendingBefore.revisionId === args.target.revisionId &&
-        pendingBefore.digest === args.target.digest;
+        pendingBefore.revisionId === args.target.currentRevisionId &&
+        pendingBefore.digest === args.target.digest &&
+        pendingBefore.token === token;
     if (!confirmed) {
         pendingByKey.set(key, {
             timestamp: now,
             argsKey: args.argsKey,
-            revisionId: args.target.revisionId,
+            revisionId: args.target.currentRevisionId,
             digest: args.target.digest,
+            token,
             nonce: randomUUID(),
         });
         return { pending: true };
@@ -249,39 +200,45 @@ async function runConfirmedClaimMutation<T>(
     pendingByKey.delete(key);
     const nonce = pendingBefore.nonce;
     await args.beforeMutate?.();
-    const outcome = runInMemoryClaimsWriteTransaction(deps.db, () =>
-        withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
-            const operation = runMemoryClaimOperationInCurrentTransaction(
+    const operation = runClaimOperation(
+        deps.db,
+        {
+            producer: args.producer,
+            operationKey: args.operationKey(nonce),
+            requestDigest: computeClaimOperationRequestDigest(args.request(nonce)),
+        },
+        () => {
+            const current = resolveTarget(deps, args.target.publicClaimId);
+            if ("error" in current) throw new Error(current.error);
+            const validation = validateProjectMemoryMutationToken(
                 deps.db,
-                {
-                    producer: args.producer,
-                    operationKey: args.operationKey(nonce),
-                    requestDigest: sha256Utf8Hex(JSON.stringify(args.request(nonce))),
-                },
-                () => {
-                    // Stale-safe recheck inside the write transaction (R10).
-                    const current = resolveTarget(deps, args.target.memoryId);
-                    if ("error" in current) throw new Error(current.error);
-                    if (
-                        current.revisionId !== args.target.revisionId ||
-                        current.digest !== args.target.digest
-                    ) {
-                        throw new Error("the memory changed since confirmation; rerun the command");
-                    }
-                    return args.mutate(nonce);
-                },
+                args.target.mutationToken,
             );
-            bumpEpochForClaimProjectInCurrentTransaction(deps.db, args.target.claimId);
-            return operation;
-        }),
+            if (
+                !validation.ok ||
+                current.currentRevisionId !== args.target.currentRevisionId ||
+                current.revisionLocator !== args.target.revisionLocator ||
+                current.digest !== args.target.digest
+            ) {
+                throw new Error("the claim changed since confirmation; rerun the command");
+            }
+            const value = args.mutate(nonce);
+            return {
+                kind: "effects",
+                payload: value.payload,
+                effects: value.effects,
+                policyRevisionIds: value.policyRevisionIds,
+            };
+        },
+        now,
     );
-    return { pending: false, result: outcome.result };
+    return { pending: false, result: args.decode(operation.result.payload) };
 }
 
 const APPROVE_USAGE = [
     "Usage:",
-    "- `/ctx-approve <memory-id>` — approve the exact current revision",
-    "- `/ctx-approve <memory-id> --revoke` — revoke a recorded approval",
+    "- `/ctx-approve <public-claim-id>` — approve the exact current revision",
+    "- `/ctx-approve <public-claim-id> --revoke` — revoke a recorded approval",
 ].join("\n");
 
 export async function executeClaimApprovalCommand(
@@ -290,28 +247,18 @@ export async function executeClaimApprovalCommand(
 ): Promise<ClaimCommandResult> {
     const parts = argsText.trim().split(/\s+/).filter(Boolean);
     const revoke = parts.includes("--revoke");
-    // Strict argument validation: a mistyped flag (`--revok`) must not
-    // silently select the OPPOSITE authority action, and a repeat within the
-    // confirmation window would then commit it. Exactly one id, and the only
-    // supported flag is --revoke.
-    const idParts = parts.filter((part) => !part.startsWith("--"));
+    const targetParts = parts.filter((part) => !part.startsWith("--"));
     const flagParts = parts.filter((part) => part.startsWith("--"));
     if (
-        idParts.length !== 1 ||
+        targetParts.length !== 1 ||
         flagParts.some((flag) => flag !== "--revoke") ||
-        flagParts.length > 1
+        flagParts.length > 1 ||
+        !isValidPublicClaimId(targetParts[0])
     ) {
         return { text: `## Claim Approval\n\n${APPROVE_USAGE}`, level: "error" };
     }
-    const memoryId = Number(idParts[0]);
-    if (!Number.isSafeInteger(memoryId) || memoryId <= 0) {
-        return { text: `## Claim Approval\n\n${APPROVE_USAGE}`, level: "error" };
-    }
-    const translated = translateAgentVisibleMemoryId(deps, memoryId);
-    if (typeof translated !== "number") {
-        return { text: `## Claim Approval — Failed\n\n${translated.error}`, level: "error" };
-    }
-    const target = resolveTarget(deps, translated);
+    const publicClaimId = targetParts[0];
+    const target = resolveTarget(deps, publicClaimId);
     if ("error" in target) {
         return { text: `## Claim Approval — Failed\n\n${target.error}`, level: "error" };
     }
@@ -319,37 +266,32 @@ export async function executeClaimApprovalCommand(
     const currentApproval = currentApprovalActionId(deps.db, target.revisionId);
     if (revoke && currentApproval == null) {
         return {
-            text: `## Claim Approval — Failed\n\nRevision ${target.revisionId} has no currently effective approval to revoke.`,
+            text: `## Claim Approval — Failed\n\nRevision \`${target.revisionLocator}\` has no currently effective approval to revoke.`,
             level: "error",
         };
     }
     if (!revoke && currentApproval != null) {
         return {
-            text: `## Claim Approval\n\nRevision ${target.revisionId} is already approved.`,
+            text: `## Claim Approval\n\nRevision \`${target.revisionLocator}\` is already approved.`,
             level: "info",
         };
     }
-    let outcome: Awaited<ReturnType<typeof runConfirmedClaimMutation<{ actionId: number }>>>;
+    let outcome: Awaited<ReturnType<typeof runConfirmedClaimMutation<null>>>;
     try {
         outcome = await runConfirmedClaimMutation(deps, {
             command: "ctx-approve",
-            argsKey: `${action}:${memoryId}`,
+            argsKey: `${action}:${publicClaimId}`,
             target,
             producer: `claim-approval:${deps.host}`,
-            operationKey: (nonce) => `${action}:${target.revisionId}:${nonce}`,
+            operationKey: (nonce) => `${action}:${publicClaimId}:r${target.revision}:${nonce}`,
             request: (nonce) => ({
                 action,
-                revisionId: target.revisionId,
-                digest: target.digest,
+                mutationToken: canonicalClaimMutationToken(target.mutationToken),
                 nonce,
+                revisionLocator: target.revisionLocator,
             }),
+            decode: () => null,
             mutate: (nonce) => {
-                // Effective-state recheck INSIDE the serialized transaction:
-                // the ordinal identity alone cannot catch two hosts racing
-                // the same transition — the second transaction observes the
-                // first action and derives the NEXT ordinal, so only the
-                // state check refuses the duplicate. A revoke of an
-                // already-revoked approval is refused symmetrically.
                 const effectiveApprovalId = currentApprovalActionId(deps.db, target.revisionId);
                 if (action === "approve" && effectiveApprovalId != null) {
                     throw new Error(
@@ -361,13 +303,6 @@ export async function executeClaimApprovalCommand(
                         "the revision has no active approval to revoke; another session may have revoked it first",
                     );
                 }
-                // Cross-process idempotency: the confirmation nonce is
-                // process-local, so two hosts racing the same
-                // propose+confirm flow would mint two identities and record
-                // the action twice. Derive the identity from the target and
-                // the revision's action ordinal — with the state recheck
-                // above refusing same-transition duplicates, the UNIQUE
-                // constraint is the belt-and-suspenders second gate.
                 const actionOrdinal = Number(
                     (
                         deps.db
@@ -377,11 +312,12 @@ export async function executeClaimApprovalCommand(
                             .get(target.revisionId) as { count: number }
                     ).count,
                 );
-                const commandIdentity = `${action}:${target.revisionId}:${target.digest}:${actionOrdinal}`;
-                const alreadyRecorded = deps.db
-                    .prepare("SELECT 1 FROM claim_approval_actions WHERE command_identity = ?")
-                    .get(commandIdentity);
-                if (alreadyRecorded) {
+                const commandIdentity = `${action}:${target.revisionLocator}:${actionOrdinal}`;
+                if (
+                    deps.db
+                        .prepare("SELECT 1 FROM claim_approval_actions WHERE command_identity = ?")
+                        .get(commandIdentity)
+                ) {
                     throw new Error(
                         "another session recorded this action first; rerun the command to view current state",
                     );
@@ -407,18 +343,19 @@ export async function executeClaimApprovalCommand(
                         nowMs: deps.nowMs,
                     });
                 }
-                refreshEffectivePolicyInCurrentTransaction(deps.db, target.revisionId, {
-                    nowMs: deps.nowMs,
-                });
-                const effects: MemoryClaimEffect[] = [
-                    {
-                        effectKey: `policy:${target.revisionId}:approval`,
-                        projectId: target.projectId,
-                        claimId: target.claimId,
-                        effectType: "lifecycle",
-                    },
-                ];
-                return { result: { actionId: recorded.actionId }, effects };
+                return {
+                    payload: { actionId: recorded.actionId },
+                    effects: [
+                        {
+                            effectKey: `policy:${publicClaimId}:approval`,
+                            projectId: target.projectId,
+                            claimId: target.claimId,
+                            revisionId: target.revisionId,
+                            changeKind: "lifecycle",
+                        },
+                    ],
+                    policyRevisionIds: [target.revisionId],
+                };
             },
         });
     } catch (error) {
@@ -430,7 +367,7 @@ export async function executeClaimApprovalCommand(
     if (outcome.pending) {
         return {
             text: confirmationText(
-                `/ctx-approve ${memoryId}${revoke ? " --revoke" : ""}`,
+                `/ctx-approve ${publicClaimId}${revoke ? " --revoke" : ""}`,
                 revoke ? "Approval Revocation" : "Claim Approval",
                 deps,
                 target,
@@ -443,7 +380,7 @@ export async function executeClaimApprovalCommand(
         text: [
             `## Claim Approval — ${revoke ? "Revoked" : "Recorded"}`,
             "",
-            `Revision ${target.revisionId} (digest \`${target.digest.slice(0, 12)}…\`) is now ${revoke ? "no longer approved; effective maturity falls back to its supported rung" : `historically ${head?.maturity ?? "APPROVED"}`}.`,
+            `Revision \`${target.revisionLocator}\` is now ${revoke ? "no longer approved; effective maturity falls back to its supported rung" : `historically ${head?.maturity ?? "APPROVED"}`}.`,
         ].join("\n"),
         level: "info",
     };
@@ -451,10 +388,10 @@ export async function executeClaimApprovalCommand(
 
 const ENFORCE_USAGE = [
     "Usage:",
-    "- `/ctx-enforce <memory-id> <artifact-path>` — bind a passing in-project test artifact",
-    "- `/ctx-enforce <memory-id> <artifact-path> --kind test|policy|config`",
-    "- `/ctx-enforce <memory-id> --revoke` — revoke every valid enforcement artifact",
-    'Quote artifact paths that contain spaces: `/ctx-enforce 12 "tests/integration suite/policy.test.ts"`',
+    "- `/ctx-enforce <public-claim-id> <artifact-path>` — bind a passing in-project test artifact",
+    "- `/ctx-enforce <public-claim-id> <artifact-path> --kind test|policy|config`",
+    "- `/ctx-enforce <public-claim-id> --revoke` — revoke every valid enforcement artifact",
+    'Quote artifact paths that contain spaces: `/ctx-enforce mcm_<32hex> "tests/integration suite/policy.test.ts"`',
 ].join("\n");
 
 /**
@@ -611,35 +548,22 @@ export async function executeClaimEnforceCommand(
     ) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
-    // Artifact revocation is the compromise-response path (KTD6): a revoked
-    // approval alone only lowers maturity until the next approval, because
-    // supportedMaturity would reuse the still-valid artifact and restore
-    // ENFORCED. Revoking covers every valid artifact for the revision so the
-    // rung must be re-earned with a fresh evaluation.
     if (parts.includes("--revoke")) {
-        const revokeIds = parts.filter((part) => !part.startsWith("--"));
-        const revokeMemoryId = revokeIds.length === 1 ? Number(revokeIds[0]) : Number.NaN;
-        if (!Number.isSafeInteger(revokeMemoryId) || revokeMemoryId <= 0) {
+        const targets = parts.filter((part) => !part.startsWith("--"));
+        if (targets.length !== 1 || !isValidPublicClaimId(targets[0])) {
             return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
         }
-        const revokeTranslated = translateAgentVisibleMemoryId(deps, revokeMemoryId);
-        if (typeof revokeTranslated !== "number") {
-            return {
-                text: `## Claim Enforcement — Failed\n\n${revokeTranslated.error}`,
-                level: "error",
-            };
-        }
-        const revokeTarget = resolveTarget(deps, revokeTranslated);
+        const publicClaimId = targets[0];
+        const revokeTarget = resolveTarget(deps, publicClaimId);
         if ("error" in revokeTarget) {
             return {
                 text: `## Claim Enforcement — Failed\n\n${revokeTarget.error}`,
                 level: "error",
             };
         }
-        const artifactIds = currentValidArtifactIds(deps.db, revokeTarget.revisionId);
-        if (artifactIds.length === 0) {
+        if (currentValidArtifactIds(deps.db, revokeTarget.revisionId).length === 0) {
             return {
-                text: `## Claim Enforcement — Failed\n\nRevision ${revokeTarget.revisionId} has no currently valid enforcement artifact to revoke.`,
+                text: `## Claim Enforcement — Failed\n\nRevision \`${revokeTarget.revisionLocator}\` has no currently valid enforcement artifact to revoke.`,
                 level: "error",
             };
         }
@@ -649,20 +573,28 @@ export async function executeClaimEnforceCommand(
         try {
             revokeOutcome = await runConfirmedClaimMutation(deps, {
                 command: "ctx-enforce",
-                argsKey: `revoke:${revokeMemoryId}`,
+                argsKey: `revoke:${publicClaimId}`,
                 target: revokeTarget,
                 producer: `claim-enforcement:${deps.host}`,
-                operationKey: (nonce) => `enforce-revoke:${revokeTarget.revisionId}:${nonce}`,
+                operationKey: (nonce) =>
+                    `enforce-revoke:${publicClaimId}:r${revokeTarget.revision}:${nonce}`,
                 request: (nonce) => ({
                     action: "revoke-artifacts",
-                    revisionId: revokeTarget.revisionId,
-                    digest: revokeTarget.digest,
+                    mutationToken: canonicalClaimMutationToken(revokeTarget.mutationToken),
                     nonce,
+                    revisionLocator: revokeTarget.revisionLocator,
                 }),
+                decode: (payload) => {
+                    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+                        throw new Error("stored enforcement revocation result is malformed");
+                    }
+                    const revokedCount = payload.revokedCount;
+                    if (typeof revokedCount !== "number" || !Number.isSafeInteger(revokedCount)) {
+                        throw new Error("stored enforcement revocation result is malformed");
+                    }
+                    return { revokedCount };
+                },
                 mutate: (nonce) => {
-                    // Re-read inside the transaction: the confirmation window
-                    // is not a lock, and an artifact recorded between the two
-                    // steps must be revoked with the rest.
                     const liveArtifactIds = currentValidArtifactIds(
                         deps.db,
                         revokeTarget.revisionId,
@@ -675,18 +607,19 @@ export async function executeClaimEnforceCommand(
                             deps.nowMs,
                         );
                     }
-                    refreshEffectivePolicyInCurrentTransaction(deps.db, revokeTarget.revisionId, {
-                        nowMs: deps.nowMs,
-                    });
-                    const effects: MemoryClaimEffect[] = [
-                        {
-                            effectKey: `policy:${revokeTarget.revisionId}:enforcement`,
-                            projectId: revokeTarget.projectId,
-                            claimId: revokeTarget.claimId,
-                            effectType: "lifecycle",
-                        },
-                    ];
-                    return { result: { revokedCount: liveArtifactIds.length }, effects };
+                    return {
+                        payload: { revokedCount: liveArtifactIds.length },
+                        effects: [
+                            {
+                                effectKey: `policy:${publicClaimId}:enforcement`,
+                                projectId: revokeTarget.projectId,
+                                claimId: revokeTarget.claimId,
+                                revisionId: revokeTarget.revisionId,
+                                changeKind: "lifecycle",
+                            },
+                        ],
+                        policyRevisionIds: [revokeTarget.revisionId],
+                    };
                 },
             });
         } catch (error) {
@@ -698,7 +631,7 @@ export async function executeClaimEnforceCommand(
         if (revokeOutcome.pending) {
             return {
                 text: confirmationText(
-                    `/ctx-enforce ${revokeMemoryId} --revoke`,
+                    `/ctx-enforce ${publicClaimId} --revoke`,
                     "Enforcement Revocation",
                     deps,
                     revokeTarget,
@@ -710,7 +643,7 @@ export async function executeClaimEnforceCommand(
             text: [
                 "## Claim Enforcement — Revoked",
                 "",
-                `Revoked ${revokeOutcome.result.revokedCount} enforcement artifact${revokeOutcome.result.revokedCount === 1 ? "" : "s"} for revision ${revokeTarget.revisionId} (digest \`${revokeTarget.digest.slice(0, 12)}…\`). ENFORCED support must be re-earned with a fresh evaluation.`,
+                `Revoked ${revokeOutcome.result.revokedCount} enforcement artifact${revokeOutcome.result.revokedCount === 1 ? "" : "s"} for revision \`${revokeTarget.revisionLocator}\`. ENFORCED support must be re-earned with a fresh evaluation.`,
             ].join("\n"),
             level: "info",
         };
@@ -735,24 +668,22 @@ export async function executeClaimEnforceCommand(
             level: "error",
         };
     }
-    const [idText, artifactInput] = parts;
-    const memoryId = Number(idText);
-    // Exactly two positional arguments (id and path): extra tokens would be
-    // silently ignored, committing arguments the user did not confirm.
-    if (parts.length !== 2 || !Number.isSafeInteger(memoryId) || memoryId <= 0 || !artifactInput) {
+    const [publicClaimId, artifactInput] = parts;
+    if (
+        parts.length !== 2 ||
+        !publicClaimId ||
+        !isValidPublicClaimId(publicClaimId) ||
+        !artifactInput
+    ) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
-    const translated = translateAgentVisibleMemoryId(deps, memoryId);
-    if (typeof translated !== "number") {
-        return { text: `## Claim Enforcement — Failed\n\n${translated.error}`, level: "error" };
-    }
-    const target = resolveTarget(deps, translated);
+    const target = resolveTarget(deps, publicClaimId);
     if ("error" in target) {
         return { text: `## Claim Enforcement — Failed\n\n${target.error}`, level: "error" };
     }
     if (currentApprovalActionId(deps.db, target.revisionId) == null) {
         return {
-            text: `## Claim Enforcement — Failed\n\nRevision ${target.revisionId} is not approved; run /ctx-approve first.`,
+            text: `## Claim Enforcement — Failed\n\nRevision \`${target.revisionLocator}\` is not approved; run /ctx-approve first.`,
             level: "error",
         };
     }
@@ -770,17 +701,33 @@ export async function executeClaimEnforceCommand(
     try {
         outcome = await runConfirmedClaimMutation(deps, {
             command: "ctx-enforce",
-            argsKey: `${memoryId}:${canonical.canonicalPath}:${kind}`,
+            argsKey: `${publicClaimId}:${canonical.canonicalPath}:${kind}`,
             target,
             producer: `claim-enforcement:${deps.host}`,
-            operationKey: (nonce) => `enforce:${target.revisionId}:${nonce}`,
+            operationKey: (nonce) =>
+                `enforce:${publicClaimId}:r${target.revision}:${nonce}`,
             request: (nonce) => ({
-                revisionId: target.revisionId,
-                digest: target.digest,
                 canonicalPath: canonical.canonicalPath,
                 kind,
+                mutationToken: canonicalClaimMutationToken(target.mutationToken),
                 nonce,
+                revisionLocator: target.revisionLocator,
             }),
+            decode: (payload) => {
+                if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+                    throw new Error("stored enforcement result is malformed");
+                }
+                const artifactId = payload.artifactId;
+                const wasEnforced = payload.enforced;
+                if (
+                    typeof artifactId !== "number" ||
+                    !Number.isSafeInteger(artifactId) ||
+                    typeof wasEnforced !== "boolean"
+                ) {
+                    throw new Error("stored enforcement result is malformed");
+                }
+                return { artifactId, enforced: wasEnforced };
+            },
             beforeMutate: async () => {
                 // Evaluation happens outside the write transaction AND off
                 // the event loop: the default evaluator runs a test process
@@ -871,8 +818,6 @@ export async function executeClaimEnforceCommand(
                 }
                 const evaluated = evaluation;
                 if (!evaluated) throw new Error("artifact evaluation did not run");
-                // Transactional recheck: the artifact bytes recorded must
-                // still be the bytes the pre-transaction evaluation ran on.
                 if (
                     sha256FileSync(
                         requireArtifactStillBound(deps.projectRoot, canonical.absolutePath),
@@ -886,13 +831,6 @@ export async function executeClaimEnforceCommand(
                     artifactKind: kind,
                     canonicalPath: canonical.canonicalPath,
                     bytesDigest,
-                    // Revalidation only rehashes from this checkout: clones
-                    // and worktrees share the project identity, and another
-                    // checkout legitimately lacks the same relative path.
-                    // CANONICAL real root, not the lexical spelling: the
-                    // revalidation probe selects rows by exact root equality,
-                    // and a symlinked alias would otherwise orphan the
-                    // artifact from every future probe.
                     enforcedFromRoot:
                         safeRealpath(resolve(deps.projectRoot)) ?? resolve(deps.projectRoot),
                     evaluator: evaluated.evaluator,
@@ -912,18 +850,19 @@ export async function executeClaimEnforceCommand(
                     });
                     enforced = true;
                 }
-                refreshEffectivePolicyInCurrentTransaction(deps.db, target.revisionId, {
-                    nowMs: deps.nowMs,
-                });
-                const effects: MemoryClaimEffect[] = [
-                    {
-                        effectKey: `policy:${target.revisionId}:enforcement`,
-                        projectId: target.projectId,
-                        claimId: target.claimId,
-                        effectType: "lifecycle",
-                    },
-                ];
-                return { result: { artifactId, enforced }, effects };
+                return {
+                    payload: { artifactId, enforced },
+                    effects: [
+                        {
+                            effectKey: `policy:${publicClaimId}:enforcement`,
+                            projectId: target.projectId,
+                            claimId: target.claimId,
+                            revisionId: target.revisionId,
+                            changeKind: "lifecycle",
+                        },
+                    ],
+                    policyRevisionIds: [target.revisionId],
+                };
             },
         });
     } catch (error) {
@@ -935,7 +874,7 @@ export async function executeClaimEnforceCommand(
     if (outcome.pending) {
         return {
             text: confirmationText(
-                `/ctx-enforce ${memoryId} ${quoteCommandArg(artifactInput)}${kind === "test" ? "" : ` --kind ${kind}`}`,
+                `/ctx-enforce ${publicClaimId} ${quoteCommandArg(artifactInput)}${kind === "test" ? "" : ` --kind ${kind}`}`,
                 "Claim Enforcement",
                 deps,
                 target,
@@ -960,7 +899,7 @@ export async function executeClaimEnforceCommand(
         text: [
             "## Claim Enforcement — Recorded",
             "",
-            `Revision ${target.revisionId} is ENFORCED by ${kind} artifact \`${canonical.canonicalPath}\` (bytes \`${bytesDigest.slice(0, 12)}…\`).`,
+            `Revision \`${target.revisionLocator}\` is ENFORCED by ${kind} artifact \`${canonical.canonicalPath}\` (bytes \`${bytesDigest.slice(0, 12)}…\`).`,
         ].join("\n"),
         level: "info",
     };
