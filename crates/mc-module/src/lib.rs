@@ -16577,6 +16577,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_settlement_streams_into_the_reservation_without_a_prior_encoding() {
+        // `measure` runs before the resident-byte reservation, so it must not
+        // retain the encoded body: a collected copy would sit outside the very
+        // budget the reservation enforces, and concurrent maximum-sized
+        // responses could exhaust memory while each one respected its charge.
+        // A pre-encoded blob would reach the destination as one `write_all`;
+        // serde streaming into the reserved writer is the observable proof that
+        // no such blob exists.
+        let value = serde_json::json!({
+            "a": ["one", "two", "three"],
+            "b": {"c": 1, "d": 2, "e": [true, false, null]},
+            "f": "payload",
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let reserve_events = Arc::clone(&events);
+        let reserved = Arc::new(AtomicUsize::new(0));
+        let reserved_len = Arc::clone(&reserved);
+        let settlement = settle_prepared_with(
+            PreparedOutcome::Response(PreparedOutput::json(value.clone())),
+            || false,
+            move |len| {
+                reserve_events.lock().unwrap().push("reserve");
+                reserved_len.store(len, Ordering::SeqCst);
+                let events = Arc::clone(&reserve_events);
+                async move {
+                    Ok::<_, ()>(SettlementWriter {
+                        events,
+                        bytes: Vec::with_capacity(len),
+                    })
+                }
+            },
+        )
+        .await;
+        let PreparedSettlement::Response(writer) = settlement else {
+            panic!("successful settlement must return a response");
+        };
+        let expected = serde_json::to_vec(&value).expect("value serializes");
+        assert_eq!(writer.bytes, expected);
+        // The reservation is sized from the counting pass and must match the
+        // body the second pass produces exactly, or the two passes disagreed.
+        assert_eq!(reserved.load(Ordering::SeqCst), expected.len());
+        let events = events.lock().unwrap();
+        assert_eq!(events.first(), Some(&"reserve"));
+        let writes = events[1..].len();
+        assert!(
+            events[1..].iter().all(|event| *event == "write"),
+            "every post-reservation event is a write"
+        );
+        assert!(
+            writes > 1,
+            "serde streamed into the reservation ({writes} writes); a single \
+             write_all would mean a fully encoded body existed before it"
+        );
+    }
+
+    #[tokio::test]
     async fn production_settlement_error_and_stream_skip_reservation() {
         let reservations = Arc::new(AtomicUsize::new(0));
         for outcome in [

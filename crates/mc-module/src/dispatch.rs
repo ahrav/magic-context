@@ -126,16 +126,20 @@ impl PreparedOutput {
 
     /// Measures this immutable source exactly before output reservation.
     ///
-    /// JSON sources are serialized exactly once, here: the encoded bytes are
-    /// cap-checked as they are produced and carried in the returned
-    /// measurement, so `write_to` copies them instead of running the
-    /// serializer a second time.
+    /// JSON sources are counted, not collected. `measure` runs BEFORE the host's
+    /// resident-byte reservation, so retaining the encoded body here would hold
+    /// up to `MAX_WIRE_BODY_BYTES` outside the very budget the reservation
+    /// exists to enforce: concurrent large responses would each own a full
+    /// uncharged copy and could exhaust process memory while every one of them
+    /// respected its charge. The serializer therefore runs twice — once to size
+    /// the reservation, once to fill it — and `write_to`'s length check turns
+    /// any disagreement between the two passes into an error rather than a
+    /// short body.
     pub fn measure(&self) -> Result<MeasuredOutput<'_>, PreparedOutputError> {
         let (source, len) = match &self.source {
             PreparedSource::Json(value) => {
-                let encoded = encode_json(value)?;
-                let len = encoded.len();
-                (MeasuredSource::Encoded(encoded), len)
+                let len = measure_json(value)?;
+                (MeasuredSource::Json(value), len)
             }
             PreparedSource::Exact(bytes) => {
                 let len = checked_body_len([bytes.len()])?;
@@ -226,7 +230,7 @@ pub struct MeasuredOutput<'a> {
 /// (measurement is the single serialization pass); the other variants borrow
 /// the prepared source and stream it during the write.
 enum MeasuredSource<'a> {
-    Encoded(Vec<u8>),
+    Json(&'a Value),
     Exact(&'a [u8]),
     Transform(&'a TransformSegments),
 }
@@ -244,7 +248,19 @@ impl MeasuredOutput<'_> {
     pub fn write_to<W: Write>(&self, destination: &mut W) -> Result<usize, PreparedOutputError> {
         let mut destination = BoundedWriter::new(destination, self.len);
         match &self.source {
-            MeasuredSource::Encoded(bytes) => destination.write_all(bytes)?,
+            MeasuredSource::Json(value) => {
+                // Serializing straight into the destination means a destination
+                // failure reaches us wrapped in serde's error type. Unwrap it so
+                // callers keep the write-versus-serialize distinction they had
+                // when this path copied a pre-encoded buffer.
+                serde_json::to_writer(&mut destination, value).map_err(|error| {
+                    if error.is_io() {
+                        PreparedOutputError::Write(error.into())
+                    } else {
+                        PreparedOutputError::Serialize(error)
+                    }
+                })?;
+            }
             MeasuredSource::Exact(bytes) => destination.write_all(bytes)?,
             MeasuredSource::Transform(segments) => write_transform(segments, &mut destination)?,
         }
@@ -326,14 +342,15 @@ fn checked_body_len(
     Ok(total)
 }
 
-/// Serializes a JSON value once, enforcing the wire cap as bytes are
-/// produced: each append is cap-checked before the buffer grows, so an
-/// over-cap body fails without buffering past the cap.
-fn encode_json(value: &Value) -> Result<Vec<u8>, PreparedOutputError> {
-    let mut writer = CountingWriter::collecting();
+/// Measures a JSON value's exact encoded length without retaining the bytes.
+///
+/// The cap is enforced as bytes are produced, so an over-cap body fails during
+/// counting rather than after a full encode.
+fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
+    let mut writer = CountingWriter::default();
     let result = serde_json::to_writer(&mut writer, value).map_err(PreparedOutputError::Serialize);
     let writer = finish_count(writer, result)?;
-    Ok(writer.collected.unwrap_or_default())
+    Ok(writer.len)
 }
 
 fn finish_count(
@@ -414,17 +431,9 @@ enum CountFailure {
 struct CountingWriter {
     len: usize,
     failure: Option<CountFailure>,
-    collected: Option<Vec<u8>>,
 }
 
 impl CountingWriter {
-    fn collecting() -> Self {
-        Self {
-            collected: Some(Vec::new()),
-            ..Self::default()
-        }
-    }
-
     fn add_len(&mut self, len: usize) -> Result<(), PreparedOutputError> {
         let Some(next) = self.len.checked_add(len) else {
             self.failure = Some(CountFailure::Overflow);
@@ -446,9 +455,6 @@ impl Write for CountingWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.add_len(bytes.len())
             .map_err(|error| io::Error::new(io::ErrorKind::FileTooLarge, error.to_string()))?;
-        if let Some(buffer) = &mut self.collected {
-            buffer.extend_from_slice(bytes);
-        }
         Ok(bytes.len())
     }
 
