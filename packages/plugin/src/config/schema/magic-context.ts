@@ -673,7 +673,7 @@ export const MagicContextConfigSchema = z
             .enum(["ts", "rust"])
             .default("ts")
             .describe(
-                'Experimental: routes the project through the direct mc-host Rust runtime (requires user-level host connection config); "ts" is the current TypeScript pipeline.',
+                'Experimental: routes the project through the direct mc-host Rust runtime (requires the user-level subc.connection_file path); "ts" is the current TypeScript pipeline.',
             ),
         auto_update: z
             .boolean()

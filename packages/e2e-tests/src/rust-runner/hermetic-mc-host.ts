@@ -33,6 +33,8 @@ const PID_FILE = "rust-e2e-pids.json";
 const MAX_LINE_BYTES = 64 * 1024;
 const MAX_LOG_BYTES = 256 * 1024;
 const STALE_PID_AGE_MS = 30 * 60 * 1_000;
+const SIGNAL_STATE_TIMEOUT_MS = 2_000;
+const SIGNAL_STATE_POLL_MS = 10;
 const EXPECTED_CATALOG = ["magic-context", "synapse", "broca"] as const;
 
 interface RustE2ePidFile {
@@ -101,6 +103,52 @@ function processExecutable(pid: number): string | null {
         } catch {
             return null;
         }
+    }
+}
+
+/**
+ * Report whether a process is stopped, from the state field of
+ * `/proc/<pid>/stat`: `T` is stopped, any other state is running. `null` means
+ * no state is observable — the process is gone, or the system has no `/proc`.
+ */
+function processStopped(pid: number): boolean | null {
+    let stat: string;
+    try {
+        stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch {
+        return null;
+    }
+    // The comm field is parenthesized and may itself contain spaces and
+    // parentheses, so the state field is the first token after the LAST ")".
+    const state = stat
+        .slice(stat.lastIndexOf(")") + 1)
+        .trim()
+        .split(/\s+/, 1)[0];
+    return state ? state === "T" : null;
+}
+
+/**
+ * Wait until the process reaches the state a just-sent SIGSTOP or SIGCONT
+ * produces. Signal delivery is asynchronous, so a request issued straight after
+ * `kill` can outrun it and exercise the wrong path.
+ *
+ * An elapsed window resolves rather than throwing: a drill asserts the module's
+ * behavior while the host is paused, and failing it because this confirmation
+ * ran out of time would report the harness instead of the mechanism. An
+ * unobservable state resolves for the same reason.
+ */
+async function waitForProcessState(
+    pid: number,
+    stopped: boolean,
+): Promise<void> {
+    const deadline = Date.now() + SIGNAL_STATE_TIMEOUT_MS;
+    for (;;) {
+        const observed = processStopped(pid);
+        if (observed === null || observed === stopped) return;
+        if (Date.now() >= deadline) return;
+        await new Promise((resolvePoll) =>
+            setTimeout(resolvePoll, SIGNAL_STATE_POLL_MS),
+        );
     }
 }
 
@@ -744,16 +792,20 @@ export class HermeticMcHostStack {
         this.persistPidFile();
     }
 
-    pauseHost(): void {
+    async pauseHost(): Promise<void> {
         const child = this.child;
-        if (child && child.exitCode === null && child.signalCode === null)
-            child.kill("SIGSTOP");
+        if (!child || child.exitCode !== null || child.signalCode !== null)
+            return;
+        child.kill("SIGSTOP");
+        if (child.pid !== undefined) await waitForProcessState(child.pid, true);
     }
 
-    resumeHost(): void {
+    async resumeHost(): Promise<void> {
         const child = this.child;
-        if (child && child.exitCode === null && child.signalCode === null)
-            child.kill("SIGCONT");
+        if (!child || child.exitCode !== null || child.signalCode !== null)
+            return;
+        child.kill("SIGCONT");
+        if (child.pid !== undefined) await waitForProcessState(child.pid, false);
     }
 
     /**

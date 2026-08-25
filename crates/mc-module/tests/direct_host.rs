@@ -11,8 +11,8 @@ use mc_host::TargetKind;
 use mc_store::{McStore, StoredCompartment};
 use serde_json::{json, Value};
 use support::direct_host::{
-    mode, request_json, send_body, storage_descriptor, workspace_root, FixtureProcess, BUDGET,
-    REDACTION_SENTINEL,
+    mode, request_json, send_body, storage_descriptor, wait_for_store, workspace_root,
+    FixtureProcess, BUDGET, REDACTION_SENTINEL,
 };
 
 fn base64(bytes: &[u8]) -> String {
@@ -61,35 +61,6 @@ fn redaction_forms(publication: &str) -> Vec<String> {
         forms.push(base64(&bytes));
     }
     forms
-}
-
-async fn wait_for_store(client: &mc_host::Client, route: mc_host::RouteHandle, session: &str) {
-    let deadline = Instant::now() + BUDGET;
-    loop {
-        let body = serde_json::to_vec(&json!({"kind": "status", "session_id": session})).unwrap();
-        match client
-            .request(
-                route,
-                body,
-                mc_host::RequestOptions {
-                    timeout: BUDGET,
-                    cancellation: None,
-                },
-            )
-            .await
-        {
-            Ok(response) => {
-                let status: Value = serde_json::from_slice(&response.body).unwrap();
-                if status["store_open"] == true {
-                    return;
-                }
-            }
-            Err(error) if error.code() == "store_unavailable" => {}
-            Err(error) => panic!("store readiness request failed: {error}"),
-        }
-        assert!(Instant::now() < deadline, "module store did not open");
-        tokio::task::yield_now().await;
-    }
 }
 
 #[tokio::test]

@@ -34,7 +34,8 @@ export function foldInfraEnabled(): boolean {
 }
 
 export const FOLD_SKIP_REASON =
-    "requires broad Rust fold qualification beyond the focused direct backend fixture";
+    "requires broad Rust fold qualification beyond the focused direct " +
+    "backend fixture; set MC_RUST_E2E_FOLD=1 to run it";
 
 /** Enable the duplicate-ID regression only when the stack can produce the selection refresh needed to reproduce duplicate IDs. */
 export function duplicateIdInfraEnabled(): boolean {
@@ -42,7 +43,8 @@ export function duplicateIdInfraEnabled(): boolean {
 }
 
 export const DUPLICATE_ID_SKIP_REASON =
-    "requires broad duplicate-ID qualification beyond the focused direct backend fixture";
+    "requires broad duplicate-ID qualification beyond the focused direct " +
+    "backend fixture; set MC_RUST_E2E_DUPLICATE_IDS=1 to run it";
 
 /**
  * Print a one-line skip notice. Call from a gated scenario's single `it` so the

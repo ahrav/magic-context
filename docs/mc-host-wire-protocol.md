@@ -818,6 +818,8 @@ Managed Rust and TypeScript client defaults:
 
 Data and reserved-control frames share one queued-byte budget; reserved admission is not a byte-budget bypass. Data traffic cannot consume control slots. Exhausting control reserve retires the generation and deterministically settles pending work. Backoff counts the first attempt, and retry delay or a later stage never resets the owning deadline.
 
+The 2-second handshake deadline spans discovery, dial, authentication, and negotiation together, while Section 5.1's recommended host authentication deadline is also 2 seconds. The client therefore retires the generation at or before the end of the host's permitted authentication window, and negotiation receives only the remainder. A deployment that shortens the host authentication deadline keeps the two compatible; one that needs the full host window for authentication MUST raise the client handshake deadline above it, because these two values are not independent.
+
 ## 12. Reconnect, restart, and shutdown
 
 Any EOF, authentication failure, framing corruption, liveness failure, or explicit connection close retires the connection generation. Client MUST immediately invalidate its routes, pending correlations, capability/catalog caches, and late responses. The host has the mirror obligation for every handler-visible route on the retired generation: stop new dispatch, settle or cancel route work within a finite close budget, invoke `on_route_gone` exactly once, and release each global channel only after that callback completes — otherwise a reconnect finds handler bindings and channels still held by the dead generation. Reconnect MUST reread the connection file and rerun authentication; credentials MUST NOT be cached across host incarnations.

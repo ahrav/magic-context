@@ -96,9 +96,10 @@ const mutations: Record<string, MutationCase[]> = {
         {
             name: "FM_OC_5_RUNG_SWAP",
             source: drillFile("5"),
-            oldText: "h.mcHost.pauseHost();\n            await h.sendPrompt",
+            oldText:
+                "await h.mcHost.pauseHost();\n            await h.sendPrompt",
             replacement:
-                "h.mcHost.resumeHost();\n            await h.sendPrompt",
+                "await h.mcHost.resumeHost();\n            await h.sendPrompt",
         },
         {
             name: "FM_OC_5_RUNG_DELETION",

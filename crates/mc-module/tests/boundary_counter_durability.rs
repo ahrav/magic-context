@@ -3,13 +3,10 @@
 
 mod support;
 
-use std::time::{Duration, Instant};
-
 use mc_core::CoreState;
 use mc_host::TargetKind;
 use mc_store::{McStore, McStoreError, ModuleMeta};
-use serde_json::json;
-use support::direct_host::{request_json, storage_descriptor, FixtureProcess, BUDGET};
+use support::direct_host::{storage_descriptor, wait_for_store, FixtureProcess};
 
 #[tokio::test]
 async fn competing_pass_counter_survives_direct_primary_lifecycle_and_reopen() {
@@ -50,24 +47,8 @@ async fn competing_pass_counter_survives_direct_primary_lifecycle_and_reopen() {
     let route = fixture
         .open_route(&client, "magic-context", TargetKind::ToolProvider, session)
         .await;
-    let deadline = Instant::now() + BUDGET;
-    loop {
-        let status = request_json(
-            &client,
-            route,
-            json!({"kind": "status", "session_id": session}),
-        )
-        .await;
-        if status["store_open"] == true {
-            assert_eq!(status["session_id"], session);
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "direct primary store did not open"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let status = wait_for_store(&client, route, session).await;
+    assert_eq!(status["session_id"], session);
     client.close().await.expect("managed client closes");
     fixture.shutdown();
 

@@ -373,6 +373,38 @@ pub async fn request_json(client: &Client, route: RouteHandle, body: Value) -> V
     serde_json::from_slice(&response.body).expect("response JSON")
 }
 
+/// Poll `status` until the module reports an open store, and return that status.
+/// Connection publication proves the transport is ready, not that the store is
+/// open, so a terminal `store_unavailable` is a retry rather than a failure.
+pub async fn wait_for_store(client: &Client, route: RouteHandle, session: &str) -> Value {
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        let body = serde_json::to_vec(&json!({"kind": "status", "session_id": session})).unwrap();
+        match client
+            .request(
+                route,
+                body,
+                RequestOptions {
+                    timeout: BUDGET,
+                    cancellation: None,
+                },
+            )
+            .await
+        {
+            Ok(response) => {
+                let status: Value = serde_json::from_slice(&response.body).unwrap();
+                if status["store_open"] == true {
+                    return status;
+                }
+            }
+            Err(error) if error.code() == "store_unavailable" => {}
+            Err(error) => panic!("store readiness request failed: {error}"),
+        }
+        assert!(Instant::now() < deadline, "module store did not open");
+        tokio::task::yield_now().await;
+    }
+}
+
 pub fn send_body(prompt: &str) -> Value {
     json!({
         "method": "session.send",

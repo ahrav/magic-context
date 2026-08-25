@@ -139,7 +139,7 @@ export async function reportAuthorityMarkers(args: {
     for (const marker of markers) {
         if (marker.project_path !== currentIdentity) {
             args.warn(
-                `  ${marker.project_path}: module state unavailable outside its project root — writes fenced; run with rust mode or restore subc connectivity`,
+                `  ${marker.project_path}: module state unavailable outside its project root — writes fenced; run with rust mode or restore mc-host connectivity`,
             );
             continue;
         }
@@ -164,7 +164,7 @@ export async function reportAuthorityMarkers(args: {
             );
         } catch {
             args.warn(
-                `  ${marker.project_path}: module unreachable — writes fenced; run with rust mode or restore subc connectivity`,
+                `  ${marker.project_path}: module unreachable — writes fenced; run with rust mode or restore mc-host connectivity`,
             );
         }
     }
@@ -228,7 +228,7 @@ export async function runDoctorDrainAuthority(
         return 1;
     } catch (error) {
         console.error(
-            `Module unreachable — writes fenced; run with rust mode or restore subc connectivity: ${error instanceof Error ? error.message : String(error)}`,
+            `Module unreachable — writes fenced; run with rust mode or restore mc-host connectivity: ${error instanceof Error ? error.message : String(error)}`,
         );
         return 1;
     } finally {
