@@ -14,23 +14,18 @@
  *     project-stamped session rows (session_projects, compartment chunk
  *     embeddings) to the new identity and clear the cached m[0]/m[1] so the
  *     next load re-materializes under the new project.
- *   - Memories are project-scoped; the caller chooses whether/how they follow
- *     (move/copy × all/originated, or leave) — see MemoryAction.
+ *   - Claims, evidence, receipts, lineage, and staged claim intents are durable
+ *     project history. Session re-home never rewrites or copies them.
  *
  * V1 is OpenCode-only. Pi sessions are JSONL (a different re-home mechanism).
  */
 
+import console from "node:console";
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path, { join } from "node:path";
 import type { AuthorityModuleClient } from "@magic-context/core/features/magic-context/context-authority";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
-import {
-    copyMemoriesToProject,
-    moveMemoriesToProject,
-    selectRelocatableMemoryIds,
-} from "@magic-context/core/features/magic-context/memory/relocate-memory";
-import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
 import { McHostModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
@@ -51,21 +46,6 @@ import {
 } from "./doctor-authority";
 
 type DatabaseLike = Pick<DatabaseType, "prepare" | "close" | "exec">;
-
-export type MemoryAction =
-    | "move-all"
-    | "move-originated"
-    | "copy-all"
-    | "copy-originated"
-    | "leave";
-
-const VALID_MEMORY_ACTIONS: ReadonlySet<string> = new Set<MemoryAction>([
-    "move-all",
-    "move-originated",
-    "copy-all",
-    "copy-originated",
-    "leave",
-]);
 
 export interface MigrateSessionDeps {
     opencodeDb: DatabaseLike;
@@ -96,24 +76,12 @@ export interface MigrateSessionPlan {
     /** Magic Context identity the session will be keyed under after the move. */
     toMcIdentity: string;
     targetIsGit: boolean;
-    /** Injectable (active + permanent) memory count under fromMcIdentity. */
-    injectableMemoryCount: number;
-    /** Of those, how many originated from this session (source_session_id). */
-    originatedMemoryCount: number;
 }
 
 export interface MigrateSessionResult {
     plan: MigrateSessionPlan;
-    memoryAction: MemoryAction;
     dryRun: boolean;
-    /** Memory rows relocated/copied under the new identity. */
-    memoriesRelocated: number;
-    /** Memory rows merged into a pre-existing equivalent at the target (move only). */
-    memoriesMerged: number;
-    /** Memory rows skipped because an equivalent already existed (copy only). */
-    memoriesSkipped: number;
     chunkEmbeddingsRestamped: number;
-    epochsBumped: string[];
 }
 
 export interface MigrateSessionSafetyModule {
@@ -285,21 +253,6 @@ export function planMigrateSession(
         (sessionRow.directory ? deps.resolveIdentity(sessionRow.directory) : "");
     const toMcIdentity = deps.resolveIdentity(targetDirectory);
 
-    const injectableMemoryCount = (
-        deps.contextDb
-            .prepare(
-                "SELECT COUNT(*) AS c FROM memories WHERE project_path = ? AND status IN ('active','permanent')",
-            )
-            .get(fromMcIdentity) as { c: number }
-    ).c;
-    const originatedMemoryCount = (
-        deps.contextDb
-            .prepare(
-                "SELECT COUNT(*) AS c FROM memories WHERE project_path = ? AND status IN ('active','permanent') AND source_session_id = ?",
-            )
-            .get(fromMcIdentity, sessionId) as { c: number }
-    ).c;
-
     return {
         sessionId,
         currentDirectory: sessionRow.directory,
@@ -311,8 +264,6 @@ export function planMigrateSession(
         fromMcIdentity,
         toMcIdentity,
         targetIsGit,
-        injectableMemoryCount,
-        originatedMemoryCount,
     };
 }
 
@@ -322,7 +273,6 @@ export function planMigrateSession(
  */
 export function applyMigrateSession(
     plan: MigrateSessionPlan,
-    memoryAction: MemoryAction,
     deps: MigrateSessionDeps,
 ): MigrateSessionResult {
     const now = deps.now ?? Date.now();
@@ -397,12 +347,8 @@ export function applyMigrateSession(
         }
     };
 
-    // 2. Magic Context side — re-stamp + memory action in one transaction.
-    let memoriesRelocated = 0;
-    let memoriesMerged = 0;
-    let memoriesSkipped = 0;
+    // Magic Context re-stamps only session runtime.
     let chunkEmbeddingsRestamped = 0;
-    const epochsBumped: string[] = [];
 
     // BEGIN is INSIDE the try: if it throws (e.g. DB locked), OpenCode is already
     // committed, so we must still compensate. `txBegan` gates the rollback so we
@@ -436,48 +382,6 @@ export function applyMigrateSession(
             )
             .run(plan.sessionId);
 
-        // Memory action.
-        if (
-            memoryAction !== "leave" &&
-            plan.fromMcIdentity &&
-            plan.fromMcIdentity !== plan.toMcIdentity
-        ) {
-            const originatedOnly =
-                memoryAction === "move-originated" || memoryAction === "copy-originated";
-            const ids = selectRelocatableMemoryIds(
-                deps.contextDb as DatabaseType,
-                plan.fromMcIdentity,
-                originatedOnly ? { sourceSessionId: plan.sessionId } : {},
-            );
-            const isMove = memoryAction === "move-all" || memoryAction === "move-originated";
-            const result = isMove
-                ? moveMemoriesToProject(
-                      deps.contextDb as DatabaseType,
-                      ids,
-                      plan.fromMcIdentity,
-                      plan.toMcIdentity,
-                  )
-                : copyMemoriesToProject(deps.contextDb as DatabaseType, ids, plan.toMcIdentity);
-            memoriesRelocated = result.relocated;
-            memoriesMerged = result.merged;
-            memoriesSkipped = result.skipped;
-
-            // Epoch bumps: the target always gains memories; the source loses
-            // them only on a move.
-            if (result.relocated > 0 || result.merged > 0) {
-                bumpProjectMemoryEpoch(deps.contextDb as DatabaseType, plan.toMcIdentity, now);
-                epochsBumped.push(plan.toMcIdentity);
-                if (isMove) {
-                    bumpProjectMemoryEpoch(
-                        deps.contextDb as DatabaseType,
-                        plan.fromMcIdentity,
-                        now,
-                    );
-                    epochsBumped.push(plan.fromMcIdentity);
-                }
-            }
-        }
-
         deps.contextDb.exec("COMMIT");
     } catch (error) {
         // Roll back context.db only if a transaction actually began, and never let
@@ -498,13 +402,8 @@ export function applyMigrateSession(
 
     return {
         plan,
-        memoryAction,
         dryRun: false,
-        memoriesRelocated,
-        memoriesMerged,
-        memoriesSkipped,
         chunkEmbeddingsRestamped,
-        epochsBumped,
     };
 }
 
@@ -544,9 +443,6 @@ function printMigrateSessionHelp(): void {
     console.log("    --to <dir>         Target working directory");
     console.log("");
     console.log("  Optional:");
-    console.log("    --memories <a>     Non-interactive memory action:");
-    console.log("                       move-all | move-originated | copy-all |");
-    console.log("                       copy-originated | leave");
     console.log("    --dry-run          Show the plan; write nothing");
     console.log("    --yes              Skip the 'OpenCode stopped?' confirmation");
     console.log("");
@@ -554,31 +450,6 @@ function printMigrateSessionHelp(): void {
     console.log("    npx @cortexkit/magic-context@latest doctor migrate-session \\");
     console.log("        --session ses_xxx --to ~/Work/Projects/CortexKit/benchmarks --dry-run");
     console.log("");
-}
-
-async function promptMemoryAction(plan: MigrateSessionPlan): Promise<MemoryAction> {
-    const all = plan.injectableMemoryCount;
-    const originated = plan.originatedMemoryCount;
-    promptIO.note(
-        `${all} memory${all === 1 ? "" : "ies"} live under the current project ` +
-            `(${plan.fromMcIdentity}); ${originated} of them originated from this session.`,
-        "Memories",
-    );
-    const choice = await promptIO.selectOne("How should memories be handled?", [
-        {
-            label: `Move only memories originated from this session (${originated})`,
-            value: "move-originated",
-            recommended: true,
-        },
-        { label: `Move all memories of this project (${all})`, value: "move-all" },
-        {
-            label: `Copy only memories originated from this session (${originated})`,
-            value: "copy-originated",
-        },
-        { label: `Copy all memories of this project (${all})`, value: "copy-all" },
-        { label: "Leave memories as is", value: "leave" },
-    ]);
-    return choice as MemoryAction;
 }
 
 export async function runMigrateSessionCli(args: string[]): Promise<number> {
@@ -590,7 +461,6 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
     const toDir = valueAfter(args, "--to");
     const dryRun = args.includes("--dry-run");
     const skipConfirm = args.includes("--yes");
-    const memoriesFlag = valueAfter(args, "--memories");
 
     if (!sessionId) {
         console.error("Missing required flag: --session <id>");
@@ -599,11 +469,6 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
     }
     if (!toDir) {
         console.error("Missing required flag: --to <dir>");
-        printMigrateSessionHelp();
-        return 1;
-    }
-    if (memoriesFlag !== null && !VALID_MEMORY_ACTIONS.has(memoriesFlag)) {
-        console.error(`Invalid --memories value: ${memoriesFlag}`);
         printMigrateSessionHelp();
         return 1;
     }
@@ -710,15 +575,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
             }
         }
 
-        const memoryAction: MemoryAction =
-            (memoriesFlag as MemoryAction | null) ?? (await promptMemoryAction(plan));
-
         if (dryRun) {
-            const willMove = memoryAction === "move-all" || memoryAction === "move-originated";
-            const willCopy = memoryAction === "copy-all" || memoryAction === "copy-originated";
-            const count = memoryAction.endsWith("originated")
-                ? plan.originatedMemoryCount
-                : plan.injectableMemoryCount;
             promptIO.log.info(
                 `[dry-run] Would update opencode.db session row → project ${plan.ocProjectId}, dir ${plan.targetDirectory}.`,
             );
@@ -726,11 +583,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
                 `[dry-run] Would re-stamp session_projects + chunk embeddings to ${plan.toMcIdentity} and clear cached m[0]/m[1].`,
             );
             promptIO.log.info(
-                `[dry-run] Memories: ${
-                    memoryAction === "leave"
-                        ? "left as is"
-                        : `${willMove ? "move" : willCopy ? "copy" : "?"} ${count}`
-                }.`,
+                "[dry-run] Durable claims, evidence, receipts, and lineage stay unchanged.",
             );
             promptIO.log.info("[dry-run] No changes written.");
             return 0;
@@ -766,24 +619,13 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         promptIO.log.info(`Backed up: ${ocBackup}`);
         promptIO.log.info(`Backed up: ${ctxBackup}`);
 
-        const result = applyMigrateSession(plan, memoryAction, deps);
+        const result = applyMigrateSession(plan, deps);
 
         promptIO.log.success("Session re-homed.");
         console.log(`  OpenCode: project ${plan.ocProjectId}, directory ${plan.targetDirectory}`);
         console.log(`  MC identity: ${plan.fromMcIdentity} → ${plan.toMcIdentity}`);
         console.log(`  chunk embeddings re-stamped: ${result.chunkEmbeddingsRestamped}`);
-        console.log(
-            `  memories: ${result.memoriesRelocated} ${
-                memoryAction.startsWith("copy") ? "copied" : "moved"
-            }` +
-                (result.memoriesMerged ? `, ${result.memoriesMerged} merged` : "") +
-                (result.memoriesSkipped
-                    ? `, ${result.memoriesSkipped} skipped (already present)`
-                    : ""),
-        );
-        if (result.epochsBumped.length > 0) {
-            console.log(`  memory epoch bumped: ${result.epochsBumped.join(", ")}`);
-        }
+        console.log("  claim history: unchanged");
         console.log(
             `Magic Context schema: v${contextSchemaVersionBefore} → v${getPersistedSchemaVersion(contextDb as DatabaseType)}`,
         );

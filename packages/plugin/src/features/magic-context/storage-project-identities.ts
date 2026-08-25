@@ -459,7 +459,7 @@ export function applyIdentityMergeToProjectRegistry(
     ).get(sourceId, sourceId) as { owns: number };
     if (ownsChildren.owns === 1) {
         throw new Error(
-            `Refusing identity merge: source project ${sourceId} (${boundedIdentityList([fromIdentity])}) owns authoritative episodes or claims. Full authoritative project merging is not supported yet.`,
+            `Refusing identity merge: source project ${sourceId} (${boundedIdentityList([fromIdentity])}) owns authoritative episodes or claims. Projects with claim history cannot be merged; use an explicit claim copy or move operation so each target gets derivation lineage.`,
         );
     }
 
