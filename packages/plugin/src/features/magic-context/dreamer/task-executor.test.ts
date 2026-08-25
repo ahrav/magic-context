@@ -15,7 +15,11 @@ import { getClaimMuralCueStates } from "../mural/storage-mural-cues";
 import { createClaimMemorySchema } from "../storage-claim-memory-schema";
 import { initializeDatabase } from "../storage-db";
 import { type SeededProjectMemoryClaim, seedProjectMemoryClaim } from "../test-claim-database";
-import { getUserMemoryCandidates, insertUserMemory } from "../user-memory/storage-user-memory";
+import {
+    getUserMemoryCandidates,
+    insertUserMemory,
+    insertUserMemoryCandidates,
+} from "../user-memory/storage-user-memory";
 import { readDreamerProjectClaims } from "./claim-manifest";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
@@ -434,6 +438,80 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
             0,
         );
         expect(getDreamRuns(db, project)[0]?.tasks_failed).toBe(1);
+    });
+});
+
+describe("createDreamTaskExecutor — review-user-memories", () => {
+    test("forwards project identity and commits project promotion through claim operation", async () => {
+        db = freshDb();
+        const project = "git:user-review-executor";
+        db.prepare(
+            `INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+             VALUES ('user-review-source', 'opencode', ?, ?)`,
+        ).run(project, Date.now());
+        insertUserMemoryCandidates(db, [
+            {
+                content: "This project requires focused tests before commit",
+                sessionId: "user-review-source",
+            },
+        ]);
+        const [candidate] = getUserMemoryCandidates(db);
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "user-review-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        JSON.stringify({
+                            promote_project: [
+                                {
+                                    content: "Run focused tests before commit.",
+                                    category: "PROJECT_RULES",
+                                    candidate_ids: [candidate.id],
+                                },
+                            ],
+                            consume_candidate_ids: [candidate.id],
+                        }),
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: "/repo/user-review-executor",
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor("review-user-memories", project);
+
+        const result = await executor(
+            {
+                task: "review-user-memories",
+                schedule: "0 3 * * *",
+                timeoutMinutes: 20,
+                promotionThreshold: 1,
+            },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-user-review",
+                leaseKey,
+            },
+        );
+
+        expect(result).toEqual({ status: "completed" });
+        expect(readDreamerProjectClaims(db, project, "hygiene").map((claim) => claim.content)).toEqual([
+            "Run focused tests before commit.",
+        ]);
+        expect(getUserMemoryCandidates(db)).toHaveLength(0);
+        expect(
+            (
+                db.prepare("SELECT COUNT(*) AS count FROM claim_operation_effects").get() as {
+                    count: number;
+                }
+            ).count,
+        ).toBe(1);
     });
 });
 

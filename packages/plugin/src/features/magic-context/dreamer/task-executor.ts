@@ -578,6 +578,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 const result = await reviewUserMemories({
                     db,
                     client: deps.client,
+                    projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
                     holderId,
@@ -591,7 +592,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 });
                 recordRun("completed", null);
                 log(
-                    `[dreamer] review-user-memories: promoted=${result.promoted} merged=${result.merged} dismissed=${result.dismissed}`,
+                    `[dreamer] review-user-memories: promoted=${result.promoted} project_promoted=${result.projectPromoted} merged=${result.merged} dismissed=${result.dismissed}`,
                 );
                 return { status: "completed" };
             }
