@@ -19,7 +19,7 @@ use rustix::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    instance::{is_safe_ancestor, is_secure_regular, read_all_fd, S_IFDIR, S_IFMT},
+    instance::{is_safe_ancestor, is_secure_regular, mode_bits, read_all_fd, S_IFDIR, S_IFMT},
     wire::PROTOCOL_VERSION,
 };
 
@@ -281,8 +281,13 @@ fn validate_directory(
 ) -> Result<(), ConnectionFileError> {
     let stat =
         rustix::fs::fstat(fd).map_err(|source| io_error("fstat_parent", path, source.into()))?;
-    let directory = (stat.st_mode & S_IFMT) == S_IFDIR;
-    let private = stat.st_uid == rustix::process::geteuid().as_raw() && stat.st_mode & 0o077 == 0;
+    // `mode_bits` and not `stat.st_mode`: `st_mode` is `u16` on Darwin and `u32`
+    // on Linux, so mixing it with the `u32` type constants compiles on one target
+    // and not the other. Every other mode check in this crate already goes
+    // through that helper.
+    let mode = mode_bits(&stat);
+    let directory = (mode & S_IFMT) == S_IFDIR;
+    let private = stat.st_uid == rustix::process::geteuid().as_raw() && mode & 0o077 == 0;
     if !directory || !is_safe_ancestor(&stat) || (require_private && !private) {
         return Err(ConnectionFileError::Insecure {
             path: path.to_path_buf(),
@@ -342,6 +347,39 @@ fn io_error(op: &'static str, path: &Path, source: io::Error) -> ConnectionFileE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `st_mode` is `u16` on Darwin and `u32` on Linux, so mode arithmetic against
+    /// this crate's `u32` type constants compiles on one target and not the other.
+    /// `mode_bits` is the cfg-gated widening that makes it portable, and reading
+    /// `st_mode` directly bypassed it — a break no Linux build could catch, which
+    /// is why it reached CI as a macOS-only failure.
+    #[test]
+    fn mode_arithmetic_goes_through_the_portable_accessor() {
+        for source in [
+            include_str!("connection_file.rs"),
+            include_str!("instance.rs"),
+        ] {
+            let production = source
+                .split("#[cfg(test)]\nmod tests {")
+                .next()
+                .expect("production source");
+            for (number, line) in production.lines().enumerate() {
+                // Prose may name the field while explaining why not to use it.
+                let code = line.split("//").next().unwrap_or("");
+                // The accessor's own two cfg branches are the one place that may
+                // touch the field.
+                if code.contains("u32::from(stat.st_mode)") || code.trim() == "stat.st_mode" {
+                    continue;
+                }
+                assert!(
+                    !code.contains(".st_mode"),
+                    "line {} reads st_mode directly instead of mode_bits(): {}",
+                    number + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
 
     fn info() -> ConnectionInfo {
         ConnectionInfo {
