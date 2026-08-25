@@ -157,7 +157,6 @@ describe("dream-timer normal chunk recovery trigger (static)", () => {
             source.indexOf("async function runProjectMaintenance("),
             source.indexOf("async function sweepProject("),
         );
-        expect(maintenance).toContain("embedUnembeddedMemoriesForProject(db, reg.projectIdentity)");
         expect(maintenance).toContain("embedUnembeddedCompartmentChunksForProject");
     });
 

@@ -3082,7 +3082,6 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
         expect(state.memoryAuthorityReady).toBe(false);
     });
 
-
     it("reconciles remaining MODULE domains after a DRAINING resume before tools open", async () => {
         const db = makeDb();
         const projectPath = "git:mixed-restore";

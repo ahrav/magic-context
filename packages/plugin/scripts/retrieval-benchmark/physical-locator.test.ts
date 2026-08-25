@@ -2,8 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { UnifiedSearchResult } from "./search";
-import { encodePhysicalResultLocator, parsePhysicalResultLocator } from "./search-result-locator";
+import type { UnifiedSearchResult } from "../../src/features/magic-context/search";
+import { encodePhysicalResultLocator, parsePhysicalResultLocator } from "./physical-locator";
 
 function result(partial: Record<string, unknown>): UnifiedSearchResult {
     return partial as unknown as UnifiedSearchResult;
@@ -79,14 +79,8 @@ describe("parsePhysicalResultLocator", () => {
 });
 
 describe("layering", () => {
-    it("production locator code has no import edge to the benchmark scripts", () => {
-        const source = readFileSync(join(import.meta.dir, "search-result-locator.ts"), "utf8");
-        const importLines = source.split("\n").filter((line) => /^\s*import\b/.test(line));
-        expect(importLines.some((line) => line.includes("retrieval-benchmark"))).toBe(false);
-    });
-
     it("no production magic-context module imports the benchmark scripts", () => {
-        const dir = import.meta.dir;
+        const dir = join(import.meta.dir, "..", "..", "src", "features", "magic-context");
         // Recursive: subdirectories (memory/, dreamer/, ...) are production
         // modules too and must honor the same layering invariant.
         for (const name of readdirSync(dir, { recursive: true }) as string[]) {

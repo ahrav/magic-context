@@ -7,8 +7,24 @@ import {
     getShadowEmbeddingMeasurementCohort,
 } from "./memory/embedding";
 import type { CapturedQueryEmbedding, UnifiedSearchOptions, UnifiedSearchResult } from "./search";
-import { encodePhysicalResultLocator } from "./search-result-locator";
 import { recordEmbeddingMeasurement } from "./storage-embedding-measurements";
+
+function encodePhysicalResultLocator(result: UnifiedSearchResult): string {
+    switch (result.source) {
+        case "memory":
+            return `memory:${result.publicClaimId}`;
+        case "message":
+            return `message:${result.messageId}`;
+        case "compartment":
+            return `chunk:${result.compartmentId}`;
+        case "git_commit":
+            return `commit:${result.sha}`;
+        case "primer":
+            return `primer:${result.primerId}`;
+        case "note":
+            return `note:${result.noteId}`;
+    }
+}
 
 export async function recordShadowMeasurement(args: {
     db: Database;

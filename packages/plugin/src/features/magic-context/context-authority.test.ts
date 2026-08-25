@@ -787,7 +787,6 @@ describe("memory authority protocol", () => {
         expect(getAuthorityManagedMarker(database, "/repo")).toBeNull();
     });
 
-
     test("installs the marker before reading the stable seed set", async () => {
         const database = db();
         database
@@ -867,7 +866,6 @@ describe("memory authority protocol", () => {
                 .run("/repo"),
         ).toThrow("managed by the Rust module");
     });
-
 
     test("privileged same-connection UPDATE between capture and verify aborts prepare", async () => {
         const database = db();

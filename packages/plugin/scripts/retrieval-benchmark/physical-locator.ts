@@ -1,18 +1,13 @@
 /**
- * Production physical result-locator codec.
- *
- * One frozen encoding for the physical identity of a `UnifiedSearchResult`,
- * shared by shadow measurement telemetry and (one-way) by the script-only
- * retrieval-benchmark layer. The strings are a persisted vocabulary — rows in
- * `embedding_measurement_corpus` already carry them — so this codec is
- * byte-compatibility-frozen: `memory:`, `message:`, `chunk:` (compartment),
- * `commit:` (git_commit), `primer:`, `note:`.
- *
- * Production code must never import benchmark contracts; the benchmark layer
- * imports THIS module and layers canonical relevance identities on top.
+ * Frozen physical result-locator codec for the benchmark layer. The strings
+ * are a persisted vocabulary — rows in `embedding_measurement_corpus` already
+ * carry them — so the encoding is byte-compatibility-frozen: `memory:`,
+ * `message:`, `chunk:` (compartment), `commit:` (git_commit), `primer:`,
+ * `note:`. Production search-measurement keeps its own encoder for the same
+ * vocabulary and never imports this layer.
  */
 
-import type { UnifiedSearchResult } from "./search";
+import type { UnifiedSearchResult } from "../../src/features/magic-context/search";
 
 export const PHYSICAL_LOCATOR_KINDS = [
     "memory",

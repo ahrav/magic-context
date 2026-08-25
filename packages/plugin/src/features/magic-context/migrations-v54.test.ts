@@ -4,10 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
-import {
-    ensureContextStoreUuid,
-    installAuthorityManagedMarker,
-} from "./context-authority";
+import { ensureContextStoreUuid, installAuthorityManagedMarker } from "./context-authority";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 

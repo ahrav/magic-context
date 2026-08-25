@@ -10,7 +10,7 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import { saveCommitEmbedding, upsertCommits } from "./git-commits";
-import { insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
+import { insertMemory } from "./memory";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
 import { _resetProjectEmbeddingRegistryForTests } from "./project-embedding-registry";
@@ -63,7 +63,6 @@ function seedMixedCorpus(db: Database): { memoryId: number; compartmentWindows: 
         category: "ARCHITECTURE_DECISIONS",
         content: "The queue drain path applies backpressure before the retry budget resets.",
     });
-    saveEmbedding(db, memory.id, new Float32Array([1, 0]), MODEL);
 
     createPrimer(db, {
         projectPath: PROJECT,
@@ -205,14 +204,12 @@ function syntheticSpan(args: {
 
 afterEach(() => {
     rawMessagesBySession.clear();
-    resetEmbeddingCacheForTests();
     _resetCompartmentChunkSearchCacheForTests();
     _resetProjectEmbeddingRegistryForTests();
 });
 
 describe("trace neutrality", () => {
     async function runOnce(traceMode: "none" | "noop" | "collect") {
-        resetEmbeddingCacheForTests();
         _resetCompartmentChunkSearchCacheForTests();
         rawMessagesBySession.clear();
         const db = createTestDb();

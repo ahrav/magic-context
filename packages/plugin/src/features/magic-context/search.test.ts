@@ -17,7 +17,7 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
-import { insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
+import { insertMemory } from "./memory";
 import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
 import {
     computeProjectMemoryMutationToken,
@@ -123,7 +123,6 @@ afterEach(() => {
     queryEmbedding = null;
     embeddingQueries.length = 0;
     rawMessagesBySession.clear();
-    resetEmbeddingCacheForTests();
     _resetProjectEmbeddingRegistryForTests();
 });
 
@@ -219,7 +218,6 @@ describe("unifiedSearch", () => {
             category: "ARCHITECTURE_DECISIONS",
             content: "Magic context stores ranked search data in SQLite.",
         });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
 
         rawMessagesBySession.set("ses-1", [
@@ -391,7 +389,6 @@ describe("unifiedSearch", () => {
             category: "ARCHITECTURE_DECISIONS",
             content: "Magic context stores ranked search data in SQLite.",
         });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
 
         rawMessagesBySession.set("ses-1", [
@@ -616,7 +613,6 @@ describe("unifiedSearch", () => {
             category: "ARCHITECTURE_DECISIONS",
             content: "Historian uses a compact static system prompt.",
         });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
 
         rawMessagesBySession.set("ses-sources", [
@@ -1038,7 +1034,6 @@ describe("unifiedSearch", () => {
             category: "ARCHITECTURE_DECISIONS",
             content: "shared embed test.",
         });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
 
         await unifiedSearch(db, "ses-1", "/repo/project", "shared embed query", {

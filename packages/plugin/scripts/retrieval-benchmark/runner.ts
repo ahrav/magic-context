@@ -37,10 +37,10 @@ import {
     AUTO_SEARCH_SOURCES,
 } from "../../src/hooks/magic-context/auto-search-prompt";
 import {
-    getProjectEmbeddings,
-    invalidateProject,
-    peekProjectEmbeddings,
-} from "../../src/features/magic-context/memory";
+    invalidateMemoryVectorCache,
+    peekMemoryVectorCache,
+    primeMemoryVectorCache,
+} from "./memory-vector-store";
 import type {
     SearchSource,
     UnifiedSearchOptions,
@@ -53,7 +53,7 @@ import {
     SEARCH_TRACE_SCHEMA_VERSION,
     type SearchTraceSpan,
 } from "../../src/features/magic-context/search-trace";
-import { encodePhysicalResultLocator } from "../../src/features/magic-context/search-result-locator";
+import { encodePhysicalResultLocator } from "./physical-locator";
 import { packSearchResults } from "../../src/tools/ctx-search/render";
 import type { Database } from "../../src/shared/sqlite";
 import { closeQuietly } from "../../src/shared/sqlite-helpers";
@@ -263,11 +263,10 @@ interface CheckpointCaseFile {
 
 function defaultCacheHooks(): CacheHooks {
     return {
-        invalidateProcessVector: (projectScope) => invalidateProject(projectScope),
-        peekProcessVector: (projectScope, modelId) =>
-            peekProjectEmbeddings(projectScope, modelId) !== null,
+        invalidateProcessVector: (projectScope) => invalidateMemoryVectorCache(projectScope),
+        peekProcessVector: (projectScope, modelId) => peekMemoryVectorCache(projectScope, modelId),
         primeProcessVector: (db, projectScope, modelId) => {
-            getProjectEmbeddings(db, projectScope, modelId);
+            primeMemoryVectorCache(db, projectScope, modelId);
         },
         // No privileged OS cache-eviction mechanism ships with the harness;
         // controlled hosts must supply one, CI records not-attempted.

@@ -13,7 +13,6 @@ import {
 } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import { insertMemory as insertMemoryRaw } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
-import { queueMemoryMutation } from "@magic-context/core/features/magic-context/storage-memory-mutation-log";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
@@ -41,6 +40,28 @@ import {
 	renderM1Pi,
 } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
+
+function queueMemoryMutation(
+	db: ReturnType<typeof createTestDb>,
+	input: {
+		projectPath: string;
+		mutationType: string;
+		targetMemoryId: number;
+		newContent: string;
+		queuedAt: number;
+	},
+): void {
+	db.prepare(
+		"INSERT INTO memory_mutation_log (project_path, mutation_type, target_memory_id, new_content, queued_at) VALUES (?, ?, ?, ?, ?)",
+	).run(
+		input.projectPath,
+		input.mutationType,
+		input.targetMemoryId,
+		input.newContent,
+		input.queuedAt,
+	);
+}
+
 
 const directSchemaDatabases = new WeakSet<ReturnType<typeof createTestDb>>();
 const seededClaims = new WeakMap<

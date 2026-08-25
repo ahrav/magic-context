@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
 import { hasMuralCueColumns, hasMuralCueRejectionCountColumn } from "../mural/storage-mural-cues";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
-import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
 import {
     computeClaimRequestDigest,
@@ -870,9 +869,7 @@ export function insertMemory(
                 nowMs: now,
             }),
         );
-        const inserted = loadInsertedMemory(db, outcome.result.memoryId);
-        invalidateProject(input.projectPath);
-        return inserted;
+        return loadInsertedMemory(db, outcome.result.memoryId);
     }
     const insertValues = buildInsertMemoryValues(
         input,
@@ -883,10 +880,7 @@ export function insertMemory(
     const result = getInsertMemoryStatement(db).run(...insertValues);
 
     const insertedResult = result as { lastInsertRowid?: number | bigint };
-    const inserted = loadInsertedMemory(db, insertedResult.lastInsertRowid);
-
-    invalidateProject(input.projectPath);
-    return inserted;
+    return loadInsertedMemory(db, insertedResult.lastInsertRowid);
 }
 
 /**
@@ -1385,10 +1379,7 @@ export function updateMemoryContent(
     normalizedHash: string,
     operationIdentity?: MemoryClaimOperationIdentity,
 ): boolean {
-    // Intentional: read outside transaction — Bun is single-threaded so no concurrent
-    // modification can happen. The projectPath is only used for cache invalidation after
-    // the write, which self-heals on next search if stale.
-    const memory = assertTsMemoryIdWriteAllowed(db, id);
+    assertTsMemoryIdWriteAllowed(db, id);
 
     if (hasMemoryClaimsCompatSchema(db)) {
         const envelope = storageMemoryClaimEnvelope(
@@ -1403,9 +1394,6 @@ export function updateMemoryContent(
                 normalizedHash,
             }),
         );
-        if (memory) {
-            invalidateMemory(memory.projectPath, id);
-        }
         return outcome.replayed;
     }
 
@@ -1451,9 +1439,6 @@ export function updateMemoryContent(
         stmt.run(id);
     })();
 
-    if (memory) {
-        invalidateMemory(memory.projectPath, id);
-    }
     return false;
 }
 
@@ -1679,7 +1664,7 @@ export function archiveMemory(
 }
 
 export function deleteMemory(db: Database, id: number): void {
-    const memory = assertTsMemoryIdWriteAllowed(db, id);
+    assertTsMemoryIdWriteAllowed(db, id);
 
     if (hasMemoryClaimsCompatSchema(db)) {
         const envelope = storageMemoryClaimEnvelope("delete", { id });
@@ -1691,10 +1676,6 @@ export function deleteMemory(db: Database, id: number): void {
             getDeleteMemoryEmbeddingStatement(db).run(id);
             getDeleteMemoryStatement(db).run(id);
         })();
-    }
-
-    if (memory) {
-        invalidateMemory(memory.projectPath, id);
     }
 }
 

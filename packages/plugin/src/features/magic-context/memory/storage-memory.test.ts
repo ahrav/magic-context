@@ -9,8 +9,6 @@ import { initializeDatabase } from "../storage-db";
 import { dropMemoryClaimsCompatObjectsForTests } from "../storage-memory-claims-schema";
 import {
     archiveMemory,
-    clearEmbeddingsForProject,
-    deleteEmbedding,
     deleteMemory,
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
@@ -19,21 +17,11 @@ import {
     getMemoryByHash,
     getMemoryById,
     getMemoryCount,
-    getMemoryVerifications,
-    getProjectEmbeddings,
-    getStoredModelId,
     insertMemory,
     insertMemoryIdempotent,
-    loadAllEmbeddings,
     MemoryStatsIntegrityError,
     mergeMemoryStats,
     readNewMemoriesForM1Union,
-    recordMemoryMapping,
-    recordMemoryVerifications,
-    resetEmbeddingCacheForTests,
-    saveEmbedding,
-    searchMemoriesFTS,
-    searchMemoriesFTSUnion,
     setMemoryClassification,
     supersededMemory,
     updateMemoryContent,
@@ -43,11 +31,52 @@ import {
     updateMemoryVerification,
 } from "./index";
 import { computeNormalizedHash } from "./normalize-hash";
-import { rekeyMemoryRowWithCollisionMerge } from "./relocate-memory";
 import {
     getCurrentMemoryClaimByLegacyMemoryId,
     runInMemoryClaimsWriteTransaction,
 } from "./storage-memory-claims";
+import { searchMemoriesFTS, searchMemoriesFTSUnion } from "./storage-memory-fts";
+import {
+    getMemoryVerifications,
+    recordMemoryMapping,
+    recordMemoryVerifications,
+} from "./storage-memory-verifications";
+
+function saveEmbedding(
+    database: Database,
+    memoryId: number,
+    embedding: Float32Array,
+    modelId: string,
+): void {
+    database
+        .prepare(
+            "INSERT INTO memory_embeddings (memory_id, embedding, model_id) VALUES (?, ?, ?) ON CONFLICT(memory_id, model_id) DO UPDATE SET embedding = excluded.embedding",
+        )
+        .run(
+            memoryId,
+            Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+            modelId,
+        );
+}
+
+function loadAllEmbeddings(
+    database: Database,
+    projectPath: string,
+    modelId: string,
+): Map<number, Float32Array> {
+    const rows = database
+        .prepare(
+            "SELECT me.memory_id AS memoryId, me.embedding AS embedding FROM memory_embeddings me JOIN memories m ON m.id = me.memory_id WHERE m.project_path = ? AND me.model_id = ? ORDER BY me.memory_id",
+        )
+        .all(projectPath, modelId) as Array<{ memoryId: number; embedding: Uint8Array }>;
+    return new Map(
+        rows.map((row) => {
+            const blob = row.embedding;
+            const buffer = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength);
+            return [row.memoryId, new Float32Array(buffer)] as const;
+        }),
+    );
+}
 
 let db: Database;
 
@@ -111,7 +140,6 @@ function makeMemoryDatabase(): Database {
 }
 
 afterEach(() => {
-    resetEmbeddingCacheForTests();
     if (db) {
         closeQuietly(db);
     }
@@ -260,46 +288,6 @@ describe("storage-memory", () => {
             expect(updated?.normalizedHash).toBe(computeNormalizedHash("cache_ttl=10m"));
             expect(loadAllEmbeddings(db, "/repo/project", "local:model-a")).toEqual(new Map());
         });
-
-        it("#when cache-sensitive writes occur #then embedding cache invalidates updated project entries", () => {
-            db = makeMemoryDatabase();
-
-            const memory = insertMemory(db, {
-                projectPath: "/repo/project",
-                category: "CONFIG_DEFAULTS",
-                content: "cache_ttl=5m",
-            });
-            saveEmbedding(db, memory.id, new Float32Array([0.1, 0.2]), "local:model-a");
-
-            const initialCache = getProjectEmbeddings(db, "/repo/project", "local:model-a");
-            expect(Array.from(initialCache.get(memory.id)?.embedding ?? [])).toEqual(
-                Array.from(new Float32Array([0.1, 0.2])),
-            );
-
-            updateMemoryContent(
-                db,
-                memory.id,
-                "cache_ttl=10m",
-                computeNormalizedHash("cache_ttl=10m"),
-            );
-
-            const cacheAfterUpdate = getProjectEmbeddings(db, "/repo/project", "local:model-a");
-            expect(cacheAfterUpdate.has(memory.id)).toBeFalse();
-
-            const secondMemory = insertMemory(db, {
-                projectPath: "/repo/project",
-                category: "CONFIG_DEFAULTS",
-                content: "cache_ttl=15m",
-            });
-            saveEmbedding(db, secondMemory.id, new Float32Array([0.3, 0.4]), "local:model-a");
-
-            const cacheAfterInsert = getProjectEmbeddings(db, "/repo/project", "local:model-a");
-            expect(Array.from(cacheAfterInsert.keys())).toEqual([secondMemory.id]);
-
-            deleteMemory(db, secondMemory.id);
-
-            expect(getProjectEmbeddings(db, "/repo/project", "local:model-a")).toEqual(new Map());
-        });
     });
 
     describe("#given FTS search", () => {
@@ -427,77 +415,6 @@ describe("storage-memory", () => {
         expect(getMaxMemoryIdForProjects(db, identities, ownIdentities, null)).toBe(
             foreignHidden.id,
         );
-    });
-
-    describe("#given embedding storage", () => {
-        it("#when saving, loading, and deleting embeddings #then blob values round-trip by project", () => {
-            db = makeMemoryDatabase();
-            const memoryA = insertMemory(db, {
-                projectPath: "/repo/project",
-                category: "NAMING",
-                content: "Prefer createMemoryStore naming",
-            });
-            const memoryB = insertMemory(db, {
-                projectPath: "/repo/other",
-                category: "NAMING",
-                content: "Prefer createOther naming",
-            });
-
-            saveEmbedding(db, memoryA.id, new Float32Array([0.25, 0.5, 0.75]), "local:model-a");
-            saveEmbedding(db, memoryB.id, new Float32Array([1, 2, 3]), "local:model-a");
-
-            const embeddings = loadAllEmbeddings(db, "/repo/project", "local:model-a");
-
-            expect(Array.from(embeddings.keys())).toEqual([memoryA.id]);
-            expect(Array.from(embeddings.get(memoryA.id)?.embedding ?? [])).toEqual([
-                0.25, 0.5, 0.75,
-            ]);
-            expect(getStoredModelId(db, "/repo/project")).toBe("local:model-a");
-
-            deleteEmbedding(db, memoryA.id);
-
-            expect(loadAllEmbeddings(db, "/repo/project", "local:model-a")).toEqual(new Map());
-        });
-
-        it("#when clearing all embeddings #then stored vectors and model id are removed", () => {
-            db = makeMemoryDatabase();
-            const memory = insertMemory(db, {
-                projectPath: "/repo/project",
-                category: "NAMING",
-                content: "Prefer createMemoryStore naming",
-            });
-
-            saveEmbedding(db, memory.id, new Float32Array([0.25, 0.5, 0.75]), "local:model-b");
-
-            clearEmbeddingsForProject(db, "/repo/project");
-
-            expect(loadAllEmbeddings(db, "/repo/project", "local:model-b")).toEqual(new Map());
-            expect(getStoredModelId(db, "/repo/project")).toBeNull();
-        });
-
-        it("#when clearing embeddings for one project #then other projects' embeddings are preserved", () => {
-            db = makeMemoryDatabase();
-            const memoryA = insertMemory(db, {
-                projectPath: "/repo/project-a",
-                category: "NAMING",
-                content: "Project A naming",
-            });
-            const memoryB = insertMemory(db, {
-                projectPath: "/repo/project-b",
-                category: "NAMING",
-                content: "Project B naming",
-            });
-
-            saveEmbedding(db, memoryA.id, new Float32Array([1, 2, 3]), "local:model-x");
-            saveEmbedding(db, memoryB.id, new Float32Array([4, 5, 6]), "local:model-x");
-
-            clearEmbeddingsForProject(db, "/repo/project-a");
-
-            expect(loadAllEmbeddings(db, "/repo/project-a", "local:model-x")).toEqual(new Map());
-            expect(getStoredModelId(db, "/repo/project-a")).toBeNull();
-            expect(loadAllEmbeddings(db, "/repo/project-b", "local:model-x").size).toBe(1);
-            expect(getStoredModelId(db, "/repo/project-b")).toBe("local:model-x");
-        });
     });
 
     describe("#given count and delete operations", () => {
@@ -1158,62 +1075,5 @@ describe("migrated-v82 mutation inventory characterization", () => {
         } finally {
             closeQuietly(preV84);
         }
-    });
-
-    it("identity repair: rekey moves project_path in place; a collision merges stats and deletes the source", () => {
-        migrated = migratedDb();
-        const plain = insertMemory(migrated, {
-            projectPath: "/legacy/raw-path",
-            category: "CONSTRAINTS",
-            content: "plain rekey row",
-            nowMs: 1_000,
-        });
-        const source = insertMemory(migrated, {
-            projectPath: "/legacy/raw-path",
-            category: "NAMING",
-            content: "collision wording",
-            nowMs: 1_000,
-        });
-        const target = insertMemory(migrated, {
-            projectPath: "git:canonical",
-            category: "NAMING",
-            content: "Collision   WORDING",
-            nowMs: 1_000,
-        });
-        migrated
-            .prepare("UPDATE memory_stats SET seen_count = 5 WHERE memory_id = ?")
-            .run(source.id);
-        saveEmbedding(migrated, source.id, new Float32Array([9, 9]), "local:model-a");
-
-        migrated.transaction(() => {
-            // Plain rekey: same row id, new identity, everything else intact.
-            expect(
-                rekeyMemoryRowWithCollisionMerge(
-                    migrated,
-                    plain.id,
-                    "/legacy/raw-path",
-                    "git:canonical",
-                ),
-            ).toBeTrue();
-            // Collision merge: target keeps the larger seen_count, adopts the
-            // orphaned embedding, and the source row is deleted.
-            expect(
-                rekeyMemoryRowWithCollisionMerge(
-                    migrated,
-                    source.id,
-                    "/legacy/raw-path",
-                    "git:canonical",
-                ),
-            ).toBeTrue();
-        })();
-
-        const plainRow = baseRow(migrated, plain.id);
-        expect(plainRow?.project_path).toBe("git:canonical");
-        expect(plainRow?.content).toBe("plain rekey row");
-        expect(baseRow(migrated, source.id)).toBeNull();
-        expect(statsRow(migrated, target.id)?.seen_count).toBe(5);
-        const adopted = loadAllEmbeddings(migrated, "git:canonical", "local:model-a");
-        expect(Array.from(adopted.keys())).toEqual([target.id]);
-        expect(getMemoryCount(migrated, "/legacy/raw-path")).toBe(0);
     });
 });

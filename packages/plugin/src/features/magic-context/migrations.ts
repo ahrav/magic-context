@@ -48,8 +48,9 @@ import {
     synapseBatchLedgerDdl,
     synapseBatchLedgerIndexDdl,
 } from "./storage-schema-helpers";
-import { V22_BACKFILL_META_KEY } from "./v22-deferred-backfill";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
+
+const V22_BACKFILL_META_KEY = "v22_legacy_memory_backfill";
 
 /** First version reserved for downstream migrations; upstream versions stay below it. */
 export const FORK_MIGRATION_VERSION_FLOOR = 10_000;
@@ -207,6 +208,7 @@ function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
 function installLatestAuthorityTriggers(db: Database): void {
     const privilegeCheck = authorityPrivilegeCheck();
     if (tableExists(db, "memories")) {
+        // pi-lens-ignore: sql-injection
         db.exec(`
             DROP TRIGGER IF EXISTS memories_authority_guard_insert;
             DROP TRIGGER IF EXISTS memories_authority_guard_update;
@@ -236,6 +238,7 @@ function installLatestAuthorityTriggers(db: Database): void {
     if (tableExists(db, "notes")) {
         const managedOld = managedAuthorityNoteRow("OLD");
         const managedNew = managedAuthorityNoteRow("NEW");
+        // pi-lens-ignore: sql-injection
         db.exec(`
             DROP TRIGGER IF EXISTS notes_authority_guard_insert;
             DROP TRIGGER IF EXISTS notes_authority_guard_update;

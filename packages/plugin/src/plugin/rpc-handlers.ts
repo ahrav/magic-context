@@ -855,7 +855,6 @@ function buildEmbedDetail(
         model: coverage.model,
         provider: coverage.provider,
         session: coverage.session,
-        memories: coverage.memories,
         commits: coverage.commits,
         statusText,
     };

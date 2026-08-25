@@ -230,7 +230,6 @@ export interface EmbedDetail {
     model: string;
     provider: string;
     session: { embedded: number; total: number };
-    memories: { embedded: number; total: number };
     commits: { embedded: number; total: number; gitEnabled: boolean };
     statusText: string;
 }

@@ -242,7 +242,6 @@ const EMPTY_EMBED_DETAIL: EmbedDetail = {
     model: "off",
     provider: "off",
     session: { embedded: 0, total: 0 },
-    memories: { embedded: 0, total: 0 },
     commits: { embedded: 0, total: 0, gitEnabled: false },
     statusText: "Embedding is off (no provider configured).",
 };

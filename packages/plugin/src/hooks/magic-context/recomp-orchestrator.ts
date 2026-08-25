@@ -261,7 +261,6 @@ function buildRecompDeps(ctx: ManagedRecompContext, sessionId: string) {
     };
 }
 
-
 /**
  * Run a recomp (full or partial), with fallback + live progress + terminal state.
  * Returns the runner's outcome message; the CALLER delivers it (so it can choose
@@ -410,4 +409,3 @@ export async function runManagedUpgrade(
         return `## Session Upgrade — Failed\n\nUpgrade crashed: ${String(error)}`;
     }
 }
-
