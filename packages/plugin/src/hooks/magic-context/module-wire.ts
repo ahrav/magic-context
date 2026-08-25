@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { computeClaimOperationRequestDigest } from "../../features/magic-context/memory/claim-operation-contract";
 import {
     getRawSessionStoredMessageCount,
     readRawSessionMessageOrdinalPage,
@@ -18,6 +19,304 @@ export const MODULE_ITEM_CONTINUATION_CHUNK_BYTES = 64 * 1024;
 // authority state sync and live transform requests.
 export const MODULE_ITEM_CONTINUATION_KEY = "__shadow_item_continuation";
 export const MODULE_ORDINAL_PAGE_SIZE = 500;
+export const CLAIM_INTENT_PROTOCOL_VERSION = 1;
+export const CLAIM_REQUEST_ENCODING_VERSION = 1;
+
+export interface ClaimIntentBinding {
+    databaseIncarnationId: string;
+    formatEpoch: number;
+    authorityProject: string;
+    authorityGeneration: number;
+}
+
+export interface ClaimCommandIdentity {
+    producer: string;
+    operationKey: string;
+}
+
+export type ClaimIntentState =
+    | "staged"
+    | "context-committed"
+    | "acknowledged"
+    | "terminal-rejected";
+
+export interface ClaimIntentWireRecord {
+    binding: ClaimIntentBinding;
+    command: ClaimCommandIdentity;
+    requestDigest: string;
+    state: ClaimIntentState;
+    resultJson: string | null;
+}
+
+export interface ClaimIntentStageRequest {
+    protocolVersion: number;
+    requestEncodingVersion: number;
+    binding: ClaimIntentBinding;
+    command: ClaimCommandIdentity;
+    request: unknown;
+}
+
+export interface ClaimIntentInspectRequest {
+    protocolVersion: number;
+    command: ClaimCommandIdentity | null;
+    unresolvedOnly: boolean;
+    limit: number;
+}
+
+export interface ClaimIntentAckRequest {
+    protocolVersion: number;
+    binding: ClaimIntentBinding;
+    command: ClaimCommandIdentity;
+    requestDigest: string;
+    kind: "context-committed" | "acknowledged" | "terminal-rejected";
+    resultJson: string | null;
+}
+
+export interface ClaimIntentStageResponse {
+    protocolVersion: number;
+    replayed: boolean;
+    intent: ClaimIntentWireRecord;
+}
+
+export interface ClaimIntentInspectResponse {
+    protocolVersion: number;
+    intents: ClaimIntentWireRecord[];
+}
+
+export interface ClaimIntentAckResponse {
+    protocolVersion: number;
+    replayed: boolean;
+    intent: ClaimIntentWireRecord;
+}
+
+export interface ClaimEffectDeliveryEffect {
+    id: number;
+    effectKey: string;
+    projectId: number;
+    generation: number;
+    changeKind: string;
+    revisionLocator: string | null;
+}
+
+export interface ClaimEffectDeliveryReceipt {
+    receiptId: number;
+    producer: string;
+    operationKey: string;
+    requestDigest: string;
+    resultJson: string;
+    effects: ClaimEffectDeliveryEffect[];
+}
+
+export interface ClaimEffectDeliveryRequest {
+    protocolVersion: number;
+    consumer: string;
+    receipt: ClaimEffectDeliveryReceipt;
+}
+
+export interface ClaimEffectDeliveryResponse {
+    protocolVersion: number;
+    ackedEffectId: number;
+}
+
+export interface ModuleFacadeWireBody<T> {
+    name: string;
+    arguments: T;
+}
+
+function wireRecord(value: unknown, label: string): Record<string, unknown> {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${label} must be an object`);
+    }
+    return value as Record<string, unknown>;
+}
+
+function wireString(record: Record<string, unknown>, key: string, label: string): string {
+    const value = record[key];
+    if (typeof value !== "string" || value.length === 0) {
+        throw new Error(`${label}.${key} must be a non-empty string`);
+    }
+    return value;
+}
+
+function wireSafeInteger(
+    record: Record<string, unknown>,
+    key: string,
+    label: string,
+    minimum = 0,
+): number {
+    const value = record[key];
+    if (!Number.isSafeInteger(value) || (value as number) < minimum) {
+        throw new Error(`${label}.${key} must be a safe integer >= ${minimum}`);
+    }
+    return value as number;
+}
+
+function decodeClaimIntentBinding(value: unknown): ClaimIntentBinding {
+    const record = wireRecord(value, "claim intent binding");
+    return {
+        databaseIncarnationId: wireString(record, "databaseIncarnationId", "binding"),
+        formatEpoch: wireSafeInteger(record, "formatEpoch", "binding", 1),
+        authorityProject: wireString(record, "authorityProject", "binding"),
+        authorityGeneration: wireSafeInteger(record, "authorityGeneration", "binding", 0),
+    };
+}
+
+function decodeClaimCommandIdentity(value: unknown): ClaimCommandIdentity {
+    const record = wireRecord(value, "claim command identity");
+    return {
+        producer: wireString(record, "producer", "command"),
+        operationKey: wireString(record, "operationKey", "command"),
+    };
+}
+
+function decodeClaimIntentWireRecord(value: unknown): ClaimIntentWireRecord {
+    const record = wireRecord(value, "claim intent");
+    const state = record.state;
+    if (
+        state !== "staged" &&
+        state !== "context-committed" &&
+        state !== "acknowledged" &&
+        state !== "terminal-rejected"
+    ) {
+        throw new Error("claim intent.state is unsupported");
+    }
+    const requestDigest = wireString(record, "requestDigest", "claim intent");
+    if (!/^[0-9a-f]{64}$/.test(requestDigest)) {
+        throw new Error("claim intent.requestDigest must be lowercase SHA-256");
+    }
+    const resultJson = record.resultJson;
+    if (resultJson !== null && typeof resultJson !== "string") {
+        throw new Error("claim intent.resultJson must be a string or null");
+    }
+    return {
+        binding: decodeClaimIntentBinding(record.binding),
+        command: decodeClaimCommandIdentity(record.command),
+        requestDigest,
+        state,
+        resultJson,
+    };
+}
+
+function requireIntentProtocol(record: Record<string, unknown>, label: string): void {
+    if (record.protocolVersion !== CLAIM_INTENT_PROTOCOL_VERSION) {
+        throw new Error(`${label}.protocolVersion is unsupported`);
+    }
+}
+
+export function buildClaimIntentStageWireBody(
+    request: ClaimIntentStageRequest,
+): ModuleFacadeWireBody<ClaimIntentStageRequest> {
+    return { name: "claim.intent.stage", arguments: request };
+}
+
+export function buildClaimIntentInspectWireBody(
+    request: ClaimIntentInspectRequest,
+): ModuleFacadeWireBody<ClaimIntentInspectRequest> {
+    return { name: "claim.intent.inspect", arguments: request };
+}
+
+export function buildClaimIntentAckWireBody(
+    request: ClaimIntentAckRequest,
+): ModuleFacadeWireBody<ClaimIntentAckRequest> {
+    return { name: "claim.intent.ack", arguments: request };
+}
+
+export function buildClaimEffectDeliveryWireBody(
+    request: ClaimEffectDeliveryRequest,
+): ModuleFacadeWireBody<ClaimEffectDeliveryRequest> {
+    return { name: "claim.effects.apply", arguments: request };
+}
+
+export function decodeClaimIntentStageResponse(
+    value: unknown,
+    request: ClaimIntentStageRequest,
+): ClaimIntentStageResponse {
+    const record = wireRecord(value, "claim intent stage response");
+    requireIntentProtocol(record, "claim intent stage response");
+    if (typeof record.replayed !== "boolean") {
+        throw new Error("claim intent stage response.replayed must be boolean");
+    }
+    const intent = decodeClaimIntentWireRecord(record.intent);
+    const expectedDigest = computeClaimOperationRequestDigest(request.request);
+    if (intent.requestDigest !== expectedDigest) {
+        throw new Error("claim intent stage response request digest mismatch");
+    }
+    if (
+        intent.command.producer !== request.command.producer ||
+        intent.command.operationKey !== request.command.operationKey
+    ) {
+        throw new Error("claim intent stage response command mismatch");
+    }
+    if (
+        intent.binding.databaseIncarnationId !== request.binding.databaseIncarnationId ||
+        intent.binding.formatEpoch !== request.binding.formatEpoch ||
+        intent.binding.authorityProject !== request.binding.authorityProject ||
+        intent.binding.authorityGeneration !== request.binding.authorityGeneration
+    ) {
+        throw new Error("claim intent stage response binding mismatch");
+    }
+    return {
+        protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
+        replayed: record.replayed,
+        intent,
+    };
+}
+
+export function decodeClaimIntentInspectResponse(value: unknown): ClaimIntentInspectResponse {
+    const record = wireRecord(value, "claim intent inspect response");
+    requireIntentProtocol(record, "claim intent inspect response");
+    if (!Array.isArray(record.intents)) {
+        throw new Error("claim intent inspect response.intents must be an array");
+    }
+    return {
+        protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
+        intents: record.intents.map(decodeClaimIntentWireRecord),
+    };
+}
+
+export function decodeClaimIntentAckResponse(
+    value: unknown,
+    request: ClaimIntentAckRequest,
+): ClaimIntentAckResponse {
+    const record = wireRecord(value, "claim intent ack response");
+    requireIntentProtocol(record, "claim intent ack response");
+    if (typeof record.replayed !== "boolean") {
+        throw new Error("claim intent ack response.replayed must be boolean");
+    }
+    const intent = decodeClaimIntentWireRecord(record.intent);
+    if (
+        intent.command.producer !== request.command.producer ||
+        intent.command.operationKey !== request.command.operationKey ||
+        intent.requestDigest !== request.requestDigest
+    ) {
+        throw new Error("claim intent ack response identity mismatch");
+    }
+    return {
+        protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
+        replayed: record.replayed,
+        intent,
+    };
+}
+
+export function decodeClaimEffectDeliveryResponse(
+    value: unknown,
+    expectedEffectId: number,
+): ClaimEffectDeliveryResponse {
+    const record = wireRecord(value, "claim effect delivery response");
+    requireIntentProtocol(record, "claim effect delivery response");
+    const ackedEffectId = wireSafeInteger(
+        record,
+        "ackedEffectId",
+        "claim effect delivery response",
+        1,
+    );
+    if (ackedEffectId !== expectedEffectId) {
+        throw new Error(
+            `claim effect delivery response skipped checkpoint ${expectedEffectId} -> ${ackedEffectId}`,
+        );
+    }
+    return { protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION, ackedEffectId };
+}
 
 export interface ModuleNormalizationRecord {
     kind: "tag_prefix" | "ctx_search_hint" | "summary_message";
@@ -46,7 +345,12 @@ function canonicalJson(value: unknown): string {
 }
 
 function transformPageDigest(arrays: Record<string, unknown[]>): string {
-    const wireArrays = JSON.parse(JSON.stringify(arrays)) as Record<string, unknown[]>;
+    let wireArrays: Record<string, unknown[]>;
+    try {
+        wireArrays = JSON.parse(JSON.stringify(arrays)) as Record<string, unknown[]>;
+    } catch (error) {
+        throw new Error("module transform page is not JSON-serializable", { cause: error });
+    }
     return crypto.createHash("sha256").update(canonicalJson(wireArrays)).digest("hex");
 }
 

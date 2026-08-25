@@ -1,5 +1,13 @@
 import { createHmac, randomUUID } from "node:crypto";
 import {
+    decodeClaimOperationResult,
+    type ClaimOperationResult,
+} from "../../features/magic-context/memory/claim-operation-contract";
+import {
+    advanceOutboxConsumerCheckpointInCurrentTransaction,
+    readOutboxConsumerCheckpoint,
+} from "../../features/magic-context/memory/storage-claim-operations";
+import {
     reconcileCompatibilityVerifications,
     seedLateCompatibilityRevisions,
 } from "../../features/magic-context/claim-policy-backfill";
@@ -64,7 +72,12 @@ import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
-import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
+import {
+    type ClaimEffectDeliveryReceipt,
+    MODULE_PAGE_MAX_BYTES,
+    moduleRawBlockMappings,
+    moduleWireBodyBytes,
+} from "./module-wire";
 
 /** Ceiling for a single live (non-seed) state_sync body. Well under the
  * transport frame limit; an epoch-driven replacement snapshot that exceeds
@@ -2072,6 +2085,264 @@ export async function buildModuleStateSyncPayload(args: {
         return "frame_budget";
     }
     return livePayload;
+}
+
+export interface ClaimOperationDurabilityProof {
+    receiptId: number;
+    requestDigest: string;
+    resultJson: string;
+    result: ClaimOperationResult;
+    effects: ClaimEffectDeliveryReceipt["effects"];
+}
+
+interface ClaimReceiptRow {
+    id: number;
+    requestDigest: string;
+    expectedEffectCount: number;
+    resultJson: string;
+}
+
+interface ClaimEffectRow {
+    id: number;
+    receiptId: number;
+    effectKey: string;
+    projectId: number;
+    generation: number;
+    changeKind: string;
+}
+
+function claimReceiptRow(
+    db: ContextDatabase,
+    producer: string,
+    operationKey: string,
+): ClaimReceiptRow | null {
+    return (
+        (db
+            .prepare(
+                `SELECT id, request_digest AS requestDigest,
+                        expected_effect_count AS expectedEffectCount, result_json AS resultJson
+                   FROM claim_operation_receipts
+                  WHERE producer = ? AND operation_key = ?`,
+            )
+            .get(producer, operationKey) as ClaimReceiptRow | undefined) ?? null
+    );
+}
+
+function claimEffectRows(db: ContextDatabase, receiptId: number): ClaimEffectRow[] {
+    return db
+        .prepare(
+            `SELECT id, receipt_id AS receiptId, effect_key AS effectKey,
+                    project_id AS projectId, generation, change_kind AS changeKind
+               FROM claim_operation_effects
+              WHERE receipt_id = ? ORDER BY id`,
+        )
+        .all(receiptId) as ClaimEffectRow[];
+}
+
+export function proveClaimOperationDurable(args: {
+    db: ContextDatabase;
+    producer: string;
+    operationKey: string;
+    resultJson?: string;
+}): ClaimOperationDurabilityProof {
+    const receipt = claimReceiptRow(args.db, args.producer, args.operationKey);
+    if (!receipt) throw new Error("claim operation context receipt is not durable");
+    if (args.resultJson !== undefined && receipt.resultJson !== args.resultJson) {
+        throw new Error("claim operation context receipt result changed");
+    }
+    const result = decodeClaimOperationResult(receipt.resultJson);
+    const rows = claimEffectRows(args.db, receipt.id);
+    if (rows.length !== receipt.expectedEffectCount || rows.length !== result.effects.length) {
+        throw new Error("claim operation receipt group is incomplete");
+    }
+    const resultByKey = new Map(result.effects.map((effect) => [effect.effectKey, effect]));
+    if (resultByKey.size !== result.effects.length) {
+        throw new Error("claim operation result repeats an effect key");
+    }
+    const effects = rows.map((row) => {
+        const effect = resultByKey.get(row.effectKey);
+        if (
+            !effect ||
+            effect.projectId !== row.projectId ||
+            effect.generation !== row.generation ||
+            effect.changeKind !== row.changeKind
+        ) {
+            throw new Error(`claim operation effect ${row.id} disagrees with its receipt`);
+        }
+        return {
+            id: row.id,
+            effectKey: row.effectKey,
+            projectId: row.projectId,
+            generation: row.generation,
+            changeKind: row.changeKind,
+            revisionLocator: effect.revisionLocator,
+        };
+    });
+    for (const [projectIdText, generation] of Object.entries(result.generations)) {
+        const projectId = Number(projectIdText);
+        if (!Number.isSafeInteger(projectId) || projectId <= 0) {
+            throw new Error(`claim operation generation project ${projectIdText} is invalid`);
+        }
+        const row = args.db
+            .prepare("SELECT generation FROM claim_project_generations WHERE project_id = ?")
+            .get(projectId) as { generation: number } | undefined;
+        if (!row || row.generation < generation) {
+            throw new Error(
+                `claim operation generation ${projectIdText}:${generation} is not durable`,
+            );
+        }
+    }
+    return {
+        receiptId: receipt.id,
+        requestDigest: receipt.requestDigest,
+        resultJson: receipt.resultJson,
+        result,
+        effects,
+    };
+}
+
+export interface ClaimEffectPrefixDrainResult {
+    deliveredReceipts: number;
+    deliveredEffects: number;
+    lastEffectId: number;
+    reachedReceipt: boolean;
+}
+
+export async function drainClaimEffectPrefix(args: {
+    db: ContextDatabase;
+    consumer: string;
+    deliver: (receipt: ClaimEffectDeliveryReceipt) => Promise<{ ackedEffectId: number }>;
+    throughReceiptId?: number;
+    maxReceipts?: number;
+}): Promise<ClaimEffectPrefixDrainResult> {
+    const maxReceipts = Math.max(1, Math.min(args.maxReceipts ?? 1_000, 1_000));
+    let deliveredReceipts = 0;
+    let deliveredEffects = 0;
+    let lastEffectId = 0;
+    let reachedReceipt = false;
+
+    if (args.throughReceiptId !== undefined) {
+        const targetEffects = claimEffectRows(args.db, args.throughReceiptId);
+        const targetReceiptExists = args.db
+            .prepare("SELECT 1 AS present FROM claim_operation_receipts WHERE id = ?")
+            .get(args.throughReceiptId) as { present: number } | undefined;
+        if (!targetReceiptExists) {
+            throw new Error(`claim effect target receipt ${args.throughReceiptId} is missing`);
+        }
+        reachedReceipt = targetEffects.every(
+            (effect) =>
+                effect.id <= readOutboxConsumerCheckpoint(args.db, args.consumer, effect.projectId),
+        );
+        if (reachedReceipt) {
+            lastEffectId = targetEffects.at(-1)?.id ?? 0;
+            return { deliveredReceipts, deliveredEffects, lastEffectId, reachedReceipt };
+        }
+    }
+
+    while (deliveredReceipts < maxReceipts) {
+        const first = args.db
+            .prepare(
+                `SELECT effects.id, effects.receipt_id AS receiptId
+                   FROM claim_operation_effects AS effects
+                   LEFT JOIN claim_outbox_consumer_checkpoints AS checkpoint
+                     ON checkpoint.consumer = ? AND checkpoint.project_id = effects.project_id
+                  WHERE effects.id > COALESCE(checkpoint.acked_effect_id, 0)
+                  ORDER BY effects.id LIMIT 1`,
+            )
+            .get(args.consumer) as { id: number; receiptId: number } | undefined;
+        if (!first) break;
+
+        const receipt = args.db
+            .prepare(
+                `SELECT producer, operation_key AS operationKey,
+                        request_digest AS requestDigest, result_json AS resultJson,
+                        expected_effect_count AS expectedEffectCount
+                   FROM claim_operation_receipts WHERE id = ?`,
+            )
+            .get(first.receiptId) as
+            | {
+                  producer: string;
+                  operationKey: string;
+                  requestDigest: string;
+                  resultJson: string;
+                  expectedEffectCount: number;
+              }
+            | undefined;
+        if (!receipt) throw new Error(`claim effect receipt ${first.receiptId} is missing`);
+        const proof = proveClaimOperationDurable({
+            db: args.db,
+            producer: receipt.producer,
+            operationKey: receipt.operationKey,
+            resultJson: receipt.resultJson,
+        });
+        if (
+            proof.receiptId !== first.receiptId ||
+            proof.effects.length !== receipt.expectedEffectCount
+        ) {
+            throw new Error(`claim effect receipt ${first.receiptId} is incomplete`);
+        }
+        for (const effect of proof.effects) {
+            const checkpoint = readOutboxConsumerCheckpoint(
+                args.db,
+                args.consumer,
+                effect.projectId,
+            );
+            if (effect.id <= checkpoint) {
+                throw new Error(
+                    `claim effect receipt ${first.receiptId} was checkpointed partially`,
+                );
+            }
+        }
+        const delivery: ClaimEffectDeliveryReceipt = {
+            receiptId: proof.receiptId,
+            producer: receipt.producer,
+            operationKey: receipt.operationKey,
+            requestDigest: receipt.requestDigest,
+            resultJson: receipt.resultJson,
+            effects: proof.effects,
+        };
+        const expectedEffectId = proof.effects.at(-1)?.id;
+        if (expectedEffectId === undefined) {
+            throw new Error(`claim effect receipt ${first.receiptId} has no effects`);
+        }
+        const acknowledged = await args.deliver(delivery);
+        if (acknowledged.ackedEffectId !== expectedEffectId) {
+            throw new Error(
+                `claim effect delivery skipped checkpoint ${expectedEffectId} -> ${acknowledged.ackedEffectId}`,
+            );
+        }
+        args.db
+            .transaction(() => {
+                const maxByProject = new Map<number, number>();
+                for (const effect of proof.effects) {
+                    maxByProject.set(
+                        effect.projectId,
+                        Math.max(maxByProject.get(effect.projectId) ?? 0, effect.id),
+                    );
+                }
+                for (const [projectId, ackedEffectId] of maxByProject) {
+                    advanceOutboxConsumerCheckpointInCurrentTransaction(args.db, {
+                        consumer: args.consumer,
+                        projectId,
+                        ackedEffectId,
+                    });
+                }
+            })
+            .immediate();
+
+        deliveredReceipts += 1;
+        deliveredEffects += proof.effects.length;
+        lastEffectId = expectedEffectId;
+        reachedReceipt ||= proof.receiptId === args.throughReceiptId;
+        if (reachedReceipt) break;
+    }
+
+    if (args.throughReceiptId !== undefined && !reachedReceipt) {
+        throw new Error(
+            `claim effect prefix did not reach receipt ${args.throughReceiptId} within ${maxReceipts} groups`,
+        );
+    }
+    return { deliveredReceipts, deliveredEffects, lastEffectId, reachedReceipt };
 }
 
 export interface ModuleStateSyncClient {

@@ -349,6 +349,14 @@ function getClaims(
     };
 }
 
+export interface CtxMemoryClaimCommit {
+    response: string;
+    producer: string;
+    operationKey: string;
+    requestDigest: string;
+    resultJson: string;
+}
+
 export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionArgs): string {
     const { db, args, projectIdentity, identity } = input;
     const action = args.action;
@@ -466,4 +474,31 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
         requestScope,
     });
     return mutationResult(action, operation);
+}
+
+export function executeCtxMemoryClaimActionWithCommit(
+    input: ExecuteCtxMemoryClaimActionArgs,
+): CtxMemoryClaimCommit {
+    if (input.args.action === "get" || input.args.action === "list") {
+        throw new ClaimOperationInputError("only ctx_memory mutations produce claim receipts");
+    }
+    const identity = createCtxMemoryProducerIdentity(input.identity);
+    const response = executeCtxMemoryClaimAction(input);
+    const receipt = input.db
+        .prepare(
+            `SELECT request_digest AS requestDigest, result_json AS resultJson
+               FROM claim_operation_receipts
+              WHERE producer = ? AND operation_key = ?`,
+        )
+        .get(identity.producer, identity.operationKey) as
+        | { requestDigest: string; resultJson: string }
+        | undefined;
+    if (!receipt) throw new Error("ctx_memory claim operation committed without a receipt");
+    return {
+        response,
+        producer: identity.producer,
+        operationKey: identity.operationKey,
+        requestDigest: receipt.requestDigest,
+        resultJson: receipt.resultJson,
+    };
 }

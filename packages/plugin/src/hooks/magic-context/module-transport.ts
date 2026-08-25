@@ -24,6 +24,24 @@ import {
     StaleRouteHandleError,
 } from "../../shared/mc-host-client";
 import { isRecord } from "../../shared/record-type-guard";
+import {
+    buildClaimEffectDeliveryWireBody,
+    buildClaimIntentAckWireBody,
+    buildClaimIntentInspectWireBody,
+    buildClaimIntentStageWireBody,
+    type ClaimEffectDeliveryRequest,
+    type ClaimEffectDeliveryResponse,
+    type ClaimIntentAckRequest,
+    type ClaimIntentAckResponse,
+    type ClaimIntentInspectRequest,
+    type ClaimIntentInspectResponse,
+    type ClaimIntentStageRequest,
+    type ClaimIntentStageResponse,
+    decodeClaimEffectDeliveryResponse,
+    decodeClaimIntentAckResponse,
+    decodeClaimIntentInspectResponse,
+    decodeClaimIntentStageResponse,
+} from "./module-wire";
 
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
@@ -455,6 +473,10 @@ export class McHostModuleTransport {
             | "mirror.pull"
             | "ctx_note"
             | "ctx_memory"
+            | "claim.intent.stage"
+            | "claim.intent.inspect"
+            | "claim.intent.ack"
+            | "claim.effects.apply"
             | "note.evaluate"
             | "note.evaluation.register"
             | "note.evaluation.heartbeat"
@@ -765,6 +787,65 @@ export class McHostModuleTransport {
         return { page: response.page as unknown as ChangefeedPage };
     }
 
+    async claimIntentStage(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentStageRequest;
+    }): Promise<ClaimIntentStageResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.stage",
+            body: buildClaimIntentStageWireBody(args.request),
+        });
+        return decodeClaimIntentStageResponse(response, args.request);
+    }
+
+    async claimIntentInspect(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentInspectRequest;
+    }): Promise<ClaimIntentInspectResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.inspect",
+            body: buildClaimIntentInspectWireBody(args.request),
+        });
+        return decodeClaimIntentInspectResponse(response);
+    }
+
+    async claimIntentAck(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentAckRequest;
+    }): Promise<ClaimIntentAckResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.ack",
+            body: buildClaimIntentAckWireBody(args.request),
+        });
+        return decodeClaimIntentAckResponse(response, args.request);
+    }
+
+    async claimEffectsApply(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimEffectDeliveryRequest;
+    }): Promise<ClaimEffectDeliveryResponse> {
+        const expectedEffectId = Math.max(
+            ...args.request.receipt.effects.map((effect) => effect.id),
+        );
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.effects.apply",
+            body: buildClaimEffectDeliveryWireBody(args.request),
+        });
+        return decodeClaimEffectDeliveryResponse(response, expectedEffectId);
+    }
+
     async deleteSession(sessionId: string, projectRoot: string): Promise<void> {
         await this.call({
             sessionId,
@@ -852,7 +933,7 @@ export class McHostModuleTransport {
                 "opening the module route",
             );
             if (
-                routeOpening.closed ||
+                routeOpening?.closed === true ||
                 this.client !== client ||
                 generation !== this.connectionGeneration
             ) {
@@ -864,11 +945,13 @@ export class McHostModuleTransport {
             this.routes.set(routeKey, { route, generation });
             return { client, route, routeKey, generation };
         })();
-        this.routeOpenings.set(routeKey, routeOpening);
+        const newOpening: OpeningRoute = { client, generation, closed: false, promise };
+        routeOpening = newOpening;
+        this.routeOpenings.set(routeKey, newOpening);
         try {
-            return await routeOpening.promise;
+            return await newOpening.promise;
         } finally {
-            if (this.routeOpenings.get(routeKey) === routeOpening) {
+            if (this.routeOpenings.get(routeKey) === newOpening) {
                 this.routeOpenings.delete(routeKey);
             }
         }

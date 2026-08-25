@@ -156,6 +156,7 @@ export function createToolRegistry(args: {
                   resolveProjectPath,
                   ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
                   allowedActions: [...CTX_MEMORY_ACTIONS],
+                  rustToolBackends,
               })
             : {}),
     };

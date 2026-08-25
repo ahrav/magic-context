@@ -91,6 +91,14 @@ import {
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import {
     buildPagedModuleTransformPayloads,
+    type ClaimEffectDeliveryRequest,
+    type ClaimEffectDeliveryResponse,
+    type ClaimIntentAckRequest,
+    type ClaimIntentAckResponse,
+    type ClaimIntentInspectRequest,
+    type ClaimIntentInspectResponse,
+    type ClaimIntentStageRequest,
+    type ClaimIntentStageResponse,
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
@@ -202,6 +210,26 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         sessionId: string,
         afterSequence: number,
     ): Promise<ModuleCompartmentMirrorResponse>;
+    claimIntentStage?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentStageRequest;
+    }): Promise<ClaimIntentStageResponse>;
+    claimIntentInspect?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentInspectRequest;
+    }): Promise<ClaimIntentInspectResponse>;
+    claimIntentAck?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentAckRequest;
+    }): Promise<ClaimIntentAckResponse>;
+    claimEffectsApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimEffectDeliveryRequest;
+    }): Promise<ClaimEffectDeliveryResponse>;
 }
 
 interface MessageContentSnapshot {

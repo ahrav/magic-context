@@ -6,6 +6,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory, updateMemoryVerification } from "../../features/magic-context/memory";
+import { computeClaimOperationRequestDigest } from "../../features/magic-context/memory/claim-operation-contract";
+import {
+    advanceOutboxConsumerCheckpointInCurrentTransaction,
+    createProjectMemoryClaim,
+    runClaimOperation,
+} from "../../features/magic-context/memory/storage-claim-operations";
+import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import {
     getCurrentMemoryClaimByLegacyMemoryId,
     runInMemoryClaimsWriteTransaction,
@@ -32,7 +39,9 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
+    drainClaimEffectPrefix,
     loadModuleWatermarks,
+    proveClaimOperationDurable,
     type ModuleStateSyncState,
     mirrorModuleCompartments,
     resetCompartmentMirrorCursorsForTest,
@@ -1598,5 +1607,124 @@ describe("module compartment mirror-back", () => {
         await expect(mirrorModuleCompartments({ db, sessionId, reader })).rejects.toThrow(
             "module compartment mirror changed while its authoritative set was read",
         );
+    });
+});
+
+function seedGroupedClaimEffects(db: Database, operationKey: string) {
+    const projectId = ensureProject(db, "git:u5-effects");
+    createProjectMemoryClaim(
+        db,
+        { producer: "u5-seed", operationKey: `seed-${operationKey}` },
+        {
+            projectId,
+            content: `seed ${operationKey}`,
+            category: "CONSTRAINTS",
+            provenance: {
+                sourceLocator: `test:${operationKey}`,
+                sourceContent: `seed ${operationKey}`,
+                extractor: "u5-test",
+                extractorVersion: "1",
+                extractorRunId: operationKey,
+                independenceKey: operationKey,
+            },
+            actor: "test:u5",
+            requestScope: "git:u5-effects",
+        },
+    );
+    const claim = db
+        .prepare(
+            `SELECT claims.id AS claimId, heads.revision_id AS revisionId
+               FROM claims
+               JOIN claim_current_heads AS heads ON heads.claim_id = claims.id
+              WHERE claims.project_id = ? ORDER BY claims.id DESC LIMIT 1`,
+        )
+        .get(projectId) as { claimId: number; revisionId: number };
+    const operation = runClaimOperation(
+        db,
+        {
+            producer: "u5-group",
+            operationKey,
+            requestDigest: computeClaimOperationRequestDigest({ operationKey }),
+        },
+        () => ({
+            kind: "effects",
+            payload: null,
+            effects: [
+                {
+                    effectKey: `${operationKey}:first`,
+                    projectId,
+                    claimId: claim.claimId,
+                    revisionId: claim.revisionId,
+                    changeKind: "revision",
+                },
+                {
+                    effectKey: `${operationKey}:second`,
+                    projectId,
+                    claimId: claim.claimId,
+                    revisionId: claim.revisionId,
+                    changeKind: "revision",
+                },
+            ],
+        }),
+    );
+    return proveClaimOperationDurable({
+        db,
+        producer: "u5-group",
+        operationKey,
+        resultJson: operation.resultJson,
+    });
+}
+
+describe("claim effect prefix delivery", () => {
+    it("delivers earlier effects first and checkpoints each receipt group atomically", async () => {
+        const db = createContextDb();
+        const target = seedGroupedClaimEffects(db, "ordered");
+        const deliveries: Array<{ receiptId: number; effectIds: number[] }> = [];
+
+        const result = await drainClaimEffectPrefix({
+            db,
+            consumer: "u5-module",
+            throughReceiptId: target.receiptId,
+            deliver: async (receipt) => {
+                deliveries.push({
+                    receiptId: receipt.receiptId,
+                    effectIds: receipt.effects.map((effect) => effect.id),
+                });
+                return { ackedEffectId: receipt.effects.at(-1)?.id ?? 0 };
+            },
+        });
+
+        expect(deliveries.map((delivery) => delivery.effectIds.length)).toEqual([1, 2]);
+        expect(deliveries[1]?.effectIds).toEqual(target.effects.map((effect) => effect.id));
+        expect(result.reachedReceipt).toBe(true);
+        expect(result.deliveredReceipts).toBe(2);
+    });
+
+    it("rejects a partially checkpointed receipt instead of skipping its earlier effect", async () => {
+        const db = createContextDb();
+        const target = seedGroupedClaimEffects(db, "partial");
+        const firstTargetEffect = target.effects[0];
+        if (!firstTargetEffect) throw new Error("missing target effect");
+        db.transaction(() => {
+            advanceOutboxConsumerCheckpointInCurrentTransaction(db, {
+                consumer: "u5-module",
+                projectId: firstTargetEffect.projectId,
+                ackedEffectId: firstTargetEffect.id,
+            });
+        }).immediate();
+
+        let delivered = false;
+        await expect(
+            drainClaimEffectPrefix({
+                db,
+                consumer: "u5-module",
+                throughReceiptId: target.receiptId,
+                deliver: async (receipt) => {
+                    delivered = true;
+                    return { ackedEffectId: receipt.effects.at(-1)?.id ?? 0 };
+                },
+            }),
+        ).rejects.toThrow("checkpointed partially");
+        expect(delivered).toBe(false);
     });
 });

@@ -15,6 +15,7 @@ import type { createCompactionHandler } from "../../features/magic-context/compa
 import {
     applyMirrorPage,
     chainMirrorDomainSync,
+    commitModuleClaimIntent,
     disposeModuleNoteEvaluationBridges,
     ensureContextStoreUuid,
     getMirrorCursor,
@@ -54,6 +55,7 @@ import { compileSmartNoteCheck } from "../../features/magic-context/smart-notes/
 import { SmartNoteEvaluatorWorker } from "../../features/magic-context/smart-notes/evaluator-worker";
 import { runCompiledSmartNoteCheck } from "../../features/magic-context/smart-notes/sandbox-runner";
 import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
+import { readDirectFormatMarker } from "../../features/magic-context/storage-format-epoch";
 import {
     getDatabasePersistenceError,
     getSessionsWithPendingMarker,
@@ -98,7 +100,9 @@ import {
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { dropSlot } from "./lkg-slot";
+import { drainClaimEffectPrefix, proveClaimOperationDurable } from "./module-state-sync";
 import { McHostModuleTransport } from "./module-transport";
+import { CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION } from "./module-wire";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -903,37 +907,88 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       return response;
                   },
                   memory: async ({
-                      commandId,
                       sessionId,
                       projectRoot,
-                      memoryProject,
-                      action,
-                      content,
-                      category,
-                      ids,
-                      reason,
+                      projectPath,
+                      producer,
+                      operationKey,
+                      intentRequest,
+                      commitContext,
                   }) => {
-                      const response = await rustModeModuleClient.call({
+                      const marker = readDirectFormatMarker(db);
+                      if (marker.status !== "present") {
+                          throw new Error("claim intent requires a valid context format marker");
+                      }
+                      if (!rustModeModuleClient.authorityStatus) {
+                          throw new Error("claim intent requires memory authority status");
+                      }
+                      const status = await rustModeModuleClient.authorityStatus({
+                          context_store_uuid: ensureContextStoreUuid(db),
+                          project: projectPath,
+                          projectRoot,
+                          domain: "memories",
+                      });
+                      if (!status.authority || status.authority.state !== "MODULE") {
+                          throw Object.assign(
+                              new Error("memory authority is not accepting intents"),
+                              {
+                                  code: "authority_draining",
+                              },
+                          );
+                      }
+                      const claimIntentStage = rustModeModuleClient.claimIntentStage;
+                      const claimIntentInspect = rustModeModuleClient.claimIntentInspect;
+                      const claimIntentAck = rustModeModuleClient.claimIntentAck;
+                      const claimEffectsApply = rustModeModuleClient.claimEffectsApply;
+                      if (
+                          !claimIntentStage ||
+                          !claimIntentInspect ||
+                          !claimIntentAck ||
+                          !claimEffectsApply
+                      ) {
+                          throw new Error("module claim intent protocol is unavailable");
+                      }
+                      return commitModuleClaimIntent({
+                          client: { claimIntentStage, claimIntentInspect, claimIntentAck },
                           sessionId,
                           projectRoot,
-                          method: "ctx_memory",
-                          body: {
-                              name: "ctx_memory",
-                              arguments: {
-                                  ...(commandId ? { command_id: commandId } : {}),
-                                  action,
-                                  content,
-                                  category,
-                                  ids,
-                                  reason,
-                                  memory_project: memoryProject,
+                          request: {
+                              protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
+                              requestEncodingVersion: CLAIM_REQUEST_ENCODING_VERSION,
+                              binding: {
+                                  databaseIncarnationId: marker.marker.databaseIncarnationId,
+                                  formatEpoch: marker.marker.formatEpoch,
+                                  authorityProject: projectPath,
+                                  authorityGeneration: status.authority.generation,
                               },
+                              command: { producer, operationKey },
+                              request: intentRequest,
+                          },
+                          commitContext,
+                          settleContext: async (commit) => {
+                              const proof = proveClaimOperationDurable({
+                                  db,
+                                  producer: commit.producer,
+                                  operationKey: commit.operationKey,
+                                  resultJson: commit.resultJson,
+                              });
+                              await drainClaimEffectPrefix({
+                                  db,
+                                  consumer: "rust-module-claims-v1",
+                                  throughReceiptId: proof.receiptId,
+                                  deliver: (receipt) =>
+                                      claimEffectsApply({
+                                          sessionId,
+                                          projectRoot,
+                                          request: {
+                                              protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
+                                              consumer: "rust-module-claims-v1",
+                                              receipt,
+                                          },
+                                      }),
+                              });
                           },
                       });
-                      // Auto-search and local RPC/dashboard reads consume the mirror,
-                      // so publish the module mutation to that read model before return.
-                      await syncModuleMemories();
-                      return response;
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,

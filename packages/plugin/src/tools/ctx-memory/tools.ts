@@ -7,9 +7,16 @@ import {
     ClaimOperationInputError,
     ClaimOperationKeyReuseError,
 } from "../../features/magic-context/memory/storage-claim-operations";
-import { toolCallIdFromContext } from "../../plugin/rust-tool-backends";
+import {
+    isRustAuthorityDrainingError,
+    toolCallIdFromContext,
+} from "../../plugin/rust-tool-backends";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import { executeCtxMemoryClaimAction } from "./claim-actions";
+import {
+    createCtxMemoryProducerIdentity,
+    executeCtxMemoryClaimAction,
+    executeCtxMemoryClaimActionWithCommit,
+} from "./claim-actions";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME } from "./constants";
 import {
     CTX_MEMORY_ACTIONS,
@@ -113,30 +120,80 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return "Cross-session memory is disabled for this project.";
                 }
                 const toolCallId = toolCallIdFromContext(toolContext);
-                if (!toolCallId && !["get", "list"].includes(args.action)) {
+                const mutation = !["get", "list"].includes(args.action);
+                if (!toolCallId && mutation) {
                     return "Error: ctx_memory mutation requires a stable tool-call identity.";
                 }
-                return executeCtxMemoryClaimAction({
+                const actor =
+                    toolContext.agent === DREAMER_AGENT
+                        ? "agent:opencode:dreamer"
+                        : "agent:opencode";
+                const identity = {
+                    harness: "opencode" as const,
+                    sessionId: toolContext.sessionID,
+                    toolCallId: toolCallId ?? "read",
+                    projectIdentity,
+                };
+                const executeArgs = {
                     db: deps.db,
                     args,
                     projectIdentity,
-                    identity: {
-                        harness: "opencode",
-                        sessionId: toolContext.sessionID,
-                        toolCallId: toolCallId ?? "read",
-                        projectIdentity,
-                    },
-                    actor:
-                        toolContext.agent === DREAMER_AGENT
-                            ? "agent:opencode:dreamer"
-                            : "agent:opencode",
-                });
+                    identity,
+                    actor,
+                };
+                if (mutation && deps.rustToolBackends?.memory) {
+                    const authority = await deps.rustToolBackends.authorityState?.({
+                        projectPath: projectIdentity,
+                        projectRoot: toolContext.directory,
+                        domain: "memories",
+                    });
+                    if (authority === "PREPARING" || authority === "DRAINING") {
+                        return "Error: memory authority is transitioning; retry this tool call.";
+                    }
+                    if (authority === "MODULE") {
+                        const producer = createCtxMemoryProducerIdentity(identity);
+                        const intentRequest = {
+                            action,
+                            actor,
+                            projectIdentity,
+                            ...(args.content !== undefined ? { content: args.content } : {}),
+                            ...(args.category !== undefined ? { category: args.category } : {}),
+                            ...(args.publicClaimId !== undefined
+                                ? { publicClaimId: args.publicClaimId }
+                                : {}),
+                            ...(args.publicClaimIds !== undefined
+                                ? { publicClaimIds: args.publicClaimIds }
+                                : {}),
+                            ...(args.mutationToken !== undefined
+                                ? { mutationToken: args.mutationToken }
+                                : {}),
+                            ...(args.mutationTokens !== undefined
+                                ? { mutationTokens: args.mutationTokens }
+                                : {}),
+                            ...(args.reason !== undefined ? { reason: args.reason } : {}),
+                        };
+                        return await deps.rustToolBackends.memory({
+                            commandId: toolCallId as string,
+                            sessionId: toolContext.sessionID,
+                            projectRoot: toolContext.directory,
+                            projectPath: projectIdentity,
+                            producer: producer.producer,
+                            operationKey: producer.operationKey,
+                            intentRequest,
+                            commitContext: () => executeCtxMemoryClaimActionWithCommit(executeArgs),
+                        });
+                    }
+                }
+                return executeCtxMemoryClaimAction(executeArgs);
             } catch (error) {
                 if (error instanceof ClaimOperationKeyReuseError) {
                     return "Error: this tool call id was already committed with different arguments. Retry as a new call.";
                 }
                 if (error instanceof ClaimOperationInputError) {
                     return `Error: ${error.message}`;
+                }
+                if (isRustAuthorityDrainingError(error)) {
+                    return "Error: memory authority is transitioning; retry this tool call.";
                 }
                 throw error;
             }

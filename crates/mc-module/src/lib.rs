@@ -10677,12 +10677,162 @@ impl McHandler {
             }
             "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
+            "claim.intent.stage" => self.handle_claim_intent_stage(&request),
+            "claim.intent.inspect" => self.handle_claim_intent_inspect(&request),
+            "claim.intent.ack" => self.handle_claim_intent_ack(&request),
+            "claim.effects.apply" => self.handle_claim_effects_apply(&request),
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
             "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
             "ctx_note" => self.handle_ctx_note_facade(channel, &request).await,
             _ => unrecognized_request_error(&request),
         }
+    }
+
+    fn handle_claim_intent_stage(&self, request: &Value) -> HandlerOutcome {
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.stage requires arguments");
+        };
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentStageRequest>(arguments) {
+            Ok(parsed) => parsed,
+            Err(error) => return invalid_params_error(format!("invalid claim intent stage: {error}")),
+        };
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::stage_claim_intent(store, &parsed, now_ms()) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => HandlerOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => HandlerOutcome::Error {
+                code: "claim_intent_stage_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_intent_inspect(&self, request: &Value) -> HandlerOutcome {
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.inspect requires arguments");
+        };
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentInspectRequest>(arguments)
+        {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim intent inspection: {error}"));
+            }
+        };
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::inspect_claim_intents(store, &parsed) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => HandlerOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => HandlerOutcome::Error {
+                code: "claim_intent_inspect_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_intent_ack(&self, request: &Value) -> HandlerOutcome {
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.ack requires arguments");
+        };
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentAckRequest>(arguments) {
+            Ok(parsed) => parsed,
+            Err(error) => return invalid_params_error(format!("invalid claim intent ack: {error}")),
+        };
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::acknowledge_claim_intent(store, &parsed, now_ms()) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => HandlerOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => HandlerOutcome::Error {
+                code: "claim_intent_ack_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_effects_apply(&self, request: &Value) -> HandlerOutcome {
+        let Some(arguments) = request.get("arguments").and_then(Value::as_object) else {
+            return invalid_params_error("claim.effects.apply requires arguments");
+        };
+        if arguments.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+            return invalid_params_error("claim.effects.apply protocolVersion is unsupported");
+        }
+        if arguments
+            .get("consumer")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return invalid_params_error("claim.effects.apply consumer is required");
+        }
+        let Some(receipt) = arguments.get("receipt").and_then(Value::as_object) else {
+            return invalid_params_error("claim.effects.apply receipt is required");
+        };
+        let Some(result_json) = receipt.get("resultJson").and_then(Value::as_str) else {
+            return invalid_params_error("claim.effects.apply resultJson is required");
+        };
+        let result = match mc_core::claim_operation::decode_claim_operation_result(result_json) {
+            Ok(result) => result,
+            Err(error) => {
+                return invalid_params_error(format!("claim.effects.apply result is invalid: {error}"));
+            }
+        };
+        let Some(effects) = receipt.get("effects").and_then(Value::as_array) else {
+            return invalid_params_error("claim.effects.apply effects are required");
+        };
+        if effects.is_empty() || effects.len() != result.effects.len() {
+            return invalid_params_error("claim.effects.apply receipt group is incomplete");
+        }
+        let mut previous = 0_u64;
+        for (index, effect) in effects.iter().enumerate() {
+            let Some(effect) = effect.as_object() else {
+                return invalid_params_error("claim.effects.apply effect must be an object");
+            };
+            let Some(id) = effect.get("id").and_then(Value::as_u64) else {
+                return invalid_params_error("claim.effects.apply effect id is required");
+            };
+            if id <= previous {
+                return invalid_params_error("claim.effects.apply effect ids must increase");
+            }
+            let Some(result_effect) = result.effects.get(index) else {
+                return invalid_params_error("claim.effects.apply result effect is missing");
+            };
+            if effect.get("effectKey").and_then(Value::as_str)
+                != Some(result_effect.effect_key.as_str())
+                || effect.get("projectId").and_then(Value::as_i64)
+                    != Some(result_effect.project_id)
+                || effect.get("generation").and_then(Value::as_i64)
+                    != Some(result_effect.generation)
+                || effect.get("changeKind").and_then(Value::as_str)
+                    != Some(result_effect.change_kind.as_str())
+            {
+                return invalid_params_error("claim.effects.apply effect disagrees with result");
+            }
+            previous = id;
+        }
+        respond(json!({
+            "protocolVersion": 1,
+            "ackedEffectId": previous,
+        }))
     }
 
     fn log_missing_facade_command_id(&self, session_id: &str, tool: &str, action: &str) {
