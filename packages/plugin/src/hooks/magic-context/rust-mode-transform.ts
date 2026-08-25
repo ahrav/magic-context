@@ -319,7 +319,6 @@ export interface RustModeTransformOptions {
     projectRoot?: string;
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
-    memorySyncRequestedSessions?: Set<string>;
     /**
      * Invoked with each project that reaches rust-mode authority preparation, so the
      * host can lazily register per-project services (the smart-note evaluator bridge)
@@ -2258,19 +2257,6 @@ export function createRustModeTransform(
                     allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
                     onProjectPrepared: options.onProjectPrepared,
                 });
-                if (options.memorySyncRequestedSessions?.delete(sessionId)) {
-                    // A memory tool call can complete after the prior authority pass has
-                    // acknowledged its watermarks. Rewind only memory watermarks so the
-                    // next pass ships the mutation delta without reseeding compartments.
-                    const watermarks = state.lastAckedWatermarks;
-                    if (watermarks) {
-                        state.lastAckedWatermarks = {
-                            ...watermarks,
-                            memory_id: 0,
-                            memory_mutation_id: 0,
-                        };
-                    }
-                }
                 const getCachedStateSyncCapabilities =
                     options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;

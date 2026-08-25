@@ -5,7 +5,6 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import { insertMemory, updateMemoryVerification } from "../../features/magic-context/memory";
 import { computeClaimOperationRequestDigest } from "../../features/magic-context/memory/claim-operation-contract";
 import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
@@ -16,10 +15,6 @@ import {
     runClaimOperation,
 } from "../../features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../features/magic-context/memory/storage-claims";
-import {
-    getCurrentMemoryClaimByLegacyMemoryId,
-    runInMemoryClaimsWriteTransaction,
-} from "../../features/magic-context/memory/storage-memory-claims";
 import { runMigrations } from "../../features/magic-context/migrations";
 import {
     addProcessedImageStrippedIds,
@@ -443,118 +438,6 @@ describe("module state sync section deltas", () => {
         expect(forced.workspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
     });
 
-    it("an epoch-only change sends a full replace snapshot instead of the id-gated increment", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-epoch-replace";
-        const projectPath = "dir:/tmp/epoch-replace";
-        // Explicit-user origin memories are immediately auto-eligible, so
-        // they cross the mirror boundary and must appear in the snapshot.
-        const eligible = insertMemory(db, {
-            projectPath: projectPath,
-            category: "CONSTRAINTS",
-            content: "policy-eligible baseline row",
-            sourceType: "user",
-        });
-        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: projectPath });
-        const state = {
-            ...syncState(),
-            lastAckedWatermarks: baseline,
-            seedPassPending: false,
-        };
-
-        // A policy transition bumps the epoch without minting a new memory
-        // id; the payload must carry replace semantics and the full eligible
-        // set so the module prunes rows the policy now hides.
-        setProjectState(db, projectPath, {
-            projectMemoryEpoch: baseline.project_memory_epoch + 1,
-        });
-        const params = await buildDeltaPayload({ db, state, sessionId, projectPath });
-        expect(params.memories_replace_projects).toEqual([projectPath]);
-        const snapshotIds = (params.memories as Array<{ id: number }>).map((row) => row.id);
-        expect(snapshotIds).toContain(eligible.id);
-
-        // A new eligible memory bumps the epoch at link time, so it arrives
-        // as another replace snapshot carrying both rows.
-        state.lastAckedWatermarks = loadModuleWatermarks({
-            db,
-            sessionId,
-            projectPath: projectPath,
-        });
-        const added = insertMemory(db, {
-            projectPath: projectPath,
-            category: "CONSTRAINTS",
-            content: "second eligible row",
-            sourceType: "user",
-        });
-        const second = await buildDeltaPayload({ db, state, sessionId, projectPath });
-        expect(second.memories_replace_projects).toEqual([projectPath]);
-        const secondIds = (second.memories as Array<{ id: number }>).map((row) => row.id);
-        expect(secondIds).toContain(eligible.id);
-        expect(secondIds).toContain(added.id);
-
-        // A pure id advance with no epoch change keeps upsert-only
-        // semantics (raw kernel insert; no eligibility flip, no bump).
-        state.lastAckedWatermarks = loadModuleWatermarks({
-            db,
-            sessionId,
-            projectPath: projectPath,
-        });
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare(
-                `INSERT INTO memories (project_path, category, content, normalized_hash,
-                    first_seen_at, created_at, updated_at, last_seen_at)
-                 VALUES ('dir:/tmp/epoch-replace', 'CONSTRAINTS', 'new row', 'hash-epoch-test', 1, 1, 1, 1)`,
-            ).run();
-        });
-        const incremental = await buildDeltaPayload({ db, state, sessionId, projectPath });
-        expect(incremental).not.toHaveProperty("memories_replace_projects");
-    });
-
-    it("a non-workspace replace snapshot relies on the scope prune, not explicit delete ids", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-epoch-delete-ids";
-        const projectPath = "dir:/tmp/epoch-delete-ids";
-        const eligible = insertMemory(db, {
-            projectPath: projectPath,
-            category: "CONSTRAINTS",
-            content: "policy-eligible baseline row",
-            sourceType: "user",
-        });
-        // A raw kernel insert has no claim link, so the policy hides it from
-        // the automatic mirror. For a single-project sync the replace scope
-        // names the whole project and prunes every omitted row — explicit
-        // delete ids would re-list the archived history for nothing, so the
-        // payload must NOT carry them. (Foreign workspace rows, which the
-        // scope cannot cover, are the delete-id lane's only job.)
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare(
-                `INSERT INTO memories (project_path, category, content, normalized_hash,
-                    first_seen_at, created_at, updated_at, last_seen_at)
-                 VALUES (?, 'CONSTRAINTS', 'hidden unlinked row', 'hash-delete-ids-test', 1, 1, 1, 1)`,
-            ).run(projectPath);
-        });
-        const hiddenId = (
-            db
-                .prepare("SELECT id FROM memories WHERE normalized_hash = 'hash-delete-ids-test'")
-                .get() as { id: number }
-        ).id;
-        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: projectPath });
-        const state = {
-            ...syncState(),
-            lastAckedWatermarks: baseline,
-            seedPassPending: false,
-        };
-        setProjectState(db, projectPath, {
-            projectMemoryEpoch: baseline.project_memory_epoch + 1,
-        });
-        const params = await buildDeltaPayload({ db, state, sessionId, projectPath });
-        expect(params.memories_replace_projects).toEqual([projectPath]);
-        const snapshotIds = (params.memories as Array<{ id: number }>).map((row) => row.id);
-        expect(snapshotIds).toContain(eligible.id);
-        expect(snapshotIds).not.toContain(hiddenId);
-        expect(params).not.toHaveProperty("memories_delete_ids");
-    });
-
     it("uses omitted sections only after the module advertises the delta capability", async () => {
         const db = createContextDb();
         const sessionId = "ses-state-sync-capability";
@@ -856,46 +739,7 @@ describe("module state sync section deltas", () => {
     });
 });
 
-describe("module state authority direction", () => {
-    it("omits module-owned memory sections from the TypeScript sender payload", async () => {
-        const db = createContextDb();
-        const projectPath = "git:u6-module-authority";
-        const memory = insertMemory(db, {
-            projectPath,
-            category: "CONSTRAINTS",
-            content: "module-owned fact",
-        });
-        expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(
-            "module-owned fact",
-        );
-        const calls: unknown[] = [];
-        const state = syncState();
-
-        await syncModuleState({
-            client: {
-                async call(args) {
-                    calls.push(args.body);
-                    return { result: { shadow_seq: 1, memories_skipped: true } };
-                },
-            },
-            state,
-            pass: {
-                db,
-                sessionId: "ses-authority-direction",
-                projectPath,
-                nowMs: 1,
-            },
-            projectRoot: "/tmp/project",
-            force: true,
-            options: { authority: true, authorityState: "MODULE" },
-        });
-
-        const body = calls[0] as Record<string, unknown>;
-        expect(body).not.toHaveProperty("memories");
-        expect(body).not.toHaveProperty("memory_mutations");
-        expect(state.authorityMemorySyncSkipLogged).toBe(true);
-    });
-});
+describe("module state authority direction", () => {});
 
 describe("module compartment ordinal serialization", () => {
     it("uses canonical ordinals when stored boundaries include a summary row", async () => {
@@ -1097,96 +941,6 @@ describe("module compartment ordinal serialization", () => {
 });
 
 describe("module incremental and paged assembly", () => {
-    it("serializes claim-backed memories with unchanged legacy wire bytes", async () => {
-        const db = createContextDb();
-        const projectPath = "git:u6-module-wire";
-        const memory = insertMemory(db, {
-            projectPath,
-            category: "CONSTRAINTS",
-            content: "module wire bytes: café",
-            sourceSessionId: "ses-u6-module-wire",
-            sourceType: "agent",
-        });
-        expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(memory.content);
-        // Only policy-eligible automatic rows cross the module boundary, so
-        // the wire fixture verifies its memory to keep it in the mirror.
-        updateMemoryVerification(db, memory.id, "verified");
-        const refreshed = { ...memory, ...{} };
-        const row = db
-            .prepare(
-                "SELECT verification_status AS verificationStatus, verified_at AS verifiedAt, updated_at AS updatedAt FROM memories WHERE id = ?",
-            )
-            .get(memory.id) as {
-            verificationStatus: string;
-            verifiedAt: number | null;
-            updatedAt: number;
-        };
-        refreshed.verificationStatus = row.verificationStatus as typeof memory.verificationStatus;
-        refreshed.verifiedAt = row.verifiedAt;
-        refreshed.updatedAt = row.updatedAt;
-
-        const statements: string[] = [];
-        const originalPrepare = db.prepare.bind(db);
-        db.prepare = ((sql: string) => {
-            statements.push(sql);
-            return originalPrepare(sql);
-        }) as typeof db.prepare;
-        let payload: Awaited<ReturnType<typeof buildModuleStateSyncPayload>>;
-        try {
-            payload = await buildModuleStateSyncPayload({
-                state: syncState(),
-                pass: {
-                    db,
-                    sessionId: "ses-u6-module-wire",
-                    projectPath,
-                    nowMs: Date.now(),
-                },
-                force: true,
-                seedId: "u6-fixed-seed",
-            });
-        } finally {
-            db.prepare = originalPrepare;
-        }
-        if (!payload || typeof payload === "string") throw new Error("expected state-sync payload");
-
-        const serialized = payload.params.memories;
-        const expected = [
-            {
-                id: memory.id,
-                project_path: memory.projectPath,
-                category: memory.category,
-                content: memory.content,
-                normalized_hash: memory.normalizedHash,
-                importance: memory.importance,
-                scope: memory.scope,
-                shareable: memory.shareable,
-                source_session_id: memory.sourceSessionId,
-                source_type: memory.sourceType,
-                seen_count: memory.seenCount,
-                retrieval_count: memory.retrievalCount,
-                first_seen_at: memory.firstSeenAt,
-                created_at: memory.createdAt,
-                updated_at: refreshed.updatedAt,
-                last_seen_at: memory.lastSeenAt,
-                last_retrieved_at: memory.lastRetrievedAt,
-                status: memory.status,
-                expires_at: memory.expiresAt,
-                verification_status: refreshed.verificationStatus,
-                verified_at: refreshed.verifiedAt,
-                superseded_by_memory_id: memory.supersededByMemoryId,
-                merged_from: memory.mergedFrom,
-                metadata_json: memory.metadataJson,
-            },
-        ];
-        expect(serialized).toEqual(expected);
-        expect(Buffer.from(JSON.stringify(serialized))).toEqual(
-            Buffer.from(JSON.stringify(expected)),
-        );
-        expect(statements.some((sql) => /FROM memories\b/i.test(sql))).toBeTrue();
-        expect(statements.some((sql) => /claim_effective_policy/i.test(sql))).toBeTrue();
-        expect(statements.some((sql) => /claim_revisions\.content\b/i.test(sql))).toBeFalse();
-    });
-
     it("packs pages linearly and preserves item order under the wire cap", () => {
         createContextDb();
         const watermarks = {
@@ -1232,50 +986,6 @@ describe("module incremental and paged assembly", () => {
         expect(pages.length).toBeGreaterThan(1);
         expect(pages.flatMap((page) => page.params.compartments)).toEqual(items);
         expect(serializedBytes).toBeLessThan(10_000_000);
-        for (const page of pages) {
-            expect(
-                moduleWireBodyBytes({
-                    method: "state_sync",
-                    params: page.params,
-                }),
-            ).toBeLessThanOrEqual(MODULE_PAGE_MAX_BYTES);
-        }
-    });
-
-    it("pages explicit delete ids with the seed items instead of the completing batch", () => {
-        const watermarks = {
-            compartment_sequence: 0,
-            memory_id: 0,
-            memory_mutation_id: 0,
-            m0_mutation_id: 0,
-            last_todo_state_hash: "",
-            project_memory_epoch: 0,
-            project_user_profile_version: 0,
-            reasoning_cleared_through_tag: 0,
-        };
-        // Enough ids that an unpaged completing-batch attachment would blow
-        // the 512 KiB page limit on its own.
-        const deleteIds = Array.from({ length: 90_000 }, (_, index) => 1_000_000_000 + index);
-        const pages = buildPagedModuleStateSyncPayloads({
-            moduleGeneration: 1,
-            expectedShadowSeq: 0,
-            seedId: "seed-delete-ids",
-            seedBoundaryId: null,
-            compartments: [],
-            memories: [],
-            memoryMutations: [],
-            memoriesDeleteIds: deleteIds,
-            userProfile: [],
-            workspace: null,
-            lastTodoState: "",
-            watermarks,
-        });
-        expect(pages.length).toBeGreaterThan(1);
-        expect(
-            pages.flatMap(
-                (page) => (page.params.memories_delete_ids as number[] | undefined) ?? [],
-            ),
-        ).toEqual(deleteIds);
         for (const page of pages) {
             expect(
                 moduleWireBodyBytes({

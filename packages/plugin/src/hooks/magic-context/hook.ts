@@ -742,7 +742,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
-    const rustMemorySyncRequestedSessions = new Set<string>();
     // Build the same subc-backed client for the TS recovery arm. Constructing the
     // transport is inert; it connects only if a marker actually needs draining.
     const authorityRecoveryModuleClient =
@@ -991,9 +990,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,
-                  memorySync: (sessionId: string) => {
-                      rustMemorySyncRequestedSessions.add(sessionId);
-                  },
               }
             : undefined;
     // Bridges are per resolved project, and sessions can resolve projects other
@@ -1330,7 +1326,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,
         tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
-        rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
         onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
     });
@@ -1383,7 +1378,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             sessionDirectoryBySession.delete(sessionId);
             recompProgressBySession.delete(sessionId);
             internalChildSessions.delete(sessionId);
-            rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
             channel2DirectiveTextBySession.delete(sessionId);
             clearEmbedSessionState(sessionId);

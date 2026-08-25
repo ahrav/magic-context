@@ -105,16 +105,6 @@ export {
     queueM0Mutation as appendM0Mutation,
 } from "./storage-m0-mutation-log";
 export {
-    getMaxMemoryMutationId,
-    getMaxMemoryMutationIdForProjects,
-    getMemoryMutation,
-    getMemoryMutationsForRender,
-    getMemoryMutationsForRenderByProjects,
-    type MemoryMutationLogRow,
-    type MemoryMutationType,
-    queueMemoryMutation,
-} from "./storage-memory-mutation-log";
-export {
     type AcquireWrapupResult,
     type AppendAutoSearchHintOutcome,
     type AutoSearchHintDecision,

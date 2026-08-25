@@ -13,10 +13,10 @@ import {
 } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import { insertMemory as insertMemoryRaw } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
+import { queueMemoryMutation } from "@magic-context/core/features/magic-context/storage-memory-mutation-log";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
-	queueMemoryMutation,
 	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
 import { createClaimMemorySchema } from "@magic-context/core/features/magic-context/storage-claim-memory-schema";

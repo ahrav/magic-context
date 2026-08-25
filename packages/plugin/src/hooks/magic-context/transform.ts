@@ -665,7 +665,6 @@ export interface TransformDeps {
     tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
     onRustModeProjectPrepared?: (projectPath: string, projectRoot: string) => void;
-    rustMemorySyncRequestedSessions?: Set<string>;
 }
 
 export function createTransform(deps: TransformDeps) {
@@ -678,7 +677,6 @@ export function createTransform(deps: TransformDeps) {
                   projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
                   onProjectPrepared: deps.onRustModeProjectPrepared,
-                  memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
                   allowAuthorityProtocolBypassForTests:
                       deps.rustModeAllowAuthorityProtocolBypassForTests,
               })
