@@ -257,18 +257,32 @@ impl Client {
     ///
     /// Discovery validates one descriptor-anchored snapshot before any dial.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
-        let info = read_for_client(path)
-            .map_err(|_| ClientError::new("discovery_failed", "secure discovery failed"))?;
-        Self::connect_info(info).await
+        // The deadline starts before discovery, not after it. §11.2 spends one
+        // 2-second budget on discovery, dial, authentication, and negotiation
+        // together, so starting the clock after the snapshot would give a
+        // stalled filesystem unbounded time and then hand the handshake a fresh
+        // budget. The snapshot also runs on a blocking pool: it is synchronous
+        // filesystem work, and on a wedged mount it would otherwise occupy an
+        // async worker for as long as the mount takes.
+        let deadline = Instant::now() + CLIENT_HANDSHAKE_TIMEOUT;
+        let path = path.as_ref().to_path_buf();
+        let info = timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || read_for_client(path)),
+        )
+        .await
+        .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
+        .map_err(|_| ClientError::new("discovery_failed", "secure discovery failed"))?
+        .map_err(|_| ClientError::new("discovery_failed", "secure discovery failed"))?;
+        Self::connect_info(info, deadline).await
     }
 
-    async fn connect_info(info: ConnectionInfo) -> Result<Self, ClientError> {
+    async fn connect_info(info: ConnectionInfo, deadline: Instant) -> Result<Self, ClientError> {
         let endpoint = info
             .endpoints
             .first()
             .ok_or_else(|| ClientError::new("discovery_failed", "secure discovery failed"))?
             .clone();
-        let deadline = Instant::now() + CLIENT_HANDSHAKE_TIMEOUT;
         let mut stream = timeout_at(
             deadline,
             TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
@@ -362,7 +376,25 @@ impl Client {
             match response {
                 Ok(response) => {
                     let handle = parse_route_open(&response.body)?;
-                    lock_unpoisoned(&self.inner.routes).insert(handle);
+                    // Publish under the same lock `close` drains, and recheck
+                    // closure while holding it. A close that lands between the
+                    // response arriving and this insert would otherwise leave a
+                    // handle in a drained set and hand the caller an `Ok` that
+                    // fails `client_closed` on first use. Local close wins
+                    // (protocol §11.1). The host side needs no route `Goodbye`
+                    // here: `close` sends the connection `Goodbye`, which
+                    // obliges the host to settle every route on the generation.
+                    {
+                        let mut routes = lock_unpoisoned(&self.inner.routes);
+                        if self.inner.closed.load(Ordering::Acquire) {
+                            return Err(CallError::local(
+                                SendOutcome::NotSent,
+                                "client_closed",
+                                "client is closed",
+                            ));
+                        }
+                        routes.insert(handle);
+                    }
                     return Ok(handle);
                 }
                 Err(error)
@@ -936,6 +968,17 @@ impl Inner {
             Err(CallError::local(outcome, code, "request stopped")),
         );
         if outcome == SendOutcome::OutcomeUnknown {
+            // A control request has identity 0/0, and §6.2 requires `Cancel` on
+            // a current nonzero route with a pending nonzero correlation — so
+            // cancelling one has no legal frame. Emitting 0/0 anyway made the
+            // host close the generation, taking every unrelated route with it,
+            // and left cleanup depending on the peer accepting a malformed
+            // frame. The host settles the request on its own deadline instead;
+            // the caller's OutcomeUnknown classification is already correct and
+            // is what actually protects it from replaying.
+            if key.channel == 0 {
+                return Ok(());
+            }
             // The Cancel is best-effort cleanup, and the request's bytes may
             // already be on the wire. Report the failed enqueue, but keep the
             // request's own OutcomeUnknown classification: substituting the

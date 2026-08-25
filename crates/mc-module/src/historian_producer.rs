@@ -920,20 +920,26 @@ impl HistorianProducer {
         frozen_identity: SemanticIdentity,
         frozen: &[u8],
     ) -> Result<Value, HistorianProducerError> {
+        // Release the ambiguous generation before dialing the replay
+        // connection. Both hold a host connection permit, so overlapping them
+        // cannot recover at a `max_connections` of 1: the host drops the newly
+        // authenticated socket for capacity, `reconnect` fails, and the old
+        // permit is never freed because the cleanup sits past the failure.
+        // The daemon comparison survives the reorder because `frozen_daemon` is
+        // already captured — it does not come from the old connection.
+        if let Err(error) = self.close_routes_and_connection().await {
+            eprintln!("mc-module: historian replay cleanup failed: {error}");
+        }
+        self.command_route = None;
+        self.subscribe_route = None;
+
         let reconnected = self
             .connector
             .reconnect(&self.config, &frozen_identity)
             .await?;
         let daemon_changed = reconnected.connection.daemon_id() != frozen_daemon;
         let identity_changed = reconnected.identity != frozen_identity;
-
-        let old_cleanup = self.close_routes_and_connection().await;
-        if let Err(error) = old_cleanup {
-            eprintln!("mc-module: historian replay cleanup failed: {error}");
-        }
         self.connection = reconnected.connection;
-        self.command_route = None;
-        self.subscribe_route = None;
 
         if daemon_changed || identity_changed {
             return Err(HistorianProducerError::CrossIncarnationUnknown {

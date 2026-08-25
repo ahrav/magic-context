@@ -292,10 +292,16 @@ fn open_file(
     name: &OsString,
     path: &Path,
 ) -> Result<OwnedFd, ConnectionFileError> {
+    // `NONBLOCK` so a special file reaches metadata validation instead of
+    // stalling here: opening a FIFO for reading blocks until a writer appears,
+    // which is before `checked_stat` gets to reject it as non-regular — so the
+    // fail-closed contract never runs and the caller hangs. It cannot leak into
+    // the read: `checked_stat` proves `S_IFREG` first, and a regular file never
+    // reports `EAGAIN`. The TypeScript reader passes the same flag.
     openat(
         parent,
         name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(|source| io_error("open", path, source.into()))
@@ -346,6 +352,55 @@ mod tests {
             pid: 9,
             daemon_ver: "test".to_owned(),
         }
+    }
+
+    /// A FIFO at the configured path must be rejected, not waited on. Without
+    /// `NONBLOCK` the open itself parks until a writer appears, so this call
+    /// never returns and `Client::connect` hangs with it.
+    ///
+    /// The scratch directory is chmodded to owner-only on purpose: `open_parent`
+    /// requires a private leaf parent, so a default-mode temp directory is
+    /// rejected before `open_file` runs and the test would pass without ever
+    /// reaching the open under test.
+    #[test]
+    fn a_fifo_is_rejected_rather_than_blocking_the_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("mc-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only scratch dir");
+        let path = dir.join("subc-connection.json");
+        let _ = std::fs::remove_file(&path);
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("mkfifo");
+
+        // No writer is ever opened, so a blocking open can never complete.
+        // Bounded on a worker thread rather than called directly: a regression
+        // hangs instead of returning, and this turns that into a failure rather
+        // than a wedged suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_for_client(&probe).map_err(|error| format!("{error:?}")));
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+
+        let outcome = outcome.expect("the open must not block on a writer that never arrives");
+        let error = outcome.expect_err("a FIFO is not a connection file");
+        assert!(
+            error.contains("Insecure"),
+            "expected an insecure-type rejection, got {error}"
+        );
     }
 
     #[test]
