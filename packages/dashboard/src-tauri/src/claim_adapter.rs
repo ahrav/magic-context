@@ -275,11 +275,15 @@ struct Effect {
 #[derive(Debug, Clone)]
 enum Stage {
     Stale(String),
-    Noop(Value),
+    Noop {
+        payload: Value,
+        mutation_token_public_ids: Vec<String>,
+    },
     Effects {
         payload: Value,
         effects: Vec<Effect>,
         policy_revision_ids: Vec<i64>,
+        mutation_token_public_ids: Vec<String>,
     },
 }
 
@@ -308,7 +312,10 @@ fn marker_incarnation(conn: &Connection) -> AdapterResult<String> {
     ))
 }
 
-fn read_generations(conn: &Connection, project_ids: &[i64]) -> AdapterResult<BTreeMap<String, i64>> {
+fn read_generations(
+    conn: &Connection,
+    project_ids: &[i64],
+) -> AdapterResult<BTreeMap<String, i64>> {
     let mut generations = BTreeMap::new();
     for project_id in project_ids {
         let generation = sql(conn
@@ -318,7 +325,7 @@ fn read_generations(conn: &Connection, project_ids: &[i64]) -> AdapterResult<BTr
                 |row| row.get(0),
             )
             .optional())?
-            .unwrap_or(0);
+        .unwrap_or(0);
         generations.insert(project_id.to_string(), generation);
     }
     Ok(generations)
@@ -355,20 +362,19 @@ fn applicability_digest(conn: &Connection, revision_id: i64) -> AdapterResult<St
     ))?;
     let heads = sql(statement
         .query_map([revision_id], |row| Ok((row.get(0)?, row.get(1)?)))
-        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(String, i64)>>>() ))?;
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(String, i64)>>>()))?;
     compute_applicability_heads_digest(&heads).map_err(|error| error.to_string())
 }
 
 fn policy_counts(conn: &Connection, revision_id: i64) -> AdapterResult<PolicyHeadCounts> {
-    let maturity_seq = sql(conn
-        .query_row(
-            "SELECT MAX(assertion.seq) FROM claim_maturity_streams stream \
+    let maturity_seq = sql(conn.query_row(
+        "SELECT MAX(assertion.seq) FROM claim_maturity_streams stream \
              JOIN claim_maturity_assertions assertion ON assertion.stream_id = stream.id \
              WHERE stream.revision_id = ?1",
-            [revision_id],
-            |row| row.get::<_, Option<i64>>(0),
-        ))?
-        .unwrap_or(0);
+        [revision_id],
+        |row| row.get::<_, Option<i64>>(0),
+    ))?
+    .unwrap_or(0);
     let count = |table: &str, predicate: &str| -> AdapterResult<i64> {
         let query = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
         sql(conn.query_row(&query, [revision_id], |row| row.get(0)))
@@ -437,7 +443,12 @@ fn current_locator(claim: &ClaimRef) -> AdapterResult<String> {
         revision: claim.revision,
         content_digest: claim.content_digest.clone(),
     })
-    .ok_or_else(|| format!("claim {} has an invalid revision identity", claim.public_claim_id))
+    .ok_or_else(|| {
+        format!(
+            "claim {} has an invalid revision identity",
+            claim.public_claim_id
+        )
+    })
 }
 
 fn validate_target(
@@ -454,9 +465,8 @@ fn validate_target(
     if token.public_claim_id.is_empty() {
         return Err("claim mutation token has an empty public claim ID".to_string());
     }
-    let claim = get_claim(conn, &token.public_claim_id)?.ok_or_else(|| {
-        format!("unknown project-memory claim: {}", token.public_claim_id)
-    })?;
+    let claim = get_claim(conn, &token.public_claim_id)?
+        .ok_or_else(|| format!("unknown project-memory claim: {}", token.public_claim_id))?;
     if token.revision != claim.revision || token.content_digest != claim.content_digest {
         return Ok(Err(format!(
             "revision: revision head moved from r{} to r{}",
@@ -580,7 +590,10 @@ fn read_policy(conn: &Connection, revision_id: i64) -> AdapterResult<ClaimPolicy
     let explicit_label = if auto && !missing && soft.is_empty() {
         None
     } else {
-        let mut parts = vec![maturity.to_lowercase(), format!("taint:{}", taint.to_lowercase())];
+        let mut parts = vec![
+            maturity.to_lowercase(),
+            format!("taint:{}", taint.to_lowercase()),
+        ];
         parts.extend(soft.into_iter().map(str::to_string));
         if missing {
             parts.push("policy:unknown".to_string());
@@ -728,7 +741,25 @@ fn hydrate_claim(conn: &Connection, public_claim_id: &str) -> AdapterResult<Clai
             claim.public_claim_id, claim.revision
         ));
     }
-    let (project_identity, revision_created_at, category, normalized_hash, importance, memory_scope, sharing, expires_at): (String, i64, String, String, i64, String, String, Option<i64>) = sql(conn.query_row(
+    let (
+        project_identity,
+        revision_created_at,
+        category,
+        normalized_hash,
+        importance,
+        memory_scope,
+        sharing,
+        expires_at,
+    ): (
+        String,
+        i64,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        Option<i64>,
+    ) = sql(conn.query_row(
         "SELECT project.canonical_identity, revision.created_at, attributes.category, \
                 attributes.normalized_hash, attributes.importance, attributes.memory_scope, \
                 attributes.sharing, attributes.expires_at \
@@ -737,7 +768,18 @@ fn hydrate_claim(conn: &Connection, public_claim_id: &str) -> AdapterResult<Clai
          JOIN projects project ON project.id = attributes.project_id \
          WHERE revision.id = ?1 AND attributes.claim_id = ?2 AND attributes.project_id = ?3",
         params![claim.current_revision_id, claim.claim_id, claim.project_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
     ))?;
     let evidence_labels = read_evidence(conn, claim.current_revision_id)?;
     if evidence_labels.is_empty() {
@@ -750,10 +792,18 @@ fn hydrate_claim(conn: &Connection, public_claim_id: &str) -> AdapterResult<Clai
         .query_row(
             "SELECT seen_count, retrieval_count FROM claim_usage_stats WHERE claim_id = ?1",
             [claim.claim_id],
-            |row| Ok(ClaimTelemetry { seen_count: row.get(0)?, retrieval_count: row.get(1)? }),
+            |row| {
+                Ok(ClaimTelemetry {
+                    seen_count: row.get(0)?,
+                    retrieval_count: row.get(1)?,
+                })
+            },
         )
         .optional())?
-        .unwrap_or(ClaimTelemetry { seen_count: 0, retrieval_count: 0 });
+    .unwrap_or(ClaimTelemetry {
+        seen_count: 0,
+        retrieval_count: 0,
+    });
     Ok(ClaimMemory {
         public_claim_id: claim.public_claim_id.clone(),
         revision_locator: current_locator(&claim)?,
@@ -777,18 +827,25 @@ fn hydrate_claim(conn: &Connection, public_claim_id: &str) -> AdapterResult<Clai
     })
 }
 
+fn claim_is_explicitly_visible(claim: &ClaimMemory, now_ms: i64) -> bool {
+    let dispositions = &claim.policy.dispositions;
+    claim
+        .expires_at
+        .is_none_or(|expires_at| expires_at > now_ms)
+        && claim.policy.explicit_eligible
+        && !claim.policy.hard_hidden
+        && !dispositions.contradicted
+        && !dispositions.quarantined
+        && !dispositions.rejected
+}
+
 fn candidate_public_ids(
     conn: &Connection,
     project: Option<&str>,
     lifecycle: Option<&str>,
     category: Option<&str>,
     search: Option<&str>,
-    limit: i64,
-    offset: i64,
 ) -> AdapterResult<Vec<(String, i64)>> {
-    if limit < 0 || offset < 0 {
-        return Err("claim query limit and offset must be non-negative".to_string());
-    }
     let mut conditions = Vec::new();
     let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(project) = project {
@@ -807,14 +864,24 @@ fn candidate_public_ids(
         conditions.push(format!("head.category = ?{}", values.len()));
     }
     if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
-        values.push(Box::new(format!("%{}%", search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))));
-        conditions.push(format!("(revision.content LIKE ?{} ESCAPE '\\' OR head.category LIKE ?{} ESCAPE '\\')", values.len(), values.len()));
+        values.push(Box::new(format!(
+            "%{}%",
+            search
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        )));
+        conditions.push(format!(
+            "(revision.content LIKE ?{} ESCAPE '\\' OR head.category LIKE ?{} ESCAPE '\\')",
+            values.len(),
+            values.len()
+        ));
     }
-    values.push(Box::new(limit));
-    let limit_index = values.len();
-    values.push(Box::new(offset));
-    let offset_index = values.len();
-    let where_clause = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
     let query = format!(
         "SELECT public.public_id, claim.project_id \
          FROM claim_memory_current_heads head \
@@ -822,8 +889,7 @@ fn candidate_public_ids(
          JOIN claim_public_ids public ON public.claim_id = claim.id \
          JOIN claim_revisions revision ON revision.id = head.revision_id AND revision.claim_id = claim.id \
          JOIN projects project ON project.id = claim.project_id \
-         {where_clause} ORDER BY revision.created_at DESC, public.public_id \
-         LIMIT ?{limit_index} OFFSET ?{offset_index}"
+         {where_clause} ORDER BY revision.created_at DESC, public.public_id"
     );
     let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(Box::as_ref).collect();
     let mut statement = sql(conn.prepare(&query))?;
@@ -842,14 +908,28 @@ pub fn read_claim_memories(
     limit: i64,
     offset: i64,
 ) -> AdapterResult<ClaimMemoryReadResult> {
+    if limit < 0 || offset < 0 {
+        return Err("claim query limit and offset must be non-negative".to_string());
+    }
     sql(conn.execute_batch("BEGIN DEFERRED"))?;
     let hydrated = (|| {
-        let candidates = candidate_public_ids(conn, project, lifecycle, category, search, limit, offset)?;
+        let candidates = candidate_public_ids(conn, project, lifecycle, category, search)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let claims = candidates
             .iter()
             .map(|(public_id, _)| hydrate_claim(conn, public_id))
+            .filter_map(|claim| match claim {
+                Ok(claim) if claim_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .skip(offset as usize)
+            .take(limit as usize)
             .collect::<AdapterResult<Vec<_>>>()?;
-        let project_ids = candidates.iter().map(|(_, project_id)| *project_id).collect::<Vec<_>>();
+        let project_ids = candidates
+            .iter()
+            .map(|(_, project_id)| *project_id)
+            .collect::<Vec<_>>();
         let vector = read_snapshot_vector(conn, &project_ids)?;
         Ok((claims, project_ids, vector))
     })();
@@ -903,16 +983,23 @@ pub fn read_claim_memory_stats(
             categories: Vec::new(),
         });
     }
-    let predicate = if project_id.is_some() { " WHERE project_id = ?1" } else { "" };
+    let predicate = if project_id.is_some() {
+        " WHERE project_id = ?1"
+    } else {
+        ""
+    };
     let count = |state: Option<&str>| -> AdapterResult<i64> {
         let state_predicate = match (project_id, state) {
             (Some(_), Some(_)) => " AND lifecycle_state = ?2",
             (None, Some(_)) => " WHERE lifecycle_state = ?1",
             _ => "",
         };
-        let query = format!("SELECT COUNT(*) FROM claim_memory_current_heads{predicate}{state_predicate}");
+        let query =
+            format!("SELECT COUNT(*) FROM claim_memory_current_heads{predicate}{state_predicate}");
         match (project_id, state) {
-            (Some(project_id), Some(state)) => sql(conn.query_row(&query, params![project_id, state], |row| row.get(0))),
+            (Some(project_id), Some(state)) => {
+                sql(conn.query_row(&query, params![project_id, state], |row| row.get(0)))
+            }
             (Some(project_id), None) => sql(conn.query_row(&query, [project_id], |row| row.get(0))),
             (None, Some(state)) => sql(conn.query_row(&query, [state], |row| row.get(0))),
             (None, None) => sql(conn.query_row(&query, [], |row| row.get(0))),
@@ -925,11 +1012,21 @@ pub fn read_claim_memory_stats(
     let mut statement = sql(conn.prepare(&category_query))?;
     let categories = if let Some(project_id) = project_id {
         sql(statement
-            .query_map([project_id], |row| Ok(ClaimCategoryCount { category: row.get(0)?, count: row.get(1)? }))
+            .query_map([project_id], |row| {
+                Ok(ClaimCategoryCount {
+                    category: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
             .and_then(|rows| rows.collect()))?
     } else {
         sql(statement
-            .query_map([], |row| Ok(ClaimCategoryCount { category: row.get(0)?, count: row.get(1)? }))
+            .query_map([], |row| {
+                Ok(ClaimCategoryCount {
+                    category: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
             .and_then(|rows| rows.collect()))?
     };
     Ok(ClaimMemoryStats {
@@ -953,9 +1050,19 @@ pub fn enumerate_claim_projects(conn: &Connection) -> AdapterResult<Vec<ClaimPro
             let identity: String = row.get(0)?;
             let display_name = identity
                 .split_once(':')
-                .map(|(prefix, rest)| format!("{}:{}{}", prefix, &rest[..rest.len().min(10)], if rest.len() > 10 { "…" } else { "" }))
+                .map(|(prefix, rest)| {
+                    format!(
+                        "{}:{}{}",
+                        prefix,
+                        &rest[..rest.len().min(10)],
+                        if rest.len() > 10 { "…" } else { "" }
+                    )
+                })
                 .unwrap_or_else(|| identity.clone());
-            Ok(ClaimProjectRow { identity, display_name })
+            Ok(ClaimProjectRow {
+                identity,
+                display_name,
+            })
         })
         .and_then(|rows| rows.collect()))
 }
@@ -975,6 +1082,31 @@ fn provenance_shape(channel: MutationChannel, operation_key: &str) -> Value {
 
 fn token_shape(token: &ClaimMutationToken) -> Value {
     serde_json::to_value(token).expect("claim mutation token serializes")
+}
+
+fn payload_with_mutation_tokens(
+    conn: &Connection,
+    mut payload: Value,
+    public_claim_ids: &[String],
+) -> AdapterResult<Value> {
+    if public_claim_ids.is_empty() {
+        return Ok(payload);
+    }
+    let record = payload
+        .as_object_mut()
+        .ok_or("mutation-token results require an object payload")?;
+    let mut seen = BTreeSet::new();
+    let tokens = public_claim_ids
+        .iter()
+        .filter(|public_claim_id| seen.insert((*public_claim_id).clone()))
+        .map(|public_claim_id| {
+            let claim = get_claim(conn, public_claim_id)?
+                .ok_or_else(|| format!("unknown project-memory claim: {public_claim_id}"))?;
+            Ok(token_shape(&mutation_token(conn, &claim)?))
+        })
+        .collect::<AdapterResult<Vec<_>>>()?;
+    record.insert("mutationTokens".to_string(), Value::Array(tokens));
+    Ok(payload)
 }
 
 fn write_evidence(
@@ -1023,9 +1155,37 @@ fn write_evidence(
     Ok(conn.last_insert_rowid())
 }
 
+fn is_javascript_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
 fn normalize_hash(content: &str) -> String {
-    let normalized = content.to_lowercase();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for character in content.to_lowercase().chars() {
+        if is_javascript_whitespace(character) {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(character);
+        }
+    }
     format!("{:032x}", md5::compute(normalized.as_bytes()))
 }
 
@@ -1041,7 +1201,14 @@ fn ensure_baseline_applicability(
          (revision_id, project_id, owner_kind, stream_key, key_protocol, source_digest, \
           branch_selector, context_fingerprint, created_at) \
          VALUES (?1, ?2, 'source', ?3, ?4, ?5, NULL, NULL, ?6)",
-        params![revision_id, project_id, APPLICABILITY_STREAM_KEY, APPLICABILITY_KEY_PROTOCOL, content_digest, now_ms],
+        params![
+            revision_id,
+            project_id,
+            APPLICABILITY_STREAM_KEY,
+            APPLICABILITY_KEY_PROTOCOL,
+            content_digest,
+            now_ms
+        ],
     ))?;
     let stream_id = conn.last_insert_rowid();
     sql(conn.execute(
@@ -1069,7 +1236,16 @@ fn insert_policy_subject(
          (revision_id, project_id, claim_kind, origin_observation_id, origin_taint, \
           classification_method, source_digest, policy_version, created_at) \
          VALUES (?1, ?2, 'unknown', ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![revision_id, project_id, observation_id, channel.origin_taint(), TAINT_CLASSIFIER_METHOD, content_digest, POLICY_VERSION, now_ms],
+        params![
+            revision_id,
+            project_id,
+            observation_id,
+            channel.origin_taint(),
+            TAINT_CLASSIFIER_METHOD,
+            content_digest,
+            POLICY_VERSION,
+            now_ms
+        ],
     ))?;
     Ok(())
 }
@@ -1098,7 +1274,8 @@ fn append_maturity(
             [revision_id],
             |row| row.get::<_, i64>(0),
         )
-        .optional())? {
+        .optional())?
+    {
         Some(id) => id,
         None => {
             sql(conn.execute(
@@ -1128,7 +1305,15 @@ fn append_maturity(
          (stream_id, seq, predecessor_id, maturity, actor, evidence_json, approval_action_id, \
           artifact_id, policy_version, recorded_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6, ?7)",
-        params![stream_id, head.as_ref().map_or(1, |(_, seq, _)| seq + 1), head.map(|(id, _, _)| id), maturity, POLICY_ACTOR, POLICY_VERSION, now_ms],
+        params![
+            stream_id,
+            head.as_ref().map_or(1, |(_, seq, _)| seq + 1),
+            head.map(|(id, _, _)| id),
+            maturity,
+            POLICY_ACTOR,
+            POLICY_VERSION,
+            now_ms
+        ],
     ))?;
     Ok(())
 }
@@ -1151,8 +1336,12 @@ fn finalize_policy(
     let explicit_user = sql(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM claim_evidence evidence \
          JOIN observations observation ON observation.id = evidence.observation_id \
+         JOIN claim_revisions revision ON revision.id = evidence.revision_id \
          WHERE evidence.revision_id = ?1 AND evidence.relation = 'supports' \
-           AND observation.source_trust_class = 'explicit_user')",
+           AND observation.source_trust_class = 'explicit_user' \
+           AND (revision.revision = 1 OR revision.content_sha256 = ( \
+               SELECT first.content_sha256 FROM claim_revisions first \
+               WHERE first.claim_id = revision.claim_id AND first.revision = 1)))",
         [revision_id],
         |row| row.get::<_, i64>(0),
     ))? != 0;
@@ -1211,7 +1400,21 @@ fn finalize_policy(
           hard_hidden=excluded.hard_hidden, reason_codes_json=excluded.reason_codes_json, \
           dispositions_json=excluded.dispositions_json, policy_version=excluded.policy_version, \
           generation=excluded.generation, updated_at=excluded.updated_at",
-        params![revision_id, claim_id, project_id, maturity, origin_taint, i64::from(auto_eligible), i64::from(explicit_eligible), i64::from(hard_hidden), serde_json::to_string(&reasons).map_err(|error| error.to_string())?, serde_json::to_string(&disposition_names).map_err(|error| error.to_string())?, POLICY_VERSION, generation, now_ms],
+        params![
+            revision_id,
+            claim_id,
+            project_id,
+            maturity,
+            origin_taint,
+            i64::from(auto_eligible),
+            i64::from(explicit_eligible),
+            i64::from(hard_hidden),
+            serde_json::to_string(&reasons).map_err(|error| error.to_string())?,
+            serde_json::to_string(&disposition_names).map_err(|error| error.to_string())?,
+            POLICY_VERSION,
+            generation,
+            now_ms
+        ],
     ))?;
     Ok(())
 }
@@ -1277,19 +1480,23 @@ where
     if !valid_operation_key(operation_key) {
         return Err("operation key must contain 1-256 bytes".to_string());
     }
-    let request_digest = compute_claim_operation_request_digest(&request)
-        .map_err(|error| error.to_string())?;
+    let request_digest =
+        compute_claim_operation_request_digest(&request).map_err(|error| error.to_string())?;
     let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
-    if let Some((stored_digest, result_json)) = stored_receipt(&tx, channel.producer(), operation_key)? {
+    if let Some((stored_digest, result_json)) =
+        stored_receipt(&tx, channel.producer(), operation_key)?
+    {
         if stored_digest != request_digest {
             return Err(format!(
                 "claim operation key reused with different input: {}/{}",
-                channel.producer(), operation_key
+                channel.producer(),
+                operation_key
             ));
         }
-        let decoded = decode_claim_operation_result(&result_json)
-            .map_err(|error| error.to_string())?;
-        let result: Value = serde_json::from_str(&result_json).map_err(|error| error.to_string())?;
+        let decoded =
+            decode_claim_operation_result(&result_json).map_err(|error| error.to_string())?;
+        let result: Value =
+            serde_json::from_str(&result_json).map_err(|error| error.to_string())?;
         let outcome = decoded.outcome.as_str().to_string();
         sql(tx.commit())?;
         return Ok(RunResult {
@@ -1311,10 +1518,13 @@ where
             Vec::new(),
             BTreeMap::new(),
         ),
-        Stage::Noop(payload) => (
+        Stage::Noop {
+            payload,
+            mutation_token_public_ids,
+        } => (
             "noop".to_string(),
             None,
-            payload,
+            payload_with_mutation_tokens(&tx, payload, &mutation_token_public_ids)?,
             Vec::new(),
             BTreeMap::new(),
         ),
@@ -1322,6 +1532,7 @@ where
             payload,
             effects: staged_effects,
             policy_revision_ids,
+            mutation_token_public_ids,
         } => {
             if staged_effects.is_empty() {
                 return Err("effects operation declared no effects".to_string());
@@ -1381,7 +1592,7 @@ where
             (
                 "applied".to_string(),
                 None,
-                payload,
+                payload_with_mutation_tokens(&tx, payload, &mutation_token_public_ids)?,
                 result_effects,
                 generation_map,
             )
@@ -1397,10 +1608,10 @@ where
     });
     let result_json = canonical_json_encode(&result_value).map_err(|error| error.to_string())?;
     decode_claim_operation_result(&result_json).map_err(|error| error.to_string())?;
-    let effect_summary = canonical_json_encode(&result_value["effects"])
-        .map_err(|error| error.to_string())?;
-    let generation_vector = canonical_json_encode(&result_value["generations"])
-        .map_err(|error| error.to_string())?;
+    let effect_summary =
+        canonical_json_encode(&result_value["effects"]).map_err(|error| error.to_string())?;
+    let generation_vector =
+        canonical_json_encode(&result_value["generations"]).map_err(|error| error.to_string())?;
     sql(tx.execute(
         "INSERT INTO claim_operation_receipts \
          (producer, operation_key, request_digest, request_encoding_version, result_encoding_version, \
@@ -1416,8 +1627,12 @@ where
         };
         for value in staged_effects {
             let effect_key = value["effectKey"].as_str().ok_or("effect key missing")?;
-            let project_id = value["projectId"].as_i64().ok_or("effect project missing")?;
-            let generation = value["generation"].as_i64().ok_or("effect generation missing")?;
+            let project_id = value["projectId"]
+                .as_i64()
+                .ok_or("effect project missing")?;
+            let generation = value["generation"]
+                .as_i64()
+                .ok_or("effect generation missing")?;
             let source = effect_sources
                 .iter()
                 .find(|effect| effect.effect_key == effect_key)
@@ -1462,17 +1677,39 @@ fn revise_stage(
     if input.content.is_none() && input.category.is_none() {
         return Err("claim revision must change content or category".to_string());
     }
-    if input.content.as_deref().is_some_and(|content| content.trim().is_empty()) {
+    if input
+        .content
+        .as_deref()
+        .is_some_and(|content| content.trim().is_empty())
+    {
         return Err("claim content must not be empty".to_string());
     }
-    if input.category.as_deref().is_some_and(|category| category.trim().is_empty()) {
+    if input
+        .category
+        .as_deref()
+        .is_some_and(|category| category.trim().is_empty())
+    {
         return Err("claim category must not be empty".to_string());
     }
-    let (current_category, importance, memory_scope, sharing, expires_at): (String, i64, String, String, Option<i64>) = sql(conn.query_row(
+    let (current_category, importance, memory_scope, sharing, expires_at): (
+        String,
+        i64,
+        String,
+        String,
+        Option<i64>,
+    ) = sql(conn.query_row(
         "SELECT category, importance, memory_scope, sharing, expires_at \
          FROM claim_memory_revision_attributes WHERE revision_id = ?1",
         [claim.current_revision_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
     ))?;
     let next_content = input.content.as_deref().unwrap_or(&claim.content);
     let next_category = input.category.as_deref().unwrap_or(&current_category);
@@ -1500,6 +1737,7 @@ fn revise_stage(
                 change_kind: "evidence".to_string(),
             }],
             policy_revision_ids: vec![claim.current_revision_id],
+            mutation_token_public_ids: vec![claim.public_claim_id.clone()],
         });
     }
     let normalized_hash = normalize_hash(next_content);
@@ -1509,7 +1747,12 @@ fn revise_stage(
              JOIN claim_public_ids public ON public.claim_id = head.claim_id \
              WHERE head.project_id = ?1 AND head.category = ?2 AND head.normalized_hash = ?3 \
                AND head.lifecycle_state = 'active' AND head.claim_id <> ?4 LIMIT 1",
-            params![claim.project_id, next_category, normalized_hash, claim.claim_id],
+            params![
+                claim.project_id,
+                next_category,
+                normalized_hash,
+                claim.claim_id
+            ],
             |row| row.get(0),
         )
         .optional())?;
@@ -1530,7 +1773,13 @@ fn revise_stage(
         "INSERT INTO claim_revisions \
          (claim_id, revision, content, content_sha256, source_session_id, created_at) \
          VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-        params![claim.claim_id, next_revision, next_content, content_digest, now_ms],
+        params![
+            claim.claim_id,
+            next_revision,
+            next_content,
+            content_digest,
+            now_ms
+        ],
     ))?;
     let revision_id = conn.last_insert_rowid();
     sql(conn.execute(
@@ -1558,7 +1807,15 @@ fn revise_stage(
          lifecycle_state = ?4, updated_at = ?5 WHERE claim_id = ?6",
         params![next_category, normalized_hash, revision_id, lifecycle_state, now_ms, claim.claim_id],
     ))?;
-    insert_policy_subject(conn, revision_id, claim.project_id, observation_id, channel, &content_digest, now_ms)?;
+    insert_policy_subject(
+        conn,
+        revision_id,
+        claim.project_id,
+        observation_id,
+        channel,
+        &content_digest,
+        now_ms,
+    )?;
     let revised = ClaimRef {
         current_revision_id: revision_id,
         revision: next_revision,
@@ -1576,6 +1833,7 @@ fn revise_stage(
             change_kind: "upsert".to_string(),
         }],
         policy_revision_ids: vec![revision_id],
+        mutation_token_public_ids: vec![revised.public_claim_id.clone()],
     })
 }
 
@@ -1587,7 +1845,9 @@ fn lifecycle_stage(
     now_ms: i64,
 ) -> AdapterResult<Stage> {
     if !matches!(state, "active" | "archived") {
-        return Err(format!("dashboard lifecycle mutation does not allow '{state}'"));
+        return Err(format!(
+            "dashboard lifecycle mutation does not allow '{state}'"
+        ));
     }
     let claim = match validate_target(conn, target)? {
         Ok(claim) => claim,
@@ -1595,11 +1855,14 @@ fn lifecycle_stage(
     };
     let (event_id, sequence, current_state) = lifecycle_head(conn, claim.claim_id)?;
     if current_state == state {
-        return Ok(Stage::Noop(json!({
-            "claim": claim_payload(&claim)?,
-            "kind": "lifecycle",
-            "state": state,
-        })));
+        return Ok(Stage::Noop {
+            payload: json!({
+                "claim": claim_payload(&claim)?,
+                "kind": "lifecycle",
+                "state": state,
+            }),
+            mutation_token_public_ids: vec![claim.public_claim_id.clone()],
+        });
     }
     if state == "active" {
         let (category, normalized_hash): (String, String) = sql(conn.query_row(
@@ -1618,18 +1881,35 @@ fn lifecycle_stage(
             )
             .optional())?;
         if let Some(duplicate) = duplicate {
-            return Err(format!("cannot restore claim; live duplicate exists: {duplicate}"));
+            return Err(format!(
+                "cannot restore claim; live duplicate exists: {duplicate}"
+            ));
         }
     }
     sql(conn.execute(
         "INSERT INTO claim_memory_lifecycle_events \
          (claim_id, seq, predecessor_id, state, actor, reason, recorded_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![claim.claim_id, sequence + 1, event_id, state, channel.actor(), format!("dashboard {state}"), now_ms],
+        params![
+            claim.claim_id,
+            sequence + 1,
+            event_id,
+            state,
+            channel.actor(),
+            format!("dashboard {state}"),
+            now_ms
+        ],
     ))?;
     sql(conn.execute(
         "UPDATE claims SET state = ?1 WHERE id = ?2",
-        params![if state == "active" { "active" } else { "archived" }, claim.claim_id],
+        params![
+            if state == "active" {
+                "active"
+            } else {
+                "archived"
+            },
+            claim.claim_id
+        ],
     ))?;
     sql(conn.execute(
         "UPDATE claim_memory_current_heads SET lifecycle_state = ?1, updated_at = ?2 WHERE claim_id = ?3",
@@ -1645,6 +1925,7 @@ fn lifecycle_stage(
             change_kind: "lifecycle".to_string(),
         }],
         policy_revision_ids: Vec::new(),
+        mutation_token_public_ids: vec![claim.public_claim_id.clone()],
     })
 }
 
@@ -1692,6 +1973,7 @@ pub fn revise_claim(
         "memoryScope": Value::Null,
         "operation": "revise-project-memory-claim",
         "provenance": provenance_shape(channel, &input.operation_key),
+        "requestScope": Value::Null,
         "sharing": Value::Null,
         "token": token_shape(&input.target.mutation_token),
         "userInferred": false,
@@ -1714,6 +1996,7 @@ pub fn set_claim_lifecycle(
         "actor": channel.actor(),
         "operation": "set-project-memory-lifecycle",
         "reason": format!("dashboard {}", input.lifecycle_state),
+        "requestScope": Value::Null,
         "state": input.lifecycle_state,
         "token": token_shape(&input.target.mutation_token),
     });
@@ -1756,6 +2039,7 @@ pub fn bulk_archive_claims(
         "actor": channel.actor(),
         "operation": "bulk-set-project-memory-lifecycle",
         "reason": "dashboard bulk archive",
+        "requestScope": Value::Null,
         "state": "archived",
         "targets": request_targets,
     });
@@ -1786,9 +2070,18 @@ pub fn bulk_archive_claims(
                 "INSERT INTO claim_memory_lifecycle_events \
                  (claim_id, seq, predecessor_id, state, actor, reason, recorded_at) \
                  VALUES (?1, ?2, ?3, 'archived', ?4, 'dashboard bulk archive', ?5)",
-                params![claim.claim_id, sequence + 1, event_id, channel.actor(), now_ms],
+                params![
+                    claim.claim_id,
+                    sequence + 1,
+                    event_id,
+                    channel.actor(),
+                    now_ms
+                ],
             ))?;
-            sql(tx.execute("UPDATE claims SET state = 'archived' WHERE id = ?1", [claim.claim_id]))?;
+            sql(tx.execute(
+                "UPDATE claims SET state = 'archived' WHERE id = ?1",
+                [claim.claim_id],
+            ))?;
             sql(tx.execute(
                 "UPDATE claim_memory_current_heads SET lifecycle_state = 'archived', updated_at = ?1 WHERE claim_id = ?2",
                 params![now_ms, claim.claim_id],
@@ -1802,12 +2095,16 @@ pub fn bulk_archive_claims(
             });
         }
         if effects.is_empty() {
-            Ok(Stage::Noop(json!({"claims": payload_claims, "kind": "bulk-lifecycle", "state": "archived"})))
+            Ok(Stage::Noop {
+                payload: json!({"claims": payload_claims, "kind": "bulk-lifecycle", "state": "archived"}),
+                mutation_token_public_ids: public_ids.clone(),
+            })
         } else {
             Ok(Stage::Effects {
                 payload: json!({"claims": payload_claims, "kind": "bulk-lifecycle", "state": "archived"}),
                 effects,
                 policy_revision_ids: Vec::new(),
+                mutation_token_public_ids: public_ids.clone(),
             })
         }
     })?;

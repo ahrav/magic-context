@@ -70,8 +70,8 @@ fn verify_context_database(conn: &Connection, path: &Path) -> Result<(), rusqlit
             runtime_reasons.join("; ")
         )));
     }
-    let format_reasons = crate::sqlite_runtime::verify_direct_format(conn, path)
-        .map_err(refusal)?;
+    let format_reasons =
+        crate::sqlite_runtime::verify_direct_format(conn, path).map_err(refusal)?;
     if !format_reasons.is_empty() {
         return Err(refusal(format!(
             "unsupported Magic Context database format: {}",
@@ -96,9 +96,9 @@ pub fn open_readonly(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    verify_context_database(&conn, path)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    verify_context_database(&conn, path)?;
     let violations = crate::sqlite_runtime::verify_sqlite_connection_contract(&conn, true, 5000)?;
     if !violations.is_empty() {
         return Err(refusal(format!(
@@ -115,9 +115,9 @@ pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    verify_context_database(&conn, path)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    verify_context_database(&conn, path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     let violations = crate::sqlite_runtime::verify_sqlite_connection_contract(&conn, true, 5000)?;
     if !violations.is_empty() {
@@ -2636,11 +2636,7 @@ pub fn get_projects(conn: &Connection) -> Result<Vec<ProjectInfo>, rusqlite::Err
     let workspace_identities =
         crate::workspaces::extra_workspace_member_identities(conn).unwrap_or_default();
 
-    // UNION only the project-path sources that exist. The dashboard opens the
-    // DB read-only and never migrates, so a DB older than the Dreamer V2 schema
-    // lacks task_schedule_state / dream_runs; an unconditional UNION would throw
-    // "no such table" and break the Projects page instead of degrading.
-    let mut sources = vec!["SELECT project_path FROM memories".to_string()];
+    let mut sources = vec!["SELECT canonical_identity AS project_path FROM projects".to_string()];
     if table_exists(conn, "task_schedule_state") {
         sources.push("SELECT project_path FROM task_schedule_state".to_string());
     }

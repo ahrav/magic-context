@@ -272,11 +272,10 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             let a: GetMemoriesArgs = parse_args(args)?;
             let conn = open_readonly(state)?;
             json(
-                db::get_memories(
+                claim_adapter::read_claim_memories(
                     &conn,
                     a.project.as_deref(),
-                    a.workspace_id,
-                    a.status.as_deref(),
+                    a.lifecycle.as_deref(),
                     a.category.as_deref(),
                     a.search.as_deref(),
                     a.limit.unwrap_or(100),
@@ -286,10 +285,10 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             )
         }
         "get_memory_stats" => {
-            let a: ProjectWorkspaceArgs = parse_args(args)?;
+            let a: ProjectArgs = parse_args(args)?;
             let conn = open_readonly(state)?;
             json(
-                db::get_memory_stats(&conn, a.project.as_deref(), a.workspace_id)
+                claim_adapter::read_claim_memory_stats(&conn, a.project.as_deref())
                     .map_err(to_command)?,
             )
         }
@@ -357,44 +356,70 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
                 .map_err(to_command)?,
             )
         }
-        "update_memory_status" => {
-            let a: MemoryStatusArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
-            json(db::update_memory_status(&mut conn, a.memory_id, &a.status).map_err(to_command)?)
-        }
-        "update_memory_content" => {
-            let a: MemoryContentArgs = parse_args(args)?;
+        "set_memory_lifecycle" => {
+            let a: SetMemoryLifecycleArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
             json(
-                db::update_memory_content(&mut conn, a.memory_id, &a.content)
-                    .map_err(to_command)?,
+                claim_adapter::set_claim_lifecycle(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::SetLifecycleInput {
+                        target: a.target,
+                        operation_key: a.operation_key,
+                        lifecycle_state: a.lifecycle_state,
+                    },
+                )
+                .map_err(to_command)?,
             )
         }
-        "update_memory_category" => {
-            let a: MemoryCategoryArgs = parse_args(args)?;
+        "revise_memory_content" => {
+            let a: ReviseMemoryContentArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
             json(
-                db::update_memory_category(&mut conn, a.memory_id, &a.category)
-                    .map_err(to_command)?,
+                claim_adapter::revise_claim(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::ReviseClaimInput {
+                        target: a.target,
+                        operation_key: a.operation_key,
+                        content: Some(a.content),
+                        category: None,
+                    },
+                )
+                .map_err(to_command)?,
             )
         }
-        "delete_memory" => {
-            let a: MemoryIdArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
-            json(db::delete_memory(&mut conn, a.memory_id).map_err(to_command)?)
-        }
-        "bulk_update_memory_status" => {
-            let a: BulkMemoryStatusArgs = parse_args(args)?;
+        "revise_memory_category" => {
+            let a: ReviseMemoryCategoryArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
             json(
-                db::bulk_update_memory_status(&mut conn, &a.memory_ids, &a.status)
-                    .map_err(to_command)?,
+                claim_adapter::revise_claim(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::ReviseClaimInput {
+                        target: a.target,
+                        operation_key: a.operation_key,
+                        content: None,
+                        category: Some(a.category),
+                    },
+                )
+                .map_err(to_command)?,
             )
         }
-        "bulk_delete_memory" => {
-            let a: BulkMemoryIdsArgs = parse_args(args)?;
+        "bulk_archive_memories" => {
+            let a: BulkArchiveMemoriesArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
-            json(db::bulk_delete_memory(&mut conn, &a.memory_ids).map_err(to_command)?)
+            json(
+                claim_adapter::bulk_archive_claims(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::BulkArchiveInput {
+                        targets: a.targets,
+                        operation_key: a.operation_key,
+                    },
+                )
+                .map_err(to_command)?,
+            )
         }
         "get_sessions" => {
             parse_args::<NoArgs>(args)?;
@@ -467,7 +492,7 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         "enumerate_memory_projects" => {
             parse_args::<NoArgs>(args)?;
             let conn = open_readonly(state)?;
-            json(db::enumerate_memory_projects(&conn).map_err(to_command)?)
+            json(claim_adapter::enumerate_claim_projects(&conn).map_err(to_command)?)
         }
         "get_project_cards" => {
             parse_args::<NoArgs>(args)?;

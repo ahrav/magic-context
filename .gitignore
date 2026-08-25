@@ -32,6 +32,7 @@ local-ignore/
 packages/dashboard/dist/
 packages/dashboard/node_modules/
 packages/dashboard/src-tauri/target/
+packages/dashboard/src-tauri/gen/schemas/
 
 # Plugin README is generated from the root README when packaging.
 packages/plugin/README.md
