@@ -154,5 +154,38 @@
     ],
     "injected_gate_control_must_be_disqualified": true,
     "no_qualifying_arm_action": "ship_no_shared_memory_provider"
+  },
+  "failure_hardening": {
+    "status": "UNSET_REQUIRES_YMC12_RETAINED_RESULT",
+    "tuple_schema": {
+      "description": "Shape magic-context-ymc.12 freezes for each retained_tuples entry. status becomes FROZEN once the retained-provider result lands; until then the matrix gate fails before tuple-specific execution.",
+      "os": "linux | macos",
+      "runtime": "rust | bun | node",
+      "provider": "one of arms.selectable",
+      "profile": "target profile id",
+      "descriptor_geometry": {
+        "slot_size": "bytes per descriptor slot (positive integer)",
+        "slot_count": "descriptor slots per lane (positive integer)",
+        "arena_bytes": "payload arena bytes per direction (positive integer)",
+        "lane_count": "SPSC lanes (positive integer)"
+      },
+      "host_limits": {
+        "active": {
+          "arena_bytes": "active arena-byte cap (non-negative integer)",
+          "descriptors": "active descriptor cap (non-negative integer)",
+          "mappings": "active mapping cap (non-negative integer)",
+          "pinned_workers": "active pinned-worker cap (non-negative integer)"
+        },
+        "quarantine": {
+          "arena_bytes": "quarantined arena-byte cap (non-negative integer)",
+          "descriptors": "quarantined descriptor cap (non-negative integer)",
+          "mappings": "quarantined mapping cap (non-negative integer)",
+          "pinned_workers": "quarantined pinned-worker cap (non-negative integer)"
+        }
+      },
+      "expectation": "active | omission (every retained tuple must be active)"
+    },
+    "active_platforms": [],
+    "retained_tuples": []
   }
 }
