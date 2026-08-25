@@ -28,7 +28,7 @@ pub struct ClientHello {
     pub role: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerProof {
     pub daemon_id: [u8; DAEMON_ID_LEN],
     pub server_nonce: [u8; NONCE_LEN],
@@ -36,9 +36,35 @@ pub struct ServerProof {
     pub server_proof: [u8; PROOF_LEN],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// V24 classifies proof bytes as sensitive diagnostics. A derived `Debug` prints
+// the whole HMAC, so one routine `{:?}` in an error path or panic message
+// persists a live authentication transcript secret. The nonces and daemon ID stay
+// visible: both travel in the clear and are what makes a transcript identifiable
+// while debugging.
+impl fmt::Debug for ServerProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerProof")
+            .field("daemon_id", &self.daemon_id)
+            .field("server_nonce", &self.server_nonce)
+            .field("daemon_ver", &self.daemon_ver)
+            .field("server_proof", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientAuth {
     pub client_auth: [u8; PROOF_LEN],
+}
+
+/// Redacted for the same reason as [`ServerProof`]; this struct is nothing but
+/// the proof, so there is no non-secret field to keep.
+impl fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientAuth")
+            .field("client_auth", &"[redacted]")
+            .finish()
+    }
 }
 
 /// The outcome of a successful handshake.
@@ -567,6 +593,40 @@ impl Error for AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_debug_output_never_carries_the_proof_bytes() {
+        // V24 classifies proof bytes as sensitive diagnostics. A derived `Debug`
+        // prints the whole HMAC, so one `{:?}` in an error path or panic message
+        // persists a live authentication transcript secret.
+        let sentinel = 0xAB;
+        let server = ServerProof {
+            daemon_id: [1; DAEMON_ID_LEN],
+            server_nonce: [2; NONCE_LEN],
+            daemon_ver: "1.2.3".to_owned(),
+            server_proof: [sentinel; PROOF_LEN],
+        };
+        let rendered = format!("{server:?}");
+        let byte = format!("{sentinel}");
+        assert!(
+            !rendered.contains(&byte),
+            "server_proof bytes leaked into Debug: {rendered}"
+        );
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        // The identifying, non-secret fields stay debuggable.
+        assert!(rendered.contains("1.2.3"), "{rendered}");
+        assert!(rendered.contains("server_nonce"), "{rendered}");
+
+        let client = ClientAuth {
+            client_auth: [sentinel; PROOF_LEN],
+        };
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains(&byte),
+            "client_auth bytes leaked into Debug: {rendered}"
+        );
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+    }
 
     #[test]
     fn an_unrepresentable_auth_deadline_is_rejected_not_panicked() {

@@ -997,13 +997,21 @@ impl HistorianProducer {
             });
         }
         // `send_frozen_once` opens the command route before it sends, and
-        // `open_route` carries its own 30-second budget without observing the
-        // token. The request itself does observe it, so this is the last gate
+        // `open_route` carries its own 30-second budget. This is the last gate
         // that can prevent binding a route for a run nobody is waiting for.
         if self.stop_requested() {
             return Err(ambiguous);
         }
-        self.send_frozen_once(frozen).await
+        let sent = self.send_frozen_once(frozen).await;
+        // A cancellation landing anywhere inside the replay's own send leaves the
+        // ORIGINAL send's outcome unresolved, and the replay's local failure —
+        // `cancelled`/`NotSent` from the route-open race, say — describes only the
+        // replay. Reporting it would tell the caller a possibly-committed request
+        // is safe to send again.
+        if sent.is_err() && self.stop_requested() {
+            return Err(ambiguous);
+        }
+        sent
     }
 
     async fn ensure_command_route(&mut self) -> Result<RouteHandle, HistorianProducerError> {
@@ -1026,23 +1034,50 @@ impl HistorianProducer {
 
     async fn open_bound_route(&self) -> Result<RouteHandle, HistorianProducerError> {
         let semantic = self.semantic_identity()?;
-        self.connection
-            .open_route(
-                RouteTarget {
-                    module_id: self.config.module_id.clone(),
-                    kind: TargetKind::ManagementSurface,
-                },
-                RouteIdentity {
-                    project_root: semantic.project_root,
-                    harness: semantic.harness,
-                    session: semantic.session,
-                    consumer_module_id: nonempty_env(SUBC_MODULE_ID_ENV),
-                    consumer_launch_nonce: nonempty_env(SUBC_LAUNCH_NONCE_ENV),
-                    consumer_capabilities: Vec::new(),
-                    admission_facts: None,
-                },
-            )
-            .await
+        let open = self.connection.open_route(
+            RouteTarget {
+                module_id: self.config.module_id.clone(),
+                kind: TargetKind::ManagementSurface,
+            },
+            RouteIdentity {
+                project_root: semantic.project_root,
+                harness: semantic.harness,
+                session: semantic.session,
+                consumer_module_id: nonempty_env(SUBC_MODULE_ID_ENV),
+                consumer_launch_nonce: nonempty_env(SUBC_LAUNCH_NONCE_ENV),
+                consumer_capabilities: Vec::new(),
+                admission_facts: None,
+            },
+        );
+        let Some(cancellation) = self.config.cancellation.clone() else {
+            return open.await;
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                // `Client::open_route` carries its own 30-second budget and
+                // retries retryable terminals without observing this token, so
+                // abandoning the await is the only way a stopping handler does
+                // not wait for it.
+                //
+                // Walking away is safe only because of the cleanup below. The
+                // host may bind the route after we stop listening, and we can
+                // never name it, so closing the connection is what settles it:
+                // its connection `Goodbye` obliges the host to settle every
+                // route on this generation (§11.2), including the one we
+                // abandoned. Without that this would strand a route and a
+                // channel permit on every cancelled open.
+                if let Err(error) = self.connection.close().await {
+                    eprintln!("mc-module: historian cancelled route-open cleanup failed: {error}");
+                }
+                Err(HistorianProducerError::Call(HistorianCallFailure::untagged(
+                    HistorianSendOutcome::NotSent,
+                    "cancelled",
+                    "historian route open was cancelled".to_owned(),
+                )))
+            }
+            route = open => route,
+        }
     }
 
     async fn unary_json(
@@ -1461,6 +1496,7 @@ mod tests {
         next_channel: u16,
         stall_stream: bool,
         cancel_on_close: Option<CancellationToken>,
+        cancel_on_open_route: Option<CancellationToken>,
     }
 
     #[async_trait]
@@ -1474,6 +1510,16 @@ mod tests {
             _target: RouteTarget,
             identity: RouteIdentity,
         ) -> Result<RouteHandle, HistorianProducerError> {
+            // Lets a test place a cancellation inside the route open itself,
+            // which is the window `Client::open_route`'s own budget does not
+            // observe.
+            let cancel = self.state.lock().unwrap().cancel_on_open_route.take();
+            if let Some(cancel) = cancel {
+                cancel.cancel();
+                // Yield so the racing `select!` observes the token before this
+                // open resolves; otherwise the ordering under test never occurs.
+                tokio::task::yield_now().await;
+            }
             let mut state = self.state.lock().unwrap();
             state.identities.push(identity);
             state.next_channel += 1;
@@ -1957,6 +2003,55 @@ mod tests {
             error.send_outcome(),
             Some(HistorianSendOutcome::OutcomeUnknown),
             "a consumer asking whether the request was sent must still get the ambiguous answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_during_route_open_abandons_it_and_closes_the_connection() {
+        // `Client::open_route` carries its own 30-second budget and does not
+        // observe the token, so a cancellation landing after the start gate must
+        // abandon the open rather than wait for it. Abandoning is only sound
+        // because the connection is closed: the host may bind the route after we
+        // stop listening, and its connection `Goodbye` is what settles a route we
+        // can never name.
+        let cancelled = CancellationToken::new();
+        let first = connection(9, [Ok(br#"{"run_id":"unreachable"}"#.to_vec())]);
+        // Cancel while the route open is in flight.
+        first.state.lock().unwrap().cancel_on_open_route = Some(cancelled.clone());
+        let state = Arc::clone(&first.state);
+        let connector = Arc::new(FakeConnector {
+            initial: first,
+            reconnects: Mutex::new(VecDeque::new()),
+            reconnect_calls: AtomicU64::new(0),
+        });
+        let config = HistorianProducerConfig {
+            request_timeout: Duration::from_secs(1),
+            await_timeout: Duration::from_secs(1),
+            cancellation: Some(cancelled),
+            ..HistorianProducerConfig::new("/unused", "/project", "opencode")
+        };
+        let mut producer = HistorianProducer::connect_with(config, connector.clone())
+            .await
+            .unwrap();
+
+        let error = producer
+            .start("session", "", "prompt", "provider/model")
+            .await
+            .expect_err("a cancelled route open does not start a run");
+        assert_eq!(
+            error.send_outcome(),
+            Some(HistorianSendOutcome::NotSent),
+            "nothing of the caller's request was queued: {error:?}"
+        );
+        let state = state.lock().unwrap();
+        assert!(
+            state.requests.is_empty(),
+            "no session.send may follow an abandoned route open"
+        );
+        assert!(
+            state.close_calls >= 1,
+            "the abandoned open must be settled by closing the connection, since \
+             the host may bind a route this client can never name"
         );
     }
 
