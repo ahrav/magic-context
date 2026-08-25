@@ -258,9 +258,20 @@ export function validateCommittedMatrix(
 }
 
 if (import.meta.main) {
+    const allowUnresolved = Bun.argv.includes("--allow-unresolved");
     const result = validateCommittedMatrix();
     if (result.outcome === "valid") {
         console.log("validated shm failure-hardening matrix");
+    } else if (result.outcome === "unresolved" && allowUnresolved) {
+        for (const error of result.errors)
+            console.error(`shm hardening matrix unresolved: ${error}`);
+        console.error(
+            "PROVISIONAL PHASE: tuple-specific execution is BLOCKED until " +
+                "magic-context-ymc.12 freezes failure_hardening in " +
+                "crates/mc-shm-transport/benches/manifests/v1.json; " +
+                "hardening suites run against the provisional in-repo ring " +
+                "tuple on Linux only",
+        );
     } else {
         for (const error of result.errors)
             console.error(`shm hardening matrix ${result.outcome}: ${error}`);

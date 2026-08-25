@@ -11,7 +11,8 @@
         "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
         "test:rust-e2e": "bun test --timeout 600000 --max-concurrency=1 tests/rust-*.test.ts",
         "mutation:rust-historian": "bun scripts/run-rust-historian-producer-mutation.ts",
-        "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts"
+        "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts",
+        "mutation:shm-hardening": "bun scripts/run-mc-shm-hardening-mutation.ts"
     },
     "dependencies": {
         "@cortexkit/subc-client": "0.4.1",

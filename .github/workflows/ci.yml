@@ -35,6 +35,54 @@ env:
 # gauntlet.
 
 jobs:
+  shm-hardening-gate:
+    name: SHM failure-hardening matrix gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Matrix validator unit tests
+        working-directory: packages/e2e-tests
+        run: bun test scripts/validate-shm-hardening-matrix.test.ts
+
+      # --allow-unresolved keeps an unresolved manifest loud but
+      # non-fatal; a FROZEN manifest is validated strictly with no
+      # workflow edit. commentlint: allow(JUDGE)
+      - name: Validate hardening matrix (strict when frozen)
+        working-directory: packages/e2e-tests
+        run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
+
+  shm-crash-recovery:
+    name: SHM crash isolation + recovery (Linux, provisional ring tuple)
+    runs-on: ubuntu-latest
+    needs: [shm-hardening-gate]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      # Serialized shm-crash nextest group; the ignored full soak
+      # stays opt-in via shm-hardening-optin.yml; no artifact upload.
+      # commentlint: allow(JUDGE)
+      - name: Crash, recovery, and soak-smoke suites
+        run: |
+          cargo nextest run -p mc-host \
+            --test shm_failure_modes --test shm_soak
+
   shm-source-build:
     name: Shared memory source build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -76,10 +124,15 @@ jobs:
           cargo nextest run -p mc-host \
             --test shm_transport --test transport_negotiation
 
-      - name: Rust contracts and clean host omission (macOS)
+      # No retained macOS provider: Linux-gated crash/soak harnesses
+      # are absent by cfg, so this proves side-effect-free omission
+      # (R15), not active parity. commentlint: allow(JUDGE)
+      - name: Contracts, observer self-tests, and omission proof (macOS)
         if: runner.os == 'macOS'
         run: |
-          cargo nextest run -p mc-shm-transport --test contract
+          cargo nextest run -p mc-shm-transport \
+            --test contract --test fuzz_corpus
+          cargo nextest run -p mc-host --test shm_soak
           cargo test -p mc-host --lib \
             shm_provider::tests::platform_preflight_is_side_effect_free
 
