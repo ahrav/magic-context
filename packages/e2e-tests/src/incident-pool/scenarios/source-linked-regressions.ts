@@ -949,6 +949,14 @@ const SOURCE_LINKED_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/harness.ts",
     "packages/e2e-tests/src/opencode-runner/spawn.ts",
     "packages/plugin/src/hooks/magic-context/hook-handlers.ts",
+    // The product transform pipeline these cases actually exercise: A1/A3 read
+    // the rendered prefix it emits, and the thinking variants depend on its
+    // replay, shell-drop, and image-preservation behavior. Hashing only the
+    // importing hook file would leave the digest unchanged when this behavior
+    // changes.
+    "packages/plugin/src/hooks/magic-context/transform.ts",
+    "packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts",
+    "packages/plugin/src/hooks/magic-context/strip-content.ts",
 ];
 
 export const FIRST_RENDER_A1_FIXTURE = {

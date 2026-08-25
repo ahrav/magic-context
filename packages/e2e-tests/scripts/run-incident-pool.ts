@@ -13,6 +13,7 @@ import {
     validateIncidentHistory,
     type IncidentHistoryState,
 } from "../src/incident-pool/history";
+import { validateEvidenceAndSources } from "../src/incident-pool/evidence";
 import {
     builtinIncidentCaseRegistry,
     implementationBundleDigest,
@@ -210,6 +211,11 @@ async function main(): Promise<number> {
     const state = validateIncidentHistory(files);
     const registry = builtinIncidentCaseRegistry();
     validateRegistryCatalogCorrespondence(registry, state.catalog);
+    // Fail closed on drifted provenance: a named audit source, mutation
+    // artifact, reciprocal ownership link, or evidence count that no longer
+    // matches the inventory must stop the run here rather than reaching a
+    // published and scored report through a separately invoked test suite.
+    validateEvidenceAndSources(state.inventory, state.catalog);
 
     const implementationDigests = new Map<string, string>();
     for (const [variantId, registered] of registry) {
