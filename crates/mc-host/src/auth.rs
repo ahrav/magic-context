@@ -190,6 +190,22 @@ impl Deadline {
     }
 }
 
+/// Error-path teardown for either handshake side.
+///
+/// Bounded by the SAME absolute deadline as the handshake itself, so a failed
+/// attempt — and the unauthenticated-handshake slot it holds — is released
+/// promptly instead of waiting out another full budget.
+///
+/// The policy lives here rather than in both wrappers: the surrounding four lines
+/// of scaffolding are shape, but *how* a failed handshake tears down is the part
+/// that must not diverge between server and client.
+async fn teardown_failed_handshake<S>(stream: &mut S, deadline: Deadline)
+where
+    S: AsyncWrite + Unpin,
+{
+    let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
+}
+
 pub async fn authenticate_server<S>(
     stream: &mut S,
     key: &[u8],
@@ -203,10 +219,7 @@ where
     let deadline = Deadline::starting_now(deadline)?;
     let result = authenticate_server_inner(stream, key, daemon_id, daemon_ver, deadline).await;
     if result.is_err() {
-        // Bound teardown by the SAME absolute deadline so a failed handshake (and
-        // the unauthenticated-handshake slot it holds) is released promptly instead
-        // of waiting out another full budget.
-        let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
+        teardown_failed_handshake(stream, deadline).await;
     }
     result
 }
@@ -272,7 +285,7 @@ where
     let deadline = Deadline::starting_now(deadline)?;
     let result = authenticate_client_inner(stream, conn, deadline).await;
     if result.is_err() {
-        let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
+        teardown_failed_handshake(stream, deadline).await;
     }
     result
 }

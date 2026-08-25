@@ -96,9 +96,14 @@ pub const CLIENT_RETAINED_RESPONSE_BYTES: usize = MAX_BODY_LEN as usize + 1_048_
 
 /// Concurrent connection-file snapshots allowed across this process.
 ///
-/// A snapshot runs on the blocking pool and cannot be cancelled, so this caps how
-/// many blocking workers a wedged mount can strand; see `Client::connect`.
-const CLIENT_DISCOVERY_SLOTS: usize = 4;
+/// The cap exists to bound how many blocking workers a wedged mount can strand,
+/// not to throttle healthy discovery: a snapshot on a responsive filesystem
+/// completes in microseconds, so contention only appears when the mount is
+/// already the problem. Sized well above the connects a process makes at once —
+/// `mc-module` links this crate and dials through the same pool for its own
+/// reconnects — while staying far below Tokio's default 512-thread blocking pool,
+/// so a wedged mount cannot starve unrelated blocking work.
+const CLIENT_DISCOVERY_SLOTS: usize = 64;
 
 /// Permits for [`CLIENT_DISCOVERY_SLOTS`], held by the blocking closure itself so
 /// a detached worker still counts against the cap.

@@ -139,7 +139,14 @@ fn adapter_source_has_one_prepared_outcome_and_tracked_spawn_boundary() {
     assert!(!production.contains(&removed_client_api));
     assert!(!production.contains("tokio::spawn("));
     assert!(production.contains("spawn_module_task"));
-    assert!(production.contains("task_admission_open"));
+    // Shutdown state has one source of truth: the cancellation token. The gate is
+    // a critical section, not a second flag — an admission boolean here would have
+    // to be flipped in lockstep with the token, with nothing enforcing it.
+    assert!(production.contains("spawn_gate"));
+    assert!(
+        !production.contains("task_admission_open"),
+        "admission must be derived from the cancellation token, not tracked separately"
+    );
     assert!(production.contains("self.tasks.close()"));
     assert!(production.contains("self.cancel.cancel()"));
     assert!(production.contains("self.tasks.wait().await"));

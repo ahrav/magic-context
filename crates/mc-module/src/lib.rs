@@ -2997,7 +2997,14 @@ impl ProjectionCache {
 pub struct McHandler {
     store: Arc<Mutex<Option<Arc<McStore>>>>,
     store_open: Arc<StoreOpenCoordinator>,
-    task_admission_open: Mutex<bool>,
+    /// Serializes "is the module still accepting tasks?" against shutdown.
+    ///
+    /// Holds no state: `cancel` is the single source of truth for whether
+    /// admission is open. This exists only so the check and the `tasks.spawn`
+    /// that follows it cannot straddle a shutdown that closes the tracker in
+    /// between. A second boolean here would be state that must be flipped in
+    /// lockstep with the token, and nothing would enforce that.
+    spawn_gate: Mutex<()>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     producer_factory: Arc<dyn HistorianProducerFactory>,
@@ -3524,7 +3531,7 @@ impl McHandler {
         McHandler {
             store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
-            task_admission_open: Mutex::new(true),
+            spawn_gate: Mutex::new(()),
             cancel,
             tasks: TaskTracker::new(),
             producer_factory,
@@ -3593,11 +3600,8 @@ impl McHandler {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let admission = self
-            .task_admission_open
-            .lock()
-            .expect("module task admission mutex");
-        if !*admission {
+        let _gate = self.spawn_gate.lock().expect("module spawn gate mutex");
+        if self.cancel.is_cancelled() {
             return None;
         }
         Some(self.tasks.spawn(future))
@@ -3612,11 +3616,7 @@ impl McHandler {
     }
 
     fn begin_store_open(&self, descriptor: StorageDescriptor) -> Result<(), InitError> {
-        if !*self
-            .task_admission_open
-            .lock()
-            .expect("module task admission mutex")
-        {
+        if self.cancel.is_cancelled() {
             return Err(InitError("module task admission is closed".to_owned()));
         }
         if self.store().is_some()
@@ -3839,7 +3839,7 @@ impl McHandler {
         McHandler {
             store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
-            task_admission_open: Mutex::new(true),
+            spawn_gate: Mutex::new(()),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
             producer_factory: factory,
@@ -12419,11 +12419,10 @@ impl McHandler {
 
 impl Drop for McHandler {
     fn drop(&mut self) {
-        if let Ok(admission) = self.task_admission_open.get_mut() {
-            *admission = false;
-        }
-        self.tasks.close();
+        // `&mut self` excludes any concurrent spawn, so the gate is unnecessary
+        // here. Cancel first, matching `shutdown`: the token closes admission.
         self.cancel.cancel();
+        self.tasks.close();
     }
 }
 
@@ -12510,14 +12509,13 @@ impl CompositeComponent for McHandler {
 
     async fn shutdown(&self) -> Result<(), ShutdownError> {
         {
-            let mut admission = self
-                .task_admission_open
-                .lock()
-                .expect("module task admission mutex");
-            *admission = false;
+            // Closing admission and closing the tracker under the gate is what
+            // stops a spawn that already passed the check from landing in a
+            // tracker `wait` has stopped watching.
+            let _gate = self.spawn_gate.lock().expect("module spawn gate mutex");
+            self.cancel.cancel();
             self.tasks.close();
         }
-        self.cancel.cancel();
         self.tasks.wait().await;
 
         self.bindings.lock().expect("bindings mutex").clear();
@@ -17623,7 +17621,6 @@ mod tests {
         assert!(state.exited.load(Ordering::SeqCst));
         assert!(handler.cancel.is_cancelled());
         assert!(handler.tasks.is_empty());
-        assert!(!*handler.task_admission_open.lock().unwrap());
         assert!(handler.spawn_module_task(async {}).is_none());
     }
 
