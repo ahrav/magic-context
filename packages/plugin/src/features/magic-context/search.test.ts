@@ -213,7 +213,7 @@ describe("unifiedSearch", () => {
             content: "Magic context stores ranked search data in SQLite.",
             category: "ARCHITECTURE",
         });
-        const memory = insertMemory(db, {
+        insertMemory(db, {
             projectPath: "git:repo-project",
             category: "ARCHITECTURE_DECISIONS",
             content: "Magic context stores ranked search data in SQLite.",
@@ -384,7 +384,7 @@ describe("unifiedSearch", () => {
         // so the ctx_search tool passes a cutoff of 0. Ordinals are 1-based, so a
         // 0 cutoff must exclude EVERY indexed message — none have scrolled out of
         // the live context the agent already sees (incl. the current prompt).
-        const memory = insertMemory(db, {
+        insertMemory(db, {
             projectPath: "/repo/project",
             category: "ARCHITECTURE_DECISIONS",
             content: "Magic context stores ranked search data in SQLite.",
@@ -608,7 +608,7 @@ describe("unifiedSearch", () => {
     });
 
     it("restricts results to the sources filter", async () => {
-        const memory = insertMemory(db, {
+        insertMemory(db, {
             projectPath: "/repo/project",
             category: "ARCHITECTURE_DECISIONS",
             content: "Historian uses a compact static system prompt.",
@@ -1029,7 +1029,7 @@ describe("unifiedSearch", () => {
      * the same vector to both consumers.
      */
     it("embeds the query exactly once even when memory + git_commit both need it", async () => {
-        const memory = insertMemory(db, {
+        insertMemory(db, {
             projectPath: "/repo/project",
             category: "ARCHITECTURE_DECISIONS",
             content: "shared embed test.",
