@@ -1,26 +1,25 @@
-import type { Database } from "../../shared/sqlite";
 import {
     type CanonicalJsonValue,
-    canonicalJsonEncode,
     type ClaimMutationToken,
+    canonicalJsonEncode,
     formatRevisionLocator,
     isValidPublicClaimId,
 } from "../../features/magic-context/memory/claim-operation-contract";
-import {
-    type ClaimOperationRunResult,
-    type ProducerIdentity,
-    ClaimOperationInputError,
-    computeProjectMemoryMutationToken,
-    createProjectMemoryClaim,
-    mergeProjectMemoryClaims,
-    reviseProjectMemoryClaim,
-    setProjectMemoryClaimLifecycle,
-} from "../../features/magic-context/memory/storage-claim-operations";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "../../features/magic-context/memory/storage-claim-current-state";
+import {
+    ClaimOperationInputError,
+    type ClaimOperationRunResult,
+    computeProjectMemoryMutationToken,
+    createProjectMemoryClaim,
+    mergeProjectMemoryClaims,
+    type ProducerIdentity,
+    reviseProjectMemoryClaim,
+    setProjectMemoryClaimLifecycle,
+} from "../../features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import {
     computeWorkspaceEpochFingerprint,
@@ -28,6 +27,7 @@ import {
     resolveWorkspaceIdentitySet,
     resolveWorkspaceShareCategories,
 } from "../../features/magic-context/workspaces";
+import type { Database } from "../../shared/sqlite";
 import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS } from "./constants";
 import { CTX_MEMORY_DREAMER_ACTIONS, type CtxMemoryAction, type CtxMemoryArgs } from "./types";
 

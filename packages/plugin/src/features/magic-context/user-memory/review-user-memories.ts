@@ -8,6 +8,14 @@ import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
+import { dreamerManifestIdentity, recordDreamerManifestRejection } from "../dreamer/claim-manifest";
+import {
+    DREAMING_LEASE_KEY,
+    type LeaseAcquisition,
+    runLeaseGuardedWrite,
+    startLeaseHeartbeat,
+} from "../dreamer/lease";
+import { REVIEW_USER_MEMORIES_SYSTEM_PROMPT } from "../dreamer/task-prompts";
 import { canonicalJsonEncode } from "../memory/claim-operation-contract";
 import {
     type AutonomousManifestIdentity,
@@ -16,17 +24,6 @@ import {
 import { stageCreateProjectMemoryClaimInCurrentTransaction } from "../memory/storage-claim-operations";
 import { ensureProject, sha256Utf8Hex } from "../memory/storage-claims";
 import type { MemoryCategory } from "../memory/types";
-import {
-    dreamerManifestIdentity,
-    recordDreamerManifestRejection,
-} from "../dreamer/claim-manifest";
-import {
-    DREAMING_LEASE_KEY,
-    type LeaseAcquisition,
-    runLeaseGuardedWrite,
-    startLeaseHeartbeat,
-} from "../dreamer/lease";
-import { REVIEW_USER_MEMORIES_SYSTEM_PROMPT } from "../dreamer/task-prompts";
 import { bumpProjectUserProfileVersion } from "../storage";
 import { recordChildInvocation } from "../subagent-token-capture";
 import {
@@ -229,44 +226,37 @@ export function parseUserMemoryReviewManifest(value: unknown): UserMemoryReviewM
             candidateIds: idArray(row.candidate_ids, `promote[${index}].candidate_ids`, true),
         };
     });
-    const projectPromotions = optionalArray(
-        root.promote_project,
-        "promote_project",
-    ).map((item, index) => {
-        const row = requireObject(item, `promote_project[${index}]`);
-        if (
-            typeof row.category !== "string" ||
-            !PROJECT_MEMORY_CATEGORIES.has(row.category as MemoryCategory)
-        ) {
-            throw new Error(`promote_project[${index}] has an invalid project-memory category`);
-        }
-        return {
-            content: requiredContent(row.content, `promote_project[${index}]`),
-            category: row.category as MemoryCategory,
-            candidateIds: idArray(
-                row.candidate_ids,
-                `promote_project[${index}].candidate_ids`,
-                true,
-            ),
-        };
-    });
-    const updates = optionalArray(root.update_existing, "update_existing").map(
+    const projectPromotions = optionalArray(root.promote_project, "promote_project").map(
         (item, index) => {
-            const row = requireObject(item, `update_existing[${index}]`);
+            const row = requireObject(item, `promote_project[${index}]`);
+            if (
+                typeof row.category !== "string" ||
+                !PROJECT_MEMORY_CATEGORIES.has(row.category as MemoryCategory)
+            ) {
+                throw new Error(`promote_project[${index}] has an invalid project-memory category`);
+            }
             return {
-                memoryId: positiveInteger(row.memory_id, `update_existing[${index}].memory_id`),
-                content: requiredContent(row.content, `update_existing[${index}]`),
-                candidateIds:
-                    row.candidate_ids === undefined
-                        ? []
-                        : idArray(
-                              row.candidate_ids,
-                              `update_existing[${index}].candidate_ids`,
-                              false,
-                          ),
+                content: requiredContent(row.content, `promote_project[${index}]`),
+                category: row.category as MemoryCategory,
+                candidateIds: idArray(
+                    row.candidate_ids,
+                    `promote_project[${index}].candidate_ids`,
+                    true,
+                ),
             };
         },
     );
+    const updates = optionalArray(root.update_existing, "update_existing").map((item, index) => {
+        const row = requireObject(item, `update_existing[${index}]`);
+        return {
+            memoryId: positiveInteger(row.memory_id, `update_existing[${index}].memory_id`),
+            content: requiredContent(row.content, `update_existing[${index}]`),
+            candidateIds:
+                row.candidate_ids === undefined
+                    ? []
+                    : idArray(row.candidate_ids, `update_existing[${index}].candidate_ids`, false),
+        };
+    });
     const dismissals = optionalArray(root.dismiss_existing, "dismiss_existing").map(
         (item, index) => {
             const row = requireObject(item, `dismiss_existing[${index}]`);
@@ -303,9 +293,11 @@ function validateManifestReferences(args: {
     const usedCandidates = new Set<number>();
     const useCandidates = (ids: readonly number[], label: string): void => {
         for (const id of ids) {
-            if (!candidateById.has(id)) throw new Error(`${label} references unknown candidate ${id}`);
+            if (!candidateById.has(id))
+                throw new Error(`${label} references unknown candidate ${id}`);
             if (!consumed.has(id)) throw new Error(`${label} candidate ${id} is not consumed`);
-            if (usedCandidates.has(id)) throw new Error(`candidate ${id} appears in multiple actions`);
+            if (usedCandidates.has(id))
+                throw new Error(`candidate ${id} appears in multiple actions`);
             usedCandidates.add(id);
         }
     };
@@ -325,7 +317,9 @@ function validateManifestReferences(args: {
     }
     for (const [index, update] of args.manifest.updates.entries()) {
         if (!stableIds.has(update.memoryId)) {
-            throw new Error(`update_existing[${index}] references unknown memory ${update.memoryId}`);
+            throw new Error(
+                `update_existing[${index}] references unknown memory ${update.memoryId}`,
+            );
         }
         useCandidates(update.candidateIds, `update_existing[${index}]`);
     }
@@ -338,7 +332,9 @@ function validateManifestReferences(args: {
             );
         }
         if (updatedMemoryIds.has(dismissal.memoryId)) {
-            throw new Error(`memory ${dismissal.memoryId} cannot be updated and dismissed together`);
+            throw new Error(
+                `memory ${dismissal.memoryId} cannot be updated and dismissed together`,
+            );
         }
         if (dismissedMemoryIds.has(dismissal.memoryId)) {
             throw new Error(`memory ${dismissal.memoryId} is dismissed more than once`);

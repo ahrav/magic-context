@@ -2,12 +2,8 @@ import { describe, expect, mock, test } from "bun:test";
 
 import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import { Database } from "../../../shared/sqlite";
-import {
-    acquireLeaseWithAcquisition,
-    releaseLease,
-} from "../dreamer/lease";
-import { dreamerManifestIdentity } from "../dreamer/claim-manifest";
-import { readDreamerProjectClaims } from "../dreamer/claim-manifest";
+import { dreamerManifestIdentity, readDreamerProjectClaims } from "../dreamer/claim-manifest";
+import { acquireLeaseWithAcquisition, releaseLease } from "../dreamer/lease";
 import { runMigrations } from "../migrations";
 import { createClaimMemorySchema } from "../storage-claim-memory-schema";
 import { initializeDatabase } from "../storage-db";

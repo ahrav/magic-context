@@ -1,16 +1,16 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { V2_MEMORY_CATEGORIES } from "@magic-context/core/features/magic-context/memory";
 import { getProjectEmbeddingSnapshot } from "@magic-context/core/features/magic-context/memory/embedding";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	ClaimOperationInputError,
 	ClaimOperationKeyReuseError,
 } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
-import { V2_MEMORY_CATEGORIES } from "@magic-context/core/features/magic-context/memory";
+import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { executeCtxMemoryClaimAction } from "@magic-context/core/tools/ctx-memory/claim-actions";
 import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
 import type { CtxMemoryArgs } from "@magic-context/core/tools/ctx-memory/types";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
-import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { type Static, Type } from "typebox";
 
 const ALL_ACTIONS = [

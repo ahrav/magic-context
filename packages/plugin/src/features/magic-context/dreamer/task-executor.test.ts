@@ -501,9 +501,9 @@ describe("createDreamTaskExecutor — review-user-memories", () => {
         );
 
         expect(result).toEqual({ status: "completed" });
-        expect(readDreamerProjectClaims(db, project, "hygiene").map((claim) => claim.content)).toEqual([
-            "Run focused tests before commit.",
-        ]);
+        expect(
+            readDreamerProjectClaims(db, project, "hygiene").map((claim) => claim.content),
+        ).toEqual(["Run focused tests before commit."]);
         expect(getUserMemoryCandidates(db)).toHaveLength(0);
         expect(
             (

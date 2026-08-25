@@ -1,6 +1,7 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
+import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory";
 import { getProjectEmbeddingSnapshot } from "../../features/magic-context/memory/embedding";
 import {
     ClaimOperationInputError,
@@ -17,7 +18,6 @@ import {
     type CtxMemoryArgs,
     type CtxMemoryToolDeps,
 } from "./types";
-import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory";
 
 export { CTX_MEMORY_LIGHT_DESCRIPTION } from "../light-descriptions";
 

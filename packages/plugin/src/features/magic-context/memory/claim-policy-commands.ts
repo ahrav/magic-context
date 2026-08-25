@@ -15,11 +15,11 @@ import type { Database } from "../../../shared/sqlite";
 import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
 import {
     type CanonicalJsonValue,
+    type ClaimMutationToken,
     canonicalClaimMutationToken,
     computeClaimOperationRequestDigest,
     formatRevisionLocator,
     isValidPublicClaimId,
-    type ClaimMutationToken,
 } from "./claim-operation-contract";
 import {
     type ClaimEffectDescriptor,
@@ -114,8 +114,7 @@ function resolveTarget(
     if (!claim || projectId === null || claim.projectId !== projectId) {
         return { error: "The claim does not belong to the active project." };
     }
-    const preview =
-        claim.content.length > 200 ? `${claim.content.slice(0, 200)}…` : claim.content;
+    const preview = claim.content.length > 200 ? `${claim.content.slice(0, 200)}…` : claim.content;
     return {
         publicClaimId,
         claimId: claim.claimId,
@@ -704,8 +703,7 @@ export async function executeClaimEnforceCommand(
             argsKey: `${publicClaimId}:${canonical.canonicalPath}:${kind}`,
             target,
             producer: `claim-enforcement:${deps.host}`,
-            operationKey: (nonce) =>
-                `enforce:${publicClaimId}:r${target.revision}:${nonce}`,
+            operationKey: (nonce) => `enforce:${publicClaimId}:r${target.revision}:${nonce}`,
             request: (nonce) => ({
                 canonicalPath: canonical.canonicalPath,
                 kind,

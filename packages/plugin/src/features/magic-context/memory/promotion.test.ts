@@ -5,11 +5,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createClaimReaderTestDatabase } from "../test-claim-database";
+import { type HistorianPromotionIdentity, promoteSessionFactsDurable } from "./promotion";
 import {
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "./storage-claim-current-state";
-import { promoteSessionFactsDurable, type HistorianPromotionIdentity } from "./promotion";
 
 const PROJECT = "git:promotion-test";
 let db: Database | null = null;

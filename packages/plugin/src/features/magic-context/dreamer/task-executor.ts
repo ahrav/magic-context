@@ -37,6 +37,13 @@ import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
+import {
+    claimManifestBinding,
+    dreamerInferenceProvenance,
+    dreamerManifestIdentity,
+    readDreamerProjectClaims,
+    recordDreamerManifestRejection,
+} from "./claim-manifest";
 import { type ClassifyModuleClient, runClassify } from "./classify";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import {
@@ -96,13 +103,6 @@ import type {
     TaskExecutor,
     TaskExecutorContext,
 } from "./task-scheduler";
-import {
-    claimManifestBinding,
-    dreamerInferenceProvenance,
-    dreamerManifestIdentity,
-    readDreamerProjectClaims,
-    recordDreamerManifestRejection,
-} from "./claim-manifest";
 import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {

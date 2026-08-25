@@ -1,7 +1,7 @@
 import type { Database } from "../../../shared/sqlite";
 import { isInTransaction } from "../../../shared/sqlite";
-import { V2_MEMORY_CATEGORIES } from "./constants";
 import type { CanonicalJsonValue } from "./claim-operation-contract";
+import { V2_MEMORY_CATEGORIES } from "./constants";
 import {
     type AutonomousManifestIdentity,
     runAutonomousCreationManifestInCurrentTransaction,
