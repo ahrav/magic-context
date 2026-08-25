@@ -19,8 +19,10 @@ import {
     type FrameChannelCloseReason,
     type InboundFrame,
     type OutboundFrame,
+    ProducerError,
+    type ProducerFrameHeader,
 } from "../frame-channel";
-import { FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "../protocol";
+import { type EnvelopeHeader, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "../protocol";
 import { TcpFrameChannel } from "../tcp-frame-channel";
 import { encodePeerFrame, FakePeer, type PeerFrameFields } from "./fake-peer";
 import { expectMcHostCallError, waitUntil } from "./test-util";
@@ -76,6 +78,12 @@ export interface ContractChannelOverrides {
     maxQueuedFrames?: number;
     maxQueuedBytes?: number;
     controlReserveFrames?: number;
+    producerSpanBytes?: number;
+}
+
+export interface ContractReceivedFrame {
+    header: EnvelopeHeader;
+    body: Uint8Array;
 }
 
 /** One live channel/peer pair plus the factory-recorded observations. */
@@ -83,12 +91,14 @@ export interface FrameChannelContractHandle {
     channel: FrameChannel;
     budget: ByteBudget;
     peer: ContractPeer;
-    /** Delivered inbound frames, in order. */
-    received: InboundFrame[];
+    /** Whether releasing a lease must revoke aliases before backing storage is reused. */
+    reusesReceiveStorage: boolean;
+    /** The contract factory retains owned bodies after the provider releases each inbound lease. */
+    received: ContractReceivedFrame[];
     /** Channel-detected closes, in order (owner close never records here). */
     closes: { reason: FrameChannelCloseReason; error: unknown }[];
     /** Scenario-installed hook, run before each delivery is recorded. */
-    frameHook: ((frame: InboundFrame) => void) | null;
+    frameHook: ((frame: InboundFrame) => boolean | undefined) | null;
     cleanup(): Promise<void>;
 }
 
@@ -133,6 +143,17 @@ function requestFrame(corr: bigint, body: Uint8Array): OutboundFrame {
             corr,
         },
         body,
+    };
+}
+
+function producerHeader(corr: bigint): ProducerFrameHeader {
+    return {
+        ver: PROTOCOL_VERSION,
+        ty: FrameType.Request,
+        flags: 0,
+        channel: CHANNEL,
+        epoch: EPOCH,
+        corr,
     };
 }
 
@@ -316,10 +337,11 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 memoryCapBytes: 5_000,
                 frameDeadlineMs: 10_000,
             });
-            // Simulate a receiver retaining the first delivered body: the
-            // transient reader charge transfers to the retainer.
+            const retained: { lease: InboundFrame["body"] | null } = { lease: null };
             h.frameHook = (frame) => {
-                if (frame.header.corr === 1n) h.budget.charge(frame.body.length);
+                if (frame.header.corr !== 1n) return false;
+                retained.lease = frame.body;
+                return true;
             };
             await h.peer.send({
                 ty: FrameType.Response,
@@ -328,7 +350,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 corr: 1n,
                 body: Buffer.alloc(4_096, 1),
             });
-            await waitUntil(() => h.received.length === 1);
+            await waitUntil(() => retained.lease !== null);
             await h.peer.send({
                 ty: FrameType.Response,
                 channel: CHANNEL,
@@ -337,14 +359,12 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 body: Buffer.alloc(4_096, 2),
             });
             await waitUntil(() => h.channel.stats().readPaused);
-            // Deferred before allocation: nothing held for the second body.
-            assert.equal(h.channel.stats().readerHeldBytes, 0);
-            assert.equal(h.received.length, 1);
-            // Releasing the retained bytes clears pressure and resumes.
-            h.budget.release(4_096);
-            await waitUntil(() => h.received.length === 2);
+            assert.equal(h.channel.stats().readerHeldBytes, 4_096);
+            assert.equal(h.received.length, 0);
+            retained.lease?.release();
+            await waitUntil(() => h.received.length === 1);
             assert.equal(h.channel.stats().readPaused, false);
-            assert.equal(h.received[1]?.body.length, 4_096);
+            assert.equal(h.received[0]?.body.length, 4_096);
             // The cap was never exceeded while paused.
             assert.ok(h.budget.peak <= 5_000);
         },
@@ -478,6 +498,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 depth++;
                 maxDepth = Math.max(maxDepth, depth);
                 depth--;
+                return undefined;
             };
             await h.peer.sendBurst(
                 [1n, 2n, 3n].map((corr) => ({
@@ -494,6 +515,153 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 [1n, 2n, 3n],
             );
             assert.equal(maxDepth, 1);
+        },
+    },
+    {
+        name: "bounded producers commit empty, boundary, segmented, and maximum bodies exactly",
+        async run(create) {
+            const h = await create({
+                producerSpanBytes: 32 * 1024 * 1024,
+            });
+            const sizes = [0, 64, 65, MAX_FRAME_BODY_LEN];
+            for (let i = 0; i < sizes.length; i++) {
+                const size = sizes[i] as number;
+                const source = new Uint8Array(size).fill(i + 1);
+                const producer = h.channel.reserve(producerHeader(BigInt(i + 1)), size);
+                const aliases: Uint8Array[] = [];
+                let offset = 0;
+                while (offset < source.length) {
+                    const view = producer.view();
+                    const take = Math.min(view.length, source.length - offset);
+                    view.set(source.subarray(offset, offset + take));
+                    aliases.push(view);
+                    producer.advance(take);
+                    offset += take;
+                }
+                producer.commit(size);
+                assert.equal(producer.written, size);
+                for (const alias of aliases) assert.equal(alias.byteLength, 0);
+            }
+            await h.peer.waitFor(() => requestCorrs(h.peer).length === sizes.length, 15_000);
+            assert.deepEqual(
+                h.peer.frames
+                    .filter((frame) => frame.ty === FrameType.Request)
+                    .map((frame) => frame.body.length),
+                sizes,
+            );
+            assert.equal(h.channel.stats().ownedAdapterCopies, sizes.length);
+        },
+    },
+    {
+        name: "underfill, overflow, and abort return reservations without publication",
+        async run(create) {
+            const h = await create({ maxBodyLen: 64, memoryCapBytes: 1_024 });
+
+            const underfill = h.channel.reserve(producerHeader(1n), 8);
+            underfill.write(Buffer.from("four"));
+            assert.throws(
+                () => underfill.commit(8),
+                (error) => error instanceof ProducerError && error.code === "producer_underfill",
+            );
+
+            const overflow = h.channel.reserve(producerHeader(2n), 8);
+            assert.throws(
+                () => overflow.write(Buffer.alloc(9)),
+                (error) => error instanceof ProducerError && error.code === "producer_overflow",
+            );
+
+            h.channel.reserve(producerHeader(3n), 8).abort();
+            assert.equal(h.channel.stats().queueHeldBytes, 0);
+            assert.equal(h.channel.stats().queuedDataFrames, 0);
+            assert.equal(h.budget.used, 0);
+            assert.equal(requestCorrs(h.peer).length, 0);
+
+            const valid = h.channel.reserve(producerHeader(4n), 4);
+            valid.write(Buffer.from("good"));
+            valid.commit(4);
+            await h.peer.waitFor(() => requestCorrs(h.peer).includes(4n));
+            const published = h.peer.frames.find((frame) => frame.corr === 4n);
+            assert.equal(Buffer.from(published?.body ?? []).toString(), "good");
+        },
+    },
+    {
+        name: "owned receive adapter copies once after transport lease release",
+        async run(create) {
+            const h = await create();
+            h.frameHook = (frame) => {
+                const segment = frame.body.segment(0);
+                assert.equal(segment.byteOffset, 0);
+                assert.equal(segment.byteLength, segment.buffer.byteLength);
+                return undefined;
+            };
+            await h.peer.send({
+                ty: FrameType.Response,
+                channel: CHANNEL,
+                epoch: EPOCH,
+                corr: 1n,
+                body: Buffer.from("owned"),
+            });
+            await waitUntil(() => h.received.length === 1);
+            assert.equal(Buffer.from(h.received[0]?.body ?? []).toString(), "owned");
+            assert.equal(h.channel.stats().activeReceiveLeases, 0);
+            assert.equal(h.channel.stats().ownedAdapterCopies, 1);
+        },
+    },
+    {
+        name: "close revokes active receive aliases before storage reuse",
+        async run(create) {
+            const h = await create();
+            const held: { frame: InboundFrame | null; alias: Uint8Array | null } = {
+                frame: null,
+                alias: null,
+            };
+            h.frameHook = (frame) => {
+                held.frame = frame;
+                held.alias = frame.body.segment(0);
+                return true;
+            };
+            await h.peer.send({
+                ty: FrameType.Response,
+                channel: CHANNEL,
+                epoch: EPOCH,
+                corr: 1n,
+                body: Buffer.from("lease"),
+            });
+            await waitUntil(() => held.frame !== null);
+            assert.equal(held.alias?.byteLength, 5);
+            h.channel.close();
+            assert.equal(held.alias?.byteLength, h.reusesReceiveStorage ? 0 : 5);
+            assert.equal(held.frame?.body.isReleased(), true);
+            assert.equal(h.channel.stats().activeReceiveLeases, 0);
+            assert.throws(() => held.frame?.body.segment(0), /released/);
+
+            const uncertain = await create();
+            const escaped: { frame: InboundFrame | null; alias: Uint8Array | null } = {
+                frame: null,
+                alias: null,
+            };
+            uncertain.frameHook = (frame) => {
+                escaped.frame = frame;
+                escaped.alias = frame.body.segment(0);
+                return true;
+            };
+            await uncertain.peer.send({
+                ty: FrameType.Response,
+                channel: CHANNEL,
+                epoch: EPOCH,
+                corr: 2n,
+                body: Buffer.from("maybe"),
+            });
+            await waitUntil(() => escaped.alias !== null);
+            const backing = escaped.alias?.buffer;
+            if (!(backing instanceof ArrayBuffer)) throw new Error("expected ArrayBuffer");
+            structuredClone(backing, { transfer: [backing] });
+            uncertain.channel.close();
+            assert.equal(uncertain.channel.stats().activeReceiveLeases, 0);
+            assert.equal(
+                uncertain.channel.stats().quarantinedBytes,
+                uncertain.reusesReceiveStorage ? 5 : 0,
+            );
         },
     },
 ];
@@ -528,9 +696,9 @@ export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async
     const peer = await FakePeer.start();
     const maxBodyLen = overrides.maxBodyLen ?? MAX_FRAME_BODY_LEN;
     const budget = new ByteBudget(overrides.memoryCapBytes ?? maxBodyLen + 1_048_576);
-    const received: InboundFrame[] = [];
+    const received: ContractReceivedFrame[] = [];
     const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
-    const hookSlot: { fn: ((frame: InboundFrame) => void) | null } = { fn: null };
+    const hookSlot: { fn: ((frame: InboundFrame) => boolean | undefined) | null } = { fn: null };
     const channel = new TcpFrameChannel({
         host: "127.0.0.1",
         port: peer.port,
@@ -541,10 +709,11 @@ export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async
         maxQueuedFrames: overrides.maxQueuedFrames,
         maxQueuedBytes: overrides.maxQueuedBytes,
         controlReserveFrames: overrides.controlReserveFrames,
+        producerSpanBytes: overrides.producerSpanBytes,
         handlers: {
             onFrame: (frame) => {
-                hookSlot.fn?.(frame);
-                received.push(frame);
+                if (hookSlot.fn?.(frame) === true) return;
+                received.push({ header: frame.header, body: frame.body.takeOwned() });
             },
             onClosed: (reason, error) => {
                 closes.push({ reason, error });
@@ -564,12 +733,13 @@ export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async
         channel,
         budget,
         peer: contractPeer,
+        reusesReceiveStorage: false,
         received,
         closes,
         get frameHook() {
             return hookSlot.fn;
         },
-        set frameHook(fn: ((frame: InboundFrame) => void) | null) {
+        set frameHook(fn: ((frame: InboundFrame) => boolean | undefined) | null) {
             hookSlot.fn = fn;
         },
         cleanup: async () => {

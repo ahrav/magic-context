@@ -408,9 +408,10 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                     None => ReadExit::Peer,
                 };
             }
-            Err(ReadClose::CleanEof) | Err(ReadClose::Corrupt(_)) | Err(ReadClose::Io(_)) => {
-                return ReadExit::Peer
-            }
+            Err(ReadClose::CleanEof)
+            | Err(ReadClose::Corrupt(_))
+            | Err(ReadClose::Io(_))
+            | Err(ReadClose::Overloaded) => return ReadExit::Peer,
         };
 
         match event {
@@ -470,7 +471,8 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         }
                         watermark = header.corr;
                         if header.channel == 0 {
-                            match handle_control(shared, gen, frame, setup).await {
+                            let (corr, action) = decode_control_frame(frame, &shared.targets);
+                            match handle_control(shared, gen, corr, action, setup).await {
                                 ControlFlow::Continue => {}
                                 ControlFlow::Close(exit) => return exit,
                             }
@@ -481,7 +483,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                             if !transport_ready(setup) {
                                 return ReadExit::Peer;
                             }
-                            dispatch_request(shared, gen, frame).await;
+                            dispatch_request(shared, gen, frame.into_owned()).await;
                         }
                     }
                     FrameType::Cancel => {
@@ -596,17 +598,38 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
     }
 }
 
+/// Runs `decode` over the frame's body as one contiguous byte slice. TCP
+/// frames arrive contiguous; a ring backend delivers a body as two spans
+/// when it wraps the arena end, so that shape flattens through the explicit
+/// copying adapter first. Only decoded values leave the lease scope.
+fn decode_contiguous<T>(
+    frame: &crate::frame_channel::InboundFrame,
+    decode: impl FnOnce(&[u8]) -> T,
+) -> T {
+    let copies = frame.copy_counter();
+    frame.with_lease(|lease| match lease.contiguous_bytes() {
+        Some(body) => decode(body),
+        None => decode(&lease.to_owned(&copies)),
+    })
+}
+
+fn decode_control_frame(
+    frame: crate::frame_channel::InboundFrame,
+    targets: &crate::control::TargetIndex,
+) -> (u64, ControlAction) {
+    let corr = frame.header.corr;
+    let binary = frame.header.flags.is_binary();
+    let action = decode_contiguous(&frame, |body| parse_control(body, binary, targets));
+    (corr, action)
+}
+
 async fn handle_control<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    frame: crate::frame_channel::InboundFrame,
+    corr: u64,
+    action: ControlAction,
     setup: &mut ConnectionSetup,
 ) -> ControlFlow {
-    let corr = frame.header.corr;
-    let action = parse_control(&frame.body, frame.header.flags.is_binary(), &shared.targets);
-    // The body and its charge are done: validation is complete.
-    drop(frame);
-
     // Negotiation bypasses pending-request admission because it is setup
     // traffic: exhausted global capacity must not turn a negotiation into a
     // `server_busy` terminal.
@@ -856,7 +879,14 @@ async fn handle_negotiate<H: McHostHandler>(
             .providers
             .find(&offer.transport, offer.capability_version)
         {
-            Some(provider) => {
+            Some(provider)
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::panic_boundary::redact_sync(|| {
+                        provider.preflight(offer.parameters.as_ref())
+                    })
+                }))
+                .unwrap_or(false) =>
+            {
                 let provider = Arc::clone(provider);
                 let selected = SelectedTransport {
                     transport: offer.transport.clone(),
@@ -873,6 +903,7 @@ async fn handle_negotiate<H: McHostHandler>(
                 )
                 .await;
             }
+            Some(_) => {}
             // Known transport at another version: name the real cause
             // (§7.7.3) rather than reporting it as unavailable.
             None if shared.providers.serves_transport(&offer.transport) => {
@@ -1069,8 +1100,7 @@ async fn run_candidate_setup<H: McHostHandler>(
 ) {
     let exchange = async {
         let frame = expect_candidate_request(&mut receiver, ACTIVATION_CORRELATION).await?;
-        let request = decode_activate_request(&frame.body).map_err(|_| ())?;
-        drop(frame);
+        let request = decode_candidate_activate(frame)?;
         grant
             .consume(&request.activation_token, &binding)
             .map_err(|_| ())?;
@@ -1084,8 +1114,7 @@ async fn run_candidate_setup<H: McHostHandler>(
         .await?;
 
         let frame = expect_candidate_request(&mut receiver, COMMIT_CORRELATION).await?;
-        decode_commit_request(&frame.body).map_err(|_| ())?;
-        drop(frame);
+        decode_candidate_commit(frame)?;
         // Promotion is gated on this exact frame's local completion — not
         // queue admission, not an aggregate flush (KTD4). The receiver is
         // deliberately NOT polled while waiting: an un-promoted host never
@@ -1129,6 +1158,16 @@ async fn run_candidate_setup<H: McHostHandler>(
             bootstrap.writer.discard();
         }
     }
+}
+
+fn decode_candidate_activate(
+    frame: crate::frame_channel::InboundFrame,
+) -> Result<crate::transport_negotiation::ActivateRequest, ()> {
+    decode_contiguous(&frame, decode_activate_request).map_err(|_| ())
+}
+
+fn decode_candidate_commit(frame: crate::frame_channel::InboundFrame) -> Result<(), ()> {
+    decode_contiguous(&frame, decode_commit_request).map_err(|_| ())
 }
 
 async fn expect_candidate_request(
@@ -1181,6 +1220,7 @@ async fn send_candidate_response<H: McHostHandler>(
             OutboundFrame {
                 bytes,
                 tail: Vec::new(),
+                direct: None,
                 charge,
                 written: written_tx.map(|tx| {
                     Box::new(move |_completed_at: Instant| {
@@ -1254,6 +1294,7 @@ async fn reserve_catalog_frame(
     Ok(OutboundFrame {
         bytes,
         tail: Vec::new(),
+        direct: None,
         charge,
         written: None,
     })
@@ -1371,6 +1412,7 @@ async fn liveness_loop(
         let send = gen.writer.send(crate::frame_channel::OutboundFrame {
             bytes,
             tail: Vec::new(),
+            direct: None,
             charge: crate::wire::ByteCharge::none(),
             written: Some(written_hook),
         });

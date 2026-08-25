@@ -19,6 +19,7 @@ import {
     type ConnectionDiagnosticEvent,
     ConnectionGeneration,
     type ConnectionGenerationOptions,
+    type JsonReceiveBody,
     type PendingRequest,
     type RequestTerminal,
     type RetirementInfo,
@@ -36,6 +37,7 @@ import {
     McHostClientError,
     SocketTimeoutError,
 } from "./errors";
+import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
 import { flagsBinary } from "./protocol";
 import {
     belongsToConnection,
@@ -293,9 +295,11 @@ function makeSetupFlight<T>(
 interface RequestParams {
     channel: number;
     epoch: number;
-    body: Uint8Array;
+    body: Uint8Array | DirectFrameBody;
     deadline: Deadline;
     options: RequestOptions;
+    responseMode?: "json" | "binary";
+    binary?: boolean;
     /**
      * Retain the raw wire Error terminal on the thrown failure. Only the
      * negotiation family needs it (legacy-fallback classification reads the
@@ -478,6 +482,33 @@ export class McHostClient {
         return parseResponseJson(terminal);
     }
 
+    /** Caller releases the returned ReceiveLease. */
+    async requestBinary(
+        handle: RouteHandle,
+        body: Uint8Array,
+        options: RequestOptions = {},
+    ): Promise<ReceiveLease> {
+        const active = this.requireLiveHandle(handle);
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const terminal = await this.awaitRequest(active.generation, {
+            channel: handle.channel,
+            epoch: handle.epoch,
+            body: bytesFrameBody(body),
+            deadline,
+            options,
+            responseMode: "binary",
+            binary: true,
+        });
+        if (terminal.kind !== "response" || !(terminal.body instanceof ReceiveLease)) {
+            throw new McHostCallError(
+                "terminal",
+                "binary request did not receive a binary response",
+                "expected_binary_response",
+            );
+        }
+        return terminal.body;
+    }
+
     /**
      * Managed route + request convenience: opens and caches a route keyed by
      * (target kind, module id, identity, consumer identity), reconnecting
@@ -491,9 +522,8 @@ export class McHostClient {
         options: ManagedCallOptions = {},
     ): Promise<Response> {
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
-        const body = Buffer.from(
+        const body = utf8FrameBody(
             JSON.stringify(params === undefined ? { method } : { method, params }),
-            "utf8",
         );
         let replaySpent = false;
         for (;;) {
@@ -805,7 +835,10 @@ export class McHostClient {
             if (flagsBinary(terminal.flags)) {
                 throw new NegotiationError("malformed_json", "flags");
             }
-            return decodeNegotiateResponse(terminal.body, offers);
+            return decodeNegotiateResponse(
+                requireJsonReceiveBody(terminal.body).text ?? "",
+                offers,
+            );
         } catch (error) {
             throw wrapNegotiationError(error);
         }
@@ -893,7 +926,7 @@ export class McHostClient {
             if (flagsBinary(activate.flags)) {
                 throw new NegotiationError("malformed_json", "flags");
             }
-            decodeActivateResponse(activate.body);
+            decodeActivateResponse(requireJsonReceiveBody(activate.body).text ?? "");
             const commit = await this.awaitRequest(candidate, {
                 channel: 0,
                 epoch: 0,
@@ -905,7 +938,7 @@ export class McHostClient {
             if (flagsBinary(commit.flags)) {
                 throw new NegotiationError("malformed_json", "flags");
             }
-            decodeCommitResponse(commit.body);
+            decodeCommitResponse(requireJsonReceiveBody(commit.body).text ?? "");
         } catch (error) {
             const failure = boundedNegotiationFailure(error);
             candidate.retire("negotiation_failed", failure);
@@ -1015,6 +1048,8 @@ export class McHostClient {
             body: params.body,
             deadline: params.deadline,
             mode: "unary",
+            responseMode: params.responseMode,
+            binary: params.binary,
             priority: params.options.priority,
             admissionClass: params.options.admissionClass,
         });
@@ -1027,10 +1062,11 @@ export class McHostClient {
         try {
             const terminal = await pending.result;
             if (terminal.kind === "error") {
-                const failure = terminalFromErrorBody(terminal.body);
+                const errorBody = requireJsonReceiveBody(terminal.body);
+                const failure = terminalFromErrorBody(errorBody);
                 if (params.captureErrorTerminal === true) {
                     failure.errorTerminal = {
-                        body: terminal.body,
+                        bodyText: errorBody.text,
                         flags: terminal.flags,
                         // A stream frame ahead of the terminal means the
                         // host produced response data, which cannot prove a
@@ -1078,12 +1114,8 @@ export class McHostClient {
             deadline,
             options: {},
         });
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(Buffer.from(terminal.body).toString("utf8"));
-        } catch {
-            parsed = undefined;
-        }
+        const responseBody = requireJsonReceiveBody(terminal.body);
+        const parsed = responseBody.valid ? responseBody.value : undefined;
         if (
             typeof parsed !== "object" ||
             parsed === null ||
@@ -1096,7 +1128,12 @@ export class McHostClient {
                 "malformed_control_response",
             );
         }
-        this.emitDiagnostics({ type: "parse", channel: 0, epoch: 0, len: terminal.body.length });
+        this.emitDiagnostics({
+            type: "parse",
+            channel: 0,
+            epoch: 0,
+            len: responseBody.byteLength,
+        });
         return parsed as Record<string, unknown>;
     }
 
@@ -1443,8 +1480,11 @@ export class McHostClient {
 // Body encoding and terminal classification helpers.
 // ----------------------------------------------------------------------
 
-function encodeBody(body: unknown): Uint8Array {
-    return body instanceof Uint8Array ? body : Buffer.from(JSON.stringify(body), "utf8");
+function encodeBody(body: unknown): DirectFrameBody {
+    if (body instanceof Uint8Array) return bytesFrameBody(body);
+    const text = JSON.stringify(body);
+    if (text === undefined) throw new TypeError("request body is not JSON serializable");
+    return utf8FrameBody(text);
 }
 
 /** Canonical compact `route.open` request body (wire doc 7.2). */
@@ -1477,33 +1517,47 @@ function routeOpenBody(
     );
 }
 
-/** Canonical `ErrorBody {code, message}` into a `terminal` McHostCallError. */
-function terminalFromErrorBody(body: Uint8Array): McHostCallError {
-    const text = Buffer.from(body).toString("utf8");
-    try {
-        const parsed = JSON.parse(text) as { code?: unknown; message?: unknown };
-        if (typeof parsed === "object" && parsed !== null) {
-            const code = typeof parsed.code === "string" ? parsed.code : undefined;
-            const message = typeof parsed.message === "string" ? parsed.message : undefined;
-            return new McHostCallError("terminal", message ?? "mc-host error", code);
-        }
-    } catch {
-        // Fall through to the opaque-body form.
-    }
-    return new McHostCallError("terminal", text || "mc-host error");
-}
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-function parseResponseJson<Response = unknown>(terminal: RequestTerminal): Response {
-    try {
-        return JSON.parse(Buffer.from(terminal.body).toString("utf8"));
-    } catch (error) {
+function requireJsonReceiveBody(body: RequestTerminal["body"]): JsonReceiveBody {
+    if (body instanceof ReceiveLease) {
+        // A quarantined release throws after onRelease has already accounted
+        // the outcome; the unexpected_binary_response error must win here.
+        if (!body.isReleased()) {
+            try {
+                body.release();
+            } catch {
+                // Quarantine is already accounted by onRelease before the throw.
+            }
+        }
         throw new McHostCallError(
             "terminal",
-            "response body was not valid JSON",
-            "invalid_response_body",
-            error,
+            "response body was unexpectedly binary",
+            "unexpected_binary_response",
         );
     }
+    return body;
+}
+
+/** Canonical `ErrorBody {code, message}` into a `terminal` McHostCallError. */
+function terminalFromErrorBody(body: JsonReceiveBody): McHostCallError {
+    if (typeof body.value === "object" && body.value !== null && !Array.isArray(body.value)) {
+        const parsed = body.value as { code?: unknown; message?: unknown };
+        const code = typeof parsed.code === "string" ? parsed.code : undefined;
+        const message = typeof parsed.message === "string" ? parsed.message : undefined;
+        return new McHostCallError("terminal", message ?? "mc-host error", code);
+    }
+    return new McHostCallError("terminal", body.text || "mc-host error");
+}
+
+function parseResponseJson<Response = JsonValue>(terminal: RequestTerminal): Response {
+    const body = requireJsonReceiveBody(terminal.body);
+    if (body.valid) return body.value as Response;
+    throw new McHostCallError(
+        "terminal",
+        "response body was not valid JSON",
+        "invalid_response_body",
+    );
 }
 
 function wrapNegotiationError(error: unknown): Error {

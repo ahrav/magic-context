@@ -355,17 +355,22 @@ class StrictJsonParser {
     }
 }
 
-function parseStrict(bytes: Uint8Array): StrictValue {
+type JsonInput = Uint8Array | string;
+
+function parseStrict(bytes: JsonInput): StrictValue {
     let text: string;
     try {
-        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        text =
+            typeof bytes === "string"
+                ? bytes
+                : new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     } catch {
         throw new NegotiationError("malformed_json", "body");
     }
     return new StrictJsonParser(text).parse();
 }
 
-function requireRootObject(bytes: Uint8Array): Map<string, StrictValue> {
+function requireRootObject(bytes: JsonInput): Map<string, StrictValue> {
     const root = parseStrict(bytes);
     if (root.kind !== "object") {
         throw new NegotiationError("invalid_type", "body");
@@ -561,7 +566,7 @@ function decodeOffers(fields: Map<string, StrictValue>): TransportOffer[] {
  * An unsupported-but-valid `negotiation_version` decodes successfully: the
  * version-mismatch fallback is host policy, not grammar.
  */
-export function decodeNegotiateRequest(bytes: Uint8Array): NegotiateRequest {
+export function decodeNegotiateRequest(bytes: JsonInput): NegotiateRequest {
     const fields = requireRootObject(bytes);
     checkClosedFields(fields, ["op", "negotiation_version", "offers"], "body");
     requireOp(fields, OP_TRANSPORT_NEGOTIATE);
@@ -593,7 +598,7 @@ function requireActivationToken(fields: Map<string, StrictValue>): string {
  * `(transport, capability_version)` entry (wire doc Section 7.7.2).
  */
 export function decodeNegotiateResponse(
-    bytes: Uint8Array,
+    bytes: JsonInput,
     offers: readonly TransportOffer[],
 ): NegotiateResponse {
     const fields = requireRootObject(bytes);
@@ -655,7 +660,7 @@ export function decodeNegotiateResponse(
 }
 
 /** Decodes one candidate `transport.activate` request body (correlation 1). */
-export function decodeActivateRequest(bytes: Uint8Array): ActivateRequest {
+export function decodeActivateRequest(bytes: JsonInput): ActivateRequest {
     const fields = requireRootObject(bytes);
     checkClosedFields(fields, ["op", "negotiation_version", "activation_token"], "body");
     requireOp(fields, OP_TRANSPORT_ACTIVATE);
@@ -668,21 +673,21 @@ export function decodeActivateRequest(bytes: Uint8Array): ActivateRequest {
  * no provider data: any additional field is malformed (wire doc Section
  * 7.7.4).
  */
-export function decodeActivateResponse(bytes: Uint8Array): void {
+export function decodeActivateResponse(bytes: JsonInput): void {
     decodeTaggedOnly(bytes, OP_TRANSPORT_ACTIVATE);
 }
 
 /** Decodes one candidate `transport.commit` request body (correlation 2). */
-export function decodeCommitRequest(bytes: Uint8Array): void {
+export function decodeCommitRequest(bytes: JsonInput): void {
     decodeTaggedOnly(bytes, OP_TRANSPORT_COMMIT);
 }
 
 /** Decodes one tagged candidate `transport.commit` response body. */
-export function decodeCommitResponse(bytes: Uint8Array): void {
+export function decodeCommitResponse(bytes: JsonInput): void {
     decodeTaggedOnly(bytes, OP_TRANSPORT_COMMIT);
 }
 
-function decodeTaggedOnly(bytes: Uint8Array, op: string): void {
+function decodeTaggedOnly(bytes: JsonInput, op: string): void {
     const fields = requireRootObject(bytes);
     checkClosedFields(fields, ["op", "negotiation_version"], "body");
     requireOp(fields, op);

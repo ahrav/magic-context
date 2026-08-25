@@ -47,7 +47,7 @@ export class McHostCallError extends Error {
      * peer-controlled Error terminals with a bounded failure before
      * exposing them to callers.
      */
-    errorTerminal?: { body: Uint8Array; flags: number; streamed: boolean };
+    errorTerminal?: { bodyText: string | null; flags: number; streamed: boolean };
 
     constructor(
         readonly kind: McHostCallErrorKind,

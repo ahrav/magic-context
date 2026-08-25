@@ -288,6 +288,7 @@ pub async fn run(
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
             rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
             let parent = rustix::process::getppid().map(|pid| pid.as_raw_nonzero().get() as u32);
             if parent == Some(host_pid) {

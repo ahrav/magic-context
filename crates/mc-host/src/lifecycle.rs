@@ -17,7 +17,7 @@ use crate::connection_file::{ConnectionInfo, KEY_LEN};
 
 use crate::instance::{
     flock_bounded, flock_exclusive_bounded, hex, io_err, is_safe_ancestor, is_secure_regular,
-    read_all_fd, runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard,
+    mode_bits, read_all_fd, runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard,
     CONNECTION_FILE_NAME, S_IFDIR, S_IFMT,
 };
 
@@ -350,9 +350,10 @@ fn open_validated_dir(dir_path: &Path) -> Result<Option<OwnedFd>, InstanceError>
                 return Err(insecure());
             }
         } else {
-            let is_dir = (stat.st_mode & S_IFMT) == S_IFDIR;
+            let mode = mode_bits(&stat);
+            let is_dir = (mode & S_IFMT) == S_IFDIR;
             let owner_ok = stat.st_uid == rustix::process::geteuid().as_raw();
-            if !is_dir || !owner_ok || stat.st_mode & 0o077 != 0 {
+            if !is_dir || !owner_ok || mode & 0o077 != 0 {
                 return Err(insecure());
             }
         }
@@ -1227,6 +1228,7 @@ mod tests {
             .send(crate::frame_channel::OutboundFrame {
                 bytes: vec![0u8; 8],
                 tail: Vec::new(),
+                direct: None,
                 charge: crate::wire::ByteCharge::none(),
                 written: Some(Box::new(move |_at| commit.acknowledge())),
             })
@@ -1307,6 +1309,7 @@ mod tests {
     /// signal unambiguous and bounded: the harness reports a failure, and no
     /// wedged thread outlives it. The fixed build returns in microseconds and
     /// never reaches the deadline.
+    #[cfg(target_os = "linux")]
     fn within<T: Send + 'static>(
         budget: Duration,
         diagnosis: &str,
@@ -1333,6 +1336,7 @@ mod tests {
     /// reading blocks until a writer arrives. Without `O_NONBLOCK` both
     /// evidence readers hang forever; the probe must instead classify the
     /// hostile shape.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_fifo_at_an_evidence_name_cannot_hang_the_probe() {
         for name in [LIFECYCLE_RECORD_NAME, CONNECTION_FILE_NAME] {
@@ -1373,6 +1377,7 @@ mod tests {
     /// A FIFO at the record name must not hang fenced removal either: that
     /// runs from `Drop` while the instance lock is held, so a hang would
     /// retain the lock and fail every later start.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_fifo_at_the_record_name_cannot_hang_fenced_removal() {
         let root = temp_root();

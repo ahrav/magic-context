@@ -24,16 +24,20 @@ import { armExpiryTimer, type Deadline } from "./deadline";
 import { McHostCallError, SocketClosedError, SocketTimeoutError } from "./errors";
 import {
     ByteBudget,
+    bytesFrameBody,
+    type DirectFrameBody,
     type FrameChannelCloseReason,
     type FrameChannelHandlers,
     type FrameMeta,
     type FrameSendTicket,
+    ReceiveLease,
     type SetupFrameChannel,
 } from "./frame-channel";
 import {
     buildFlags,
     type EnvelopeHeader,
     FrameType,
+    flagsBinary,
     MAX_CORRELATION,
     MAX_FRAME_BODY_LEN,
     PROTOCOL_VERSION,
@@ -55,7 +59,13 @@ const RETIREMENT_SETTLE_GRACE_MS = 50;
  * reserved control frames, and small control-plane bodies.
  */
 const DEFAULT_MEMORY_OVERHEAD_BYTES = 1_048_576;
-const EMPTY_BODY = new Uint8Array(0);
+const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
+    kind: "json",
+    byteLength: 0,
+    text: "",
+    value: undefined,
+    valid: false,
+});
 
 export type RetirementReason =
     | "setup_failed"
@@ -72,6 +82,7 @@ export type RetirementReason =
     | "control_capacity_exhausted"
     | "cleanup_deadline"
     | "write_failed"
+    | "quarantined"
     | "ambiguous_route_open"
     | "negotiation_failed"
     | "owner_close";
@@ -99,12 +110,22 @@ export interface ConnectionDiagnosticEvent {
     readonly len: number;
 }
 
+export interface JsonReceiveBody {
+    readonly kind: "json";
+    readonly byteLength: number;
+    readonly text: string | null;
+    readonly value: unknown;
+    readonly valid: boolean;
+}
+
+export type RequestReceiveBody = JsonReceiveBody | ReceiveLease;
+
 /** One observed matching terminal. `stream` holds stream-mode StreamData bodies. */
 export interface RequestTerminal {
     kind: "response" | "error" | "stream_end";
-    body: Uint8Array;
+    body: RequestReceiveBody;
     flags: number;
-    stream: Uint8Array[];
+    stream: RequestReceiveBody[];
     /**
      * A StreamData frame arrived before this terminal. Unary mode drains
      * stream bodies privately, so `stream` stays empty there and cannot
@@ -117,10 +138,12 @@ export interface RequestTerminal {
 export interface RequestParams {
     channel: number;
     epoch: number;
-    body: Uint8Array;
+    body: Uint8Array | DirectFrameBody;
     /** Absolute operation deadline; covers queueing, writing, and terminal wait. */
     deadline: Deadline;
     mode?: PendingMode;
+    responseMode?: "json" | "binary";
+    binary?: boolean;
     priority?: Priority;
     admissionClass?: AdmissionClass;
 }
@@ -202,10 +225,11 @@ interface PendingEntry {
     epoch: number;
     corr: bigint;
     mode: PendingMode;
+    responseMode: "json" | "binary";
     writeInvoked: boolean;
     callerSettled: boolean;
     sawStream: boolean;
-    streamItems: Uint8Array[];
+    streamItems: RequestReceiveBody[];
     heldBytes: number;
     resolve: (terminal: RequestTerminal) => void;
     reject: (error: unknown) => void;
@@ -217,6 +241,54 @@ interface PendingEntry {
 
 function pendingKey(channel: number, epoch: number, corr: bigint): string {
     return `${channel}:${epoch}:${corr}`;
+}
+
+function consumeJsonBody(lease: ReceiveLease): JsonReceiveBody {
+    const byteLength = lease.byteLength;
+    let text: string | null = null;
+    let value: unknown;
+    let valid = false;
+    try {
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        text = "";
+        for (let index = 0; index < lease.segmentCount; index++) {
+            text += decoder.decode(lease.segment(index), { stream: true });
+        }
+        text += decoder.decode();
+        try {
+            value = JSON.parse(text);
+            valid = true;
+        } catch {
+            value = undefined;
+        }
+        return { kind: "json", byteLength, text, value, valid };
+    } catch {
+        return { kind: "json", byteLength, text: null, value: undefined, valid: false };
+    } finally {
+        releaseQuietly(lease);
+    }
+}
+
+/**
+ * Releases a lease without letting a quarantined outcome unwind the caller.
+ * The outcome is already reported through the lease's `onRelease` before
+ * `release()` throws, so the throw is a redundant signal that dispatch,
+ * retirement, and body-consumption paths must contain: escaping there would
+ * abort teardown mid-way or convert a known terminal into a channel close.
+ */
+function releaseQuietly(lease: ReceiveLease): void {
+    if (lease.isReleased()) return;
+    try {
+        lease.release();
+    } catch {
+        // Quarantine is already accounted by onRelease before the throw.
+    }
+}
+
+function releaseReceiveBodies(bodies: readonly RequestReceiveBody[]): void {
+    for (const body of bodies) {
+        if (body instanceof ReceiveLease) releaseQuietly(body);
+    }
 }
 
 /**
@@ -382,14 +454,15 @@ export class ConnectionGeneration {
             );
         }
         const flags = buildFlags(
-            false,
+            params.binary ?? false,
             params.priority ?? Priority.Interactive,
             false,
             params.admissionClass ?? AdmissionClass.Normal,
         );
+        const body = params.body instanceof Uint8Array ? bytesFrameBody(params.body) : params.body;
         const corr = this.nextCorr;
         const header: EnvelopeHeader = {
-            len: params.body.length,
+            len: body.byteLength,
             ver: PROTOCOL_VERSION,
             ty: FrameType.Request,
             flags,
@@ -414,6 +487,7 @@ export class ConnectionGeneration {
             epoch: params.epoch,
             corr,
             mode: params.mode ?? "unary",
+            responseMode: params.responseMode ?? "json",
             writeInvoked: false,
             callerSettled: false,
             sawStream: false,
@@ -433,15 +507,23 @@ export class ConnectionGeneration {
             // The channel validates the encoded header and refuses a full
             // queue or an over-cap frame BEFORE any state changes, so the
             // correlation is committed only after successful admission.
-            ticket = this.channel.send(
-                { header, body: params.body },
+            ticket = this.channel.produce(
                 {
-                    // KTD4 possible-send boundary: fired immediately before
-                    // socket.write() is invoked for any of this frame's bytes.
+                    ver: header.ver,
+                    ty: header.ty,
+                    flags: header.flags,
+                    channel: header.channel,
+                    epoch: header.epoch,
+                    corr: header.corr,
+                },
+                body,
+                {
+                    // onPublish runs immediately before transport publication begins.
                     onPublish: () => {
                         entry.writeInvoked = true;
                     },
                 },
+                params.deadline,
             );
         } catch (error) {
             this.pending.delete(key);
@@ -458,7 +540,7 @@ export class ConnectionGeneration {
             channel: params.channel,
             epoch: params.epoch,
             corr,
-            len: params.body.length,
+            len: body.byteLength,
         };
         if (!this.retiredInfo) {
             entry.cancelDeadlineTimer = this.armDeadlineTimer(params.deadline, () =>
@@ -550,6 +632,8 @@ export class ConnectionGeneration {
                     );
                 }
             }
+            releaseReceiveBodies(entry.streamItems);
+            entry.streamItems = [];
             this.resolveTicket(entry);
         }
         this.pending.clear();
@@ -647,22 +731,21 @@ export class ConnectionGeneration {
     // Frame dispatch and pending-entry settlement.
     // ------------------------------------------------------------------
 
-    private dispatch(header: EnvelopeHeader, body: Uint8Array): void {
+    private dispatch(header: EnvelopeHeader, body: ReceiveLease): void {
         this.emitDiagnostic("dispatch", {
             ty: header.ty,
             channel: header.channel,
             epoch: header.epoch,
             corr: header.corr,
-            len: body.length,
+            len: body.byteLength,
         });
         switch (header.ty) {
             case FrameType.Ping:
-                // Echo version, flags, channel, epoch, and correlation via
-                // reserved control capacity. Host correlations are a fully
-                // separate namespace: nothing is stored or matched here.
+                releaseQuietly(body);
                 this.enqueueControlHeader({ ...header, ty: FrameType.Pong });
                 return;
             case FrameType.Goodbye:
+                releaseQuietly(body);
                 if (header.channel === 0) {
                     this.retire(
                         "connection_goodbye",
@@ -673,7 +756,7 @@ export class ConnectionGeneration {
                 }
                 return;
             case FrameType.Push:
-                // Compatibility-only: decoded and fenced; no route cache here.
+                releaseQuietly(body);
                 this.droppedFrameCount++;
                 return;
             case FrameType.Response:
@@ -683,36 +766,49 @@ export class ConnectionGeneration {
                 this.dispatchToPending(header, body);
                 return;
             default:
-                return;
+                releaseQuietly(body);
         }
     }
 
-    private dispatchToPending(header: EnvelopeHeader, body: Uint8Array): void {
-        // Route epoch is part of the key, so a stale-epoch frame can never
-        // reach a live entry; stale/unmatched/duplicate/post-terminal
-        // ingress all land here and are dropped.
+    private dispatchToPending(header: EnvelopeHeader, lease: ReceiveLease): void {
         const entry = this.pending.get(pendingKey(header.channel, header.epoch, header.corr));
         if (!entry) {
+            releaseQuietly(lease);
             this.droppedFrameCount++;
             return;
         }
         if (header.ty === FrameType.StreamData) {
-            if (entry.callerSettled) return;
-            entry.sawStream = true;
-            if (entry.mode === "stream") {
-                entry.streamItems.push(body);
-                entry.heldBytes += body.length;
-                this.chargePending(body.length);
+            if (entry.callerSettled) {
+                releaseQuietly(lease);
+                return;
             }
-            // Unary mode drains a legal stream privately: bytes are dropped.
+            entry.sawStream = true;
+            if (entry.mode === "unary") {
+                releaseQuietly(lease);
+                return;
+            }
+            let body: RequestReceiveBody;
+            try {
+                body = this.consumeResponseBody(entry, header, lease);
+            } catch (error) {
+                this.settleCallerReject(entry, error);
+                this.finishEntry(entry);
+                return;
+            }
+            entry.streamItems.push(body);
+            if (!(body instanceof ReceiveLease)) {
+                entry.heldBytes += body.byteLength;
+                this.chargePending(body.byteLength);
+            }
             return;
         }
-        // Terminal: Response, Error, or StreamEnd.
         if (entry.callerSettled) {
+            releaseQuietly(lease);
             this.finishEntry(entry);
             return;
         }
         if (header.ty === FrameType.Error) {
+            const body = consumeJsonBody(lease);
             this.settleCallerResolve(entry, {
                 kind: "error",
                 body,
@@ -721,10 +817,11 @@ export class ConnectionGeneration {
                 sawStream: entry.sawStream,
             });
         } else if (header.ty === FrameType.StreamEnd) {
+            releaseQuietly(lease);
             if (entry.mode === "stream") {
                 this.settleCallerResolve(entry, {
                     kind: "stream_end",
-                    body: EMPTY_BODY,
+                    body: EMPTY_JSON_BODY,
                     flags: header.flags,
                     stream: entry.streamItems,
                     sawStream: entry.sawStream,
@@ -739,25 +836,61 @@ export class ConnectionGeneration {
                     ),
                 );
             }
-        } else if (entry.mode === "unary" && entry.sawStream) {
-            this.settleCallerReject(
-                entry,
-                new McHostCallError(
-                    "terminal",
-                    "unary request received a stream before its Response",
-                    "unexpected_stream",
-                ),
-            );
         } else {
-            this.settleCallerResolve(entry, {
-                kind: "response",
-                body,
-                flags: header.flags,
-                stream: entry.mode === "stream" ? entry.streamItems : [],
-                sawStream: entry.sawStream,
-            });
+            let body: RequestReceiveBody;
+            try {
+                body = this.consumeResponseBody(entry, header, lease);
+            } catch (error) {
+                this.settleCallerReject(entry, error);
+                this.finishEntry(entry);
+                return;
+            }
+            if (entry.mode === "unary" && entry.sawStream) {
+                if (body instanceof ReceiveLease) releaseQuietly(body);
+                this.settleCallerReject(
+                    entry,
+                    new McHostCallError(
+                        "terminal",
+                        "unary request received a stream before its Response",
+                        "unexpected_stream",
+                    ),
+                );
+            } else {
+                this.settleCallerResolve(entry, {
+                    kind: "response",
+                    body,
+                    flags: header.flags,
+                    stream: entry.mode === "stream" ? entry.streamItems : [],
+                    sawStream: entry.sawStream,
+                });
+            }
         }
         this.finishEntry(entry);
+    }
+
+    private consumeResponseBody(
+        entry: PendingEntry,
+        header: EnvelopeHeader,
+        lease: ReceiveLease,
+    ): RequestReceiveBody {
+        if (flagsBinary(header.flags)) {
+            if (entry.responseMode === "binary") return lease;
+            releaseQuietly(lease);
+            throw new McHostCallError(
+                "terminal",
+                "request received an unexpected binary body",
+                "unexpected_binary_response",
+            );
+        }
+        const body = consumeJsonBody(lease);
+        if (entry.responseMode === "binary") {
+            throw new McHostCallError(
+                "terminal",
+                "binary request received a JSON body",
+                "expected_binary_response",
+            );
+        }
+        return body;
     }
 
     private handleRouteGoodbye(channel: number, epoch: number): void {
@@ -801,6 +934,7 @@ export class ConnectionGeneration {
             this.releasePending(entry.heldBytes);
             entry.heldBytes = 0;
         }
+        entry.streamItems = [];
         entry.resolve(terminal);
     }
 
@@ -821,6 +955,7 @@ export class ConnectionGeneration {
             this.releasePending(entry.heldBytes);
             entry.heldBytes = 0;
         }
+        releaseReceiveBodies(entry.streamItems);
         entry.streamItems = [];
         this.resolveTicket(entry);
     }
@@ -916,8 +1051,9 @@ export class ConnectionGeneration {
         if (entry.heldBytes > 0) {
             this.releasePending(entry.heldBytes);
             entry.heldBytes = 0;
-            entry.streamItems = [];
         }
+        releaseReceiveBodies(entry.streamItems);
+        entry.streamItems = [];
         let resolveTicket!: () => void;
         const promise = new Promise<void>((resolve) => {
             resolveTicket = resolve;

@@ -426,6 +426,23 @@ impl McHostHandler for TestHandler {
             "response_bytes" => {
                 zero_response(&ctx, request["bytes"].as_u64().unwrap_or(1) as usize).await
             }
+            "direct_fill" => {
+                let len = request["bytes"].as_u64().unwrap_or(1) as usize;
+                let value = request["value"].as_u64().unwrap_or(0xa5) as u8;
+                match ctx
+                    .output_from_writer(len, move |writer| {
+                        let chunk = [value; 1024];
+                        for _ in 0..len / chunk.len() {
+                            writer.write_all(&chunk)?;
+                        }
+                        writer.write_all(&chunk[..len % chunk.len()])
+                    })
+                    .await
+                {
+                    Ok(body) => RequestOutcome::Response { body, binary: true },
+                    Err(_) => output_error(),
+                }
+            }
             "reserve_then_await_completion" => {
                 let len = request["bytes"].as_u64().unwrap_or(1) as usize;
                 let Ok(mut body) = ctx.reserve_output(len).await else {

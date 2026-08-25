@@ -15,6 +15,8 @@ pub mod config;
 pub mod connection_file;
 pub mod handler;
 pub mod lifecycle;
+#[doc(hidden)]
+pub mod shm_provider;
 pub mod synapse;
 #[doc(hidden)]
 pub mod transport_negotiation;
@@ -24,13 +26,20 @@ pub mod transport_provider;
 mod connection;
 mod control;
 mod dispatch;
-mod frame_channel;
+#[doc(hidden)]
+pub mod frame_channel;
 mod instance;
 mod panic_boundary;
 mod routing;
 mod runtime;
 mod tcp_frame_channel;
-mod wire;
+// Doc-hidden rather than private because `shm_provider`'s public `send`/`recv`
+// already take and return `EnvelopeHeader`, so the type must be nameable by any
+// consumer of that module. Doc-hidden keeps it out of the documented surface:
+// the managed `client` API still yields only `Response`, `StreamItem`, and
+// `CallError`, so raw frame types never reach an ordinary caller.
+#[doc(hidden)]
+pub mod wire;
 
 pub use auth::{
     authenticate_client, authenticate_server, compute_proof, AuthError, AuthStage, Authenticated,

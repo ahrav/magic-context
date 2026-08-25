@@ -19,6 +19,7 @@ export {
     SocketClosedError,
     SocketTimeoutError,
 } from "./errors";
+export { ReceiveLease, type ReceiveReleaseOutcome } from "./frame-channel";
 export { RouteHandle, StaleRouteHandleError } from "./route-handle";
 export {
     AdmissionClass,

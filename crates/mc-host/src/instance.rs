@@ -416,7 +416,8 @@ pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceErr
     }
 
     let stat = rustix::fs::fstat(&current).map_err(|e| io_err("fstat_dir", dir_path, e))?;
-    let is_dir = (stat.st_mode & S_IFMT) == S_IFDIR;
+    let mode = mode_bits(&stat);
+    let is_dir = (mode & S_IFMT) == S_IFDIR;
     let owner_ok = stat.st_uid == rustix::process::geteuid().as_raw();
     if !is_dir || !owner_ok {
         return Err(InstanceError::Insecure {
@@ -576,26 +577,38 @@ const S_ISVTX: u32 = 0o1000;
 pub(crate) const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
+#[cfg(target_os = "macos")]
+pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
+    u32::from(stat.st_mode)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
+    stat.st_mode
+}
+
 /// A directory no other principal can replace: owned by us or by root, and
 /// not group/other-writable unless sticky (a sticky directory forbids
 /// renaming entries you do not own, which is what `/tmp` relies on).
 pub(crate) fn is_safe_ancestor(stat: &rustix::fs::Stat) -> bool {
-    if (stat.st_mode & S_IFMT) != S_IFDIR {
+    let mode = mode_bits(stat);
+    if (mode & S_IFMT) != S_IFDIR {
         return false;
     }
     let ours = rustix::process::geteuid().as_raw();
     if stat.st_uid != ours && stat.st_uid != 0 {
         return false;
     }
-    stat.st_mode & 0o022 == 0 || stat.st_mode & S_ISVTX != 0
+    mode & 0o022 == 0 || mode & S_ISVTX != 0
 }
 
 /// Regular file, single hard link, owned by us, no group/other bits.
 pub(crate) fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
-    (stat.st_mode & S_IFMT) == S_IFREG
+    let mode = mode_bits(stat);
+    (mode & S_IFMT) == S_IFREG
         && stat.st_nlink == 1
         && stat.st_uid == rustix::process::geteuid().as_raw()
-        && stat.st_mode & 0o077 == 0
+        && mode & 0o077 == 0
 }
 
 /// Every canonical name installed through [`write_atomic_owner_only`]. The

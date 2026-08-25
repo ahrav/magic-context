@@ -15,18 +15,18 @@
 #[cfg(test)]
 use crate::wire::Flags;
 use crate::wire::{
-    decode_header, AdmissionClass, DecodeError, EnvelopeHeader, FrameType, FROZEN_PREFIX_LEN,
-    HEADER_LEN, PROTOCOL_VERSION,
+    decode_header, DecodeError, EnvelopeHeader, FrameType, FROZEN_PREFIX_LEN, HEADER_LEN,
+    PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::{timeout_at, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::frame_channel::{
-    frame_sender, FrameReceiver, FrameSender, InboundEvent, InboundFrame, ReadClose, RejectedFrame,
-    SenderQueue,
+    frame_sender, validate_inbound_header, CopyCounter, FrameReceiver, FrameSender, InboundEvent,
+    InboundFrame, ReadClose, RejectedFrame, SenderQueue,
 };
-use crate::wire::{ByteBudget, ByteCharge, MAX_BODY_LEN, MAX_CONTROL_BODY_LEN};
+use crate::wire::{ByteBudget, ByteCharge, MAX_CONTROL_BODY_LEN};
 
 /// Read-side buffering for coalesced small frames.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -43,6 +43,7 @@ pub(crate) struct TcpFrameChannel<R> {
     /// on the stream: the next `recv` drains them under the rejected frame's
     /// own absolute deadline before reading further (protocol §7.1).
     pending_drain: Option<PendingDrain>,
+    copies: CopyCounter,
 }
 
 struct PendingDrain {
@@ -77,12 +78,14 @@ impl<R: AsyncRead + Send + Unpin> TcpFrameChannel<R> {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let (sender, queue) = frame_sender(queue_frames, generation, frame_deadline);
+        let copies = CopyCounter::default();
         let receiver = Self {
             reader: BufReader::with_capacity(READ_BUFFER_BYTES, read),
             frame_deadline,
             budget: ingress,
             cancel: read_cancel,
             pending_drain: None,
+            copies,
         };
         let task = Box::pin(write_frames(write, queue, frame_deadline));
         (sender, receiver, task)
@@ -112,6 +115,7 @@ impl<R: AsyncRead + Send + Unpin> FrameReceiver for TcpFrameChannel<R> {
             self.frame_deadline,
             &self.budget,
             &self.cancel,
+            &self.copies,
         )
         .await?
         {
@@ -146,6 +150,7 @@ async fn read_frame<R>(
     frame_deadline: Duration,
     budget: &ByteBudget,
     cancel: &CancellationToken,
+    copies: &CopyCounter,
 ) -> Result<ReadEvent, ReadClose>
 where
     R: AsyncRead + Unpin,
@@ -188,26 +193,7 @@ where
         })
     })?;
 
-    if header.len > MAX_BODY_LEN {
-        return Err(ReadClose::Corrupt("body over interoperability cap"));
-    }
-    if header.ty.is_pure_header()
-        && (header.flags.is_binary()
-            || header.flags.is_last()
-            || header.flags.admission_class() != Some(AdmissionClass::Normal))
-    {
-        return Err(ReadClose::Corrupt("invalid pure-header flags"));
-    }
-    // Consumer-role classification from the header alone, BEFORE any body
-    // admission: a role-invalid type with a large declared body must not
-    // hold ingress budget or an allocation through the frame deadline —
-    // the type already proves the generation closes (protocol §6.2).
-    if !matches!(
-        header.ty,
-        FrameType::Request | FrameType::Cancel | FrameType::Pong | FrameType::Goodbye
-    ) {
-        return Err(ReadClose::Corrupt("role-invalid frame type"));
-    }
+    validate_inbound_header(header)?;
 
     if header.ty == FrameType::Request && header.channel == 0 && header.len > MAX_CONTROL_BODY_LEN {
         // The header alone proves the violation; never buffer the body
@@ -233,11 +219,12 @@ where
         read_body_deadline(reader, &mut body, header.len as usize, deadline, cancel).await?;
     }
 
-    Ok(ReadEvent::Frame(InboundFrame {
+    Ok(ReadEvent::Frame(InboundFrame::contiguous(
         header,
         body,
         charge,
-    }))
+        copies.clone(),
+    )))
 }
 
 /// Discards the declared bytes of an early-rejected oversize control body
@@ -346,34 +333,58 @@ async fn write_frames<W>(mut stream: W, mut queue: SenderQueue, write_deadline: 
 where
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    let discard = queue.discard.clone();
+    let finish = queue.finish.clone();
     loop {
-        let frame = tokio::select! {
+        let mut queued = tokio::select! {
             biased;
-            () = queue.discard.cancelled() => break,
+            () = discard.cancelled() => break,
             // Finished: flush what is queued, then exit without waiting
             // for senders an inert handler may still hold.
-            () = queue.finish.cancelled() => match queue.rx.try_recv() {
+            () = finish.cancelled() => match queue.try_recv() {
                 Ok(frame) => frame,
                 Err(_) => break,
             },
-            frame = queue.rx.recv() => match frame {
+            frame = queue.recv() => match frame {
                 Some(frame) => frame,
                 None => break,
             },
         };
+        // `begin_publication` synchronizes cancellation with the possible-send
+        // transition before the first transport write.
+        if !queued.begin_publication() {
+            continue;
+        }
+        let completion = std::sync::Arc::clone(&queued.state);
         let crate::frame_channel::OutboundFrame {
-            bytes,
-            tail,
+            mut bytes,
+            mut tail,
+            direct,
             charge,
             written,
-        } = frame;
+        } = queued.frame;
+        if let Some(direct) = direct {
+            let encoded =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| direct.into_owned()));
+            match encoded {
+                Ok(Ok(encoded)) => {
+                    bytes = encoded;
+                    tail.clear();
+                }
+                Ok(Err(_)) | Err(_) => {
+                    queue.retired.cancel();
+                    queue.generation.cancel();
+                    break;
+                }
+            }
+        }
         // The completion instant is taken inside the arm, the moment
         // `write_all` returns — not after the result check — so a
         // preemption between them cannot push `completed_at` past a peer
         // answer that the bytes themselves caused.
         let result = tokio::select! {
             biased;
-            () = queue.discard.cancelled() => None,
+            () = discard.cancelled() => None,
             result = tokio::time::timeout(write_deadline, async {
                 stream.write_all(&bytes).await?;
                 if !tail.is_empty() {
@@ -394,6 +405,10 @@ where
             queue.generation.cancel();
             break;
         }
+        completion.store(
+            crate::frame_channel::COMPLETE,
+            std::sync::atomic::Ordering::Release,
+        );
         if let Some(written) = written {
             written(completed_at);
         }
@@ -518,7 +533,7 @@ mod tests {
     use std::io;
     use tokio::io::{duplex, AsyncWriteExt};
 
-    use crate::wire::{encode_frame, response_flags, FrameId};
+    use crate::wire::{encode_frame, response_flags, FrameId, MAX_BODY_LEN};
 
     fn budget() -> ByteBudget {
         ByteBudget::new(crate::config::MIN_RESIDENT_BYTES)
@@ -540,6 +555,7 @@ mod tests {
         crate::frame_channel::OutboundFrame {
             bytes,
             tail: Vec::new(),
+            direct: None,
             charge: ByteCharge::none(),
             written: None,
         }
@@ -558,6 +574,7 @@ mod tests {
             budget,
             cancel,
             pending_drain: None,
+            copies: CopyCounter::default(),
         }
     }
 
@@ -566,10 +583,16 @@ mod tests {
         let (client, mut server) = duplex(64);
         drop(client);
         let cancel = CancellationToken::new();
-        let err = read_frame(&mut server, Duration::from_secs(1), &budget(), &cancel)
-            .await
-            .err()
-            .expect("close");
+        let err = read_frame(
+            &mut server,
+            Duration::from_secs(1),
+            &budget(),
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .err()
+        .expect("close");
         assert!(matches!(err, ReadClose::CleanEof));
     }
 
@@ -579,10 +602,16 @@ mod tests {
         let cancel = CancellationToken::new();
         client.write_all(&[7u8]).await.unwrap();
         drop(client);
-        let err = read_frame(&mut server, Duration::from_secs(1), &budget(), &cancel)
-            .await
-            .err()
-            .expect("close");
+        let err = read_frame(
+            &mut server,
+            Duration::from_secs(1),
+            &budget(),
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .err()
+        .expect("close");
         assert!(matches!(err, ReadClose::Corrupt(_)));
     }
 
@@ -594,10 +623,16 @@ mod tests {
         wire.extend_from_slice(b"abc");
         client.write_all(&wire).await.unwrap();
         drop(client);
-        let err = read_frame(&mut server, Duration::from_secs(1), &budget(), &cancel)
-            .await
-            .err()
-            .expect("close");
+        let err = read_frame(
+            &mut server,
+            Duration::from_secs(1),
+            &budget(),
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .err()
+        .expect("close");
         assert!(matches!(err, ReadClose::Corrupt("EOF inside frame")));
     }
 
@@ -606,7 +641,18 @@ mod tests {
         let (mut client, mut server) = duplex(64);
         let cancel = CancellationToken::new();
         let read = tokio::spawn(async move {
-            read_frame(&mut server, Duration::from_secs(5), &budget(), &cancel).await
+            match read_frame(
+                &mut server,
+                Duration::from_secs(5),
+                &budget(),
+                &cancel,
+                &CopyCounter::default(),
+            )
+            .await
+            {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            }
         });
         // Idle wait is unbounded: nothing has been sent yet.
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -617,7 +663,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         client.write_all(&[0u8, 0u8]).await.unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let err = read.await.unwrap().err().expect("deadline close");
+        let err = read.await.unwrap().expect_err("deadline close");
         assert!(matches!(err, ReadClose::Corrupt("frame deadline expired")));
     }
 
@@ -634,9 +680,15 @@ mod tests {
             9,
         );
         client.write_all(&header).await.unwrap();
-        let event = read_frame(&mut server, Duration::from_secs(1), &budget(), &cancel)
-            .await
-            .expect("event");
+        let event = read_frame(
+            &mut server,
+            Duration::from_secs(1),
+            &budget(),
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .expect("event");
         match event {
             ReadEvent::OversizeControl { header, .. } => {
                 assert_eq!(header.len, MAX_CONTROL_BODY_LEN + 1);
@@ -653,9 +705,15 @@ mod tests {
         let mut wire = header_bytes(MAX_CONTROL_BODY_LEN, FrameType::Request as u8, 0, 0, 0, 3);
         wire.extend_from_slice(&vec![b' '; MAX_CONTROL_BODY_LEN as usize]);
         let writer = tokio::spawn(async move { client.write_all(&wire).await });
-        let event = read_frame(&mut server, Duration::from_secs(5), &budget(), &cancel)
-            .await
-            .expect("event");
+        let event = read_frame(
+            &mut server,
+            Duration::from_secs(5),
+            &budget(),
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .expect("event");
         writer.await.unwrap().unwrap();
         assert!(matches!(
             event,
@@ -672,10 +730,16 @@ mod tests {
         let cancel = CancellationToken::new();
         let header = header_bytes(MAX_BODY_LEN + 1, FrameType::Request as u8, 0, 7, 1, 1);
         client.write_all(&header).await.unwrap();
-        let err = read_frame(&mut server, Duration::from_secs(1), &tiny_budget, &cancel)
-            .await
-            .err()
-            .expect("close");
+        let err = read_frame(
+            &mut server,
+            Duration::from_secs(1),
+            &tiny_budget,
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .err()
+        .expect("close");
         assert!(matches!(
             err,
             ReadClose::Corrupt("body over interoperability cap")
@@ -693,18 +757,30 @@ mod tests {
         wire.extend_from_slice(&header_bytes(0, FrameType::Goodbye as u8, 0, 0, 0, 0));
         let writer = tokio::spawn(async move { client.write_all(&wire).await });
 
-        let event = read_frame(&mut server, Duration::from_secs(5), &budget(), &cancel)
-            .await
-            .expect("event");
+        let event = read_frame(
+            &mut server,
+            Duration::from_secs(5),
+            &budget(),
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .expect("event");
         let ReadEvent::OversizeControl { header, deadline } = event else {
             panic!("expected oversize control");
         };
         drain_declared_body(&mut server, header.len, deadline, &cancel)
             .await
             .expect("drain");
-        let next = read_frame(&mut server, Duration::from_secs(5), &budget(), &cancel)
-            .await
-            .expect("aligned next frame");
+        let next = read_frame(
+            &mut server,
+            Duration::from_secs(5),
+            &budget(),
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .expect("aligned next frame");
         writer.await.unwrap().unwrap();
         assert!(matches!(
             next,
@@ -832,7 +908,7 @@ mod tests {
                 panic!("expected a complete frame");
             };
             assert_eq!(frame.header.corr, corr);
-            assert_eq!(frame.body, body);
+            frame.with_lease(|lease| assert_eq!(lease.segment(0), Some(body)));
         }
         writer.await.unwrap();
     }
@@ -877,7 +953,7 @@ mod tests {
             panic!("expected a complete frame");
         };
         assert_eq!(frame.header.len, MAX_BODY_LEN);
-        assert_eq!(frame.body.len(), MAX_BODY_LEN as usize);
+        assert_eq!(frame.body_len(), MAX_BODY_LEN as usize);
         assert_eq!(budget.available(), baseline - MAX_BODY_LEN as usize);
         drop(frame);
         assert_eq!(budget.available(), baseline);
@@ -892,9 +968,15 @@ mod tests {
         let mut wire = header_bytes(5, FrameType::Request as u8, 0, 3, 1, 1);
         wire.extend_from_slice(b"hello");
         client.write_all(&wire).await.unwrap();
-        let event = read_frame(&mut server, Duration::from_secs(1), &budget, &cancel)
-            .await
-            .expect("frame");
+        let event = read_frame(
+            &mut server,
+            Duration::from_secs(1),
+            &budget,
+            &cancel,
+            &CopyCounter::default(),
+        )
+        .await
+        .expect("frame");
         let ReadEvent::Frame(frame) = event else {
             panic!("expected frame");
         };
@@ -1019,6 +1101,7 @@ mod tests {
             .send(crate::frame_channel::OutboundFrame {
                 bytes,
                 tail: Vec::new(),
+                direct: None,
                 charge,
                 written: None,
             })
