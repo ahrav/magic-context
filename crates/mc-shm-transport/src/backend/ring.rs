@@ -994,6 +994,14 @@ impl Ring {
         Ok((descriptors, bytes))
     }
 
+    /// Readiness probe that only reads shared state. commentlint: allow(JUDGE)
+    pub fn probe(&self) -> Result<(), RingError> {
+        if self.is_quarantined() {
+            return Err(RingError::Quarantined);
+        }
+        self.conservation().map(|_| ())
+    }
+
     /// Verifies all pages are resident after setup prefault.
     pub fn verify_prefaulted(&self) -> Result<bool, RingError> {
         let mut residency = vec![0u8; residency_vector_len(self.mapping.len, system_page_size())];

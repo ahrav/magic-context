@@ -838,7 +838,7 @@ async fn tcp_only_selection_is_exact_and_the_generation_serves_requests() {
 }
 
 #[tokio::test]
-async fn unprovided_non_tcp_offer_selects_tcp_with_unavailable() {
+async fn unprovided_non_tcp_offer_selects_reasonless_tcp() {
     let host = TestHost::start().await;
     let mut client = host.client().await;
 
@@ -851,7 +851,10 @@ async fn unprovided_non_tcp_offer_selects_tcp_with_unavailable() {
     let json = frame.json();
     assert_eq!(json["selected"]["transport"], "tcp");
     assert_eq!(json["selected"]["capability_version"], 1);
-    assert_eq!(json["reason"], "unavailable");
+    assert!(
+        json.get("reason").is_none(),
+        "permanent absence is a static omission, not `unavailable` (KTD6)"
+    );
 
     let frame = control_response(&mut client, &serde_json::json!({"op": "catalog.list"})).await;
     assert_eq!(frame.ty, TY_RESPONSE, "the generation stays usable");
@@ -1594,7 +1597,10 @@ async fn sentinel_provider_data_stays_off_diagnostic_surfaces() {
         {"transport": "tcp", "capability_version": 1}
     ]);
     let frame = control_response(&mut client, &negotiate_body(offers)).await;
-    assert_eq!(frame.json()["reason"], "unavailable");
+    assert!(
+        frame.json().get("reason").is_none(),
+        "an absent provider selects reasonless TCP"
+    );
     assert!(!String::from_utf8_lossy(&frame.body).contains(SENTINEL));
 
     // Grant records and provider failures format without token or provider

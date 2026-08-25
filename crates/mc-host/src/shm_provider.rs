@@ -34,8 +34,12 @@ use crate::frame_channel::{
     frame_sender, validate_inbound_header, BoxedReceiver, CopyCounter, DirectFrame, FrameReceiver,
     InboundEvent, InboundFrame, OutboundFrame, ReadClose, RejectedFrame, SenderQueue, COMPLETE,
 };
+use crate::provider_recovery::{
+    CleanupOutcome, ProviderReadiness, ProviderRecovery, RecoveryBackend, SystemClock,
+};
 use crate::transport_provider::{
-    Candidate, InjectedProvider, PreparedCandidate, ProviderContext, ProviderFailure,
+    Candidate, InjectedProvider, PreflightEligibility, PreparedCandidate, ProviderContext,
+    ProviderFailure,
 };
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
@@ -109,16 +113,55 @@ pub struct ShmProvider {
     admission: Arc<AdmissionController>,
     preparations: AtomicU64,
     quarantine_next_close: Arc<AtomicBool>,
+    recovery: ProviderRecovery,
+    recovery_cleanups: Arc<AtomicU64>,
+}
+
+/// Recovery primitives for the thread-confined ring endpoint. The rings die
+/// with their endpoint thread, so a suspect close leaves alias state
+/// uncertain: cleanup isolates instead of reclaiming. commentlint: allow(JUDGE)
+struct ShmRecoveryBackend {
+    profile: Arc<TargetProfile>,
+    admission: Arc<AdmissionController>,
+    cleanups: Arc<AtomicU64>,
+}
+
+impl RecoveryBackend for ShmRecoveryBackend {
+    fn cleanup(&self, _candidate_id: u64) -> CleanupOutcome {
+        self.cleanups.fetch_add(1, Ordering::AcqRel);
+        CleanupOutcome::Uncertain
+    }
+
+    fn probe(&self) -> bool {
+        // No shared state outlives the endpoint thread, so isolation alone
+        // proves the provider side is clean.
+        true
+    }
+
+    fn admission_fits(&self) -> bool {
+        self.admission.can_admit(&self.profile, None).is_ok()
+    }
 }
 
 impl ShmProvider {
     /// Builds provider with explicit process-wide admission limits.
     pub fn for_qualified_test_profile(limits: ShmHostLimits) -> Self {
+        let profile = Arc::new(qualified_test_profile());
+        let admission = Arc::new(AdmissionController::new(limits));
+        let recovery_cleanups = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ShmRecoveryBackend {
+            profile: Arc::clone(&profile),
+            admission: Arc::clone(&admission),
+            cleanups: Arc::clone(&recovery_cleanups),
+        });
+        let recovery = ProviderRecovery::new(backend, Arc::new(SystemClock::new()));
         Self {
-            profile: Arc::new(qualified_test_profile()),
-            admission: Arc::new(AdmissionController::new(limits)),
+            profile,
+            admission,
             preparations: AtomicU64::new(0),
             quarantine_next_close: Arc::new(AtomicBool::new(false)),
+            recovery,
+            recovery_cleanups,
         }
     }
 
@@ -147,6 +190,17 @@ impl ShmProvider {
         self.quarantine_next_close.store(true, Ordering::Release);
     }
 
+    /// Provider offer readiness (R6): governs new offers only.
+    pub fn readiness(&self) -> ProviderReadiness {
+        self.recovery.readiness()
+    }
+
+    /// Number of recovery cleanup calls the controller dispatched. Preflight
+    /// must never move this counter (R6, seeded-defect detector).
+    pub fn recovery_cleanup_count(&self) -> u64 {
+        self.recovery_cleanups.load(Ordering::Acquire)
+    }
+
     fn offer_is_exact(parameters: Option<&serde_json::Value>) -> bool {
         parameters == Some(&qualified_test_parameters())
     }
@@ -170,14 +224,23 @@ impl InjectedProvider for ShmProvider {
         SHM_CAPABILITY_VERSION
     }
 
-    fn preflight(&self, parameters: Option<&serde_json::Value>) -> bool {
-        cfg!(target_os = "linux")
-            && Self::offer_is_exact(parameters)
-            && self.admission.can_admit(&self.profile, None).is_ok()
+    fn preflight(&self, parameters: Option<&serde_json::Value>) -> PreflightEligibility {
+        if !cfg!(target_os = "linux") || !Self::offer_is_exact(parameters) {
+            return PreflightEligibility::StaticallyOmitted;
+        }
+        if self.recovery.readiness() != ProviderReadiness::Ready
+            || self.admission.can_admit(&self.profile, None).is_err()
+        {
+            return PreflightEligibility::DynamicallyUnavailable;
+        }
+        PreflightEligibility::Serveable
     }
 
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure> {
         if !cfg!(target_os = "linux") || !Self::offer_is_exact(ctx.offer_parameters()) {
+            return Err(ProviderFailure::Unavailable);
+        }
+        if self.recovery.readiness() != ProviderReadiness::Ready {
             return Err(ProviderFailure::Unavailable);
         }
         let admission = self
@@ -187,6 +250,10 @@ impl InjectedProvider for ShmProvider {
         self.preparations.fetch_add(1, Ordering::AcqRel);
 
         let candidate_id = NEXT_CANDIDATE_ID.fetch_add(1, Ordering::Relaxed);
+        // Custody of the exact admission charges moves into one lifecycle
+        // record before the candidate is exposed (KTD4).
+        let custody = self.recovery.admit_candidate(candidate_id, admission);
+        let recovery = self.recovery.clone();
         let root = CancellationToken::new();
         let read_cancel = root.child_token();
         let (sender, queue) = frame_sender(ctx.queue_frames, root.clone(), ctx.frame_deadline);
@@ -245,9 +312,12 @@ impl InjectedProvider for ShmProvider {
                 }))
                 .unwrap_or(false);
                 if clean && !quarantine_next_close.swap(false, Ordering::AcqRel) {
-                    admission.release();
+                    let _ = custody.release();
                 } else {
-                    let _ = admission.quarantine();
+                    // Unclean close (or the forced test hook): the record
+                    // becomes a suspect and the recovery controller decides
+                    // between reclamation and isolation (KTD4).
+                    recovery.report_suspect(custody);
                 }
                 let _ = done_tx.send(());
             });
@@ -692,11 +762,22 @@ mod tests {
     #[test]
     fn platform_preflight_is_side_effect_free() {
         let provider = ShmProvider::for_qualified_test_profile(single_candidate_limits());
+        let expected = if cfg!(target_os = "linux") {
+            PreflightEligibility::Serveable
+        } else {
+            PreflightEligibility::StaticallyOmitted
+        };
         assert_eq!(
             provider.preflight(Some(&qualified_test_parameters())),
-            cfg!(target_os = "linux")
+            expected
         );
+        assert_eq!(
+            provider.preflight(Some(&serde_json::json!({}))),
+            PreflightEligibility::StaticallyOmitted
+        );
+        assert_eq!(provider.readiness(), ProviderReadiness::Ready);
         assert_eq!(provider.preparation_count(), 0);
+        assert_eq!(provider.recovery_cleanup_count(), 0);
         let accounting = provider.accounting().unwrap();
         assert_eq!(accounting.active, ResourceCharges::ZERO);
         assert_eq!(accounting.quarantined, ResourceCharges::ZERO);

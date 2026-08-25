@@ -105,6 +105,21 @@ fn allocation_slack_never_reaches_the_frame_decoder() {
 }
 
 #[test]
+fn stale_node_observation_lists_without_disturbing_a_live_backend() {
+    let backend = IceoryxBackend::create(&iceoryx_profile(), 7).unwrap();
+    // The observed value depends on host state left by other processes. commentlint: allow(JUDGE)
+    // The contract under test: observation succeeds and the live backend still round-trips afterwards. commentlint: allow(JUDGE)
+    let _ = IceoryxBackend::stale_node_observed().unwrap();
+    let body = [0x5Au8; 4];
+    let mut reservation = backend.try_reserve(64, wire(body.len())).unwrap();
+    reservation.write(&body).unwrap();
+    reservation.commit(body.len()).unwrap();
+    let lease = backend.try_receive().unwrap().unwrap();
+    assert_eq!(lease.segment(0).unwrap(), &body);
+    lease.release();
+}
+
+#[test]
 fn sequences_progress_exactly_and_wrap_attempts_fail_closed() {
     let backend = IceoryxBackend::create(&iceoryx_profile(), 5).unwrap();
     for (index, value) in [0x11u8, 0x22, 0x33].into_iter().enumerate() {

@@ -272,6 +272,20 @@ fn quarantine_rejects_all_operations_and_reports_conservation() {
 }
 
 #[test]
+fn probe_reads_shared_state_without_consuming_a_frame() {
+    let ring = Ring::create(&profile(), 27).unwrap();
+    publish(&ring, &[7]);
+    ring.probe().unwrap();
+    // The published frame is still receivable after the probe.
+    let lease = ring.try_receive().unwrap().unwrap();
+    assert_eq!(lease.segment(0).unwrap().read_byte(0), Some(7));
+    lease.release().unwrap();
+    ring.probe().unwrap();
+    ring.enter_quarantine();
+    assert!(matches!(ring.probe(), Err(RingError::Quarantined)));
+}
+
+#[test]
 fn lease_limit_reports_backpressure_then_recovers_after_release() {
     let ring = Ring::create(&lease_limited_profile(), 18).unwrap();
     publish(&ring, &[1]);

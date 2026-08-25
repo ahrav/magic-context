@@ -13,6 +13,8 @@ pub mod config;
 pub mod handler;
 pub mod lifecycle;
 #[doc(hidden)]
+pub mod provider_recovery;
+#[doc(hidden)]
 pub mod shm_provider;
 pub mod synapse;
 #[doc(hidden)]

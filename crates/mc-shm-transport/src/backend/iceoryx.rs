@@ -174,6 +174,19 @@ impl IceoryxBackend {
             _not_send: PhantomData,
         }))
     }
+    /// `stale_node_observed` reports a `NodeState::Dead` without performing cleanup or creating ports or services. commentlint: allow(JUDGE)
+    pub fn stale_node_observed() -> Result<bool, IceoryxError> {
+        let mut observed = false;
+        iceoryx2::node::Node::<IpcService>::list(Config::global_config(), |state| {
+            if matches!(state, iceoryx2::node::NodeState::Dead(_)) {
+                observed = true;
+                return CallbackProgression::Stop;
+            }
+            CallbackProgression::Continue
+        })
+        .map_err(|_| IceoryxError::SetupFailed)?;
+        Ok(observed)
+    }
 }
 
 impl fmt::Debug for IceoryxBackend {
