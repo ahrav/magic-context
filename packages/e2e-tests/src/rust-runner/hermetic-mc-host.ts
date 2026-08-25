@@ -229,6 +229,18 @@ export function detectRustModePrereqs(): RustModePrereqs {
             skipReason: "direct mc-host fixture requires Unix sockets",
         };
     }
+    // The fixture always links `BrocaComponent`, and its `initialize` refuses
+    // every non-Linux target because crash-ownership records and sweeps read
+    // `/proc` process identity. Excluding only Windows let a macOS runner report
+    // the prerequisites as met, build the fixture, and then fail during startup
+    // instead of taking the skip path this check exists to provide.
+    if (process.platform !== "linux") {
+        return {
+            ok: false,
+            skipReason:
+                "direct mc-host fixture requires Linux: broca crash-ownership records depend on /proc process identity",
+        };
+    }
     if (!existsSync(join(REPO_ROOT, "Cargo.toml"))) {
         return {
             ok: false,
