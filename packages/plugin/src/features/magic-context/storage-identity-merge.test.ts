@@ -2,8 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createSourceSpan } from "./memory/storage-claims";
-import { seedProjectMemoryClaim } from "./test-claim-database";
-import { createDirectTestDatabase } from "./test-database";
 import {
     deleteMemory,
     insertMemory as insertMemoryThroughKernel,
@@ -18,6 +16,8 @@ import {
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { auditIdentityMerge, mergeProjectIdentities } from "./storage-identity-merge";
+import { seedProjectMemoryClaim } from "./test-claim-database";
+import { createDirectTestDatabase } from "./test-database";
 
 let db: Database | null = null;
 

@@ -2,9 +2,9 @@ import type { Database } from "../../../shared/sqlite";
 import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "../claims-backfill";
 import type { ClaimDerivationRelation } from "../storage-claim-memory-schema";
 import {
+    type ClaimMutationToken,
     computeClaimOperationRequestDigest,
     formatRevisionLocator,
-    type ClaimMutationToken,
 } from "./claim-operation-contract";
 import {
     type ClaimEffectDescriptor,

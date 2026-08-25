@@ -2,11 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { initializeDatabase } from "../storage-db";
 import { clearSession, updateSessionMeta } from "../storage-meta-session";
-import { createDirectTestDatabase } from "../test-database";
 import { seedProjectMemoryClaim } from "../test-claim-database";
+import { createDirectTestDatabase } from "../test-database";
+import { copyProjectMemoryClaims, moveProjectMemoryClaims } from "./relocate-memory";
 import { computeProjectMemoryMutationToken } from "./storage-claim-operations";
 import { ensureProject } from "./storage-claims";
-import { copyProjectMemoryClaims, moveProjectMemoryClaims } from "./relocate-memory";
 
 function directDb() {
     const db = createDirectTestDatabase().db;
