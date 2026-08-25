@@ -1,0 +1,7 @@
+# Serialize the shared-memory crash tests. commentlint: allow(JUDGE)
+[test-groups]
+shm-crash = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(mc-host) and binary(shm_failure_modes)'
+test-group = 'shm-crash'

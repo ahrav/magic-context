@@ -11,7 +11,7 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
 #[cfg(target_os = "linux")]
@@ -22,7 +22,7 @@ use mc_shm_transport::descriptor::{
     SchedulingMode, TransportDescriptor, WorkloadClass,
 };
 use mc_shm_transport::profile::{
-    AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
+    Admission, AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
     ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
 };
 use subc_protocol::{decode_header, EnvelopeHeader, FrameType};
@@ -55,6 +55,12 @@ const DESCRIPTOR_DEPTH: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
 static NEXT_CANDIDATE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Test-only observer invoked after each successful frame publication with
+/// the published frame's type and channel. It receives no descriptors,
+/// payloads, or provider data.
+#[doc(hidden)]
+pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
 /// Exact offer parameters required to select the test-only provider.
 pub fn qualified_test_parameters() -> serde_json::Value {
@@ -115,6 +121,8 @@ pub struct ShmProvider {
     quarantine_next_close: Arc<AtomicBool>,
     recovery: ProviderRecovery,
     recovery_cleanups: Arc<AtomicU64>,
+    publish_hook: Mutex<Option<PublishHook>>,
+    held_admission: Mutex<Option<Admission>>,
 }
 
 /// Recovery primitives for the thread-confined ring endpoint. The rings die
@@ -162,6 +170,8 @@ impl ShmProvider {
             quarantine_next_close: Arc::new(AtomicBool::new(false)),
             recovery,
             recovery_cleanups,
+            publish_hook: Mutex::new(None),
+            held_admission: Mutex::new(None),
         }
     }
 
@@ -188,6 +198,44 @@ impl ShmProvider {
     /// Test hook: next endpoint close retains non-worker commitments.
     pub fn quarantine_next_close(&self) {
         self.quarantine_next_close.store(true, Ordering::Release);
+    }
+
+    /// Test hook: install a publication observer for candidates prepared
+    /// after this call. The hook runs on the endpoint thread after the ring
+    /// commit. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn set_publish_hook(&self, hook: PublishHook) {
+        *self.publish_hook.lock().expect("publish hook lock") = Some(hook);
+    }
+
+    /// Test hook: hold one profile's admission charges so preflight reports
+    /// exact dynamic unavailability. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn hold_admission(&self) -> bool {
+        let mut held = self.held_admission.lock().expect("held admission lock");
+        if held.is_some() {
+            return false;
+        }
+        match self.admission.admit(&self.profile, None) {
+            Ok(admission) => {
+                *held = Some(admission);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Test hook: end the admission hold. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn release_admission(&self) {
+        if let Some(admission) = self
+            .held_admission
+            .lock()
+            .expect("held admission lock")
+            .take()
+        {
+            admission.release();
+        }
     }
 
     /// Provider offer readiness (R6): governs new offers only.
@@ -266,6 +314,7 @@ impl InjectedProvider for ShmProvider {
         let worker_root = root.clone();
         let worker_read_cancel = read_cancel.clone();
         let quarantine_next_close = Arc::clone(&self.quarantine_next_close);
+        let publish_hook = self.publish_hook.lock().expect("publish hook lock").clone();
 
         let spawned = std::thread::Builder::new()
             .name("mc-host-shm-endpoint".to_owned())
@@ -308,6 +357,7 @@ impl InjectedProvider for ShmProvider {
                         frame_deadline,
                         worker_root,
                         worker_read_cancel,
+                        publish_hook,
                     ))
                 }))
                 .unwrap_or(false);
@@ -406,6 +456,7 @@ impl FrameReceiver for ShmReceiver {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_endpoint(
     rings: DuplexRing,
     mut queue: SenderQueue,
@@ -414,6 +465,7 @@ async fn run_endpoint(
     frame_deadline: Duration,
     root: CancellationToken,
     read_cancel: CancellationToken,
+    publish_hook: Option<PublishHook>,
 ) -> bool {
     let discard = queue.discard.clone();
     let finish = queue.finish.clone();
@@ -428,6 +480,7 @@ async fn run_endpoint(
                 &ingress,
                 frame_deadline,
                 &read_cancel,
+                publish_hook.as_ref(),
             )
             .await
             {
@@ -482,7 +535,7 @@ async fn run_endpoint(
         let Some(queued) = queued else {
             continue;
         };
-        if publish_one(&rings.first, queued, frame_deadline).is_err() {
+        if publish_one(&rings.first, queued, frame_deadline, publish_hook.as_ref()).is_err() {
             queue.retired.cancel();
             root.cancel();
             return false;
@@ -497,6 +550,7 @@ async fn receive_one(
     ingress: &ByteBudget,
     frame_deadline: Duration,
     read_cancel: &CancellationToken,
+    publish_hook: Option<&PublishHook>,
 ) -> Result<bool, ReadClose> {
     let Some(lease) = rings
         .second
@@ -540,7 +594,7 @@ async fn receive_one(
         // would otherwise miss their deadlines behind it.
         match queue.try_recv() {
             Ok(queued) => {
-                if publish_one(&rings.first, queued, frame_deadline).is_err() {
+                if publish_one(&rings.first, queued, frame_deadline, publish_hook).is_err() {
                     return Err(ReadClose::Corrupt("shared-memory publish failed"));
                 }
             }
@@ -568,6 +622,7 @@ fn publish_one(
     ring: &Ring,
     mut queued: crate::frame_channel::QueuedOutboundFrame,
     frame_deadline: Duration,
+    publish_hook: Option<&PublishHook>,
 ) -> Result<(), ()> {
     if !queued.begin_publication() {
         return Ok(());
@@ -580,6 +635,12 @@ fn publish_one(
         charge,
         written,
     } = queued.frame;
+    let wire_header: Option<[u8; subc_protocol::HEADER_LEN]> = match &direct {
+        Some(direct) => Some(direct.header()),
+        None => bytes
+            .get(..subc_protocol::HEADER_LEN)
+            .and_then(|header| header.try_into().ok()),
+    };
     let deadline = StdInstant::now() + frame_deadline;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match direct {
         Some(direct) => publish_direct(ring, direct, deadline),
@@ -589,6 +650,11 @@ fn publish_one(
         return Err(());
     }
     completion.store(COMPLETE, Ordering::Release);
+    if let Some(hook) = publish_hook {
+        if let Some(header) = wire_header.and_then(|header| decode_header(&header).ok()) {
+            hook(header.ty, header.channel);
+        }
+    }
     if let Some(written) = written {
         written(Instant::now());
     }
@@ -813,6 +879,7 @@ mod tests {
             &ByteBudget::new(1024),
             Duration::from_secs(1),
             &CancellationToken::new(),
+            None,
         )
         .await
         .unwrap());
