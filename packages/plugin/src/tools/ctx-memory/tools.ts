@@ -36,10 +36,7 @@ const ctxMemoryArgsShape = {
         .enum([...CTX_MEMORY_DREAMER_ACTIONS])
         .optional()
         .describe("create, get, list, revise, archive, restore, or merge"),
-    content: tool.schema
-        .string()
-        .optional()
-        .describe("Claim content for create/revise/merge"),
+    content: tool.schema.string().optional().describe("Claim content for create/revise/merge"),
     category: tool.schema
         .enum([...V2_MEMORY_CATEGORIES])
         .optional()
@@ -97,22 +94,22 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return "Error: ctx_memory is not available to the sidekick agent.";
                 }
                 if (
-                    args.action === undefined ||
-                    (toolContext.agent !== DREAMER_AGENT && !primaryActions.includes(args.action))
+                    typeof rawAction !== "string" ||
+                    !CTX_MEMORY_DREAMER_ACTIONS.includes(rawAction as CtxMemoryAction) ||
+                    (toolContext.agent !== DREAMER_AGENT &&
+                        !primaryActions.includes(rawAction as CtxMemoryAction))
                 ) {
                     return `Error: Action '${String(rawAction)}' is not allowed in this context.`;
                 }
+                const action = rawAction as CtxMemoryAction;
+                args.action = action;
                 const projectIdentity = deps.resolveProjectPath(toolContext.directory);
                 if (!projectIdentity) {
                     return "Error: Could not resolve project identity for memory action.";
                 }
                 await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
                 const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-                if (
-                    snapshot
-                        ? !snapshot.features.memoryEnabled
-                        : deps.memoryEnabled === false
-                ) {
+                if (snapshot ? !snapshot.features.memoryEnabled : deps.memoryEnabled === false) {
                     return "Cross-session memory is disabled for this project.";
                 }
                 const toolCallId = toolCallIdFromContext(toolContext);
@@ -127,6 +124,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         harness: "opencode",
                         sessionId: toolContext.sessionID,
                         toolCallId: toolCallId ?? "read",
+                        projectIdentity,
                     },
                     actor:
                         toolContext.agent === DREAMER_AGENT

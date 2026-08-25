@@ -314,9 +314,20 @@ export type ClaimOperationStageOutcome =
           effects: readonly ClaimEffectDescriptor[];
           /** Revisions whose policy ladder/projection phase two finalizes. */
           policyRevisionIds?: readonly number[];
+          /** Public claim IDs whose mutation tokens are added to the result payload. */
+          mutationTokenPublicClaimIds?: readonly string[];
       }
-    | { kind: "stale"; reason: string; payload?: CanonicalJsonValue | null }
-    | { kind: "noop"; payload?: CanonicalJsonValue | null };
+    | {
+          kind: "stale";
+          reason: string;
+          payload?: CanonicalJsonValue | null;
+          mutationTokenPublicClaimIds?: readonly string[];
+      }
+    | {
+          kind: "noop";
+          payload?: CanonicalJsonValue | null;
+          mutationTokenPublicClaimIds?: readonly string[];
+      };
 
 export interface ClaimOperationRunResult {
     outcome: "applied" | "stale" | "noop";
@@ -358,6 +369,23 @@ function revisionLocatorForRow(db: Database, revisionId: number | null): string 
         | undefined;
     if (!row) return null;
     return formatRevisionLocator(row);
+}
+
+function payloadWithMutationTokens(
+    db: Database,
+    payload: CanonicalJsonValue | null,
+    publicClaimIds: readonly string[] | undefined,
+): CanonicalJsonValue | null {
+    if (!publicClaimIds || publicClaimIds.length === 0) return payload;
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new ClaimOperationInputError("mutation-token results require an object payload");
+    }
+    return {
+        ...payload,
+        mutationTokens: [...new Set(publicClaimIds)].map((publicClaimId) =>
+            tokenRequestShape(computeProjectMemoryMutationToken(db, publicClaimId)),
+        ),
+    };
 }
 
 /** Ladder + projection finalization for one revision under an allocated
@@ -492,7 +520,11 @@ export function runClaimOperationInCurrentTransaction(
             resultEncodingVersion: CLAIM_RESULT_ENCODING_VERSION,
             outcome: staged.kind,
             staleReason: staged.kind === "stale" ? staged.reason : null,
-            payload: staged.payload ?? null,
+            payload: payloadWithMutationTokens(
+                db,
+                staged.payload ?? null,
+                staged.mutationTokenPublicClaimIds,
+            ),
             effects: [],
             generations: {},
         };
@@ -583,7 +615,7 @@ export function runClaimOperationInCurrentTransaction(
         resultEncodingVersion: CLAIM_RESULT_ENCODING_VERSION,
         outcome: "applied",
         staleReason: null,
-        payload: staged.payload,
+        payload: payloadWithMutationTokens(db, staged.payload, staged.mutationTokenPublicClaimIds),
         effects: resultEffects,
         generations,
     };
@@ -938,6 +970,7 @@ function attachEvidenceStage(
             },
         ],
         policyRevisionIds: [claim.currentRevisionId],
+        mutationTokenPublicClaimIds: [claim.publicClaimId],
     };
 }
 
@@ -956,6 +989,7 @@ export interface CreateProjectMemoryClaimInput {
     provenance: ClaimEvidenceProvenance;
     actor: string;
     userInferred?: boolean;
+    requestScope?: string;
     nowMs?: number;
 }
 
@@ -1049,12 +1083,7 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
     }
 
     const publicClaimId = generatePublicClaimId();
-    const observationId = writeEvidenceChain(
-        db,
-        input.projectId,
-        input.provenance,
-        input.content,
-    );
+    const observationId = writeEvidenceChain(db, input.projectId, input.provenance, input.content);
     const created = createClaimInCurrentTransaction(db, {
         projectId: input.projectId,
         subject: publicClaimId,
@@ -1125,6 +1154,7 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
             },
         ],
         policyRevisionIds: [created.revisionId],
+        mutationTokenPublicClaimIds: [publicClaimId],
     };
 }
 
@@ -1148,6 +1178,7 @@ export function createProjectMemoryClaim(
             operation: "create-project-memory-claim",
             projectId: input.projectId,
             provenance: provenanceRequestShape(input.provenance),
+            requestScope: input.requestScope ?? null,
             userInferred: input.userInferred ?? false,
         }),
     };
@@ -1172,6 +1203,7 @@ export interface ReviseProjectMemoryClaimInput {
     provenance: ClaimEvidenceProvenance;
     actor: string;
     userInferred?: boolean;
+    requestScope?: string;
     nowMs?: number;
 }
 
@@ -1220,12 +1252,7 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         normalizedHash,
         claimId: claim.claimId,
     });
-    const observationId = writeEvidenceChain(
-        db,
-        claim.projectId,
-        input.provenance,
-        nextContent,
-    );
+    const observationId = writeEvidenceChain(db, claim.projectId, input.provenance, nextContent);
     const appended = appendClaimRevisionInCurrentTransaction(db, {
         claimId: claim.claimId,
         expectedCurrentRevisionId: claim.currentRevisionId,
@@ -1281,6 +1308,7 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
             },
         ],
         policyRevisionIds: [appended.revisionId],
+        mutationTokenPublicClaimIds: [claim.publicClaimId],
     };
 }
 
@@ -1305,6 +1333,7 @@ export function reviseProjectMemoryClaim(
             memoryScope: input.memoryScope ?? null,
             operation: "revise-project-memory-claim",
             provenance: provenanceRequestShape(input.provenance),
+            requestScope: input.requestScope ?? null,
             sharing: input.sharing ?? null,
             token: tokenRequestShape(input.token),
             userInferred: input.userInferred ?? false,
@@ -1328,6 +1357,7 @@ export interface SetProjectMemoryLifecycleInput {
     state: ClaimMemoryLifecycleState;
     actor: string;
     reason?: string | null;
+    requestScope?: string;
     nowMs?: number;
 }
 
@@ -1356,6 +1386,7 @@ export function stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
                 kind: "lifecycle",
                 state: head.state,
             },
+            mutationTokenPublicClaimIds: [claim.publicClaimId],
         };
     }
     const attributes = readRevisionAttributes(db, claim.currentRevisionId);
@@ -1404,6 +1435,7 @@ export function stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
                 changeKind: "lifecycle",
             },
         ],
+        mutationTokenPublicClaimIds: [claim.publicClaimId],
     };
 }
 
@@ -1420,6 +1452,7 @@ export function setProjectMemoryClaimLifecycle(
             actor: input.actor,
             operation: "set-project-memory-lifecycle",
             reason: input.reason ?? null,
+            requestScope: input.requestScope ?? null,
             state: input.state,
             token: tokenRequestShape(input.token),
         }),
@@ -1439,6 +1472,7 @@ export interface MergeProjectMemoryClaimsInput {
     /** Undefined keeps the target's current content. */
     mergedContent?: string;
     actor: string;
+    requestScope?: string;
     nowMs?: number;
 }
 
@@ -1609,6 +1643,10 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         },
         effects,
         policyRevisionIds,
+        mutationTokenPublicClaimIds: [
+            target.publicClaimId,
+            ...sources.map((source) => source.publicClaimId),
+        ],
     };
 }
 
@@ -1632,6 +1670,7 @@ export function mergeProjectMemoryClaims(
             actor: input.actor,
             mergedContent: input.mergedContent ?? null,
             operation: "merge-project-memory-claims",
+            requestScope: input.requestScope ?? null,
             sourceTokens: input.sourceTokens.map(tokenRequestShape),
             targetToken: tokenRequestShape(input.targetToken),
         }),

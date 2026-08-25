@@ -19,7 +19,6 @@ const FOREIGN = "git:u4-foreign";
 type JsonResult = {
     action: string;
     outcome: string;
-    replayed: boolean;
     staleReason: string | null;
     affectedClaims?: Array<{
         publicClaimId: string;
@@ -35,7 +34,7 @@ type JsonResult = {
     }>;
     missingPublicClaimIds?: string[];
     effects: unknown[];
-    generations: Record<string, number>;
+    generation: number | null;
 };
 
 function harness(db: ReturnType<typeof createClaimReaderTestDatabase>) {
@@ -49,12 +48,15 @@ function harness(db: ReturnType<typeof createClaimReaderTestDatabase>) {
         callID: string,
         agent = "primary",
     ): Promise<string> =>
-        definition.execute(args as never, {
-            sessionID: "ses-u4-opencode",
-            directory: "/tmp/u4-opencode",
-            callID,
-            agent,
-        } as never) as Promise<string>;
+        definition.execute(
+            args as never,
+            {
+                sessionID: "ses-u4-opencode",
+                directory: "/tmp/u4-opencode",
+                callID,
+                agent,
+            } as never,
+        ) as Promise<string>;
     return { definition, execute };
 }
 
@@ -72,16 +74,19 @@ describe("ctx_memory U4 scenario 1: create uses direct claims", () => {
         const db = createClaimReaderTestDatabase();
         try {
             const result = parseResult(
-                await harness(db).execute(createArgs("OpenCode uses direct claims."), "call-create"),
+                await harness(db).execute(
+                    createArgs("OpenCode uses direct claims."),
+                    "call-create",
+                ),
             );
-            expect(result).toMatchObject({ action: "create", outcome: "applied", replayed: false });
+            expect(result).toMatchObject({ action: "create", outcome: "applied" });
             expect(result.affectedClaims).toHaveLength(1);
             expect(result.affectedClaims?.[0]?.publicClaimId).toMatch(/^mcm_[0-9a-f]{32}$/);
             expect(result.affectedClaims?.[0]?.revisionLocator).toContain("/r1/");
             expect(result.affectedClaims?.[0]?.mutationToken.publicClaimId).toBe(
                 result.affectedClaims?.[0]?.publicClaimId,
             );
-            expect(Object.values(result.generations)).toEqual([1]);
+            expect(result.generation).toBe(1);
             expect(
                 db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get(),
             ).toEqual({ count: 1 });
@@ -181,9 +186,7 @@ describe("ctx_memory U4 scenario 3: revise and lifecycle", () => {
                 ),
             );
             expect(restored.outcome).toBe("applied");
-            expect(
-                getProjectMemoryClaimByPublicId(db, second.publicClaimId)?.revision,
-            ).toBe(2);
+            expect(getProjectMemoryClaimByPublicId(db, second.publicClaimId)?.revision).toBe(2);
         } finally {
             closeQuietly(db);
         }
@@ -255,16 +258,24 @@ describe("ctx_memory U4 scenario 5: operation replay", () => {
             const tool = harness(db);
             const args = createArgs("Replay exact bytes.");
             const firstText = await tool.execute(args, "call-replay");
-            const first = parseResult(firstText);
-            const second = parseResult(await tool.execute(args, "call-replay"));
-            expect(second.replayed).toBeTrue();
-            expect({ ...second, replayed: false }).toEqual(first);
+            const first = parseResult(firstText).affectedClaims?.[0];
+            if (!first) throw new Error("missing replay create result");
+            await tool.execute(
+                {
+                    action: "revise",
+                    publicClaimId: first.publicClaimId,
+                    mutationToken: first.mutationToken,
+                    content: "Replay state moved later.",
+                },
+                "call-replay-state-move",
+            );
+            expect(await tool.execute(args, "call-replay")).toBe(firstText);
             expect(await tool.execute(createArgs("Changed args."), "call-replay")).toBe(
                 "Error: this tool call id was already committed with different arguments. Retry as a new call.",
             );
             expect(
                 db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get(),
-            ).toEqual({ count: 1 });
+            ).toEqual({ count: 2 });
         } finally {
             closeQuietly(db);
         }
@@ -274,6 +285,7 @@ describe("ctx_memory U4 scenario 5: operation replay", () => {
 describe("ctx_memory U4 scenario 6: privacy and ownership", () => {
     test("hidden and missing get results match; foreign claims cannot mutate", async () => {
         const db = createClaimReaderTestDatabase();
+        const missingDb = createClaimReaderTestDatabase();
         try {
             const hidden = seedProjectMemoryClaim(db, {
                 projectIdentity: PROJECT,
@@ -292,23 +304,19 @@ describe("ctx_memory U4 scenario 6: privacy and ownership", () => {
                     "UPDATE claim_effective_policy SET hard_hidden = 1, auto_eligible = 0, explicit_eligible = 0 WHERE revision_id = ?",
                 ).run(hiddenRef.currentRevisionId);
             }).immediate();
-            const missingId = `mcm_${"f".repeat(32)}`;
             const tool = harness(db);
-            const hiddenGet = parseResult(
-                await tool.execute(
-                    { action: "get", publicClaimIds: [hidden.publicClaimId] },
-                    "call-hidden",
-                ),
+            const hiddenText = await tool.execute(
+                { action: "get", publicClaimIds: [hidden.publicClaimId] },
+                "call-hidden",
             );
-            const missingGet = parseResult(
-                await tool.execute(
-                    { action: "get", publicClaimIds: [missingId] },
-                    "call-missing",
-                ),
+            const missingText = await harness(missingDb).execute(
+                { action: "get", publicClaimIds: [hidden.publicClaimId] },
+                "call-missing",
             );
-            expect(hiddenGet.claims).toEqual(missingGet.claims);
+            expect(hiddenText).toBe(missingText);
+            const hiddenGet = parseResult(hiddenText);
+            expect(hiddenGet.claims).toEqual([]);
             expect(hiddenGet.missingPublicClaimIds).toEqual([hidden.publicClaimId]);
-            expect(missingGet.missingPublicClaimIds).toEqual([missingId]);
 
             const foreign = seedProjectMemoryClaim(db, {
                 projectIdentity: FOREIGN,
@@ -327,6 +335,7 @@ describe("ctx_memory U4 scenario 6: privacy and ownership", () => {
             ).toBe("Error: claim not found or not visible from this project");
         } finally {
             closeQuietly(db);
+            closeQuietly(missingDb);
         }
     });
 });
@@ -342,6 +351,9 @@ describe("ctx_memory U4 scenario 7: human authority", () => {
             expect(await tool.execute({ action: "enforce" }, "call-enforce")).toContain(
                 "human-host-owned",
             );
+            expect(
+                await tool.execute({ action: "delete" }, "call-delete", DREAMER_AGENT),
+            ).toContain("not allowed");
         } finally {
             closeQuietly(db);
         }
@@ -351,16 +363,25 @@ describe("ctx_memory U4 scenario 7: human authority", () => {
 describe("ctx_memory U4 scenario 8: no legacy active path", () => {
     test("tool sources contain no legacy IDs, embeddings, or mutation-log writes", () => {
         const files = [
+            resolve(import.meta.dir, "claim-actions.ts"),
+            resolve(import.meta.dir, "constants.ts"),
             resolve(import.meta.dir, "tools.ts"),
+            resolve(import.meta.dir, "types.ts"),
+            resolve(import.meta.dir, "../../plugin/tool-registry.ts"),
             resolve(import.meta.dir, "../../../../pi-plugin/src/tools/ctx-memory.ts"),
+            resolve(import.meta.dir, "../../../../pi-plugin/src/tools/index.ts"),
+        ];
+        const forbidden = [
+            "memory_embeddings",
+            "memory_mutation_log",
+            "storage-memory-claims",
+            'storage-memory"',
+            "memoryId",
+            "projectId: effect.projectId",
         ];
         for (const file of files) {
             const source = readFileSync(file, "utf8");
-            expect(source).not.toContain("memory_embeddings");
-            expect(source).not.toContain("memory_mutation_log");
-            expect(source).not.toContain("storage-memory-claims");
-            expect(source).not.toContain("storage-memory\"");
-            expect(source).not.toContain("memoryId");
+            for (const value of forbidden) expect(source).not.toContain(value);
         }
     });
 });

@@ -1,6 +1,4 @@
 import type { ClaimMutationToken } from "../../features/magic-context/memory/claim-operation-contract";
-import type { MemorySourceType } from "../../features/magic-context/memory";
-import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
@@ -40,8 +38,5 @@ export interface CtxMemoryToolDeps {
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
     resolveProjectPath: (directory: string) => string | undefined;
     memoryEnabled?: boolean;
-    embeddingEnabled?: boolean;
     allowedActions?: CtxMemoryAction[];
-    sourceType?: MemorySourceType;
-    rustToolBackends?: RustToolBackends;
 }

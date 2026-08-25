@@ -5,15 +5,9 @@ import {
 	ClaimOperationKeyReuseError,
 } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import { V2_MEMORY_CATEGORIES } from "@magic-context/core/features/magic-context/memory";
-import {
-	executeCtxMemoryClaimAction,
-} from "@magic-context/core/tools/ctx-memory/claim-actions";
-import {
-	CTX_MEMORY_DESCRIPTION,
-} from "@magic-context/core/tools/ctx-memory/constants";
-import type {
-	CtxMemoryArgs,
-} from "@magic-context/core/tools/ctx-memory/types";
+import { executeCtxMemoryClaimAction } from "@magic-context/core/tools/ctx-memory/claim-actions";
+import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
+import type { CtxMemoryArgs } from "@magic-context/core/tools/ctx-memory/types";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -43,18 +37,26 @@ const MutationTokenSchema = Type.Object({
 const ParamsSchema = Type.Object(
 	{
 		action: Type.Optional(
-			Type.Union(ALL_ACTIONS.map((action) => Type.Literal(action)), {
-				description: "create, get, list, revise, archive, restore, or merge",
-			}),
+			Type.Union(
+				ALL_ACTIONS.map((action) => Type.Literal(action)),
+				{
+					description: "create, get, list, revise, archive, restore, or merge",
+				},
+			),
 		),
 		content: Type.Optional(Type.String({ description: "Claim content" })),
 		category: Type.Optional(
-			Type.Union(V2_MEMORY_CATEGORIES.map((category) => Type.Literal(category)), {
-				description: "Claim category or list filter",
-			}),
+			Type.Union(
+				V2_MEMORY_CATEGORIES.map((category) => Type.Literal(category)),
+				{
+					description: "Claim category or list filter",
+				},
+			),
 		),
 		publicClaimId: Type.Optional(
-			Type.String({ description: "Public claim ID for single-claim mutations" }),
+			Type.String({
+				description: "Public claim ID for single-claim mutations",
+			}),
 		),
 		publicClaimIds: Type.Optional(
 			Type.Array(Type.String(), { description: "Public claim IDs for get" }),
@@ -66,7 +68,9 @@ const ParamsSchema = Type.Object(
 			}),
 		),
 		limit: Type.Optional(Type.Number({ description: "Maximum list results" })),
-		reason: Type.Optional(Type.String({ description: "Lifecycle-change reason" })),
+		reason: Type.Optional(
+			Type.String({ description: "Lifecycle-change reason" }),
+		),
 	},
 	{ additionalProperties: true },
 );
@@ -92,7 +96,6 @@ export interface CtxMemoryToolDeps {
 		db: ContextDatabase,
 	) => Promise<void>;
 	memoryEnabled?: boolean;
-	embeddingEnabled?: boolean;
 	resolveProjectIdentity?: (directory: string) => string | undefined;
 	allowDreamerActions?: boolean;
 }
@@ -128,17 +131,25 @@ export function createCtxMemoryTool(
 						"Error: approve and enforce are human-host-owned commands, not agent actions.",
 					);
 				}
-				if (params.action === undefined) {
-					return err("Error: Action 'undefined' is not allowed in this context.");
-				}
-				if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(params.action)) {
+				if (
+					typeof rawAction !== "string" ||
+					!ALL_ACTIONS.includes(rawAction as (typeof ALL_ACTIONS)[number])
+				) {
 					return err(
-						`Error: Action '${params.action}' is not allowed in this context.`,
+						`Error: Action '${String(rawAction)}' is not allowed in this context.`,
+					);
+				}
+				const action = rawAction as (typeof ALL_ACTIONS)[number];
+				if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(action)) {
+					return err(
+						`Error: Action '${action}' is not allowed in this context.`,
 					);
 				}
 				const projectIdentity = resolveProject(ctx.cwd);
 				if (!projectIdentity) {
-					return err("Error: Could not resolve project identity for memory action.");
+					return err(
+						"Error: Could not resolve project identity for memory action.",
+					);
 				}
 				await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
 				const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
@@ -153,19 +164,20 @@ export function createCtxMemoryTool(
 				if (!sessionId) {
 					return err("Error: ctx_memory requires an active session.");
 				}
-				if (!toolCallId && !["get", "list"].includes(params.action)) {
+				if (!toolCallId && !["get", "list"].includes(action)) {
 					return err(
 						"Error: ctx_memory mutation requires a stable tool-call identity.",
 					);
 				}
 				const text = executeCtxMemoryClaimAction({
 					db: deps.db,
-					args: params,
+					args: { ...params, action },
 					projectIdentity,
 					identity: {
 						harness: "pi",
 						sessionId,
 						toolCallId: toolCallId || "read",
+						projectIdentity,
 					},
 					actor: dreamerAllowed ? "agent:pi:dreamer" : "agent:pi",
 				});

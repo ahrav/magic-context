@@ -2,9 +2,9 @@ import type { Database } from "../../shared/sqlite";
 import {
     type CanonicalJsonValue,
     canonicalJsonEncode,
-    canonicalClaimMutationToken,
     type ClaimMutationToken,
-    parseRevisionLocator,
+    formatRevisionLocator,
+    isValidPublicClaimId,
 } from "../../features/magic-context/memory/claim-operation-contract";
 import {
     type ClaimOperationRunResult,
@@ -29,7 +29,7 @@ import {
     resolveWorkspaceShareCategories,
 } from "../../features/magic-context/workspaces";
 import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS } from "./constants";
-import type { CtxMemoryAction, CtxMemoryArgs } from "./types";
+import { CTX_MEMORY_DREAMER_ACTIONS, type CtxMemoryAction, type CtxMemoryArgs } from "./types";
 
 export type CtxMemoryHarness = "opencode" | "pi";
 
@@ -37,22 +37,29 @@ export interface CtxMemoryCallIdentity {
     harness: CtxMemoryHarness;
     sessionId: string;
     toolCallId: string;
+    projectIdentity: string;
+}
+
+export interface CtxMemoryProducerIdentity extends ProducerIdentity {
+    requestScope: string;
 }
 
 /** Tool-call identity is the durable operation key; actions add no live-row suffix. */
 export function createCtxMemoryProducerIdentity(
     identity: CtxMemoryCallIdentity,
-): ProducerIdentity {
+): CtxMemoryProducerIdentity {
     const sessionId = identity.sessionId.trim();
     const toolCallId = identity.toolCallId.trim();
-    if (!sessionId || !toolCallId) {
+    const projectIdentity = identity.projectIdentity.trim();
+    if (!sessionId || !toolCallId || !projectIdentity) {
         throw new ClaimOperationInputError(
-            "ctx_memory mutations require stable session and tool-call identities",
+            "ctx_memory mutations require stable project, session, and tool-call identities",
         );
     }
     return {
         producer: "ctx-memory-agent-v1",
         operationKey: `${identity.harness}:${sessionId}:${toolCallId}`,
+        requestScope: projectIdentity,
     };
 }
 
@@ -75,9 +82,7 @@ function workspaceReadScope(db: Database, projectIdentity: string): WorkspaceRea
     const workspace = resolveWorkspaceIdentitySet(db, projectIdentity);
     const expanded = expandWorkspaceIdentitySetWithAliases(db, workspace.identities);
     const isWorkspaced = workspace.identities.length > 1;
-    const authorizedIdentities = isWorkspaced
-        ? expanded.expandedIdentities
-        : workspace.identities;
+    const authorizedIdentities = isWorkspaced ? expanded.expandedIdentities : workspace.identities;
     const ownIdentities = authorizedIdentities.filter(
         (identity) =>
             (expanded.canonicalIdentityByStoredPath.get(identity) ?? identity) === projectIdentity,
@@ -205,58 +210,83 @@ function claimView(item: ProjectMemoryClaimSnapshot): CanonicalJsonValue {
     };
 }
 
-function affectedPublicClaimIds(operation: ClaimOperationRunResult): string[] {
-    const ids: string[] = [];
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+function mutationTokensFromResult(operation: ClaimOperationRunResult): ClaimMutationToken[] {
     const payload = operation.result.payload;
-    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-        const claim = payload.claim;
-        if (claim && typeof claim === "object" && !Array.isArray(claim)) {
-            const publicClaimId = claim.publicClaimId;
-            if (typeof publicClaimId === "string") ids.push(publicClaimId);
-        }
-        const retiredSources = payload.retiredSources;
-        if (Array.isArray(retiredSources)) {
-            for (const value of retiredSources) {
-                if (typeof value === "string") ids.push(value);
-            }
-        }
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+        if (operation.outcome === "stale") return [];
+        throw new Error("stored ctx_memory result has no mutation-token payload");
     }
-    for (const effect of operation.result.effects) {
-        if (!effect.revisionLocator) continue;
-        const locator = parseRevisionLocator(effect.revisionLocator);
-        if (locator) ids.push(locator.publicClaimId);
+    const values = payload.mutationTokens;
+    if (!Array.isArray(values)) {
+        if (operation.outcome === "stale") return [];
+        throw new Error("stored ctx_memory result has no mutation tokens");
     }
-    return [...new Set(ids)];
+    return values.map((value) => {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) {
+            throw new Error("stored ctx_memory result has a malformed mutation token");
+        }
+        const {
+            tokenVersion,
+            publicClaimId,
+            revision,
+            contentDigest,
+            lifecycleSeq,
+            applicabilityHeadsDigest,
+            policyHeadsDigest,
+        } = value;
+        if (
+            tokenVersion !== 1 ||
+            typeof publicClaimId !== "string" ||
+            !isValidPublicClaimId(publicClaimId) ||
+            typeof revision !== "number" ||
+            !Number.isSafeInteger(revision) ||
+            revision <= 0 ||
+            typeof contentDigest !== "string" ||
+            !SHA256_HEX.test(contentDigest) ||
+            typeof lifecycleSeq !== "number" ||
+            !Number.isSafeInteger(lifecycleSeq) ||
+            lifecycleSeq <= 0 ||
+            typeof applicabilityHeadsDigest !== "string" ||
+            !SHA256_HEX.test(applicabilityHeadsDigest) ||
+            typeof policyHeadsDigest !== "string" ||
+            !SHA256_HEX.test(policyHeadsDigest)
+        ) {
+            throw new Error("stored ctx_memory result has a malformed mutation token");
+        }
+        return {
+            tokenVersion,
+            publicClaimId,
+            revision,
+            contentDigest,
+            lifecycleSeq,
+            applicabilityHeadsDigest,
+            policyHeadsDigest,
+        };
+    });
 }
 
-function mutationResult(
-    db: Database,
-    action: CtxMemoryAction,
-    operation: ClaimOperationRunResult,
-): string {
-    const affectedClaims: CanonicalJsonValue[] = affectedPublicClaimIds(operation).map(
-        (publicClaimId) => {
-            const token = computeProjectMemoryMutationToken(db, publicClaimId);
-            return {
-                mutationToken: mutationTokenView(token),
-                publicClaimId,
-                revisionLocator: `${publicClaimId}/r${token.revision}/${token.contentDigest}`,
-            };
-        },
-    );
+function mutationResult(action: CtxMemoryAction, operation: ClaimOperationRunResult): string {
+    const generations = [...new Set(Object.values(operation.result.generations))];
+    if (generations.length > 1) {
+        throw new Error("ctx_memory operation crossed project generations");
+    }
     return canonicalJsonEncode({
         action,
-        affectedClaims,
+        affectedClaims: mutationTokensFromResult(operation).map((token) => ({
+            mutationToken: mutationTokenView(token),
+            publicClaimId: token.publicClaimId,
+            revisionLocator: formatRevisionLocator(token),
+        })),
         effects: operation.result.effects.map((effect) => ({
             changeKind: effect.changeKind,
             effectKey: effect.effectKey,
             generation: effect.generation,
-            projectId: effect.projectId,
             revisionLocator: effect.revisionLocator,
         })),
-        generations: { ...operation.result.generations },
+        generation: generations[0] ?? null,
         outcome: operation.outcome,
-        replayed: operation.replayed,
         staleReason: operation.result.staleReason,
     });
 }
@@ -270,10 +300,9 @@ function readResult(
         action,
         claims: claims.map(claimView),
         effects: [],
-        generations: {},
+        generation: null,
         missingPublicClaimIds: [...missingPublicClaimIds],
         outcome: "noop",
-        replayed: false,
         staleReason: null,
     });
 }
@@ -324,14 +353,15 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
     const { db, args, projectIdentity, identity } = input;
     const action = args.action;
     if (!action) throw new ClaimOperationInputError("ctx_memory action is required");
+    if (!CTX_MEMORY_DREAMER_ACTIONS.includes(action)) {
+        throw new ClaimOperationInputError(`unsupported ctx_memory action: ${String(action)}`);
+    }
     const ownProjectId = ensureProject(db, projectIdentity);
 
     if (action === "get") {
         const ids = uniquePublicClaimIds(args.publicClaimIds);
         if (ids.length === 0 || ids.length > GET_MAX_CLAIMS) {
-            throw new ClaimOperationInputError(
-                `get requires 1-${GET_MAX_CLAIMS} publicClaimIds`,
-            );
+            throw new ClaimOperationInputError(`get requires 1-${GET_MAX_CLAIMS} publicClaimIds`);
         }
         const result = getClaims(db, projectIdentity, ids);
         return readResult("get", result.claims, result.missing);
@@ -355,7 +385,7 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
         return readResult("list", claims);
     }
 
-    const producer = createCtxMemoryProducerIdentity(identity);
+    const { requestScope, ...producer } = createCtxMemoryProducerIdentity(identity);
     if (action === "create") {
         const content = args.content?.trim();
         const category = args.category?.trim();
@@ -368,8 +398,9 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
             category,
             provenance: provenance(identity, producer, content),
             actor: input.actor,
+            requestScope,
         });
-        return mutationResult(db, action, operation);
+        return mutationResult(action, operation);
     }
 
     if (action === "merge") {
@@ -391,8 +422,9 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
             sourceTokens: tokens.slice(1),
             ...(args.content?.trim() ? { mergedContent: args.content.trim() } : {}),
             actor: input.actor,
+            requestScope,
         });
-        return mutationResult(db, action, operation);
+        return mutationResult(action, operation);
     }
 
     const target = requireSingleMutationTarget(args);
@@ -421,8 +453,9 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
                 `revise:${target.publicClaimId}:${target.token.contentDigest}`,
             ),
             actor: input.actor,
+            requestScope,
         });
-        return mutationResult(db, action, operation);
+        return mutationResult(action, operation);
     }
 
     const operation = setProjectMemoryClaimLifecycle(db, producer, {
@@ -430,13 +463,7 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
         state: action === "archive" ? "archived" : "active",
         actor: input.actor,
         reason: args.reason?.trim() || null,
+        requestScope,
     });
-    return mutationResult(db, action, operation);
-}
-
-export function claimMutationTokensEqual(
-    left: ClaimMutationToken,
-    right: ClaimMutationToken,
-): boolean {
-    return canonicalClaimMutationToken(left) === canonicalClaimMutationToken(right);
+    return mutationResult(action, operation);
 }

@@ -10,6 +10,7 @@ import {
 	seedProjectMemoryClaim,
 } from "@magic-context/core/features/magic-context/test-claim-database";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createCtxMemoryTools } from "@magic-context/core/tools/ctx-memory/tools";
 import { createCtxMemoryTool } from "./ctx-memory";
 
 const PROJECT = "git:u4-pi";
@@ -19,7 +20,6 @@ type MutationToken = ReturnType<typeof computeProjectMemoryMutationToken>;
 type JsonResult = {
 	action: string;
 	outcome: string;
-	replayed: boolean;
 	staleReason: string | null;
 	affectedClaims?: Array<{
 		publicClaimId: string;
@@ -35,16 +35,17 @@ type JsonResult = {
 	}>;
 	missingPublicClaimIds?: string[];
 	effects: unknown[];
-	generations: Record<string, number>;
+	generation: number | null;
 };
 
 function harness(
 	db: ReturnType<typeof createClaimReaderTestDatabase>,
 	allowDreamerActions = false,
+	resolveProjectIdentity: () => string = () => PROJECT,
 ) {
 	const tool = createCtxMemoryTool({
 		db,
-		resolveProjectIdentity: () => PROJECT,
+		resolveProjectIdentity,
 		allowDreamerActions,
 	});
 	const execute = async (args: Record<string, unknown>, callId: string) =>
@@ -61,7 +62,9 @@ function harness(
 	return { tool, execute };
 }
 
-function textOf(result: Awaited<ReturnType<ReturnType<typeof harness>["execute"]>>): string {
+function textOf(
+	result: Awaited<ReturnType<ReturnType<typeof harness>["execute"]>>,
+): string {
 	return result.content[0]?.text ?? "";
 }
 
@@ -82,18 +85,20 @@ describe("Pi ctx_memory U4 scenario 1: create", () => {
 		const db = createClaimReaderTestDatabase();
 		try {
 			const result = parseResult(
-				await harness(db).execute(createArgs("Pi uses direct claims."), "call-create"),
+				await harness(db).execute(
+					createArgs("Pi uses direct claims."),
+					"call-create",
+				),
 			);
 			expect(result).toMatchObject({
 				action: "create",
 				outcome: "applied",
-				replayed: false,
 			});
 			expect(result.affectedClaims?.[0]?.publicClaimId).toMatch(
 				/^mcm_[0-9a-f]{32}$/,
 			);
 			expect(result.affectedClaims?.[0]?.revisionLocator).toContain("/r1/");
-			expect(Object.values(result.generations)).toEqual([1]);
+			expect(result.generation).toBe(1);
 		} finally {
 			closeQuietly(db);
 		}
@@ -121,11 +126,14 @@ describe("Pi ctx_memory U4 scenario 2: get/list", () => {
 				revisionLocator: seeded.revisionLocator,
 				content: "Pi reader claim.",
 			});
-			expect(textOf(await primary.execute({ action: "list" }, "call-list"))).toContain(
-				"not allowed",
-			);
+			expect(
+				textOf(await primary.execute({ action: "list" }, "call-list")),
+			).toContain("not allowed");
 			const listed = parseResult(
-				await harness(db, true).execute({ action: "list" }, "call-list-dreamer"),
+				await harness(db, true).execute(
+					{ action: "list" },
+					"call-list-dreamer",
+				),
 			);
 			expect(listed.claims?.map((claim) => claim.publicClaimId)).toEqual([
 				seeded.publicClaimId,
@@ -219,9 +227,9 @@ describe("Pi ctx_memory U4 scenario 4: same-project merge", () => {
 					"call-merge",
 				),
 			);
-			expect(merged.affectedClaims?.map((claim) => claim.publicClaimId).sort()).toEqual(
-				[target.publicClaimId, source.publicClaimId].sort(),
-			);
+			expect(
+				merged.affectedClaims?.map((claim) => claim.publicClaimId).sort(),
+			).toEqual([target.publicClaimId, source.publicClaimId].sort());
 			const blocked = await tool.execute(
 				{
 					action: "merge",
@@ -248,11 +256,24 @@ describe("Pi ctx_memory U4 scenario 5: replay", () => {
 		try {
 			const tool = harness(db);
 			const args = createArgs("Pi replay claim.");
-			const first = parseResult(await tool.execute(args, "call-replay"));
-			const replay = parseResult(await tool.execute(args, "call-replay"));
-			expect(replay.replayed).toBeTrue();
-			expect({ ...replay, replayed: false }).toEqual(first);
-			const changed = await tool.execute(createArgs("Changed Pi args."), "call-replay");
+			const firstResult = await tool.execute(args, "call-replay");
+			const firstText = textOf(firstResult);
+			const first = parseResult(firstResult).affectedClaims?.[0];
+			if (!first) throw new Error("missing Pi replay create result");
+			await tool.execute(
+				{
+					action: "revise",
+					publicClaimId: first.publicClaimId,
+					mutationToken: first.mutationToken,
+					content: "Pi replay state moved later.",
+				},
+				"call-replay-state-move",
+			);
+			expect(textOf(await tool.execute(args, "call-replay"))).toBe(firstText);
+			const changed = await tool.execute(
+				createArgs("Changed Pi args."),
+				"call-replay",
+			);
 			expect(changed.isError).toBeTrue();
 			expect(textOf(changed)).toBe(
 				"Error: this tool call id was already committed with different arguments. Retry as a new call.",
@@ -272,7 +293,10 @@ describe("Pi ctx_memory U4 scenario 6: privacy/ownership", () => {
 				content: "Pi hidden claim.",
 				operationKey: "u4-pi-hidden",
 			});
-			const hiddenRef = getProjectMemoryClaimByPublicId(db, hidden.publicClaimId);
+			const hiddenRef = getProjectMemoryClaimByPublicId(
+				db,
+				hidden.publicClaimId,
+			);
 			if (!hiddenRef) throw new Error("missing hidden claim");
 			db.transaction(() => {
 				db.prepare(
@@ -322,6 +346,26 @@ describe("Pi ctx_memory U4 scenario 6: privacy/ownership", () => {
 	});
 });
 
+describe("Pi ctx_memory U4 scenario 6b: active project binding", () => {
+	it("rejects a mutation retry after the active project changes", async () => {
+		const db = createClaimReaderTestDatabase();
+		try {
+			let activeProject = PROJECT;
+			const tool = harness(db, false, () => activeProject);
+			const args = createArgs("Project-bound Pi operation.");
+			expect(
+				(await tool.execute(args, "call-project-bound")).isError,
+			).toBeUndefined();
+			activeProject = FOREIGN;
+			const retry = await tool.execute(args, "call-project-bound");
+			expect(retry.isError).toBeTrue();
+			expect(textOf(retry)).toContain("different arguments");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});
+
 describe("Pi ctx_memory U4 scenario 7: human authority", () => {
 	it("rejects agent approve and enforce", async () => {
 		const db = createClaimReaderTestDatabase();
@@ -333,6 +377,51 @@ describe("Pi ctx_memory U4 scenario 7: human authority", () => {
 				expect(result.isError).toBeTrue();
 				expect(textOf(result)).toContain("human-host-owned");
 			}
+			const unknown = await harness(db, true).execute(
+				{ action: "delete" },
+				"call-delete",
+			);
+			expect(unknown.isError).toBeTrue();
+			expect(textOf(unknown)).toContain("not allowed");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});
+
+describe("ctx_memory U4 cross-harness parity", () => {
+	it("returns identical canonical reads and authority errors", async () => {
+		const db = createClaimReaderTestDatabase();
+		try {
+			const seeded = seedProjectMemoryClaim(db, {
+				projectIdentity: PROJECT,
+				content: "Cross-harness claim.",
+				operationKey: "u4-cross-harness",
+			});
+			const openCode = createCtxMemoryTools({
+				db,
+				resolveProjectPath: () => PROJECT,
+			}).ctx_memory;
+			const openCodeExecute = (args: Record<string, unknown>, callID: string) =>
+				openCode.execute(
+					args as never,
+					{
+						sessionID: "ses-u4-cross-harness",
+						directory: "/tmp/u4-cross-harness",
+						callID,
+						agent: "primary",
+					} as never,
+				) as Promise<string>;
+			const pi = harness(db);
+			const args = { action: "get", publicClaimIds: [seeded.publicClaimId] };
+			expect(textOf(await pi.execute(args, "call-get-pi"))).toBe(
+				await openCodeExecute(args, "call-get-opencode"),
+			);
+			expect(
+				textOf(await pi.execute({ action: "approve" }, "call-approve-pi")),
+			).toBe(
+				await openCodeExecute({ action: "approve" }, "call-approve-opencode"),
+			);
 		} finally {
 			closeQuietly(db);
 		}
@@ -341,12 +430,15 @@ describe("Pi ctx_memory U4 scenario 7: human authority", () => {
 
 describe("Pi ctx_memory U4 scenario 8: no legacy active path", () => {
 	it("contains no legacy IDs, embeddings, or mutation-log writes", () => {
-		const source = readFileSync(resolve(import.meta.dir, "ctx-memory.ts"), "utf8");
+		const source = readFileSync(
+			resolve(import.meta.dir, "ctx-memory.ts"),
+			"utf8",
+		);
 		for (const forbidden of [
 			"memory_embeddings",
 			"memory_mutation_log",
 			"storage-memory-claims",
-			"storage-memory\"",
+			'storage-memory"',
 			"memoryId",
 		]) {
 			expect(source).not.toContain(forbidden);

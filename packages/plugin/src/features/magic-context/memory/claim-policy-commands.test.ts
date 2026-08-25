@@ -3,10 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import {
-    createClaimReaderTestDatabase,
-    seedProjectMemoryClaim,
-} from "../test-claim-database";
+import { createClaimReaderTestDatabase, seedProjectMemoryClaim } from "../test-claim-database";
 import {
     type ArtifactEvaluation,
     type ClaimCommandDeps,
@@ -183,7 +180,10 @@ describe("claim approval command", () => {
         const db = createClaimReaderTestDatabase();
         try {
             const foreign = seed(db, "foreign", FOREIGN_PROJECT);
-            const foreignResult = await executeClaimApprovalCommand(deps(db), foreign.publicClaimId);
+            const foreignResult = await executeClaimApprovalCommand(
+                deps(db),
+                foreign.publicClaimId,
+            );
             expect(foreignResult.level).toBe("error");
             expect(foreignResult.text).not.toContain("Confirmation Required");
             expect(foreignResult.text).not.toContain("foreign content");
@@ -193,10 +193,11 @@ describe("claim approval command", () => {
         }
     });
 
-    test("revocation keeps approval history and lowers effective maturity", async () => {
+    test("revocation keeps history and falls back to explicit-user VERIFIED support", async () => {
         const db = createClaimReaderTestDatabase();
         try {
             const claim = seed(db, "revoke");
+            expect(effectiveMaturity(db, claim.revisionId)).toBe("VERIFIED");
             const commandDeps = deps(db);
             await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
             await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
@@ -243,7 +244,47 @@ describe("claim enforcement command", () => {
         }
     });
 
-    test("rechecks exact revision, digest, and claim token after artifact evaluation", async () => {
+    test("rechecks exact revision and digest after artifact evaluation", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const commandDeps = deps(db);
+            const claim = await approvedClaim(db, commandDeps, "enforce-revision-race");
+            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
+            commandDeps.evaluateArtifact = () => {
+                reviseProjectMemoryClaim(
+                    db,
+                    { producer: "test", operationKey: "evaluation-revision-race" },
+                    {
+                        token: computeProjectMemoryMutationToken(db, claim.publicClaimId),
+                        content: "changed during artifact evaluation",
+                        provenance: {
+                            sourceLocator: "test://enforcement/revision-race",
+                            sourceContent: "changed during artifact evaluation",
+                            extractor: "test",
+                            extractorVersion: "1",
+                            extractorRunId: "evaluation-revision-race",
+                            independenceKey: "evaluation-revision-race",
+                        },
+                        actor: "user:test",
+                    },
+                );
+                return passEvaluator();
+            };
+            const args = `${claim.publicClaimId} gate.test.ts`;
+            await executeClaimEnforceCommand(commandDeps, args);
+            const result = await executeClaimEnforceCommand(commandDeps, args);
+            expect(result.level).toBe("error");
+            expect(result.text).toContain("changed since confirmation");
+            expect(
+                db.prepare("SELECT COUNT(*) AS count FROM claim_enforcement_artifacts").get(),
+            ).toEqual({ count: 0 });
+            expect(effectiveMaturity(db, claim.revisionId)).not.toBe("ENFORCED");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rechecks the exact claim token after artifact evaluation", async () => {
         const db = createClaimReaderTestDatabase();
         try {
             const commandDeps = deps(db);
