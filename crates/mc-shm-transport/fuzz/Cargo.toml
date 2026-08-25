@@ -1,0 +1,41 @@
+[package]
+name = "mc-shm-transport-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mc-shm-transport]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "frame_descriptor"
+path = "fuzz_targets/frame_descriptor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider_grant"
+path = "fuzz_targets/provider_grant.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider_sample"
+path = "fuzz_targets/provider_sample.rs"
+test = false
+doc = false
+bench = false
+
+# The root workspace excludes this directory, so this manifest declares a
+# standalone workspace. commentlint: allow(JUDGE)
+[workspace]
+members = ["."]
