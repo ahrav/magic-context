@@ -236,6 +236,8 @@ pub enum DecodeError {
     SheddableIllegalFrameType { ty: FrameType, flags: u8 },
     /// Channel 0 carried an epoch other than its reserved epoch 0.
     NonzeroEpochOnControlChannel { epoch: u32 },
+    /// A routed channel carried epoch 0, which is reserved for channel 0.
+    ZeroEpochOnRoutedChannel { channel: u16 },
     /// A pure-header frame declared body bytes.
     PureHeaderFrameWithBody { ty: FrameType, len: u32 },
 }
@@ -269,6 +271,9 @@ impl fmt::Display for DecodeError {
             ),
             Self::NonzeroEpochOnControlChannel { epoch } => {
                 write!(f, "control channel carried nonzero epoch {epoch}")
+            }
+            Self::ZeroEpochOnRoutedChannel { channel } => {
+                write!(f, "routed channel {channel} carried zero epoch")
             }
             Self::PureHeaderFrameWithBody { ty, len } => {
                 write!(
@@ -339,6 +344,13 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     let epoch = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
     if channel == 0 && epoch != 0 {
         return Err(DecodeError::NonzeroEpochOnControlChannel { epoch });
+    }
+    // Epoch 0 is reserved for the control channel (Section 6.1), so a routed
+    // channel without an epoch names no bindable route. Rejecting it here keeps
+    // the framing layer's identity contract symmetric instead of leaving the
+    // frame to be dropped as unmatched further up.
+    if channel != 0 && epoch == 0 {
+        return Err(DecodeError::ZeroEpochOnRoutedChannel { channel });
     }
     let corr = u64::from_le_bytes([
         bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
@@ -803,6 +815,20 @@ mod tests {
         assert_eq!(
             decode_header(&h.encode()),
             Err(DecodeError::NonzeroEpochOnControlChannel { epoch: u32::MAX })
+        );
+        // Epoch 0 is reserved for channel 0, so a routed channel must carry a
+        // nonzero epoch. Both halves of the pairing are structural.
+        let h = hdr_with_epoch(
+            0,
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            7,
+            0,
+            2,
+        );
+        assert_eq!(
+            decode_header(&h.encode()),
+            Err(DecodeError::ZeroEpochOnRoutedChannel { channel: 7 })
         );
     }
 

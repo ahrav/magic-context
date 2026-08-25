@@ -661,6 +661,10 @@ enum PendingKind {
     Stream {
         items: mpsc::Sender<ChargedItem>,
         terminal: oneshot::Sender<Result<(), CallError>>,
+        /// Fired once when this stream settles, so the detached deadline
+        /// watcher stops sleeping instead of outliving the stream by up to the
+        /// caller's whole timeout.
+        settled: CancellationToken,
     },
 }
 
@@ -731,12 +735,14 @@ impl Inner {
         let (item_tx, item_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
         let (terminal_tx, terminal_rx) = oneshot::channel();
         let deadline = Instant::now() + options.timeout;
+        let settled = CancellationToken::new();
         let admitted = self.admit(
             route,
             body,
             PendingKind::Stream {
                 items: item_tx,
                 terminal: terminal_tx,
+                settled: settled.clone(),
             },
             deadline,
         );
@@ -747,31 +753,28 @@ impl Inner {
                 return Err(error);
             }
         };
-        if let Some(cancel) = options.cancellation {
-            let weak = Arc::downgrade(self);
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = cancel.cancelled() => {
-                        if let Some(inner) = weak.upgrade() {
-                            let _ = inner.cancel_key(key, "cancelled");
-                        }
-                    }
-                    () = tokio::time::sleep_until(deadline) => {
-                        if let Some(inner) = weak.upgrade() {
-                            let _ = inner.cancel_key(key, "deadline_expired");
-                        }
+        // A default token is never cancelled, so the absent-cancellation case
+        // reduces to a deadline-only watcher without a second spawn shape.
+        let cancel = options.cancellation.unwrap_or_default();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                // Settlement first: a stream that already terminated must not
+                // issue a cancel on a correlation the host may have reused.
+                () = settled.cancelled() => {}
+                () = cancel.cancelled() => {
+                    if let Some(inner) = weak.upgrade() {
+                        let _ = inner.cancel_key(key, "cancelled");
                     }
                 }
-            });
-        } else {
-            let weak = Arc::downgrade(self);
-            tokio::spawn(async move {
-                tokio::time::sleep_until(deadline).await;
-                if let Some(inner) = weak.upgrade() {
-                    let _ = inner.cancel_key(key, "deadline_expired");
+                () = tokio::time::sleep_until(deadline) => {
+                    if let Some(inner) = weak.upgrade() {
+                        let _ = inner.cancel_key(key, "deadline_expired");
+                    }
                 }
-            });
-        }
+            }
+        });
         Ok(ResponseStream {
             inner: Arc::downgrade(self),
             key,
@@ -901,7 +904,13 @@ impl Inner {
             Err(CallError::local(outcome, code, "request stopped")),
         );
         if outcome == SendOutcome::OutcomeUnknown {
-            self.send_control(
+            // The Cancel is best-effort cleanup, and the request's bytes may
+            // already be on the wire. Report the failed enqueue, but keep the
+            // request's own OutcomeUnknown classification: substituting the
+            // control frame's outcome (NotSent when the generation retires
+            // concurrently) would tell the caller a possibly-delivered request
+            // is replay-safe.
+            if let Err(error) = self.send_control(
                 FrameType::Cancel,
                 FrameId {
                     channel: key.channel,
@@ -909,7 +918,9 @@ impl Inner {
                     corr: key.corr,
                 },
                 None,
-            )?;
+            ) {
+                return Err(CallError::new(outcome, error.code, error.message));
+            }
         }
         Ok(())
     }
@@ -1114,9 +1125,15 @@ impl Inner {
             PendingKind::Unary(tx) => {
                 let _ = tx.send(result);
             }
-            PendingKind::Stream { terminal, .. } => {
+            PendingKind::Stream {
+                terminal, settled, ..
+            } => {
                 let terminal_result = result.map(|_| ());
                 let _ = terminal.send(terminal_result);
+                // Every settle path — terminal frame, caller cancel, stream
+                // drop, route settle, generation retire — funnels through here,
+                // so this is the single point that retires the watcher task.
+                settled.cancel();
                 self.release_stream();
             }
         }
@@ -1507,12 +1524,24 @@ fn validate_inbound(header: &EnvelopeHeader) -> Result<(), ()> {
     }
     match header.ty {
         FrameType::Response | FrameType::Error | FrameType::StreamData | FrameType::StreamEnd => {
+            // `decode_header` already rejects a mixed zero/nonzero
+            // channel/epoch pair, so the identity is control (0/0) or routed
+            // (nonzero/nonzero) by here; only the correlation is left.
             if header.corr == 0 {
+                return Err(());
+            }
+            // The direct profile carries stream termination in the header. A
+            // StreamEnd body is structural corruption even though the framing
+            // layer does not classify StreamEnd as pure-header, so the
+            // pure-header check below never sees it.
+            if matches!(header.ty, FrameType::StreamEnd) && header.len != 0 {
                 return Err(());
             }
         }
         FrameType::Push => {
-            if header.channel == 0 || header.epoch == 0 {
+            // Push is unsolicited, so a correlation would claim a pending
+            // request the frame cannot answer.
+            if header.channel == 0 || header.epoch == 0 || header.corr != 0 {
                 return Err(());
             }
         }
@@ -2057,6 +2086,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_cancel_enqueue_keeps_outcome_unknown() {
+        let (inner, mut data_rx, control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let (kind, rx) = unary_sender();
+        let (key, publish) = inner
+            .admit(
+                route(1),
+                b"possibly-sent".to_vec(),
+                kind,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("admitted");
+        assert!(claim_for_write(&publish), "writer claims the request");
+        // Retire without draining pending, so the best-effort Cancel enqueue
+        // fails with the control path's own NotSent classification.
+        inner.retired.store(true, Ordering::Release);
+
+        let error = inner
+            .cancel_key(key, "cancelled")
+            .expect_err("Cancel cannot be queued on a retired generation");
+        assert_eq!(
+            error.outcome(),
+            SendOutcome::OutcomeUnknown,
+            "a claimed request stays possibly-sent when its Cancel cannot be queued"
+        );
+        assert_eq!(error.code(), "generation_retired");
+        let settled = rx.await.expect("settled").expect_err("cancelled");
+        assert_eq!(settled.outcome(), SendOutcome::OutcomeUnknown);
+        drop(data_rx.recv().await);
+        drop(control_rx);
+    }
+
+    #[tokio::test]
+    async fn settled_stream_retires_its_deadline_watcher() {
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let (items_tx, _items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let settled = CancellationToken::new();
+        let (key, _publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                PendingKind::Stream {
+                    items: items_tx,
+                    terminal: terminal_tx,
+                    settled: settled.clone(),
+                },
+                Instant::now() + Duration::from_secs(600),
+            )
+            .expect("stream admitted");
+        assert!(
+            !settled.is_cancelled(),
+            "the watcher must stay armed while the stream is live"
+        );
+        drop(data_rx.recv().await);
+
+        inner.cancel_key(key, "cancelled").expect("stream settled");
+        assert!(
+            settled.is_cancelled(),
+            "settlement must retire the watcher instead of leaving it asleep until the deadline"
+        );
+        let _ = terminal_rx.await;
+    }
+
+    #[test]
+    fn inbound_validation_enforces_the_direct_profile_table() {
+        let header =
+            |ty: FrameType, channel: u16, epoch: u32, corr: u64, len: u32| EnvelopeHeader {
+                len,
+                ver: PROTOCOL_VERSION,
+                ty,
+                flags: if ty.is_pure_header() {
+                    pure_header_flags()
+                } else {
+                    Flags::new(false, Priority::Interactive, false)
+                },
+                channel,
+                epoch,
+                corr,
+            };
+
+        // Legal control and routed identities stay legal.
+        assert!(validate_inbound(&header(FrameType::Response, 0, 0, 7, 4)).is_ok());
+        assert!(validate_inbound(&header(FrameType::Response, 3, 9, 7, 4)).is_ok());
+        assert!(validate_inbound(&header(FrameType::StreamData, 3, 9, 7, 4)).is_ok());
+        assert!(validate_inbound(&header(FrameType::StreamEnd, 3, 9, 7, 0)).is_ok());
+        assert!(validate_inbound(&header(FrameType::Push, 3, 9, 0, 4)).is_ok());
+
+        // A routed frame with epoch 0 never decodes, so `validate_inbound` only
+        // sees coherent identities (see `wire::decode_header`).
+        assert!(validate_inbound(&header(FrameType::Response, 3, 0, 7, 4)).is_ok());
+
+        // The direct profile requires an empty StreamEnd body.
+        assert!(validate_inbound(&header(FrameType::StreamEnd, 3, 9, 7, 1)).is_err());
+
+        // Push is unsolicited, so it carries no correlation.
+        assert!(validate_inbound(&header(FrameType::Push, 3, 9, 5, 4)).is_err());
+
+        // Pre-existing rules keep holding.
+        assert!(validate_inbound(&header(FrameType::Response, 3, 9, 0, 4)).is_err());
+        assert!(validate_inbound(&header(FrameType::Ping, 0, 0, 7, 0)).is_ok());
+        assert!(validate_inbound(&header(FrameType::Ping, 1, 0, 7, 0)).is_err());
+        assert!(validate_inbound(&header(FrameType::Goodbye, 0, 0, 0, 0)).is_ok());
+        assert!(validate_inbound(&header(FrameType::Goodbye, 3, 9, 0, 1)).is_err());
+        assert!(validate_inbound(&header(FrameType::Request, 3, 9, 7, 4)).is_err());
+    }
+
+    #[tokio::test]
     async fn dropped_unary_future_cleans_pending_and_possibly_sent_request() {
         let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
         let task_inner = Arc::clone(&inner);
@@ -2246,6 +2382,7 @@ mod tests {
                 PendingKind::Stream {
                     items: items_tx,
                     terminal: terminal_tx,
+                    settled: CancellationToken::new(),
                 },
                 Instant::now() + Duration::from_secs(1),
             )
