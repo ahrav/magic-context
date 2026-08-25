@@ -730,18 +730,21 @@ export async function driveThinkingDroppedShell(
         : /\[dropped \u00a7\d+\u00a7\]/.test(allUserText);
 
     const thinkings = findThinkingBlocks(body);
-    const signatures = new Set(thinkings.map((t) => t.signature));
     let signedReplayIntact: boolean;
     if (options.rustMode) {
         signedReplayIntact = thinkings.length === 0;
     } else {
-        signedReplayIntact = signatures.has(sigA) || signatures.has(sigB);
-        for (const t of thinkings) {
-            if (t.signature === sigA && t.thinking !== signedThinkingA)
-                signedReplayIntact = false;
-            if (t.signature === sigB && t.thinking !== signedThinkingB)
-                signedReplayIntact = false;
-        }
+        // BOTH signed replays must survive with their original bytes. An `||`
+        // over the signature set reads as intact when one signed assistant
+        // message is dropped entirely, and per-block byte comparisons only run
+        // for blocks that are present, so a dropped block was never checked.
+        signedReplayIntact =
+            thinkings.some(
+                (t) => t.signature === sigA && t.thinking === signedThinkingA,
+            ) &&
+            thinkings.some(
+                (t) => t.signature === sigB && t.thinking === signedThinkingB,
+            );
     }
 
     const messages = messagesOf(body);

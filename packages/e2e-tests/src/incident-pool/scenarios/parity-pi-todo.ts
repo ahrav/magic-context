@@ -20,7 +20,7 @@ import {
     TODO_PRESSURE_FIXTURE,
     captureTodoState,
     findSyntheticPair,
-    findSyntheticPairs,
+    injectedTodoPairs,
     isMagicContextRequest,
     normalizedTodoJson,
     primeNextTurnAsCacheBust,
@@ -640,9 +640,11 @@ export async function drivePiTodoDeferReplay(
         // that the frozen pair survived beside it. Byte-comparing the old call
         // id cannot see a second pair injected for the newer state, and the
         // durable fields stay frozen in that case too, so without a count the
-        // case reads as deferred while already exposing the newer todos.
+        // case reads as deferred while already exposing the newer todos. Count
+        // injected pairs by their deterministic call-id prefix: a real executed
+        // todowrite pair replayed in history is not a second injection.
         const newerDeferPairCount = newerDefer
-            ? findSyntheticPairs(newerDefer).length
+            ? injectedTodoPairs(newerDefer).length
             : 0;
 
         const legacy = await preparePiCacheBust(context, h);

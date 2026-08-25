@@ -190,7 +190,22 @@ function findToolUseId(
     message: WireMessage,
     expectedCallId?: string,
 ): string | null {
-    if (message.role !== "assistant") return null;
+    return findToolUseIds(message, expectedCallId)[0] ?? null;
+}
+
+/**
+ * Every todowrite tool-use id in one assistant message.
+ *
+ * Returning only the first id makes a second pair inside the SAME assistant
+ * message invisible, which is one of the two ways a premature newer state hides
+ * beside a frozen pair (the other is a second assistant/user shell).
+ */
+function findToolUseIds(
+    message: WireMessage,
+    expectedCallId?: string,
+): string[] {
+    if (message.role !== "assistant") return [];
+    const ids: string[] = [];
     for (const block of contentBlocks(message.content)) {
         if (!block || typeof block !== "object") continue;
         const value = block as {
@@ -207,9 +222,9 @@ function findToolUseId(
         }
         if (typeof value.id !== "string") continue;
         if (expectedCallId && value.id !== expectedCallId) continue;
-        return value.id;
+        ids.push(value.id);
     }
-    return null;
+    return ids;
 }
 
 function findToolResultBlock(
@@ -227,12 +242,21 @@ function findToolResultBlock(
     return null;
 }
 
+/** Deterministic prefix carried by every injected synthetic call id. */
+export const SYNTHETIC_TODO_CALL_ID_PREFIX = "mc_synthetic_todo_";
+
 /**
- * Every synthetic pair on the wire, in message order.
+ * Every pair on the wire whose tool name is todowrite, in message order.
  *
  * A check that only looks for one expected call id cannot see an ADDITIONAL
  * pair beside it, which is how a premature newer state leaks onto a defer turn
- * while the expected frozen bytes stay intact.
+ * while the expected frozen bytes stay intact. All matching ids within an
+ * assistant message are enumerated, not just the first, so a second pair sharing
+ * one assistant/user shell is counted too.
+ *
+ * This matches on tool NAME, so a real executed todowrite pair replayed in
+ * history also qualifies. Callers that need injected pairs only must filter on
+ * `SYNTHETIC_TODO_CALL_ID_PREFIX` — see `injectedTodoPairs`.
  */
 export function findSyntheticPairs(
     body: RequestBody,
@@ -244,22 +268,33 @@ export function findSyntheticPairs(
     for (let index = 0; index < messages.length - 1; index += 1) {
         const assistant = messages[index] as WireMessage;
         const user = messages[index + 1] as WireMessage;
-        const callId = findToolUseId(assistant, expectedCallId);
-        if (!callId) continue;
-        const toolResult = findToolResultBlock(user, callId);
-        if (!toolResult) continue;
-        const toolUse = contentBlocks(assistant.content).find((block) => {
-            if (!block || typeof block !== "object") return false;
-            const value = block as { type?: unknown; id?: unknown };
-            return value.type === "tool_use" && value.id === callId;
-        });
-        pairs.push({
-            index,
-            callId,
-            bytes: JSON.stringify([toolUse, toolResult]),
-        });
+        for (const callId of findToolUseIds(assistant, expectedCallId)) {
+            const toolResult = findToolResultBlock(user, callId);
+            if (!toolResult) continue;
+            const toolUse = contentBlocks(assistant.content).find((block) => {
+                if (!block || typeof block !== "object") return false;
+                const value = block as { type?: unknown; id?: unknown };
+                return value.type === "tool_use" && value.id === callId;
+            });
+            pairs.push({
+                index,
+                callId,
+                bytes: JSON.stringify([toolUse, toolResult]),
+            });
+        }
     }
     return pairs;
+}
+
+/**
+ * The pairs an injector produced, identified by the deterministic call-id
+ * prefix rather than by tool name, so a real executed todowrite pair replayed in
+ * history is never counted as an injected one.
+ */
+export function injectedTodoPairs(body: RequestBody): SyntheticPair[] {
+    return findSyntheticPairs(body).filter((pair) =>
+        pair.callId.startsWith(SYNTHETIC_TODO_CALL_ID_PREFIX),
+    );
 }
 
 export function findSyntheticPair(

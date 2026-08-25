@@ -266,7 +266,10 @@ export async function driveHistorianFailureDump(
             !serializedFacts.includes(contentCanary) &&
             !serializedFacts.includes(terminalCanary) &&
             !serializedFacts.includes(shellCanary) &&
-            !serializedFacts.includes(dumpPath);
+            // `includes("")` is true for every string, so an absent dump path
+            // would read as a leak. Guarded to match `dumpProjectLocal`, which
+            // already treats an empty path as "nothing to check".
+            (dumpPath.length === 0 || !serializedFacts.includes(dumpPath));
         return staticFacts;
     } finally {
         db.close();

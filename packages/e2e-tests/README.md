@@ -34,9 +34,10 @@ bun run --cwd packages/e2e-tests test:rust-e2e
 bun run --cwd packages/e2e-tests test:incidents:rust
 ```
 
-Rust commands require `../commons`, `../subconscious`, Cargo, and `ck-mc`.
-Absent prerequisites are unavailable, not passing. Public CI runs the supported
-TS report only.
+Rust commands require Unix socket support, Cargo, and this repository's own
+Cargo workspace metadata for the `direct_host_fixture` example. Absent
+prerequisites are unavailable, not passing. Public CI runs the supported TS
+report only.
 
 ### Incident report artifacts
 

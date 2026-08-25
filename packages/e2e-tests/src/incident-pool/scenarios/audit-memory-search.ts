@@ -1125,9 +1125,17 @@ export async function driveEmbeddingFreshness(
             request.inputs.some((input) => input.includes(fixture.newContent)),
         );
         const finalVector = readStoredVector();
+        // "Different from the stale vector" is not "correct": any corrupted
+        // replacement satisfies it. The passage-request check proves only that
+        // an embedding was REQUESTED, not that the returned vector was
+        // persisted, and a single-row search can satisfy the fresh/stale query
+        // assertions with a merely favorable wrong vector. Compare against the
+        // deterministic embedding of the edited content and require the same
+        // model, so durable embedding provenance is what is asserted.
         const vectorReplacedBySearchTime =
             finalVector !== null &&
-            !vectorsRoughlyEqual(finalVector.vector, oldVector);
+            vectorsRoughlyEqual(finalVector.vector, newVector) &&
+            finalVector.modelId === seeded.modelId;
 
         return {
             kind: "a32-embedding-freshness",
