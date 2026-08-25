@@ -1,5 +1,10 @@
 import * as crypto from "node:crypto";
-import { computeClaimOperationRequestDigest } from "../../features/magic-context/memory/claim-operation-contract";
+import {
+    computeClaimOperationRequestDigest,
+    parseRevisionLocator,
+    sha256HexUtf8,
+    type SnapshotVector,
+} from "../../features/magic-context/memory/claim-operation-contract";
 import {
     getRawSessionStoredMessageCount,
     readRawSessionMessageOrdinalPage,
@@ -21,6 +26,8 @@ export const MODULE_ITEM_CONTINUATION_KEY = "__shadow_item_continuation";
 export const MODULE_ORDINAL_PAGE_SIZE = 500;
 export const CLAIM_INTENT_PROTOCOL_VERSION = 1;
 export const CLAIM_REQUEST_ENCODING_VERSION = 1;
+export const CLAIM_MIRROR_PROTOCOL_VERSION = 1;
+export const CLAIM_MIRROR_VERSION = 1;
 
 export interface ClaimIntentBinding {
     databaseIncarnationId: string;
@@ -118,6 +125,84 @@ export interface ClaimEffectDeliveryResponse {
     ackedEffectId: number;
 }
 
+export type ClaimMirrorLifecycle = "active" | "archived" | "retired";
+export type ClaimMirrorChangeKind =
+    | "upsert"
+    | "evidence"
+    | "lifecycle"
+    | "applicability"
+    | "verification"
+    | "derivation";
+
+/** Complete authorized provider row. Numeric storage identities never cross this wire. */
+export interface CommittedClaimMirrorRow {
+    publicClaimId: string;
+    projectId: number;
+    revisionLocator: string;
+    content: string;
+    contentDigest: string;
+    attributes: Record<string, unknown>;
+    lifecycle: ClaimMirrorLifecycle;
+    applicability: Record<string, unknown>;
+    policy: Record<string, unknown>;
+    provenanceLabel: string | null;
+    projectGeneration: number;
+    policyGeneration: number;
+}
+
+export interface ClaimMirrorSnapshot {
+    mirrorVersion: number;
+    vector: SnapshotVector;
+    projectCheckpoints: Record<string, number>;
+    claims: CommittedClaimMirrorRow[];
+}
+
+export interface ClaimMirrorEffect {
+    effectId: number;
+    previousProjectEffectId: number;
+    effectKey: string;
+    projectId: number;
+    generation: number;
+    changeKind: ClaimMirrorChangeKind;
+    publicClaimId: string;
+    revisionLocator: string;
+    claim: CommittedClaimMirrorRow | null;
+}
+
+export interface ClaimMirrorReceiptGroup {
+    mirrorVersion: number;
+    receiptId: number;
+    expectedEffectCount: number;
+    vector: SnapshotVector;
+    effects: ClaimMirrorEffect[];
+}
+
+export interface ClaimMirrorSnapshotRequest {
+    protocolVersion: number;
+    snapshot: ClaimMirrorSnapshot;
+}
+
+export interface ClaimMirrorReceiptRequest {
+    protocolVersion: number;
+    receipt: ClaimMirrorReceiptGroup;
+}
+
+export interface ClaimMirrorSnapshotResponse {
+    protocolVersion: number;
+    mirrorVersion: number;
+    databaseIncarnationId: string;
+    projectCheckpoints: Record<string, number>;
+}
+
+export interface ClaimMirrorReceiptResponse {
+    protocolVersion: number;
+    mirrorVersion: number;
+    receiptId: number;
+    replayed: boolean;
+    appliedEffectCount: number;
+    ackedEffectId: number;
+}
+
 export interface ModuleFacadeWireBody<T> {
     name: string;
     arguments: T;
@@ -149,6 +234,243 @@ function wireSafeInteger(
         throw new Error(`${label}.${key} must be a safe integer >= ${minimum}`);
     }
     return value as number;
+}
+
+function wireIntegerRecord(value: unknown, label: string, minimum = 0): Record<string, number> {
+    const record = wireRecord(value, label);
+    const decoded: Record<string, number> = {};
+    for (const [key, entry] of Object.entries(record)) {
+        if (
+            !/^[1-9]\d*$/.test(key) ||
+            !Number.isSafeInteger(entry) ||
+            (entry as number) < minimum
+        ) {
+            throw new Error(`${label}.${key} must be a safe integer >= ${minimum}`);
+        }
+        decoded[key] = entry as number;
+    }
+    return decoded;
+}
+
+function validateClaimMirrorVector(value: unknown, label: string): SnapshotVector {
+    const record = wireRecord(value, label);
+    if (record.vectorVersion !== 1) throw new Error(`${label}.vectorVersion is unsupported`);
+    const databaseIncarnationId = wireString(record, "databaseIncarnationId", label);
+    if (!/^[0-9a-f]{32}$/.test(databaseIncarnationId)) {
+        throw new Error(`${label}.databaseIncarnationId must be 32 lowercase hex characters`);
+    }
+    const workspaceEpoch = wireString(record, "workspaceEpoch", label);
+    const projectGenerations = wireIntegerRecord(
+        record.projectGenerations,
+        `${label}.projectGenerations`,
+    );
+    const policyGenerations = wireIntegerRecord(
+        record.policyGenerations,
+        `${label}.policyGenerations`,
+    );
+    if (Object.keys(projectGenerations).join("\0") !== Object.keys(policyGenerations).join("\0")) {
+        throw new Error(`${label} generation vectors must name the same projects in order`);
+    }
+    return {
+        vectorVersion: 1,
+        databaseIncarnationId,
+        workspaceEpoch,
+        projectGenerations,
+        policyGenerations,
+    };
+}
+
+function validateCommittedClaimMirrorRow(
+    value: unknown,
+    vector: SnapshotVector,
+    label: string,
+): CommittedClaimMirrorRow {
+    const record = wireRecord(value, label);
+    const publicClaimId = wireString(record, "publicClaimId", label);
+    const projectId = wireSafeInteger(record, "projectId", label, 1);
+    const revisionLocator = wireString(record, "revisionLocator", label);
+    const locator = parseRevisionLocator(revisionLocator);
+    const content = typeof record.content === "string" ? record.content : null;
+    const contentDigest = wireString(record, "contentDigest", label);
+    if (
+        !locator ||
+        locator.publicClaimId !== publicClaimId ||
+        locator.contentDigest !== contentDigest ||
+        content === null ||
+        sha256HexUtf8(content) !== contentDigest
+    ) {
+        throw new Error(`${label} revision identity or content digest is invalid`);
+    }
+    const lifecycle = record.lifecycle;
+    if (lifecycle !== "active" && lifecycle !== "archived" && lifecycle !== "retired") {
+        throw new Error(`${label}.lifecycle is unsupported`);
+    }
+    const projectGeneration = wireSafeInteger(record, "projectGeneration", label);
+    const policyGeneration = wireSafeInteger(record, "policyGeneration", label);
+    if (
+        vector.projectGenerations[String(projectId)] !== projectGeneration ||
+        vector.policyGenerations[String(projectId)] !== policyGeneration
+    ) {
+        throw new Error(`${label} generation does not match vector`);
+    }
+    const provenanceLabel = record.provenanceLabel;
+    if (
+        provenanceLabel !== null &&
+        (typeof provenanceLabel !== "string" ||
+            provenanceLabel.length === 0 ||
+            provenanceLabel.length > 512)
+    ) {
+        throw new Error(`${label}.provenanceLabel must be null or contain 1..=512 characters`);
+    }
+    return {
+        publicClaimId,
+        projectId,
+        revisionLocator,
+        content,
+        contentDigest,
+        attributes: wireRecord(record.attributes, `${label}.attributes`),
+        lifecycle,
+        applicability: wireRecord(record.applicability, `${label}.applicability`),
+        policy: wireRecord(record.policy, `${label}.policy`),
+        provenanceLabel,
+        projectGeneration,
+        policyGeneration,
+    };
+}
+
+function validateClaimMirrorSnapshot(value: unknown): ClaimMirrorSnapshot {
+    const record = wireRecord(value, "claim mirror snapshot");
+    if (record.mirrorVersion !== CLAIM_MIRROR_VERSION) {
+        throw new Error("claim mirror snapshot.mirrorVersion is unsupported");
+    }
+    const vector = validateClaimMirrorVector(record.vector, "claim mirror snapshot.vector");
+    const projectCheckpoints = wireIntegerRecord(
+        record.projectCheckpoints,
+        "claim mirror snapshot.projectCheckpoints",
+    );
+    if (
+        Object.keys(projectCheckpoints).join("\0") !==
+        Object.keys(vector.projectGenerations).join("\0")
+    ) {
+        throw new Error(
+            "claim mirror snapshot checkpoints must name every vector project in order",
+        );
+    }
+    if (!Array.isArray(record.claims))
+        throw new Error("claim mirror snapshot.claims must be an array");
+    const claims = record.claims.map((claim, index) =>
+        validateCommittedClaimMirrorRow(claim, vector, `claim mirror snapshot.claims[${index}]`),
+    );
+    if (new Set(claims.map((claim) => claim.publicClaimId)).size !== claims.length) {
+        throw new Error("claim mirror snapshot repeats a public claim ID");
+    }
+    return { mirrorVersion: CLAIM_MIRROR_VERSION, vector, projectCheckpoints, claims };
+}
+
+function validateClaimMirrorReceipt(value: unknown): ClaimMirrorReceiptGroup {
+    const record = wireRecord(value, "claim mirror receipt");
+    if (record.mirrorVersion !== CLAIM_MIRROR_VERSION) {
+        throw new Error("claim mirror receipt.mirrorVersion is unsupported");
+    }
+    const receiptId = wireSafeInteger(record, "receiptId", "claim mirror receipt", 1);
+    const expectedEffectCount = wireSafeInteger(
+        record,
+        "expectedEffectCount",
+        "claim mirror receipt",
+        1,
+    );
+    const vector = validateClaimMirrorVector(record.vector, "claim mirror receipt.vector");
+    if (!Array.isArray(record.effects) || record.effects.length !== expectedEffectCount) {
+        throw new Error("claim mirror receipt effect group is incomplete");
+    }
+    const effects = record.effects.map((value, index): ClaimMirrorEffect => {
+        const effect = wireRecord(value, `claim mirror receipt.effects[${index}]`);
+        const effectId = wireSafeInteger(
+            effect,
+            "effectId",
+            `claim mirror receipt.effects[${index}]`,
+            1,
+        );
+        const previousProjectEffectId = wireSafeInteger(
+            effect,
+            "previousProjectEffectId",
+            `claim mirror receipt.effects[${index}]`,
+        );
+        const projectId = wireSafeInteger(
+            effect,
+            "projectId",
+            `claim mirror receipt.effects[${index}]`,
+            1,
+        );
+        const generation = wireSafeInteger(
+            effect,
+            "generation",
+            `claim mirror receipt.effects[${index}]`,
+            1,
+        );
+        const changeKind = effect.changeKind;
+        if (
+            changeKind !== "upsert" &&
+            changeKind !== "evidence" &&
+            changeKind !== "lifecycle" &&
+            changeKind !== "applicability" &&
+            changeKind !== "verification" &&
+            changeKind !== "derivation"
+        ) {
+            throw new Error(`claim mirror receipt.effects[${index}].changeKind is unsupported`);
+        }
+        const publicClaimId = wireString(
+            effect,
+            "publicClaimId",
+            `claim mirror receipt.effects[${index}]`,
+        );
+        const revisionLocator = wireString(
+            effect,
+            "revisionLocator",
+            `claim mirror receipt.effects[${index}]`,
+        );
+        const locator = parseRevisionLocator(revisionLocator);
+        if (
+            !locator ||
+            locator.publicClaimId !== publicClaimId ||
+            vector.projectGenerations[String(projectId)] !== generation
+        ) {
+            throw new Error(
+                `claim mirror receipt.effects[${index}] identity or generation is invalid`,
+            );
+        }
+        return {
+            effectId,
+            previousProjectEffectId,
+            effectKey: wireString(effect, "effectKey", `claim mirror receipt.effects[${index}]`),
+            projectId,
+            generation,
+            changeKind,
+            publicClaimId,
+            revisionLocator,
+            claim:
+                effect.claim === null
+                    ? null
+                    : validateCommittedClaimMirrorRow(
+                          effect.claim,
+                          vector,
+                          `claim mirror receipt.effects[${index}].claim`,
+                      ),
+        };
+    });
+    const firstEffectId = effects[0]?.effectId ?? 0;
+    for (let index = 0; index < effects.length; index += 1) {
+        if (effects[index]?.effectId !== firstEffectId + index) {
+            throw new Error("claim mirror receipt effects must have contiguous IDs");
+        }
+    }
+    return {
+        mirrorVersion: CLAIM_MIRROR_VERSION,
+        receiptId,
+        expectedEffectCount,
+        vector,
+        effects,
+    };
 }
 
 function decodeClaimIntentBinding(value: unknown): ClaimIntentBinding {
@@ -225,6 +547,26 @@ export function buildClaimEffectDeliveryWireBody(
     request: ClaimEffectDeliveryRequest,
 ): ModuleFacadeWireBody<ClaimEffectDeliveryRequest> {
     return { name: "claim.effects.apply", arguments: request };
+}
+
+export function buildClaimMirrorSnapshotWireBody(
+    request: ClaimMirrorSnapshotRequest,
+): ModuleFacadeWireBody<ClaimMirrorSnapshotRequest> {
+    if (request.protocolVersion !== CLAIM_MIRROR_PROTOCOL_VERSION) {
+        throw new Error("claim mirror snapshot request.protocolVersion is unsupported");
+    }
+    validateClaimMirrorSnapshot(request.snapshot);
+    return { name: "claim.mirror.replace", arguments: request };
+}
+
+export function buildClaimMirrorReceiptWireBody(
+    request: ClaimMirrorReceiptRequest,
+): ModuleFacadeWireBody<ClaimMirrorReceiptRequest> {
+    if (request.protocolVersion !== CLAIM_MIRROR_PROTOCOL_VERSION) {
+        throw new Error("claim mirror receipt request.protocolVersion is unsupported");
+    }
+    validateClaimMirrorReceipt(request.receipt);
+    return { name: "claim.mirror.apply", arguments: request };
 }
 
 export function decodeClaimIntentStageResponse(
@@ -316,6 +658,82 @@ export function decodeClaimEffectDeliveryResponse(
         );
     }
     return { protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION, ackedEffectId };
+}
+
+function requireClaimMirrorResponseVersion(record: Record<string, unknown>, label: string): void {
+    if (record.protocolVersion !== CLAIM_MIRROR_PROTOCOL_VERSION) {
+        throw new Error(`${label}.protocolVersion is unsupported`);
+    }
+    if (record.mirrorVersion !== CLAIM_MIRROR_VERSION) {
+        throw new Error(`${label}.mirrorVersion is unsupported`);
+    }
+}
+
+export function decodeClaimMirrorSnapshotResponse(
+    value: unknown,
+    request: ClaimMirrorSnapshotRequest,
+): ClaimMirrorSnapshotResponse {
+    const snapshot = validateClaimMirrorSnapshot(request.snapshot);
+    const record = wireRecord(value, "claim mirror snapshot response");
+    requireClaimMirrorResponseVersion(record, "claim mirror snapshot response");
+    const databaseIncarnationId = wireString(
+        record,
+        "databaseIncarnationId",
+        "claim mirror snapshot response",
+    );
+    const projectCheckpoints = wireIntegerRecord(
+        record.projectCheckpoints,
+        "claim mirror snapshot response.projectCheckpoints",
+    );
+    if (
+        databaseIncarnationId !== snapshot.vector.databaseIncarnationId ||
+        JSON.stringify(projectCheckpoints) !== JSON.stringify(snapshot.projectCheckpoints)
+    ) {
+        throw new Error("claim mirror snapshot response acknowledgement mismatch");
+    }
+    return {
+        protocolVersion: CLAIM_MIRROR_PROTOCOL_VERSION,
+        mirrorVersion: CLAIM_MIRROR_VERSION,
+        databaseIncarnationId,
+        projectCheckpoints,
+    };
+}
+
+export function decodeClaimMirrorReceiptResponse(
+    value: unknown,
+    request: ClaimMirrorReceiptRequest,
+): ClaimMirrorReceiptResponse {
+    const receipt = validateClaimMirrorReceipt(request.receipt);
+    const record = wireRecord(value, "claim mirror receipt response");
+    requireClaimMirrorResponseVersion(record, "claim mirror receipt response");
+    const receiptId = wireSafeInteger(record, "receiptId", "claim mirror receipt response", 1);
+    if (receiptId !== receipt.receiptId || typeof record.replayed !== "boolean") {
+        throw new Error("claim mirror receipt response identity is invalid");
+    }
+    const appliedEffectCount = wireSafeInteger(
+        record,
+        "appliedEffectCount",
+        "claim mirror receipt response",
+    );
+    const ackedEffectId = wireSafeInteger(
+        record,
+        "ackedEffectId",
+        "claim mirror receipt response",
+        1,
+    );
+    const expectedEffectId = receipt.effects.at(-1)?.effectId;
+    const expectedApplied = record.replayed ? 0 : receipt.effects.length;
+    if (ackedEffectId !== expectedEffectId || appliedEffectCount !== expectedApplied) {
+        throw new Error("claim mirror receipt response acknowledgement mismatch");
+    }
+    return {
+        protocolVersion: CLAIM_MIRROR_PROTOCOL_VERSION,
+        mirrorVersion: CLAIM_MIRROR_VERSION,
+        receiptId,
+        replayed: record.replayed,
+        appliedEffectCount,
+        ackedEffectId,
+    };
 }
 
 export interface ModuleNormalizationRecord {

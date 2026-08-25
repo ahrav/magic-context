@@ -5,9 +5,17 @@ import {
 } from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
+    canonicalSnapshotVector,
     type ClaimOperationResult,
     decodeClaimOperationResult,
+    parseRevisionLocator,
+    type SnapshotVector,
 } from "../../features/magic-context/memory/claim-operation-contract";
+import { readAuthorizedClaimMemorySnapshot } from "../../features/magic-context/memory/claim-memory-render";
+import {
+    type ProjectMemoryClaimSnapshot,
+    readProjectMemorySnapshotVector,
+} from "../../features/magic-context/memory/storage-claim-current-state";
 import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
     readOutboxConsumerCheckpoint,
@@ -74,6 +82,17 @@ import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import {
     type ClaimEffectDeliveryReceipt,
+    CLAIM_MIRROR_PROTOCOL_VERSION,
+    CLAIM_MIRROR_VERSION,
+    type ClaimMirrorChangeKind,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshot,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
+    type CommittedClaimMirrorRow,
+    decodeClaimMirrorReceiptResponse,
+    decodeClaimMirrorSnapshotResponse,
     MODULE_PAGE_MAX_BYTES,
     moduleRawBlockMappings,
     moduleWireBodyBytes,
@@ -246,6 +265,10 @@ export interface ModuleStateSyncState {
     idOrdinalMemo: Map<string, number>;
     seedPassPending?: boolean;
     authorityMemorySyncSkipLogged?: boolean;
+    /** Host-side proof that the claim mirror has been seeded. */
+    claimMirrorSeeded?: boolean;
+    claimMirrorSuppressed?: boolean;
+    claimMirrorVector?: SnapshotVector | null;
 }
 
 export interface ModuleStateSyncPass {
@@ -2087,6 +2110,437 @@ export async function buildModuleStateSyncPayload(args: {
     return livePayload;
 }
 
+export const MODULE_CLAIM_MIRROR_CONSUMER = "rust-module-claim-mirror-v1";
+const CLAIM_MIRROR_MAX_GROUPS_PER_SYNC = 1_000;
+const CLAIM_MIRROR_CHANGE_KINDS: readonly ClaimMirrorChangeKind[] = [
+    "upsert",
+    "evidence",
+    "lifecycle",
+    "applicability",
+    "verification",
+    "derivation",
+];
+
+export type ModuleClaimMirrorSyncResult =
+    | { status: "active"; seeded: boolean; appliedReceipts: number }
+    | { status: "unavailable" }
+    | { status: "suppressed"; reason: string };
+
+function claimMirrorRow(
+    item: ProjectMemoryClaimSnapshot,
+    vector: SnapshotVector,
+): CommittedClaimMirrorRow {
+    const projectKey = String(item.projectId);
+    return {
+        publicClaimId: item.publicClaimId,
+        projectId: item.projectId,
+        revisionLocator: item.revisionLocator,
+        content: item.content,
+        contentDigest: item.contentDigest,
+        attributes: {
+            category: item.category,
+            normalizedHash: item.normalizedHash,
+            importance: item.importance,
+            memoryScope: item.memoryScope,
+            sharing: item.sharing,
+            expiresAt: item.expiresAt,
+        },
+        lifecycle: item.lifecycleState,
+        applicability: { assertions: item.applicability },
+        policy: { ...item.policy, dispositions: item.dispositions },
+        provenanceLabel: item.explicitLabel,
+        projectGeneration: vector.projectGenerations[projectKey] ?? -1,
+        policyGeneration: vector.policyGenerations[projectKey] ?? -1,
+    };
+}
+
+function maxClaimEffectId(db: ContextDatabase, projectId: number): number {
+    return (
+        db
+            .prepare(
+                "SELECT COALESCE(MAX(id), 0) AS effectId FROM claim_operation_effects WHERE project_id = ?",
+            )
+            .get(projectId) as { effectId: number }
+    ).effectId;
+}
+
+/** Return a snapshot only when its vector stays fixed while reading effect checkpoints. */
+export function buildAuthorizedClaimMirrorSnapshot(args: {
+    db: ContextDatabase;
+    projectPath: string;
+    nowMs?: number;
+}): ClaimMirrorSnapshot | null {
+    const workspace = resolveModuleWorkspaceContext(args.db, args.projectPath);
+    const workspaceEpoch = computeWorkspaceEpochFingerprint(args.db, workspace.expandedIdentities);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const provider = readAuthorizedClaimMemorySnapshot(args.db, {
+            authorizedIdentities: workspace.expandedIdentities,
+            ownIdentities: workspace.ownIdentities,
+            sharedCategories: workspace.shareCategories ?? [],
+            workspaceEpoch,
+            ...(args.nowMs === undefined ? {} : { nowMs: args.nowMs }),
+        });
+        if (!provider) continue;
+        const projectIds = [...provider.projectIds].sort((left, right) => left - right);
+        const projectCheckpoints: Record<string, number> = {};
+        for (const projectId of projectIds) {
+            projectCheckpoints[String(projectId)] = maxClaimEffectId(args.db, projectId);
+        }
+        const after = readProjectMemorySnapshotVector(args.db, projectIds, workspaceEpoch);
+        if (canonicalSnapshotVector(provider.snapshotVector) !== canonicalSnapshotVector(after)) {
+            continue;
+        }
+        return {
+            mirrorVersion: CLAIM_MIRROR_VERSION,
+            vector: provider.snapshotVector,
+            projectCheckpoints,
+            claims: provider.items
+                .map((item) => claimMirrorRow(item, provider.snapshotVector))
+                .sort((left, right) => left.publicClaimId.localeCompare(right.publicClaimId)),
+        };
+    }
+    return null;
+}
+
+function advanceClaimMirrorCheckpoints(
+    db: ContextDatabase,
+    checkpoints: Readonly<Record<string, number>>,
+): void {
+    db.transaction(() => {
+        for (const [projectId, ackedEffectId] of Object.entries(checkpoints)) {
+            advanceOutboxConsumerCheckpointInCurrentTransaction(db, {
+                consumer: MODULE_CLAIM_MIRROR_CONSUMER,
+                projectId: Number(projectId),
+                ackedEffectId,
+            });
+        }
+    }).immediate();
+}
+
+async function publishClaimMirrorSnapshot(args: {
+    client: Required<Pick<ModuleStateSyncClient, "claimMirrorReplace">>;
+    state: ModuleStateSyncState;
+    pass: ModuleStateSyncPass & { projectPath: string };
+    projectRoot: string;
+    snapshot: ClaimMirrorSnapshot;
+}): Promise<void> {
+    const request: ClaimMirrorSnapshotRequest = {
+        protocolVersion: CLAIM_MIRROR_PROTOCOL_VERSION,
+        snapshot: args.snapshot,
+    };
+    const response = await args.client.claimMirrorReplace({
+        sessionId: args.pass.sessionId,
+        projectRoot: args.projectRoot,
+        request,
+    });
+    decodeClaimMirrorSnapshotResponse(response, request);
+    advanceClaimMirrorCheckpoints(args.pass.db, args.snapshot.projectCheckpoints);
+    args.state.claimMirrorSeeded = true;
+    args.state.claimMirrorSuppressed = false;
+    args.state.claimMirrorVector = args.snapshot.vector;
+}
+
+function pendingClaimMirrorReceipt(
+    db: ContextDatabase,
+    projectIds: readonly number[],
+): number | null {
+    if (projectIds.length === 0) return null;
+    const placeholders = projectIds.map(() => "?").join(", ");
+    const row = db
+        .prepare(
+            `SELECT effects.receipt_id AS receiptId
+               FROM claim_operation_effects AS effects
+               LEFT JOIN claim_outbox_consumer_checkpoints AS checkpoint
+                 ON checkpoint.consumer = ? AND checkpoint.project_id = effects.project_id
+              WHERE effects.project_id IN (${placeholders})
+                AND effects.id > COALESCE(checkpoint.acked_effect_id, 0)
+              ORDER BY effects.id LIMIT 1`,
+        )
+        .get(MODULE_CLAIM_MIRROR_CONSUMER, ...projectIds) as { receiptId: number } | undefined;
+    return row?.receiptId ?? null;
+}
+
+function vectorsAdvanceOneReceipt(
+    previous: SnapshotVector,
+    current: SnapshotVector,
+    touchedProjects: ReadonlySet<number>,
+): boolean {
+    if (
+        previous.vectorVersion !== current.vectorVersion ||
+        previous.databaseIncarnationId !== current.databaseIncarnationId ||
+        previous.workspaceEpoch !== current.workspaceEpoch ||
+        Object.keys(previous.projectGenerations).join("\0") !==
+            Object.keys(current.projectGenerations).join("\0")
+    ) {
+        return false;
+    }
+    return Object.keys(current.projectGenerations).every((projectId) => {
+        const increment = touchedProjects.has(Number(projectId)) ? 1 : 0;
+        return (
+            current.projectGenerations[projectId] ===
+                previous.projectGenerations[projectId] + increment &&
+            current.policyGenerations[projectId] ===
+                previous.policyGenerations[projectId] + increment
+        );
+    });
+}
+
+function claimMirrorGroup(args: {
+    db: ContextDatabase;
+    snapshot: ClaimMirrorSnapshot;
+    receiptId: number;
+    previousVector: SnapshotVector;
+}): ClaimMirrorReceiptRequest {
+    const receipt = args.db
+        .prepare(
+            `SELECT producer, operation_key AS operationKey,
+                    request_digest AS requestDigest, result_json AS resultJson,
+                    expected_effect_count AS expectedEffectCount
+               FROM claim_operation_receipts WHERE id = ?`,
+        )
+        .get(args.receiptId) as
+        | {
+              producer: string;
+              operationKey: string;
+              requestDigest: string;
+              resultJson: string;
+              expectedEffectCount: number;
+          }
+        | undefined;
+    if (!receipt) throw new Error(`claim mirror receipt ${args.receiptId} is missing`);
+    const proof = proveClaimOperationDurable({
+        db: args.db,
+        producer: receipt.producer,
+        operationKey: receipt.operationKey,
+        resultJson: receipt.resultJson,
+    });
+    if (
+        proof.receiptId !== args.receiptId ||
+        proof.effects.length === 0 ||
+        proof.effects.length !== receipt.expectedEffectCount
+    ) {
+        throw new Error(`claim mirror receipt ${args.receiptId} is incomplete`);
+    }
+    const firstEffectId = proof.effects[0]?.id ?? 0;
+    if (proof.effects.some((effect, index) => effect.id !== firstEffectId + index)) {
+        throw new Error(`claim mirror receipt ${args.receiptId} is reordered`);
+    }
+    const projectIds = new Set(Object.keys(args.snapshot.vector.projectGenerations).map(Number));
+    const touchedProjects = new Set(proof.effects.map((effect) => effect.projectId));
+    if (
+        [...touchedProjects].some((projectId) => !projectIds.has(projectId)) ||
+        !vectorsAdvanceOneReceipt(args.previousVector, args.snapshot.vector, touchedProjects)
+    ) {
+        throw new Error(`claim mirror receipt ${args.receiptId} generation mismatch`);
+    }
+    const claimByPublicId = new Map(
+        args.snapshot.claims.map((claim) => [claim.publicClaimId, claim] as const),
+    );
+    const previousByProject = new Map<number, number>();
+    for (const projectId of projectIds) {
+        previousByProject.set(
+            projectId,
+            readOutboxConsumerCheckpoint(args.db, MODULE_CLAIM_MIRROR_CONSUMER, projectId),
+        );
+    }
+    const effects = proof.effects.map((effect) => {
+        const changeKind = CLAIM_MIRROR_CHANGE_KINDS.find(
+            (candidate) => candidate === effect.changeKind,
+        );
+        const revisionLocator = effect.revisionLocator;
+        const locator = revisionLocator === null ? null : parseRevisionLocator(revisionLocator);
+        const previousProjectEffectId = previousByProject.get(effect.projectId);
+        if (
+            !changeKind ||
+            revisionLocator === null ||
+            !locator ||
+            previousProjectEffectId === undefined ||
+            effect.id <= previousProjectEffectId ||
+            effect.generation !== args.snapshot.vector.projectGenerations[String(effect.projectId)]
+        ) {
+            throw new Error(`claim mirror effect ${effect.id} is invalid`);
+        }
+        const claim = claimByPublicId.get(locator.publicClaimId) ?? null;
+        if (claim !== null && claim.revisionLocator !== revisionLocator) {
+            throw new Error(`claim mirror effect ${effect.id} revision is no longer current`);
+        }
+        previousByProject.set(effect.projectId, effect.id);
+        return {
+            effectId: effect.id,
+            previousProjectEffectId,
+            effectKey: effect.effectKey,
+            projectId: effect.projectId,
+            generation: effect.generation,
+            changeKind,
+            publicClaimId: locator.publicClaimId,
+            revisionLocator,
+            claim,
+        };
+    });
+    return {
+        protocolVersion: CLAIM_MIRROR_PROTOCOL_VERSION,
+        receipt: {
+            mirrorVersion: CLAIM_MIRROR_VERSION,
+            receiptId: args.receiptId,
+            expectedEffectCount: receipt.expectedEffectCount,
+            vector: args.snapshot.vector,
+            effects,
+        },
+    };
+}
+
+function claimMirrorNotSeeded(error: unknown): boolean {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        const code = typeof current.code === "string" ? current.code.toLowerCase() : "";
+        const message = typeof current.message === "string" ? current.message.toLowerCase() : "";
+        if (
+            code === "claim_mirror_not_seeded" ||
+            message.includes("claim mirror has not been seeded")
+        ) {
+            return true;
+        }
+        current = current.cause;
+    }
+    return false;
+}
+
+function suppressClaimMirror(
+    state: ModuleStateSyncState,
+    error: unknown,
+): ModuleClaimMirrorSyncResult {
+    state.claimMirrorSuppressed = true;
+    const reason = error instanceof Error ? error.message : String(error);
+    return { status: "suppressed", reason };
+}
+
+export async function syncModuleClaimMirror(args: {
+    client: ModuleStateSyncClient;
+    state: ModuleStateSyncState;
+    pass: ModuleStateSyncPass;
+    projectRoot: string;
+}): Promise<ModuleClaimMirrorSyncResult> {
+    if (
+        !args.pass.projectPath ||
+        !args.client.claimMirrorReplace ||
+        !args.client.claimMirrorApply
+    ) {
+        return { status: "unavailable" };
+    }
+    const projectPath = args.pass.projectPath;
+    const snapshot = buildAuthorizedClaimMirrorSnapshot({
+        db: args.pass.db,
+        projectPath,
+        nowMs: args.pass.nowMs,
+    });
+    if (!snapshot)
+        return suppressClaimMirror(args.state, new Error("claim provider snapshot moved"));
+    const claimMirrorReplace = args.client.claimMirrorReplace;
+    const claimMirrorApply = args.client.claimMirrorApply;
+    const client: Required<Pick<ModuleStateSyncClient, "claimMirrorReplace" | "claimMirrorApply">> =
+        {
+            claimMirrorReplace: (mirrorArgs) => claimMirrorReplace.call(args.client, mirrorArgs),
+            claimMirrorApply: (mirrorArgs) => claimMirrorApply.call(args.client, mirrorArgs),
+        };
+    if (args.state.claimMirrorSeeded !== true) {
+        try {
+            await publishClaimMirrorSnapshot({
+                client,
+                state: args.state,
+                pass: { ...args.pass, projectPath },
+                projectRoot: args.projectRoot,
+                snapshot,
+            });
+            return { status: "active", seeded: true, appliedReceipts: 0 };
+        } catch (error) {
+            return suppressClaimMirror(args.state, error);
+        }
+    }
+    if (!args.state.claimMirrorVector) {
+        return suppressClaimMirror(args.state, new Error("claim mirror host vector is missing"));
+    }
+
+    let appliedReceipts = 0;
+    let currentSnapshot = snapshot;
+    try {
+        while (appliedReceipts < CLAIM_MIRROR_MAX_GROUPS_PER_SYNC) {
+            const receiptId = pendingClaimMirrorReceipt(
+                args.pass.db,
+                Object.keys(currentSnapshot.vector.projectGenerations).map(Number),
+            );
+            if (receiptId === null) {
+                if (
+                    canonicalSnapshotVector(args.state.claimMirrorVector) !==
+                    canonicalSnapshotVector(currentSnapshot.vector)
+                ) {
+                    throw new Error("claim mirror generation moved without a contiguous receipt");
+                }
+                args.state.claimMirrorSuppressed = false;
+                return { status: "active", seeded: false, appliedReceipts };
+            }
+            const request = claimMirrorGroup({
+                db: args.pass.db,
+                snapshot: currentSnapshot,
+                receiptId,
+                previousVector: args.state.claimMirrorVector,
+            });
+            const response: ClaimMirrorReceiptResponse = await client.claimMirrorApply({
+                sessionId: args.pass.sessionId,
+                projectRoot: args.projectRoot,
+                request,
+            });
+            decodeClaimMirrorReceiptResponse(response, request);
+            const maxByProject: Record<string, number> = {};
+            for (const effect of request.receipt.effects) {
+                maxByProject[String(effect.projectId)] = Math.max(
+                    maxByProject[String(effect.projectId)] ?? 0,
+                    effect.effectId,
+                );
+            }
+            advanceClaimMirrorCheckpoints(args.pass.db, maxByProject);
+            args.state.claimMirrorVector = request.receipt.vector;
+            args.state.claimMirrorSuppressed = false;
+            appliedReceipts += 1;
+            currentSnapshot =
+                buildAuthorizedClaimMirrorSnapshot({
+                    db: args.pass.db,
+                    projectPath,
+                    nowMs: args.pass.nowMs,
+                }) ??
+                (() => {
+                    throw new Error("claim provider snapshot moved");
+                })();
+        }
+        throw new Error("claim mirror outbox drain exceeded 1000 receipt groups");
+    } catch (error) {
+        if (claimMirrorNotSeeded(error)) {
+            args.state.claimMirrorSeeded = false;
+            const reseed = buildAuthorizedClaimMirrorSnapshot({
+                db: args.pass.db,
+                projectPath,
+                nowMs: args.pass.nowMs,
+            });
+            if (!reseed)
+                return suppressClaimMirror(args.state, new Error("claim provider snapshot moved"));
+            try {
+                await publishClaimMirrorSnapshot({
+                    client,
+                    state: args.state,
+                    pass: { ...args.pass, projectPath },
+                    projectRoot: args.projectRoot,
+                    snapshot: reseed,
+                });
+                return { status: "active", seeded: true, appliedReceipts };
+            } catch (reseedError) {
+                return suppressClaimMirror(args.state, reseedError);
+            }
+        }
+        return suppressClaimMirror(args.state, error);
+    }
+}
+
 export interface ClaimOperationDurabilityProof {
     receiptId: number;
     requestDigest: string;
@@ -2355,6 +2809,16 @@ export interface ModuleStateSyncClient {
         sessionId: string;
         projectRoot: string;
     }): Promise<{ state_sync_deltas?: boolean }>;
+    claimMirrorReplace?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse>;
+    claimMirrorApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse>;
     call(args: {
         sessionId: string;
         projectRoot: string;
@@ -2447,6 +2911,12 @@ export async function syncModuleState(args: {
     options?: ModuleStateSyncOptions;
 }): Promise<ModuleStateSyncResult> {
     let force = args.force;
+    await syncModuleClaimMirror({
+        client: args.client,
+        state: args.state,
+        pass: args.pass,
+        projectRoot: args.projectRoot,
+    });
     // Captured from the completing batch of the most recent send, for the
     // post-send policy revalidation below (the batch list itself is scoped
     // to the try block).

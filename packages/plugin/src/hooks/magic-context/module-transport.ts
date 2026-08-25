@@ -29,6 +29,8 @@ import {
     buildClaimIntentAckWireBody,
     buildClaimIntentInspectWireBody,
     buildClaimIntentStageWireBody,
+    buildClaimMirrorReceiptWireBody,
+    buildClaimMirrorSnapshotWireBody,
     type ClaimEffectDeliveryRequest,
     type ClaimEffectDeliveryResponse,
     type ClaimIntentAckRequest,
@@ -37,10 +39,16 @@ import {
     type ClaimIntentInspectResponse,
     type ClaimIntentStageRequest,
     type ClaimIntentStageResponse,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
     decodeClaimEffectDeliveryResponse,
     decodeClaimIntentAckResponse,
     decodeClaimIntentInspectResponse,
     decodeClaimIntentStageResponse,
+    decodeClaimMirrorReceiptResponse,
+    decodeClaimMirrorSnapshotResponse,
 } from "./module-wire";
 
 const DEFAULT_MODULE_ID = "magic-context";
@@ -477,6 +485,8 @@ export class McHostModuleTransport {
             | "claim.intent.inspect"
             | "claim.intent.ack"
             | "claim.effects.apply"
+            | "claim.mirror.replace"
+            | "claim.mirror.apply"
             | "note.evaluate"
             | "note.evaluation.register"
             | "note.evaluation.heartbeat"
@@ -844,6 +854,34 @@ export class McHostModuleTransport {
             body: buildClaimEffectDeliveryWireBody(args.request),
         });
         return decodeClaimEffectDeliveryResponse(response, expectedEffectId);
+    }
+
+    async claimMirrorReplace(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.mirror.replace",
+            body: buildClaimMirrorSnapshotWireBody(args.request),
+        });
+        return decodeClaimMirrorSnapshotResponse(response, args.request);
+    }
+
+    async claimMirrorApply(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.mirror.apply",
+            body: buildClaimMirrorReceiptWireBody(args.request),
+        });
+        return decodeClaimMirrorReceiptResponse(response, args.request);
     }
 
     async deleteSession(sessionId: string, projectRoot: string): Promise<void> {

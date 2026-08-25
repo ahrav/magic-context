@@ -9,7 +9,9 @@ import { insertMemory, updateMemoryVerification } from "../../features/magic-con
 import { computeClaimOperationRequestDigest } from "../../features/magic-context/memory/claim-operation-contract";
 import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
+    computeProjectMemoryMutationToken,
     createProjectMemoryClaim,
+    recordProjectMemoryVerification,
     runClaimOperation,
 } from "../../features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../features/magic-context/memory/storage-claims";
@@ -38,6 +40,7 @@ import { McHostCallError } from "../../shared/mc-host-client";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    buildAuthorizedClaimMirrorSnapshot,
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     drainClaimEffectPrefix,
@@ -46,9 +49,15 @@ import {
     mirrorModuleCompartments,
     proveClaimOperationDurable,
     resetCompartmentMirrorCursorsForTest,
+    syncModuleClaimMirror,
     syncModuleState,
 } from "./module-state-sync";
 import {
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshot,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
     MODULE_PAGE_MAX_BYTES,
     moduleWireBodyBytes,
     resolveOrdinalsForModule,
@@ -1719,5 +1728,320 @@ describe("claim effect prefix delivery", () => {
                 })
                 .immediate(),
         ).toThrow("splits a receipt group");
+    });
+});
+
+class DeterministicClaimMirrorFacade {
+    snapshot: ClaimMirrorSnapshot | null = null;
+    readonly rows = new Map<string, ClaimMirrorSnapshot["claims"][number]>();
+    readonly snapshots: ClaimMirrorSnapshotRequest[] = [];
+    readonly receipts: ClaimMirrorReceiptRequest[] = [];
+
+    async call(): Promise<never> {
+        throw new Error("claim mirror facade does not use generic module calls");
+    }
+
+    async claimMirrorReplace(args: {
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse> {
+        this.snapshot = args.request.snapshot;
+        this.rows.clear();
+        for (const claim of args.request.snapshot.claims) {
+            this.rows.set(claim.publicClaimId, claim);
+        }
+        this.snapshots.push(args.request);
+        return {
+            protocolVersion: 1,
+            mirrorVersion: 1,
+            databaseIncarnationId: args.request.snapshot.vector.databaseIncarnationId,
+            projectCheckpoints: { ...args.request.snapshot.projectCheckpoints },
+        };
+    }
+
+    async claimMirrorApply(args: {
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse> {
+        if (!this.snapshot) {
+            throw Object.assign(new Error("claim mirror has not been seeded"), {
+                code: "claim_mirror_not_seeded",
+            });
+        }
+        const touched = new Set(args.request.receipt.effects.map((effect) => effect.projectId));
+        for (const projectId of Object.keys(this.snapshot.vector.projectGenerations)) {
+            const increment = touched.has(Number(projectId)) ? 1 : 0;
+            expect(args.request.receipt.vector.projectGenerations[projectId]).toBe(
+                this.snapshot.vector.projectGenerations[projectId] + increment,
+            );
+            expect(args.request.receipt.vector.policyGenerations[projectId]).toBe(
+                this.snapshot.vector.policyGenerations[projectId] + increment,
+            );
+        }
+        const checkpoints = { ...this.snapshot.projectCheckpoints };
+        for (const effect of args.request.receipt.effects) {
+            const key = String(effect.projectId);
+            expect(effect.previousProjectEffectId).toBe(checkpoints[key]);
+            checkpoints[key] = effect.effectId;
+            if (effect.claim) this.rows.set(effect.publicClaimId, effect.claim);
+            else this.rows.delete(effect.publicClaimId);
+        }
+        this.snapshot = {
+            mirrorVersion: 1,
+            vector: args.request.receipt.vector,
+            projectCheckpoints: checkpoints,
+            claims: [...this.rows.values()],
+        };
+        this.receipts.push(args.request);
+        return {
+            protocolVersion: 1,
+            mirrorVersion: 1,
+            receiptId: args.request.receipt.receiptId,
+            replayed: false,
+            appliedEffectCount: args.request.receipt.effects.length,
+            ackedEffectId: args.request.receipt.effects.at(-1)?.effectId ?? 0,
+        };
+    }
+
+    loseStore(): void {
+        this.snapshot = null;
+        this.rows.clear();
+    }
+}
+
+function seedU10Claim(db: Database, projectPath: string, key: string, content: string) {
+    const projectId = ensureProject(db, projectPath);
+    const created = createProjectMemoryClaim(
+        db,
+        { producer: "u10-test", operationKey: key },
+        {
+            projectId,
+            content,
+            category: "WORKFLOW",
+            importance: 87,
+            memoryScope: "project",
+            sharing: "private",
+            provenance: {
+                sourceLocator: `user:${key}`,
+                sourceContent: content,
+                extractor: "u10-test",
+                extractorVersion: "1",
+                extractorRunId: key,
+                independenceKey: key,
+                sourceTrustClass: "explicit_user",
+            },
+            actor: "user:test",
+            requestScope: projectPath,
+        },
+    );
+    const payload = created.result.payload as { claim: { publicClaimId: string } };
+    return { projectId, publicClaimId: payload.claim.publicClaimId };
+}
+
+function appendU10GroupedEffects(
+    db: Database,
+    projectId: number,
+    publicClaimId: string,
+    operationKey: string,
+    count = 1,
+): void {
+    const claim = db
+        .prepare(
+            `SELECT claims.id AS claimId, heads.revision_id AS revisionId
+               FROM claims
+               JOIN claim_public_ids ON claim_public_ids.claim_id = claims.id
+               JOIN claim_memory_current_heads AS heads ON heads.claim_id = claims.id
+              WHERE claim_public_ids.public_id = ?`,
+        )
+        .get(publicClaimId) as { claimId: number; revisionId: number };
+    runClaimOperation(
+        db,
+        {
+            producer: "u10-group",
+            operationKey,
+            requestDigest: computeClaimOperationRequestDigest({ operationKey }),
+        },
+        () => ({
+            kind: "effects",
+            payload: null,
+            effects: Array.from({ length: count }, (_, index) => ({
+                effectKey: `${operationKey}:${index}`,
+                projectId,
+                claimId: claim.claimId,
+                revisionId: claim.revisionId,
+                changeKind: "evidence" as const,
+            })),
+        }),
+    );
+}
+
+async function syncU10Mirror(args: {
+    db: Database;
+    state: ModuleStateSyncState;
+    facade: DeterministicClaimMirrorFacade;
+    projectPath: string;
+}) {
+    return syncModuleClaimMirror({
+        client: args.facade,
+        state: args.state,
+        pass: {
+            db: args.db,
+            sessionId: "ses-u10-claim-mirror",
+            projectPath: args.projectPath,
+            nowMs: 100,
+        },
+        projectRoot: "/tmp/u10-project",
+    });
+}
+
+describe("U10 committed claim mirror state sync", () => {
+    it("scenario 1 publishes authorized claim rows with exact identities and attributes", async () => {
+        const db = createContextDb();
+        const projectPath = "git:u10-snapshot";
+        const seeded = seedU10Claim(db, projectPath, "snapshot", "Use formatter before commit.");
+        const state: ModuleStateSyncState = syncState();
+        const facade = new DeterministicClaimMirrorFacade();
+
+        await expect(syncU10Mirror({ db, state, facade, projectPath })).resolves.toEqual({
+            status: "active",
+            seeded: true,
+            appliedReceipts: 0,
+        });
+        const row = facade.rows.get(seeded.publicClaimId);
+        expect(row).toMatchObject({
+            publicClaimId: seeded.publicClaimId,
+            projectId: seeded.projectId,
+            content: "Use formatter before commit.",
+            attributes: {
+                category: "WORKFLOW",
+                importance: 87,
+                memoryScope: "project",
+                sharing: "private",
+            },
+            lifecycle: "active",
+            projectGeneration: 1,
+            policyGeneration: 1,
+        });
+        expect(row?.revisionLocator).toBe(`${seeded.publicClaimId}/r1/${row?.contentDigest}`);
+        expect(state.claimMirrorSuppressed).toBe(false);
+    });
+
+    it("scenario 2 applies complete receipt groups in source outbox order", async () => {
+        const db = createContextDb();
+        const projectPath = "git:u10-effects";
+        const seeded = seedU10Claim(db, projectPath, "effects", "Initial claim.");
+        const state: ModuleStateSyncState = syncState();
+        const facade = new DeterministicClaimMirrorFacade();
+        await syncU10Mirror({ db, state, facade, projectPath });
+
+        appendU10GroupedEffects(db, seeded.projectId, seeded.publicClaimId, "two-effects", 2);
+        await expect(syncU10Mirror({ db, state, facade, projectPath })).resolves.toEqual({
+            status: "active",
+            seeded: false,
+            appliedReceipts: 1,
+        });
+        expect(facade.receipts).toHaveLength(1);
+        expect(facade.receipts[0]?.receipt.effects).toHaveLength(2);
+        expect(facade.receipts[0]?.receipt.effects.map((effect) => effect.effectId)).toEqual([
+            facade.receipts[0]!.receipt.effects[0]!.effectId,
+            facade.receipts[0]!.receipt.effects[0]!.effectId + 1,
+        ]);
+    });
+
+    it("scenario 3 suppresses the claim lane and keeps the checkpoint on invalid wire", async () => {
+        const db = createContextDb();
+        const projectPath = "git:u10-invalid";
+        const seeded = seedU10Claim(db, projectPath, "invalid", "Strict claim.");
+        const state: ModuleStateSyncState = syncState();
+        const facade = new DeterministicClaimMirrorFacade();
+        await syncU10Mirror({ db, state, facade, projectPath });
+        const before = facade.snapshot?.projectCheckpoints[String(seeded.projectId)] ?? 0;
+        appendU10GroupedEffects(db, seeded.projectId, seeded.publicClaimId, "future-version");
+        const invalidFacade = Object.assign(facade, {
+            async claimMirrorApply(args: { request: ClaimMirrorReceiptRequest }) {
+                const response =
+                    await DeterministicClaimMirrorFacade.prototype.claimMirrorApply.call(
+                        facade,
+                        args,
+                    );
+                return { ...response, mirrorVersion: 2 } as ClaimMirrorReceiptResponse;
+            },
+        });
+
+        const result = await syncU10Mirror({ db, state, facade: invalidFacade, projectPath });
+        expect(result).toEqual({
+            status: "suppressed",
+            reason: "claim mirror receipt response.mirrorVersion is unsupported",
+        });
+        expect(state.claimMirrorSuppressed).toBe(true);
+        expect(
+            readOutboxConsumerCheckpoint(db, "rust-module-claim-mirror-v1", seeded.projectId),
+        ).toBe(before);
+    });
+
+    it("scenario 4 sends policy-only revocation as a row removal", async () => {
+        const db = createContextDb();
+        const projectPath = "git:u10-revoke";
+        const seeded = seedU10Claim(db, projectPath, "revoke", "Visible claim.");
+        const state: ModuleStateSyncState = syncState();
+        const facade = new DeterministicClaimMirrorFacade();
+        await syncU10Mirror({ db, state, facade, projectPath });
+        const snapshot = buildAuthorizedClaimMirrorSnapshot({ db, projectPath, nowMs: 100 });
+        const row = snapshot?.claims.find((claim) => claim.publicClaimId === seeded.publicClaimId);
+        if (!row) throw new Error("missing seeded U10 row");
+
+        recordProjectMemoryVerification(
+            db,
+            { producer: "u10-test", operationKey: "revoke-stale" },
+            {
+                token: computeProjectMemoryMutationToken(db, seeded.publicClaimId),
+                revisionLocator: row.revisionLocator,
+                outcome: "stale",
+                verifier: "u10-test",
+                nowMs: 101,
+            },
+        );
+        await syncU10Mirror({ db, state, facade, projectPath });
+        expect(facade.receipts.at(-1)?.receipt.effects).toEqual([
+            expect.objectContaining({
+                publicClaimId: seeded.publicClaimId,
+                revisionLocator: row.revisionLocator,
+                claim: null,
+            }),
+        ]);
+        expect(facade.rows.has(seeded.publicClaimId)).toBe(false);
+    });
+
+    it("scenarios 7-8 fully reseed after drained module-store loss", async () => {
+        const db = createContextDb();
+        const projectPath = "git:u10-reseed";
+        const seeded = seedU10Claim(db, projectPath, "reseed", "Rebuildable claim.");
+        const state: ModuleStateSyncState = syncState();
+        const facade = new DeterministicClaimMirrorFacade();
+        await syncU10Mirror({ db, state, facade, projectPath });
+        facade.loseStore();
+        appendU10GroupedEffects(db, seeded.projectId, seeded.publicClaimId, "after-loss");
+
+        await expect(syncU10Mirror({ db, state, facade, projectPath })).resolves.toEqual({
+            status: "active",
+            seeded: true,
+            appliedReceipts: 0,
+        });
+        expect(facade.snapshots).toHaveLength(2);
+        expect(facade.rows.get(seeded.publicClaimId)?.content).toBe("Rebuildable claim.");
+        expect(state.claimMirrorSeeded).toBe(true);
+        expect(state.claimMirrorSuppressed).toBe(false);
+    });
+
+    it("scenario 9 sends no numeric memory identity or legacy default", async () => {
+        const db = createContextDb();
+        const projectPath = "git:u10-wire-shape";
+        seedU10Claim(db, projectPath, "wire-shape", "Claim-native wire.");
+        const state: ModuleStateSyncState = syncState();
+        const facade = new DeterministicClaimMirrorFacade();
+        await syncU10Mirror({ db, state, facade, projectPath });
+
+        const serialized = JSON.stringify(facade.snapshots[0]);
+        expect(serialized).not.toContain('"memoryId"');
+        expect(serialized).not.toContain('"legacy"');
+        expect(facade.snapshots[0]?.snapshot.claims[0]).not.toHaveProperty("id");
     });
 });

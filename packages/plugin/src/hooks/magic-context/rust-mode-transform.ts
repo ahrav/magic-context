@@ -99,6 +99,10 @@ import {
     type ClaimIntentInspectResponse,
     type ClaimIntentStageRequest,
     type ClaimIntentStageResponse,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
@@ -230,6 +234,16 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         projectRoot: string;
         request: ClaimEffectDeliveryRequest;
     }): Promise<ClaimEffectDeliveryResponse>;
+    claimMirrorReplace?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse>;
+    claimMirrorApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse>;
 }
 
 interface MessageContentSnapshot {
@@ -820,6 +834,9 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
             authorityMemorySyncSkipLogged: false,
+            claimMirrorSeeded: false,
+            claimMirrorSuppressed: true,
+            claimMirrorVector: null,
             lkgCaptureSequence: 0,
             lkgLastCapturedRowVersion: 0,
             lkgSyncCaptureRequired: false,
@@ -2256,6 +2273,8 @@ export function createRustModeTransform(
                 const getCachedStateSyncCapabilities =
                     options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
+                const claimMirrorReplace = options.moduleClient.claimMirrorReplace;
+                const claimMirrorApply = options.moduleClient.claimMirrorApply;
                 const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
@@ -2265,6 +2284,14 @@ export function createRustModeTransform(
                         stateSyncCapabilities: stateSyncCapabilities
                             ? (capabilityArgs) =>
                                   stateSyncCapabilities.call(options.moduleClient, capabilityArgs)
+                            : undefined,
+                        claimMirrorReplace: claimMirrorReplace
+                            ? (mirrorArgs) =>
+                                  claimMirrorReplace.call(options.moduleClient, mirrorArgs)
+                            : undefined,
+                        claimMirrorApply: claimMirrorApply
+                            ? (mirrorArgs) =>
+                                  claimMirrorApply.call(options.moduleClient, mirrorArgs)
                             : undefined,
                     },
                     state,
