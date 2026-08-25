@@ -24,7 +24,7 @@ use crate::lease::{LeaseError, LeaseSpan, ReceiveLease};
 use crate::profile::TargetProfile;
 
 const MAPPING_MAGIC: u64 = 0x4d43_5348_4d52_3031;
-const LAYOUT_VERSION: u16 = 1;
+const LAYOUT_VERSION: u16 = 2;
 const CACHELINE: usize = 128;
 const PAGE_SIZE: usize = 4096;
 const GRANT_BYTES: usize = 58;
@@ -45,9 +45,13 @@ struct ProducerPage {
 #[repr(C, align(128))]
 struct ConsumerPage {
     consumed: AtomicU64,
+    active_leases: AtomicU64,
+}
+
+#[repr(C, align(128))]
+struct ReclaimPage {
     completed: AtomicU64,
     arena_reclaimed: AtomicU64,
-    active_leases: AtomicU64,
 }
 
 #[repr(C)]
@@ -127,6 +131,7 @@ struct LifecyclePage {
 struct Layout {
     producer: usize,
     consumer: usize,
+    reclaim: usize,
     slots: usize,
     arena: usize,
     lifecycle: usize,
@@ -137,9 +142,15 @@ impl Layout {
     fn new(depth: usize, arena_bytes: usize) -> Result<Self, RingError> {
         let producer = 0usize;
         let consumer = align_up(size_of::<ProducerPage>(), CACHELINE)?;
-        let slots = align_up(
+        let reclaim = align_up(
             consumer
                 .checked_add(size_of::<ConsumerPage>())
+                .ok_or(RingError::ArithmeticOverflow)?,
+            CACHELINE,
+        )?;
+        let slots = align_up(
+            reclaim
+                .checked_add(size_of::<ReclaimPage>())
                 .ok_or(RingError::ArithmeticOverflow)?,
             CACHELINE,
         )?;
@@ -164,6 +175,7 @@ impl Layout {
         Ok(Self {
             producer,
             consumer,
+            reclaim,
             slots,
             arena,
             lifecycle,
@@ -178,6 +190,19 @@ fn align_up(value: usize, alignment: usize) -> Result<usize, RingError> {
         .checked_add(mask)
         .map(|sum| sum & !mask)
         .ok_or(RingError::ArithmeticOverflow)
+}
+
+fn system_page_size() -> usize {
+    // SAFETY: sysconf has no pointer or lifetime preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page_size)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(PAGE_SIZE)
+}
+
+fn residency_vector_len(mapping_len: usize, page_size: usize) -> usize {
+    mapping_len.div_ceil(page_size.max(1))
 }
 
 struct Mapping {
@@ -223,6 +248,8 @@ impl Mapping {
 
     fn attach(fd: OwnedFd, len: usize) -> Result<Self, RingError> {
         validate_object(&fd, len)?;
+        #[cfg(target_os = "linux")]
+        validate_seals(&fd)?;
         // SAFETY: authenticated fd was size-validated before mapping.
         let mapped = unsafe {
             libc::mmap(
@@ -623,11 +650,11 @@ impl Ring {
         }
         self.reclaim_completed().map_err(ProducerError::Ring)?;
         let producer = self.producer_ptr().map_err(ProducerError::Ring)?;
-        let consumer = self.consumer_ptr().map_err(ProducerError::Ring)?;
-        // SAFETY: producer and consumer pages were initialized before activation.
+        let reclaim = self.reclaim_ptr().map_err(ProducerError::Ring)?;
+        // SAFETY: producer and reclaim pages were initialized before activation.
         let published = unsafe { (*producer).published.load(Ordering::Relaxed) };
         // SAFETY: same as above.
-        let completed = unsafe { (*consumer).completed.load(Ordering::Acquire) };
+        let completed = unsafe { (*reclaim).completed.load(Ordering::Acquire) };
         let outstanding = published
             .checked_sub(completed)
             .ok_or(ProducerError::Ring(RingError::InvalidSharedState))?;
@@ -653,7 +680,7 @@ impl Ring {
         // SAFETY: pages remain mapped for self lifetime.
         let write = unsafe { (*producer).arena_write.load(Ordering::Relaxed) };
         // SAFETY: pages remain mapped for self lifetime.
-        let reclaimed = unsafe { (*consumer).arena_reclaimed.load(Ordering::Acquire) };
+        let reclaimed = unsafe { (*reclaim).arena_reclaimed.load(Ordering::Acquire) };
         let plan = match SpanPlan::reserve(self.arena_bytes(), write, reclaimed, bound) {
             Ok(plan) => plan,
             Err(ArenaError::Exhausted) => {
@@ -940,8 +967,7 @@ impl Ring {
 
     /// Verifies all pages are resident after setup prefault.
     pub fn verify_prefaulted(&self) -> Result<bool, RingError> {
-        let pages = self.mapping.len.div_ceil(PAGE_SIZE);
-        let mut residency = vec![0u8; pages];
+        let mut residency = vec![0u8; residency_vector_len(self.mapping.len, system_page_size())];
         // SAFETY: mincore receives exact live mapping and output vector.
         let result = unsafe {
             libc::mincore(
@@ -996,6 +1022,10 @@ impl Ring {
         self.mapping.ptr_at(self.layout.consumer)
     }
 
+    fn reclaim_ptr(&self) -> Result<*mut ReclaimPage, RingError> {
+        self.mapping.ptr_at(self.layout.reclaim)
+    }
+
     fn lifecycle_ptr(&self) -> Result<*mut LifecyclePage, RingError> {
         self.mapping.ptr_at(self.layout.lifecycle)
     }
@@ -1037,9 +1067,9 @@ impl Ring {
     }
 
     fn reclaim_completed(&self) -> Result<(), RingError> {
-        let consumer = self.consumer_ptr()?;
-        // SAFETY: consumer page remains mapped.
-        let mut completed = unsafe { (*consumer).completed.load(Ordering::Relaxed) };
+        let reclaim = self.reclaim_ptr()?;
+        // SAFETY: producer-owned reclaim page remains mapped.
+        let mut completed = unsafe { (*reclaim).completed.load(Ordering::Relaxed) };
         loop {
             let next = completed
                 .checked_add(1)
@@ -1061,8 +1091,8 @@ impl Ring {
                 .snapshot()
                 .validate(expected, self.arena_bytes())
                 .map_err(RingError::Descriptor)?;
-            // SAFETY: producer reads consumer-owned reclamation cursor atomically.
-            let reclaimed = unsafe { (*consumer).arena_reclaimed.load(Ordering::Relaxed) };
+            // SAFETY: producer owns the reclaim cursor.
+            let reclaimed = unsafe { (*reclaim).arena_reclaimed.load(Ordering::Relaxed) };
             if validated.allocation_start() != reclaimed {
                 return Err(RingError::InvalidSharedState);
             }
@@ -1071,13 +1101,13 @@ impl Ring {
                 .ok_or(RingError::ArithmeticOverflow)?;
             // SAFETY: producer alone reclaims in publication order.
             unsafe {
-                (*consumer)
+                (*reclaim)
                     .arena_reclaimed
                     .store(new_reclaimed, Ordering::Release);
                 (*slot).reservation_len.store(0, Ordering::Relaxed);
                 (*slot).completion_sequence.store(0, Ordering::Relaxed);
                 (*slot).state.store(SLOT_FREE, Ordering::Release);
-                (*consumer).completed.store(next, Ordering::Release);
+                (*reclaim).completed.store(next, Ordering::Release);
             }
             completed = next;
         }
@@ -1255,6 +1285,18 @@ impl ProducerReservation<'_> {
         Ok(())
     }
 
+    /// Sets the wire header that commit validates against exact body length. commentlint: allow(JUDGE)
+    pub fn set_wire_header(
+        &mut self,
+        wire_header: [u8; WIRE_V2_HEADER_BYTES],
+    ) -> Result<(), ProducerError> {
+        if self.finished {
+            return Err(ProducerError::Aborted);
+        }
+        self.wire_header = wire_header;
+        Ok(())
+    }
+
     /// Writes all bytes or aborts reservation on overflow.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), ProducerError> {
         if self.finished {
@@ -1419,7 +1461,15 @@ impl fmt::Display for ProducerError {
     }
 }
 
-impl std::error::Error for ProducerError {}
+impl std::error::Error for ProducerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Arena(error) => Some(error),
+            Self::Ring(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Ring setup, validation, or receive failure.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1478,7 +1528,15 @@ impl fmt::Display for RingError {
     }
 }
 
-impl std::error::Error for RingError {}
+impl std::error::Error for RingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Descriptor(error) => Some(error),
+            Self::Lease(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 fn initialize_mapping(
     mapping: &Mapping,
@@ -1487,6 +1545,7 @@ fn initialize_mapping(
 ) -> Result<(), RingError> {
     let producer = mapping.ptr_at::<ProducerPage>(layout.producer)?;
     let consumer = mapping.ptr_at::<ConsumerPage>(layout.consumer)?;
+    let reclaim = mapping.ptr_at::<ReclaimPage>(layout.reclaim)?;
     // SAFETY: fresh mapping is exclusively initialized before publication.
     unsafe {
         producer.write(ProducerPage {
@@ -1495,9 +1554,11 @@ fn initialize_mapping(
         });
         consumer.write(ConsumerPage {
             consumed: AtomicU64::new(0),
+            active_leases: AtomicU64::new(0),
+        });
+        reclaim.write(ReclaimPage {
             completed: AtomicU64::new(0),
             arena_reclaimed: AtomicU64::new(0),
-            active_leases: AtomicU64::new(0),
         });
     }
     for index in 0..grant.descriptor_depth {
@@ -1600,6 +1661,17 @@ fn validate_object(fd: &OwnedFd, expected_len: usize) -> Result<(), RingError> {
 }
 
 #[cfg(target_os = "linux")]
+fn validate_seals(fd: &OwnedFd) -> Result<(), RingError> {
+    // SAFETY: F_GET_SEALS reads flags from an owned valid descriptor.
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    let required = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if seals < 0 || seals & required != required {
+        return Err(RingError::ObjectValidationFailed);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn create_linux_memfd(len: usize) -> Result<OwnedFd, RingError> {
     let name = c"mc-shm-transport";
     // SAFETY: static name is valid and flags request sealing support.
@@ -1661,14 +1733,26 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     }
     // SAFETY: successful shm_open returns newly owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let len = libc::off_t::try_from(len).map_err(|_| RingError::ArithmeticOverflow)?;
-    // SAFETY: fd is valid and resized exactly once before unlink.
-    if unsafe { libc::ftruncate(fd.as_raw_fd(), len) } != 0 {
-        return Err(RingError::ObjectSetupFailed);
-    }
-    // SAFETY: name remains valid and unlink removes locator before activation.
+    // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
     if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
         return Err(RingError::ObjectSetupFailed);
     }
+    let len = libc::off_t::try_from(len).map_err(|_| RingError::ArithmeticOverflow)?;
+    // SAFETY: fd remains owned here and len was checked for off_t conversion.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len) } != 0 {
+        return Err(RingError::ObjectSetupFailed);
+    }
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::residency_vector_len;
+
+    #[test]
+    fn residency_vector_tracks_runtime_page_size() {
+        let mapping_len = 128 * 1024 + 1;
+        assert_eq!(residency_vector_len(mapping_len, 16 * 1024), 9);
+        assert_eq!(residency_vector_len(mapping_len, 64 * 1024), 3);
+    }
 }

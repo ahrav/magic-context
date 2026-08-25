@@ -58,20 +58,20 @@ impl<'lease> LeaseSpan<'lease> {
         if destination.len() != self.len {
             return Err(LeaseError::LengthMismatch);
         }
-        for (index, byte) in destination.iter_mut().enumerate() {
-            *byte = self.read_byte(index).ok_or(LeaseError::InvalidSpan)?;
-        }
+        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; destination is distinct and no shared-memory reference escapes. commentlint: allow(JUDGE)
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.base.as_ptr(), destination.as_mut_ptr(), self.len)
+        };
         Ok(())
     }
 
     /// Touches every byte without materializing a body copy.
     pub fn checksum(self) -> u64 {
-        (0..self.len).fold(0u64, |sum, index| {
-            sum.wrapping_add(u64::from(
-                self.read_byte(index)
-                    .expect("loop index remains within validated span"),
-            ))
-        })
+        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; slice stays inside this call. commentlint: allow(JUDGE)
+        let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) };
+        bytes
+            .iter()
+            .fold(0u64, |sum, byte| sum.wrapping_add(u64::from(*byte)))
     }
 }
 

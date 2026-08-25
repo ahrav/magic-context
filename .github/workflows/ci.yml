@@ -14,23 +14,25 @@ env:
 #   (unit tests + lint + typecheck, parallel)
 #                  ↓
 #   e2e-opencode, e2e-pi
-#   (Docker install + smoke, parallel, gated by unit)
+#   (Docker install + smoke, parallel — gated by unit)
 #                  ↓
 #   e2e-host-opencode, e2e-host-pi
-#   (host behavior suite, parallel, gated by Docker)
+#   (host behavior suite from packages/e2e-tests, parallel — gated by Docker)
 #
 # Two e2e layers cover different concerns:
-#   - Docker e2e: fresh-install smoke. Plugin loads, doctor is clean, and
-#     one mock turn writes DB rows under the correct cortexkit harness path.
-#     This catches packaging and install-flow regressions.
+#   - Docker e2e: fresh-install smoke (plugin loads, doctor clean, one mock
+#     turn writes DB rows under cortexkit path with right harness). Catches
+#     packaging / install-flow regressions.
 #   - Host e2e: behavior suite with byte-level wire assertions, multi-turn
-#     cache stability, historian publishing, tag-owner collision, synthetic
-#     todowrite, and cross-harness memory. It spawns real `opencode serve` and
-#     Pi subprocesses against an embedded mock provider. This catches behavior
-#     that the install smoke cannot see.
+#     cache stability, historian publish behavior, tag-owner collision,
+#     synthetic todowrite, cross-harness memory, etc. Spawns real
+#     `opencode serve` / Pi subprocesses against an embedded mock provider.
+#     Catches cache-stability + correctness regressions that the smoke layer
+#     cannot see.
 #
-# Docker e2e was previously in e2e-docker.yml. Folding it here means
-# every PR and main push exercises the full unit → Docker → host gauntlet.
+# Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding
+# it here means every PR and main push exercises the full unit → Docker → host
+# gauntlet.
 
 jobs:
   shm-source-build:
@@ -142,10 +144,11 @@ jobs:
       - name: Smoke (node:sqlite backend)
         run: node packages/plugin/scripts/smoke-node-sqlite.ts
 
-      # Smart-note QuickJS sandbox loads a ~1MB WASM. `bun test` runs it from
-      # src, where wasm resolves via node_modules, so it cannot catch a bundling
-      # break where wasm is not embedded. This bundles sandbox-runner exactly
-      # like the package build and runs a real check against the bundle.
+      # The smart-note QuickJS sandbox loads a ~1MB WASM. `bun test` runs it
+      # from src (wasm resolves via node_modules), so it cannot catch a
+      # BUNDLING break where the wasm isn't embedded in dist. This bundles
+      # sandbox-runner exactly like the package build and runs a real check
+      # against the bundle.
       - name: Smoke (smart-note wasm bundle)
         run: bun packages/plugin/scripts/smoke-smartnote-wasm.ts
 
@@ -459,8 +462,9 @@ jobs:
       #
       # Per-test (and per-hook) timeout bumped to 300s: the first test file
       # Bun loads on a cold GitHub-hosted runner pays the dependency-resolution
-      # plus opencode cold-start cost in `beforeAll(TestHarness.create)`,
-      # which can exceed Bun's 120s default. Subsequent files run in 5-10s.
+      # + opencode-binary cold-start cost in its
+      # `beforeAll(TestHarness.create)`, which can exceed Bun's 120s default.
+      # Subsequent files run in 5-10s.
       - name: Run host e2e suite (OpenCode tests only)
         env:
           NODE_ENV: ""
@@ -471,11 +475,13 @@ jobs:
           # CI because its private ../commons and ../subconscious path-deps are
           # not provisioned here; the local release gate runs that host group.
           cd packages/e2e-tests
-          mapfile -t files < <(
-            bun scripts/validate-mode-manifest.ts --mode ts --harness opencode
+          files=$(
+            bun scripts/validate-mode-manifest.ts --mode ts --harness opencode |
+              tr '\n' ' '
           )
-          echo "Running OpenCode host tests from mode manifest: ${files[*]}"
-          bun test --timeout 600000 "${files[@]}"
+          echo "Running OpenCode host tests from mode manifest: $files"
+          # shellcheck disable=SC2086
+          bun test --timeout 600000 $files
           # This oracle is outside the manifest's tests/**/*.test.ts inventory.
           bun test --timeout 600000 src/cache-analysis.test.ts
 
@@ -528,8 +534,10 @@ jobs:
           MC_E2E_MODE: ts
         run: |
           cd packages/e2e-tests
-          mapfile -t files < <(
-            bun scripts/validate-mode-manifest.ts --mode ts --harness pi
+          files=$(
+            bun scripts/validate-mode-manifest.ts --mode ts --harness pi |
+              tr '\n' ' '
           )
-          echo "Running Pi host tests from mode manifest: ${files[*]}"
-          bun test --timeout 600000 "${files[@]}"
+          echo "Running Pi host tests from mode manifest: $files"
+          # shellcheck disable=SC2086
+          bun test --timeout 600000 $files

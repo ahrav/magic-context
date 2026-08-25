@@ -577,6 +577,13 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             assert.equal(h.channel.stats().queuedDataFrames, 0);
             assert.equal(h.budget.used, 0);
             assert.equal(requestCorrs(h.peer).length, 0);
+
+            const valid = h.channel.reserve(producerHeader(4n), 4);
+            valid.write(Buffer.from("good"));
+            valid.commit(4);
+            await h.peer.waitFor(() => requestCorrs(h.peer).includes(4n));
+            const published = h.peer.frames.find((frame) => frame.corr === 4n);
+            assert.equal(Buffer.from(published?.body ?? []).toString(), "good");
         },
     },
     {

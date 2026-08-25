@@ -177,7 +177,7 @@ impl InjectedProvider for ShmProvider {
     }
 
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure> {
-        if !Self::offer_is_exact(ctx.offer_parameters()) {
+        if !cfg!(target_os = "linux") || !Self::offer_is_exact(ctx.offer_parameters()) {
             return Err(ProviderFailure::Unavailable);
         }
         let admission = self
@@ -664,3 +664,42 @@ impl fmt::Display for TestPeerError {
 }
 
 impl std::error::Error for TestPeerError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use subc_protocol::{Flags, Priority, PROTOCOL_VERSION};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn copied_control_frame_records_one_host_adapter_copy() {
+        let ring = Ring::create(&qualified_test_profile(), 4).unwrap();
+        let body = b"copy";
+        let header = EnvelopeHeader {
+            len: body.len() as u32,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Request,
+            flags: Flags::new(false, Priority::Interactive, false),
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+        };
+        let mut reservation = ring.try_reserve(body.len(), header.encode()).unwrap();
+        reservation.write(body).unwrap();
+        reservation.commit(body.len()).unwrap();
+
+        let (inbound, mut received) = mpsc::channel(1);
+        assert!(receive_one(
+            &ring,
+            &inbound,
+            &ByteBudget::new(1024),
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap());
+        let InboundEvent::Frame(frame) = received.recv().await.unwrap().unwrap() else {
+            panic!("expected copied frame");
+        };
+        assert_eq!(frame.copy_counter().copies(), 1);
+    }
+}

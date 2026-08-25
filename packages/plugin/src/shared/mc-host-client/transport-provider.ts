@@ -186,6 +186,7 @@ const CHANNEL_CLOSE_REASONS: ReadonlySet<FrameChannelCloseReason> = new Set([
     "frame_deadline",
     "write_failed",
     "control_capacity_exhausted",
+    "quarantined",
 ]);
 
 /** The closed diagnostic-type vocabulary a provider channel may emit. */

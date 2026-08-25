@@ -12,7 +12,8 @@ export type FrameChannelCloseReason =
     | "role_violation"
     | "frame_deadline"
     | "write_failed"
-    | "control_capacity_exhausted";
+    | "control_capacity_exhausted"
+    | "quarantined";
 
 export type ProducerFrameHeader = Omit<EnvelopeHeader, "len">;
 
@@ -29,7 +30,6 @@ export type ReceiveReleaseOutcome = "released" | "quarantined";
 export class ReceiveLease {
     private released = false;
     private readonly originalLengths: readonly number[];
-    private readonly releaseObservers = new Set<(outcome: ReceiveReleaseOutcome) => void>();
 
     constructor(
         private readonly leasedSegments: readonly Uint8Array[],
@@ -108,17 +108,10 @@ export class ReceiveLease {
             }
         }
         this.onRelease(outcome);
-        for (const observer of this.releaseObservers) observer(outcome);
-        this.releaseObservers.clear();
         if (outcome === "quarantined") {
             throw new Error("receive lease alias state is uncertain; storage quarantined");
         }
         return true;
-    }
-
-    observeRelease(observer: (outcome: ReceiveReleaseOutcome) => void): void {
-        this.assertActive();
-        this.releaseObservers.add(observer);
     }
 
     isReleased(): boolean {
@@ -262,6 +255,7 @@ export class BoundedFrameProducer implements FrameProducerCursor {
             exactLength: number,
         ) => PreparedProducerCommit,
         private readonly releaseReservation: () => void,
+        private readonly detachOnCommit = true,
     ) {
         try {
             const available = producerSegments.reduce((total, segment) => {
@@ -341,7 +335,7 @@ export class BoundedFrameProducer implements FrameProducerCursor {
         let prepared: PreparedProducerCommit;
         try {
             prepared = this.prepareCommit(this.committedSegments(exactLength), exactLength);
-            this.detachProducerAliases();
+            if (this.detachOnCommit) this.detachProducerAliases();
         } catch (error) {
             this.abort();
             throw error;

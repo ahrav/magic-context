@@ -199,7 +199,56 @@ async fn qualified_provider_grants_activates_correlates_and_closes() {
 
     tokio::task::block_in_place(|| peer.send(goodbye_header(), &[]).expect("publish goodbye"));
     wait_for_no_active(&provider).await;
+    let accounting = provider.accounting().expect("accounting");
+    assert_eq!(accounting.active.arena_bytes, 0);
+    assert_eq!(accounting.quarantined.arena_bytes, 0);
     assert_eq!(provider.preparation_count(), 1);
+    host.shutdown_gracefully().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quarantine_next_close_retains_charges_and_rejects_readmission() {
+    let provider = Arc::new(ShmProvider::for_qualified_test_profile(
+        single_candidate_limits(),
+    ));
+    let providers = registry(&provider);
+    let host = TestHost::start_with(move |config| config.transport_providers = providers).await;
+    let mut bootstrap = host.client().await;
+    let grant = control_response(&mut bootstrap, &offers(qualified_test_parameters())).await;
+    let grant = grant.json();
+    let token = grant["activation_token"]
+        .as_str()
+        .expect("activation token")
+        .to_owned();
+    let peer = tokio::task::block_in_place(|| {
+        TestShmPeer::attach(&grant["descriptor"]).expect("attach candidate")
+    });
+
+    let activate = format!(
+        r#"{{"op":"transport.activate","negotiation_version":1,"activation_token":"{token}"}}"#
+    )
+    .into_bytes();
+    tokio::task::block_in_place(|| {
+        peer.send(request_header(0, 0, 1, activate.len()), &activate)
+            .expect("publish activate")
+    });
+    tokio::task::block_in_place(|| peer.recv(BUDGET).expect("activate reply"));
+    let commit = br#"{"op":"transport.commit","negotiation_version":1}"#;
+    tokio::task::block_in_place(|| {
+        peer.send(request_header(0, 0, 2, commit.len()), commit)
+            .expect("publish commit")
+    });
+    tokio::task::block_in_place(|| peer.recv(BUDGET).expect("commit reply"));
+    assert!(bootstrap.closed_within(BUDGET).await);
+
+    provider.quarantine_next_close();
+    tokio::task::block_in_place(|| peer.send(goodbye_header(), &[]).expect("publish goodbye"));
+    wait_for_no_active(&provider).await;
+    let accounting = provider.accounting().expect("accounting");
+    assert_eq!(accounting.active.arena_bytes, 0);
+    assert_eq!(accounting.quarantined, provider.profile_charges());
+    assert!(!provider.preflight(Some(&qualified_test_parameters())));
     host.shutdown_gracefully().await;
 }
 

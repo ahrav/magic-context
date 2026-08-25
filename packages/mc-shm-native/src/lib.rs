@@ -11,7 +11,7 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mc_shm_transport::backend::ring::{Ring, RingGrant};
+use mc_shm_transport::backend::ring::{ProducerReservation, Ring, RingGrant};
 use mc_shm_transport::descriptor::{
     HardwareProfileId, ReleaseIdentity, SchedulingMode, WIRE_V2_HEADER_BYTES,
 };
@@ -47,10 +47,17 @@ struct ActiveLease {
     buffers: Vec<ExternalRef>,
 }
 
+struct ActiveProducer {
+    reservation: ProducerReservation<'static>,
+    buffers: Vec<ExternalRef>,
+}
+
 struct Channel {
-    to_host: Ring,
-    from_host: Ring,
+    producers: HashMap<u32, ActiveProducer>,
     active: HashMap<u32, ActiveLease>,
+    to_host: Box<Ring>,
+    from_host: Ring,
+    next_producer: u32,
     next_lease: u32,
     closed: bool,
 }
@@ -95,31 +102,69 @@ fn attach_ring(pid: u32, fd: i32, grant: &str) -> Result<Ring> {
         .map_err(|_| error("shared-memory attachment failed"))
 }
 
-fn detach_active(env: &Env, channel: &mut Channel, token: u32) -> Result<()> {
+fn cleanup_created_refs(env: &Env, ring: &Ring, buffers: Vec<ExternalRef>) -> Result<()> {
+    let detached = napi_buffers::detach_all(env, &buffers);
+    let deleted = napi_buffers::delete_all(env, buffers);
+    if detached.is_err() || deleted.is_err() {
+        ring.enter_quarantine();
+        return Err(error("external alias cleanup failed; storage quarantined"));
+    }
+    Ok(())
+}
+
+fn detach_active(env: &Env, channel: &mut Channel, token: u32, complete: bool) -> Result<()> {
     let Some(active) = channel.active.remove(&token) else {
         return Err(error("receive lease is already released"));
     };
-    for buffer in &active.buffers {
-        if napi_buffers::detach(env, buffer).is_err() {
-            channel.from_host.enter_quarantine();
-            channel.active.insert(token, active);
-            return Err(error("receive alias state is unknown; storage quarantined"));
-        }
+    if napi_buffers::detach_all(env, &active.buffers).is_err() {
+        channel.from_host.enter_quarantine();
+        channel.active.insert(token, active);
+        return Err(error("receive alias state is unknown; storage quarantined"));
     }
-    for buffer in active.buffers {
-        napi_buffers::delete_ref(env, buffer)?;
+    if napi_buffers::delete_all(env, active.buffers).is_err() {
+        channel.from_host.enter_quarantine();
+        return Err(error("receive alias cleanup failed; storage quarantined"));
     }
-    channel
-        .from_host
-        .release(active.identity)
-        .map_err(|_| error("receive completion failed"))
+    if complete {
+        channel
+            .from_host
+            .release(active.identity)
+            .map_err(|_| error("receive completion failed"))?;
+    }
+    Ok(())
+}
+
+fn detach_producer(
+    env: &Env,
+    channel: &mut Channel,
+    token: u32,
+) -> Result<ProducerReservation<'static>> {
+    let Some(active) = channel.producers.remove(&token) else {
+        return Err(error("producer reservation is already released"));
+    };
+    if napi_buffers::detach_all(env, &active.buffers).is_err() {
+        channel.to_host.enter_quarantine();
+        channel.producers.insert(token, active);
+        return Err(error(
+            "producer alias state is unknown; storage quarantined",
+        ));
+    }
+    if napi_buffers::delete_all(env, active.buffers).is_err() {
+        channel.to_host.enter_quarantine();
+        return Err(error("producer alias cleanup failed; storage quarantined"));
+    }
+    Ok(active.reservation)
 }
 
 fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
+    let producer_tokens: Vec<u32> = channel.producers.keys().copied().collect();
+    for token in producer_tokens {
+        detach_producer(env, channel, token)?.abort();
+    }
     let tokens: Vec<u32> = channel.active.keys().copied().collect();
     for token in tokens {
-        detach_active(env, channel, token)?;
+        detach_active(env, channel, token, true)?;
     }
     Ok(())
 }
@@ -128,20 +173,13 @@ fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
     channel.to_host.enter_quarantine();
     channel.from_host.enter_quarantine();
+    let producer_tokens: Vec<u32> = channel.producers.keys().copied().collect();
+    for token in producer_tokens {
+        detach_producer(env, channel, token)?.abort();
+    }
     let tokens: Vec<u32> = channel.active.keys().copied().collect();
     for token in tokens {
-        let Some(active) = channel.active.remove(&token) else {
-            continue;
-        };
-        for buffer in &active.buffers {
-            if napi_buffers::detach(env, buffer).is_err() {
-                channel.active.insert(token, active);
-                return Err(error("receive alias state is unknown; storage quarantined"));
-            }
-        }
-        for buffer in active.buffers {
-            napi_buffers::delete_ref(env, buffer)?;
-        }
+        detach_active(env, channel, token, false)?;
     }
     Ok(())
 }
@@ -214,6 +252,16 @@ pub fn native_leak_diagnostics() -> u32 {
 }
 
 #[napi]
+pub fn active_external_ref_count() -> u32 {
+    napi_buffers::active_external_refs().min(u64::from(u32::MAX)) as u32
+}
+
+#[napi]
+pub fn set_external_view_failpoint(call: u32) {
+    napi_buffers::set_external_view_failpoint(call);
+}
+
+#[napi]
 pub fn worker_limit() -> u32 {
     scheduling::WORKER_LIMIT
 }
@@ -264,9 +312,11 @@ pub fn attach(env: &Env, descriptor: NativeDescriptor) -> Result<u32> {
             insert_channel(
                 &mut registry,
                 Channel {
-                    to_host,
-                    from_host,
+                    producers: HashMap::new(),
                     active: HashMap::new(),
+                    to_host: Box::new(to_host),
+                    from_host,
+                    next_producer: 0,
                     next_lease: 0,
                     closed: false,
                 },
@@ -311,9 +361,11 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
             let first = insert_channel(
                 &mut registry,
                 Channel {
-                    to_host: first_to_second,
-                    from_host: first_from_second,
+                    producers: HashMap::new(),
                     active: HashMap::new(),
+                    to_host: Box::new(first_to_second),
+                    from_host: first_from_second,
+                    next_producer: 0,
                     next_lease: 0,
                     closed: false,
                 },
@@ -321,9 +373,11 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
             let second = insert_channel(
                 &mut registry,
                 Channel {
-                    to_host: second_to_first,
-                    from_host: second_from_first,
+                    producers: HashMap::new(),
                     active: HashMap::new(),
+                    to_host: Box::new(second_to_first),
+                    from_host: second_from_first,
+                    next_producer: 0,
                     next_lease: 0,
                     closed: false,
                 },
@@ -375,32 +429,25 @@ pub fn produce(
             .map_err(|_| error("shared-memory reservation failed"))?;
         let mut views = Vec::with_capacity(reservation.segment_count());
         let mut refs = Vec::with_capacity(reservation.segment_count());
-        for index in 0..reservation.segment_count() {
-            let span = reservation
-                .segment(index)
-                .map_err(|_| error("shared-memory reservation failed"))?
-                .ok_or_else(|| error("shared-memory reservation failed"))?;
-            let (view, reference) =
-                napi_buffers::create_external_view(env, span.as_mut_ptr(), span.len())?;
-            views.push(view);
-            refs.push(reference);
+        let built = (|| -> Result<()> {
+            for index in 0..reservation.segment_count() {
+                let span = reservation
+                    .segment(index)
+                    .map_err(|_| error("shared-memory reservation failed"))?
+                    .ok_or_else(|| error("shared-memory reservation failed"))?;
+                let (view, reference) =
+                    napi_buffers::create_external_view(env, span.as_mut_ptr(), span.len())?;
+                views.push(view);
+                refs.push(reference);
+            }
+            Ok(())
+        })();
+        if let Err(build_error) = built {
+            cleanup_created_refs(env, &channel.to_host, refs)?;
+            return Err(build_error);
         }
         let written = fill.call(views);
-        let mut detach_ok = true;
-        for reference in &refs {
-            if napi_buffers::detach(env, reference).is_err() {
-                detach_ok = false;
-                channel.to_host.enter_quarantine();
-            }
-        }
-        for reference in refs {
-            napi_buffers::delete_ref(env, reference)?;
-        }
-        if !detach_ok {
-            return Err(error(
-                "producer alias state is unknown; storage quarantined",
-            ));
-        }
+        cleanup_created_refs(env, &channel.to_host, refs)?;
         let written = written? as usize;
         reservation
             .advance(written)
@@ -409,6 +456,123 @@ pub fn produce(
         reservation
             .commit(written)
             .map_err(|_| error("producer underfill or invalid commit"))?;
+        Ok(())
+    })
+}
+
+#[napi]
+pub fn reserve(
+    env: &Env,
+    channel_id: u32,
+    capacity: u32,
+    timeout_ms: u32,
+    deliver: Function<FnArgs<(u32, Vec<Unknown<'_>>)>, ()>,
+) -> Result<()> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry
+            .try_borrow_mut()
+            .map_err(|_| error("native channel is busy"))?;
+        let channel = registry
+            .channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| error("native channel is closed"))?;
+        if channel.closed {
+            return Err(error("native channel is closed"));
+        }
+        let ring_ptr: *const Ring = channel.to_host.as_ref();
+        // SAFETY: `to_host` remains allocated until all `producers` are dropped.
+        let ring: &'static Ring = unsafe { &*ring_ptr };
+        let reservation = ring
+            .reserve_until(
+                capacity as usize,
+                [0; WIRE_V2_HEADER_BYTES],
+                Instant::now() + Duration::from_millis(u64::from(timeout_ms)),
+            )
+            .map_err(|_| error("shared-memory reservation failed"))?;
+        let mut views = Vec::with_capacity(reservation.segment_count());
+        let mut refs = Vec::with_capacity(reservation.segment_count());
+        let built = (|| -> Result<()> {
+            for index in 0..reservation.segment_count() {
+                let span = reservation
+                    .segment(index)
+                    .map_err(|_| error("shared-memory reservation failed"))?
+                    .ok_or_else(|| error("shared-memory reservation failed"))?;
+                let (view, reference) =
+                    napi_buffers::create_external_view(env, span.as_mut_ptr(), span.len())?;
+                views.push(view);
+                refs.push(reference);
+            }
+            Ok(())
+        })();
+        if let Err(build_error) = built {
+            cleanup_created_refs(env, &channel.to_host, refs)?;
+            return Err(build_error);
+        }
+        channel.next_producer = channel
+            .next_producer
+            .checked_add(1)
+            .ok_or_else(|| error("producer reservation identity exhausted"))?;
+        let token = channel.next_producer;
+        channel.producers.insert(
+            token,
+            ActiveProducer {
+                reservation,
+                buffers: refs,
+            },
+        );
+        if let Err(callback_error) = deliver.call(FnArgs::from((token, views))) {
+            detach_producer(env, channel, token)?.abort();
+            return Err(callback_error);
+        }
+        Ok(())
+    })
+}
+
+#[napi]
+pub fn commit_reservation(
+    env: &Env,
+    channel_id: u32,
+    token: u32,
+    header: Buffer,
+    written: u32,
+    before_publish: Function<(), ()>,
+) -> Result<()> {
+    let header: [u8; WIRE_V2_HEADER_BYTES] = header
+        .as_ref()
+        .try_into()
+        .map_err(|_| error("wire header has invalid length"))?;
+    REGISTRY.with(|registry| {
+        let mut registry = registry
+            .try_borrow_mut()
+            .map_err(|_| error("native channel is busy"))?;
+        let channel = registry
+            .channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| error("native channel is closed"))?;
+        let mut reservation = detach_producer(env, channel, token)?;
+        reservation
+            .set_wire_header(header)
+            .and_then(|()| reservation.advance(written as usize))
+            .map_err(|_| error("producer overflow"))?;
+        before_publish.call(())?;
+        reservation
+            .commit(written as usize)
+            .map_err(|_| error("producer underfill or invalid commit"))?;
+        Ok(())
+    })
+}
+
+#[napi]
+pub fn abort_reservation(env: &Env, channel_id: u32, token: u32) -> Result<()> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry
+            .try_borrow_mut()
+            .map_err(|_| error("native channel is busy"))?;
+        let channel = registry
+            .channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| error("native channel is closed"))?;
+        detach_producer(env, channel, token)?.abort();
         Ok(())
     })
 }
@@ -443,14 +607,21 @@ pub fn poll(
         let header = Buffer::from(lease.wire_header().to_vec());
         let mut views = Vec::with_capacity(lease.segment_count());
         let mut refs = Vec::with_capacity(lease.segment_count());
-        for index in 0..lease.segment_count() {
-            let span = lease
-                .segment(index)
-                .ok_or_else(|| error("shared-memory receive failed"))?;
-            let (view, reference) =
-                napi_buffers::create_external_view(env, span.as_mut_ptr(), span.len())?;
-            views.push(view);
-            refs.push(reference);
+        let built = (|| -> Result<()> {
+            for index in 0..lease.segment_count() {
+                let span = lease
+                    .segment(index)
+                    .ok_or_else(|| error("shared-memory receive failed"))?;
+                let (view, reference) =
+                    napi_buffers::create_external_view(env, span.as_mut_ptr(), span.len())?;
+                views.push(view);
+                refs.push(reference);
+            }
+            Ok(())
+        })();
+        if let Err(build_error) = built {
+            cleanup_created_refs(env, &channel.from_host, refs)?;
+            return Err(build_error);
         }
         std::mem::forget(lease);
         channel.active.insert(
@@ -476,7 +647,7 @@ pub fn poll(
                 .get_mut(&channel_id)
                 .ok_or_else(|| error("native channel is closed"))?;
             if channel.active.contains_key(&token) {
-                detach_active(env, channel, token)?;
+                detach_active(env, channel, token, true)?;
             }
             Ok::<(), Error>(())
         })?;
@@ -495,7 +666,7 @@ pub fn release(env: &Env, channel_id: u32, token: u32) -> Result<()> {
             .channels
             .get_mut(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
-        detach_active(env, channel, token)
+        detach_active(env, channel, token, true)
     })
 }
 

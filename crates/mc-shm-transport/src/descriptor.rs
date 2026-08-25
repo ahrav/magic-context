@@ -334,14 +334,16 @@ impl FrameDescriptor {
         expected: ReleaseIdentity,
         arena_bytes: usize,
     ) -> Result<ValidatedFrame, DescriptorError> {
-        let schema_version = self.schema_version;
-        let wire_header = self.wire_header;
-        let identity = self.identity;
-        let body_len = self.body_len;
-        let allocation_start = self.allocation_start;
-        let allocation_len = self.allocation_len;
-        let span_count = self.span_count;
-        let spans = self.spans;
+        let Self {
+            schema_version,
+            wire_header,
+            identity,
+            body_len,
+            allocation_start,
+            allocation_len,
+            span_count,
+            spans,
+        } = self;
 
         if schema_version != DESCRIPTOR_SCHEMA_VERSION {
             return Err(DescriptorError::UnsupportedSchema);

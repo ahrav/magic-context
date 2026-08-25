@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -5,6 +6,11 @@ use std::sync::Arc;
 use napi::{sys, Env, Error, JsValue, Result, Status, Unknown};
 
 static LEAK_DIAGNOSTICS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_EXTERNAL_REFS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static FAIL_EXTERNAL_VIEW_AFTER: Cell<u32> = const { Cell::new(0) };
+}
 
 pub(crate) struct ExternalRef {
     reference: sys::napi_ref,
@@ -48,6 +54,23 @@ pub(crate) fn create_external_view<'env>(
     data: *mut u8,
     len: usize,
 ) -> Result<(Unknown<'env>, ExternalRef)> {
+    let fail = FAIL_EXTERNAL_VIEW_AFTER.with(|remaining| match remaining.get() {
+        0 => false,
+        1 => {
+            remaining.set(0);
+            true
+        }
+        count => {
+            remaining.set(count - 1);
+            false
+        }
+    });
+    if fail {
+        return Err(Error::new(
+            Status::GenericFailure,
+            "external view creation failpoint",
+        ));
+    }
     let released = Arc::new(AtomicBool::new(false));
     let hint = Box::into_raw(Box::new(FinalizerState {
         released: Arc::clone(&released),
@@ -90,6 +113,7 @@ pub(crate) fn create_external_view<'env>(
         unsafe { sys::napi_create_reference(env.raw(), arraybuffer, 1, &mut reference) },
         "ArrayBuffer reference creation failed",
     )?;
+    ACTIVE_EXTERNAL_REFS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: typedarray was created in env and remains in current callback scope.
     let view = unsafe { Unknown::from_raw_unchecked(env.raw(), typedarray) };
     Ok((
@@ -140,7 +164,51 @@ pub(crate) fn delete_ref(env: &Env, external: ExternalRef) -> Result<()> {
     check(
         unsafe { sys::napi_delete_reference(env.raw(), external.reference) },
         "ArrayBuffer reference deletion failed",
-    )
+    )?;
+    ACTIVE_EXTERNAL_REFS.fetch_sub(1, Ordering::Relaxed);
+    Ok(())
+}
+
+pub(crate) fn detach_all(env: &Env, refs: &[ExternalRef]) -> Result<()> {
+    let mut failed = false;
+    for reference in refs {
+        if detach(env, reference).is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(Error::new(
+            Status::GenericFailure,
+            "ArrayBuffer detachment failed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn delete_all(env: &Env, refs: Vec<ExternalRef>) -> Result<()> {
+    let mut failed = false;
+    for reference in refs {
+        if delete_ref(env, reference).is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(Error::new(
+            Status::GenericFailure,
+            "ArrayBuffer reference deletion failed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn set_external_view_failpoint(call: u32) {
+    FAIL_EXTERNAL_VIEW_AFTER.with(|remaining| remaining.set(call));
+}
+
+pub(crate) fn active_external_refs() -> u64 {
+    ACTIVE_EXTERNAL_REFS.load(Ordering::Relaxed)
 }
 
 pub(crate) fn create_owned_probe<'env>(env: &'env Env, len: usize) -> Result<Unknown<'env>> {

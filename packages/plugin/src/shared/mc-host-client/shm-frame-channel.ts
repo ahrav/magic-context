@@ -88,28 +88,43 @@ export class ShmFrameChannel implements SetupFrameChannel {
         capacity: number,
         hooks?: FrameSendHooks,
     ): BoundedFrameProducer {
-        const spans = capacity === 0 ? [] : [new Uint8Array(new ArrayBuffer(capacity))];
+        if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        const reservation = this.native.reserve(capacity);
         let held = true;
         return new BoundedFrameProducer(
-            spans,
+            reservation.segments,
             capacity,
-            (segments, exactLength) => ({
+            (_segments, exactLength) => ({
                 publish: () => {
                     if (!held) throw new SubcCallError("not_sent", "reservation released");
-                    const body = new Uint8Array(exactLength);
-                    let offset = 0;
-                    for (const segment of segments) {
-                        body.set(segment, offset);
-                        offset += segment.byteLength;
-                    }
-                    this.copies.record();
+                    let published = false;
+                    reservation.commit(
+                        encodeHeader({ ...header, len: exactLength }),
+                        exactLength,
+                        () => {
+                            published = true;
+                            try {
+                                hooks?.onPublish?.();
+                            } catch {
+                                // Send hooks cannot change publication.
+                            }
+                        },
+                    );
                     held = false;
-                    return this.send({ header: { ...header, len: exactLength }, body }, hooks);
+                    try {
+                        hooks?.onComplete?.();
+                    } catch {
+                        // Send hooks cannot change completion.
+                    }
+                    return { cancel: () => !published };
                 },
             }),
             () => {
+                if (!held) return;
                 held = false;
+                reservation.abort();
             },
+            false,
         );
     }
 
@@ -136,12 +151,17 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.closed = true;
         if (this.timer !== null) clearInterval(this.timer);
         this.timer = null;
+        let quarantineError: unknown;
         for (const lease of [...this.receiveLeases]) {
             try {
                 lease.release();
-            } catch {
-                continue;
+            } catch (error) {
+                quarantineError ??= error;
             }
+        }
+        if (quarantineError !== undefined) {
+            this.options.handlers.onClosed("quarantined", quarantineError);
+            throw quarantineError;
         }
         this.native.close();
     }

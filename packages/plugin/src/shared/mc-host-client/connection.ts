@@ -82,6 +82,7 @@ export type RetirementReason =
     | "control_capacity_exhausted"
     | "cleanup_deadline"
     | "write_failed"
+    | "quarantined"
     | "ambiguous_route_open"
     | "negotiation_failed"
     | "owner_close";

@@ -7,10 +7,28 @@ import {
 } from "@magic-context/mc-shm-native";
 import { ConnectionGeneration } from "./connection";
 import { Deadline } from "./deadline";
-import { ByteBudget, ReceiveLease } from "./frame-channel";
-import { FrameType, PROTOCOL_VERSION, encodeHeader, type EnvelopeHeader } from "./protocol";
+import {
+    ByteBudget,
+    type FrameChannelCloseReason,
+    type InboundFrame,
+    ReceiveLease,
+} from "./frame-channel";
+import {
+    decodeHeader,
+    FrameType,
+    PROTOCOL_VERSION,
+    encodeHeader,
+    type EnvelopeHeader,
+} from "./protocol";
 import { ShmFrameChannel } from "./shm-frame-channel";
 import { createExplicitShmTestProvider } from "./shm-transport-provider";
+import {
+    type ContractPeerFrame,
+    type FrameChannelContractFactory,
+    frameChannelContractScenarios,
+    runFrameChannelContractScenario,
+} from "./test-support/frame-channel-contract";
+import { waitUntil } from "./test-support/test-util";
 
 function responseHeader(
     ty: FrameType,
@@ -60,6 +78,134 @@ async function generationHarness(): Promise<{
     if (!channel) throw new Error("missing shared-memory channel");
     return { generation, channel, peer: pair.second };
 }
+
+const shmContractFactory: FrameChannelContractFactory = async () => {
+    const pair = NativeChannel.createTestPair();
+    const budget = new ByteBudget(128 * 1024 * 1024);
+    const frames: ContractPeerFrame[] = [];
+    const received: { header: EnvelopeHeader; body: Uint8Array }[] = [];
+    const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
+    const hook: { current: ((frame: InboundFrame) => boolean | void) | null } = {
+        current: null,
+    };
+    let reading = true;
+    let cleaning = false;
+    const channel = new ShmFrameChannel({
+        nativeChannel: pair.first,
+        budget,
+        handlers: {
+            onFrame: (frame) => {
+                if (hook.current?.(frame)) return;
+                received.push({ header: frame.header, body: frame.body.takeOwned() });
+            },
+            onClosed: (reason, error) => closes.push({ reason, error }),
+        },
+    });
+    channel.beginFrames();
+    const drain = (): void => {
+        if (!reading || cleaning) return;
+        while (
+            pair.second.poll((lease) => {
+                const header = decodeHeader(lease.header);
+                const body = new Uint8Array(lease.byteLength);
+                let offset = 0;
+                for (let index = 0; index < lease.segmentCount; index++) {
+                    const segment = lease.segment(index);
+                    body.set(segment, offset);
+                    offset += segment.byteLength;
+                }
+                lease.release();
+                frames.push({ ...header, body });
+            })
+        ) {}
+    };
+    const drainTimer = setInterval(drain, 0);
+    const peer = {
+        get frames(): readonly ContractPeerFrame[] {
+            return frames;
+        },
+        async send(fields: {
+            ty: number;
+            flags?: number;
+            channel?: number;
+            epoch?: number;
+            corr?: bigint;
+            body?: Uint8Array;
+        }): Promise<void> {
+            const body = fields.body ?? new Uint8Array();
+            publish(
+                pair.second,
+                {
+                    len: body.byteLength,
+                    ver: PROTOCOL_VERSION,
+                    ty: fields.ty,
+                    flags: fields.flags ?? 0,
+                    channel: fields.channel ?? 0,
+                    epoch: fields.epoch ?? 0,
+                    corr: fields.corr ?? 0n,
+                },
+                body,
+            );
+        },
+        async sendBurst(fields: readonly {
+            ty: number;
+            flags?: number;
+            channel?: number;
+            epoch?: number;
+            corr?: bigint;
+            body?: Uint8Array;
+        }[]): Promise<void> {
+            for (const frame of fields) await this.send(frame);
+        },
+        waitFor: async (check: () => boolean, timeoutMs?: number) =>
+            waitUntil(check, timeoutMs),
+        pauseReading: () => {
+            reading = false;
+        },
+        resumeReading: () => {
+            reading = true;
+            drain();
+        },
+        end: () => pair.second.close(),
+        destroy: () => pair.second.forceClose(),
+    };
+    return {
+        channel,
+        budget,
+        peer,
+        received,
+        closes,
+        get frameHook() {
+            return hook.current;
+        },
+        set frameHook(value) {
+            hook.current = value;
+        },
+        async cleanup() {
+            cleaning = true;
+            clearInterval(drainTimer);
+            if (!channel.isClosed()) channel.close();
+            pair.second.close();
+        },
+    };
+};
+
+const SHM_CONTRACT_SCENARIOS = new Set([
+    "concurrent send and receive preserve FIFO order",
+    "publication and local completion fire exactly once, in order",
+    "underfill, overflow, and abort return reservations without publication",
+    "owned receive adapter copies once after transport lease release",
+]);
+
+describe("frame channel semantic contract (shared-memory factory)", () => {
+    for (const scenario of frameChannelContractScenarios) {
+        if (!SHM_CONTRACT_SCENARIOS.has(scenario.name)) continue;
+        test(scenario.name, async () => {
+            if (!probeCapabilities().available) return;
+            await runFrameChannelContractScenario(scenario, shmContractFactory);
+        }, 30_000);
+    }
+});
 
 describe("explicit shared-memory provider", () => {
     test("omits unsupported and non-qualified profiles without registration", () => {
@@ -169,21 +315,32 @@ describe("explicit shared-memory provider", () => {
         const { generation, peer } = await generationHarness();
         try {
             let alias: Uint8Array | undefined;
-            for (const fill of [
-                (cursor: { view(): Uint8Array; write(bytes: Uint8Array): void }) => {
-                    alias = cursor.view();
-                    cursor.write(Buffer.from([1, 2]));
-                },
-                (cursor: { view(): Uint8Array; write(bytes: Uint8Array): void }) => {
-                    alias = cursor.view();
-                    cursor.write(Buffer.alloc(5));
-                },
-                (cursor: { view(): Uint8Array; write(bytes: Uint8Array): void }) => {
-                    alias = cursor.view();
-                    cursor.write(Buffer.alloc(4));
-                    throw new Error("fill failed");
-                },
-            ]) {
+            const failures = [
+                [
+                    (cursor: { view(): Uint8Array; write(bytes: Uint8Array): void }) => {
+                        alias = cursor.view();
+                        cursor.write(Buffer.from([1, 2]));
+                    },
+                    /producer underfill/,
+                ],
+                [
+                    (cursor: { view(): Uint8Array; write(bytes: Uint8Array): void }) => {
+                        alias = cursor.view();
+                        cursor.write(Buffer.alloc(5));
+                    },
+                    /producer overflow/,
+                ],
+                [
+                    (cursor: { view(): Uint8Array; write(bytes: Uint8Array): void }) => {
+                        alias = cursor.view();
+                        cursor.write(Buffer.alloc(4));
+                        throw new Error("fill failed");
+                    },
+                    /fill failed/,
+                ],
+            ] as const;
+            for (const [fill, expected] of failures) {
+                alias = undefined;
                 expect(() =>
                     generation.request({
                         channel: 7,
@@ -191,14 +348,112 @@ describe("explicit shared-memory provider", () => {
                         body: { byteLength: 4, fill },
                         deadline: Deadline.start(50),
                     }),
-                ).toThrow();
+                ).toThrow(expected);
                 expect(alias?.byteLength).toBe(0);
                 expect(peer.poll(() => {})).toBe(false);
+
+                generation.request({
+                    channel: 7,
+                    epoch: 1,
+                    body: Buffer.from([9]),
+                    deadline: Deadline.start(50),
+                });
+                const valid = take(peer);
+                expect(valid.segment(0)[0]).toBe(9);
+                valid.release();
             }
         } finally {
             generation.retire("owner_close");
             peer.close();
         }
+    });
+
+    test("native reservation publishes directly and cannot cancel after publication", () => {
+        if (!probeCapabilities().available) return;
+        const pair = NativeChannel.createTestPair();
+        const channel = new ShmFrameChannel({
+            nativeChannel: pair.first,
+            budget: new ByteBudget(1024),
+            handlers: { onFrame: () => {}, onClosed: () => {} },
+        });
+        const { len: _len, ...header } = responseHeader(FrameType.Request, 8n, 4);
+        const producer = channel.reserve(header, 4);
+        const alias = producer.view();
+        producer.write(Buffer.from([1, 2, 3, 4]));
+        const ticket = producer.commit(4);
+        expect(ticket.cancel()).toBe(false);
+        expect(alias.byteLength).toBe(0);
+        const lease = take(pair.second);
+        expect(Array.from(lease.segment(0))).toEqual([1, 2, 3, 4]);
+        lease.release();
+        expect(channel.stats().ownedAdapterCopies).toBe(0);
+        channel.close();
+        pair.second.close();
+    });
+
+    test("owned receive adapter records exactly one copy", async () => {
+        if (!probeCapabilities().available) return;
+        const pair = NativeChannel.createTestPair();
+        let owned: Uint8Array | undefined;
+        const channel = new ShmFrameChannel({
+            nativeChannel: pair.first,
+            budget: new ByteBudget(1024),
+            handlers: {
+                onFrame: (frame) => {
+                    owned = frame.body.takeOwned();
+                },
+                onClosed: () => {},
+            },
+        });
+        channel.beginFrames();
+        publish(pair.second, responseHeader(FrameType.Response, 1n, 4), Buffer.from("once"));
+        await waitUntil(() => owned !== undefined);
+        expect(Buffer.from(owned ?? []).toString()).toBe("once");
+        expect(channel.stats().ownedAdapterCopies).toBe(1);
+        channel.close();
+        pair.second.close();
+    });
+
+    test("close reports quarantine and rejects alias cleanup failure", async () => {
+        const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
+        let delivered = false;
+        let nativeCloseCalls = 0;
+        const nativeLease = {
+            header: encodeHeader(responseHeader(FrameType.Response, 1n, 5)),
+            segmentCount: 1,
+            segment: () => new Uint8Array(Buffer.from("maybe")),
+            release: () => {
+                throw new Error("detach failed");
+            },
+        } as unknown as NativeReceiveLease;
+        const native = {
+            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+                if (delivered) return false;
+                delivered = true;
+                deliver(nativeLease);
+                return true;
+            },
+            close: () => {
+                nativeCloseCalls++;
+            },
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget: new ByteBudget(1024),
+            handlers: {
+                onFrame: () => {},
+                onClosed: (reason, error) => closes.push({ reason, error }),
+            },
+        });
+        channel.beginFrames();
+        await waitUntil(() => channel.stats().activeReceiveLeases === 1);
+        expect(() => channel.close()).toThrow(
+            "receive lease alias state is uncertain; storage quarantined",
+        );
+        expect(channel.stats().activeReceiveLeases).toBe(0);
+        expect(channel.stats().quarantinedBytes).toBe(5);
+        expect(closes.map((entry) => entry.reason)).toEqual(["quarantined"]);
+        expect(nativeCloseCalls).toBe(0);
     });
 
     test("handler throw releases JSON lease before fail-close", async () => {

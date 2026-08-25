@@ -1,24 +1,56 @@
 #[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
-use std::process::Command;
+use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 use std::time::Instant;
 
-use mc_shm_transport::backend::ring::{wire_v2_header, ProducerError, Ring, RingGrant};
+use mc_shm_transport::backend::ring::{wire_v2_header, ProducerError, Ring, RingError, RingGrant};
 use mc_shm_transport::descriptor::{
-    HardwareProfileId, Incarnation, ReleaseIdentity, SchedulingMode,
+    BackendId, HardwareProfileId, Incarnation, MemoryLayout, OwnershipMode, PlatformKind,
+    ReleaseIdentity, RuntimeKind, SchedulingMode, TransportDescriptor, WorkloadClass,
 };
 use mc_shm_transport::lease::LeaseError;
-use mc_shm_transport::profile::ring_profile;
+use mc_shm_transport::profile::{
+    ring_profile, CompletionMode, ProducerTopology, ProfileConfig, TargetProfile, WorkerTopology,
+};
 use mc_shm_transport::MAX_FRAME_BYTES;
 
-fn profile() -> mc_shm_transport::profile::TargetProfile {
+fn profile() -> TargetProfile {
     ring_profile(
         HardwareProfileId::new("ring-contract-host").unwrap(),
         SchedulingMode::ColdParkWake,
     )
+    .unwrap()
+}
+
+fn lease_limited_profile() -> TargetProfile {
+    TargetProfile::new(ProfileConfig {
+        descriptor: TransportDescriptor::new(
+            BackendId::Ring,
+            MemoryLayout::TwoSpanWrap,
+            OwnershipMode::DirectLeased,
+            SchedulingMode::ColdParkWake,
+            WorkloadClass::MixedDuplex,
+            if cfg!(target_os = "macos") {
+                PlatformKind::Macos
+            } else {
+                PlatformKind::Linux
+            },
+            RuntimeKind::Rust,
+            HardwareProfileId::new("ring-lease-limit").unwrap(),
+        ),
+        descriptor_depth: 2,
+        arena_bytes: MAX_FRAME_BYTES,
+        max_spans: 2,
+        max_leases: 1,
+        mappings: 2,
+        pinned_workers: 0,
+        producer_topology: ProducerTopology::CallerConfined,
+        worker_topology: WorkerTopology::CallerThread,
+        completion_mode: CompletionMode::SynchronousPull,
+    })
     .unwrap()
 }
 
@@ -186,6 +218,73 @@ fn retained_oldest_lease_enforces_fifo_reclamation_and_release_validation() {
     lease.release().unwrap();
 }
 
+#[test]
+fn stale_lap_release_cannot_complete_recycled_slot() {
+    let ring = Ring::create(&profile(), 13).unwrap();
+    let depth = profile().descriptor_depth();
+
+    let stale = publish(&ring, &[1]);
+    ring.try_receive().unwrap().unwrap().release().unwrap();
+    for value in 2..=depth {
+        publish(&ring, &[value as u8]);
+        ring.try_receive().unwrap().unwrap().release().unwrap();
+    }
+
+    publish(&ring, &[0xa5]);
+    let fresh = ring.try_receive().unwrap().unwrap();
+    assert_eq!(
+        ring.release(stale),
+        Err(LeaseError::InvalidSequence),
+        "stale identity must not complete recycled slot"
+    );
+    assert_eq!(fresh.segment(0).unwrap().read_byte(0), Some(0xa5));
+    let (descriptors, bytes) = ring.conservation().unwrap();
+    assert_eq!(descriptors.receiver_leased, 1);
+    assert_eq!(descriptors.free, depth as u64 - 1);
+    assert_eq!(bytes.receiver_leased, 1);
+    fresh.release().unwrap();
+
+    ring.try_reserve(0, wire_v2_header(0).unwrap())
+        .unwrap()
+        .abort();
+    let (descriptors, bytes) = ring.conservation().unwrap();
+    assert_eq!(descriptors.free, depth as u64);
+    assert_eq!(bytes.free, MAX_FRAME_BYTES as u64);
+}
+
+#[test]
+fn quarantine_rejects_all_operations_and_reports_conservation() {
+    let ring = Ring::create(&profile(), 17).unwrap();
+    let identity = publish(&ring, &[1, 2, 3]);
+    ring.enter_quarantine();
+
+    assert_eq!(
+        ring.try_reserve(1, wire_v2_header(1).unwrap()).unwrap_err(),
+        ProducerError::Quarantined
+    );
+    assert!(matches!(ring.try_receive(), Err(RingError::Quarantined)));
+    assert_eq!(ring.release(identity), Err(LeaseError::Quarantined));
+    let (descriptors, bytes) = ring.conservation().unwrap();
+    assert_eq!(descriptors.quarantined, profile().descriptor_depth() as u64);
+    assert_eq!(bytes.quarantined, MAX_FRAME_BYTES as u64);
+    assert!(descriptors.conserves(profile().descriptor_depth() as u64));
+    assert!(bytes.conserves(MAX_FRAME_BYTES as u64));
+}
+
+#[test]
+fn lease_limit_rejects_then_recovers_after_release() {
+    let ring = Ring::create(&lease_limited_profile(), 18).unwrap();
+    publish(&ring, &[1]);
+    publish(&ring, &[2]);
+
+    let first = ring.try_receive().unwrap().unwrap();
+    assert!(matches!(ring.try_receive(), Err(RingError::LeaseLimit)));
+    first.release().unwrap();
+    let second = ring.try_receive().unwrap().unwrap();
+    assert_eq!(second.segment(0).unwrap().read_byte(0), Some(2));
+    second.release().unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn sealed_object_prefault_repeated_setup_and_stress_conservation() {
@@ -212,9 +311,13 @@ fn sealed_object_prefault_repeated_setup_and_stress_conservation() {
         assert_eq!(lease.len(), len);
         assert_eq!(lease.segment(0).unwrap().read_byte(0), Some(state as u8));
         lease.release().unwrap();
+        ring.try_reserve(0, wire_v2_header(0).unwrap())
+            .unwrap()
+            .abort();
         let (descriptors, bytes) = ring.conservation().unwrap();
-        assert!(descriptors.conserves(32));
-        assert!(bytes.conserves(MAX_FRAME_BYTES as u64));
+        assert_eq!(descriptors.free, 32);
+        assert_eq!(descriptors.published, 0);
+        assert_eq!(bytes.free, MAX_FRAME_BYTES as u64);
     }
     ring.try_reserve(0, wire_v2_header(0).unwrap())
         .unwrap()
@@ -222,6 +325,77 @@ fn sealed_object_prefault_repeated_setup_and_stress_conservation() {
     let (descriptors, bytes) = ring.conservation().unwrap();
     assert_eq!(descriptors.free, 32);
     assert_eq!(bytes.free, MAX_FRAME_BYTES as u64);
+}
+
+#[cfg(target_os = "linux")]
+fn duplicate_fd(raw: i32) -> OwnedFd {
+    // SAFETY: F_DUPFD_CLOEXEC duplicates the live test descriptor.
+    let duplicated = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(duplicated >= 0);
+    // SAFETY: successful fcntl returned a new owned descriptor.
+    unsafe { OwnedFd::from_raw_fd(duplicated) }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_rejects_unsealed_objects_and_tampered_grants() {
+    let ring = Ring::create(&profile(), 21).unwrap();
+    let base = ring.grant().encode();
+
+    let mut cases = Vec::new();
+    let mut version = base;
+    version[0..2].copy_from_slice(&1u16.to_le_bytes());
+    cases.push(version);
+    let mut incarnation = base;
+    incarnation[2] ^= 1;
+    cases.push(incarnation);
+    let mut lane = base;
+    lane[18] ^= 1;
+    cases.push(lane);
+    let mut depth = base;
+    depth[22..30].copy_from_slice(&31u64.to_le_bytes());
+    cases.push(depth);
+    let mut arena = base;
+    arena[30..38].copy_from_slice(&(MAX_FRAME_BYTES as u64 + 4096).to_le_bytes());
+    cases.push(arena);
+
+    for bytes in cases {
+        let grant = RingGrant::decode(bytes).unwrap();
+        assert!(matches!(
+            Ring::attach(
+                duplicate_fd(ring.raw_fd()),
+                grant,
+                SchedulingMode::ColdParkWake
+            ),
+            Err(RingError::InvalidGrant)
+        ));
+    }
+
+    let mut reserved = base;
+    reserved[54] = 1;
+    assert_eq!(RingGrant::decode(reserved), Err(RingError::InvalidGrant));
+
+    let name = c"mc-shm-unsealed-test";
+    // SAFETY: static name and flags are valid for memfd_create.
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        ) as libc::c_int
+    };
+    assert!(raw >= 0);
+    // SAFETY: successful memfd_create returned a new owned descriptor.
+    let unsealed = unsafe { OwnedFd::from_raw_fd(raw) };
+    assert_eq!(
+        unsafe { libc::ftruncate(unsealed.as_raw_fd(), ring.object_size() as libc::off_t) },
+        0
+    );
+    assert_eq!(unsafe { libc::fchmod(unsealed.as_raw_fd(), 0o600) }, 0);
+    assert!(matches!(
+        Ring::attach(unsealed, ring.grant(), SchedulingMode::ColdParkWake),
+        Err(RingError::ObjectValidationFailed)
+    ));
 }
 
 #[cfg(target_os = "linux")]
@@ -248,15 +422,41 @@ fn decode_hex<const N: usize>(text: &str) -> [u8; N] {
 fn two_process_zero_copy_exchange_uses_authenticated_grant() {
     let ring = Ring::create(&profile(), 23).unwrap();
     ring.set_inheritable(true).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "ring_child_exchange", "--nocapture"])
         .env("MC_SHM_CHILD_FD", ring.raw_fd().to_string())
         .env("MC_SHM_CHILD_GRANT", hex(&ring.grant().encode()))
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     ring.set_inheritable(false).unwrap();
-    publish(&ring, &[1, 2, 3, 4]);
-    assert!(child.wait().unwrap().success());
+
+    let mut reservation = ring
+        .try_reserve(MAX_FRAME_BYTES, wire_v2_header(MAX_FRAME_BYTES).unwrap())
+        .unwrap();
+    let chunk = vec![7; 1024 * 1024];
+    for _ in 0..64 {
+        reservation.write(&chunk).unwrap();
+    }
+    reservation.commit(MAX_FRAME_BYTES).unwrap();
+
+    let waiting_since = Instant::now();
+    ring.reserve_until(
+        1,
+        wire_v2_header(1).unwrap(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap()
+    .abort();
+    assert!(waiting_since.elapsed() >= Duration::from_millis(25));
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("MC_SHM_CHILD_EXCHANGE_OK"), "{stdout}");
+    let (descriptors, bytes) = ring.conservation().unwrap();
+    assert_eq!(descriptors.free, profile().descriptor_depth() as u64);
+    assert_eq!(bytes.free, MAX_FRAME_BYTES as u64);
 }
 
 #[cfg(target_os = "linux")]
@@ -273,9 +473,13 @@ fn ring_child_exchange() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(lease) = ring.try_receive().unwrap() {
-            assert_eq!(lease.len(), 4);
-            assert_eq!(lease.segment(0).unwrap().checksum(), 10);
+            assert_eq!(lease.len(), MAX_FRAME_BYTES);
+            let first = lease.segment(0).unwrap();
+            assert_eq!(first.read_byte(0), Some(7));
+            assert_eq!(first.read_byte(first.len() - 1), Some(7));
+            std::thread::sleep(Duration::from_millis(50));
             lease.release().unwrap();
+            println!("MC_SHM_CHILD_EXCHANGE_OK");
             return;
         }
         assert!(Instant::now() < deadline, "parent never published frame");

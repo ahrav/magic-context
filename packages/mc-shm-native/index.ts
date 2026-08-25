@@ -36,6 +36,8 @@ interface NativeAddon {
     detachArrayBuffer(buffer: ArrayBuffer): boolean;
     registerCleanupProbe(path: string): void;
     nativeLeakDiagnostics(): number;
+    activeExternalRefCount(): number;
+    setExternalViewFailpoint(call: number): void;
     workerLimit(): number;
     activeChannelCount(): number;
     attach(descriptor: NativeDescriptor): number;
@@ -53,6 +55,20 @@ interface NativeAddon {
         fill: (segments: Uint8Array[]) => number,
         beforePublish: () => void,
     ): void;
+    reserve(
+        channel: number,
+        capacity: number,
+        timeoutMs: number,
+        deliver: (token: number, segments: Uint8Array[]) => void,
+    ): void;
+    commitReservation(
+        channel: number,
+        token: number,
+        header: Uint8Array,
+        written: number,
+        beforePublish: () => void,
+    ): void;
+    abortReservation(channel: number, token: number): void;
     poll(
         channel: number,
         deliver: (token: number, header: Uint8Array, segments: Uint8Array[]) => void,
@@ -229,6 +245,41 @@ export class ProducerCursor {
     }
 }
 
+export class NativeProducerReservation {
+    private active = true;
+
+    constructor(
+        private readonly native: NativeAddon,
+        private readonly channel: number,
+        private readonly token: number,
+        readonly segments: readonly Uint8Array[],
+    ) {
+        protect(segments);
+    }
+
+    commit(header: Uint8Array, written: number, beforePublish?: () => void): void {
+        this.assertActive();
+        this.native.commitReservation(
+            this.channel,
+            this.token,
+            header,
+            written,
+            beforePublish ?? (() => {}),
+        );
+        this.active = false;
+    }
+
+    abort(): void {
+        if (!this.active) return;
+        this.native.abortReservation(this.channel, this.token);
+        this.active = false;
+    }
+
+    private assertActive(): void {
+        if (!this.active) throw new Error("producer reservation is released");
+    }
+}
+
 export class NativeReceiveLease {
     private released = false;
 
@@ -328,6 +379,20 @@ export class NativeChannel {
         );
     }
 
+    reserve(capacity: number, timeoutMs = 0): NativeProducerReservation {
+        this.assertOpen();
+        let token: number | undefined;
+        let segments: Uint8Array[] | undefined;
+        this.native.reserve(this.id, capacity, timeoutMs, (reservedToken, reservedSegments) => {
+            token = reservedToken;
+            segments = reservedSegments;
+        });
+        if (token === undefined || segments === undefined) {
+            throw new Error("native reservation callback did not run");
+        }
+        return new NativeProducerReservation(this.native, this.id, token, segments);
+    }
+
     poll(deliver: (lease: NativeReceiveLease) => void): boolean {
         this.assertOpen();
         return this.native.poll(this.id, (token, header, segments) => {
@@ -361,6 +426,14 @@ export function registerCleanupProbe(path: string): boolean {
 
 export function nativeLeakDiagnostics(): number {
     return addon()?.nativeLeakDiagnostics() ?? 0;
+}
+
+export function activeExternalRefs(): number {
+    return addon()?.activeExternalRefCount() ?? 0;
+}
+
+export function setExternalViewCreationFailpoint(call: number): void {
+    addon()?.setExternalViewFailpoint(call);
 }
 
 export function activeNativeChannels(): number {

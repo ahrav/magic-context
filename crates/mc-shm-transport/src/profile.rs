@@ -59,6 +59,16 @@ pub struct ResourceCharges {
 }
 
 impl ResourceCharges {
+    /// Empty resource commitment.
+    pub const ZERO: Self = Self {
+        descriptors: 0,
+        arena_bytes: 0,
+        spans_per_frame: 0,
+        leases: 0,
+        mappings: 0,
+        pinned_workers: 0,
+    };
+
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             descriptors: self.descriptors.checked_add(other.descriptors)?,
@@ -339,22 +349,8 @@ impl AdmissionController {
         Self {
             limits,
             accounting: Mutex::new(Accounting {
-                active: ResourceCharges {
-                    descriptors: 0,
-                    arena_bytes: 0,
-                    spans_per_frame: 0,
-                    leases: 0,
-                    mappings: 0,
-                    pinned_workers: 0,
-                },
-                quarantined: ResourceCharges {
-                    descriptors: 0,
-                    arena_bytes: 0,
-                    spans_per_frame: 0,
-                    leases: 0,
-                    mappings: 0,
-                    pinned_workers: 0,
-                },
+                active: ResourceCharges::ZERO,
+                quarantined: ResourceCharges::ZERO,
             }),
         }
     }

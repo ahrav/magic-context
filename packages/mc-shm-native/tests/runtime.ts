@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
 import { setFlagsFromString } from "node:v8";
 import {
+    activeExternalRefs,
     NativeChannel,
     type NativeReceiveLease,
     probeCapabilities,
+    setExternalViewCreationFailpoint,
 } from "../index.ts";
 
 const result = probeCapabilities();
@@ -143,6 +145,25 @@ function runNativeLifecycle(): void {
     receive(arena.second).release();
     arena.first.close();
     arena.second.close();
+
+    const partial = NativeChannel.createTestPair();
+    partial.first.produce(header(partial.arenaBytes - 2), partial.arenaBytes - 2, (cursor) => {
+        cursor.advance(partial.arenaBytes - 2);
+    });
+    receive(partial.second).release();
+    fill(partial.first, 4, 3, 1_000);
+    const refsBeforeFailure = activeExternalRefs();
+    setExternalViewCreationFailpoint(2);
+    assert.throws(
+        () => partial.second.poll(() => {}),
+        /external view creation failpoint/,
+    );
+    setExternalViewCreationFailpoint(0);
+    assert.equal(activeExternalRefs(), refsBeforeFailure);
+    fill(partial.first, 1, 4, 1_000);
+    receive(partial.second).release();
+    partial.first.close();
+    partial.second.close();
 
     const leaked = NativeChannel.createTestPair();
     for (let index = 0; index < leaked.descriptorDepth; index++) {

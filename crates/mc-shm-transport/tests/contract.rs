@@ -240,6 +240,33 @@ fn arena_plans_wrap_and_conserves_all_states() {
 
 #[test]
 fn lifecycle_accepts_only_diagram_edges_and_quarantine_is_terminal() {
+    assert_eq!(
+        Lifecycle::new().advance(CloseState::ReleasingSamples),
+        Err(LifecycleError::InvalidTransition)
+    );
+
+    let mut skipped_revoke = Lifecycle::new();
+    skipped_revoke.advance(CloseState::Quiescing).unwrap();
+    assert_eq!(
+        skipped_revoke.advance(CloseState::RevokingJsOnEnv),
+        Err(LifecycleError::InvalidTransition)
+    );
+
+    let mut late_quarantine = Lifecycle::new();
+    for state in [
+        CloseState::Quiescing,
+        CloseState::DrainingPublished,
+        CloseState::StoppingEnvScheduling,
+        CloseState::RevokingJsOnEnv,
+        CloseState::AsyncCleanupJoin,
+    ] {
+        late_quarantine.advance(state).unwrap();
+    }
+    assert_eq!(
+        late_quarantine.advance(CloseState::Quarantined),
+        Err(LifecycleError::InvalidTransition)
+    );
+
     let mut lifecycle = Lifecycle::new();
     lifecycle.mark_prepared().unwrap();
     assert!(lifecycle.must_fail_closed());
