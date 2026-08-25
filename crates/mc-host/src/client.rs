@@ -61,8 +61,21 @@ pub const CLIENT_STREAM_QUEUE_ITEMS: usize = 16;
 pub const CLIENT_DATA_QUEUE_FRAMES: usize = 256;
 /// Reserved pure-header Pong, Cancel, and Goodbye slots.
 pub const CLIENT_CONTROL_QUEUE_FRAMES: usize = 32;
-/// Shared queued-byte cap charged by both ordinary and reserved control frames.
+/// Queued-byte cap for ordinary data frames.
+///
+/// Reserved control frames draw on `CLIENT_CONTROL_QUEUED_BYTES` instead, so
+/// ordinary traffic cannot starve them: a control charge that failed here retires
+/// the whole generation, while a data charge that fails is one caller's local
+/// error, and sharing one pool let legitimate large bodies turn into a
+/// self-inflicted connection teardown.
 pub const CLIENT_QUEUED_BYTES: usize = MAX_BODY_LEN as usize + 1_048_576;
+/// Queued-byte reservation for the pure-header control frames.
+///
+/// Sized to exactly the reserved control channel: every control frame is
+/// header-only, so this covers `CLIENT_CONTROL_QUEUE_FRAMES` of them and a byte
+/// charge can only fail once that channel is already full — the same condition
+/// that retires the generation a few lines later.
+pub const CLIENT_CONTROL_QUEUED_BYTES: usize = CLIENT_CONTROL_QUEUE_FRAMES * HEADER_LEN;
 /// Reservation for the body of the frame the reader is currently decoding.
 ///
 /// The wire contract obliges an admitted connection to accept any otherwise
@@ -373,6 +386,7 @@ impl Client {
             streams: Mutex::new(0),
             routes: Mutex::new(HashSet::new()),
             queue_budget: Arc::new(ByteCounter::new(CLIENT_QUEUED_BYTES)),
+            control_budget: Arc::new(ByteCounter::new(CLIENT_CONTROL_QUEUED_BYTES)),
             read_budget: Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
             retained_budget: Arc::new(ByteCounter::new(CLIENT_RETAINED_RESPONSE_BYTES)),
             data_tx,
@@ -822,6 +836,10 @@ struct Inner {
     streams: Mutex<usize>,
     routes: Mutex<HashSet<RouteHandle>>,
     queue_budget: Arc<ByteCounter>,
+    /// Reserved queued bytes for pure-header control frames, separate from
+    /// `queue_budget` so ordinary data traffic can never starve a Pong, Cancel,
+    /// or Goodbye into retiring the generation.
+    control_budget: Arc<ByteCounter>,
     /// Reserved for the body of the one frame the reader is decoding. Separate
     /// from `retained_budget` so queue retention can never deny an otherwise
     /// valid inbound frame; see `CLIENT_INBOUND_FRAME_BYTES`.
@@ -1208,7 +1226,11 @@ impl Inner {
                 "control encode failed",
             )
         })?;
-        let charge = self.queue_budget.charge(bytes.len()).ok_or_else(|| {
+        // The reserved pool, not the shared one: a control charge failing here
+        // retires the whole generation, so charging it against bytes that ordinary
+        // requests can legitimately occupy turned a busy connection into a
+        // self-inflicted teardown.
+        let charge = self.control_budget.charge(bytes.len()).ok_or_else(|| {
             self.retire("control_capacity_exhausted");
             CallError::local(
                 SendOutcome::Terminal,
@@ -2268,6 +2290,7 @@ mod tests {
                 streams: Mutex::new(0),
                 routes: Mutex::new(HashSet::from([route(1), route(2)])),
                 queue_budget: Arc::new(ByteCounter::new(queued_bytes)),
+                control_budget: Arc::new(ByteCounter::new(CLIENT_CONTROL_QUEUED_BYTES)),
                 read_budget: Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
                 retained_budget: Arc::new(ByteCounter::new(CLIENT_RETAINED_RESPONSE_BYTES)),
                 data_tx,
@@ -3206,16 +3229,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_and_control_charge_one_shared_byte_cap() {
-        let (inner, data_rx, control_rx) = test_inner(HEADER_LEN * 2);
-        inner
-            .send_control(
-                FrameType::Pong,
-                pure_header_flags(),
-                FrameId::control(1),
-                None,
-            )
-            .expect("first header");
+    async fn data_saturation_never_starves_a_control_frame() {
+        // Control frames used to charge the same pool as request bodies, and the
+        // two react to exhaustion in opposite ways: a data charge that fails is
+        // one caller's local error, while a control charge that fails retires the
+        // whole generation. Legitimate large bodies sitting in the writer queue
+        // could therefore make the next keepalive Pong or deadline Cancel tear
+        // down every unrelated route on the connection.
+        let (inner, data_rx, mut control_rx) = test_inner(HEADER_LEN);
         let (kind, _rx) = unary_sender();
         inner
             .admit(
@@ -3224,16 +3245,29 @@ mod tests {
                 kind,
                 Instant::now() + Duration::from_secs(1),
             )
-            .expect("data header uses remaining shared bytes");
-        assert_eq!(inner.queue_budget.used(), HEADER_LEN * 2);
-        assert!(inner
+            .expect("data header fills the whole data budget");
+        assert_eq!(
+            inner.queue_budget.used(),
+            HEADER_LEN,
+            "the data pool is now saturated"
+        );
+
+        inner
             .send_control(
                 FrameType::Pong,
                 pure_header_flags(),
-                FrameId::control(2),
-                None
+                FrameId::control(1),
+                None,
             )
-            .is_err());
+            .expect("a reserved control frame does not compete with request bytes");
+        assert!(
+            !inner.retired.load(Ordering::Acquire),
+            "ordinary traffic must never retire the generation through a starved control frame"
+        );
+        assert_eq!(inner.control_budget.used(), HEADER_LEN);
+        let queued = control_rx.try_recv().expect("Pong queued");
+        assert_eq!(queued.bytes[5], FrameType::Pong as u8);
+
         drop(data_rx);
         drop(control_rx);
         assert_eq!(inner.queue_budget.used(), 0);
