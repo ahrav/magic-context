@@ -88,8 +88,11 @@ impl fmt::Debug for PreparedSegment {
 }
 
 impl PreparedOutput {
-    /// Retains a JSON value; measurement performs the single serialization
-    /// pass and the write phase reuses the encoded bytes.
+    /// Retains a JSON value and encodes it only on the write phase.
+    ///
+    /// Measurement counts the serialized length without keeping the bytes, so
+    /// nothing is retained outside the host's reservation; see
+    /// [`PreparedOutput::measure`] for why the serializer runs twice.
     pub fn json(value: Value) -> Self {
         Self {
             source: PreparedSource::Json(Arc::new(value)),
