@@ -1,5 +1,11 @@
 import { afterAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseIncidentCatalog } from "../contract";
@@ -94,26 +100,38 @@ function a47Observation(
 describe("A28 historian failure containment verifier", () => {
     it("passes only static accepted containment facts", () => {
         const observation = a28Observation();
-        expect(preconditionHistorianFailureDump(observation).satisfied).toBe(true);
+        expect(preconditionHistorianFailureDump(observation).satisfied).toBe(
+            true,
+        );
         expect(failedIds(verifyHistorianFailureDump(observation))).toEqual([]);
     });
 
     it("rejects a dump outside the isolated project", () => {
         expect(
-            failedIds(verifyHistorianFailureDump(a28Observation({ dumpProjectLocal: false }))),
+            failedIds(
+                verifyHistorianFailureDump(
+                    a28Observation({ dumpProjectLocal: false }),
+                ),
+            ),
         ).toEqual(["check-a28-project-local-dump"]);
     });
 
     it("rejects a dump without gitignore coverage", () => {
         expect(
-            failedIds(verifyHistorianFailureDump(a28Observation({ dumpGitignored: false }))),
+            failedIds(
+                verifyHistorianFailureDump(
+                    a28Observation({ dumpGitignored: false }),
+                ),
+            ),
         ).toEqual(["check-a28-gitignore-coverage"]);
     });
 
     it("rejects deletion before intentional retention is observed", () => {
         expect(
             failedIds(
-                verifyHistorianFailureDump(a28Observation({ dumpRetainedAfterFailure: false })),
+                verifyHistorianFailureDump(
+                    a28Observation({ dumpRetainedAfterFailure: false }),
+                ),
             ),
         ).toEqual(["check-a28-intentional-retention"]);
     });
@@ -121,14 +139,20 @@ describe("A28 historian failure containment verifier", () => {
     it("rejects a published canary leak", () => {
         expect(
             failedIds(
-                verifyHistorianFailureDump(a28Observation({ publishedReportRedacted: false })),
+                verifyHistorianFailureDump(
+                    a28Observation({ publishedReportRedacted: false }),
+                ),
             ),
         ).toEqual(["check-a28-report-redaction"]);
     });
 
     it("rejects a shell command or external side effect", () => {
         expect(
-            failedIds(verifyHistorianFailureDump(a28Observation({ sideEffectAbsent: false }))),
+            failedIds(
+                verifyHistorianFailureDump(
+                    a28Observation({ sideEffectAbsent: false }),
+                ),
+            ),
         ).toEqual(["check-a28-metacharacter-safety"]);
     });
 
@@ -140,7 +164,9 @@ describe("A28 historian failure containment verifier", () => {
             } as never),
         ).toThrow(/must contain exactly/);
         expect(() =>
-            verifyHistorianFailureDump({ kind: "a28-historian-dump-containment" } as unknown as NormalizedObservation),
+            verifyHistorianFailureDump({
+                kind: "a28-historian-dump-containment",
+            } as unknown as NormalizedObservation),
         ).toThrow(/must contain exactly/);
     });
 
@@ -151,7 +177,10 @@ describe("A28 historian failure containment verifier", () => {
             { terminalCanaryRetained: false },
             { shellCanaryRetained: false },
         ] as const) {
-            expect(preconditionHistorianFailureDump(a28Observation(overrides)).satisfied).toBe(false);
+            expect(
+                preconditionHistorianFailureDump(a28Observation(overrides))
+                    .satisfied,
+            ).toBe(false);
         }
     });
 });
@@ -159,22 +188,30 @@ describe("A28 historian failure containment verifier", () => {
 describe("A47 lease-loss residual-write verifier", () => {
     it("records current committed mutation as known-red failed check", () => {
         const observation = a47Observation();
-        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(true);
+        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(
+            true,
+        );
         expect(failedIds(verifyLeaseLossResidualWrite(observation))).toEqual([
             "check-a47-no-post-lease-loss-commit",
         ]);
     });
 
     it("accepts a complete future no-commit trace as the resolution shape", () => {
-        const trace = A47_CURRENT_TRACE.filter((event) => event !== "mutation-commit");
+        const trace = A47_CURRENT_TRACE.filter(
+            (event) => event !== "mutation-commit",
+        );
         const observation = a47Observation({
             postCommitMemoryStatus: "active",
             postCommitMutationCount: 0,
             mutationIdsUnique: true,
             trace,
         });
-        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(true);
-        expect(failedIds(verifyLeaseLossResidualWrite(observation))).toEqual([]);
+        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(
+            true,
+        );
+        expect(failedIds(verifyLeaseLossResidualWrite(observation))).toEqual(
+            [],
+        );
     });
 
     it("rejects ordered callbacks without durable ownership or commit reads", () => {
@@ -182,7 +219,9 @@ describe("A47 lease-loss residual-write verifier", () => {
             replacementOwnershipRead: false,
             postCommitMemoryStatus: "missing",
         });
-        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(false);
+        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(
+            false,
+        );
         expect(failedIds(verifyLeaseLossResidualWrite(observation))).toContain(
             "check-a47-durable-happens-before",
         );
@@ -193,7 +232,10 @@ describe("A47 lease-loss residual-write verifier", () => {
             { originalLeaseAcquired: false },
             { originalOwnershipRead: false },
         ] as const) {
-            expect(preconditionLeaseLossResidualWrite(a47Observation(overrides)).satisfied).toBe(false);
+            expect(
+                preconditionLeaseLossResidualWrite(a47Observation(overrides))
+                    .satisfied,
+            ).toBe(false);
         }
     });
 
@@ -203,7 +245,10 @@ describe("A47 lease-loss residual-write verifier", () => {
             { replacementOwnershipRead: false },
             { fencingIdUnique: false },
         ] as const) {
-            expect(preconditionLeaseLossResidualWrite(a47Observation(overrides)).satisfied).toBe(false);
+            expect(
+                preconditionLeaseLossResidualWrite(a47Observation(overrides))
+                    .satisfied,
+            ).toBe(false);
         }
     });
 
@@ -217,20 +262,46 @@ describe("A47 lease-loss residual-write verifier", () => {
 
     it("rejects a vacuous trace where the guarded write was not attempted", () => {
         expect(
-            preconditionLeaseLossResidualWrite(a47Observation({ guardedWriteAttempted: false }))
-                .satisfied,
+            preconditionLeaseLossResidualWrite(
+                a47Observation({ guardedWriteAttempted: false }),
+            ).satisfied,
         ).toBe(false);
     });
 
     it("leaves crash or incomplete no-commit traces unscored", () => {
-        const noCommitTrace = A47_CURRENT_TRACE.filter((event) => event !== "mutation-commit");
+        const noCommitTrace = A47_CURRENT_TRACE.filter(
+            (event) => event !== "mutation-commit",
+        );
         for (const overrides of [
-            { driverCompleted: false, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
-            { terminalLeaseLossEvents: 0, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
-            { taskReportedLeaseLoss: false, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
-            { childReleased: false, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
+            {
+                driverCompleted: false,
+                postCommitMemoryStatus: "active",
+                postCommitMutationCount: 0,
+                trace: noCommitTrace,
+            },
+            {
+                terminalLeaseLossEvents: 0,
+                postCommitMemoryStatus: "active",
+                postCommitMutationCount: 0,
+                trace: noCommitTrace,
+            },
+            {
+                taskReportedLeaseLoss: false,
+                postCommitMemoryStatus: "active",
+                postCommitMutationCount: 0,
+                trace: noCommitTrace,
+            },
+            {
+                childReleased: false,
+                postCommitMemoryStatus: "active",
+                postCommitMutationCount: 0,
+                trace: noCommitTrace,
+            },
         ] as const) {
-            expect(preconditionLeaseLossResidualWrite(a47Observation(overrides)).satisfied).toBe(false);
+            expect(
+                preconditionLeaseLossResidualWrite(a47Observation(overrides))
+                    .satisfied,
+            ).toBe(false);
         }
     });
 
@@ -248,9 +319,9 @@ describe("A47 lease-loss residual-write verifier", () => {
                 postCommitMutationCount: 1,
             }),
         ]) {
-            expect(failedIds(verifyLeaseLossResidualWrite(observation))).toContain(
-                "check-a47-no-post-lease-loss-commit",
-            );
+            expect(
+                failedIds(verifyLeaseLossResidualWrite(observation)),
+            ).toContain("check-a47-no-post-lease-loss-commit");
         }
         expect(
             failedIds(
@@ -269,11 +340,17 @@ describe("A47 lease-loss residual-write verifier", () => {
         const outOfOrder = [...A47_CURRENT_TRACE];
         [outOfOrder[2], outOfOrder[3]] = [outOfOrder[3]!, outOfOrder[2]!];
         expect(
-            failedIds(verifyLeaseLossResidualWrite(a47Observation({ trace: outOfOrder }))),
+            failedIds(
+                verifyLeaseLossResidualWrite(
+                    a47Observation({ trace: outOfOrder }),
+                ),
+            ),
         ).toContain("check-a47-durable-happens-before");
         expect(
             failedIds(
-                verifyLeaseLossResidualWrite(a47Observation({ terminalLeaseLossEvents: 2 })),
+                verifyLeaseLossResidualWrite(
+                    a47Observation({ terminalLeaseLossEvents: 2 }),
+                ),
             ),
         ).toContain("check-a47-single-terminal-lease-event");
     });
@@ -290,11 +367,16 @@ describe("A47 lease-loss residual-write verifier", () => {
 
 describe("U5 catalog bindings", () => {
     const catalog = parseIncidentCatalog(
-        JSON.parse(readFileSync(join(E2E_ROOT, "incidents", "catalog.json"), "utf8")),
+        JSON.parse(
+            readFileSync(join(E2E_ROOT, "incidents", "catalog.json"), "utf8"),
+        ),
     );
 
     it("keeps builtin registry consistent with live U5 revisions", () => {
-        validateRegistryCatalogCorrespondence(builtinIncidentCaseRegistry(), catalog);
+        validateRegistryCatalogCorrespondence(
+            builtinIncidentCaseRegistry(),
+            catalog,
+        );
     });
 
     it("emits exactly the committed U5 normative check ids", () => {
@@ -313,7 +395,9 @@ describe("U5 catalog bindings", () => {
             for (const variant of family.variants) {
                 const checks = emitted.get(variant.id);
                 if (!checks) continue;
-                expect(checks.map((entry) => entry.id)).toEqual(variant.normative_checks);
+                expect(checks.map((entry) => entry.id)).toEqual(
+                    variant.normative_checks,
+                );
                 matched += 1;
             }
         }
@@ -323,7 +407,8 @@ describe("U5 catalog bindings", () => {
 
 const caseRoots: string[] = [];
 afterAll(() => {
-    for (const root of caseRoots) rmSync(root, { recursive: true, force: true });
+    for (const root of caseRoots)
+        rmSync(root, { recursive: true, force: true });
 });
 
 function integrationContext(slug: string): CaseDriverContext {
@@ -344,7 +429,9 @@ describe("U5 driver integration", () => {
         const observation = normalizeHistorianFailureDump(
             await driveHistorianFailureDump(context),
         );
-        expect(preconditionHistorianFailureDump(observation).satisfied).toBe(true);
+        expect(preconditionHistorianFailureDump(observation).satisfied).toBe(
+            true,
+        );
         expect(failedIds(verifyHistorianFailureDump(observation))).toEqual([]);
         rmSync(context.workspaceRoot, { recursive: true, force: true });
         expect(existsSync(context.workspaceRoot)).toBe(false);
@@ -355,7 +442,9 @@ describe("U5 driver integration", () => {
         const observation = normalizeLeaseLossResidualWrite(
             await driveLeaseLossResidualWrite(context),
         );
-        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(true);
+        expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(
+            true,
+        );
         expect(observation.trace).toEqual(A47_CURRENT_TRACE);
         expect(failedIds(verifyLeaseLossResidualWrite(observation))).toEqual([
             "check-a47-no-post-lease-loss-commit",

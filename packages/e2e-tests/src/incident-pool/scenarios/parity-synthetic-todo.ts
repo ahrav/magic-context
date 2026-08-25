@@ -183,9 +183,7 @@ export function findTodoToolName(body: RequestBody): string | null {
 
 function contentBlocks(content: unknown): unknown[] {
     if (Array.isArray(content)) return content;
-    return typeof content === "string"
-        ? [{ type: "text", text: content }]
-        : [];
+    return typeof content === "string" ? [{ type: "text", text: content }] : [];
 }
 
 function findToolUseId(
@@ -214,15 +212,15 @@ function findToolUseId(
     return null;
 }
 
-function findToolResultBlock(message: WireMessage, callId: string): unknown | null {
+function findToolResultBlock(
+    message: WireMessage,
+    callId: string,
+): unknown | null {
     if (message.role !== "user") return null;
     for (const block of contentBlocks(message.content)) {
         if (!block || typeof block !== "object") continue;
         const value = block as { type?: unknown; tool_use_id?: unknown };
-        if (
-            value.type === "tool_result" &&
-            value.tool_use_id === callId
-        ) {
+        if (value.type === "tool_result" && value.tool_use_id === callId) {
             return block;
         }
     }
@@ -309,7 +307,9 @@ export async function captureTodoState(
     adapter.mock.reset();
     const probe = emitTodoOnce(adapter, todos);
     adapter.mock.setDefault({ text: "after todo", usage: LOW_USAGE });
-    await adapter.sendPrompt(`${label}: ${todos.map((todo) => todo.content).join(", ")}`);
+    await adapter.sendPrompt(
+        `${label}: ${todos.map((todo) => todo.content).join(", ")}`,
+    );
     return probe;
 }
 
@@ -401,7 +401,9 @@ function exactBooleanObservation<T>(
     }
     for (const field of fields) {
         if (typeof record[field] !== "boolean") {
-            throw new Error(`${kind} observation field ${field} must be boolean`);
+            throw new Error(
+                `${kind} observation field ${field} must be boolean`,
+            );
         }
     }
     return raw as T;
@@ -552,8 +554,7 @@ function verifyDependentTodo(
     return [
         check(
             checkId,
-            value.providerTransitionCorrect &&
-                value.durableTransitionCorrect,
+            value.providerTransitionCorrect && value.durableTransitionCorrect,
         ),
     ];
 }
@@ -599,10 +600,7 @@ export function verifyTodoDeferReplay(
 export function verifyTodoNewerDeferral(
     observation: NormalizedObservation,
 ): VerifierCheck[] {
-    return verifyDependentTodo(
-        observation,
-        "check-todo3-newer-todo-deferred",
-    );
+    return verifyDependentTodo(observation, "check-todo3-newer-todo-deferred");
 }
 
 export function verifyTodoLegacyAnchorHeal(
@@ -635,25 +633,38 @@ function opencodeAdapter(h: TestHarness, sessionId: string): TodoScriptAdapter {
                 .requests()
                 .filter((request) => isMagicContextRequest(request.body)),
         waitForPressure: () =>
-            h.waitFor(
-                () => {
-                    const row = h
-                        .contextDb()
-                        .prepare(
-                            "SELECT last_context_percentage FROM session_meta WHERE session_id = ?",
-                        )
-                        .get(sessionId) as { last_context_percentage: number } | null;
-                    return (
-                        (row?.last_context_percentage ?? 0) >=
-                        TODO_PRESSURE_PERCENTAGE
-                    );
-                },
-                { timeoutMs: 60_000, label: "todo real-byte pressure recorded" },
-            ).then(() => true, () => false),
+            h
+                .waitFor(
+                    () => {
+                        const row = h
+                            .contextDb()
+                            .prepare(
+                                "SELECT last_context_percentage FROM session_meta WHERE session_id = ?",
+                            )
+                            .get(sessionId) as {
+                            last_context_percentage: number;
+                        } | null;
+                        return (
+                            (row?.last_context_percentage ?? 0) >=
+                            TODO_PRESSURE_PERCENTAGE
+                        );
+                    },
+                    {
+                        timeoutMs: 60_000,
+                        label: "todo real-byte pressure recorded",
+                    },
+                )
+                .then(
+                    () => true,
+                    () => false,
+                ),
     };
 }
 
-function readOpenCodeTodoMeta(h: TestHarness, sessionId: string): TodoMeta | null {
+function readOpenCodeTodoMeta(
+    h: TestHarness,
+    sessionId: string,
+): TodoMeta | null {
     return h
         .contextDb()
         .prepare(
@@ -750,7 +761,10 @@ export async function runOpenCodeTodoScenario(
 
     if (scenario === "subagent-gate") {
         const parentId = await h.createSession();
-        const childId = await h.createChildSession(parentId, "todo-synthesis-child");
+        const childId = await h.createChildSession(
+            parentId,
+            "todo-synthesis-child",
+        );
         await h.waitFor(() => h.isSubagent(childId), {
             timeoutMs: 60_000,
             label: "child is_subagent=true",
@@ -765,7 +779,9 @@ export async function runOpenCodeTodoScenario(
             probe.executed ? null : "todowrite-executed",
             meta?.is_subagent === 1 ? null : "subagent-flag",
             (meta?.last_todo_state ?? "") === "" ? null : "subagent-last-state",
-            (meta?.todo_synthetic_call_id ?? "") === "" ? null : "subagent-call-id",
+            (meta?.todo_synthetic_call_id ?? "") === ""
+                ? null
+                : "subagent-call-id",
             (meta?.todo_synthetic_anchor_message_id ?? "") === ""
                 ? null
                 : "subagent-anchor",
@@ -824,7 +840,8 @@ export async function runOpenCodeTodoScenario(
             metaT0?.todo_synthetic_anchor_message_id
                 ? null
                 : "replay-anchor",
-            metaT1?.todo_synthetic_state_json === metaT0?.todo_synthetic_state_json
+            metaT1?.todo_synthetic_state_json ===
+            metaT0?.todo_synthetic_state_json
                 ? null
                 : "replay-state-json",
         ].filter((id): id is string => id !== null);
@@ -859,7 +876,8 @@ export async function runOpenCodeTodoScenario(
             meta?.todo_synthetic_call_id === prepared.callId
                 ? null
                 : "frozen-call-id",
-            meta?.todo_synthetic_state_json === normalizedTodoJson(STATE_X_TODOS)
+            meta?.todo_synthetic_state_json ===
+            normalizedTodoJson(STATE_X_TODOS)
                 ? null
                 : "frozen-state",
             meta?.last_todo_state === normalizedTodoJson(STATE_Y_TODOS)
@@ -896,7 +914,8 @@ export async function runOpenCodeTodoScenario(
             before?.todo_synthetic_state_json === "" ? null : "legacy-seed",
             pressureUsedRealBytes ? null : "real-byte-pressure",
             bustBytes === null ? "legacy-bust-pair" : null,
-            after?.todo_synthetic_state_json === normalizedTodoJson(STATE_X_TODOS)
+            after?.todo_synthetic_state_json ===
+            normalizedTodoJson(STATE_X_TODOS)
                 ? null
                 : "legacy-state-healed",
             deferBytes === bustBytes ? null : "legacy-replay",
@@ -911,11 +930,17 @@ export async function runOpenCodeTodoScenario(
         normalizedTodoJson(TERMINAL_TODOS),
     );
     const pressureUsedRealBytes = await primeNextTurnAsCacheBust(adapter);
-    const body = await sendAndCaptureMainRequest(adapter, "terminal cache-bust turn");
+    const body = await sendAndCaptureMainRequest(
+        adapter,
+        "terminal cache-bust turn",
+    );
     const meta = readOpenCodeTodoMeta(h, sessionId);
     return [
         pressureUsedRealBytes ? null : "real-byte-pressure",
-        body && findSyntheticPair(body, prepared.callId)
+        // Any synthetic pair, not just the prior call id: a terminal state must
+        // clear the anchor outright, so a REBUILT pair under a fresh call id is
+        // the same defect and must not read as a clean clear.
+        body && findSyntheticPair(body)
             ? "terminal-pair-still-present"
             : null,
         meta?.last_todo_state === normalizedTodoJson(TERMINAL_TODOS)
@@ -977,17 +1002,28 @@ function rustAdapter(h: RustTestHarness, sessionId: string): TodoScriptAdapter {
         },
         mainRequests: () => h.mainRequests(),
         waitForPressure: () =>
-            h.waitFor(
-                () => {
-                    const state = h.readModuleTodoState(sessionId);
-                    if (!state || state.contextLimitTokens <= 0) return false;
-                    return (
-                        (state.currentTotalInputTokens / state.contextLimitTokens) * 100 >=
-                        TODO_PRESSURE_PERCENTAGE
-                    );
-                },
-                { timeoutMs: 30_000, label: "Rust real-byte pressure recorded" },
-            ).then(() => true, () => false),
+            h
+                .waitFor(
+                    () => {
+                        const state = h.readModuleTodoState(sessionId);
+                        if (!state || state.contextLimitTokens <= 0)
+                            return false;
+                        return (
+                            (state.currentTotalInputTokens /
+                                state.contextLimitTokens) *
+                                100 >=
+                            TODO_PRESSURE_PERCENTAGE
+                        );
+                    },
+                    {
+                        timeoutMs: 30_000,
+                        label: "Rust real-byte pressure recorded",
+                    },
+                )
+                .then(
+                    () => true,
+                    () => false,
+                ),
     };
 }
 
@@ -1034,56 +1070,71 @@ async function createRustTodoHarness(
     );
 }
 
-async function driveRustRoot(
-    context: CaseDriverContext,
-): Promise<{
+async function driveRustRoot(context: CaseDriverContext): Promise<{
     observation: Todo1Observation;
     h: RustTestHarness;
     sessionId: string;
     callId: string;
 }> {
     const h = await createRustTodoHarness(context);
-    const sessionId = await h.createSession();
-    const adapter = rustAdapter(h, sessionId);
-    const initialModuleState = h.readModuleTodoState(sessionId);
-    const stateJson = normalizedTodoJson(STATE_X_TODOS);
-    const callId = computeSyntheticCallId(stateJson);
-    const probe = await captureTodoState(adapter, STATE_X_TODOS);
-    const moduleTodoStateCaptured = await h.waitFor(
-        () => h.readModuleTodoState(sessionId)?.lastTodoState === stateJson,
-        {
-            timeoutMs: 30_000,
-            label: "Rust module-owned todo state captured",
-        },
-    ).then(() => true, () => false);
-    const pressureUsedRealBytes = await primeNextTurnAsCacheBust(adapter);
-    const body = await sendAndCaptureMainRequest(adapter, "cache-bust turn");
-    const pair = body ? findSyntheticPair(body, callId) : null;
-    return {
-        h,
-        sessionId,
-        callId,
-        observation: {
-            kind: "rust-todo-1-synthetic-injection",
-            promptMatched: true,
-            toolRegistryMatched: probe.toolName === "todowrite",
-            environmentMatched: pathInside(
-                context.workspaceRoot,
-                h.env.dataDir,
-            ),
-            clonedStateMatched: initialModuleState === null,
-            modeMatched: true,
-            harnessMatched: true,
-            prerequisitesMet: true,
-            todoWriteExecuted: probe.executed,
-            schemaAccepted: probe.executed,
-            pressureUsedRealBytes,
-            providerRequestCaptured: body !== null,
-            moduleTodoStateCaptured,
-            providerSyntheticPairPresent: pair !== null,
-            deterministicCallIdMatched: pair?.callId === callId,
-        },
-    };
+    try {
+        const sessionId = await h.createSession();
+        const adapter = rustAdapter(h, sessionId);
+        const initialModuleState = h.readModuleTodoState(sessionId);
+        const stateJson = normalizedTodoJson(STATE_X_TODOS);
+        const callId = computeSyntheticCallId(stateJson);
+        const probe = await captureTodoState(adapter, STATE_X_TODOS);
+        const moduleTodoStateCaptured = await h
+            .waitFor(
+                () =>
+                    h.readModuleTodoState(sessionId)?.lastTodoState ===
+                    stateJson,
+                {
+                    timeoutMs: 30_000,
+                    label: "Rust module-owned todo state captured",
+                },
+            )
+            .then(
+                () => true,
+                () => false,
+            );
+        const pressureUsedRealBytes = await primeNextTurnAsCacheBust(adapter);
+        const body = await sendAndCaptureMainRequest(
+            adapter,
+            "cache-bust turn",
+        );
+        const pair = body ? findSyntheticPair(body, callId) : null;
+        return {
+            h,
+            sessionId,
+            callId,
+            observation: {
+                kind: "rust-todo-1-synthetic-injection",
+                promptMatched: true,
+                toolRegistryMatched: probe.toolName === "todowrite",
+                environmentMatched: pathInside(
+                    context.workspaceRoot,
+                    h.env.dataDir,
+                ),
+                clonedStateMatched: initialModuleState === null,
+                modeMatched: true,
+                harnessMatched: true,
+                prerequisitesMet: true,
+                todoWriteExecuted: probe.executed,
+                schemaAccepted: probe.executed,
+                pressureUsedRealBytes,
+                providerRequestCaptured: body !== null,
+                moduleTodoStateCaptured,
+                providerSyntheticPairPresent: pair !== null,
+                deterministicCallIdMatched: pair?.callId === callId,
+            },
+        };
+    } catch (error) {
+        // Callers own disposal only once this returns a harness; a setup
+        // failure here would otherwise leak the Rust host for the whole run.
+        await h.dispose();
+        throw error;
+    }
 }
 
 export async function driveTodoSyntheticInjection(
@@ -1094,6 +1145,33 @@ export async function driveTodoSyntheticInjection(
         return root.observation;
     } finally {
         await root.h.dispose();
+    }
+}
+
+/**
+ * Drop the frozen synthetic pair from module-owned state while keeping
+ * `last_todo_state`, which is exactly the legacy shape: a session that
+ * captured `last_todo_state` before anchors existed. The module rebuilds the
+ * pair from that state on the next bust pass
+ * (`advance_injection_from_meta`).
+ */
+function seedRustLegacyAnchor(h: RustTestHarness, sessionId: string): boolean {
+    const path = join(h.env.dataDir, "cortexkit", "magic-context", "store.db");
+    const db = openTestDb(path, { readwrite: true });
+    try {
+        const row = db
+            .prepare("SELECT meta FROM mc_cache_state WHERE session_id = ?")
+            .get(sessionId) as { meta: string } | null;
+        if (!row) return false;
+        const meta = JSON.parse(row.meta) as Record<string, unknown>;
+        if (typeof meta.last_todo_state !== "string") return false;
+        delete meta.synthetic_todo;
+        db.prepare(
+            "UPDATE mc_cache_state SET meta = ? WHERE session_id = ?",
+        ).run(JSON.stringify(meta), sessionId);
+        return true;
+    } finally {
+        db.close();
     }
 }
 
@@ -1125,17 +1203,22 @@ async function driveDependent(
         if (!base.rootSyntheticPairPresent) return base;
         const adapter = rustAdapter(root.h, root.sessionId);
         if (kind === "rust-todo-2-defer-replay") {
-            const t0 = await sendAndCaptureMainRequest(adapter, "defer replay t0");
+            const t0 = await sendAndCaptureMainRequest(
+                adapter,
+                "defer replay t0",
+            );
             const state0 = root.h.readModuleTodoState(root.sessionId);
-            const t1 = await sendAndCaptureMainRequest(adapter, "defer replay t1");
+            const t1 = await sendAndCaptureMainRequest(
+                adapter,
+                "defer replay t1",
+            );
             const state1 = root.h.readModuleTodoState(root.sessionId);
             const bytes0 = t0 ? syntheticPairBytes(t0, root.callId) : null;
             const bytes1 = t1 ? syntheticPairBytes(t1, root.callId) : null;
             return {
                 ...base,
                 ownActionExecuted: true,
-                providerTransitionCorrect:
-                    bytes0 !== null && bytes1 === bytes0,
+                providerTransitionCorrect: bytes0 !== null && bytes1 === bytes0,
                 durableTransitionCorrect:
                     state0?.syntheticCallId === root.callId &&
                     state1?.syntheticCallId === state0.syntheticCallId &&
@@ -1157,12 +1240,20 @@ async function driveDependent(
                 "write changed todos",
             );
             const newerState = normalizedTodoJson(STATE_Y_TODOS);
-            const newerCaptured = await root.h.waitFor(
-                () =>
-                    root.h.readModuleTodoState(root.sessionId)?.lastTodoState ===
-                    newerState,
-                { timeoutMs: 30_000, label: "newer Rust todo state captured" },
-            ).then(() => true, () => false);
+            const newerCaptured = await root.h
+                .waitFor(
+                    () =>
+                        root.h.readModuleTodoState(root.sessionId)
+                            ?.lastTodoState === newerState,
+                    {
+                        timeoutMs: 30_000,
+                        label: "newer Rust todo state captured",
+                    },
+                )
+                .then(
+                    () => true,
+                    () => false,
+                );
             const defer = await sendAndCaptureMainRequest(
                 adapter,
                 "defer after changed todos",
@@ -1182,19 +1273,62 @@ async function driveDependent(
                     state.syntheticCallId === root.callId,
             };
         }
-        if (kind === "rust-todo-4-legacy-anchor-heal") return base;
+        if (kind === "rust-todo-4-legacy-anchor-heal") {
+            const legacySeeded = seedRustLegacyAnchor(root.h, root.sessionId);
+            const before = root.h.readModuleTodoState(root.sessionId);
+            const pressureUsedRealBytes =
+                await primeNextTurnAsCacheBust(adapter);
+            const bust = await sendAndCaptureMainRequest(
+                adapter,
+                "legacy self-heal cache bust",
+            );
+            const bustBytes = bust
+                ? syntheticPairBytes(bust, root.callId)
+                : null;
+            const after = root.h.readModuleTodoState(root.sessionId);
+            const defer = await sendAndCaptureMainRequest(
+                adapter,
+                "legacy self-heal defer",
+            );
+            const deferBytes = defer
+                ? syntheticPairBytes(defer, root.callId)
+                : null;
+            return {
+                ...base,
+                ownActionExecuted:
+                    legacySeeded &&
+                    before?.syntheticCallId === null &&
+                    pressureUsedRealBytes,
+                // The rebuilt pair must carry the deterministic call id for the
+                // retained state, and the following defer pass must replay it
+                // byte-for-byte rather than rebuild it again.
+                providerTransitionCorrect:
+                    bustBytes !== null && deferBytes === bustBytes,
+                durableTransitionCorrect:
+                    after?.syntheticCallId === root.callId &&
+                    after?.lastTodoState === normalizedTodoJson(STATE_X_TODOS),
+            };
+        }
         const terminalProbe = await captureTodoState(
             adapter,
             TERMINAL_TODOS,
             "write terminal todos",
         );
         const terminalState = normalizedTodoJson(TERMINAL_TODOS);
-        const terminalCaptured = await root.h.waitFor(
-            () =>
-                root.h.readModuleTodoState(root.sessionId)?.lastTodoState ===
-                terminalState,
-            { timeoutMs: 30_000, label: "terminal Rust todo state captured" },
-        ).then(() => true, () => false);
+        const terminalCaptured = await root.h
+            .waitFor(
+                () =>
+                    root.h.readModuleTodoState(root.sessionId)
+                        ?.lastTodoState === terminalState,
+                {
+                    timeoutMs: 30_000,
+                    label: "terminal Rust todo state captured",
+                },
+            )
+            .then(
+                () => true,
+                () => false,
+            );
         await primeNextTurnAsCacheBust(adapter);
         const body = await sendAndCaptureMainRequest(
             adapter,
@@ -1204,8 +1338,10 @@ async function driveDependent(
         return {
             ...base,
             ownActionExecuted: terminalProbe.executed,
+            // Any pair, not just the prior call id: a rebuilt pair under a
+            // fresh call id is the same failure to clear the anchor.
             providerTransitionCorrect:
-                body !== null && findSyntheticPair(body, root.callId) === null,
+                body !== null && findSyntheticPair(body) === null,
             durableTransitionCorrect:
                 terminalCaptured &&
                 state?.lastTodoState === terminalState &&
@@ -1266,6 +1402,10 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizeTodoSyntheticInjection,
             precondition: preconditionTodoSyntheticInjection,
             verifier: verifyTodoSyntheticInjection,
+            binding: {
+                driver: driveTodoSyntheticInjection,
+                verifier: verifyTodoSyntheticInjection,
+            },
             prerequisite: rustPrerequisite,
         },
         {
@@ -1281,6 +1421,10 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizeTodoDeferReplay,
             precondition: preconditionTodoDeferReplay,
             verifier: verifyTodoDeferReplay,
+            binding: {
+                driver: driveTodoDeferReplay,
+                verifier: verifyTodoDeferReplay,
+            },
         },
         {
             variantId: "var-todo-3-newer-todo-deferral",
@@ -1295,6 +1439,10 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizeTodoNewerDeferral,
             precondition: preconditionTodoNewerDeferral,
             verifier: verifyTodoNewerDeferral,
+            binding: {
+                driver: driveTodoNewerDeferral,
+                verifier: verifyTodoNewerDeferral,
+            },
         },
         {
             variantId: "var-todo-4-legacy-anchor-heal",
@@ -1309,6 +1457,10 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizeTodoLegacyAnchorHeal,
             precondition: preconditionTodoLegacyAnchorHeal,
             verifier: verifyTodoLegacyAnchorHeal,
+            binding: {
+                driver: driveTodoLegacyAnchorHeal,
+                verifier: verifyTodoLegacyAnchorHeal,
+            },
         },
         {
             variantId: "var-todo-5-terminal-clear",
@@ -1323,6 +1475,10 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizeTodoTerminalClear,
             precondition: preconditionTodoTerminalClear,
             verifier: verifyTodoTerminalClear,
+            binding: {
+                driver: driveTodoTerminalClear,
+                verifier: verifyTodoTerminalClear,
+            },
         },
     ];
 }

@@ -105,7 +105,9 @@ function anchor(
 
 describe("Pi synthetic todo incident family", () => {
     it("preserves capture and default-priority assertions", () => {
-        expect(preconditionPiTodoCapture(capture())).toEqual({ satisfied: true });
+        expect(preconditionPiTodoCapture(capture())).toEqual({
+            satisfied: true,
+        });
         expect(failedIds(verifyPiTodoCapture(capture()))).toEqual([]);
         expect(
             failedIds(
@@ -160,16 +162,12 @@ describe("Pi synthetic todo incident family", () => {
         ).toEqual(["check-pi-todo-byte-identical-replay"]);
         expect(
             failedIds(
-                verifyPiTodoDeferReplay(
-                    replay({ newerTodoDeferred: false }),
-                ),
+                verifyPiTodoDeferReplay(replay({ newerTodoDeferred: false })),
             ),
         ).toEqual(["check-pi-todo-newer-state-deferred"]);
         expect(
             failedIds(
-                verifyPiTodoDeferReplay(
-                    replay({ legacyAnchorExisted: false }),
-                ),
+                verifyPiTodoDeferReplay(replay({ legacyAnchorExisted: false })),
             ),
         ).toEqual(["check-pi-todo-legacy-anchor-self-heal"]);
     });

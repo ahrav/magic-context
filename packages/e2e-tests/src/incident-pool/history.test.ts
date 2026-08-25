@@ -308,7 +308,11 @@ describe("adjudication ledger replay", () => {
     });
 
     it("rejects correction, resolution, or retirement superseding a baseline", () => {
-        for (const kind of ["correction", "resolution", "retirement"] as const) {
+        for (const kind of [
+            "correction",
+            "resolution",
+            "retirement",
+        ] as const) {
             const data = fixture();
             data.events.push(
                 event({
@@ -439,6 +443,18 @@ describe("incident history cross-checks", () => {
         );
     });
 
+    it("rejects a variant claim that is not linked to its own family", () => {
+        const data = fixture();
+        // claim-red-one still exists, but no longer belongs to the family that
+        // encloses the variant claiming it.
+        (
+            data.catalog.families as Record<string, unknown>[]
+        )[0]!.source_claims = ["claim-green-one"];
+        expect(() => validateIncidentHistory(snapshot(data))).toThrow(
+            /variant var-red-one claims claim-red-one, which is not linked to its family fam-demo/,
+        );
+    });
+
     it("rejects a claim link to an unknown family", () => {
         const data = fixture();
         claims(data)[0]!.family_links = ["fam-ghost"];
@@ -560,7 +576,8 @@ describe("repository-baseline comparison", () => {
             id: "claim-new-one",
             content_digest: HEX("9"),
             disposition: "informational",
-            rationale: "new appended provenance was inserted in the wrong position",
+            rationale:
+                "new appended provenance was inserted in the wrong position",
             family_links: ["fam-demo"],
         });
         expect(() =>
@@ -687,12 +704,7 @@ describe("repository-baseline comparison", () => {
         const redacted = fixture();
         redacted.events[1] = after;
         redacted.redactions.push(
-            redactionFor(
-                "adjudication_event",
-                before.event_id,
-                before,
-                after,
-            ),
+            redactionFor("adjudication_event", before.event_id, before, after),
         );
         expect(() =>
             compareWithAcceptedSnapshot(accepted, snapshot(redacted)),

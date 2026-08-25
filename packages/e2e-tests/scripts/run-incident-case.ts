@@ -101,6 +101,18 @@ async function main(): Promise<void> {
 
     if (precondition.satisfied) {
         const checks = registered.verifier(observation);
+        // A verifier that omits a declared check (or emits nothing) must never
+        // read as green: absence of failures is only meaningful when every
+        // normative check was actually judged. Throwing loses the envelope,
+        // which the parent classifies as a crash.
+        const emitted = new Set(checks.map((entry) => entry.id));
+        for (const required of variant.normative_checks) {
+            if (!emitted.has(required)) {
+                throw new Error(
+                    `verifier for ${variantId} omitted declared normative check ${required}`,
+                );
+            }
+        }
         const failed = checks
             .filter((check) => !check.passed)
             .map((check) => check.id);

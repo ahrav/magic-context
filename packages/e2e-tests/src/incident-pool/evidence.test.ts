@@ -386,11 +386,12 @@ describe("ownership matrix (U3 approach 4)", () => {
                 catalog,
                 "var-parity-a1-pure-defer-stability",
             );
-            variant.verifier_binding!.driver =
-                `${relative}#driveFirstRenderPureDeferStability`;
+            variant.verifier_binding!.driver = `${relative}#driveFirstRenderPureDeferStability`;
             expect(() =>
                 verifyOwnershipMatrix(committedInventory(), catalog),
-            ).toThrow(/does not export function driveFirstRenderPureDeferStability/);
+            ).toThrow(
+                /does not export function driveFirstRenderPureDeferStability/,
+            );
         } finally {
             rmSync(absolute, { force: true });
         }

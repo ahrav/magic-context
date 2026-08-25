@@ -13,7 +13,7 @@
     "test:e2e-pi": "bun run --cwd packages/e2e-tests test:pi-e2e",
     "test:rust-e2e": "bun run --cwd packages/e2e-tests test:rust-e2e",
     "test:incident-unit": "bun run --cwd packages/e2e-tests test:incident-unit",
-    "test:incidents": "bun run --cwd packages/e2e-tests test:incidents --mode ts",
+    "test:incidents": "bun run --cwd packages/e2e-tests test:incidents",
     "test:incidents:rust": "bun run --cwd packages/e2e-tests test:incidents:rust",
     "validate:incident-history:ci": "bun run --cwd packages/e2e-tests validate:incident-history:ci",
     "validate:incident-verifiers": "bun run --cwd packages/e2e-tests validate:incident-verifiers",

@@ -121,7 +121,11 @@ function stringField(
 }
 
 function trustedSha(value: unknown, label: string): string {
-    if (typeof value !== "string" || !SHA_RE.test(value) || value === ZERO_SHA) {
+    if (
+        typeof value !== "string" ||
+        !SHA_RE.test(value) ||
+        value === ZERO_SHA
+    ) {
         throw new Error(`${label} must be a non-zero 40-character commit SHA`);
     }
     return value;
@@ -203,11 +207,15 @@ export function deriveTrustedAcceptedCommit(input: TrustedBaseInput): string {
             "push event.repository",
         );
         if (eventRef !== `refs/heads/${defaultBranch}`) {
-            throw new Error("push event is not for the protected default branch");
+            throw new Error(
+                "push event is not for the protected default branch",
+            );
         }
         const after = trustedSha(event.after, "push event.after");
         if (after !== head) {
-            throw new Error("push event.after does not match the checked-out commit");
+            throw new Error(
+                "push event.after does not match the checked-out commit",
+            );
         }
         accepted = trustedSha(event.before, "push event.before");
     } else {
@@ -333,7 +341,9 @@ export function validateAgainstTrustedCiBase(
     try {
         event = JSON.parse(readFileSync(eventPath, "utf8")) as unknown;
     } catch (error) {
-        throw new Error(`could not read trusted GitHub event payload: ${String(error)}`);
+        throw new Error(
+            `could not read trusted GitHub event payload: ${String(error)}`,
+        );
     }
     const acceptedCommit = deriveTrustedAcceptedCommit({
         eventName,
@@ -365,7 +375,9 @@ interface CiCliArgs {
 
 export type IncidentHistoryCliArgs = LocalCliArgs | CiCliArgs;
 
-export function parseIncidentHistoryArgs(args: string[]): IncidentHistoryCliArgs {
+export function parseIncidentHistoryArgs(
+    args: string[],
+): IncidentHistoryCliArgs {
     if (args.includes("--ci")) {
         if (args.length !== 1 || args[0] !== "--ci") {
             throw new Error(

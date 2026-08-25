@@ -25,6 +25,7 @@ import {
     publishIncidentReport,
     publishScheduledIncidentReport,
     scheduledIncidentExitCode,
+    scoredBaselineMismatches,
     unexpectedIncompleteResults,
     type IncidentMode,
     type IncidentPoolReport,
@@ -192,6 +193,12 @@ async function runHarness(
         console.error(
             `[incident-pool:${harness}] unexpected incomplete result ${incomplete.variant_id}: ` +
                 `${incomplete.run_health} (${incomplete.reason_code ?? "no reason"})`,
+        );
+    }
+    for (const mismatch of scoredBaselineMismatches(report)) {
+        console.error(
+            `[incident-pool:${harness}] baseline mismatch ${mismatch.variant_id}: ` +
+                `${mismatch.baseline_comparison} (failed: ${mismatch.failed_checks.join(", ") || "none"})`,
         );
     }
     return report;

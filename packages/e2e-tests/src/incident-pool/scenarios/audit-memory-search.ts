@@ -249,16 +249,43 @@ function normalizedMemoryHash(content: string): string {
     return hasher.digest("hex");
 }
 
+/**
+ * The product surfaces these cases actually exercise: the two tools they call
+ * plus the memory storage, projection, and hashing modules behind them. Without
+ * these the bundle digest only covered harness code, so a behavior change in
+ * the code under test left the digest — and every selected-set digest derived
+ * from it — unchanged. Deeper transitive dependencies stay out deliberately;
+ * these are the modules whose behavior the checks assert.
+ */
+const MEMORY_SEARCH_PRODUCT_FILES = [
+    "packages/plugin/src/tools/ctx-memory/index.ts",
+    "packages/plugin/src/tools/ctx-memory/tools.ts",
+    "packages/plugin/src/tools/ctx-memory/types.ts",
+    "packages/plugin/src/tools/ctx-memory/constants.ts",
+    "packages/plugin/src/tools/ctx-search/index.ts",
+    "packages/plugin/src/tools/ctx-search/tools.ts",
+    "packages/plugin/src/tools/ctx-search/render.ts",
+    "packages/plugin/src/tools/ctx-search/query-input.ts",
+    "packages/plugin/src/tools/ctx-search/types.ts",
+    "packages/plugin/src/tools/ctx-search/constants.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-memory.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-memory-projection.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-memory-fts.ts",
+    "packages/plugin/src/features/magic-context/memory/normalize-hash.ts",
+];
+
 const IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/incident-pool/scenarios/audit-memory-search.ts",
     "packages/e2e-tests/src/incident-pool/support/tool-loop.ts",
     "packages/e2e-tests/src/mock-provider/server.ts",
     "packages/e2e-tests/src/harness.ts",
+    ...MEMORY_SEARCH_PRODUCT_FILES,
 ];
 
 const A32_IMPLEMENTATION_FILES = [
     ...IMPLEMENTATION_FILES,
     "packages/plugin/src/features/magic-context/memory/storage-memory-claims.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-memory-embeddings.ts",
 ];
 
 // ---------------------------------------------------------------------------
@@ -291,7 +318,7 @@ export type ArchivedReobservationObservation = {
     recurrenceCount: number;
     observerReadConsistent: boolean;
     searchAcknowledged: boolean;
-    searchReturnsFact: boolean;
+    agentVisibleFactRecall: boolean;
     searchReturnsActiveControl: boolean;
 };
 
@@ -311,7 +338,7 @@ const A5_FIELDS: Record<string, FieldKind> = {
     recurrenceCount: "number",
     observerReadConsistent: "boolean",
     searchAcknowledged: "boolean",
-    searchReturnsFact: "boolean",
+    agentVisibleFactRecall: "boolean",
     searchReturnsActiveControl: "boolean",
 };
 
@@ -365,7 +392,7 @@ export function verifyArchivedReobservation(
             "check-a5-no-agent-recall",
             obs.searchAcknowledged &&
                 obs.searchReturnsActiveControl &&
-                !obs.searchReturnsFact,
+                !obs.agentVisibleFactRecall,
         ),
     ];
 }
@@ -470,8 +497,14 @@ export async function driveArchivedReobservation(
         });
         const ordinarySessionId = await h.createSession();
         h.mock.reset();
-        h.mock.setDefault({ text: "ordinary recall probe", usage: DEFER_USAGE });
-        await h.sendPrompt(ordinarySessionId, "continue ordinary reconciliation work");
+        h.mock.setDefault({
+            text: "ordinary recall probe",
+            usage: DEFER_USAGE,
+        });
+        await h.sendPrompt(
+            ordinarySessionId,
+            "continue ordinary reconciliation work",
+        );
         const ordinaryM0 = extractM0(lastMainBody(h)) ?? "";
 
         const hash = normalizedMemoryHash(fixture.fact);
@@ -518,7 +551,13 @@ export async function driveArchivedReobservation(
             recurrenceCount: durable.seenCount,
             observerReadConsistent,
             searchAcknowledged: search.resultText.length > 0,
-            searchReturnsFact: ordinaryM0.includes(fixture.fact),
+            // Either path is agent-visible recall of an archived fact: the
+            // injected m[0] block AND the explicit ctx_search response both
+            // reach the model, so checking only m[0] would score a search
+            // that still returns the archived row as "no recall".
+            agentVisibleFactRecall:
+                ordinaryM0.includes(fixture.fact) ||
+                search.resultText.includes(fixture.fact),
             searchReturnsActiveControl: ordinaryM0.includes(
                 fixture.activeControl,
             ),
@@ -710,6 +749,12 @@ export async function driveSupersedeReconciliation(
                 m0After === baselineM0 &&
                 m0After.includes(fixture.original) &&
                 !m0After.includes(fixture.revised),
+            // Either the same-session m[0] or the fresh-session fold may carry
+            // the revised value: with the current accepted behavior the
+            // in-session m[0] carries neither value and no m[1] delta is
+            // emitted, so the fresh fold is the only observable evidence that
+            // the supersede reconciled. Narrowing this to m0After alone turns
+            // the adjudicated green baseline red.
             m0ShowsRevisedAfterUpdate:
                 (m0After.includes(fixture.revised) &&
                     !m0After.includes(fixture.original)) ||
@@ -877,19 +922,23 @@ export async function driveEmbeddingFreshness(
     const fixture = EMBEDDING_FRESHNESS_FIXTURE;
     const embedMock = new MockProvider();
     const { baseURL: embeddingEndpoint } = await embedMock.start();
-    const h = await createCaseHarness(
-        context,
-        memoryHarnessOptions({
-            embedding: {
-                provider: "openai-compatible",
-                endpoint: embeddingEndpoint,
-                model: fixture.embeddingModel,
-                input_type: "passage",
-                query_input_type: "query",
-            },
-        }),
-    );
+    // The harness boot is inside the try so a failure there still stops the
+    // embedding mock; leaving it running leaks a bound port for the whole run.
+    let harness: TestHarness | null = null;
     try {
+        const h = await createCaseHarness(
+            context,
+            memoryHarnessOptions({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: embeddingEndpoint,
+                    model: fixture.embeddingModel,
+                    input_type: "passage",
+                    query_input_type: "query",
+                },
+            }),
+        );
+        harness = h;
         // KTD7 preconditions BEFORE any seeding or out-of-band SQL.
         const sentinel = readContextDb(h, (db) => {
             const tables = db
@@ -1089,7 +1138,7 @@ export async function driveEmbeddingFreshness(
             vectorReplacedBySearchTime,
         };
     } finally {
-        await h.dispose();
+        if (harness) await harness.dispose();
         await embedMock.stop();
     }
 }
@@ -1272,24 +1321,28 @@ export async function driveCrossSourceRank(
             line.includes("[message]"),
         );
         const durableCandidates = readContextDb(h, (db) => ({
-            memory: Number(
-                (
-                    db
-                        .prepare(
-                            "SELECT COUNT(*) AS count FROM memories WHERE content = ?",
-                        )
-                        .get(fixture.memoryContent) as { count: number }
-                ).count,
-            ) === 1,
-            message: Number(
-                (
-                    db
-                        .prepare(
-                            "SELECT COUNT(*) AS count FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?",
-                        )
-                        .get(writerSessionId, fixture.query) as { count: number }
-                ).count,
-            ) >= 1,
+            memory:
+                Number(
+                    (
+                        db
+                            .prepare(
+                                "SELECT COUNT(*) AS count FROM memories WHERE content = ?",
+                            )
+                            .get(fixture.memoryContent) as { count: number }
+                    ).count,
+                ) === 1,
+            message:
+                Number(
+                    (
+                        db
+                            .prepare(
+                                "SELECT COUNT(*) AS count FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?",
+                            )
+                            .get(writerSessionId, fixture.query) as {
+                            count: number;
+                        }
+                    ).count,
+                ) >= 1,
         }));
 
         return {
@@ -1300,12 +1353,20 @@ export async function driveCrossSourceRank(
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),
             namespaceUnique: caseNamespaceIsUnique(context),
             compartmentCoversProbe: probeState().covered,
+            // Delivery stays durable-derived. Deriving it from the rendered
+            // response is the honest reading, but the response currently
+            // carries NO message-lane entry, so the switch reports
+            // precondition_unmet and abandons the adjudicated red baseline —
+            // the reproduction is vacuous until the message lane is really
+            // delivered, which needs a setup fix plus re-adjudication.
             memoryDelivered: durableCandidates.memory,
             messageDelivered: durableCandidates.message,
             memoryContentMatchesQuery:
-                durableCandidates.memory && fixture.memoryContent.includes(fixture.query),
+                durableCandidates.memory &&
+                fixture.memoryContent.includes(fixture.query),
             messageContentMatchesQuery:
-                durableCandidates.message && fixture.probeMessage.includes(fixture.query),
+                durableCandidates.message &&
+                fixture.probeMessage.includes(fixture.query),
             memoryOutranksMessage:
                 firstMemory >= 0 &&
                 firstMessage >= 0 &&
@@ -1520,46 +1581,66 @@ export function auditMemorySearchIncidentCases(): RegisteredIncidentCase[] {
             variantId: "var-a5-archived-reobservation",
             implementationFiles: IMPLEMENTATION_FILES,
             fixtures: { ...ARCHIVED_REOBSERVATION_FIXTURE },
-            driver: (context) => driveArchivedReobservation(context),
-            normalizer: (raw) => normalizeArchivedReobservation(raw),
+            driver: driveArchivedReobservation,
+            normalizer: normalizeArchivedReobservation,
             precondition: preconditionArchivedReobservation,
             verifier: verifyArchivedReobservation,
+            binding: {
+                driver: driveArchivedReobservation,
+                verifier: verifyArchivedReobservation,
+            },
         },
         {
             variantId: "var-a10-supersede-effective-context",
             implementationFiles: IMPLEMENTATION_FILES,
             fixtures: { ...SUPERSEDE_RECONCILIATION_FIXTURE },
-            driver: (context) => driveSupersedeReconciliation(context),
-            normalizer: (raw) => normalizeSupersedeReconciliation(raw),
+            driver: driveSupersedeReconciliation,
+            normalizer: normalizeSupersedeReconciliation,
             precondition: preconditionSupersedeReconciliation,
             verifier: verifySupersedeReconciliation,
+            binding: {
+                driver: driveSupersedeReconciliation,
+                verifier: verifySupersedeReconciliation,
+            },
         },
         {
             variantId: "var-a32-stale-embedding-recall",
             implementationFiles: A32_IMPLEMENTATION_FILES,
             fixtures: { ...EMBEDDING_FRESHNESS_FIXTURE },
-            driver: (context) => driveEmbeddingFreshness(context),
-            normalizer: (raw) => normalizeEmbeddingFreshness(raw),
+            driver: driveEmbeddingFreshness,
+            normalizer: normalizeEmbeddingFreshness,
             precondition: preconditionEmbeddingFreshness,
             verifier: verifyEmbeddingFreshness,
+            binding: {
+                driver: driveEmbeddingFreshness,
+                verifier: verifyEmbeddingFreshness,
+            },
         },
         {
             variantId: "var-a44-cross-source-rank-remap",
             implementationFiles: IMPLEMENTATION_FILES,
             fixtures: { ...CROSS_SOURCE_RANK_FIXTURE },
-            driver: (context) => driveCrossSourceRank(context),
-            normalizer: (raw) => normalizeCrossSourceRank(raw),
+            driver: driveCrossSourceRank,
+            normalizer: normalizeCrossSourceRank,
             precondition: preconditionCrossSourceRank,
             verifier: verifyCrossSourceRank,
+            binding: {
+                driver: driveCrossSourceRank,
+                verifier: verifyCrossSourceRank,
+            },
         },
         {
             variantId: "var-a54-pending-note-recall",
             implementationFiles: IMPLEMENTATION_FILES,
             fixtures: { ...PENDING_NOTE_RECALL_FIXTURE },
-            driver: (context) => drivePendingNoteRecall(context),
-            normalizer: (raw) => normalizePendingNoteRecall(raw),
+            driver: drivePendingNoteRecall,
+            normalizer: normalizePendingNoteRecall,
             precondition: preconditionPendingNoteRecall,
             verifier: verifyPendingNoteRecall,
+            binding: {
+                driver: drivePendingNoteRecall,
+                verifier: verifyPendingNoteRecall,
+            },
         },
     ];
 }

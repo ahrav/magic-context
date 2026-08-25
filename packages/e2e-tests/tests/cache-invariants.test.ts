@@ -198,10 +198,13 @@ function projectIdentity(): string {
     return resolveProjectIdentity(realpathSync(pathResolve(h.opencode.env.workdir)));
 }
 
-function writeContextDb<T>(
-    fn: (db: ReturnType<typeof openTestDb>) => T,
-): T {
-    const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
+function writeContextDb<T>(fn: (db: ReturnType<typeof openTestDb>) => T): T {
+    const dbPath = join(
+        h.opencode.env.dataDir,
+        "cortexkit",
+        "magic-context",
+        "context.db",
+    );
     const db = openTestDb(dbPath, { readwrite: true });
     try {
         return fn(db);
@@ -210,7 +213,10 @@ function writeContextDb<T>(
     }
 }
 
-function seedMemory(content: string, category: Memory["category"] = "PROJECT_RULES"): number {
+function seedMemory(
+    content: string,
+    category: Memory["category"] = "PROJECT_RULES",
+): number {
     return writeContextDb((db) => {
         const id = insertMemory(db as never, {
             projectPath: projectIdentity(),
@@ -605,10 +611,18 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // maxMemoryId advances when the new memory is seeded, but it must
                 // NOT re-materialize m[0] (not a HARD trigger); the new memory is
                 // an m[1] delta via the readNewMemoriesForM1 watermark.
-                h.mock.setDefault({ text: "B10 pressure", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B10 turn 4: high usage marks the next pass execute.");
+                h.mock.setDefault({
+                    text: "B10 pressure",
+                    usage: EXECUTE_USAGE,
+                });
+                await h.sendPrompt(
+                    sessionId,
+                    "B10 turn 4: high usage marks the next pass execute.",
+                );
                 const epochBeforeAdditive = projectEpoch();
-                seedMemory("B10 fresh rule: always run the full gate before a release.");
+                seedMemory(
+                    "B10 fresh rule: always run the full gate before a release.",
+                );
                 setProjectEpoch(epochBeforeAdditive);
                 setDefer("B10 surface");
                 await h.sendPrompt(sessionId, "B10 turn 5: execute pass surfaces the new memory.");
@@ -704,10 +718,19 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // m[0] must NOT re-materialize: the stale baseline still shows the
                 // ORIGINAL text, and m[1] carries a <memory-updates> correction.
                 // Turn 4 records high usage so turn 5 is the cache-busting pass.
-                h.mock.setDefault({ text: "B11 pressure", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B11 turn 4: high usage marks the next pass execute.");
+                h.mock.setDefault({
+                    text: "B11 pressure",
+                    usage: EXECUTE_USAGE,
+                });
+                await h.sendPrompt(
+                    sessionId,
+                    "B11 turn 4: high usage marks the next pass execute.",
+                );
                 const epochBeforeUpdate = projectEpoch();
-                queueMemoryUpdate(memId, "B11 revised rule: deploys go straight to production with a feature flag.");
+                queueMemoryUpdate(
+                    memId,
+                    "B11 revised rule: deploys go straight to production with a feature flag.",
+                );
                 // A content rewrite withdraws verification (the successor revision
                 // starts CANDIDATE); re-verify through the real API so the revised
                 // row stays render-eligible, then pin the epoch so the mutation
@@ -793,10 +816,18 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 setDefer("B12 materialize-empty");
                 await h.sendPrompt(sessionId, "B12 turn 3: execute pass materializes empty m[0].");
 
-                h.mock.setDefault({ text: "B12 pressure", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B12 turn 4: high usage marks next pass execute.");
+                h.mock.setDefault({
+                    text: "B12 pressure",
+                    usage: EXECUTE_USAGE,
+                });
+                await h.sendPrompt(
+                    sessionId,
+                    "B12 turn 4: high usage marks next pass execute.",
+                );
                 const epochBeforeSeed = projectEpoch();
-                seedMemory("B12 delta rule: keep the cache prefix byte-identical across defer passes.");
+                seedMemory(
+                    "B12 delta rule: keep the cache prefix byte-identical across defer passes.",
+                );
                 setProjectEpoch(epochBeforeSeed);
                 setDefer("B12 surface");
                 await h.sendPrompt(sessionId, "B12 turn 5: execute pass surfaces the memory into m[1].");

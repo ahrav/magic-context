@@ -84,6 +84,10 @@ export interface RegisteredIncidentCase {
     precondition(observation: NormalizedObservation): PreconditionOutcome;
     /** Pure verifier over the normalized observation. */
     verifier(observation: NormalizedObservation): VerifierCheck[];
+    /** The exact module functions this case executes, carried as references
+     *  so validation can bind them to the catalog's `file#symbol`
+     *  verifier_binding names instead of trusting registration placement. */
+    binding: { driver: unknown; verifier: unknown };
     /** Parent-side availability probe; a miss reports `unavailable`. */
     prerequisite?(): PrerequisiteOutcome;
 }
@@ -243,6 +247,27 @@ export function validateRegistryCatalogCorrespondence(
                 `registered case ${variantId} has no executable catalog variant`,
             );
         }
+        // Bind the registered functions to the catalog's named symbols: a
+        // registration that wraps or swaps in another exported function from
+        // the same module must fail here, not silently execute the wrong
+        // oracle. Function identity is compared by the runtime `name` of the
+        // carried reference, which matches the catalog symbol exactly for the
+        // module-level declarations these bindings name.
+        const binding = variant.verifier_binding;
+        if (!binding) {
+            throw new Error(
+                `registered case ${variantId} has no catalog verifier binding to satisfy`,
+            );
+        }
+        const boundDriver = bindingName(registered.binding.driver);
+        const boundVerifier = bindingName(registered.binding.verifier);
+        const catalogDriver = bindingSymbol(binding.driver);
+        const catalogVerifier = bindingSymbol(binding.verifier);
+        if (boundDriver !== catalogDriver || boundVerifier !== catalogVerifier) {
+            throw new Error(
+                `registered case ${variantId} binds ${catalogDriver}/${catalogVerifier} but carries ${boundDriver || "<anonymous>"}/${boundVerifier || "<anonymous>"}`,
+            );
+        }
         const computed = semanticFingerprint(variant, registered.fixtures);
         if (computed !== variant.semantic_revision.fingerprint) {
             throw new Error(
@@ -250,4 +275,16 @@ export function validateRegistryCatalogCorrespondence(
             );
         }
     }
+}
+
+/** Runtime name of a carried binding reference, for catalog comparison. */
+function bindingName(reference: unknown): string {
+    if (typeof reference !== "function") return "";
+    return reference.name;
+}
+
+/** The exported-symbol half of a catalog `path#symbol` binding string. */
+function bindingSymbol(binding: string): string {
+    const symbol = binding.split("#")[1] ?? "";
+    return symbol.trim();
 }

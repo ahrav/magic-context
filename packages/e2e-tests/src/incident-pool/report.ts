@@ -844,13 +844,16 @@ export function readScheduledIncidentReport(
 
 // ---------------------------------------------------------------------------
 // CLI exit policy (KTD10): evaluation incompleteness is acceptable only when
-// every incomplete result matches a reviewed blocked_by dependency.
+// every incomplete result matches a reviewed blocked_by dependency, and a
+// scored result must agree with its reviewed baseline.
 // ---------------------------------------------------------------------------
 
 export function unexpectedIncompleteResults(
     report: IncidentPoolReport,
 ): IncidentCaseResult[] {
-    const resultIds = new Set(report.results.map((result) => result.variant_id));
+    const resultIds = new Set(
+        report.results.map((result) => result.variant_id),
+    );
     return report.results.filter(
         (result) =>
             !isEvaluationComplete(result) &&
@@ -864,8 +867,31 @@ export function unexpectedIncompleteResults(
     );
 }
 
+/**
+ * Scored results that contradict their reviewed baseline: a green-lane case
+ * that failed (`regression`) or a known-red case whose failure shape no longer
+ * matches what was adjudicated (`unexpected_failure`). Known-red cases run
+ * only in the dedicated incident command, so without this the pool would
+ * report a resurfaced defect and still exit 0. `expected_green`,
+ * `expected_red`, and the reviewed `resolution_candidate` transition are not
+ * mismatches.
+ */
+export function scoredBaselineMismatches(
+    report: IncidentPoolReport,
+): IncidentCaseResult[] {
+    return report.results.filter(
+        (result) =>
+            isEvaluationComplete(result) &&
+            (result.baseline_comparison === "regression" ||
+                result.baseline_comparison === "unexpected_failure"),
+    );
+}
+
 export function incidentPoolExitCode(report: IncidentPoolReport): number {
-    return unexpectedIncompleteResults(report).length === 0 ? 0 : 1;
+    return unexpectedIncompleteResults(report).length === 0 &&
+        scoredBaselineMismatches(report).length === 0
+        ? 0
+        : 1;
 }
 
 export function scheduledIncidentExitCode(

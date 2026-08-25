@@ -288,7 +288,9 @@ export interface BuildSnapshotInput {
 export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
     const selected: SelectedCase[] = [];
     const excluded: ExcludedCase[] = [];
-    const requestedVariants = input.variantIds ? new Set(input.variantIds) : null;
+    const requestedVariants = input.variantIds
+        ? new Set(input.variantIds)
+        : null;
     for (const family of input.catalog.families) {
         for (const variant of family.variants) {
             if (!EXECUTABLE_LANES.includes(variant.lane)) {
@@ -329,14 +331,23 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
                 });
                 continue;
             }
+            const history = input.ledger.byIdentity.get(variant.id) ?? null;
+            // No later event can reverse a retirement, so a retired variant
+            // would otherwise stay scheduled and scored forever.
+            if (history?.retired) {
+                excluded.push({
+                    variantId: variant.id,
+                    reason: "variant was retired by adjudication",
+                });
+                continue;
+            }
             const digest = input.implementationDigests.get(variant.id);
             if (digest === undefined) {
                 throw new Error(
                     `selected live executable variant ${variant.id} has no registered case digest`,
                 );
             }
-            const baseline =
-                input.ledger.byIdentity.get(variant.id)?.latestBaseline ?? null;
+            const baseline = history?.latestBaseline ?? null;
             if (baseline === null) {
                 throw new Error(
                     `selected variant ${variant.id} has no reviewed baseline adjudication`,
@@ -510,7 +521,8 @@ function spawnCaseProcess(
             } catch {
                 diagnosticError = true;
                 try {
-                    if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+                    if (child.pid !== undefined)
+                        process.kill(-child.pid, "SIGKILL");
                 } catch {
                     // Child exited before the diagnostic failure could stop it.
                 }
@@ -832,11 +844,7 @@ export async function runIncidentPool(
             results.push(await runCase(selected));
         } catch {
             results.push(
-                unhealthyResult(
-                    selected,
-                    "crash",
-                    "case_execution_failed",
-                ),
+                unhealthyResult(selected, "crash", "case_execution_failed"),
             );
         }
     }

@@ -54,21 +54,32 @@ function exactRecord<T>(
     const expected = ["kind", ...Object.keys(fields)].sort((left, right) =>
         left.localeCompare(right),
     );
-    const actual = Object.keys(record).sort((left, right) => left.localeCompare(right));
+    const actual = Object.keys(record).sort((left, right) =>
+        left.localeCompare(right),
+    );
     if (
         expected.length !== actual.length ||
         expected.some((key, index) => key !== actual[index])
     ) {
-        throw new Error(`${kind} observation must contain exactly ${expected.join(", ")}`);
+        throw new Error(
+            `${kind} observation must contain exactly ${expected.join(", ")}`,
+        );
     }
     for (const [field, fieldKind] of Object.entries(fields)) {
         const value = record[field];
         if (fieldKind === "string-array") {
-            if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
-                throw new Error(`${kind} observation field ${field} must be a string array`);
+            if (
+                !Array.isArray(value) ||
+                !value.every((entry) => typeof entry === "string")
+            ) {
+                throw new Error(
+                    `${kind} observation field ${field} must be a string array`,
+                );
             }
         } else if (typeof value !== fieldKind) {
-            throw new Error(`${kind} observation field ${field} must be a ${fieldKind}`);
+            throw new Error(
+                `${kind} observation field ${field} must be a ${fieldKind}`,
+            );
         }
     }
     return raw as T;
@@ -101,16 +112,19 @@ export type HistorianFailureDumpObservation = {
     dumpRetainedAfterFailure: boolean;
     publishedReportRedacted: boolean;
     sideEffectAbsent: boolean;
-}
+};
 
 export const HISTORIAN_FAILURE_DUMP_FIXTURE = {
-    response: "invalid historian XML with three distinct synthetic canary classes",
+    response:
+        "invalid historian XML with three distinct synthetic canary classes",
     dumpBoundary: "case-owned project-local historian directory",
     retention: "failed validation dumps remain until case teardown",
     publication: "static containment facts only",
 } as const;
 
-export function normalizeHistorianFailureDump(raw: JsonValue): HistorianFailureDumpObservation {
+export function normalizeHistorianFailureDump(
+    raw: JsonValue,
+): HistorianFailureDumpObservation {
     return exactRecord<HistorianFailureDumpObservation>(
         raw,
         "a28-historian-dump-containment",
@@ -139,7 +153,10 @@ export function verifyHistorianFailureDump(
     return [
         check("check-a28-project-local-dump", value.dumpProjectLocal),
         check("check-a28-gitignore-coverage", value.dumpGitignored),
-        check("check-a28-intentional-retention", value.dumpRetainedAfterFailure),
+        check(
+            "check-a28-intentional-retention",
+            value.dumpRetainedAfterFailure,
+        ),
         check("check-a28-report-redaction", value.publishedReportRedacted),
         check("check-a28-metacharacter-safety", value.sideEffectAbsent),
     ];
@@ -148,7 +165,10 @@ export function verifyHistorianFailureDump(
 function pathInside(root: string, path: string): boolean {
     const resolvedRoot = resolve(root);
     const resolvedPath = resolve(path);
-    return resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}${sep}`);
+    return (
+        resolvedPath === resolvedRoot ||
+        resolvedPath.startsWith(`${resolvedRoot}${sep}`)
+    );
 }
 
 export async function driveHistorianFailureDump(
@@ -159,7 +179,8 @@ export async function driveHistorianFailureDump(
     mkdirSync(projectRoot, { recursive: true });
 
     const contentCanary = "A28_CONTENT_CANARY_7f6d";
-    const terminalCanary = "\u001b]8;;https://invalid.example\u0007A28_TERMINAL_CANARY\u001b]8;;\u0007";
+    const terminalCanary =
+        "\u001b]8;;https://invalid.example\u0007A28_TERMINAL_CANARY\u001b]8;;\u0007";
     const shellCanary = `$(touch ${sideEffectPath}) ; A28_SHELL_CANARY`;
     const invalidOutput = `<output><broken>${contentCanary}${terminalCanary}${shellCanary}</broken>`;
     const dumpPaths: string[] = [];
@@ -201,14 +222,25 @@ export async function driveHistorianFailureDump(
         });
 
         const dumpPath = dumpPaths[0] ?? "";
-        const dumpText = dumpPath && existsSync(dumpPath) ? readFileSync(dumpPath, "utf8") : "";
+        const dumpText =
+            dumpPath && existsSync(dumpPath)
+                ? readFileSync(dumpPath, "utf8")
+                : "";
         const gitInit = Bun.spawnSync(["git", "init", "-q", projectRoot], {
             stdout: "ignore",
             stderr: "ignore",
         });
         const ignored = dumpPath
             ? Bun.spawnSync(
-                  ["git", "-C", projectRoot, "check-ignore", "-q", "--", relative(projectRoot, dumpPath)],
+                  [
+                      "git",
+                      "-C",
+                      projectRoot,
+                      "check-ignore",
+                      "-q",
+                      "--",
+                      relative(projectRoot, dumpPath),
+                  ],
                   { stdout: "ignore", stderr: "ignore" },
               )
             : null;
@@ -220,9 +252,12 @@ export async function driveHistorianFailureDump(
             contentCanaryRetained: dumpText.includes(contentCanary),
             terminalCanaryRetained: dumpText.includes(terminalCanary),
             shellCanaryRetained: dumpText.includes(shellCanary),
-            dumpProjectLocal: dumpPath.length > 0 && pathInside(projectRoot, dumpPath),
+            dumpProjectLocal:
+                dumpPath.length > 0 && pathInside(projectRoot, dumpPath),
             dumpGitignored: gitInit.exitCode === 0 && ignored?.exitCode === 0,
-            dumpRetainedAfterFailure: dumpPaths.every((path) => existsSync(path)),
+            dumpRetainedAfterFailure: dumpPaths.every((path) =>
+                existsSync(path),
+            ),
             publishedReportRedacted: true,
             sideEffectAbsent: !existsSync(sideEffectPath),
         };
@@ -287,7 +322,7 @@ export type LeaseLossResidualWriteObservation = {
     taskReportedLeaseLoss: boolean;
     childReleased: boolean;
     trace: string[];
-}
+};
 
 export const LEASE_LOSS_RESIDUAL_WRITE_FIXTURE = {
     task: "curate agentic child with one real ctx_memory archive",
@@ -297,7 +332,9 @@ export const LEASE_LOSS_RESIDUAL_WRITE_FIXTURE = {
     terminal: "one injected delivery through the executor lease-loss handler",
 } as const;
 
-export function normalizeLeaseLossResidualWrite(raw: JsonValue): LeaseLossResidualWriteObservation {
+export function normalizeLeaseLossResidualWrite(
+    raw: JsonValue,
+): LeaseLossResidualWriteObservation {
     return exactRecord<LeaseLossResidualWriteObservation>(
         raw,
         "a47-lease-loss-residual-write",
@@ -347,8 +384,14 @@ const A47_TRACE_WITHOUT_COMMIT = A47_TRACE_WITH_COMMIT.filter(
     (event) => event !== "mutation-commit",
 );
 
-function traceEquals(actual: readonly string[], expected: readonly string[]): boolean {
-    return actual.length === expected.length && actual.every((event, index) => event === expected[index]);
+function traceEquals(
+    actual: readonly string[],
+    expected: readonly string[],
+): boolean {
+    return (
+        actual.length === expected.length &&
+        actual.every((event, index) => event === expected[index])
+    );
 }
 
 export function verifyLeaseLossResidualWrite(
@@ -376,7 +419,10 @@ export function verifyLeaseLossResidualWrite(
                 value.postCommitMutationCount === 0,
         ),
         check("check-a47-durable-happens-before", durableTrace),
-        check("check-a47-single-terminal-lease-event", value.terminalLeaseLossEvents === 1),
+        check(
+            "check-a47-single-terminal-lease-event",
+            value.terminalLeaseLossEvents === 1,
+        ),
         check("check-a47-child-released", value.childReleased),
     ];
 }
@@ -387,7 +433,10 @@ interface Barrier {
     signal(): Promise<void>;
 }
 
-async function completionSignal(promise: Promise<unknown>, value: boolean): Promise<boolean> {
+async function completionSignal(
+    promise: Promise<unknown>,
+    value: boolean,
+): Promise<boolean> {
     await promise;
     return value;
 }
@@ -411,10 +460,17 @@ function barrier(): Barrier {
     };
 }
 
-function publishedToolName(body: Record<string, unknown>, expected: string): string | null {
+function publishedToolName(
+    body: Record<string, unknown>,
+    expected: string,
+): string | null {
     if (!Array.isArray(body.tools)) return null;
     for (const tool of body.tools) {
-        if (tool && typeof tool === "object" && (tool as { name?: unknown }).name === expected) {
+        if (
+            tool &&
+            typeof tool === "object" &&
+            (tool as { name?: unknown }).name === expected
+        ) {
             return expected;
         }
     }
@@ -482,10 +538,16 @@ export async function driveLeaseLossResidualWrite(
             },
             prompt: "Store one synthetic A47 fixture.",
         });
-        const seed = readContextDb(h, (db) =>
-            db
-                .prepare("SELECT id, project_path, status FROM memories WHERE content = ?")
-                .get(seedContent) as { id: number; project_path: string; status: string } | undefined,
+        const seed = readContextDb(
+            h,
+            (db) =>
+                db
+                    .prepare(
+                        "SELECT id, project_path, status FROM memories WHERE content = ?",
+                    )
+                    .get(seedContent) as
+                    | { id: number; project_path: string; status: string }
+                    | undefined,
         );
         if (!seed) throw new Error("A47 seed memory was not persisted");
 
@@ -493,20 +555,32 @@ export async function driveLeaseLossResidualWrite(
         executorDb = new Database(dbPath);
         replacementDb = new Database(dbPath);
         leaseKey = leaseKeyFor("curate", seed.project_path);
-        const acquisition = acquireLeaseWithAcquisition(executorDb, originalHolder, leaseKey);
+        const acquisition = acquireLeaseWithAcquisition(
+            executorDb,
+            originalHolder,
+            leaseKey,
+        );
         const originalLeaseAcquired = acquisition !== null;
-        if (!acquisition) throw new Error("A47 could not acquire the original curate lease");
+        if (!acquisition)
+            throw new Error("A47 could not acquire the original curate lease");
         const originalGeneration = acquisition.generation;
-        const originalOwnershipRead = readContextDb(h, (db) =>
-            getLeaseHolder(db, leaseKey) === originalHolder &&
-            getLeaseGeneration(db, leaseKey) === originalGeneration,
+        const originalOwnershipRead = readContextDb(
+            h,
+            (db) =>
+                getLeaseHolder(db, leaseKey) === originalHolder &&
+                getLeaseGeneration(db, leaseKey) === originalGeneration,
         );
         if (originalOwnershipRead) trace.push("original-ownership");
 
         h.mock.reset();
         h.mock.addMatcher((body) => {
             if (guardedWriteAttempted) return null;
-            if (!JSON.stringify(body).includes("## Task: Curate Project Memory Pool")) return null;
+            if (
+                !JSON.stringify(body).includes(
+                    "## Task: Curate Project Memory Pool",
+                )
+            )
+                return null;
             curatePathUsed = true;
             const tool = publishedToolName(body, "ctx_memory");
             if (!tool) return null;
@@ -535,14 +609,18 @@ export async function driveLeaseLossResidualWrite(
         const runtimeClient: PluginContext["client"] = h.client as never;
         const wrappedClient = {
             session: {
-                list: (args: Parameters<typeof runtimeClient.session.list>[0]) =>
-                    runtimeClient.session.list(args),
-                create: (args: Parameters<typeof runtimeClient.session.create>[0]) =>
-                    runtimeClient.session.create(args),
-                prompt: (args: Parameters<typeof runtimeClient.session.prompt>[0]) =>
-                    runtimeClient.session.prompt(args),
-                messages: (args: Parameters<typeof runtimeClient.session.messages>[0]) =>
-                    runtimeClient.session.messages(args),
+                list: (
+                    args: Parameters<typeof runtimeClient.session.list>[0],
+                ) => runtimeClient.session.list(args),
+                create: (
+                    args: Parameters<typeof runtimeClient.session.create>[0],
+                ) => runtimeClient.session.create(args),
+                prompt: (
+                    args: Parameters<typeof runtimeClient.session.prompt>[0],
+                ) => runtimeClient.session.prompt(args),
+                messages: (
+                    args: Parameters<typeof runtimeClient.session.messages>[0],
+                ) => runtimeClient.session.messages(args),
                 delete: async (
                     args: Parameters<typeof runtimeClient.session.delete>[0],
                 ) => {
@@ -572,12 +650,14 @@ export async function driveLeaseLossResidualWrite(
                             .prepare(
                                 "SELECT id FROM memory_mutation_log WHERE project_path = ? AND target_memory_id = ? ORDER BY id",
                             )
-                            .all(seed.project_path, seed.id) as Array<{ id: number }>;
+                            .all(seed.project_path, seed.id) as Array<{
+                            id: number;
+                        }>;
                         postCommitMemoryStatus = memory?.status ?? "missing";
                         postCommitMutationCount = mutations.length;
                         mutationIdsUnique =
-                            new Set(mutations.map((mutation) => mutation.id)).size ===
-                            mutations.length;
+                            new Set(mutations.map((mutation) => mutation.id))
+                                .size === mutations.length;
                     } finally {
                         observer.close();
                     }
@@ -612,21 +692,30 @@ export async function driveLeaseLossResidualWrite(
             completionSignal(executorPromise, false),
         ]);
         if (!barrierReached) {
-            throw new Error("A47 curate task ended before the pre-write barrier");
+            throw new Error(
+                "A47 curate task ended before the pre-write barrier",
+            );
         }
         const preWriteBarrierReached = trace.at(-1) === "pre-write-barrier";
         replacementDb
             .prepare("UPDATE dream_state SET value = ? WHERE key = ?")
             .run(String(Date.now() - 1), `lease:${leaseKey}:expiry`);
-        const replacement = acquireLeaseWithAcquisition(replacementDb, replacementHolder, leaseKey);
+        const replacement = acquireLeaseWithAcquisition(
+            replacementDb,
+            replacementHolder,
+            leaseKey,
+        );
         const replacementOwnershipCommitted = replacement !== null;
         const replacementGeneration = replacement?.generation ?? -1;
-        const replacementOwnershipRead = readContextDb(h, (db) =>
-            getLeaseHolder(db, leaseKey) === replacementHolder &&
-            getLeaseGeneration(db, leaseKey) === replacementGeneration,
+        const replacementOwnershipRead = readContextDb(
+            h,
+            (db) =>
+                getLeaseHolder(db, leaseKey) === replacementHolder &&
+                getLeaseGeneration(db, leaseKey) === replacementGeneration,
         );
         const fencingIdUnique =
-            replacementGeneration > originalGeneration && replacementOwnershipRead;
+            replacementGeneration > originalGeneration &&
+            replacementOwnershipRead;
         if (replacementOwnershipCommitted && replacementOwnershipRead) {
             trace.push("replacement-ownership");
         }
@@ -652,8 +741,16 @@ export async function driveLeaseLossResidualWrite(
         };
         executorJoined = true;
         taskReportedLeaseLoss =
-            taskResult.status === "failed" && taskResult.error?.includes("lease lost") === true;
-        const providerToolResultObserved = findToolResultText(h, toolCallId) !== null;
+            taskResult.status === "failed" &&
+            taskResult.error?.includes("lease lost") === true;
+        const archiveResultText = findToolResultText(h, toolCallId);
+        // A tool_result block alone proves nothing: the lease fence rejects the
+        // racing write with an `Error: ...` payload, and treating that as an
+        // observed archive would let the reproduction score without ever
+        // attempting the residual write it is about.
+        const providerToolResultObserved =
+            archiveResultText !== null &&
+            archiveResultText.startsWith("Archived ");
         return {
             kind: "a47-lease-loss-residual-write",
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),
@@ -681,7 +778,12 @@ export async function driveLeaseLossResidualWrite(
         };
     } finally {
         promptBarrier.release();
-        if (executorPromise && !executorJoined) await executorPromise;
+        if (executorPromise && !executorJoined) {
+            // Contain a rejected join: awaiting it bare here would skip the
+            // handle and harness cleanup below and replace the original
+            // failure with the rejection.
+            await executorPromise.catch(() => undefined);
+        }
         replacementDb?.close();
         executorDb?.close();
         await h.dispose();
@@ -713,6 +815,10 @@ export function auditBackgroundLifecycleIncidentCases(): RegisteredIncidentCase[
             normalizer: normalizeHistorianFailureDump,
             precondition: preconditionHistorianFailureDump,
             verifier: verifyHistorianFailureDump,
+            binding: {
+                driver: driveHistorianFailureDump,
+                verifier: verifyHistorianFailureDump,
+            },
         },
         {
             variantId: "var-a47-lease-loss-residual-write",
@@ -722,6 +828,10 @@ export function auditBackgroundLifecycleIncidentCases(): RegisteredIncidentCase[
             normalizer: normalizeLeaseLossResidualWrite,
             precondition: preconditionLeaseLossResidualWrite,
             verifier: verifyLeaseLossResidualWrite,
+            binding: {
+                driver: driveLeaseLossResidualWrite,
+                verifier: verifyLeaseLossResidualWrite,
+            },
         },
     ];
 }

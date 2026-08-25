@@ -614,8 +614,9 @@ function checkBindingLiveness(
         ts.canHaveModifiers(node) &&
         ts
             .getModifiers(node)
-            ?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) ===
-            true;
+            ?.some(
+                (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword,
+            ) === true;
     const hasFunctionExport = source.statements.some((statement) => {
         if (
             ts.isFunctionDeclaration(statement) &&

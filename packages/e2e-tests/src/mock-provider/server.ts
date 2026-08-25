@@ -152,6 +152,9 @@ export class MockProvider {
         const port = options.port ?? 0; // 0 = pick any available port
         this.server = Bun.serve({
             port,
+            // Bun defaults to 0.0.0.0, which exposes the scripted provider to
+            // the whole network; every consumer dials 127.0.0.1 anyway.
+            hostname: "127.0.0.1",
             fetch: async (req) => this.handle(req),
         });
         const actualPort = this.server.port ?? 0;

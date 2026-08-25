@@ -35,11 +35,16 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
         expect(validation.files.length).toBe(60);
-        expect(validation.manifest.entries).toHaveLength(validation.files.length);
-        expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
+        expect(validation.manifest.entries).toHaveLength(
             validation.files.length,
         );
-        expect(validation.manifest.entries.map((entry) => entry.path).sort()).toEqual(validation.files);
+        expect(
+            new Set(validation.manifest.entries.map((entry) => entry.path))
+                .size,
+        ).toBe(validation.files.length);
+        expect(
+            validation.manifest.entries.map((entry) => entry.path).sort(),
+        ).toEqual(validation.files);
     });
 
     it("derives separate TS and Rust invocation lists", () => {
@@ -47,7 +52,9 @@ describe("mode manifest validator", () => {
         const rust = filesForMode(validation, "rust");
         expect(ts).toHaveLength(41);
         expect(rust).toHaveLength(31);
-        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(21);
+        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(
+            21,
+        );
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(20);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(21);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length);
@@ -59,11 +66,17 @@ describe("mode manifest validator", () => {
 
     it("rejects a missing, duplicated, or dead manifest path", () => {
         const entries = validation.manifest.entries;
-        expect(() => validateManifestDocument(manifestWith(entries.slice(0, -1)), validation.files)).toThrow(
-            /missing manifest entries/,
-        );
         expect(() =>
-            validateManifestDocument(manifestWith([...entries, entries[0]!]), validation.files),
+            validateManifestDocument(
+                manifestWith(entries.slice(0, -1)),
+                validation.files,
+            ),
+        ).toThrow(/missing manifest entries/);
+        expect(() =>
+            validateManifestDocument(
+                manifestWith([...entries, entries[0]!]),
+                validation.files,
+            ),
         ).toThrow(/duplicate manifest entry/);
         expect(() =>
             validateManifestDocument(

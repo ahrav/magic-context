@@ -120,12 +120,14 @@ const BASE_SHA = "1".repeat(40);
 const HEAD_SHA = "2".repeat(40);
 const SECOND_PARENT_SHA = "3".repeat(40);
 
-function fakeGit(options: {
-    head?: string;
-    parents?: string[];
-    ancestor?: boolean;
-    shallow?: boolean;
-} = {}): { git: GitRunner; calls: string[][] } {
+function fakeGit(
+    options: {
+        head?: string;
+        parents?: string[];
+        ancestor?: boolean;
+        shallow?: boolean;
+    } = {},
+): { git: GitRunner; calls: string[][] } {
     const head = options.head ?? HEAD_SHA;
     const parents = options.parents ?? [BASE_SHA, SECOND_PARENT_SHA];
     const calls: string[][] = [];
@@ -304,11 +306,7 @@ describe("trusted accepted-base derivation", () => {
             stdout: "",
             stderr: args[0] === "ls-tree" ? "" : "unexpected git show",
         });
-        const snapshot = loadHistorySnapshotFromGit(
-            "/fixture",
-            BASE_SHA,
-            git,
-        );
+        const snapshot = loadHistorySnapshotFromGit("/fixture", BASE_SHA, git);
         expect(JSON.parse(snapshot.inventoryText)).toEqual({
             schema: "incident-source-inventory/v1",
             items: [],
@@ -353,7 +351,11 @@ describe("trusted accepted-base derivation", () => {
         ].map((name) => `packages/e2e-tests/incidents/${name}`);
         const showFailure: GitRunner = (args) => {
             if (args[0] === "ls-tree") {
-                return { status: 0, stdout: `${paths.join("\n")}\n`, stderr: "" };
+                return {
+                    status: 0,
+                    stdout: `${paths.join("\n")}\n`,
+                    stderr: "",
+                };
             }
             if (args.join(" ").includes("catalog.json")) {
                 return { status: 128, stdout: "", stderr: "misc git failure" };

@@ -13,7 +13,12 @@ export const E2E_ROOT = resolve(import.meta.dir, "..");
 export const MANIFEST_PATH = resolve(E2E_ROOT, "mode-manifest.json");
 const TEST_GLOB = "tests/**/*.test.ts";
 
-export const TIERS = ["both-modes", "ts-only", "rust-only", "excluded"] as const;
+export const TIERS = [
+    "both-modes",
+    "ts-only",
+    "rust-only",
+    "excluded",
+] as const;
 export type Tier = (typeof TIERS)[number];
 export type Mode = "ts" | "rust";
 
@@ -41,10 +46,7 @@ function enumerateTestFiles(): string[] {
     return [...glob.scanSync({ cwd: E2E_ROOT, onlyFiles: true })].sort();
 }
 
-function parseJsonFile<T>(
-    path: string,
-    parse: (raw: unknown) => T,
-): T {
+function parseJsonFile<T>(path: string, parse: (raw: unknown) => T): T {
     let raw: unknown;
     try {
         raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -60,7 +62,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function validateEntry(value: unknown, index: number): ModeManifestEntry {
     if (!isRecord(value)) throw new Error(`entry ${index} is not an object`);
-    const expectedKeys = ["path", "tier", "invocation", "rationale", "contract_refs"];
+    const expectedKeys = [
+        "path",
+        "tier",
+        "invocation",
+        "rationale",
+        "contract_refs",
+    ];
     const actualKeys = Object.keys(value).sort();
     if (actualKeys.join("\0") !== expectedKeys.slice().sort().join("\0")) {
         throw new Error(
@@ -74,7 +82,9 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
     }
     const tier = value.tier;
     if (typeof tier !== "string" || !TIERS.includes(tier as Tier)) {
-        throw new Error(`entry ${index} has invalid classification ${JSON.stringify(tier)}`);
+        throw new Error(
+            `entry ${index} has invalid classification ${JSON.stringify(tier)}`,
+        );
     }
     const invocation = value.invocation;
     if (
@@ -83,7 +93,9 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
         typeof invocation.ts !== "boolean" ||
         typeof invocation.rust !== "boolean"
     ) {
-        throw new Error(`entry ${index} has invalid invocation; expected {ts:boolean,rust:boolean}`);
+        throw new Error(
+            `entry ${index} has invalid invocation; expected {ts:boolean,rust:boolean}`,
+        );
     }
     const rationale = value.rationale;
     if (typeof rationale !== "string" || rationale.trim().length === 0) {
@@ -92,9 +104,13 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
     const contractRefs = value.contract_refs;
     if (
         !Array.isArray(contractRefs) ||
-        contractRefs.some((ref) => typeof ref !== "string" || ref.trim().length === 0)
+        contractRefs.some(
+            (ref) => typeof ref !== "string" || ref.trim().length === 0,
+        )
     ) {
-        throw new Error(`entry ${index} must have a string-array contract_refs`);
+        throw new Error(
+            `entry ${index} must have a string-array contract_refs`,
+        );
     }
 
     const typedTier = tier as Tier;
@@ -102,16 +118,23 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
         ts: typedTier === "both-modes" || typedTier === "ts-only",
         rust: typedTier === "both-modes" || typedTier === "rust-only",
     };
-    if (invocation.ts !== expectedInvocation.ts || invocation.rust !== expectedInvocation.rust) {
+    if (
+        invocation.ts !== expectedInvocation.ts ||
+        invocation.rust !== expectedInvocation.rust
+    ) {
         throw new Error(
             `entry ${index} invocation disagrees with ${typedTier}; expected ${JSON.stringify(expectedInvocation)}`,
         );
     }
     if (typedTier !== "both-modes" && contractRefs.length === 0) {
-        throw new Error(`entry ${index} (${path}) is divergent/excluded but has no contract_refs`);
+        throw new Error(
+            `entry ${index} (${path}) is divergent/excluded but has no contract_refs`,
+        );
     }
     if (typedTier === "both-modes" && (!invocation.ts || !invocation.rust)) {
-        throw new Error(`entry ${index} (${path}) is both-modes but is absent from an invocation`);
+        throw new Error(
+            `entry ${index} (${path}) is both-modes but is absent from an invocation`,
+        );
     }
 
     return {
@@ -128,8 +151,15 @@ export function validateManifestDocument(
     raw: unknown,
     expectedFiles: string[] = enumerateTestFiles(),
 ): ValidationResult {
-    if (!isRecord(raw) || raw.schema !== 1 || typeof raw.header !== "string" || !Array.isArray(raw.entries)) {
-        throw new Error("mode manifest must be an object with schema: 1, header, and entries");
+    if (
+        !isRecord(raw) ||
+        raw.schema !== 1 ||
+        typeof raw.header !== "string" ||
+        !Array.isArray(raw.entries)
+    ) {
+        throw new Error(
+            "mode manifest must be an object with schema: 1, header, and entries",
+        );
     }
 
     const entries = raw.entries.map(validateEntry);
@@ -138,13 +168,20 @@ export function validateManifestDocument(
     for (const entry of entries) {
         seen.set(entry.path, (seen.get(entry.path) ?? 0) + 1);
         if (!expectedSet.has(entry.path)) {
-            throw new Error(`dead or out-of-scope manifest path: ${entry.path}`);
+            throw new Error(
+                `dead or out-of-scope manifest path: ${entry.path}`,
+            );
         }
         if (!existsSync(resolve(E2E_ROOT, entry.path))) {
             throw new Error(`manifest path does not exist: ${entry.path}`);
         }
-        if (!entry.path.startsWith("tests/") || !entry.path.endsWith(".test.ts")) {
-            throw new Error(`manifest path is not under ${TEST_GLOB}: ${entry.path}`);
+        if (
+            !entry.path.startsWith("tests/") ||
+            !entry.path.endsWith(".test.ts")
+        ) {
+            throw new Error(
+                `manifest path is not under ${TEST_GLOB}: ${entry.path}`,
+            );
         }
         if (seen.get(entry.path)! > 1) {
             throw new Error(`duplicate manifest entry: ${entry.path}`);
@@ -155,7 +192,9 @@ export function validateManifestDocument(
     if (missing.length > 0) {
         throw new Error(`missing manifest entries: ${missing.join(", ")}`);
     }
-    const duplicate = [...seen.entries()].filter(([, count]) => count > 1).map(([path]) => path);
+    const duplicate = [...seen.entries()]
+        .filter(([, count]) => count > 1)
+        .map(([path]) => path);
     if (duplicate.length > 0) {
         throw new Error(`duplicate manifest entries: ${duplicate.join(", ")}`);
     }
@@ -228,7 +267,9 @@ export function validateGreenIncidentWrapperSource(
             return element.text;
         });
         if (new Set(ids).size !== ids.length) {
-            throw new Error(`green incident wrapper ${name} contains duplicates`);
+            throw new Error(
+                `green incident wrapper ${name} contains duplicates`,
+            );
         }
         return [...ids].sort();
     };
@@ -316,11 +357,15 @@ export function validateModeManifest(): ValidationResult {
         entry.path.endsWith("incident-pool-green.test.ts"),
     );
     if (wrappers.length !== 1) {
-        throw new Error("mode manifest must contain exactly one incident green wrapper");
+        throw new Error(
+            "mode manifest must contain exactly one incident green wrapper",
+        );
     }
     const wrapper = wrappers[0]!;
     if (wrapper.tier !== "both-modes") {
-        throw new Error("incident green wrapper must run in both TS and Rust modes");
+        throw new Error(
+            "incident green wrapper must run in both TS and Rust modes",
+        );
     }
     validateGreenIncidentWrapperSource(
         readFileSync(resolve(E2E_ROOT, wrapper.path), "utf8"),
@@ -359,14 +404,18 @@ export function filesForMode(
         .sort();
 }
 
-function parseArgs(args: string[]): { mode?: Mode; harness: "all" | "opencode" | "pi" } {
+function parseArgs(args: string[]): {
+    mode?: Mode;
+    harness: "all" | "opencode" | "pi";
+} {
     let mode: Mode | undefined;
     let harness: "all" | "opencode" | "pi" = "all";
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
         if (arg === "--mode") {
             const value = args[++index];
-            if (value !== "ts" && value !== "rust") throw new Error("--mode must be ts or rust");
+            if (value !== "ts" && value !== "rust")
+                throw new Error("--mode must be ts or rust");
             mode = value;
         } else if (arg === "--harness") {
             const value = args[++index];
@@ -375,7 +424,9 @@ function parseArgs(args: string[]): { mode?: Mode; harness: "all" | "opencode" |
             }
             harness = value;
         } else if (arg === "--help" || arg === "-h") {
-            console.log("Usage: validate-mode-manifest.ts [--mode ts|rust] [--harness all|opencode|pi]");
+            console.log(
+                "Usage: validate-mode-manifest.ts [--mode ts|rust] [--harness all|opencode|pi]",
+            );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
@@ -389,9 +440,12 @@ if (import.meta.main) {
         const { mode, harness } = parseArgs(Bun.argv.slice(2));
         const validation = validateModeManifest();
         if (mode) {
-            for (const path of filesForMode(validation, mode, harness)) console.log(path);
+            for (const path of filesForMode(validation, mode, harness))
+                console.log(path);
         } else {
-            console.log(`validated ${validation.files.length} e2e test entries`);
+            console.log(
+                `validated ${validation.files.length} e2e test entries`,
+            );
         }
     } catch (error) {
         console.error(`mode manifest validation failed: ${String(error)}`);

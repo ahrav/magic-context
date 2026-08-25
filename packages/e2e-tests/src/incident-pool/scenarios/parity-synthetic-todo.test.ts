@@ -25,9 +25,7 @@ const SETUP: TodoParitySetup = {
     prerequisitesMet: true,
 };
 
-function todo1(
-    overrides: Partial<Todo1Observation> = {},
-): Todo1Observation {
+function todo1(overrides: Partial<Todo1Observation> = {}): Todo1Observation {
     return {
         kind: "rust-todo-1-synthetic-injection",
         ...SETUP,
@@ -153,14 +151,19 @@ describe("Rust synthetic todo incident family", () => {
     it("distinguishes a missing root precondition from an own-check failure", () => {
         expect(
             preconditionTodoDeferReplay(
-                dependent({ prerequisitesMet: false, ownActionExecuted: false }),
+                dependent({
+                    prerequisitesMet: false,
+                    ownActionExecuted: false,
+                }),
             ),
         ).toEqual({
             satisfied: false,
             reason: "blocked_by_dependency",
             blockedBy: ["var-todo-1-synthetic-injection"],
         });
-        const wrongDurableState = dependent({ durableTransitionCorrect: false });
+        const wrongDurableState = dependent({
+            durableTransitionCorrect: false,
+        });
         expect(preconditionTodoDeferReplay(wrongDurableState)).toEqual({
             satisfied: true,
         });

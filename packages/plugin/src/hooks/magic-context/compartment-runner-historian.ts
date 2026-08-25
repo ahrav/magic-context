@@ -480,7 +480,19 @@ async function runHistorianPrompt(args: {
             dumpLabel ?? "historian-response",
             result,
         );
-        if (dumpPath) responseDumpObserver?.(dumpPath);
+        if (dumpPath) {
+            try {
+                responseDumpObserver?.(dumpPath);
+            } catch (observerError: unknown) {
+                // The dump is already durably written and the model output is
+                // valid; an observer fault must not be reported as a historian
+                // failure, which would discard the result and force fallback.
+                shared.sessionLog(
+                    parentSessionId,
+                    `historian response dump observer failed: ${describeError(observerError).brief}`,
+                );
+            }
+        }
         outcomeOk = true;
         return { ok: true, result, dumpPath, invocationId: invocationId ?? undefined };
     } catch (modelError: unknown) {

@@ -98,8 +98,7 @@ export const FIRST_RENDER_A3_CHECKS = [
     "check-a3-reduce-retained-final-wire",
 ] as const;
 
-export interface FirstRenderDeferObservation
-    extends Record<string, JsonValue> {
+export interface FirstRenderDeferObservation extends Record<string, JsonValue> {
     mainRequestCount: number;
     bustCount: number;
     bustReport: string;
@@ -153,7 +152,9 @@ function messageBlocks(message: unknown): Array<Record<string, unknown>> {
     if (!Array.isArray(content)) return [];
     return content.filter(
         (block): block is Record<string, unknown> =>
-            block !== null && typeof block === "object" && !Array.isArray(block),
+            block !== null &&
+            typeof block === "object" &&
+            !Array.isArray(block),
     );
 }
 
@@ -233,7 +234,11 @@ export async function driveAgedCtxReduceSurvival(
     h.mock.setDefault({ text: "A3 reply 1", usage: DEFER_USAGE });
     await h.sendPrompt(sessionId, "A3 turn 1: establish baseline content.");
 
-    emitCtxReduceOnce(h, FIRST_RENDER_A3_FIXTURE.drop, FIRST_RENDER_A3_FIXTURE.callId);
+    emitCtxReduceOnce(
+        h,
+        FIRST_RENDER_A3_FIXTURE.drop,
+        FIRST_RENDER_A3_FIXTURE.callId,
+    );
     h.mock.setDefault({
         text: "A3 reply 2 (after ctx_reduce tool call)",
         usage: DEFER_USAGE,
@@ -1028,8 +1033,7 @@ function booleanField(
     field: string,
 ): boolean {
     const value = observation[field];
-    if (typeof value !== "boolean")
-        throw new Error(`${field} must be boolean`);
+    if (typeof value !== "boolean") throw new Error(`${field} must be boolean`);
     return value;
 }
 
@@ -1168,6 +1172,10 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             verifier: (raw) =>
                 verifyFirstRenderPureDeferStability(normalizeFirstRenderA1(raw))
                     .checks,
+            binding: {
+                driver: driveFirstRenderPureDeferStability,
+                verifier: verifyFirstRenderPureDeferStability,
+            },
             prerequisite: rustPrerequisite,
         },
         {
@@ -1182,6 +1190,10 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             precondition: satisfiedPrecondition,
             verifier: (raw) =>
                 verifyAgedCtxReduceSurvival(normalizeFirstRenderA3(raw)).checks,
+            binding: {
+                driver: driveAgedCtxReduceSurvival,
+                verifier: verifyAgedCtxReduceSurvival,
+            },
             prerequisite: rustPrerequisite,
         },
         {
@@ -1196,6 +1208,10 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             precondition: satisfiedPrecondition,
             verifier: (raw) =>
                 verifyThinkingNudgeAnchor(normalizeThinkingNudge(raw)).checks,
+            binding: {
+                driver: driveThinkingNudgeAnchor,
+                verifier: verifyThinkingNudgeAnchor,
+            },
         },
         {
             variantId: "var-thinking-dropped-shell",
@@ -1209,6 +1225,10 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             precondition: satisfiedPrecondition,
             verifier: (raw) =>
                 verifyThinkingDroppedShell(normalizeThinkingShell(raw)).checks,
+            binding: {
+                driver: driveThinkingDroppedShell,
+                verifier: verifyThinkingDroppedShell,
+            },
         },
         {
             variantId: "var-thinking-image-survival",
@@ -1222,6 +1242,10 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             precondition: satisfiedPrecondition,
             verifier: (raw) =>
                 verifyThinkingImageSurvival(normalizeThinkingImage(raw)).checks,
+            binding: {
+                driver: driveThinkingImageSurvival,
+                verifier: verifyThinkingImageSurvival,
+            },
         },
     ];
 }

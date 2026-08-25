@@ -88,7 +88,9 @@ function exactBooleanObservation<T>(
     }
     for (const field of fields) {
         if (typeof record[field] !== "boolean") {
-            throw new Error(`${kind} observation field ${field} must be boolean`);
+            throw new Error(
+                `${kind} observation field ${field} must be boolean`,
+            );
         }
     }
     return raw as T;
@@ -122,20 +124,30 @@ function piAdapter(h: PiTestHarness): TodoScriptAdapter {
                 .requests()
                 .filter((request) => isMagicContextRequest(request.body)),
         waitForPressure: () =>
-            h.waitFor(
-                () => {
-                    const sessionId = h.lastTurn?.sessionId;
-                    if (!sessionId) return false;
-                    const row = h
-                        .contextDb()
-                        .prepare(
-                            "SELECT last_context_percentage FROM session_meta WHERE session_id = ?",
-                        )
-                        .get(sessionId) as { last_context_percentage: number } | null;
-                    return (row?.last_context_percentage ?? 0) >= 65;
-                },
-                { timeoutMs: 10_000, label: "Pi todo real-byte pressure recorded" },
-            ).then(() => true, () => false),
+            h
+                .waitFor(
+                    () => {
+                        const sessionId = h.lastTurn?.sessionId;
+                        if (!sessionId) return false;
+                        const row = h
+                            .contextDb()
+                            .prepare(
+                                "SELECT last_context_percentage FROM session_meta WHERE session_id = ?",
+                            )
+                            .get(sessionId) as {
+                            last_context_percentage: number;
+                        } | null;
+                        return (row?.last_context_percentage ?? 0) >= 65;
+                    },
+                    {
+                        timeoutMs: 10_000,
+                        label: "Pi todo real-byte pressure recorded",
+                    },
+                )
+                .then(
+                    () => true,
+                    () => false,
+                ),
     };
 }
 
@@ -491,9 +503,15 @@ export async function drivePiTodoDeferReplay(
     try {
         const replay = await preparePiCacheBust(context, h);
         const replayAdapter = piAdapter(h);
-        const t0 = await sendAndCaptureMainRequest(replayAdapter, "Pi defer replay t0");
+        const t0 = await sendAndCaptureMainRequest(
+            replayAdapter,
+            "Pi defer replay t0",
+        );
         const metaT0 = readPiTodoMeta(h, replay.sessionId);
-        const t1 = await sendAndCaptureMainRequest(replayAdapter, "Pi defer replay t1");
+        const t1 = await sendAndCaptureMainRequest(
+            replayAdapter,
+            "Pi defer replay t1",
+        );
         const metaT1 = readPiTodoMeta(h, replay.sessionId);
         const bytes0 = t0 ? syntheticPairBytes(t0, replay.callId) : null;
         const bytes1 = t1 ? syntheticPairBytes(t1, replay.callId) : null;
@@ -551,19 +569,24 @@ export async function drivePiTodoDeferReplay(
             kind: "pi-todo-replay",
             ...replay.setup,
             rootTodoWriteExecuted:
-                replay.toolExecuted && newer.toolExecuted && legacy.toolExecuted,
+                replay.toolExecuted &&
+                newer.toolExecuted &&
+                legacy.toolExecuted,
             pressureUsedRealBytes:
                 replay.pressureUsedRealBytes &&
                 newer.pressureUsedRealBytes &&
                 legacy.pressureUsedRealBytes &&
                 legacyPressure,
             providerRequestCaptured:
-                replay.body !== null && newer.body !== null && legacy.body !== null,
+                replay.body !== null &&
+                newer.body !== null &&
+                legacy.body !== null,
             firstReplayPresent: bytes0 !== null && bytes1 !== null,
             byteIdenticalReplay: bytes0 !== null && bytes1 === bytes0,
             durableReplayIdentityStable:
                 metaT0?.todo_synthetic_call_id === replay.callId &&
-                metaT1?.todo_synthetic_call_id === metaT0.todo_synthetic_call_id &&
+                metaT1?.todo_synthetic_call_id ===
+                    metaT0.todo_synthetic_call_id &&
                 metaT1?.todo_synthetic_anchor_message_id ===
                     metaT0.todo_synthetic_anchor_message_id &&
                 metaT1?.todo_synthetic_state_json ===
@@ -572,7 +595,8 @@ export async function drivePiTodoDeferReplay(
             newerTodoDeferred:
                 newerBaselineBytes !== null &&
                 newerBytes === newerBaselineBytes &&
-                newerMeta?.last_todo_state === normalizedTodoJson(STATE_Y_TODOS) &&
+                newerMeta?.last_todo_state ===
+                    normalizedTodoJson(STATE_Y_TODOS) &&
                 newerMeta.todo_synthetic_call_id === newer.callId &&
                 newerMeta.todo_synthetic_state_json ===
                     normalizedTodoJson(STATE_X_TODOS),
@@ -692,7 +716,8 @@ export async function drivePiTodoAnchorLifecycle(
         const rootControlMeta = readPiTodoMeta(h, rootControlSession);
         const postTerminalRootCapture =
             rootControlProbe.executed &&
-            rootControlMeta?.last_todo_state === normalizedTodoJson(STATE_X_TODOS);
+            rootControlMeta?.last_todo_state ===
+                normalizedTodoJson(STATE_X_TODOS);
 
         const subagentSession = await newPiSessionId(h);
         updatePiTodoMeta(
@@ -726,7 +751,8 @@ export async function drivePiTodoAnchorLifecycle(
                 terminalMeta?.last_todo_state ===
                 normalizedTodoJson(TERMINAL_TODOS),
             terminalPairAbsent:
-                terminalBody !== null && findSyntheticPair(terminalBody) === null,
+                terminalBody !== null &&
+                findSyntheticPair(terminalBody) === null,
             terminalAnchorCleared:
                 (terminalMeta?.todo_synthetic_call_id ?? "") === "" &&
                 (terminalMeta?.todo_synthetic_anchor_message_id ?? "") === "" &&
@@ -764,6 +790,10 @@ export function parityPiTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizePiTodoCapture,
             precondition: preconditionPiTodoCapture,
             verifier: verifyPiTodoCapture,
+            binding: {
+                driver: drivePiTodoCapture,
+                verifier: verifyPiTodoCapture,
+            },
         },
         {
             variantId: "var-pi-todo-synthetic-injection",
@@ -777,6 +807,10 @@ export function parityPiTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizePiTodoInjection,
             precondition: preconditionPiTodoInjection,
             verifier: verifyPiTodoInjection,
+            binding: {
+                driver: drivePiTodoInjection,
+                verifier: verifyPiTodoInjection,
+            },
         },
         {
             variantId: "var-pi-todo-defer-replay",
@@ -790,6 +824,10 @@ export function parityPiTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizePiTodoDeferReplay,
             precondition: preconditionPiTodoDeferReplay,
             verifier: verifyPiTodoDeferReplay,
+            binding: {
+                driver: drivePiTodoDeferReplay,
+                verifier: verifyPiTodoDeferReplay,
+            },
         },
         {
             variantId: "var-pi-todo-anchor-lifecycle",
@@ -806,6 +844,10 @@ export function parityPiTodoIncidentCases(): RegisteredIncidentCase[] {
             normalizer: normalizePiTodoAnchorLifecycle,
             precondition: preconditionPiTodoAnchorLifecycle,
             verifier: verifyPiTodoAnchorLifecycle,
+            binding: {
+                driver: drivePiTodoAnchorLifecycle,
+                verifier: verifyPiTodoAnchorLifecycle,
+            },
         },
     ];
 }

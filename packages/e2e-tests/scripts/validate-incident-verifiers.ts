@@ -13,7 +13,10 @@ import {
     type GitRunner,
 } from "./validate-incident-history";
 
-function git(args: string[], cwd: string): {
+function git(
+    args: string[],
+    cwd: string,
+): {
     status: number;
     stdout: string;
     stderr: string;
@@ -83,23 +86,38 @@ function loadTrustedEvidence(baseCommit: string) {
             `could not create trusted verifier worktree: ${added.stderr.trim() || `git worktree add exited ${added.status}`}`,
         );
     }
+    let evidence: ReturnType<typeof loadMutationEvidence>;
     try {
-        return loadMutationEvidence(
+        evidence = loadMutationEvidence(
             resolve(worktree, "packages/e2e-tests"),
             worktree,
         );
-    } finally {
-        const removed = git(
-            ["worktree", "remove", "--force", worktree],
-            REPO_ROOT,
-        );
-        rmSync(parent, { recursive: true, force: true });
-        if (removed.status !== 0) {
-            throw new Error(
-                `could not remove trusted verifier worktree: ${removed.stderr.trim() || `git worktree remove exited ${removed.status}`}`,
-            );
-        }
+    } catch (error) {
+        // Clean up, then surface the ORIGINAL evidence failure: a cleanup
+        // error raised here would replace the diagnosis the caller needs.
+        cleanupTrustedWorktree(worktree, parent);
+        throw error;
     }
+    // The evidence loaded, so a cleanup failure is now the only failure and
+    // must not be swallowed — a leaked worktree corrupts later validations.
+    const cleanupError = cleanupTrustedWorktree(worktree, parent);
+    if (cleanupError) throw cleanupError;
+    return evidence;
+}
+
+/** Remove the trusted worktree and its parent; returns the failure, if any. */
+function cleanupTrustedWorktree(
+    worktree: string,
+    parent: string,
+): Error | null {
+    const removed = git(["worktree", "remove", "--force", worktree], REPO_ROOT);
+    rmSync(parent, { recursive: true, force: true });
+    if (removed.status !== 0) {
+        return new Error(
+            `could not remove trusted verifier worktree: ${removed.stderr.trim() || `git worktree remove exited ${removed.status}`}`,
+        );
+    }
+    return null;
 }
 
 export function validateIncidentVerifiers(baseCommit: string): number {
@@ -116,11 +134,15 @@ function main(args: string[]): void {
     const ci = args.length === 1 && args[0] === "--ci";
     const local = args.length === 2 && args[0] === "--base";
     if (!ci && !local) {
-        throw new Error("usage: validate-incident-verifiers.ts --ci | --base <commit>");
+        throw new Error(
+            "usage: validate-incident-verifiers.ts --ci | --base <commit>",
+        );
     }
     const baseCommit = ci ? trustedCiCommit(git) : args[1]!;
     const count = validateIncidentVerifiers(baseCommit);
-    console.log(`validated ${count} bound verifier files against ${baseCommit}`);
+    console.log(
+        `validated ${count} bound verifier files against ${baseCommit}`,
+    );
 }
 
 if (import.meta.main) {

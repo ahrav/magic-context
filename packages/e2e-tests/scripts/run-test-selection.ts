@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { Glob } from "bun";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { detectRustPrerequisites } from "./check-rust-prerequisites";
 import {
@@ -24,6 +25,26 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
         "scripts/validate-mode-manifest.test.ts",
     ].sort();
     if (files.length === 0) throw new Error("incident unit selection is empty");
+    return files;
+}
+
+/**
+ * Unit tests that live outside `tests/` and outside the incident-pool tree, so
+ * neither the mode manifest nor the incident-unit selection can see them. The
+ * mode selection carries them because it replaced a bare `bun test` as the
+ * package's default suite; without this they run nowhere.
+ */
+export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
+    const files = [
+        "src/cache-analysis.test.ts",
+        "src/pi-runner/rpc-client.test.ts",
+        "src/rust-runner/hermetic-subc.test.ts",
+    ];
+    for (const file of files) {
+        if (!existsSync(resolve(root, file))) {
+            throw new Error(`standalone unit selection names a missing ${file}`);
+        }
+    }
     return files;
 }
 
@@ -80,7 +101,9 @@ function parseArgs(args: string[]): CliArgs {
         } else if (arg === "--max-concurrency") {
             const value = Number(args[++index]);
             if (!Number.isInteger(value) || value <= 0) {
-                throw new Error("--max-concurrency requires a positive integer");
+                throw new Error(
+                    "--max-concurrency requires a positive integer",
+                );
             }
             maxConcurrency = value;
         } else if (arg === "--help" || arg === "-h") {
@@ -115,11 +138,15 @@ async function main(): Promise<number> {
         }
     }
     const wrapper = "tests/incident-pool-green.test.ts";
-    const groups = files.includes(wrapper)
-        ? [files.filter((file) => file !== wrapper), [wrapper]]
-        : [files];
+    // The wrapper drives the whole pool in-process, so it runs alone in a
+    // second phase. Standalone units are hermetic and ride the first phase.
+    const standalone = args.incidentUnit ? [] : standaloneUnitFiles();
+    const selected = [...files, ...standalone];
+    const groups = selected.includes(wrapper)
+        ? [selected.filter((file) => file !== wrapper), [wrapper]]
+        : [selected];
     console.log(
-        `Running ${files.length} selected test files in ${groups.length} phase(s)`,
+        `Running ${selected.length} selected test files in ${groups.length} phase(s)`,
     );
     for (const group of groups) {
         if (group.length === 0) continue;

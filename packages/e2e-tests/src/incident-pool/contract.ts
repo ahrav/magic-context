@@ -587,7 +587,53 @@ export function parseIncidentCatalog(raw: unknown): IncidentCatalog {
             }
         }
     }
+    rejectBlockedByCycles(families);
     return { schema: INCIDENT_CATALOG_SCHEMA, families };
+}
+
+/**
+ * blocked_by is a scheduling dependency, so a cycle would deadlock the
+ * scheduler with every member permanently waiting on another. Existence
+ * checks above cannot see one; reject it at parse time instead.
+ */
+function rejectBlockedByCycles(families: IncidentCatalog["families"]): void {
+    const dependents = new Map<string, string[]>();
+    for (const family of families) {
+        for (const variant of family.variants) {
+            dependents.set(variant.id, [...variant.blocked_by]);
+        }
+    }
+    // Iterative depth-first search with a node-state mark (1 = on stack,
+    // 2 = fully explored); any back edge to an on-stack node is a cycle.
+    const state = new Map<string, 0 | 1 | 2>();
+    for (const start of dependents.keys()) {
+        if (state.get(start)) continue;
+        const path: string[] = [start];
+        const iterators: Array<Iterator<string>> = [
+            (dependents.get(start) ?? [])[Symbol.iterator](),
+        ];
+        state.set(start, 1);
+        while (path.length > 0) {
+            const next = iterators[iterators.length - 1]!.next();
+            if (next.done) {
+                state.set(path.pop()!, 2);
+                iterators.pop();
+                continue;
+            }
+            const dependency = next.value;
+            const mark = state.get(dependency);
+            if (mark === 1) {
+                fail(
+                    "catalog variants",
+                    `blocked_by dependency cycle: ${[...path.slice(path.indexOf(dependency)), dependency].join(" -> ")}`,
+                );
+            }
+            if (mark) continue;
+            state.set(dependency, 1);
+            path.push(dependency);
+            iterators.push((dependents.get(dependency) ?? [])[Symbol.iterator]());
+        }
+    }
 }
 
 /** Exact-key parse of one adjudication ledger event. */

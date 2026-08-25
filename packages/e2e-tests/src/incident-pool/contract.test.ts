@@ -412,6 +412,34 @@ describe("incident catalog contract", () => {
         ).toThrow(/blocked_by references unknown variant var-ghost/);
     });
 
+    it("rejects blocked_by cycles across variants", () => {
+        expect(() =>
+            parseIncidentCatalog(
+                catalog([
+                    variant("var-a", { blocked_by: ["var-b"] }),
+                    variant("var-b", { blocked_by: ["var-a"] }),
+                ]),
+            ),
+        ).toThrow(/blocked_by dependency cycle/);
+        expect(() =>
+            parseIncidentCatalog(
+                catalog([
+                    variant("var-a", { blocked_by: ["var-b"] }),
+                    variant("var-b", { blocked_by: ["var-c"] }),
+                    variant("var-c", { blocked_by: ["var-a"] }),
+                ]),
+            ),
+        ).toThrow(/blocked_by dependency cycle/);
+        // A shared dependency is a diamond, not a cycle.
+        parseIncidentCatalog(
+            catalog([
+                variant("var-a", { blocked_by: ["var-c"] }),
+                variant("var-b", { blocked_by: ["var-c"] }),
+                variant("var-c"),
+            ]),
+        );
+    });
+
     it("rejects duplicate values in contract arrays", () => {
         expect(() =>
             parseSourceInventory(

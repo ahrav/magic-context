@@ -258,10 +258,18 @@ export function validateIncidentHistory(
             }
         }
         for (const variant of family.variants) {
+            // A variant inherits its incident from the enclosing family, so a
+            // claim linked only to a DIFFERENT family would silently move the
+            // variant's provenance out from under the family that owns it.
             for (const claimId of variant.source_claims) {
                 if (!claimIds.has(claimId)) {
                     throw new Error(
                         `orphan variant ${variant.id}: unknown source claim ${claimId}`,
+                    );
+                }
+                if (!family.source_claims.includes(claimId)) {
+                    throw new Error(
+                        `variant ${variant.id} claims ${claimId}, which is not linked to its family ${family.id}`,
                     );
                 }
             }
@@ -456,8 +464,16 @@ export function compareWithAcceptedSnapshot(
                 `adjudication ledger prefix rewrote logical identity at line ${index + 1}`,
             );
         }
-        const { rationale: beforeRationale, source_revision: beforeRevision, ...beforePinned } = before;
-        const { rationale: afterRationale, source_revision: afterRevision, ...afterPinned } = after;
+        const {
+            rationale: beforeRationale,
+            source_revision: beforeRevision,
+            ...beforePinned
+        } = before;
+        const {
+            rationale: afterRationale,
+            source_revision: afterRevision,
+            ...afterPinned
+        } = after;
         void beforeRationale;
         void beforeRevision;
         void afterRationale;

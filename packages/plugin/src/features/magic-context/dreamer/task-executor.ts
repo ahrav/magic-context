@@ -1251,8 +1251,15 @@ async function runAgenticTask(
             curate: curateMemories ? { memories: curateMemories } : undefined,
         });
 
-        const remainingMs = Math.max(0, deadline - Date.now());
         if (task === "curate") await deps.curateLifecycle?.beforePrompt?.();
+        // Recompute AFTER the awaited lifecycle hook: a slow beforePrompt
+        // spends deadline budget, and a stale remaining window would let the
+        // prompt run past the deadline the lease heartbeat is sized against.
+        const remainingMs = Math.max(0, deadline - Date.now());
+        const promptTimeoutMs = Math.min(remainingMs, config.timeoutMinutes * 60 * 1000);
+        if (promptTimeoutMs <= 0) {
+            throw new Error(`Dreamer ${task} deadline expired before the prompt was submitted.`);
+        }
         const run = await shared.promptSyncWithValidatedOutputRetry(
             deps.client,
             {
@@ -1277,7 +1284,7 @@ async function runAgenticTask(
                 },
             },
             {
-                timeoutMs: Math.min(remainingMs, config.timeoutMinutes * 60 * 1000),
+                timeoutMs: promptTimeoutMs,
                 signal: abortController.signal,
                 fallbackModels: config.fallbackModels,
                 callContext: `dreamer:${task}`,

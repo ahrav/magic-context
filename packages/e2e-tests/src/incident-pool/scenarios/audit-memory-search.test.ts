@@ -67,7 +67,7 @@ function a5Observation(
         recurrenceCount: 2,
         observerReadConsistent: true,
         searchAcknowledged: true,
-        searchReturnsFact: false,
+        agentVisibleFactRecall: false,
         searchReturnsActiveControl: true,
         ...overrides,
     };
@@ -204,7 +204,7 @@ describe("A5 archived re-observation verifier (invalid states)", () => {
         expect(
             failedIds(
                 verifyArchivedReobservation(
-                    a5Observation({ searchReturnsFact: true }),
+                    a5Observation({ agentVisibleFactRecall: true }),
                 ),
             ),
         ).toEqual(["check-a5-no-agent-recall"]);

@@ -283,7 +283,14 @@ function findOrdinalRange(
     const messages =
         (body.messages as Array<{ content: unknown }> | undefined) ?? [];
     for (const message of messages) {
-        const blocks = Array.isArray(message.content) ? message.content : [];
+        // A provider message may carry content as a bare string; treating that
+        // as "no blocks" silently degraded the historian response to an empty
+        // compartment set instead of covering the offered chunk.
+        const blocks = Array.isArray(message.content)
+            ? message.content
+            : typeof message.content === "string"
+              ? [{ text: message.content }]
+              : [];
         for (const block of blocks) {
             const text = (block as { text?: string }).text;
             if (!text || !text.includes("<new_messages>")) continue;

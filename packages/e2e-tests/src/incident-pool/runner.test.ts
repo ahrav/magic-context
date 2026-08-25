@@ -24,7 +24,9 @@ import {
     semanticFingerprint,
     validateRegistryCatalogCorrespondence,
     type IncidentCaseRegistry,
+    type JsonValue,
     type RegisteredIncidentCase,
+    type VerifierCheck,
 } from "./registry";
 import {
     buildIncidentReport,
@@ -38,6 +40,7 @@ import {
     readIncidentReport,
     readScheduledIncidentReport,
     scheduledIncidentExitCode,
+    scoredBaselineMismatches,
     unexpectedIncompleteResults,
     type IncidentCaseResult,
 } from "./report";
@@ -113,8 +116,8 @@ function rawVariant(spec: VariantSpec): Record<string, unknown> {
         },
         normative_checks: contract.normative_checks,
         verifier_binding: {
-            driver: "demo/driver",
-            verifier: "demo/verifier",
+            driver: "demo#caseDriver",
+            verifier: "demo#caseVerifier",
             binding_status: spec.bindingStatus ?? "live",
             invalid_state_evidence: ["crafted stale-plus-current coexistence"],
         },
@@ -365,6 +368,14 @@ describe("semantic and implementation fingerprints", () => {
     });
 });
 
+function caseDriver(): Promise<JsonValue> {
+    return Promise.resolve(null);
+}
+
+function caseVerifier(): VerifierCheck[] {
+    return [{ id: "check-red-holds", passed: true }];
+}
+
 function registeredCase(
     variantId: string,
     files: string[] = ["packages/e2e-tests/package.json"],
@@ -373,10 +384,11 @@ function registeredCase(
         variantId,
         implementationFiles: files,
         fixtures: {},
-        driver: () => Promise.resolve(null),
+        driver: caseDriver,
         normalizer: (raw) => raw,
         precondition: () => ({ satisfied: true }),
-        verifier: () => [{ id: "check-red-holds", passed: true }],
+        verifier: caseVerifier,
+        binding: { driver: caseDriver, verifier: caseVerifier },
     };
 }
 
@@ -419,6 +431,33 @@ describe("case registry", () => {
         expect(() =>
             validateRegistryCatalogCorrespondence(registry, catalog),
         ).toThrow(/requires a live catalog verifier binding/);
+    });
+
+    it("rejects a registered case bound to the wrong module symbol", () => {
+        const catalog = fixtureCatalog();
+        const registry: IncidentCaseRegistry = new Map();
+        function otherVerifier(): VerifierCheck[] {
+            return [{ id: "check-red-holds", passed: true }];
+        }
+        for (const variant of catalog.families[0]!.variants) {
+            const entry = registeredCase(variant.id);
+            registerIncidentCase(
+                registry,
+                variant.id === "var-red-one"
+                    ? {
+                          ...entry,
+                          verifier: otherVerifier,
+                          binding: {
+                              driver: caseDriver,
+                              verifier: otherVerifier,
+                          },
+                      }
+                    : entry,
+            );
+        }
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(/binds caseDriver\/caseVerifier but carries/);
     });
 
     it("registers the builtin cases 1:1 against the committed catalog", () => {
@@ -474,6 +513,43 @@ describe("run snapshot selection", () => {
         expect(snapshot.variantCount).toBe(3);
     });
 
+    it("excludes a variant retired by adjudication", () => {
+        const data = fixture();
+        const events: AdjudicationEvent[] = [
+            ...data.events,
+            {
+                schema: ADJUDICATION_EVENT_SCHEMA,
+                event_id: "adj-red-one-retire",
+                identity: "var-red-one",
+                seq: 2,
+                kind: "retirement",
+                baseline_verdict: null,
+                semantic_fingerprint: null,
+                expected_failed_checks: null,
+                observation_signature: null,
+                rationale: "reviewed: incident retired",
+                source_revision: "audit-2026-08-24",
+                supersedes: null,
+            },
+        ];
+        const snapshot = buildRunSnapshot({
+            catalog: data.catalog,
+            ledger: replayAdjudicationLedger(events),
+            adjudicationLines: events.map((event) => JSON.stringify(event)),
+            harness: "opencode",
+            lanes: ["green", "known-red"],
+            implementationDigests: data.implementationDigests,
+        });
+        expect(
+            snapshot.selected.map((entry) => entry.variantId),
+        ).not.toContain("var-red-one");
+        expect(
+            snapshot.excluded.find(
+                (entry) => entry.variantId === "var-red-one",
+            )?.reason,
+        ).toBe("variant was retired by adjudication");
+    });
+
     it("binds each selected case to its reviewed baseline event", () => {
         const snapshot = snapshotFor();
         const red = selectedCase(snapshot, "var-red-one");
@@ -509,10 +585,9 @@ describe("run snapshot selection", () => {
             variantIds: ["var-green-one", "var-red-one"],
             implementationDigests: data.implementationDigests,
         });
-        expect(snapshot.selected.map((entry) => entry.variantId).sort()).toEqual([
-            "var-green-one",
-            "var-red-one",
-        ]);
+        expect(
+            snapshot.selected.map((entry) => entry.variantId).sort(),
+        ).toEqual(["var-green-one", "var-red-one"]);
     });
 
     it("fails hard on a missing baseline or registered case digest", () => {
@@ -846,7 +921,9 @@ sendEnvelope();`;
                 runFakeChild(snapshot, green, "sendEnvelope();", {
                     extraEnv: { [key]: "unsafe" },
                 }),
-            ).rejects.toThrow(new RegExp(`unsafe incident case extraEnv key ${key}`));
+            ).rejects.toThrow(
+                new RegExp(`unsafe incident case extraEnv key ${key}`),
+            );
         }
     }, 20_000);
 
@@ -1159,6 +1236,62 @@ describe("catalog-bound report", () => {
         ).toEqual(["var-green-one"]);
         expect(incidentPoolExitCode(crashReport)).toBe(1);
     }, 20_000);
+
+    it("fails the command on a scored baseline mismatch and passes reviewed outcomes", async () => {
+        // A green-lane case that failed is a resurfaced defect: complete,
+        // scored, and must not exit 0.
+        const regressed = await runFakeChild(
+            snapshot,
+            green,
+            `sendEnvelope({ verdict: "assertion_fail", failed_checks: ["check-red-holds"], observation_signature: ${JSON.stringify(RED_SIGNATURE)} });`,
+        );
+        const redHolds = await runFakeChild(
+            snapshot,
+            red,
+            `sendEnvelope({ verdict: "assertion_fail", failed_checks: ["check-red-holds"], observation_signature: ${JSON.stringify(RED_SIGNATURE)} });`,
+        );
+        const regressionReport = buildIncidentReport(
+            reportInput(snapshot, [regressed.result, redHolds.result]),
+        );
+        expect(
+            regressionReport.results.find(
+                (entry) => entry.variant_id === "var-green-one",
+            )?.baseline_comparison,
+        ).toBe("regression");
+        expect(unexpectedIncompleteResults(regressionReport)).toEqual([]);
+        expect(
+            scoredBaselineMismatches(regressionReport).map(
+                (entry) => entry.variant_id,
+            ),
+        ).toEqual(["var-green-one"]);
+        expect(incidentPoolExitCode(regressionReport)).toBe(1);
+
+        // A known-red case failing in a DIFFERENT shape than the reviewed
+        // baseline is also a mismatch, not an expected red.
+        const shapeChanged = await runFakeChild(
+            snapshot,
+            red,
+            `sendEnvelope({ verdict: "assertion_fail", failed_checks: ["check-red-durable"], observation_signature: ${JSON.stringify(RED_SIGNATURE)} });`,
+        );
+        const shapeReport = buildIncidentReport(
+            reportInput(snapshot, [shapeChanged.result]),
+        );
+        expect(
+            shapeReport.results[0]?.baseline_comparison,
+        ).toBe("unexpected_failure");
+        expect(incidentPoolExitCode(shapeReport)).toBe(1);
+
+        // The reviewed outcomes stay green: expected_green + expected_red.
+        const greenPass = await runFakeChild(snapshot, green, "sendEnvelope();");
+        const reviewedReport = buildIncidentReport(
+            reportInput(snapshot, [greenPass.result, redHolds.result]),
+        );
+        expect(
+            reviewedReport.results.map((entry) => entry.baseline_comparison),
+        ).toEqual(["expected_green", "expected_red"]);
+        expect(scoredBaselineMismatches(reviewedReport)).toEqual([]);
+        expect(incidentPoolExitCode(reviewedReport)).toBe(0);
+    }, 30_000);
 
     it("continues after one case callback throws and publishes a complete static report", async () => {
         const report = await runIncidentPool(snapshot, async (selected) => {
