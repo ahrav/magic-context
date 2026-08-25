@@ -18,6 +18,7 @@ import {
 } from "../memory/storage-claim-autonomous";
 import type { ProjectMemoryClaimSnapshot } from "../memory/storage-claim-current-state";
 import { stageReviseProjectMemoryClaimInCurrentTransaction } from "../memory/storage-claim-operations";
+import { sha256Utf8Hex } from "../memory/storage-claims";
 import { recordChildInvocation } from "../subagent-token-capture";
 import {
     claimManifestBinding,
@@ -35,6 +36,7 @@ import {
     validateClassifyManifest,
 } from "./classify-prompt";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { DreamerModuleFailureError } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
@@ -44,6 +46,7 @@ const MIN_POOL_TO_CLASSIFY = 10;
 const FULL_POOL_CEILING = 100;
 const STAGE3_ANCHOR_COUNT = 30;
 const CLASSIFY_CHUNK_SIZE = 100;
+const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
 
 export interface ClassifyModuleCallArgs {
     sessionId: string;
@@ -86,6 +89,16 @@ export interface ClassifyResult {
     stage: 1 | 2 | 3;
     remaining: number;
     complete: boolean;
+}
+
+function isModuleRoute(args: ClassifyArgs): boolean {
+    return (
+        args.moduleClient !== undefined &&
+        args.moduleSessionId !== undefined &&
+        args.moduleProjectRoot !== undefined &&
+        args.moduleContextStoreUuid !== undefined &&
+        args.moduleAuthorityGeneration !== undefined
+    );
 }
 
 function toPromptMemory(claim: ProjectMemoryClaimSnapshot): ClassifyPromptMemory {
@@ -215,21 +228,24 @@ async function classifyOneChunk(
         publicClaimIds: selectedChunk.map((claim) => claim.publicClaimId),
     });
     const startedAt = Date.now();
+    const moduleRoute = isModuleRoute(args);
     try {
-        const createResponse = await createChildSessionWithFence({
-            client: args.client,
-            db: args.db,
-            parentSessionId: args.parentSessionId,
-            title: "magic-context-dream-classify",
-            directory: args.sessionDirectory,
-        });
-        const created = shared.normalizeSDKResponse(
-            createResponse,
-            null as { id?: string } | null,
-            { preferResponseOnMissingData: true },
-        );
-        agentSessionId = typeof created?.id === "string" ? created.id : null;
-        if (!agentSessionId) throw new Error("Could not create classify session.");
+        if (!moduleRoute) {
+            const createResponse = await createChildSessionWithFence({
+                client: args.client,
+                db: args.db,
+                parentSessionId: args.parentSessionId,
+                title: "magic-context-dream-classify",
+                directory: args.sessionDirectory,
+            });
+            const created = shared.normalizeSDKResponse(
+                createResponse,
+                null as { id?: string } | null,
+                { preferResponseOnMissingData: true },
+            );
+            agentSessionId = typeof created?.id === "string" ? created.id : null;
+            if (!agentSessionId) throw new Error("Could not create classify session.");
+        }
 
         const refreshed = refreshDreamerClaimBatch({
             db: args.db,
@@ -257,10 +273,16 @@ async function classifyOneChunk(
             memories: chunk.map(toPromptMemory),
             anchors,
         });
+        if (moduleRoute) {
+            rawManifest = await runClassifyThroughModule(args, chunk, prompt, sliceMs, signal);
+            recordInvocation(args, startedAt, { status: "completed" });
+            return applyClassifications(args, chunk, rawManifest);
+        }
+
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,
             {
-                path: { id: agentSessionId },
+                path: { id: agentSessionId as string },
                 query: { directory: args.sessionDirectory },
                 body: {
                     agent: DREAMER_CLASSIFIER_AGENT,
@@ -310,23 +332,28 @@ async function classifyOneChunk(
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
         return applyClassifications(args, chunk, run.validated);
     } catch (error) {
+        const failure = moduleRoute
+            ? new DreamerModuleFailureError("classify module", error)
+            : error;
         try {
             recordDreamerManifestRejection({
                 ...args,
                 identity,
                 rawManifest,
-                reason: getErrorMessage(error),
+                reason: getErrorMessage(failure),
             });
         } catch (recordError) {
             log(`[dreamer] classify rejection receipt failed: ${getErrorMessage(recordError)}`);
         }
-        const desc = describeError(error);
+        const desc = describeError(failure);
         log(
             `[dreamer] classify chunk failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: "failed", error });
-        if (signal.aborted || error instanceof DreamerProviderOutputFailureError) throw error;
+        recordInvocation(args, startedAt, { status: "failed", error: failure });
+        if (moduleRoute || signal.aborted || failure instanceof DreamerProviderOutputFailureError) {
+            throw failure;
+        }
         return { classified: 0, changed: 0 };
     } finally {
         if (agentSessionId && !shouldKeepSubagents()) {
@@ -340,6 +367,51 @@ async function classifyOneChunk(
                 });
         }
     }
+}
+
+async function runClassifyThroughModule(
+    args: ClassifyArgs,
+    chunk: ProjectMemoryClaimSnapshot[],
+    prompt: string,
+    sliceMs: number,
+    signal: AbortSignal,
+): Promise<string> {
+    const membership = chunk.map((claim) => claim.publicClaimId).join(",");
+    const response = await args.moduleClient?.call({
+        sessionId: args.moduleSessionId as string,
+        projectRoot: args.moduleProjectRoot as string,
+        method: "dreamer.run_task",
+        body: {
+            method: "dreamer.run_task",
+            v: 1,
+            session_id: args.moduleSessionId,
+            task: "classify",
+            command_id: `classify:${args.moduleCommandId ?? Date.now()}:${sha256Utf8Hex(membership).slice(0, 24)}`,
+            authority_generation: args.moduleAuthorityGeneration,
+            payload: {
+                prompt_body: prompt,
+                items: chunk.map((claim) => ({
+                    public_claim_id: claim.publicClaimId,
+                    revision_locator: claim.revisionLocator,
+                    content_digest: claim.contentDigest,
+                    mutation_token: claim.mutationToken,
+                })),
+            },
+        },
+        signal,
+        timeoutMs: Math.min(sliceMs, CLASSIFY_MODULE_RUN_TIMEOUT_MS),
+    });
+    const result = (response as { result?: unknown } | null)?.result ?? response;
+    if (!result || typeof result !== "object") {
+        throw new Error("module returned invalid classify result");
+    }
+    const manifestText = (result as { manifest_text?: unknown }).manifest_text;
+    if (typeof manifestText !== "string") throw new Error("module returned no classify manifest");
+    if ((result as { truncated?: unknown }).truncated === true) {
+        throw new Error("classify returned length-capped output");
+    }
+    validateClassifyManifest(manifestText, new Set(chunk.map((claim) => claim.publicClaimId)));
+    return manifestText;
 }
 
 export function applyClassifications(
