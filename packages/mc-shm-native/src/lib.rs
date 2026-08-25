@@ -21,8 +21,8 @@ use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode};
 use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
 #[cfg(target_os = "linux")]
 use mc_shm_transport::profile::ring_profile;
-use napi::bindgen_prelude::{Buffer, FnArgs, Function};
-use napi::{Env, Error, Result, Status, Unknown};
+use napi::bindgen_prelude::{Buffer, FnArgs, Function, Object};
+use napi::{sys, Env, Error, JsValue, Result, Status, Unknown, ValueType};
 use napi_derive::napi;
 
 use napi_buffers::ExternalRef;
@@ -30,15 +30,9 @@ use napi_buffers::ExternalRef;
 #[cfg(target_os = "linux")]
 const PROFILE: &str = "mc-host-test-ring-v1";
 
-#[napi(object)]
-pub struct NativeDescriptor {
-    pub profile: String,
-    pub pid: u32,
-    pub host_to_peer_fd: i32,
-    pub host_to_peer_grant: String,
-    pub peer_to_host_fd: i32,
-    pub peer_to_host_grant: String,
-}
+/// The one bounded, redacted failure every malformed raw descriptor maps
+/// to. Grant bytes, pids, fds, and key names never reach error messages.
+const DESCRIPTOR_ERROR: &str = "invalid shared-memory descriptor";
 
 #[napi(object)]
 pub struct NativeTestPair {
@@ -88,27 +82,111 @@ fn error(message: &'static str) -> Error {
     Error::new(Status::GenericFailure, message)
 }
 
+fn descriptor_error() -> Error {
+    error(DESCRIPTOR_ERROR)
+}
+
+/// Swallows a JavaScript exception thrown by a hostile accessor or Proxy
+/// trap during a raw property read, so the bounded descriptor error — not
+/// provider-authored text — is what reaches the caller.
+fn clear_pending_exception(env: &Env) {
+    let mut pending = false;
+    // SAFETY: env is the current environment.
+    if unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) } == sys::Status::napi_ok
+        && pending
+    {
+        let mut exception = std::ptr::null_mut();
+        // SAFETY: exception receives the cleared value, which is discarded.
+        let _ = unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) };
+    }
+}
+
+/// Reads one raw property exactly once. Missing/undefined properties and
+/// throwing getters both map to the bounded descriptor error.
+fn descriptor_field<'env>(env: &Env, object: &Object<'env>, name: &str) -> Result<Unknown<'env>> {
+    match object.get::<Unknown<'env>>(name) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Err(descriptor_error()),
+        Err(_) => {
+            clear_pending_exception(env);
+            Err(descriptor_error())
+        }
+    }
+}
+
+/// Decodes one raw numeric field without N-API numeric narrowing: the
+/// value must already be a JavaScript number whose exact double is a
+/// non-negative-zero integer inside `[min, max]`. `NaN`, infinities,
+/// fractions, `-0`, and out-of-range values are all rejected before any
+/// truncating cast exists.
+fn integer_field(env: &Env, object: &Object<'_>, name: &str, min: f64, max: f64) -> Result<f64> {
+    let value = descriptor_field(env, object, name)?;
+    if value.get_type().map_err(|_| descriptor_error())? != ValueType::Number {
+        return Err(descriptor_error());
+    }
+    // SAFETY: the value was type-checked as Number above.
+    let number: f64 = unsafe { value.cast::<f64>() }.map_err(|_| {
+        clear_pending_exception(env);
+        descriptor_error()
+    })?;
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || (number == 0.0 && number.is_sign_negative())
+        || number < min
+        || number > max
+    {
+        return Err(descriptor_error());
+    }
+    Ok(number)
+}
+
+/// Decodes one raw string field, bounding its length BEFORE materializing
+/// it so a hostile oversized string is rejected without allocation.
+fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> Result<String> {
+    let value = descriptor_field(env, object, name)?;
+    if value.get_type().map_err(|_| descriptor_error())? != ValueType::String {
+        return Err(descriptor_error());
+    }
+    let mut len = 0usize;
+    // SAFETY: value is a live string in env; a null buffer queries length.
+    let status = unsafe {
+        sys::napi_get_value_string_utf8(env.raw(), value.raw(), std::ptr::null_mut(), 0, &mut len)
+    };
+    if status != sys::Status::napi_ok || len > max_len {
+        return Err(descriptor_error());
+    }
+    // SAFETY: the value was type-checked as String above.
+    unsafe { value.cast::<String>() }.map_err(|_| descriptor_error())
+}
+
 #[cfg(target_os = "linux")]
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
-    if text.len() != N * 2 {
-        return Err(error("invalid attachment grant"));
+    let ascii = text.as_bytes();
+    if ascii.len() != N * 2 {
+        return Err(descriptor_error());
+    }
+    // Strict lowercase hexadecimal only, matching the host encoder;
+    // `from_str_radix` would also admit uppercase and sign prefixes.
+    fn nibble(byte: u8) -> Result<u8> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(descriptor_error()),
+        }
     }
     let mut bytes = [0u8; N];
     for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
-            .map_err(|_| error("invalid attachment grant"))?;
+        *byte = nibble(ascii[index * 2])? << 4 | nibble(ascii[index * 2 + 1])?;
     }
     Ok(bytes)
 }
 
 #[cfg(target_os = "linux")]
-fn attach_ring(pid: u32, fd: i32, grant: &str) -> Result<Ring> {
+fn attach_ring(pid: u32, fd: i32, grant: RingGrant) -> Result<Ring> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(format!("/proc/{pid}/fd/{fd}"))
-        .map_err(|_| error("shared-memory attachment failed"))?;
-    let grant = RingGrant::decode(decode_hex(grant)?)
         .map_err(|_| error("shared-memory attachment failed"))?;
     Ring::attach(OwnedFd::from(file), grant, SchedulingMode::ColdParkWake)
         .map_err(|_| error("shared-memory attachment failed"))
@@ -337,7 +415,7 @@ pub fn active_channel_count() -> Result<u32> {
 }
 
 #[napi]
-pub fn attach(env: &Env, descriptor: NativeDescriptor) -> Result<u32> {
+pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (env, descriptor);
@@ -347,19 +425,61 @@ pub fn attach(env: &Env, descriptor: NativeDescriptor) -> Result<u32> {
     }
     #[cfg(target_os = "linux")]
     {
-        if descriptor.profile != PROFILE {
+        const GRANT_HEX_LEN: usize = RingGrant::encoded_len() * 2;
+        // The argument is decoded as a RAW value — before any bindgen
+        // numeric narrowing or property coercion — and every check below
+        // runs before the first fd open, mapping, prefault, or registry
+        // insertion, so a rejected descriptor has zero side effects.
+        if descriptor.get_type().map_err(|_| descriptor_error())? != ValueType::Object {
+            return Err(descriptor_error());
+        }
+        // SAFETY: the value was type-checked as Object above.
+        let object = unsafe { descriptor.cast::<Object>() }.map_err(|_| descriptor_error())?;
+        let profile = string_field(env, &object, "profile", 256)?;
+        if profile != PROFILE {
             return Err(error("shared-memory profile is unavailable"));
         }
-        let from_host = attach_ring(
-            descriptor.pid,
-            descriptor.host_to_peer_fd,
-            &descriptor.host_to_peer_grant,
-        )?;
-        let to_host = attach_ring(
-            descriptor.pid,
-            descriptor.peer_to_host_fd,
-            &descriptor.peer_to_host_grant,
-        )?;
+        let pid = integer_field(env, &object, "pid", 1.0, f64::from(u32::MAX))? as u32;
+        let host_to_peer_fd =
+            integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32;
+        let peer_to_host_fd =
+            integer_field(env, &object, "peerToHostFd", 0.0, f64::from(i32::MAX))? as i32;
+        let host_to_peer_grant = RingGrant::decode(decode_hex(&string_field(
+            env,
+            &object,
+            "hostToPeerGrant",
+            GRANT_HEX_LEN,
+        )?)?)
+        .map_err(|_| descriptor_error())?;
+        let peer_to_host_grant = RingGrant::decode(decode_hex(&string_field(
+            env,
+            &object,
+            "peerToHostGrant",
+            GRANT_HEX_LEN,
+        )?)?)
+        .map_err(|_| descriptor_error())?;
+        // Both directions form one duplex pair over two distinct backing
+        // objects; an aliased fd or grant collapses them onto one ring.
+        if host_to_peer_fd == peer_to_host_fd || host_to_peer_grant == peer_to_host_grant {
+            return Err(descriptor_error());
+        }
+        // Exclusive active attachment: a grant already backing a live
+        // channel is a replayed or concurrently duplicated descriptor.
+        REGISTRY.with(|registry| {
+            let registry = registry
+                .try_borrow()
+                .map_err(|_| error("native channel is busy"))?;
+            for channel in registry.channels.values() {
+                for grant in [channel.to_host.grant(), channel.from_host.grant()] {
+                    if grant == host_to_peer_grant || grant == peer_to_host_grant {
+                        return Err(error("shared-memory descriptor is already attached"));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        let from_host = attach_ring(pid, host_to_peer_fd, host_to_peer_grant)?;
+        let to_host = attach_ring(pid, peer_to_host_fd, peer_to_host_grant)?;
         REGISTRY.with(|registry| {
             let mut registry = registry
                 .try_borrow_mut()

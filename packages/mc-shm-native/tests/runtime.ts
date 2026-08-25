@@ -3,7 +3,9 @@ import { runInNewContext } from "node:vm";
 import { setFlagsFromString } from "node:v8";
 import {
     activeExternalRefs,
+    activeNativeChannels,
     NativeChannel,
+    type NativeDescriptor,
     type NativeReceiveLease,
     probeCapabilities,
     setExternalViewCreationFailpoint,
@@ -18,11 +20,29 @@ if (result.available) {
     assert.equal(result.detachment, true);
     assert.equal(result.transferPrevention, true);
     assert.equal(result.cleanupHooks, true);
+    runAttachBoundary();
     runNativeLifecycle();
 } else {
     assert.ok(result.reason && result.reason.length > 0);
 }
 console.log(JSON.stringify({ runtime: process.release.name, ...result }));
+
+function runAttachBoundary(): void {
+    // Invalid descriptors create no native channels or external views.
+    const hostile: unknown[] = [
+        { profile: "mc-host-test-ring-v1", pid: Number.NaN },
+        { profile: "mc-host-test-ring-v1", pid: 2.5 },
+    ];
+    for (const descriptor of hostile) {
+        const refs = activeExternalRefs();
+        assert.throws(
+            () => NativeChannel.attach(descriptor as NativeDescriptor),
+            /invalid shared-memory descriptor/,
+        );
+        assert.equal(activeNativeChannels(), 0);
+        assert.equal(activeExternalRefs(), refs);
+    }
+}
 
 function header(length = 0): Uint8Array {
     const bytes = new Uint8Array(21);
@@ -36,7 +56,12 @@ function header(length = 0): Uint8Array {
     return bytes;
 }
 
-function fill(channel: NativeChannel, bytes: number, value = 1, timeoutMs = 0): void {
+function fill(
+    channel: NativeChannel,
+    bytes: number,
+    value = 1,
+    timeoutMs = 0,
+): void {
     channel.produce(
         header(bytes),
         bytes,
@@ -88,7 +113,9 @@ function runNativeLifecycle(): void {
             cursor.advance(5);
         },
         () => {
-            publishSawDetached = producerAliases.every((alias) => alias.byteLength === 0);
+            publishSawDetached = producerAliases.every(
+                (alias) => alias.byteLength === 0,
+            );
         },
     );
     assert.equal(publishSawDetached, true);
@@ -100,7 +127,9 @@ function runNativeLifecycle(): void {
     const subarray = alias.subarray(1);
     const dataView = new DataView(alias.buffer, 1);
     const buffer = Buffer.from(alias.buffer);
-    assert.throws(() => structuredClone(alias.buffer, { transfer: [alias.buffer] }));
+    assert.throws(() =>
+        structuredClone(alias.buffer, { transfer: [alias.buffer] }),
+    );
     lease.release();
     assert.equal(alias.byteLength, 0);
     assert.equal(subarray.byteLength, 0);
@@ -118,7 +147,10 @@ function runNativeLifecycle(): void {
         }),
     );
     assert.equal(thrownAlias?.byteLength, 0);
-    assert.equal(direct.second.poll(() => {}), false);
+    assert.equal(
+        direct.second.poll(() => {}),
+        false,
+    );
     direct.first.close();
     direct.second.close();
 
@@ -147,9 +179,13 @@ function runNativeLifecycle(): void {
     arena.second.close();
 
     const partial = NativeChannel.createTestPair();
-    partial.first.produce(header(partial.arenaBytes - 2), partial.arenaBytes - 2, (cursor) => {
-        cursor.advance(partial.arenaBytes - 2);
-    });
+    partial.first.produce(
+        header(partial.arenaBytes - 2),
+        partial.arenaBytes - 2,
+        (cursor) => {
+            cursor.advance(partial.arenaBytes - 2);
+        },
+    );
     receive(partial.second).release();
     fill(partial.first, 4, 3, 1_000);
     const refsBeforeFailure = activeExternalRefs();
@@ -168,7 +204,10 @@ function runNativeLifecycle(): void {
     const leaked = NativeChannel.createTestPair();
     for (let index = 0; index < leaked.descriptorDepth; index++) {
         fill(leaked.first, 1, index);
-        assert.equal(leaked.second.poll(() => {}), true);
+        assert.equal(
+            leaked.second.poll(() => {}),
+            true,
+        );
     }
     forceGc();
     assert.throws(() => fill(leaked.first, 1, 1, 1));
