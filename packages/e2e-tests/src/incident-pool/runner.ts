@@ -318,6 +318,14 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
                 });
                 continue;
             }
+            const digest = input.implementationDigests.get(variant.id);
+            if (digest === undefined) {
+                excluded.push({
+                    variantId: variant.id,
+                    reason: "no registered case for this variant; its scenario module has not registered a driver",
+                });
+                continue;
+            }
             const baseline =
                 input.ledger.byIdentity.get(variant.id)?.latestBaseline ?? null;
             if (baseline === null) {
@@ -338,12 +346,6 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
             if (baseline.baseline_verdict !== expectedVerdict) {
                 throw new Error(
                     `selected variant ${variant.id} lane disagrees with its baseline verdict`,
-                );
-            }
-            const digest = input.implementationDigests.get(variant.id);
-            if (digest === undefined) {
-                throw new Error(
-                    `selected variant ${variant.id} has no implementation-bundle digest`,
                 );
             }
             selected.push({

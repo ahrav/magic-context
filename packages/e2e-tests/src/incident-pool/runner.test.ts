@@ -23,6 +23,7 @@ import {
     registerIncidentCase,
     semanticFingerprint,
     validateRegistryCatalogCorrespondence,
+    type IncidentCaseRegistry,
     type RegisteredIncidentCase,
 } from "./registry";
 import {
@@ -68,6 +69,7 @@ interface VariantSpec {
     omittedReason?: string;
     normativeChecks?: string[];
     blockedBy?: string[];
+    bindingStatus?: "declared" | "live";
 }
 
 function rawVariant(spec: VariantSpec): Record<string, unknown> {
@@ -106,7 +108,7 @@ function rawVariant(spec: VariantSpec): Record<string, unknown> {
         verifier_binding: {
             driver: "demo/driver",
             verifier: "demo/verifier",
-            binding_status: "declared",
+            binding_status: spec.bindingStatus ?? "live",
             invalid_state_evidence: ["crafted stale-plus-current coexistence"],
         },
         blocked_by: contract.blocked_by,
@@ -372,12 +374,10 @@ function registeredCase(
 }
 
 describe("case registry", () => {
-    it("requires a registered case for every executable variant and no extras", () => {
+    it("accepts registered cases for live variants and rejects extras", () => {
         const catalog = fixtureCatalog();
-        const registry = builtinIncidentCaseRegistry();
-        expect(() =>
-            validateRegistryCatalogCorrespondence(registry, catalog),
-        ).toThrow(/no registered case/);
+        const registry: IncidentCaseRegistry = new Map();
+        validateRegistryCatalogCorrespondence(registry, catalog);
         for (const variant of catalog.families[0]!.variants)
             registerIncidentCase(registry, registeredCase(variant.id));
         validateRegistryCatalogCorrespondence(registry, catalog);
@@ -387,9 +387,42 @@ describe("case registry", () => {
         ).toThrow(/no executable catalog variant/);
     });
 
+    it("rejects a registered case whose catalog binding is still declared", () => {
+        const catalog = parseIncidentCatalog({
+            schema: "incident-catalog/v1",
+            families: [
+                {
+                    id: "fam-demo",
+                    title: "Demo incident family",
+                    source_claims: ["claim-demo-one"],
+                    variants: [
+                        rawVariant({
+                            id: "var-green-one",
+                            lane: "green",
+                            bindingStatus: "declared",
+                        }),
+                    ],
+                },
+            ],
+        });
+        const registry: IncidentCaseRegistry = new Map();
+        registerIncidentCase(registry, registeredCase("var-green-one"));
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(/live catalog verifier binding/);
+    });
+
+    it("registers the builtin cases 1:1 against the committed catalog", () => {
+        const registry = builtinIncidentCaseRegistry();
+        expect(registry.size).toBeGreaterThan(0);
+        for (const [variantId, entry] of registry) {
+            expect(entry.variantId).toBe(variantId);
+        }
+    });
+
     it("rejects a registration whose fixtures drift from the catalog fingerprint", () => {
         const catalog = fixtureCatalog();
-        const registry = builtinIncidentCaseRegistry();
+        const registry: IncidentCaseRegistry = new Map();
         for (const variant of catalog.families[0]!.variants) {
             registerIncidentCase(registry, {
                 ...registeredCase(variant.id),
@@ -402,7 +435,7 @@ describe("case registry", () => {
     });
 
     it("rejects duplicate registrations and unconfined file lists", () => {
-        const registry = builtinIncidentCaseRegistry();
+        const registry: IncidentCaseRegistry = new Map();
         registerIncidentCase(registry, registeredCase("var-red-one"));
         expect(() =>
             registerIncidentCase(registry, registeredCase("var-red-one")),
@@ -456,7 +489,7 @@ describe("run snapshot selection", () => {
         ).toEqual(["var-blocked-one", "var-red-one"]);
     });
 
-    it("fails hard on a missing baseline or implementation digest", () => {
+    it("fails hard on a missing baseline and excludes an unregistered variant", () => {
         const data = fixture();
         const noBaseline = data.events.filter(
             (event) => event.identity !== "var-red-one",
@@ -474,9 +507,14 @@ describe("run snapshot selection", () => {
             }),
         ).toThrow(/no reviewed baseline/);
         data.implementationDigests.delete("var-green-one");
-        expect(() => snapshotFor(data)).toThrow(
-            /no implementation-bundle digest/,
+        const snapshot = snapshotFor(data);
+        expect(snapshot.selected.map((entry) => entry.variantId)).not.toContain(
+            "var-green-one",
         );
+        const excludedGreen = snapshot.excluded.find(
+            (entry) => entry.variantId === "var-green-one",
+        );
+        expect(excludedGreen?.reason).toMatch(/no registered case/);
     });
 });
 

@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { parseIncidentCatalog } from "../contract";
 import { E2E_ROOT } from "../evidence";
+import * as auditMemorySearch from "./audit-memory-search";
 import * as regressions from "./source-linked-regressions";
 import {
     failedCheckIds,
@@ -270,7 +271,7 @@ describe("thinking-block successor verifiers", () => {
 });
 
 describe("registry binding surface", () => {
-    it("resolves every committed live binding to a real exported function of this module", () => {
+    it("resolves every committed live binding to a real exported function", () => {
         const catalog = parseIncidentCatalog(
             JSON.parse(
                 readFileSync(
@@ -279,7 +280,11 @@ describe("registry binding surface", () => {
                 ),
             ),
         );
-        const moduleExports = regressions as Record<string, unknown>;
+        const liveModules: Record<string, Record<string, unknown>> = {
+            [MODULE_PATH]: regressions as Record<string, unknown>,
+            "src/incident-pool/scenarios/audit-memory-search.ts":
+                auditMemorySearch as Record<string, unknown>,
+        };
         let liveBindings = 0;
         for (const family of catalog.families) {
             for (const variant of family.variants) {
@@ -291,19 +296,14 @@ describe("registry binding surface", () => {
                         string,
                         string,
                     ];
-                    expect(path).toBe(MODULE_PATH);
-                    expect(resolve(E2E_ROOT, path)).toBe(
-                        resolve(
-                            import.meta.dir,
-                            "source-linked-regressions.ts",
-                        ),
-                    );
-                    expect(typeof moduleExports[symbol]).toBe("function");
+                    const moduleExports = liveModules[path];
+                    expect(moduleExports).toBeDefined();
+                    expect(typeof moduleExports?.[symbol]).toBe("function");
                 }
                 liveBindings++;
             }
         }
-        expect(liveBindings).toBe(5);
+        expect(liveBindings).toBe(10);
     });
 
     it("keeps the committed normative checks equal to the verifier-emitted check ids", () => {

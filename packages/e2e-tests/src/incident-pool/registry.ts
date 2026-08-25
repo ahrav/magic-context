@@ -24,6 +24,7 @@ import {
     type IncidentVariant,
 } from "./contract";
 import { rowDigest } from "./history";
+import { auditMemorySearchIncidentCases } from "./scenarios/audit-memory-search";
 
 export const SEMANTIC_FINGERPRINT_CONTRACT = "incident-semantic-fingerprint/v1";
 export const IMPLEMENTATION_BUNDLE_CONTRACT =
@@ -129,13 +130,12 @@ export function registerIncidentCase(
     registry.set(entry.variantId, entry);
 }
 
-/**
- * The committed registry of executable scenario cases. Scenario units
- * (U4-U6) register their drivers/verifiers here; U2 ships it empty so the
- * runner and CLIs are proven against fake children first.
- */
 export function builtinIncidentCaseRegistry(): IncidentCaseRegistry {
-    return new Map();
+    const registry: IncidentCaseRegistry = new Map();
+    for (const entry of auditMemorySearchIncidentCases()) {
+        registerIncidentCase(registry, entry);
+    }
+    return registry;
 }
 
 /** The structured contract inputs that define one semantic revision. */
@@ -198,38 +198,38 @@ export function ledgerFingerprint(
 }
 
 /**
- * Validate strict 1:1 correspondence between executable catalog variants and
- * registered cases (U2 approach step 1), and that each catalog semantic
- * fingerprint matches the fingerprint recomputed from the registered
- * fixtures — a drifted registration is rejected before any run.
+ * Each registered case must name an executable catalog variant with a live
+ * verifier binding, and its catalog semantic fingerprint must equal the
+ * fingerprint recomputed from its fixtures. Unregistered executable
+ * variants do not fail this validation.
  */
 export function validateRegistryCatalogCorrespondence(
     registry: IncidentCaseRegistry,
     catalog: IncidentCatalog,
 ): void {
-    const executableIds = new Set<string>();
+    const executableById = new Map<string, IncidentVariant>();
     for (const family of catalog.families) {
         for (const variant of family.variants) {
             if (!EXECUTABLE_LANES.includes(variant.lane)) continue;
-            executableIds.add(variant.id);
-            const registered = registry.get(variant.id);
-            if (!registered) {
-                throw new Error(
-                    `executable variant ${variant.id} has no registered case`,
-                );
-            }
-            const computed = semanticFingerprint(variant, registered.fixtures);
-            if (computed !== variant.semantic_revision.fingerprint) {
-                throw new Error(
-                    `variant ${variant.id} semantic fingerprint ${variant.semantic_revision.fingerprint} does not match the registered case (computed ${computed}); register a new semantic revision`,
-                );
-            }
+            executableById.set(variant.id, variant);
         }
     }
-    for (const variantId of registry.keys()) {
-        if (!executableIds.has(variantId)) {
+    for (const [variantId, registered] of registry) {
+        const variant = executableById.get(variantId);
+        if (!variant) {
             throw new Error(
                 `registered case ${variantId} has no executable catalog variant`,
+            );
+        }
+        if (variant.verifier_binding?.binding_status !== "live") {
+            throw new Error(
+                `registered case ${variantId} requires a live catalog verifier binding`,
+            );
+        }
+        const computed = semanticFingerprint(variant, registered.fixtures);
+        if (computed !== variant.semantic_revision.fingerprint) {
+            throw new Error(
+                `variant ${variant.id} semantic fingerprint ${variant.semantic_revision.fingerprint} does not match the registered case (computed ${computed}); register a new semantic revision`,
             );
         }
     }

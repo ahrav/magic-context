@@ -28,8 +28,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a5-1",
-                        "fingerprint": "cdd43a8c8b701e1264ea289d00adb36c01b586fc7c787ee7207bb17eb52d17b1"
+                        "id": "rev-a5-2",
+                        "fingerprint": "52c064a247706da3be73c684f1a6a06c9f5bdbb8cd13309a18775424c492a6af"
                     },
                     "normative_checks": [
                         "check-a5-archived-row-preserved",
@@ -40,7 +40,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveArchivedReobservation",
                         "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyArchivedReobservation",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "re-observation creates a second active row",
                             "archived row revived without an explicit restore",
@@ -81,8 +81,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a10-1",
-                        "fingerprint": "4418d27519d6c757c01b33fa839f123b40e2eb0f17ed478aa03ab51df972400f"
+                        "id": "rev-a10-2",
+                        "fingerprint": "0402e3229cb26b952c0410a84be890e58d868318ac7b22f6d278fd12807993c7"
                     },
                     "normative_checks": [
                         "check-a10-effective-context-reconciled",
@@ -92,7 +92,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveSupersedeReconciliation",
                         "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifySupersedeReconciliation",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "old and new claims both authoritative after the supersede",
                             "stale cached m0 without the m1 correction"
@@ -207,8 +207,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a32-1",
-                        "fingerprint": "e78f6e2c7e8d698aa5d7e8744e8e21a7b65252a5c84b1b5562e87d7556dbe2a7"
+                        "id": "rev-a32-2",
+                        "fingerprint": "507161c88e0963fdc2948aa7d0feae93ff3d2f14650e43b86d3d004c00108501"
                     },
                     "normative_checks": [
                         "check-a32-fresh-semantic-recall",
@@ -217,7 +217,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveEmbeddingFreshness",
                         "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyEmbeddingFreshness",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "lexical overlap accidentally satisfies recall without the semantic lane",
                             "query succeeds against a re-embedded (fresh) vector presented as stale"
@@ -255,8 +255,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a44-1",
-                        "fingerprint": "328776f0f8c91f09cb85cd6dfe9efe0acf6757917782669de8fec725e53d79a6"
+                        "id": "rev-a44-2",
+                        "fingerprint": "65c2bad548c9389d7ba3cbbacb80c3e338abba64176dbce166da4d2d1462f4c3"
                     },
                     "normative_checks": [
                         "check-a44-known-better-memory-outranks",
@@ -265,7 +265,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveCrossSourceRank",
                         "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyCrossSourceRank",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "verifier fed only one eligible candidate",
                             "message hit missing so the ordering is vacuously correct"
@@ -353,8 +353,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a54-1",
-                        "fingerprint": "d1ed8e83a05351fc765322e6db8d1b36e14a752e493df8592886d19459b5043b"
+                        "id": "rev-a54-2",
+                        "fingerprint": "5525750f509e3a23abe70f131ca06dfc6fd5963ac0749ce3a729f1bbd4e039ea"
                     },
                     "normative_checks": [
                         "check-a54-explicit-search-pending-status",
@@ -363,7 +363,7 @@
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/audit-memory-search.ts#drivePendingNoteRecall",
                         "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyPendingNoteRecall",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "pending note surfaces on an ordinary turn without an explicit search",
                             "explicit search result omits the pending status label"

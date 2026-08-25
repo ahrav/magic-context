@@ -371,6 +371,7 @@ describe("ownership matrix (U3 approach 4)", () => {
     it("rejects a declared binding once its module exists (no pending_unit state)", () => {
         const catalog = committedCatalog();
         const variant = findVariant(catalog, "var-a5-archived-reobservation");
+        variant.verifier_binding!.binding_status = "declared";
         variant.verifier_binding!.driver =
             "src/incident-pool/scenarios/source-linked-regressions.ts#driveArchivedReobservation";
         expect(() =>
