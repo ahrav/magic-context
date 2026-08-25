@@ -1,7 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { log } from "../../shared/logger";
-import type { Database, Statement } from "../../shared/sqlite";
-import { withPrivilegedWriter } from "../../shared/sqlite";
 import type {
     ClaimEffectDeliveryRequest,
     ClaimEffectDeliveryResponse,
@@ -13,6 +10,9 @@ import type {
     ClaimIntentStageResponse,
     ClaimIntentWireRecord,
 } from "../../hooks/magic-context/module-wire";
+import { log } from "../../shared/logger";
+import type { Database, Statement } from "../../shared/sqlite";
+import { withPrivilegedWriter } from "../../shared/sqlite";
 import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "./claims-backfill";
 import { encodeClaimOperationResult } from "./memory/claim-operation-contract";
 import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
@@ -216,6 +216,9 @@ export async function commitModuleClaimIntent(args: {
         commit.operationKey !== args.request.command.operationKey
     ) {
         throw new Error("context receipt identity does not match staged claim intent");
+    }
+    if (commit.requestDigest !== staged.intent.requestDigest) {
+        throw new Error("context receipt digest does not match staged claim intent");
     }
 
     let intent = staged.intent;

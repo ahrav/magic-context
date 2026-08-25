@@ -1,17 +1,17 @@
 import { createHmac, randomUUID } from "node:crypto";
 import {
-    decodeClaimOperationResult,
+    reconcileCompatibilityVerifications,
+    seedLateCompatibilityRevisions,
+} from "../../features/magic-context/claim-policy-backfill";
+import type { Compartment } from "../../features/magic-context/compartment-storage";
+import {
     type ClaimOperationResult,
+    decodeClaimOperationResult,
 } from "../../features/magic-context/memory/claim-operation-contract";
 import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
     readOutboxConsumerCheckpoint,
 } from "../../features/magic-context/memory/storage-claim-operations";
-import {
-    reconcileCompatibilityVerifications,
-    seedLateCompatibilityRevisions,
-} from "../../features/magic-context/claim-policy-backfill";
-import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
     autoSearchHintFragmentsStillEligible,
     bindMemoriesToCurrentRevision,

@@ -10693,9 +10693,12 @@ impl McHandler {
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.stage requires arguments");
         };
-        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentStageRequest>(arguments) {
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentStageRequest>(arguments)
+        {
             Ok(parsed) => parsed,
-            Err(error) => return invalid_params_error(format!("invalid claim intent stage: {error}")),
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim intent stage: {error}"))
+            }
         };
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
@@ -10719,13 +10722,15 @@ impl McHandler {
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.inspect requires arguments");
         };
-        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentInspectRequest>(arguments)
-        {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return invalid_params_error(format!("invalid claim intent inspection: {error}"));
-            }
-        };
+        let parsed =
+            match serde_json::from_value::<memory_tool::ClaimIntentInspectRequest>(arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return invalid_params_error(format!(
+                        "invalid claim intent inspection: {error}"
+                    ));
+                }
+            };
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
@@ -10750,7 +10755,9 @@ impl McHandler {
         };
         let parsed = match serde_json::from_value::<memory_tool::ClaimIntentAckRequest>(arguments) {
             Ok(parsed) => parsed,
-            Err(error) => return invalid_params_error(format!("invalid claim intent ack: {error}")),
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim intent ack: {error}"))
+            }
         };
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
@@ -10793,7 +10800,9 @@ impl McHandler {
         let result = match mc_core::claim_operation::decode_claim_operation_result(result_json) {
             Ok(result) => result,
             Err(error) => {
-                return invalid_params_error(format!("claim.effects.apply result is invalid: {error}"));
+                return invalid_params_error(format!(
+                    "claim.effects.apply result is invalid: {error}"
+                ));
             }
         };
         let Some(effects) = receipt.get("effects").and_then(Value::as_array) else {
@@ -10818,8 +10827,7 @@ impl McHandler {
             };
             if effect.get("effectKey").and_then(Value::as_str)
                 != Some(result_effect.effect_key.as_str())
-                || effect.get("projectId").and_then(Value::as_i64)
-                    != Some(result_effect.project_id)
+                || effect.get("projectId").and_then(Value::as_i64) != Some(result_effect.project_id)
                 || effect.get("generation").and_then(Value::as_i64)
                     != Some(result_effect.generation)
                 || effect.get("changeKind").and_then(Value::as_str)

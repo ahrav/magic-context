@@ -25,6 +25,7 @@ import {
     getCompartments,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
 import {
@@ -41,9 +42,9 @@ import {
     buildPagedModuleStateSyncPayloads,
     drainClaimEffectPrefix,
     loadModuleWatermarks,
-    proveClaimOperationDurable,
     type ModuleStateSyncState,
     mirrorModuleCompartments,
+    proveClaimOperationDurable,
     resetCompartmentMirrorCursorsForTest,
     syncModuleState,
 } from "./module-state-sync";
@@ -132,6 +133,7 @@ function createContextDb(): Database {
     databases.push(db);
     initializeDatabase(db);
     runMigrations(db);
+    db.transaction(() => createClaimMemorySchema(db)).immediate();
     return db;
 }
 
@@ -1635,7 +1637,7 @@ function seedGroupedClaimEffects(db: Database, operationKey: string) {
         .prepare(
             `SELECT claims.id AS claimId, heads.revision_id AS revisionId
                FROM claims
-               JOIN claim_current_heads AS heads ON heads.claim_id = claims.id
+               JOIN claim_memory_current_heads AS heads ON heads.claim_id = claims.id
               WHERE claims.project_id = ? ORDER BY claims.id DESC LIMIT 1`,
         )
         .get(projectId) as { claimId: number; revisionId: number };
@@ -1655,14 +1657,14 @@ function seedGroupedClaimEffects(db: Database, operationKey: string) {
                     projectId,
                     claimId: claim.claimId,
                     revisionId: claim.revisionId,
-                    changeKind: "revision",
+                    changeKind: "upsert",
                 },
                 {
                     effectKey: `${operationKey}:second`,
                     projectId,
                     claimId: claim.claimId,
                     revisionId: claim.revisionId,
-                    changeKind: "revision",
+                    changeKind: "upsert",
                 },
             ],
         }),
@@ -1700,31 +1702,22 @@ describe("claim effect prefix delivery", () => {
         expect(result.deliveredReceipts).toBe(2);
     });
 
-    it("rejects a partially checkpointed receipt instead of skipping its earlier effect", async () => {
+    it("rejects a checkpoint that would split a receipt group", () => {
         const db = createContextDb();
         const target = seedGroupedClaimEffects(db, "partial");
         const firstTargetEffect = target.effects[0];
         if (!firstTargetEffect) throw new Error("missing target effect");
-        db.transaction(() => {
-            advanceOutboxConsumerCheckpointInCurrentTransaction(db, {
-                consumer: "u5-module",
-                projectId: firstTargetEffect.projectId,
-                ackedEffectId: firstTargetEffect.id,
-            });
-        }).immediate();
 
-        let delivered = false;
-        await expect(
-            drainClaimEffectPrefix({
-                db,
-                consumer: "u5-module",
-                throughReceiptId: target.receiptId,
-                deliver: async (receipt) => {
-                    delivered = true;
-                    return { ackedEffectId: receipt.effects.at(-1)?.id ?? 0 };
-                },
-            }),
-        ).rejects.toThrow("checkpointed partially");
-        expect(delivered).toBe(false);
+        expect(() =>
+            db
+                .transaction(() => {
+                    advanceOutboxConsumerCheckpointInCurrentTransaction(db, {
+                        consumer: "u5-module",
+                        projectId: firstTargetEffect.projectId,
+                        ackedEffectId: firstTargetEffect.id,
+                    });
+                })
+                .immediate(),
+        ).toThrow("splits a receipt group");
     });
 });

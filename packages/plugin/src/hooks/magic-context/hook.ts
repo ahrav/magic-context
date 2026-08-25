@@ -55,7 +55,6 @@ import { compileSmartNoteCheck } from "../../features/magic-context/smart-notes/
 import { SmartNoteEvaluatorWorker } from "../../features/magic-context/smart-notes/evaluator-worker";
 import { runCompiledSmartNoteCheck } from "../../features/magic-context/smart-notes/sandbox-runner";
 import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
-import { readDirectFormatMarker } from "../../features/magic-context/storage-format-epoch";
 import {
     getDatabasePersistenceError,
     getSessionsWithPendingMarker,
@@ -67,6 +66,7 @@ import {
     getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
+import { readDirectFormatMarker } from "../../features/magic-context/storage-format-epoch";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
@@ -830,7 +830,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> =>
         chainMirrorDomainSync(db, domain, () => runModuleDomainSync(domain));
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
-    const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
@@ -928,7 +927,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           projectRoot,
                           domain: "memories",
                       });
-                      if (!status.authority || status.authority.state !== "MODULE") {
+                      if (status.authority?.state !== "MODULE") {
                           throw Object.assign(
                               new Error("memory authority is not accepting intents"),
                               {

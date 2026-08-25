@@ -138,6 +138,10 @@ fn stale_zero_effect_result_can_settle_after_authority_drain_starts() {
     let preparing = store
         .authority_begin_prepare(INCARNATION, PROJECT, "memories")
         .unwrap();
+    assert!(matches!(
+        store.stage_claim_intent(&binding(preparing.generation), &command("preparing"), &request(0), 0),
+        Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "resetting"
+    ));
     let active = store
         .authority_finish_prepare(
             INCARNATION,
@@ -158,6 +162,17 @@ fn stale_zero_effect_result_can_settle_after_authority_drain_starts() {
     let draining = store
         .authority_begin_drain(INCARNATION, PROJECT, "memories", "lease", 100, 2)
         .unwrap();
+    assert!(draining.generation > active.generation);
+    assert!(matches!(
+        store.stage_claim_intent(
+            &binding(draining.generation),
+            &command("new"),
+            &request(2),
+            3,
+        ),
+        Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "draining"
+    ));
+
     let settled = store
         .acknowledge_claim_intent(
             &active_binding,
@@ -165,21 +180,11 @@ fn stale_zero_effect_result_can_settle_after_authority_drain_starts() {
             &staged.record.request_digest,
             ClaimIntentAckKind::TerminalRejected,
             Some(&result("stale")),
-            3,
+            4,
         )
         .unwrap();
     assert_eq!(settled.record.state, ClaimIntentState::TerminalRejected);
     assert_eq!(store.unresolved_claim_intent_count().unwrap(), 0);
-
-    assert!(matches!(
-        store.stage_claim_intent(
-            &binding(draining.generation),
-            &command("new"),
-            &request(2),
-            4,
-        ),
-        Err(McStoreError::ClaimIntentAuthorityFrozen { .. })
-    ));
 }
 
 #[test]
