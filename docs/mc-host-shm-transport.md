@@ -103,6 +103,10 @@ A daemon restart retires the client's old generation with its existing outcome c
 
 The crash harness kills a victim with `SIGKILL`, requires signal-9 wait status, and starts its bounded post-reap observation window (20 seconds) only after the child is reaped. A deliberately held zombie has no observation window. The harness window is observation-only: the provider's 30-second episode deadline and the client's recovery deadline are independent and are never restarted or extended by kill, reap, or harness timing.
 
+### Dead-peer reclamation gap (ring backend)
+
+Shared-memory peer death is silent for the ring endpoint: a peer that dies without sending `Goodbye` produces no readable close and never becomes a suspect, so its candidate's exact admission charges stay `active` until the daemon itself closes. The clean soak cycles in `shm_soak.rs` therefore prove clean-close charge conservation plus crash-side OS hygiene — not dead-peer charge reclamation, which remains a provider gap pending the frozen retained-tuple manifest (`magic-context-ymc.12`). The gap is pinned exactly by `killed_victim_holding_active_charges_is_never_reclaimed` in `crates/mc-host/tests/shm_failure_modes.rs`; the reachable unclean-close suspect path (a live peer publishing a structurally invalid frame) is driven by `corrupt_peer_frame_quarantines_exact_charges_and_returns_ready` in the same file.
+
 ### Operator-visible failure limits
 
 Admission accounting exposes redacted aggregate `active` and `quarantined` charges (descriptors, arena bytes, leases, mappings, pinned workers) alongside provider readiness. Active and quarantine caps are frozen per profile; quarantine retains charges against its cap instead of returning storage, and cap exhaustion stops shared-memory offers (readiness `Quarantined`) while TCP service continues. Diagnostics and errors carry state names and counts only — never descriptors, grants, tokens, object names, addresses, or provider text.

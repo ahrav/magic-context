@@ -874,8 +874,17 @@ mod tests {
         rig.backend.set_default(CleanupOutcome::StaleRetry);
         rig.recovery.report_suspect(Arc::clone(&record));
         wait_for("retries running", || rig.backend.cleanup_calls() >= 2);
-        rig.clock
-            .advance(RECOVERY_EPISODE_DEADLINE + Duration::from_secs(1));
+        // Partway advance (20s of the 30s deadline): retries must keep
+        // running under the ORIGINAL deadline. A retry branch that reset
+        // `deadline = now() + 30s` here would survive the final advance to
+        // 31s below and hang the resolution wait.
+        rig.clock.advance(Duration::from_secs(20));
+        let calls_partway = rig.backend.cleanup_calls();
+        wait_for("retries continue past the partway advance", || {
+            rig.backend.cleanup_calls() > calls_partway
+        });
+        assert_eq!(rig.recovery.readiness(), ProviderReadiness::Recovering);
+        rig.clock.advance(Duration::from_secs(11));
         wait_for("deadline resolution", || {
             rig.recovery.readiness() != ProviderReadiness::Recovering
         });
@@ -1033,5 +1042,43 @@ mod tests {
             "duplicate report deduplicated"
         );
         assert_eq!(rig.recovery.incarnation(), 2);
+    }
+
+    #[test]
+    fn suspect_inbox_overflow_isolates_directly_without_growing_the_inbox() {
+        let total = (SUSPECT_INBOX_BOUND + 2) as u64;
+        let rig = Rig::new(total);
+        rig.backend.push(Scripted::Block);
+        let wedged = rig.admit();
+        rig.recovery.report_suspect(Arc::clone(&wedged));
+        wait_for("blocked call dispatched", || {
+            rig.backend.cleanup_calls() == 1
+        });
+        let queued: Vec<_> = (0..SUSPECT_INBOX_BOUND).map(|_| rig.admit()).collect();
+        for record in &queued {
+            rig.recovery.report_suspect(Arc::clone(record));
+        }
+        // The inbox is at its bound: the next distinct suspect must be
+        // isolated synchronously with its exact charges instead of growing
+        // host memory — no new episode and no additional cleanup dispatch.
+        let overflow = rig.admit();
+        rig.recovery.report_suspect(Arc::clone(&overflow));
+        assert_eq!(overflow.phase(), CustodyPhase::Quarantined);
+        assert_eq!(rig.quarantined(), rig.charges());
+        assert_eq!(rig.backend.cleanup_calls(), 1);
+        assert_eq!(rig.recovery.episode(), 1);
+        assert_eq!(rig.recovery.readiness(), ProviderReadiness::Recovering);
+        for record in &queued {
+            assert_eq!(record.phase(), CustodyPhase::Active);
+        }
+        // Deadline resolution isolates exactly the wedged call plus the
+        // bounded inbox; the overflow record is never double-counted.
+        rig.clock
+            .advance(RECOVERY_EPISODE_DEADLINE + Duration::from_secs(1));
+        wait_for("deadline resolution", || {
+            rig.recovery.readiness() != ProviderReadiness::Recovering
+        });
+        assert_eq!(rig.quarantined(), charges_times(rig.charges(), total));
+        assert_eq!(rig.active(), ResourceCharges::ZERO);
     }
 }

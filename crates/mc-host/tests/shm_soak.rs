@@ -22,6 +22,8 @@
 //! quarantined charges, and no surviving descendants before the next cycle.
 //! commentlint: allow(JUDGE)
 //!
+//! Clean cycles therefore prove clean-close charge conservation plus crash-side OS hygiene — NOT dead-peer charge reclamation, which remains a provider gap pending the frozen `.12` manifest and is pinned exactly by `killed_victim_holding_active_charges_is_never_reclaimed` in `shm_failure_modes.rs`. commentlint: allow(JUDGE)
+//!
 //! # Envelope (KTD10)
 //! Twenty unmeasured warmup cycles run first. After logical quiescence,
 //! three equal consecutive OS snapshots per long-lived role (daemon and

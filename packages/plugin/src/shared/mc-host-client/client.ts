@@ -625,12 +625,9 @@ export class SubcClient {
     async closeRoute(handle: RouteHandle): Promise<void> {
         const conn = this.requireLiveHandle(handle);
         conn.liveRoutes.delete(handle.channel);
-        for (const [key, cached] of this.routes) {
-            if (cached.handle === handle) {
-                cached.closed = true;
-                cached.handle = null;
-                this.routes.delete(key);
-            }
+        for (const [key, cached] of this.detachCachedHandle(handle)) {
+            cached.closed = true;
+            this.routes.delete(key);
         }
         conn.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
         await conn.generation.flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock));
@@ -821,13 +818,7 @@ export class SubcClient {
         if (generation.isRetired()) return conn;
         conn.fallbackReason = selection.reason;
         this.active = conn;
-        this.emitDiagnostics({
-            type: "connected",
-            daemonVer: snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
-            pid: snapshot.pid,
-            transport: conn.transport,
-            ...(conn.fallbackReason !== undefined ? { fallbackReason: conn.fallbackReason } : {}),
-        });
+        this.emitConnected(conn, conn.fallbackReason);
         // R11: exact `unavailable` is the only fallback that starts an automatic shared-memory recovery probe; every other reason and reasonless TCP stay sticky. commentlint: allow(JUDGE)
         if (conn.fallbackReason === "unavailable") this.startRecovery(conn);
         return conn;
@@ -922,34 +913,28 @@ export class SubcClient {
         grant: Extract<NegotiateResponse, { kind: "grant" }>,
         stage: Deadline,
     ): Promise<ActiveConnection> {
-        const conn = await this.prepareCandidate(bootstrap, grant, stage, undefined);
+        const conn = await this.prepareCandidate(bootstrap, grant, stage);
         // Atomic promotion: publish the finalized candidate, then retire the
         // bootstrap; the host already replaced it after the commit response
         // reached local completion.
         this.active = conn;
         bootstrap.generation.retire("owner_close");
-        this.emitDiagnostics({
-            type: "connected",
-            daemonVer: bootstrap.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
-            pid: bootstrap.snapshot.pid,
-            transport: conn.transport,
-        });
+        this.emitConnected(conn);
         return conn;
     }
 
     /**
      * Run one grant through candidate construction, activation, and commit
      * without publishing. Any failure or uncertainty retires BOTH the
-     * candidate and the bootstrap. A shadow caller passes `role: "shadow"`
-     * so the candidate's retirement callbacks stay episode-internal until
-     * promotion clears the role.
+     * candidate and the bootstrap. A shadow caller passes its episode's
+     * `shadow` generation set so the candidate's retirement callbacks stay
+     * episode-internal until promotion clears the role.
      */
     private async prepareCandidate(
         bootstrap: ActiveConnection,
         grant: Extract<NegotiateResponse, { kind: "grant" }>,
         stage: Deadline,
-        role: "shadow" | undefined,
-        registerShadow?: Set<ConnectionGeneration>,
+        shadow?: Set<ConnectionGeneration>,
     ): Promise<ActiveConnection> {
         const provider = this.transportRegistry.find(
             grant.selected.transport,
@@ -1001,14 +986,14 @@ export class SubcClient {
             bootstrap.generation.retire("negotiation_failed", failure);
             throw failure;
         }
-        registerShadow?.add(candidate);
+        shadow?.add(candidate);
         conn = {
             generation: candidate,
             token: newConnectionToken(),
             snapshot,
             liveRoutes: new Map(),
             transport: grant.selected.transport,
-            ...(role !== undefined ? { role } : {}),
+            ...(shadow !== undefined ? { role: "shadow" as const } : {}),
         };
         try {
             await candidate.start(stage);
@@ -1097,9 +1082,7 @@ export class SubcClient {
         const handle = conn.liveRoutes.get(channel);
         if (!handle || handle.epoch !== epoch) return;
         conn.liveRoutes.delete(channel);
-        for (const cached of this.routes.values()) {
-            if (cached.handle === handle) cached.handle = null;
-        }
+        this.detachCachedHandle(handle);
         if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
@@ -1137,9 +1120,32 @@ export class SubcClient {
     private evictHandle(handle: RouteHandle): void {
         const conn = this.connectionFor(handle);
         if (conn !== null) conn.liveRoutes.delete(handle.channel);
-        for (const cached of this.routes.values()) {
-            if (cached.handle === handle) cached.handle = null;
+        this.detachCachedHandle(handle);
+    }
+
+    /**
+     * `closeRoute` uses the returned keys to mark and evict every cached
+     * entry for `handle`; the other callers only need the detach.
+     */
+    private detachCachedHandle(handle: RouteHandle): [string, CachedManagedRoute][] {
+        const detached: [string, CachedManagedRoute][] = [];
+        for (const [key, cached] of this.routes) {
+            if (cached.handle === handle) {
+                cached.handle = null;
+                detached.push([key, cached]);
+            }
         }
+        return detached;
+    }
+
+    private emitConnected(conn: ActiveConnection, fallbackReason?: FallbackReason): void {
+        this.emitDiagnostics({
+            type: "connected",
+            daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
+            pid: conn.snapshot.pid,
+            transport: conn.transport,
+            ...(fallbackReason !== undefined ? { fallbackReason } : {}),
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1280,7 +1286,6 @@ export class SubcClient {
                     bootstrap,
                     selection,
                     stage,
-                    "shadow",
                     episode.shadowGenerations,
                 );
             } catch {
@@ -1347,9 +1352,7 @@ export class SubcClient {
             if (!this.managedHandles.has(handle)) continue;
             pred.liveRoutes.delete(channel);
             pred.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
-            for (const cached of this.routes.values()) {
-                if (cached.handle === handle) cached.handle = null;
-            }
+            this.detachCachedHandle(handle);
         }
         if (pred.liveRoutes.size > 0) return;
         this.predecessor = null;

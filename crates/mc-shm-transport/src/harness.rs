@@ -27,9 +27,9 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 /// Inputs that are not exactly [`FRAME_DESCRIPTOR_BYTES`] long are rejected
 /// as truncated or suffixed. A successful validation is checked against the
 /// arena bound so no accepted descriptor can describe an out-of-range view.
-pub fn frame_descriptor(bytes: &[u8]) {
+pub fn frame_descriptor(bytes: &[u8]) -> bool {
     if bytes.len() != FRAME_DESCRIPTOR_BYTES {
-        return;
+        return false;
     }
     let schema = u16::from_le_bytes([bytes[0], bytes[1]]);
     let mut wire_header = [0u8; WIRE_V2_HEADER_BYTES];
@@ -73,7 +73,7 @@ pub fn frame_descriptor(bytes: &[u8]) {
     );
 
     // Accept path: the expected identity equals the decoded identity.
-    if let Ok(validated) = descriptor.validate(identity, MAX_FRAME_BYTES) {
+    let accepted = if let Ok(validated) = descriptor.validate(identity, MAX_FRAME_BYTES) {
         assert!(validated.body_len() <= MAX_FRAME_BYTES as u64);
         assert!((1..=MAX_SPANS as u8).contains(&validated.span_count()));
         let mut summed = 0u64;
@@ -87,25 +87,32 @@ pub fn frame_descriptor(bytes: &[u8]) {
             summed = summed.checked_add(span.len()).expect("span sum overflow");
         }
         assert_eq!(summed, validated.body_len(), "spans disagree with body");
-    }
+        true
+    } else {
+        false
+    };
 
     // Reject path: a fixed foreign identity never matches decoded bytes
     // whose sequence differs.
     let foreign = ReleaseIdentity::new(Incarnation::from_bytes([0xa5; 16]), u32::MAX, u64::MAX);
     let _ = descriptor.validate(foreign, MAX_FRAME_BYTES);
+    accepted
 }
 
 /// Decodes one ring attachment grant from raw bytes.
 ///
 /// A successful decode must re-encode to the identical input, proving exact
 /// consumption with no ignored or defaulted region.
-pub fn provider_grant(bytes: &[u8]) {
+pub fn provider_grant(bytes: &[u8]) -> bool {
     if let Ok(grant) = RingGrant::decode_slice(bytes) {
         assert_eq!(
             grant.encode().as_slice(),
             bytes,
             "accepted grant must round-trip byte-exactly"
         );
+        true
+    } else {
+        false
     }
 }
 
@@ -113,12 +120,12 @@ pub fn provider_grant(bytes: &[u8]) {
 ///
 /// A successful validation must yield a body range inside the allocation;
 /// allocation bytes past the declared body stay outside the range.
-pub fn provider_sample(bytes: &[u8]) {
+pub fn provider_sample(bytes: &[u8]) -> bool {
     let Ok(prefix) = SamplePrefix::snapshot(bytes) else {
-        return;
+        return false;
     };
     // Accept path: the expected identity equals the snapshotted identity.
-    if let Ok(validated) = prefix.validate(bytes.len(), prefix.identity()) {
+    let accepted = if let Ok(validated) = prefix.validate(bytes.len(), prefix.identity()) {
         let range = validated.body_range();
         assert_eq!(range.start, SAMPLE_PREFIX_BYTES);
         assert!(range.end >= range.start, "body range is inverted");
@@ -127,8 +134,12 @@ pub fn provider_sample(bytes: &[u8]) {
             "validated body range escapes the allocation"
         );
         assert_eq!(range.end - range.start, validated.body_len());
-    }
+        true
+    } else {
+        false
+    };
     // Reject path with one fixed foreign identity.
     let foreign = ReleaseIdentity::new(Incarnation::from_bytes([0x5a; 16]), u32::MAX, u64::MAX);
     let _ = prefix.validate(bytes.len(), foreign);
+    accepted
 }

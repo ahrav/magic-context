@@ -9,12 +9,14 @@ mod support;
 use std::time::Duration;
 use std::time::Instant;
 
-use mc_host::shm_provider::{TestShmPeer, SHM_TRANSPORT};
+use mc_host::shm_provider::{qualified_test_profile, TestShmPeer, SHM_TRANSPORT};
+use subc_protocol::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
 use support::raw_client::{FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
 use support::shm_process::{
     commit_shm_peer, daemon_info, daemon_role, goodbye_header, live_descendants, negotiate_grant,
     request_header, serial_crash_lock, shm_roundtrip, spawn_victim, start_daemon,
-    start_daemon_with, victim_role, Observer, RoleProcess, CRASH_ROOT, OBSERVATION_TIMEOUT,
+    start_daemon_with, victim_role, DaemonSoakStats, Observer, RoleProcess, CRASH_ROOT,
+    OBSERVATION_TIMEOUT,
 };
 use support::LINKED_MODULE_ID;
 
@@ -62,6 +64,35 @@ fn wait_for_dispatches(daemon: &mut RoleProcess, expected: u64, budget: Duration
     }
 }
 
+fn one_candidate_charges() -> [u64; 4] {
+    let charges = qualified_test_profile().charges();
+    [
+        charges.descriptors,
+        charges.arena_bytes,
+        charges.leases,
+        charges.mappings,
+    ]
+}
+
+fn wait_soak_stats(
+    daemon: &mut RoleProcess,
+    what: &str,
+    predicate: impl Fn(&DaemonSoakStats) -> bool,
+) -> DaemonSoakStats {
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        let stats = daemon.query_soak_stats();
+        if predicate(&stats) {
+            return stats;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon accounting did not reach {what} within the bounded wait"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios.
 // ---------------------------------------------------------------------------
@@ -106,6 +137,106 @@ async fn promptly_reaped_idle_kill_preserves_observer_and_restarts_fresh() {
 
     victim.teardown();
     fresh.teardown();
+    daemon.teardown();
+}
+
+/// Peer death is silent for the host ring endpoint: no `Goodbye` or
+/// readable close, so a victim killed WHILE holding an active committed
+/// candidate never becomes a suspect and its exact admission charges stay
+/// `active` until the daemon closes. commentlint: allow(JUDGE)
+///
+/// Known ring-backend dead-peer-reclamation gap, deferred to the `magic-context-ymc.12` retained-provider work: real reclamation must fail these exact-value assertions and force this claim to be updated. commentlint: allow(JUDGE)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_victim_holding_active_charges_is_never_reclaimed() {
+    let _serial = serial_crash_lock().await;
+    let data_root = tempfile::tempdir().expect("data root");
+    let mut daemon = start_daemon(data_root.path());
+    let info = daemon_info(data_root.path());
+    let mut observer = Observer::connect(&info, "observer-dead-peer").await;
+    observer.roundtrip(512, 7, BUDGET).await;
+
+    // The idle_committed barrier: the victim holds an active committed
+    // candidate and has NOT sent Goodbye when the kill lands.
+    let mut victim = spawn_victim(data_root.path(), "idle", "victim-dead-peer", None);
+    victim.expect_record("barrier idle_committed");
+    let held = one_candidate_charges();
+    let stats = wait_soak_stats(&mut daemon, "one active candidate", |stats| {
+        stats.active == held
+    });
+    assert_eq!(stats.quarantined, [0; 4]);
+    assert_eq!(stats.preparations, 1);
+    assert_eq!(stats.readiness, "Ready");
+
+    victim.kill();
+    let window = victim.reap_killed();
+
+    for _ in 0..10 {
+        let stats = daemon.query_soak_stats();
+        assert_eq!(stats.active, held, "dead-peer charges must stay active");
+        assert_eq!(stats.quarantined, [0; 4]);
+        assert_eq!(stats.preparations, 1);
+        assert_eq!(stats.readiness, "Ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    observer.roundtrip(1024, 42, window.remaining()).await;
+    let stats = daemon.query_soak_stats();
+    assert_eq!(stats.active, held);
+    assert_eq!(stats.quarantined, [0; 4]);
+
+    victim.teardown();
+    daemon.teardown();
+}
+
+/// A live peer that publishes a role-invalid frame closes unclean:
+/// `report_suspect` feeds the recovery controller, the uncertain ring
+/// cleanup isolates the record, and the provider resolves
+/// Recovering -> Ready with the candidate's exact charges quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_peer_frame_quarantines_exact_charges_and_returns_ready() {
+    let _serial = serial_crash_lock().await;
+    let data_root = tempfile::tempdir().expect("data root");
+    let mut daemon = start_daemon(data_root.path());
+    let info = daemon_info(data_root.path());
+    let mut observer = Observer::connect(&info, "observer-corrupt").await;
+    observer.roundtrip(512, 7, BUDGET).await;
+
+    let peer = commit_shm_peer(&info).await;
+    let held = one_candidate_charges();
+    wait_soak_stats(&mut daemon, "one active candidate", |stats| {
+        stats.active == held
+    });
+
+    // A Response is role-invalid from the peer side: the endpoint's header
+    // validation classifies it Corrupt and takes the unclean-close branch.
+    let corrupt = EnvelopeHeader {
+        len: 0,
+        ver: PROTOCOL_VERSION,
+        ty: FrameType::Response,
+        flags: Flags::new(false, Priority::Interactive, false),
+        channel: 0,
+        epoch: 0,
+        corr: 99,
+    };
+    tokio::task::block_in_place(|| {
+        peer.send(corrupt, &[]).expect("publish role-invalid frame");
+    });
+
+    let stats = wait_soak_stats(&mut daemon, "quarantined suspect charges", |stats| {
+        stats.quarantined == held && stats.active == [0; 4]
+    });
+    assert_eq!(stats.preparations, 1);
+    // Capacity remains under the 8-candidate limits, so the episode
+    // resolves back to Ready instead of Quarantined.
+    wait_soak_stats(&mut daemon, "readiness Ready", |stats| {
+        stats.readiness == "Ready" && stats.quarantined == held && stats.active == [0; 4]
+    });
+    observer.roundtrip(256, 5, BUDGET).await;
+    let peer = commit_shm_peer(&info).await;
+    tokio::task::block_in_place(|| {
+        shm_roundtrip(&peer, "victim-corrupt-fresh");
+        peer.send(goodbye_header(), &[]).expect("publish goodbye");
+    });
+
     daemon.teardown();
 }
 

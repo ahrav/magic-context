@@ -3,8 +3,7 @@
 //! Runs on stable with no libFuzzer or nightly requirement. Each corpus
 //! file passes through the same production decoder entry points the fuzz
 //! targets call; the harness asserts internally that no accepted input
-//! yields an out-of-range view, so replay only has to terminate without
-//! panicking.
+//! yields an out-of-range view.
 
 use std::fs;
 use std::path::Path;
@@ -13,7 +12,7 @@ use mc_shm_transport::harness;
 
 const EXPECTED_SEEDS: [&str; 5] = ["empty", "all-zero", "all-ff", "valid", "near-valid"];
 
-fn replay(target: &str, decoder: fn(&[u8])) {
+fn replay(target: &str, decoder: fn(&[u8]) -> bool) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fuzz/corpus")
         .join(target);
@@ -30,7 +29,10 @@ fn replay(target: &str, decoder: fn(&[u8])) {
             continue;
         }
         let bytes = fs::read(&path).expect("corpus file is readable");
-        decoder(&bytes);
+        let accepted = decoder(&bytes);
+        if path.file_name().is_some_and(|name| name == "valid") {
+            assert!(accepted, "corpus seed {target}/valid must be accepted");
+        }
         replayed += 1;
     }
     assert!(

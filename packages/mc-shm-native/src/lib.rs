@@ -101,16 +101,18 @@ fn clear_pending_exception(env: &Env) {
     }
 }
 
+fn cleared_descriptor_error(env: &Env) -> Error {
+    clear_pending_exception(env);
+    descriptor_error()
+}
+
 /// Reads one raw property exactly once. Missing/undefined properties and
 /// throwing getters both map to the bounded descriptor error.
 fn descriptor_field<'env>(env: &Env, object: &Object<'env>, name: &str) -> Result<Unknown<'env>> {
     match object.get::<Unknown<'env>>(name) {
         Ok(Some(value)) => Ok(value),
         Ok(None) => Err(descriptor_error()),
-        Err(_) => {
-            clear_pending_exception(env);
-            Err(descriptor_error())
-        }
+        Err(_) => Err(cleared_descriptor_error(env)),
     }
 }
 
@@ -121,14 +123,15 @@ fn descriptor_field<'env>(env: &Env, object: &Object<'env>, name: &str) -> Resul
 /// truncating cast exists.
 fn integer_field(env: &Env, object: &Object<'_>, name: &str, min: f64, max: f64) -> Result<f64> {
     let value = descriptor_field(env, object, name)?;
-    if value.get_type().map_err(|_| descriptor_error())? != ValueType::Number {
+    if value
+        .get_type()
+        .map_err(|_| cleared_descriptor_error(env))?
+        != ValueType::Number
+    {
         return Err(descriptor_error());
     }
     // SAFETY: the value was type-checked as Number above.
-    let number: f64 = unsafe { value.cast::<f64>() }.map_err(|_| {
-        clear_pending_exception(env);
-        descriptor_error()
-    })?;
+    let number: f64 = unsafe { value.cast::<f64>() }.map_err(|_| cleared_descriptor_error(env))?;
     if !number.is_finite()
         || number.fract() != 0.0
         || (number == 0.0 && number.is_sign_negative())
@@ -144,7 +147,11 @@ fn integer_field(env: &Env, object: &Object<'_>, name: &str, min: f64, max: f64)
 /// it so a hostile oversized string is rejected without allocation.
 fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> Result<String> {
     let value = descriptor_field(env, object, name)?;
-    if value.get_type().map_err(|_| descriptor_error())? != ValueType::String {
+    if value
+        .get_type()
+        .map_err(|_| cleared_descriptor_error(env))?
+        != ValueType::String
+    {
         return Err(descriptor_error());
     }
     let mut len = 0usize;
@@ -153,10 +160,10 @@ fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> R
         sys::napi_get_value_string_utf8(env.raw(), value.raw(), std::ptr::null_mut(), 0, &mut len)
     };
     if status != sys::Status::napi_ok || len > max_len {
-        return Err(descriptor_error());
+        return Err(cleared_descriptor_error(env));
     }
     // SAFETY: the value was type-checked as String above.
-    unsafe { value.cast::<String>() }.map_err(|_| descriptor_error())
+    unsafe { value.cast::<String>() }.map_err(|_| cleared_descriptor_error(env))
 }
 
 #[cfg(target_os = "linux")]

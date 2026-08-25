@@ -209,7 +209,13 @@ export function recoveryProvider(): FakePairedProvider {
         }
         if (frame.header.channel === 5) {
             host.send(
-                { ty: PeerFrameType.Response, flags: 0, channel: 5, epoch: 1, corr: frame.header.corr },
+                {
+                    ty: PeerFrameType.Response,
+                    flags: 0,
+                    channel: 5,
+                    epoch: 1,
+                    corr: frame.header.corr,
+                },
                 Buffer.from(JSON.stringify({ served: "shm" }), "utf8"),
             );
         }
@@ -219,6 +225,13 @@ export function recoveryProvider(): FakePairedProvider {
 
 function connectedTransports(events: SubcDiagnosticsEvent[]): string[] {
     return events.filter((e) => e.type === "connected").map((e) => e.transport ?? "");
+}
+
+/** Runs `turns` `setImmediate` turns without timer delays. */
+export async function settle(turns = 10): Promise<void> {
+    for (let index = 0; index < turns; index++) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -274,10 +287,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             assert.equal(conn1.socket.destroyed, false);
             await client.closeRoute(rawHandle);
             await waitUntil(
-                () =>
-                    conn1.frames.some(
-                        (f) => f.ty === PeerFrameType.Goodbye && f.channel === 0,
-                    ),
+                () => conn1.frames.some((f) => f.ty === PeerFrameType.Goodbye && f.channel === 0),
                 10_000,
             );
         },
@@ -353,22 +363,50 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 "connection_in_use",
             ];
             for (const reason of reasons) {
+                const label = `reason=${reason ?? "none"}`;
                 const provider = recoveryProvider();
                 const peer = await ctx.startPeer();
-                scriptNegotiations(peer, () => tcpSelectionBody(reason));
-                await ctx.connect(peer, { transportProviders: [provider] });
-                await delay(200);
-                assert.equal(peer.connections.length, 1, `reason=${reason ?? "none"}`);
-                assert.equal(provider.connectCount, 0, `reason=${reason ?? "none"}`);
+                const negotiations = scriptNegotiations(peer, () => tcpSelectionBody(reason));
+                let paces = 0;
+                const client = await ctx.connect(peer, {
+                    transportProviders: [provider],
+                    // The injected `sleep` increments `paces` so the test
+                    // can assert that no recovery attempt was paced.
+                    sleep: async () => {
+                        paces += 1;
+                    },
+                });
+                serveTcpRoutes(peer.connections[0] as FakePeerConnection, 7);
+                assert.deepEqual(
+                    await client.call("magic-context", "m1"),
+                    { served: "tcp" },
+                    label,
+                );
+                await client.closeAsync();
+                await settle();
+                assert.equal(negotiations(), 1, label);
+                assert.equal(peer.connections.length, 1, label);
+                assert.equal(provider.connectCount, 0, label);
+                assert.equal(paces, 0, label);
             }
             // Legacy fallback (exact unsupported_operation) is TCP
             // continuation evidence but never probe evidence.
             const provider = recoveryProvider();
             const peer = await ctx.startPeer({ negotiate: "unsupported-op" });
-            await ctx.connect(peer, { transportProviders: [provider] });
-            await delay(200);
+            let paces = 0;
+            const client = await ctx.connect(peer, {
+                transportProviders: [provider],
+                sleep: async () => {
+                    paces += 1;
+                },
+            });
+            serveTcpRoutes(peer.connections[0] as FakePeerConnection, 7);
+            assert.deepEqual(await client.call("magic-context", "m1"), { served: "tcp" });
+            await client.closeAsync();
+            await settle();
             assert.equal(peer.connections.length, 1);
             assert.equal(provider.connectCount, 0);
+            assert.equal(paces, 0);
         },
     },
     {
@@ -386,16 +424,17 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             const provider = recoveryProvider();
             const peer = await ctx.startPeer();
             scriptNegotiations(peer, () => tcpSelectionBody("unavailable"));
-            await ctx.connect(peer, {
+            const client = await ctx.connect(peer, {
                 transportProviders: [provider],
                 clock,
                 sleep,
             });
             // The escalating pacer sums to the 30s window in bounded steps.
             await waitUntil(() => now >= 30_000, 15_000);
-            await delay(250);
+            await client.closeAsync();
+            await settle();
             const settledCount = peer.connections.length;
-            await delay(250);
+            await settle();
             assert.equal(peer.connections.length, settledCount);
             assert.ok(settledCount <= 25, `unbounded attempts: ${settledCount}`);
             assert.equal(provider.connectCount, 0);

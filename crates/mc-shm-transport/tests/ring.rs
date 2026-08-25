@@ -496,6 +496,51 @@ fn grant_slice_rejects_every_truncation_point_and_one_byte_suffix() {
     );
 }
 
+/// The fuzz corpus seed `provider_grant/valid` doubles as the golden grant
+/// fixture: one exact `RingGrant::encode` output carrying the frozen
+/// ring-profile geometry.
+#[test]
+fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
+    const GOLDEN_GRANT_HEX: &str = "0200d489c07ee46333a5fe7901df356f6f460000000020000000000000\
+                                    0000000004000000002000000000000000004000040000000000000000";
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/provider_grant/valid");
+    let bytes = std::fs::read(path).expect("golden grant fixture is readable");
+    let text: String = bytes.iter().fold(String::new(), |mut text, byte| {
+        use std::fmt::Write;
+        write!(text, "{byte:02x}").unwrap();
+        text
+    });
+    assert_eq!(
+        text,
+        GOLDEN_GRANT_HEX.replace(char::is_whitespace, ""),
+        "the checked-in fixture bytes moved; update the copy of this hex in \
+         packages/plugin/src/shared/mc-host-client/shm-transport-provider.test.ts too"
+    );
+    let grant = RingGrant::decode_slice(&bytes).expect("golden grant fixture decodes");
+    assert_eq!(
+        grant.encode().as_slice(),
+        bytes.as_slice(),
+        "golden grant fixture must round-trip byte-exactly"
+    );
+    let frozen = profile();
+    let field =
+        |range: std::ops::Range<usize>| u64::from_le_bytes(bytes[range].try_into().unwrap());
+    assert_eq!(
+        u16::from_le_bytes([bytes[0], bytes[1]]),
+        2,
+        "layout version"
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[18..22].try_into().unwrap()),
+        0,
+        "host-to-peer lane"
+    );
+    assert_eq!(field(22..30), frozen.descriptor_depth() as u64);
+    assert_eq!(field(30..38), frozen.arena_bytes() as u64);
+    assert_eq!(field(38..46), frozen.max_leases() as u64);
+}
+
 #[cfg(target_os = "linux")]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut text, byte| {

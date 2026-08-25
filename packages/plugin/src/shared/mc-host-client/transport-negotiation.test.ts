@@ -29,7 +29,8 @@ import {
     TRANSPORT_TCP,
     type TransportOffer,
 } from "./transport-negotiation";
-import { decodeShmGrant, type ShmGrantErrorCode, ShmGrantError } from "./shm-grant";
+import { decodeShmGrant, ShmGrantError } from "./shm-grant";
+import { expectGrantCode, grantHex as sharedGrantHex } from "./test-support/shm-grant-fixtures";
 
 const VECTOR_TOKEN = "00112233445566778899aabbccddeeff";
 
@@ -670,17 +671,7 @@ describe("shared-memory grant descriptor schema (layer b)", () => {
 
     // Field offsets mirror RingGrant::encode in backend/ring.rs.
     function grantHex(lane: number, incarnation: number): string {
-        const raw = new Uint8Array(58);
-        const view = new DataView(raw.buffer);
-        view.setUint16(0, 2, true);
-        raw[2] = incarnation;
-        view.setUint32(18, lane, true);
-        view.setBigUint64(22, 32n, true);
-        view.setBigUint64(30, 67_108_864n, true);
-        view.setBigUint64(38, 32n, true);
-        view.setBigUint64(46, 67_108_864n + 12_288n, true);
-        view.setUint32(54, 0, true);
-        return [...raw].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+        return sharedGrantHex({ lane, incarnation });
     }
 
     function validGrantDescriptor(candidateId = 1): Record<string, unknown> {
@@ -693,18 +684,6 @@ describe("shared-memory grant descriptor schema (layer b)", () => {
             peer_to_host_fd: 11,
             peer_to_host_grant: grantHex(1, 0xcd),
         };
-    }
-
-    function expectGrantCode(fn: () => unknown, code: ShmGrantErrorCode): ShmGrantError {
-        let caught: unknown;
-        try {
-            fn();
-        } catch (error) {
-            caught = error;
-        }
-        expect(caught).toBeInstanceOf(ShmGrantError);
-        expect((caught as ShmGrantError).code).toBe(code);
-        return caught as ShmGrantError;
     }
 
     function grantResponse(descriptorJson: string): string {

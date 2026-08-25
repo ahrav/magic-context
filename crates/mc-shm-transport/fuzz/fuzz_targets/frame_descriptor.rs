@@ -7,5 +7,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    mc_shm_transport::harness::frame_descriptor(data);
+    let _ = mc_shm_transport::harness::frame_descriptor(data);
 });

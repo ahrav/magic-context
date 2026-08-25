@@ -5,37 +5,11 @@ import {
     QUALIFIED_TEST_PROFILE,
 } from "@magic-context/mc-shm-native";
 import { ByteBudget, type FrameChannelHandlers } from "./frame-channel";
-import { decodeShmGrant, type ShmGrantErrorCode, ShmGrantError } from "./shm-grant";
+import { decodeShmGrant, ShmGrantError } from "./shm-grant";
 import { createExplicitShmTestProvider } from "./shm-transport-provider";
+import { expectGrantCode as expectCode, grantHex } from "./test-support/shm-grant-fixtures";
 import type { CandidateChannelArgs } from "./transport-provider";
 import { sanitizedCandidateFactory } from "./transport-provider";
-
-// Field offsets mirror RingGrant::encode in backend/ring.rs.
-function grantHex(
-    overrides: Partial<{
-        layoutVersion: number;
-        incarnation: number;
-        lane: number;
-        depth: bigint;
-        arena: bigint;
-        maxLeases: bigint;
-        total: bigint;
-        reserved: number;
-    }> = {},
-): string {
-    const bytes = new Uint8Array(58);
-    const view = new DataView(bytes.buffer);
-    view.setUint16(0, overrides.layoutVersion ?? 2, true);
-    bytes[2] = overrides.incarnation ?? 0xab;
-    view.setUint32(18, overrides.lane ?? 0, true);
-    view.setBigUint64(22, overrides.depth ?? 32n, true);
-    const arena = overrides.arena ?? 67_108_864n;
-    view.setBigUint64(30, arena, true);
-    view.setBigUint64(38, overrides.maxLeases ?? 32n, true);
-    view.setBigUint64(46, overrides.total ?? arena + 12_288n, true);
-    view.setUint32(54, overrides.reserved ?? 0, true);
-    return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 
 function validGrant(candidateId = 1): Record<string, unknown> {
     return {
@@ -51,18 +25,6 @@ function validGrant(candidateId = 1): Record<string, unknown> {
 
 const OPTIONS = { expectedProfile: QUALIFIED_TEST_PROFILE };
 
-function expectCode(fn: () => unknown, code: ShmGrantErrorCode): ShmGrantError {
-    let caught: unknown;
-    try {
-        fn();
-    } catch (error) {
-        caught = error;
-    }
-    expect(caught).toBeInstanceOf(ShmGrantError);
-    expect((caught as ShmGrantError).code).toBe(code);
-    return caught as ShmGrantError;
-}
-
 function channelArgs(): CandidateChannelArgs {
     const handlers: FrameChannelHandlers = {
         onFrame: () => {},
@@ -72,6 +34,17 @@ function channelArgs(): CandidateChannelArgs {
 }
 
 describe("grant geometry and duplex-pair binding", () => {
+    // Pinned by golden_grant_fixture_matches_the_frozen_ring_profile_encoding in crates/mc-shm-transport/tests/ring.rs; keep both hex literals identical. commentlint: allow(JUDGE)
+    const GOLDEN_GRANT_HEX =
+        "0200d489c07ee46333a5fe7901df356f6f4600000000200000000000000000000004000000002000" +
+        "000000000000004000040000000000000000";
+
+    test("the pinned golden grant fixture is accepted as a lane-0 grant", () => {
+        const descriptor = { ...validGrant(), host_to_peer_grant: GOLDEN_GRANT_HEX };
+        const decoded = decodeShmGrant(descriptor, OPTIONS);
+        expect(decoded.hostToPeerGrant).toBe(GOLDEN_GRANT_HEX);
+    });
+
     test("an internally consistent over-profile grant is rejected", () => {
         const overArena = 1n << 40n;
         const grant = {
