@@ -1309,6 +1309,16 @@ impl Inner {
                 };
                 let state = lock_unpoisoned(&self.pending).remove(&key);
                 let Some(state) = state else {
+                    // An unmatched terminal is normally dropped, but a `Response`
+                    // on identity 0/0 can carry a route the host bound for an
+                    // `open_route` whose caller has since dropped or timed out.
+                    // Abandoning that request cannot withdraw it - identity 0/0
+                    // has no legal `Cancel` (Section 6.2) - so the bind lands with
+                    // no caller to name it, and dropping it here strands a host
+                    // route and channel permit until the generation ends.
+                    if header.ty == FrameType::Response && header.channel == 0 {
+                        self.release_stranded_route(&body);
+                    }
                     return;
                 };
                 drop(charge);
@@ -1443,6 +1453,37 @@ impl Inner {
                 }
             }
             _ => self.retire("protocol_violation"),
+        }
+    }
+
+    /// Returns a late route bind that no caller can ever own.
+    ///
+    /// Section 8.2 fixes the remedy for a successful bind the client cannot
+    /// cache: send a best-effort route `Goodbye`, and close the connection only
+    /// when that cleanup cannot be queued. A body that names no route is left
+    /// alone; there is nothing to release and nothing to report to a caller that
+    /// is already gone.
+    ///
+    /// A bind already in the route cache belongs to a caller that received it,
+    /// so a duplicate terminal for it must not be treated as stranded - the
+    /// `Goodbye` would close a route still in use.
+    fn release_stranded_route(&self, body: &[u8]) {
+        let Ok(route) = parse_route_open(body) else {
+            return;
+        };
+        if lock_unpoisoned(&self.routes).contains(&route) {
+            return;
+        }
+        if self
+            .send_control(
+                FrameType::Goodbye,
+                pure_header_flags(),
+                FrameId::routed(route, 0),
+                None,
+            )
+            .is_err()
+        {
+            self.retire("stranded_route_cleanup_failed");
         }
     }
 
@@ -3575,6 +3616,280 @@ mod tests {
         };
         assert_eq!(error.code(), "negotiation_failed");
         drop(peer.await);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_control_open_releases_a_late_bound_route() {
+        // A dropped or timed-out `open_route` leaves the request written, so the
+        // host may still bind the route and answer. That terminal arrives with no
+        // pending entry, and dropping it silently strands the binding: the caller
+        // never learns the handle, so it can send no route `Goodbye`, and each
+        // repeated abandon burns another host-side route and channel permit for
+        // the life of the generation. Section 8.2 fixes the remedy for a late bind
+        // the client cannot own - best-effort route `Goodbye`, and close the
+        // connection only when that cleanup cannot be queued.
+        let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let control = RouteHandle {
+            channel: 0,
+            epoch: 0,
+        };
+        let (tx, _rx) = oneshot::channel();
+        let (key, publish) = inner
+            .admit(
+                control,
+                Vec::new(),
+                PendingKind::Unary(tx),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("control request admitted");
+        // The host answers only a request it received, so the writer claimed it.
+        // That is also what makes the abandonment `OutcomeUnknown` - the branch
+        // that has no legal `Cancel` to send on identity 0/0.
+        assert!(claim_for_write(&publish), "the writer claimed the request");
+        drop(data_rx.recv().await);
+
+        // Exactly what `UnaryAdmissionGuard::drop` does for a dropped caller.
+        let removal = inner
+            .cancel_key(key, "caller_dropped")
+            .expect("abandoning a control request never fails");
+        assert!(matches!(removal, PendingRemoval::Cancelled));
+        assert!(
+            control_rx.try_recv().is_err(),
+            "identity 0/0 has no legal Cancel, so abandoning emits no control frame"
+        );
+
+        // The host bound the route anyway and answers the abandoned correlation.
+        let bound = RouteHandle {
+            channel: 9,
+            epoch: 3,
+        };
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "route.open",
+            "route_channel": bound.channel,
+            "route_epoch": bound.epoch,
+        }))
+        .expect("body encodes");
+        inner.dispatch(
+            EnvelopeHeader {
+                len: u32::try_from(body.len()).expect("fits a frame length"),
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::Response,
+                flags: response_flags(false, false),
+                channel: control.channel,
+                epoch: control.epoch,
+                corr: key.corr,
+            },
+            body,
+            ByteCharge::none(),
+        );
+
+        let goodbye = control_rx
+            .try_recv()
+            .expect("a stranded bind is released with a route Goodbye");
+        assert_eq!(goodbye.bytes[5], FrameType::Goodbye as u8);
+        let header = decode_header(&goodbye.bytes).expect("the Goodbye decodes");
+        assert_eq!(header.channel, bound.channel, "the exact stranded channel");
+        assert_eq!(header.epoch, bound.epoch, "the exact stranded epoch");
+        assert_eq!(header.corr, 0, "a route Goodbye carries correlation 0");
+        assert!(
+            !inner.retired.load(Ordering::Acquire),
+            "reclaiming one route must not take unrelated routes with it"
+        );
+        assert!(
+            !lock_unpoisoned(&inner.routes).contains(&bound),
+            "a late bind never enters the client cache"
+        );
+        inner.retire("test_done");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_bind_terminal_never_closes_an_owned_route() {
+        // Reclaiming a stranded bind reads an unmatched control `Response` for a
+        // route handle, and a duplicate terminal for a route the caller already
+        // received is unmatched too. Treating that as stranded would send a
+        // `Goodbye` for a route still in use, so the route cache is what
+        // separates "nobody owns this" from "somebody does".
+        let (inner, _data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let owned = route(1);
+        assert!(
+            lock_unpoisoned(&inner.routes).contains(&owned),
+            "the fixture owns this route"
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "route.open",
+            "route_channel": owned.channel,
+            "route_epoch": owned.epoch,
+        }))
+        .expect("body encodes");
+        inner.dispatch(
+            EnvelopeHeader {
+                len: u32::try_from(body.len()).expect("fits a frame length"),
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::Response,
+                flags: response_flags(false, false),
+                channel: 0,
+                epoch: 0,
+                corr: FIRST_APPLICATION_CORRELATION,
+            },
+            body,
+            ByteCharge::none(),
+        );
+
+        assert!(
+            control_rx.try_recv().is_err(),
+            "an owned route is never released by a duplicate bind terminal"
+        );
+        assert!(
+            lock_unpoisoned(&inner.routes).contains(&owned),
+            "the owned route stays live"
+        );
+        inner.retire("test_done");
+    }
+
+    #[tokio::test]
+    async fn token_cancelling_a_stream_leaves_its_queued_items_reachable() {
+        // The token and deadline watcher settles a stream through `cancel_key`,
+        // which cannot reach the receiver the caller holds, so queued items stay
+        // charged against the owner-wide retained budget. That is correct only
+        // because the bytes remain reachable: `finished` stays false, so `next`
+        // still drains them and `Drop` drains whatever is left. `cancel` has to
+        // drain by hand precisely because it sets `finished` and makes the same
+        // bytes unreadable forever.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let (items_tx, items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let (key, publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                PendingKind::Stream {
+                    items: items_tx,
+                    terminal: terminal_tx,
+                    _settled: CancellationToken::new().drop_guard(),
+                },
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("stream admitted");
+        assert!(claim_for_write(&publish), "the writer claimed the request");
+        drop(data_rx.recv().await);
+        let mut stream = ResponseStream {
+            inner: Arc::downgrade(&inner),
+            key,
+            correlation: key.corr,
+            items: items_rx,
+            terminal: Some(terminal_rx),
+            finished: false,
+        };
+
+        const ITEMS: usize = 4;
+        for _ in 0..ITEMS {
+            inner.dispatch(
+                EnvelopeHeader {
+                    len: 8,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType::StreamData,
+                    flags: response_flags(false, false),
+                    channel: key.channel,
+                    epoch: key.epoch,
+                    corr: key.corr,
+                },
+                vec![7; 8],
+                inner.retained_budget.charge(8).expect("retained bytes"),
+            );
+        }
+        assert_eq!(inner.retained_budget.used(), ITEMS * 8);
+
+        // Exactly what the watcher spawned by `start_stream` does.
+        let _ = inner.cancel_key(key, "cancelled");
+        assert!(
+            !stream.finished,
+            "a watcher cancellation does not short-circuit the consumer"
+        );
+
+        // Every queued item is still delivered, in order, before the terminal.
+        let mut drained = 0;
+        loop {
+            match stream.next().await {
+                Ok(Some(item)) => {
+                    assert_eq!(item.body, vec![7; 8]);
+                    drained += 1;
+                }
+                Ok(None) => panic!("a cancelled stream reports its cancellation"),
+                Err(error) => {
+                    assert_eq!(error.code(), "cancelled");
+                    break;
+                }
+            }
+        }
+        assert_eq!(drained, ITEMS, "the queued items survive the cancellation");
+        assert_eq!(
+            inner.retained_budget.used(),
+            0,
+            "draining the cancelled stream releases every charge"
+        );
+        inner.retire("test_done");
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_token_cancelled_stream_releases_its_queued_charges() {
+        // The other half of the reachability contract: a caller that never polls
+        // a watcher-cancelled stream still releases the retained bytes when it
+        // drops the value, so no charge outlives the consumer that holds it.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let (items_tx, items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let (key, publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                PendingKind::Stream {
+                    items: items_tx,
+                    terminal: terminal_tx,
+                    _settled: CancellationToken::new().drop_guard(),
+                },
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("stream admitted");
+        assert!(claim_for_write(&publish), "the writer claimed the request");
+        drop(data_rx.recv().await);
+        let stream = ResponseStream {
+            inner: Arc::downgrade(&inner),
+            key,
+            correlation: key.corr,
+            items: items_rx,
+            terminal: Some(terminal_rx),
+            finished: false,
+        };
+
+        const ITEMS: usize = 4;
+        for _ in 0..ITEMS {
+            inner.dispatch(
+                EnvelopeHeader {
+                    len: 8,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType::StreamData,
+                    flags: response_flags(false, false),
+                    channel: key.channel,
+                    epoch: key.epoch,
+                    corr: key.corr,
+                },
+                vec![7; 8],
+                inner.retained_budget.charge(8).expect("retained bytes"),
+            );
+        }
+        let _ = inner.cancel_key(key, "cancelled");
+        assert_eq!(inner.retained_budget.used(), ITEMS * 8);
+
+        drop(stream);
+        assert_eq!(
+            inner.retained_budget.used(),
+            0,
+            "dropping the consumer releases every queued charge"
+        );
+        inner.retire("test_done");
     }
 
     #[tokio::test]
