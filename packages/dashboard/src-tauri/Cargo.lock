@@ -2075,6 +2075,7 @@ dependencies = [
  "image",
  "lazy_static",
  "libc",
+ "mc-core",
  "md5",
  "notify",
  "open",
@@ -2084,6 +2085,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -2109,6 +2111,15 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "mc-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "md5"

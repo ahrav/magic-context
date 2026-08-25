@@ -11,6 +11,7 @@
 pub mod claim_operation;
 pub mod decay;
 
+#[cfg(feature = "cache-core")]
 pub use cortexkit_cache_core::{
     Action, CoreState, DurabilityClass, FrozenUnit, PassInput, StepResult,
 };

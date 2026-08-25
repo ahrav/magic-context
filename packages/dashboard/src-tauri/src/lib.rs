@@ -1,3 +1,4 @@
+pub mod claim_adapter;
 pub mod commands;
 pub mod config;
 pub mod db;

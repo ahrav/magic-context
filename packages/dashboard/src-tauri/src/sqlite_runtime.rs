@@ -8,7 +8,17 @@
 //! into `mc-core` once the dashboard joins the claim operation contract; the
 //! dashboard build stays standalone until then.
 
-use rusqlite::Connection;
+use mc_core::claim_operation::sha256_hex_utf8;
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::Path;
+
+const DIRECT_FORMAT_FIXTURE: &str = include_str!(
+    "../../../plugin/src/features/magic-context/fixtures/direct-format-vocabulary-v1.json"
+);
+
+pub const DATABASE_RESET_MARKER_SUFFIX: &str = ".mc-reset";
 
 /// `PRAGMA application_id` value for the direct format: ASCII "MCTX".
 pub const MC_APPLICATION_ID: u32 = 0x4D43_5458;
@@ -137,4 +147,149 @@ pub fn verify_sqlite_connection_contract(
         ));
     }
     Ok(violations)
+}
+
+fn direct_format_fixture() -> Result<Value, String> {
+    serde_json::from_str(DIRECT_FORMAT_FIXTURE)
+        .map_err(|error| format!("embedded direct-format fixture is invalid: {error}"))
+}
+
+fn lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Validates the exact direct-format family.
+pub fn verify_direct_format(conn: &Connection, db_path: &Path) -> Result<Vec<String>, String> {
+    let fixture = direct_format_fixture()?;
+    let mut reasons = Vec::new();
+    if std::path::PathBuf::from(format!("{}{}", db_path.display(), DATABASE_RESET_MARKER_SUFFIX))
+        .exists()
+    {
+        reasons.push("a pending reset marker exists for this database family".to_string());
+    }
+
+    let expected_application_id = fixture["applicationId"]
+        .as_i64()
+        .ok_or("direct-format fixture applicationId is invalid")?;
+    let expected_epoch = fixture["formatEpoch"]
+        .as_i64()
+        .ok_or("direct-format fixture formatEpoch is invalid")?;
+    let expected_manifest = fixture["goldens"]["manifestDigest"]
+        .as_str()
+        .ok_or("direct-format fixture manifest digest is invalid")?;
+
+    let application_id: i64 = conn
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if application_id != expected_application_id {
+        reasons.push(format!(
+            "application_id {application_id} does not match expected {expected_application_id}"
+        ));
+    }
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if user_version != expected_epoch {
+        reasons.push(format!(
+            "user_version {user_version} does not match expected format epoch {expected_epoch}"
+        ));
+    }
+
+    let marker_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = ?1",
+            [DIRECT_FORMAT_MARKER_TABLE],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if marker_exists.is_none() {
+        reasons.push("direct-format marker is absent".to_string());
+    } else {
+        let rows = conn
+            .prepare(
+                "SELECT format_epoch, database_incarnation_id, component_manifest_digest, \
+                        created_at_ms, marker_digest FROM mc_format_marker",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| error.to_string())?;
+        if rows.len() != 1 {
+            reasons.push(format!("marker table has {} rows", rows.len()));
+        } else {
+            let (epoch, incarnation, manifest, created_at, stored_digest) = &rows[0];
+            if *epoch != expected_epoch {
+                reasons.push(format!(
+                    "marker format epoch {epoch} does not match expected {expected_epoch}"
+                ));
+            }
+            if !lower_hex(incarnation, 32) {
+                reasons.push("marker database incarnation ID is invalid".to_string());
+            }
+            if !lower_hex(manifest, 64) {
+                reasons.push("marker component manifest digest is invalid".to_string());
+            } else if manifest != expected_manifest {
+                reasons.push(
+                    "marker component manifest digest does not match this build's manifest"
+                        .to_string(),
+                );
+            }
+            let digest_input = format!(
+                "{FORMAT_MARKER_DIGEST_PROTOCOL}\napplication_id={expected_application_id}\nformat_epoch={epoch}\ndatabase_incarnation_id={incarnation}\ncomponent_manifest_digest={manifest}\ncreated_at_ms={created_at}"
+            );
+            if sha256_hex_utf8(&digest_input) != *stored_digest {
+                reasons.push("marker digest mismatch".to_string());
+            }
+        }
+    }
+
+    let components = fixture["componentManifest"]["components"]
+        .as_array()
+        .ok_or("direct-format fixture components are invalid")?;
+    let mut expected_objects = BTreeSet::from([DIRECT_FORMAT_MARKER_TABLE.to_string()]);
+    for component in components {
+        for provided in component["provides"]
+            .as_array()
+            .ok_or("direct-format fixture provides list is invalid")?
+        {
+            expected_objects.insert(
+                provided
+                    .as_str()
+                    .ok_or("direct-format fixture object name is invalid")?
+                    .to_string(),
+            );
+        }
+    }
+    let actual_objects: BTreeSet<String> = conn
+        .prepare(
+            "SELECT name FROM main.sqlite_schema \
+             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()
+        })
+        .map_err(|error| error.to_string())?;
+    for missing in expected_objects.difference(&actual_objects) {
+        reasons.push(format!("missing registered schema object: {missing}"));
+    }
+    for extra in actual_objects.difference(&expected_objects) {
+        reasons.push(format!("unregistered schema object: {extra}"));
+    }
+    Ok(reasons)
 }

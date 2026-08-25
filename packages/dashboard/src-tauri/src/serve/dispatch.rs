@@ -2,7 +2,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{commands, config, db, embedding_probe, log_parser, workspaces, AppState};
+use crate::{claim_adapter, commands, config, db, embedding_probe, log_parser, workspaces, AppState};
 
 #[derive(Debug)]
 pub enum DispatchError {
@@ -20,19 +20,11 @@ struct NoArgs {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GetMemoriesArgs {
     project: Option<String>,
-    workspace_id: Option<i64>,
-    status: Option<String>,
+    lifecycle: Option<String>,
     category: Option<String>,
     search: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProjectWorkspaceArgs {
-    project: Option<String>,
-    workspace_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -73,42 +65,33 @@ struct ApplyWorkspaceChangesArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryStatusArgs {
-    memory_id: i64,
-    status: String,
+struct SetMemoryLifecycleArgs {
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
+    lifecycle_state: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryContentArgs {
-    memory_id: i64,
+struct ReviseMemoryContentArgs {
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
     content: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryCategoryArgs {
-    memory_id: i64,
+struct ReviseMemoryCategoryArgs {
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
     category: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryIdArgs {
-    memory_id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BulkMemoryStatusArgs {
-    memory_ids: Vec<i64>,
-    status: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BulkMemoryIdsArgs {
-    memory_ids: Vec<i64>,
+struct BulkArchiveMemoriesArgs {
+    targets: Vec<claim_adapter::ClaimMutationTarget>,
+    operation_key: String,
 }
 
 #[derive(Deserialize)]

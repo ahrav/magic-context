@@ -19,6 +19,8 @@ tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
+mc-core = { path = "../../../crates/mc-core", default-features = false }
+sha2 = "0.10"
 notify = { version = "6", features = ["macos_fsevent"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
