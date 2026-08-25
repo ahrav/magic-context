@@ -952,10 +952,25 @@ impl HistorianProducer {
             return Err(ambiguous);
         }
 
-        let reconnected = self
+        let reconnected = match self
             .connector
             .reconnect(&self.config, &frozen_identity)
-            .await?;
+            .await
+        {
+            Ok(reconnected) => reconnected,
+            Err(error) => {
+                // The replacement connection is the replay's own machinery, not
+                // the thing the caller asked about. Surfacing the dial failure
+                // replaces an `OutcomeUnknown` send with a transport error that
+                // carries no send classification at all — `send_outcome()` is
+                // `None` for `Client` — so a consumer can no longer tell that the
+                // frozen request may already have committed. Keep the ambiguity
+                // and log the dial failure as context, exactly as the cleanup
+                // failure above does.
+                eprintln!("mc-module: historian replay reconnect failed: {error}");
+                return Err(ambiguous);
+            }
+        };
         let daemon_changed = reconnected.connection.daemon_id() != frozen_daemon;
         let identity_changed = reconnected.identity != frozen_identity;
         self.connection = reconnected.connection;
@@ -1546,8 +1561,15 @@ mod tests {
             identity: &SemanticIdentity,
         ) -> Result<Reconnected, HistorianProducerError> {
             self.reconnect_calls.fetch_add(1, Ordering::SeqCst);
-            let (connection, override_identity) =
-                self.reconnects.lock().unwrap().pop_front().unwrap();
+            // An exhausted queue stands in for a dial that cannot be completed —
+            // a transient daemon outage during replay setup.
+            let Some((connection, override_identity)) = self.reconnects.lock().unwrap().pop_front()
+            else {
+                return Err(HistorianProducerError::Client(HistorianClientFailure {
+                    code: "connect_failed".to_owned(),
+                    message: "no host to dial".to_owned(),
+                }));
+            };
             Ok(Reconnected {
                 connection: Box::new(connection),
                 identity: override_identity.unwrap_or_else(|| identity.clone()),
@@ -1860,6 +1882,49 @@ mod tests {
         assert!(
             second_state.lock().unwrap().opened_routes.is_empty(),
             "no route may be bound for a cancelled replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_replay_reconnect_keeps_the_send_ambiguous() {
+        // The replay exists because the first `session.send` may already have
+        // committed. If the replacement dial fails — a transient daemon outage —
+        // reporting that transport error discards the only evidence of that
+        // ambiguity: `Client` carries no send classification at all, so a
+        // consumer can no longer tell the request might be live.
+        let first = connection(9, [Err(cancelled_unknown())]);
+        let connector = Arc::new(FakeConnector {
+            initial: first,
+            // No reconnect available: the dial fails.
+            reconnects: Mutex::new(VecDeque::new()),
+            reconnect_calls: AtomicU64::new(0),
+        });
+        let config = HistorianProducerConfig {
+            request_timeout: Duration::from_secs(1),
+            await_timeout: Duration::from_secs(1),
+            ..HistorianProducerConfig::new("/unused", "/project", "opencode")
+        };
+        let mut producer = HistorianProducer::connect_with(config, connector.clone())
+            .await
+            .unwrap();
+
+        let error = producer
+            .start("session", "", "prompt", "provider/model")
+            .await
+            .expect_err("a replay that cannot dial does not succeed");
+        assert_eq!(
+            connector.reconnect_calls.load(Ordering::SeqCst),
+            1,
+            "the replay did attempt the dial"
+        );
+        assert!(
+            is_outcome_unknown(&error),
+            "the dial failure must not replace the ambiguous send classification: {error:?}"
+        );
+        assert_eq!(
+            error.send_outcome(),
+            Some(HistorianSendOutcome::OutcomeUnknown),
+            "a consumer asking whether the request was sent must still get the ambiguous answer"
         );
     }
 
