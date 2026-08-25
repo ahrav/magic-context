@@ -9,12 +9,12 @@ use std::{
     error::Error,
     ffi::OsString,
     fmt, io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use rustix::{
     fd::OwnedFd,
-    fs::{openat, Mode, OFlags, CWD},
+    fs::{openat, Mode, OFlags},
 };
 use serde::{Deserialize, Serialize};
 
@@ -243,27 +243,31 @@ fn open_parent(path: &Path) -> Result<(OwnedFd, OsString), ConnectionFileError> 
         .ok_or_else(|| ConnectionFileError::InvalidPath {
             path: path.to_path_buf(),
         })?;
-    let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
-    let mut current = openat(
-        CWD,
-        if parent.is_absolute() { "/" } else { "." },
-        flags,
-        Mode::empty(),
-    )
-    .map_err(|source| io_error("open_anchor", path, source.into()))?;
+    // Anchor open, ancestor-safety proof, and component classification are shared
+    // with `instance::secure_runtime_dir`. The walks themselves are not: that one
+    // creates and tightens the host's own runtime directory, while this one is
+    // read-only discovery. Only the hardening rules are common, and those are the
+    // part that must never drift.
+    let mut current = crate::instance::open_safe_anchor(path)
+        .map_err(|source| io_error("open_anchor", path, source.into()))?
+        .ok_or_else(|| ConnectionFileError::Insecure {
+            path: path.to_path_buf(),
+        })?;
     validate_directory(&current, path, false)?;
 
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            if matches!(component, Component::RootDir | Component::CurDir) {
-                continue;
-            }
-            return Err(ConnectionFileError::InvalidPath {
-                path: path.to_path_buf(),
-            });
-        };
-        current = openat(&current, component, flags, Mode::empty())
-            .map_err(|source| io_error("open_parent", path, source.into()))?;
+    let components = crate::instance::normal_components(parent).ok_or_else(|| {
+        ConnectionFileError::InvalidPath {
+            path: path.to_path_buf(),
+        }
+    })?;
+    for component in components {
+        current = openat(
+            &current,
+            component,
+            crate::instance::HARDENED_DIR_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(|source| io_error("open_parent", path, source.into()))?;
         validate_directory(&current, path, false)?;
     }
     validate_directory(&current, path, true)?;
