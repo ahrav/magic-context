@@ -1,17 +1,13 @@
 import type { Database } from "../../../shared/sqlite";
 import { isInTransaction } from "../../../shared/sqlite";
-import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
-import { computeNormalizedHash } from "./normalize-hash";
+import { V2_MEMORY_CATEGORIES } from "./constants";
+import type { CanonicalJsonValue } from "./claim-operation-contract";
 import {
-    computeClaimOperationRequestDigest,
-    type CanonicalJsonValue,
-} from "./claim-operation-contract";
-import {
-    type ClaimOperationStageOutcome,
-    runClaimOperationInCurrentTransaction,
-    stageCreateProjectMemoryClaimInCurrentTransaction,
-} from "./storage-claim-operations";
-import { ensureProject } from "./storage-claims";
+    type AutonomousManifestIdentity,
+    runAutonomousCreationManifestInCurrentTransaction,
+} from "./storage-claim-autonomous";
+import { stageCreateProjectMemoryClaimInCurrentTransaction } from "./storage-claim-operations";
+import { ensureProject, sha256Utf8Hex } from "./storage-claims";
 import type { MemoryCategory } from "./types";
 
 interface SessionFact {
@@ -22,6 +18,7 @@ interface SessionFact {
 export interface HistorianPromotionIdentity {
     producer: "opencode-historian" | "pi-historian" | "test-historian";
     runId: string;
+    leaseKey: string;
     leaseGeneration: string | number;
     batchId: string;
 }
@@ -34,37 +31,29 @@ export interface PromotedMemoryRef {
 }
 
 function isPromotableCategory(category: string): category is MemoryCategory {
-    return PROMOTABLE_CATEGORIES.includes(category as MemoryCategory);
+    return V2_MEMORY_CATEGORIES.includes(category as (typeof V2_MEMORY_CATEGORIES)[number]);
 }
 
-function resolveExpiresAt(category: MemoryCategory, nowMs: number): number | null {
-    const ttl = CATEGORY_DEFAULT_TTL[category];
-    return ttl === undefined ? null : nowMs + ttl;
-}
-
-function mergeStages(outcomes: readonly ClaimOperationStageOutcome[]): ClaimOperationStageOutcome {
-    const effects = outcomes.flatMap((outcome) => (outcome.kind === "effects" ? outcome.effects : []));
-    if (effects.length === 0) return { kind: "noop", payload: { claims: [] } };
-    return {
-        kind: "effects",
-        payload: { claims: outcomes.map((outcome) => outcome.payload ?? null) },
-        effects,
-        policyRevisionIds: [
-            ...new Set(
-                outcomes.flatMap((outcome) =>
-                    outcome.kind === "effects" ? (outcome.policyRevisionIds ?? []) : [],
-                ),
-            ),
-        ],
-    };
+function assertIdentity(identity: HistorianPromotionIdentity): void {
+    if (
+        !identity.producer ||
+        !identity.runId ||
+        !identity.leaseKey ||
+        !identity.batchId ||
+        (typeof identity.leaseGeneration === "number"
+            ? !Number.isSafeInteger(identity.leaseGeneration) || identity.leaseGeneration < 1
+            : identity.leaseGeneration.length === 0)
+    ) {
+        throw new Error("historian promotion identity is incomplete");
+    }
 }
 
 function refsFromPayload(payload: CanonicalJsonValue): PromotedMemoryRef[] {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
-    const claims = (payload as { claims?: unknown }).claims;
-    if (!Array.isArray(claims)) return [];
+    const items = (payload as { items?: unknown }).items;
+    if (!Array.isArray(items)) return [];
     const refs: PromotedMemoryRef[] = [];
-    for (const item of claims) {
+    for (const item of items) {
         if (!item || typeof item !== "object" || Array.isArray(item)) continue;
         const claim = (item as { claim?: unknown }).claim;
         if (!claim || typeof claim !== "object" || Array.isArray(claim)) continue;
@@ -86,83 +75,70 @@ function refsFromPayload(payload: CanonicalJsonValue): PromotedMemoryRef[] {
     return refs;
 }
 
-/** This function joins an active transaction or creates one for the promotion. */
 export function promoteSessionFactsDurable(
     db: Database,
     sessionId: string,
     projectIdentity: string,
-    facts: SessionFact[],
-    identity: HistorianPromotionIdentity = {
-        producer: "test-historian",
-        runId: sessionId,
-        leaseGeneration: "test",
-        batchId: "default",
-    },
+    facts: readonly SessionFact[],
+    identity: HistorianPromotionIdentity,
 ): PromotedMemoryRef[] {
+    assertIdentity(identity);
+    const seen = new Set<string>();
+    const promotable = facts.flatMap((fact) => {
+        const content = fact.content.trim();
+        if (!isPromotableCategory(fact.category) || !content) return [];
+        const key = `${fact.category}:${sha256Utf8Hex(content)}`;
+        if (seen.has(key)) return [];
+        seen.add(key);
+        return [{ category: fact.category, content }];
+    });
+
     const apply = (): PromotedMemoryRef[] => {
-        const nowMs = Date.now();
         const projectId = ensureProject(db, projectIdentity);
-        const seen = new Set<string>();
-        const promotable = facts.filter((fact) => {
-            if (!isPromotableCategory(fact.category) || !fact.content.trim()) return false;
-            const key = `${fact.category}:${computeNormalizedHash(fact.content)}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-        const operation = runClaimOperationInCurrentTransaction(
+        const manifestIdentity: AutonomousManifestIdentity = {
+            ...identity,
+            task: "historian-promotion",
+        };
+        const operation = runAutonomousCreationManifestInCurrentTransaction({
             db,
-            {
-                producer: identity.producer,
-                operationKey: [
-                    "publish",
-                    identity.runId,
-                    String(identity.leaseGeneration),
-                    identity.batchId,
-                ].join(":"),
-                requestDigest: computeClaimOperationRequestDigest({
-                    batchId: identity.batchId,
-                    facts: promotable.map((fact) => ({
-                        category: fact.category,
-                        content: fact.content,
-                    })),
-                    leaseGeneration: String(identity.leaseGeneration),
-                    operation: "historian-promote-project-memory",
-                    projectId,
-                    runId: identity.runId,
-                    sessionId,
-                }),
-            },
-            () =>
-                mergeStages(
-                    promotable.map((fact, index) =>
-                        stageCreateProjectMemoryClaimInCurrentTransaction(
-                            db,
-                            {
-                                projectId,
-                                content: fact.content,
-                                category: fact.category,
-                                expiresAt: resolveExpiresAt(fact.category as MemoryCategory, nowMs),
-                                provenance: {
-                                    sourceLocator: `historian://${identity.producer}/${sessionId}/${identity.batchId}/${index}`,
-                                    sourceContent: fact.content,
-                                    sourceSessionId: sessionId,
-                                    extractor: "historian",
-                                    extractorVersion: "direct-claims-v1",
-                                    extractorRunId: identity.runId,
-                                    independenceKey: `${identity.producer}:${identity.runId}:${index}`,
-                                    sourceTrustClass: "model_inference",
-                                },
-                                actor: identity.producer,
-                                nowMs,
-                            },
-                            nowMs,
-                        ),
-                    ),
+            identity: manifestIdentity,
+            items: promotable.map((fact, index) => ({
+                key: {
+                    category: fact.category,
+                    contentDigest: sha256Utf8Hex(fact.content),
+                    index,
+                },
+                value: { ...fact, index },
+            })),
+            manifest: promotable.map((fact) => ({
+                category: fact.category,
+                content: fact.content,
+            })),
+            resultSummary: { promotableFacts: promotable.length },
+            stageItem: (database, item, nowMs) =>
+                stageCreateProjectMemoryClaimInCurrentTransaction(
+                    database,
+                    {
+                        projectId,
+                        content: item.value.content,
+                        category: item.value.category,
+                        provenance: {
+                            sourceLocator: `historian://${identity.producer}/${sessionId}/${identity.batchId}/${item.value.index}`,
+                            sourceContent: item.value.content,
+                            sourceSessionId: sessionId,
+                            extractor: "historian",
+                            extractorVersion: "direct-claims-v1",
+                            extractorRunId: identity.runId,
+                            independenceKey: `${identity.producer}:${identity.runId}:${item.value.index}`,
+                            sourceTrustClass: "model_inference",
+                        },
+                        actor: identity.producer,
+                        nowMs,
+                    },
+                    nowMs,
                 ),
-            nowMs,
-        );
-        const refs = refsFromPayload(operation.result.payload);
+        });
+        const refs = refsFromPayload(operation.operation.result.payload);
         for (let index = 0; index < refs.length; index += 1) {
             refs[index].content = promotable[index]?.content ?? "";
         }
@@ -171,5 +147,3 @@ export function promoteSessionFactsDurable(
 
     return isInTransaction(db) ? apply() : db.transaction(apply).immediate();
 }
-
-export async function embedPromotedFacts(): Promise<void> {}

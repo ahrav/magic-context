@@ -109,9 +109,17 @@ export function recordDreamerManifestRejection(args: {
     rawManifest: string;
     reason: string;
 }): void {
-    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-        recordAutonomousManifestRejectionInCurrentTransaction(args);
-    });
+    runLeaseGuardedWrite(
+        args.db,
+        args.holderId,
+        args.leaseKey,
+        () => {
+            recordAutonomousManifestRejectionInCurrentTransaction(args);
+        },
+        typeof args.identity.leaseGeneration === "number"
+            ? args.identity.leaseGeneration
+            : undefined,
+    );
 }
 
 export function dreamerInferenceProvenance(args: {

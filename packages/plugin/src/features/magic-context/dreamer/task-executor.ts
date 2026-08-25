@@ -18,17 +18,21 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getCompartmentEvents } from "../compartment-events";
+import { getMemoryCountsByStatus } from "../memory";
+import type { CanonicalJsonValue } from "../memory/claim-operation-contract";
 import {
-    getMemoriesByProject,
-    getMemoryCountsByStatus,
-    getMemoryVerifications,
-    type Memory,
-} from "../memory";
+    type AutonomousManifestIdentity,
+    combineClaimOperationStageOutcomes,
+    runAutonomousManifestInCurrentTransaction,
+} from "../memory/storage-claim-autonomous";
+import type { ProjectMemoryClaimSnapshot } from "../memory/storage-claim-current-state";
 import {
-    exactMemoryContentDigests,
-    filterMemoriesForMaintenance,
-} from "../memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "../memory/storage-claims";
+    stageCreateProjectMemoryClaimInCurrentTransaction,
+    stageMergeProjectMemoryClaimsInCurrentTransaction,
+    stageReviseProjectMemoryClaimInCurrentTransaction,
+    stageSetProjectMemoryClaimLifecycleInCurrentTransaction,
+} from "../memory/storage-claim-operations";
+import { ensureProject } from "../memory/storage-claims";
 import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
@@ -47,17 +51,12 @@ import {
     snapshotMaintainDocsFiles,
 } from "./maintain-docs-protected-enforcement";
 import { mapMemories } from "./map-memories";
-import {
-    DreamerModuleFailureError,
-    type DreamerModuleRoute,
-    resolveDreamerModuleRoute,
-} from "./module-apply";
+import { DreamerModuleFailureError, resolveDreamerModuleRoute } from "./module-apply";
 import { promotePrimers } from "./promote-primers";
 import { refreshPrimers } from "./refresh-primers";
 import {
     applyRetrospectiveLearnings,
     parseRetrospectiveLearnings,
-    validateRetrospectiveLearningText,
 } from "./retrospective-learnings";
 import {
     type RetrospectiveRawMessage,
@@ -77,11 +76,13 @@ import {
     buildFrictionGatePrompt,
     buildRetrospectivePrompt,
     CURATE_SYSTEM_PROMPT,
+    type CurateManifestAction,
     type CuratePromptMemory,
     FRICTION_GATE_SYSTEM_PROMPT,
     MAINTAIN_DOCS_SYSTEM_PROMPT,
     RETROSPECTIVE_SYSTEM_PROMPT,
     type RetrospectivePromptEvent,
+    validateCurateManifest,
 } from "./task-prompts";
 import {
     type DreamTaskName,
@@ -95,6 +96,13 @@ import type {
     TaskExecutor,
     TaskExecutorContext,
 } from "./task-scheduler";
+import {
+    claimManifestBinding,
+    dreamerInferenceProvenance,
+    dreamerManifestIdentity,
+    readDreamerProjectClaims,
+    recordDreamerManifestRejection,
+} from "./claim-manifest";
 import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {
@@ -165,80 +173,193 @@ function classifyFailure(error: unknown): { transient: boolean; brief: string } 
     return { transient, brief };
 }
 
-/** Ids present in `afterIds` but not in `beforeIds` (set difference). */
 function newIds(beforeIds: number[], afterIds: number[]): number[] {
     const before = new Set(beforeIds);
-    const out: number[] = [];
-    for (const id of afterIds) if (!before.has(id)) out.push(id);
-    return out;
+    return afterIds.filter((id) => !before.has(id));
 }
 
-function toCuratePromptMemory(
-    memory: Memory,
-    verificationById: ReturnType<typeof getMemoryVerifications>,
-): CuratePromptMemory {
-    const verification = verificationById.get(memory.id);
+function toCuratePromptMemory(claim: ProjectMemoryClaimSnapshot): CuratePromptMemory {
+    const paths = claim.applicability.flatMap((assertion) =>
+        assertion.paths.map((path) => path.value),
+    );
     return {
-        id: memory.id,
-        category: memory.category,
-        content: memory.content,
-        mappedFiles: verification?.files ?? [],
-        hasNoFileSentinel: verification?.hasSentinel ?? false,
+        publicClaimId: claim.publicClaimId,
+        revisionLocator: claim.revisionLocator,
+        contentDigest: claim.contentDigest,
+        category: claim.category,
+        content: claim.content,
+        mappedFiles: [...new Set(paths)],
+        hasNoFileSentinel: claim.applicability.some(
+            (assertion) => assertion.pathsState === "known" && assertion.paths.length === 0,
+        ),
     };
 }
 
-function loadActiveMemoryPromptMemories(
-    db: Database,
-    projectIdentity: string,
-): CuratePromptMemory[] {
-    // Curation is hygiene maintenance with no healing authority over
-    // dispositions: candidates stay in the pool, while soft-hidden and
-    // uniform-absence rows never reach the child-model prompt — and the
-    // ctx_memory gate refuses hidden rows as mutation targets.
-    const loaded = filterMemoriesForMaintenance(
-        db,
-        getMemoriesByProject(db, projectIdentity),
-        "hygiene",
-    );
-    // Exact-byte binding: the maintenance filter evaluates CURRENT policy by
-    // id, but the loaded rows carry bytes read before that policy read —
-    // another process rewriting a row in that window would disclose the
-    // superseded bytes to the curate child. Keep only rows whose loaded
-    // bytes still match the claim's current revision digest.
-    const oracle = exactMemoryContentDigests(
-        db,
-        loaded.map((memory) => memory.id),
-    );
-    const memories = loaded.filter(
-        (memory) => oracle.get(memory.id) === sha256Utf8Hex(memory.content),
-    );
-    if (memories.length < loaded.length) {
-        log(
-            `[dreamer] curate pool dropped ${loaded.length - memories.length} member(s) rewritten since load`,
-        );
-    }
-    const verificationById = getMemoryVerifications(
-        db,
-        memories.map((memory) => memory.id),
-    );
-    return memories.map((memory) => toCuratePromptMemory(memory, verificationById));
+function loadCurateClaims(db: Database, projectIdentity: string): ProjectMemoryClaimSnapshot[] {
+    return readDreamerProjectClaims(db, projectIdentity, "hygiene");
 }
 
-const TEXTUAL_CURATE_TOOL_CALL_PATTERNS = [
-    /\[\s*historical tool call\s*\][\s\S]*?(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
-    /(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
-    /(?:^|\n)\s*(?:```[^\n]*\n\s*)?ctx_memory\s*\(\s*action\s*=/im,
-    /["']name["']\s*:\s*["']ctx_memory["'][\s\S]*?["']arguments["']\s*:/i,
-] as const;
+function curateActionIds(action: CurateManifestAction): string[] {
+    return action.kind === "merge"
+        ? [action.targetPublicClaimId, ...action.sourcePublicClaimIds]
+        : [action.publicClaimId];
+}
 
-/** Reject serialized or hand-written ctx_memory invocations. They are assistant
- * text, not executable tool parts, so accepting one would leave its mutation
- * unapplied while recording the whole curate run as complete. */
-function validateCurateAssistantText(text: string): string {
-    if (TEXTUAL_CURATE_TOOL_CALL_PATTERNS.some((pattern) => pattern.test(text))) {
-        throw new Error("Curate returned an unresolved textual ctx_memory tool call.");
+function curateManifestValue(action: CurateManifestAction): CanonicalJsonValue {
+    switch (action.kind) {
+        case "keep":
+            return { kind: action.kind, publicClaimId: action.publicClaimId };
+        case "update":
+            return {
+                content: action.content,
+                kind: action.kind,
+                publicClaimId: action.publicClaimId,
+            };
+        case "archive":
+            return {
+                kind: action.kind,
+                publicClaimId: action.publicClaimId,
+                reason: action.reason,
+            };
+        case "merge":
+            return {
+                content: action.content,
+                kind: action.kind,
+                sourcePublicClaimIds: action.sourcePublicClaimIds,
+                targetPublicClaimId: action.targetPublicClaimId,
+            };
+        case "split":
+            return {
+                content: action.content,
+                created: action.created.map((item) => ({
+                    category: item.category,
+                    content: item.content,
+                })),
+                kind: action.kind,
+                publicClaimId: action.publicClaimId,
+            };
     }
-    return text;
+}
+
+export function applyCurateManifest(args: {
+    db: Database;
+    projectIdentity: string;
+    claims: readonly ProjectMemoryClaimSnapshot[];
+    identity: AutonomousManifestIdentity;
+    manifestText: string;
+}) {
+    const actions = validateCurateManifest(
+        args.manifestText,
+        new Set(args.claims.map((claim) => claim.publicClaimId)),
+    );
+    const byId = new Map(args.claims.map((claim) => [claim.publicClaimId, claim]));
+    const projectId = ensureProject(args.db, args.projectIdentity);
+    return runAutonomousManifestInCurrentTransaction({
+        db: args.db,
+        identity: args.identity,
+        items: actions.map((action) => {
+            const ids = curateActionIds(action);
+            const claims = ids.map((id) => {
+                const claim = byId.get(id);
+                if (!claim) throw new Error(`curate returned unknown claim ${id}`);
+                return claim;
+            });
+            const [primary, ...additional] = claims;
+            if (!primary) throw new Error("curate action has no bound claim");
+            return {
+                binding: claimManifestBinding(primary),
+                additionalBindings: additional.map(claimManifestBinding),
+                value: action,
+            };
+        }),
+        manifest: actions.map(curateManifestValue),
+        resultSummary: {
+            archived: actions.filter((action) => action.kind === "archive").length,
+            merged: actions.filter((action) => action.kind === "merge").length,
+            split: actions.filter((action) => action.kind === "split").length,
+            updated: actions.filter((action) => action.kind === "update").length,
+        },
+        stageItem: (db, item, nowMs) => {
+            const action = item.value;
+            const provenance = (content: string, suffix = "") =>
+                dreamerInferenceProvenance({
+                    identity: args.identity,
+                    binding: item.binding,
+                    sourceContent: `${content}${suffix}`,
+                });
+            if (action.kind === "keep") {
+                return { kind: "noop", payload: { kind: "kept", claim: action.publicClaimId } };
+            }
+            if (action.kind === "update") {
+                return stageReviseProjectMemoryClaimInCurrentTransaction(
+                    db,
+                    {
+                        token: item.binding.token,
+                        content: action.content,
+                        provenance: provenance(action.content),
+                        actor: args.identity.producer,
+                    },
+                    nowMs,
+                );
+            }
+            if (action.kind === "archive") {
+                return stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
+                    db,
+                    {
+                        token: item.binding.token,
+                        state: "archived",
+                        reason: action.reason,
+                        actor: args.identity.producer,
+                    },
+                    nowMs,
+                );
+            }
+            if (action.kind === "merge") {
+                return stageMergeProjectMemoryClaimsInCurrentTransaction(
+                    db,
+                    {
+                        targetToken: item.binding.token,
+                        sourceTokens: (item.additionalBindings ?? []).map(
+                            (binding) => binding.token,
+                        ),
+                        mergedContent: action.content,
+                        actor: args.identity.producer,
+                    },
+                    nowMs,
+                );
+            }
+            const outcomes = [
+                stageReviseProjectMemoryClaimInCurrentTransaction(
+                    db,
+                    {
+                        token: item.binding.token,
+                        content: action.content,
+                        provenance: provenance(action.content, ":kept"),
+                        actor: args.identity.producer,
+                    },
+                    nowMs,
+                ),
+                ...action.created.map((created, index) =>
+                    stageCreateProjectMemoryClaimInCurrentTransaction(
+                        db,
+                        {
+                            projectId,
+                            category: created.category,
+                            content: created.content,
+                            provenance: provenance(created.content, `:split:${index}`),
+                            actor: args.identity.producer,
+                            nowMs,
+                        },
+                        nowMs,
+                    ),
+                ),
+            ];
+            return combineClaimOperationStageOutcomes(outcomes, {
+                created: action.created.length,
+                kind: "split",
+            });
+        },
+    });
 }
 
 /**
@@ -313,8 +434,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             config.task === "compress-cues" ||
             config.task === "classify-memories" ||
             config.task === "verify" ||
-            config.task === "verify-broad" ||
-            config.task === "retrospective"
+            config.task === "verify-broad"
         ) {
             try {
                 moduleRoute = await resolveDreamerModuleRoute({
@@ -689,7 +809,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     parent,
                     invocationStartedAt: startedAt,
-                    moduleRoute,
                 });
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
@@ -866,7 +985,6 @@ async function runRetrospectiveTask(
         deadline: number;
         parent: string | undefined;
         invocationStartedAt: number;
-        moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<{ retrospectiveWatermarkMs: number | null }> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
@@ -1051,57 +1169,17 @@ async function runRetrospectiveTask(
         const sourceSessionId =
             flagged[0]?.sessionId ?? userMessages[0]?.sessionId ?? "retrospective";
         const learnings = parseRetrospectiveLearnings(deepenRun.validated);
-        let moduleMemoryWritten = 0;
-        const moduleRejected: Array<{ content: string; reason: string }> = [];
-        let hostLearnings = learnings;
-        if (helpers.moduleRoute) {
-            const moduleLearnings = learnings.filter((learning) => {
-                if (learning.route !== "memory") return false;
-                const reason = validateRetrospectiveLearningText(
-                    learning.content,
-                    userMessages.map((message) => message.text ?? ""),
-                );
-                if (reason || !learning.category) {
-                    if (reason) moduleRejected.push({ content: learning.content, reason });
-                    return false;
-                }
-                return true;
-            });
-            hostLearnings = learnings.filter((learning) => learning.route !== "memory");
-            for (const learning of moduleLearnings) {
-                try {
-                    const response = await helpers.moduleRoute.moduleClient.call({
-                        sessionId: helpers.moduleRoute.moduleSessionId,
-                        projectRoot: helpers.moduleRoute.moduleProjectRoot,
-                        method: "ctx_memory",
-                        body: {
-                            name: "ctx_memory",
-                            arguments: {
-                                action: "write",
-                                memory_project: projectIdentity,
-                                category: learning.category,
-                                content: learning.content,
-                                command_id: `${helpers.moduleRoute.moduleCommandId}:${moduleMemoryWritten}`,
-                            },
-                        },
-                    });
-                    const body = ((response as { result?: unknown })?.result ?? response) as {
-                        ok?: unknown;
-                        error?: unknown;
-                    };
-                    if (body?.ok === false || body?.error)
-                        throw new Error("module rejected retrospective memory");
-                    moduleMemoryWritten += 1;
-                } catch (error) {
-                    throw new DreamerModuleFailureError("ctx_memory retrospective write", error);
-                }
-            }
-            // Invalid memory learnings remain rejected, but never reach a TypeScript memory insert.
-        }
-        // Apply learnings AND record the processed-window key in ONE transaction
-        // so a crash between them can't leave the window un-recorded (which would
-        // re-deepen + risk a duplicate observation next run, since
-        // insertUserMemoryCandidates has no unique key). Both are plain DB writes.
+        const identity: AutonomousManifestIdentity = {
+            ...dreamerManifestIdentity({
+                db,
+                holderId,
+                leaseKey,
+                parentSessionId: parent,
+                task: "retrospective",
+                publicClaimIds: [],
+            }),
+            batchId: windowKey,
+        };
         const applied = runLeaseGuardedWrite(
             db,
             holderId,
@@ -1111,20 +1189,17 @@ async function runRetrospectiveTask(
                     db,
                     projectIdentity,
                     sourceSessionId,
-                    learnings: hostLearnings,
+                    learnings,
+                    identity,
                     userMemoryCollectionEnabled: deps.userMemoryCollectionEnabled === true,
-                    // Source user lines for the near-transcription reject: a learning
-                    // that echoes a long verbatim run of the user's words is a
-                    // transcription.
                     sourceUserTexts: userMessages
                         .map((message) => message.text ?? "")
                         .filter((text) => text.length > 0),
                 });
-                result.memoryWritten += moduleMemoryWritten;
-                result.rejected.push(...moduleRejected);
                 recordRetrospectiveWindowProcessed(db, projectIdentity, windowKey);
                 return result;
             },
+            typeof identity.leaseGeneration === "number" ? identity.leaseGeneration : undefined,
         );
         if (leaseLost || !applied) throw new Error("Dream lease lost during retrospective commit");
         log(
@@ -1174,7 +1249,6 @@ async function runAgenticTask(
     const task = config.task as DreamingTask;
     const docsDir = deps.sessionDirectory;
     const invocationStartedAt = Date.now();
-    const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
 
     const lastRunAt = getTaskScheduleState(db, projectIdentity, config.task)?.lastRunAt ?? null;
 
@@ -1213,6 +1287,8 @@ async function runAgenticTask(
     );
 
     let childSessionId: string | null = null;
+    let rawCurateManifest = "";
+    let curateIdentity: AutonomousManifestIdentity | undefined;
     try {
         const createResponse = await createChildSessionWithFence({
             client: deps.client,
@@ -1232,14 +1308,19 @@ async function runAgenticTask(
         if (!childSessionId) throw new Error("Dreamer could not create its child session.");
         const sessionId = childSessionId;
 
-        // Load the curate pool and build the prompt only now, past the
-        // awaited child-session creation: the maintenance filter runs on
-        // current policy state and the rendered bytes are current when the
-        // prompt is submitted. The later ctx_memory target gates prevent
-        // mutation of hidden rows but cannot undo disclosure to the child.
-        let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
+        let curateClaims: ProjectMemoryClaimSnapshot[] | undefined;
+        let curateMemories: CuratePromptMemory[] | undefined;
         if (task === "curate") {
-            curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
+            curateClaims = loadCurateClaims(db, projectIdentity);
+            curateMemories = curateClaims.map(toCuratePromptMemory);
+            curateIdentity = dreamerManifestIdentity({
+                db,
+                holderId,
+                leaseKey,
+                parentSessionId: parent,
+                task: "curate",
+                publicClaimIds: curateClaims.map((claim) => claim.publicClaimId),
+            });
             log(`[dreamer] curate pool: in_scope=${curateMemories.length}`);
         }
         const taskPrompt = buildDreamTaskPrompt(task, {
@@ -1274,11 +1355,6 @@ async function runAgenticTask(
                 path: { id: sessionId },
                 query: { directory: docsDir },
                 body: {
-                    // Each agentic task gets its OWN scoped agent + system prompt so
-                    // it never sees another task's tools/rules: curate runs on the
-                    // base `dreamer` (ctx_memory only, no codebase tools);
-                    // maintain-docs runs on `dreamer-docs` (file read/write/bash, no
-                    // memory machinery).
                     agent: task === "maintain-docs" ? DREAMER_DOCS_AGENT : DREAMER_AGENT,
                     system:
                         task === "maintain-docs"
@@ -1308,7 +1384,14 @@ async function runAgenticTask(
                 validateOutput: (messages) => {
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("Dreamer returned no assistant output.");
-                    return task === "curate" ? validateCurateAssistantText(text) : text;
+                    if (task === "curate") {
+                        rawCurateManifest = text;
+                        validateCurateManifest(
+                            text,
+                            new Set((curateClaims ?? []).map((claim) => claim.publicClaimId)),
+                        );
+                    }
+                    return text;
                 },
             },
         );
@@ -1317,6 +1400,29 @@ async function runAgenticTask(
         }
 
         if (leaseLost) throw new Error("Dream lease lost during task");
+        if (task === "curate" && curateClaims && curateIdentity) {
+            const applied = runLeaseGuardedWrite(
+                db,
+                holderId,
+                leaseKey,
+                () =>
+                    applyCurateManifest({
+                        db,
+                        projectIdentity,
+                        claims: curateClaims,
+                        identity: curateIdentity as AutonomousManifestIdentity,
+                        manifestText: run.validated,
+                    }),
+                typeof curateIdentity.leaseGeneration === "number"
+                    ? curateIdentity.leaseGeneration
+                    : undefined,
+            );
+            if (applied.operation.outcome === "stale") {
+                throw new Error(
+                    `Curate manifest became stale: ${applied.operation.result.staleReason}`,
+                );
+            }
+        }
 
         if (parent) {
             recordChildInvocation({
@@ -1339,10 +1445,24 @@ async function runAgenticTask(
             }
         }
 
-        helpers.recordRun("completed", null, {
-            memoryChanges: helpers.computeMemoryDelta(memoryBefore),
-        });
+        helpers.recordRun("completed", null);
         return { status: "completed" };
+    } catch (error) {
+        if (task === "curate" && curateIdentity) {
+            try {
+                recordDreamerManifestRejection({
+                    db,
+                    holderId,
+                    leaseKey,
+                    identity: curateIdentity,
+                    rawManifest: rawCurateManifest,
+                    reason: describeError(error).brief,
+                });
+            } catch {
+                // Lost leases do not publish rejection receipts.
+            }
+        }
+        throw error;
     } finally {
         heartbeat.stop();
         // These children contain full memory-pool snapshots or generated project

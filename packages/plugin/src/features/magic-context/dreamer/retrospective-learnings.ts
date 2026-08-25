@@ -1,6 +1,10 @@
-import type { Database } from "../../../shared/sqlite";
-import { computeNormalizedHash } from "../memory/normalize-hash";
-import { getMemoryByHash, insertMemory } from "../memory/storage-memory";
+import { type Database, isInTransaction } from "../../../shared/sqlite";
+import {
+    type AutonomousManifestIdentity,
+    runAutonomousCreationManifestInCurrentTransaction,
+} from "../memory/storage-claim-autonomous";
+import { stageCreateProjectMemoryClaimInCurrentTransaction } from "../memory/storage-claim-operations";
+import { ensureProject, sha256Utf8Hex } from "../memory/storage-claims";
 import type { MemoryCategory } from "../memory/types";
 import { insertUserMemoryCandidates } from "../user-memory/storage-user-memory";
 
@@ -142,71 +146,107 @@ export function applyRetrospectiveLearnings(args: {
     projectIdentity: string;
     sourceSessionId: string;
     learnings: ParsedRetrospectiveLearning[];
+    identity: AutonomousManifestIdentity;
     userMemoryCollectionEnabled: boolean;
     /** The raw source user lines, for the near-transcription reject check. */
     sourceUserTexts?: readonly string[];
 }): RetrospectiveApplyResult {
-    const result: RetrospectiveApplyResult = {
-        memoryWritten: 0,
-        observationsInserted: 0,
-        observationsDropped: 0,
-        rejected: [],
-    };
+    if (!isInTransaction(args.db)) {
+        throw new Error("applyRetrospectiveLearnings requires an active transaction");
+    }
+    const rejected: Array<{ content: string; reason: string }> = [];
+    const memories: Array<ParsedRetrospectiveLearning & { category: MemoryCategory }> = [];
     const observations: Array<{ content: string; sessionId: string }> = [];
     const sourceUserTexts = args.sourceUserTexts ?? [];
-    // Idempotence: dedupe identical-content learnings within this batch, and
-    // skip a memory that already exists (the model can re-emit a learning across
-    // runs). A duplicate is a no-op, never a fatal UNIQUE throw that would abort
-    // the whole apply and retry the same window.
     const seenContent = new Set<string>();
 
     for (const learning of args.learnings) {
         const dedupeKey = `${learning.route}:${learning.category ?? ""}:${learning.content}`;
         if (seenContent.has(dedupeKey)) continue;
         seenContent.add(dedupeKey);
-
         const rejectReason = validateRetrospectiveLearningText(learning.content, sourceUserTexts);
         if (rejectReason) {
-            result.rejected.push({ content: learning.content, reason: rejectReason });
+            rejected.push({ content: learning.content, reason: rejectReason });
             continue;
         }
-
-        if (learning.route === "memory") {
-            if (!learning.category) continue;
-            // Skip an already-stored identical memory rather than throwing on the
-            // UNIQUE(project_path, category, normalized_hash) constraint.
-            const existing = getMemoryByHash(
-                args.db,
-                args.projectIdentity,
-                learning.category,
-                computeNormalizedHash(learning.content),
-            );
-            if (existing) continue;
-            insertMemory(args.db, {
-                projectPath: args.projectIdentity,
-                category: learning.category,
-                content: learning.content,
-                sourceSessionId: args.sourceSessionId,
-                sourceType: "dreamer",
-                metadataJson: JSON.stringify({ source: "retrospective" }),
-            });
-            result.memoryWritten += 1;
-            continue;
-        }
-
-        if (args.userMemoryCollectionEnabled) {
+        if (learning.route === "memory" && learning.category) {
+            memories.push({ ...learning, category: learning.category });
+        } else if (learning.route === "observation" && args.userMemoryCollectionEnabled) {
             observations.push({ content: learning.content, sessionId: args.sourceSessionId });
-        } else {
-            result.observationsDropped += 1;
         }
     }
 
-    if (observations.length > 0) {
+    const observationsDropped = args.userMemoryCollectionEnabled
+        ? 0
+        : args.learnings.filter(
+              (learning) =>
+                  learning.route === "observation" &&
+                  !rejected.some((item) => item.content === learning.content),
+          ).length;
+    const projectId = ensureProject(args.db, args.projectIdentity);
+    const operation = runAutonomousCreationManifestInCurrentTransaction({
+        db: args.db,
+        identity: args.identity,
+        items: memories.map((learning, index) => ({
+            key: {
+                category: learning.category,
+                contentDigest: sha256Utf8Hex(learning.content),
+                index,
+            },
+            value: { learning, index },
+        })),
+        manifest: args.learnings.map((learning) => ({
+            category: learning.category ?? null,
+            content: learning.content,
+            route: learning.route,
+        })),
+        resultSummary: {
+            observationsDropped,
+            observationsInserted: observations.length,
+            rejected: rejected.length,
+        },
+        stageItem: (db, item, nowMs) =>
+            stageCreateProjectMemoryClaimInCurrentTransaction(
+                db,
+                {
+                    projectId,
+                    content: item.value.learning.content,
+                    category: item.value.learning.category,
+                    provenance: {
+                        sourceLocator: `retrospective://${args.identity.runId}/${args.identity.batchId}/${item.value.index}`,
+                        sourceContent: item.value.learning.content,
+                        sourceSessionId: args.sourceSessionId,
+                        extractor: "dreamer-retrospective",
+                        extractorVersion: "direct-claims-v1",
+                        extractorRunId: args.identity.runId,
+                        independenceKey: `retrospective:${args.identity.runId}:${item.value.index}`,
+                        sourceTrustClass: "model_inference",
+                    },
+                    actor: args.identity.producer,
+                    nowMs,
+                },
+                nowMs,
+            ),
+    });
+    if (!operation.operation.replayed && observations.length > 0) {
         insertUserMemoryCandidates(args.db, observations);
-        result.observationsInserted = observations.length;
     }
-
-    return result;
+    const payload = operation.operation.result.payload as { items?: unknown } | null;
+    const memoryWritten = Array.isArray(payload?.items)
+        ? payload.items.filter(
+              (item) =>
+                  item !== null &&
+                  typeof item === "object" &&
+                  !Array.isArray(item) &&
+                  (item as { kind?: unknown }).kind === "created",
+          ).length
+        : 0;
+    return {
+        memoryWritten,
+        observationsInserted: observations.length,
+        observationsDropped,
+        rejected,
+    };
 }
 
 function parseAttributes(raw: string): Record<string, string> {

@@ -44,6 +44,14 @@ export interface AutonomousManifestBinding {
 
 export interface AutonomousManifestItem<T> {
     binding: AutonomousManifestBinding;
+    /** Other claims consumed by this item, such as merge sources. */
+    additionalBindings?: readonly AutonomousManifestBinding[];
+    value: T;
+}
+
+export interface AutonomousCreationManifestItem<T> {
+    /** Stable, canonical item identity included in the operation request digest. */
+    key: CanonicalJsonValue;
     value: T;
 }
 
@@ -93,6 +101,10 @@ function bindingRequestShape(binding: AutonomousManifestBinding): CanonicalJsonV
             tokenVersion: binding.token.tokenVersion,
         },
     };
+}
+
+function itemBindings<T>(item: AutonomousManifestItem<T>): AutonomousManifestBinding[] {
+    return [item.binding, ...(item.additionalBindings ?? [])];
 }
 
 function validateBindings(
@@ -172,6 +184,24 @@ export function combineClaimOperationStageOutcomes(
                 ),
             ),
         ],
+        mutationTokenPublicClaimIds: [
+            ...new Set(outcomes.flatMap((outcome) => outcome.mutationTokenPublicClaimIds ?? [])),
+        ],
+    };
+}
+
+function applyResult(operation: ClaimOperationRunResult): AutonomousManifestApplyResult {
+    const payload = operation.result.payload as {
+        appliedItems?: unknown;
+        summary?: CanonicalJsonValue;
+    } | null;
+    return {
+        operation,
+        appliedItems:
+            operation.outcome === "applied" && typeof payload?.appliedItems === "number"
+                ? payload.appliedItems
+                : 0,
+        summary: payload?.summary ?? null,
     };
 }
 
@@ -205,7 +235,9 @@ export function runAutonomousManifestInCurrentTransaction<T>(args: {
                 runId: args.identity.runId,
                 task: args.identity.task,
             },
-            items: args.items.map((item) => bindingRequestShape(item.binding)),
+            items: args.items.map((item) => ({
+                bindings: itemBindings(item).map(bindingRequestShape),
+            })),
             manifest: args.manifest,
             operation: "autonomous-project-memory-manifest",
         }),
@@ -214,10 +246,7 @@ export function runAutonomousManifestInCurrentTransaction<T>(args: {
         args.db,
         envelope,
         () => {
-            const invalid = validateBindings(
-                args.db,
-                args.items.map((item) => item.binding),
-            );
+            const invalid = validateBindings(args.db, args.items.flatMap(itemBindings));
             if (invalid) return { kind: "stale", reason: invalid };
             return combineClaimOperationStageOutcomes(
                 args.items.map((item) => args.stageItem(args.db, item, nowMs)),
@@ -226,18 +255,56 @@ export function runAutonomousManifestInCurrentTransaction<T>(args: {
         },
         nowMs,
     );
-    const payload = operation.result.payload as {
-        appliedItems?: unknown;
-        summary?: CanonicalJsonValue;
-    } | null;
-    return {
-        operation,
-        appliedItems:
-            operation.outcome === "applied" && typeof payload?.appliedItems === "number"
-                ? payload.appliedItems
-                : 0,
-        summary: payload?.summary ?? null,
-    };
+    return applyResult(operation);
+}
+
+/** Applies a creation manifest under one outer claim operation. */
+export function runAutonomousCreationManifestInCurrentTransaction<T>(args: {
+    db: Database;
+    identity: AutonomousManifestIdentity;
+    items: readonly AutonomousCreationManifestItem<T>[];
+    manifest: CanonicalJsonValue;
+    resultSummary?: CanonicalJsonValue;
+    stageItem: (
+        db: Database,
+        item: AutonomousCreationManifestItem<T>,
+        nowMs: number,
+    ) => ClaimOperationStageOutcome;
+    nowMs?: number;
+}): AutonomousManifestApplyResult {
+    if (!isInTransaction(args.db)) {
+        throw new Error(
+            "runAutonomousCreationManifestInCurrentTransaction requires an active transaction",
+        );
+    }
+    assertIdentity(args.identity);
+    const nowMs = args.nowMs ?? Date.now();
+    const operation = runClaimOperationInCurrentTransaction(
+        args.db,
+        {
+            producer: args.identity.producer,
+            operationKey: operationKey(args.identity),
+            requestDigest: computeClaimOperationRequestDigest({
+                identity: {
+                    batchId: args.identity.batchId,
+                    leaseGeneration: String(args.identity.leaseGeneration),
+                    leaseKey: args.identity.leaseKey,
+                    runId: args.identity.runId,
+                    task: args.identity.task,
+                },
+                items: args.items.map((item) => item.key),
+                manifest: args.manifest,
+                operation: "autonomous-project-memory-creation-manifest",
+            }),
+        },
+        () =>
+            combineClaimOperationStageOutcomes(
+                args.items.map((item) => args.stageItem(args.db, item, nowMs)),
+                args.resultSummary ?? null,
+            ),
+        nowMs,
+    );
+    return applyResult(operation);
 }
 
 function rejectionEnvelope(args: {
