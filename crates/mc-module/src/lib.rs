@@ -4821,7 +4821,7 @@ impl McHandler {
                 let fingerprint_items: Vec<_> =
                     chunk.snapshot.iter().map(|item| item.as_item()).collect();
                 let observed = historian::compute_chunk_fingerprint(&fingerprint_items);
-                let _ = self.spawn_module_task(async move {
+                let spawned = self.spawn_module_task(async move {
                     let _guard = guard;
                     let result = async {
                         let action = historian::handle_restart_load(
@@ -4876,10 +4876,14 @@ impl McHandler {
                         eprintln!("mc-module: historian reattach failed for {session_id}: {e}");
                     }
                 });
-                Some("reattaching")
+                // `spawn_module_task` yields `None` once task admission closes,
+                // and the future is then dropped unpolled. Reporting the
+                // trigger anyway puts work in the diagnostics that no task will
+                // ever perform.
+                spawned.map(|_| "reattaching")
             }
             HistorianPhase::Firing | HistorianPhase::Validating | HistorianPhase::Publishing => {
-                let _ = self.spawn_module_task(async move {
+                let spawned = self.spawn_module_task(async move {
                     let _guard = guard;
                     if let Err(e) = historian::handle_restart_load(
                         &store,
@@ -4891,7 +4895,7 @@ impl McHandler {
                         );
                     }
                 });
-                Some("recovering")
+                spawned.map(|_| "recovering")
             }
             HistorianPhase::Idle => Some("recovered"),
         }

@@ -643,6 +643,7 @@ export class HermeticMcHostStack {
     private child: ChildProcess | null = null;
     private control: FixtureControlClient | null = null;
     private statusClient: McHostClient | null = null;
+    private statusClientPromise: Promise<McHostClient> | null = null;
     private stdout = "";
     private stderr = "";
     private pidFileCreatedAtMs = 0;
@@ -717,13 +718,7 @@ export class HermeticMcHostStack {
             harness: "opencode",
             session: sessionId,
         };
-        const client =
-            this.statusClient ??
-            (this.statusClient = await McHostClient.connect({
-                connectionFile: this.connectionFile,
-                identity,
-                targetKind: "tool_provider",
-            }));
+        const client = await this.ensureStatusClient(identity);
         let route: Awaited<ReturnType<McHostClient["routeOpen"]>> | null = null;
         try {
             route = await client.routeOpen(
@@ -1021,7 +1016,42 @@ export class HermeticMcHostStack {
         return this.control;
     }
 
+    /**
+     * Reuse one status client, coalescing concurrent connects on the in-flight
+     * attempt. Assigning the field only after the connect resolves lets two
+     * callers each establish a client and strand the one whose assignment is
+     * overwritten, so followers await the leader's attempt instead. A failed
+     * attempt clears the stored promise, leaving the next call free to retry.
+     */
+    private async ensureStatusClient(
+        identity: BindIdentity,
+    ): Promise<McHostClient> {
+        if (this.statusClient) return this.statusClient;
+        if (this.statusClientPromise) return await this.statusClientPromise;
+        const connecting = (async (): Promise<McHostClient> => {
+            const client = await McHostClient.connect({
+                connectionFile: this.connectionFile,
+                identity,
+                targetKind: "tool_provider",
+            });
+            this.statusClient = client;
+            return client;
+        })();
+        this.statusClientPromise = connecting;
+        try {
+            return await connecting;
+        } finally {
+            if (this.statusClientPromise === connecting)
+                this.statusClientPromise = null;
+        }
+    }
+
     private async closeStatusClient(): Promise<void> {
+        // An in-flight connect publishes its client on resolution, so teardown
+        // settles that attempt first rather than stranding its socket.
+        const connecting = this.statusClientPromise;
+        this.statusClientPromise = null;
+        if (connecting) await connecting.catch(() => undefined);
         const client = this.statusClient;
         this.statusClient = null;
         if (client) await client.closeAsync().catch(() => undefined);

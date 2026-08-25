@@ -293,17 +293,39 @@ interface RustSpawnResources {
     mcHost: HermeticMcHostStack;
 }
 
+/**
+ * Reject when the child fails to spawn or exits before readiness. A child that
+ * starts and then dies (bad flag, unusable config, taken port) emits no
+ * `error`, so without the `exit` arm the startup race only ends when
+ * `waitForReady` burns its whole timeout. Every settle path detaches both child
+ * listeners, so a child that outlives the race retains neither.
+ */
 function rejectOnSpawnError(child: ChildProcess, cancellation?: AbortSignal): Promise<never> {
     return new Promise((_, rejectSpawn) => {
+        const detach = (): void => {
+            child.off("error", onError);
+            child.off("exit", onExit);
+        };
         const onError = (error: Error): void => {
+            detach();
             cancellation?.removeEventListener("abort", onAbort);
             rejectSpawn(error);
         };
+        const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+            detach();
+            cancellation?.removeEventListener("abort", onAbort);
+            rejectSpawn(
+                new Error(
+                    `opencode serve exited before readiness (code=${code}, signal=${signal})`,
+                ),
+            );
+        };
         const onAbort = (): void => {
-            child.off("error", onError);
+            detach();
         };
         if (cancellation?.aborted) return;
         child.once("error", onError);
+        child.once("exit", onExit);
         cancellation?.addEventListener("abort", onAbort, { once: true });
     });
 }

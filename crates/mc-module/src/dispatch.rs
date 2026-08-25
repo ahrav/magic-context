@@ -5,7 +5,11 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 /// Maximum body accepted by the version-2 wire contract.
-pub const MAX_WIRE_BODY_BYTES: usize = 64 * 1024 * 1024;
+///
+/// Derived from the host's own cap rather than restated: this value gates
+/// output preparation while `mc-host` gates frame admission, so a literal here
+/// could drift and make the two disagree about what fits on the wire.
+pub const MAX_WIRE_BODY_BYTES: usize = mc_host::MAX_FRAME_BODY_LEN as usize;
 
 /// Successful response body prepared without an encoded output buffer.
 #[derive(Clone)]

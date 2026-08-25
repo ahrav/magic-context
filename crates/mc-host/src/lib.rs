@@ -64,5 +64,8 @@ pub use lifecycle::{
     LifecycleRootLock, LifecycleState, ProbeFreshness, PublicationSummary, LIFECYCLE_RECORD_NAME,
 };
 pub use runtime::{run, HostError};
+/// The version-2 body cap. Published so a consumer preparing an output can
+/// gate on the same value frame admission enforces, rather than restating it.
+pub use wire::MAX_FRAME_BODY_LEN;
 
 pub use tokio_util::sync::CancellationToken;
