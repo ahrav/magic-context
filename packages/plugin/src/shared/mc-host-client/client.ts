@@ -785,11 +785,14 @@ export class McHostClient {
                 // Every Error terminal fails closed with a bounded error:
                 // the raw body is peer-controlled and its message must not
                 // enter caller-visible error graphs (R14). There is no
-                // legacy `unsupported_operation` continuation.
+                // `unsupported_operation` continuation. The distinct code
+                // makes version skew self-describing: a host that does not
+                // implement `transport.negotiate` answers this request with
+                // an Error terminal.
                 throw new McHostCallError(
                     "terminal",
-                    "transport negotiation failed: host error terminal",
-                    "negotiation_failed",
+                    "transport negotiation failed: host returned an error terminal (host may predate transport negotiation; restart or upgrade the mc-host daemon)",
+                    "host_negotiation_rejected",
                 );
             }
             throw error;

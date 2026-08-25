@@ -759,20 +759,44 @@ impl Inner {
             ));
         }
         let (tx, rx) = oneshot::channel();
+        let mut rx = rx;
         let (key, publish) = self.admit(route, body, PendingKind::Unary(tx), deadline)?;
         let mut guard = UnaryAdmissionGuard::new(Arc::clone(self), key);
         let cancelled = cancellation.unwrap_or_default();
-        let result = tokio::select! {
+        // The stop branches borrow `rx` after the select rather than consuming
+        // it inside one, because a terminal can already be on the channel by
+        // then: `dispatch` removes the pending entry before it sends, so a stop
+        // landing in that window finds nothing to cancel while an authoritative
+        // answer is in flight.
+        enum Stopped {
+            Terminal(Result<Response, CallError>),
+            Cancelled,
+            DeadlineExpired,
+        }
+        let stopped = tokio::select! {
             biased;
-            result = rx => result.unwrap_or_else(|_| Err(retired_error(classify(&publish)))),
-            () = cancelled.cancelled() => {
-                let outcome = self.cancel_key(key, "cancelled").err().map_or_else(|| classify(&publish), |error| error.outcome);
-                Err(CallError::local(outcome, "cancelled", "request was cancelled"))
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                let outcome = self.cancel_key(key, "deadline_expired").err().map_or_else(|| classify(&publish), |error| error.outcome);
-                Err(CallError::local(outcome, "deadline_expired", "request deadline expired"))
-            }
+            result = &mut rx => Stopped::Terminal(
+                result.unwrap_or_else(|_| Err(retired_error(classify(&publish)))),
+            ),
+            () = cancelled.cancelled() => Stopped::Cancelled,
+            () = tokio::time::sleep_until(deadline) => Stopped::DeadlineExpired,
+        };
+        let result = match stopped {
+            Stopped::Terminal(result) => result,
+            Stopped::Cancelled => self.stop_or_take_terminal(
+                key,
+                &mut rx,
+                &publish,
+                "cancelled",
+                "request was cancelled",
+            ),
+            Stopped::DeadlineExpired => self.stop_or_take_terminal(
+                key,
+                &mut rx,
+                &publish,
+                "deadline_expired",
+                "request deadline expired",
+            ),
         };
         guard.disarm();
         result
@@ -961,6 +985,33 @@ impl Inner {
             ));
         }
         Ok((key, publish))
+    }
+
+    /// Stops a pending unary request, preferring a terminal that beat the stop.
+    ///
+    /// `dispatch` removes the pending entry before it publishes the terminal, so
+    /// a cancellation or deadline landing in that window makes `cancel_key` see
+    /// no entry and report success. Reporting a local error there would discard
+    /// an authoritative response the host already sent, and send the caller into
+    /// outcome-unknown recovery for an operation that actually settled.
+    fn stop_or_take_terminal(
+        &self,
+        key: PendingKey,
+        rx: &mut oneshot::Receiver<Result<Response, CallError>>,
+        publish: &AtomicU8,
+        code: &'static str,
+        message: &'static str,
+    ) -> Result<Response, CallError> {
+        let stopped = self.cancel_key(key, code);
+        if stopped.is_ok() {
+            if let Ok(result) = rx.try_recv() {
+                return result;
+            }
+        }
+        let outcome = stopped
+            .err()
+            .map_or_else(|| classify(publish), |error| error.outcome);
+        Err(CallError::local(outcome, code, message))
     }
 
     fn cancel_key(&self, key: PendingKey, code: &'static str) -> Result<(), CallError> {
@@ -1216,7 +1267,14 @@ impl Inner {
                             self.finish_pending(
                                 state,
                                 Err(CallError::local(
-                                    SendOutcome::Terminal,
+                                    // Local overflow after the request was sent.
+                                    // No `Response`, `Error`, or `StreamEnd`
+                                    // was observed and the best-effort `Cancel`
+                                    // may not have reached the host, so the run
+                                    // may still be committing: `Terminal` would
+                                    // claim an authoritative settlement the
+                                    // client never saw (§10.1).
+                                    SendOutcome::OutcomeUnknown,
                                     "stream_saturated",
                                     "stream consumer queue saturated",
                                 )),
@@ -1645,11 +1703,27 @@ fn validate_inbound(header: &EnvelopeHeader) -> Result<(), ()> {
         return Err(());
     }
     match header.ty {
-        FrameType::Response | FrameType::Error | FrameType::StreamData | FrameType::StreamEnd => {
-            // `decode_header` already rejects a mixed zero/nonzero
-            // channel/epoch pair, so the identity is control (0/0) or routed
-            // (nonzero/nonzero) by here; only the correlation is left.
+        // A terminal answers either a control request (0/0) or a routed one.
+        // `decode_header` already rejects a mixed zero/nonzero channel/epoch
+        // pair, so the identity is one or the other by here.
+        FrameType::Response | FrameType::Error => {
             if header.corr == 0 {
+                return Err(());
+            }
+            // §7.1 admits UTF-8 JSON only on channel 0. Without this, a binary
+            // control response whose bytes happen to parse as JSON would open a
+            // route and leave the malformed generation live.
+            if header.channel == 0 && header.flags.is_binary() {
+                return Err(());
+            }
+        }
+        // §6.2 requires stream frames to carry an exact pending *routed*
+        // identity. Grouping them with control-capable terminals accepted `0/0`
+        // stream frames bearing a pending control correlation, which dispatch
+        // then reported as `unexpected_stream` while leaving the generation
+        // usable — a structurally illegal identity has to close it instead.
+        FrameType::StreamData | FrameType::StreamEnd => {
+            if header.corr == 0 || header.channel == 0 || header.epoch == 0 {
                 return Err(());
             }
             // The direct profile carries stream termination in the header. A
@@ -2406,6 +2480,35 @@ mod tests {
         ))
         .is_ok());
 
+        // §6.2 requires a stream frame to name an exact pending ROUTED identity,
+        // so a control identity is structurally illegal rather than merely
+        // unmatched — grouping them with terminals accepted it.
+        assert!(validate_inbound(&header(FrameType::StreamData, 0, 0, 7, 4)).is_err());
+        assert!(validate_inbound(&header(FrameType::StreamEnd, 0, 0, 7, 0)).is_err());
+        // A terminal may still answer a control request.
+        assert!(validate_inbound(&header(FrameType::Response, 0, 0, 7, 4)).is_ok());
+        assert!(validate_inbound(&header(FrameType::Error, 0, 0, 7, 4)).is_ok());
+
+        // §7.1 admits UTF-8 JSON only on channel 0, so a binary control
+        // terminal is malformed even when its bytes happen to parse.
+        let binary_control = EnvelopeHeader {
+            len: 4,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Response,
+            flags: response_flags(true, true),
+            channel: 0,
+            epoch: 0,
+            corr: 7,
+        };
+        assert!(validate_inbound(&binary_control).is_err());
+        // A routed body stays opaque and may be binary.
+        let binary_routed = EnvelopeHeader {
+            channel: 3,
+            epoch: 9,
+            ..binary_control
+        };
+        assert!(validate_inbound(&binary_routed).is_ok());
+
         // Pre-existing rules keep holding.
         assert!(validate_inbound(&header(FrameType::Response, 3, 9, 0, 4)).is_err());
         assert!(validate_inbound(&header(FrameType::Ping, 0, 0, 7, 0)).is_ok());
@@ -2580,6 +2683,48 @@ mod tests {
             "a cancelled request must not reach the writer"
         );
         assert!(lock_unpoisoned(&inner.pending).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_that_wins_the_cancellation_race_is_not_discarded() {
+        // `dispatch` removes the pending entry before it publishes the terminal.
+        // A stop landing in that window finds nothing to cancel, and reporting a
+        // local error there would throw away an answer the host already gave and
+        // send the caller into outcome-unknown recovery for a settled operation.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let (kind, rx) = unary_sender();
+        let (key, publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                kind,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("admitted");
+        assert!(claim_for_write(&publish), "the writer claimed the request");
+        drop(data_rx.recv().await);
+
+        // Reproduce the window exactly: the entry is gone (as `dispatch` leaves
+        // it) and the terminal is already on the channel.
+        let state = lock_unpoisoned(&inner.pending)
+            .remove(&key)
+            .expect("entry exists");
+        match state.kind {
+            PendingKind::Unary(tx) => tx
+                .send(Ok(Response {
+                    body: b"authoritative".to_vec(),
+                    binary: false,
+                }))
+                .expect("terminal published"),
+            PendingKind::Stream { .. } => unreachable!("admitted a unary request"),
+        }
+
+        let mut rx = rx;
+        let response = inner
+            .stop_or_take_terminal(key, &mut rx, &publish, "cancelled", "request was cancelled")
+            .expect("the observed terminal wins over the local stop");
+        assert_eq!(response.body, b"authoritative");
     }
 
     #[test]
@@ -2872,6 +3017,12 @@ mod tests {
             .expect("terminal sender")
             .expect_err("saturated stream fails");
         assert_eq!(error.code(), "stream_saturated");
+        // Saturation is a local overflow after the request went out. No
+        // Response, Error, or StreamEnd was observed, and the best-effort Cancel
+        // may not have reached the host, so the run may still be committing:
+        // Terminal would claim an authoritative settlement the client never saw
+        // and mark a possibly-live operation replay-safe (§10.1).
+        assert_eq!(error.outcome(), SendOutcome::OutcomeUnknown);
         let cancel = control_rx.recv().await.expect("stream Cancel");
         assert_eq!(cancel.bytes[5], FrameType::Cancel as u8);
 

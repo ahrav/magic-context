@@ -1594,7 +1594,7 @@ describe("transport negotiation", () => {
             peer,
             diagnostics: (event) => events.push(event),
         });
-        expectCallError(error, "terminal", "negotiation_failed");
+        expectCallError(error, "terminal", "host_negotiation_rejected");
         await waitUntil(() =>
             events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
         );
@@ -1836,7 +1836,7 @@ describe("transport negotiation", () => {
         });
         // The host's raw error body is peer-controlled; the caller sees a
         // bounded negotiation failure, never the wire message (R14).
-        expectCallError(error, "terminal", "negotiation_failed");
+        expectCallError(error, "terminal", "host_negotiation_rejected");
         await waitUntil(() =>
             events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
         );
