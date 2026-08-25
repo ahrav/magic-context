@@ -165,8 +165,12 @@ fn lower_hex(value: &str, len: usize) -> bool {
 pub fn verify_direct_format(conn: &Connection, db_path: &Path) -> Result<Vec<String>, String> {
     let fixture = direct_format_fixture()?;
     let mut reasons = Vec::new();
-    if std::path::PathBuf::from(format!("{}{}", db_path.display(), DATABASE_RESET_MARKER_SUFFIX))
-        .exists()
+    if std::path::PathBuf::from(format!(
+        "{}{}",
+        db_path.display(),
+        DATABASE_RESET_MARKER_SUFFIX
+    ))
+    .exists()
     {
         reasons.push("a pending reset marker exists for this database family".to_string());
     }

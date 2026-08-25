@@ -15,17 +15,17 @@ import {
 import { ask } from "../../lib/platform";
 import type { ClaimLifecycleState, ClaimMemory } from "../../lib/types";
 import FilterSelect from "../shared/FilterSelect";
-import MemoryDetail from "./MemoryDetail";
 import {
+  type ClaimDraft,
   reconcileClaimSelection,
   reconcileDraft,
+  type SelectionEntry,
   selectionState,
   selectionTargets,
-  toggleClaimsSelection,
   toggleClaimSelection,
-  type ClaimDraft,
-  type SelectionEntry,
+  toggleClaimsSelection,
 } from "./claim-selection";
+import MemoryDetail from "./MemoryDetail";
 
 interface MemoryBrowserProps {
   project?: { identity: string; label: string };
@@ -179,7 +179,7 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
 
   const handleBulkArchive = async () => {
     if (selected().size === 0) return;
-    let targets;
+    let targets: ReturnType<typeof selectionTargets>;
     try {
       targets = selectionTargets(selected());
     } catch (cause: unknown) {

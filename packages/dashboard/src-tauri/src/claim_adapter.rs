@@ -1,9 +1,9 @@
 use mc_core::claim_operation::{
     canonical_json_encode, compute_applicability_heads_digest,
     compute_claim_operation_request_digest, compute_policy_heads_digest,
-    decode_claim_operation_result, format_revision_locator, sha256_hex_utf8, ClaimMutationToken,
-    PolicyHeadCounts, RevisionLocator, SnapshotVector, CLAIM_REQUEST_ENCODING_VERSION,
-    CLAIM_RESULT_ENCODING_VERSION,
+    decode_claim_operation_result, format_revision_locator, is_valid_public_claim_id,
+    sha256_hex_utf8, ClaimMutationToken, PolicyHeadCounts, RevisionLocator, SnapshotVector,
+    CLAIM_REQUEST_ENCODING_VERSION, CLAIM_RESULT_ENCODING_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -412,6 +412,9 @@ fn mutation_token(conn: &Connection, claim: &ClaimRef) -> AdapterResult<ClaimMut
 }
 
 fn get_claim(conn: &Connection, public_claim_id: &str) -> AdapterResult<Option<ClaimRef>> {
+    if !is_valid_public_claim_id(public_claim_id) {
+        return Err(format!("invalid public claim ID: {public_claim_id}"));
+    }
     sql(conn
         .query_row(
             "SELECT claim.id, claim.project_id, claim.current_revision_id, public.public_id, \

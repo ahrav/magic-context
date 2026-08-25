@@ -5,8 +5,8 @@ import {
   reconcileDraft,
   selectionState,
   selectionTargets,
-  toggleClaimsSelection,
   toggleClaimSelection,
+  toggleClaimsSelection,
 } from "./claim-selection";
 
 function claim(publicClaimId: string, revision = 1): ClaimMemory {
