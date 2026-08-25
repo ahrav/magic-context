@@ -1379,7 +1379,7 @@ export function driveTodoTerminalClear(
 const RUST_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/incident-pool/scenarios/parity-synthetic-todo.ts",
     "packages/e2e-tests/src/rust-harness.ts",
-    "packages/e2e-tests/src/rust-runner/hermetic-subc.ts",
+    "packages/e2e-tests/src/rust-runner/hermetic-mc-host.ts",
     "packages/plugin/src/hooks/magic-context/hook-handlers.ts",
     "crates/mc-module/src/injection.rs",
 ];

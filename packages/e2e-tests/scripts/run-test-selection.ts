@@ -38,7 +38,7 @@ export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         "src/cache-analysis.test.ts",
         "src/pi-runner/rpc-client.test.ts",
-        "src/rust-runner/hermetic-subc.test.ts",
+        "src/rust-runner/hermetic-mc-host.test.ts",
     ];
     for (const file of files) {
         if (!existsSync(resolve(root, file))) {
