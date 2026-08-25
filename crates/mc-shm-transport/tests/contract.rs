@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use mc_shm_transport::arena::{ArenaCounts, ArenaSpan, SpanPlan, MAX_FRAME_BYTES};
 use mc_shm_transport::descriptor::{
     BackendId, DescriptorCounts, DescriptorError, FrameDescriptor, HardwareProfileId, Incarnation,
@@ -284,13 +286,13 @@ fn host_admission_retains_quarantined_commitments() {
     )
     .unwrap();
     let charges = profile.charges();
-    let controller = AdmissionController::new(HostLimits {
+    let controller = Arc::new(AdmissionController::new(HostLimits {
         descriptors: charges.descriptors,
         arena_bytes: charges.arena_bytes,
         leases: charges.leases,
         mappings: charges.mappings,
         pinned_workers: 0,
-    });
+    }));
     let admission = controller.admit(&profile, None).unwrap();
     assert_eq!(controller.snapshot().unwrap().active, charges);
     let _quarantine = admission.quarantine().unwrap();

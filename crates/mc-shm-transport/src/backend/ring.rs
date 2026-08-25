@@ -434,6 +434,34 @@ impl fmt::Debug for RingGrant {
     }
 }
 
+/// Ring attachment handle. commentlint: allow(JUDGE)
+#[cfg(target_os = "linux")]
+pub struct RingAttachment {
+    fd: OwnedFd,
+    grant: RingGrant,
+    scheduling: SchedulingMode,
+}
+
+#[cfg(target_os = "linux")]
+impl RingAttachment {
+    /// Attaches ring. commentlint: allow(JUDGE)
+    pub fn attach(self) -> Result<Ring, RingError> {
+        Ring::attach(self.fd, self.grant, self.scheduling)
+    }
+
+    /// Grant. commentlint: allow(JUDGE)
+    pub const fn grant(&self) -> RingGrant {
+        self.grant
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for RingAttachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RingAttachment(<redacted>)")
+    }
+}
+
 /// Cacheline-isolated SPSC descriptor ring with FIFO payload arena.
 pub struct Ring {
     mapping: Mapping,
@@ -542,6 +570,23 @@ impl Ring {
     #[cfg(target_os = "linux")]
     pub fn raw_fd(&self) -> RawFd {
         self.mapping.fd.as_raw_fd()
+    }
+
+    /// Duplicates attachment handle. commentlint: allow(JUDGE)
+    #[cfg(target_os = "linux")]
+    pub fn attachment(&self) -> Result<RingAttachment, RingError> {
+        // SAFETY: F_DUPFD_CLOEXEC duplicates owned valid descriptor.
+        let raw = unsafe { libc::fcntl(self.raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if raw < 0 {
+            return Err(RingError::ObjectSetupFailed);
+        }
+        // SAFETY: successful fcntl returns a newly owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        Ok(RingAttachment {
+            fd,
+            grant: self.grant,
+            scheduling: self.scheduling,
+        })
     }
 
     /// Controls close-on-exec for child re-exec tests and handle transfer.
@@ -732,6 +777,7 @@ impl Ring {
                 [Some(first), second],
                 validated.span_count(),
                 body_len,
+                validated.wire_header(),
                 validated.identity(),
                 (self as *const Self).cast(),
                 ring_release_callback,

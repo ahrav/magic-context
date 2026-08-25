@@ -104,6 +104,7 @@ fn outbound(corr: u64, body: &[u8]) -> OutboundFrame {
         )
         .expect("contract frame encodes"),
         tail: Vec::new(),
+        direct: None,
         charge: crate::wire::ByteCharge::none(),
         written: None,
     }
@@ -175,6 +176,7 @@ pub(crate) async fn saturation_holds_at_frame_bound_and_spares_control_capacity<
             )
             .expect("header-only frame encodes"),
             tail: Vec::new(),
+            direct: None,
             charge: crate::wire::ByteCharge::none(),
             written: None,
         })

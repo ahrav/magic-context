@@ -102,6 +102,13 @@ impl fmt::Debug for PreparedCandidate {
 pub trait InjectedProvider: Send + Sync + 'static {
     fn transport(&self) -> &str;
     fn capability_version(&self) -> u32;
+
+    /// Returning `false` omits this provider from selection and permits TCP
+    /// fallback. Implementations must not create resources here. commentlint: allow(JUDGE)
+    fn preflight(&self, _parameters: Option<&serde_json::Value>) -> bool {
+        true
+    }
+
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure>;
 }
 

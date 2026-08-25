@@ -86,6 +86,7 @@ pub struct ReceiveLease<'lease> {
     spans: [Option<LeaseSpan<'lease>>; 2],
     span_count: u8,
     body_len: usize,
+    wire_header: [u8; crate::descriptor::WIRE_V2_HEADER_BYTES],
     identity: ReleaseIdentity,
     release_context: *const (),
     release_fn: ReleaseFn,
@@ -104,6 +105,7 @@ impl<'lease> ReceiveLease<'lease> {
         spans: [Option<LeaseSpan<'lease>>; 2],
         span_count: u8,
         body_len: usize,
+        wire_header: [u8; crate::descriptor::WIRE_V2_HEADER_BYTES],
         identity: ReleaseIdentity,
         release_context: *const (),
         release_fn: ReleaseFn,
@@ -119,6 +121,7 @@ impl<'lease> ReceiveLease<'lease> {
             spans,
             span_count,
             body_len,
+            wire_header,
             identity,
             release_context,
             release_fn,
@@ -149,6 +152,11 @@ impl<'lease> ReceiveLease<'lease> {
             return None;
         }
         self.spans[index]
+    }
+
+    /// Wire-v2 header.
+    pub const fn wire_header(&self) -> [u8; crate::descriptor::WIRE_V2_HEADER_BYTES] {
+        self.wire_header
     }
 
     /// Returns qualified identity for explicit completion protocols.

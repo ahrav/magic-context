@@ -25,6 +25,7 @@ tokio = { workspace = true, features = ["process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
 getrandom = "0.2"
+mc-shm-transport = { path = "../mc-shm-transport" }
 
 [dev-dependencies]
 hmac = "0.12"

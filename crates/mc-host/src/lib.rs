@@ -12,6 +12,8 @@ pub mod composite;
 pub mod config;
 pub mod handler;
 pub mod lifecycle;
+#[doc(hidden)]
+pub mod shm_provider;
 pub mod synapse;
 #[doc(hidden)]
 pub mod transport_negotiation;

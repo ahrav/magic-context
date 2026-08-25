@@ -1231,6 +1231,7 @@ mod tests {
             .send(crate::frame_channel::OutboundFrame {
                 bytes: vec![0u8; 8],
                 tail: Vec::new(),
+                direct: None,
                 charge: crate::wire::ByteCharge::none(),
                 written: Some(Box::new(move |_at| commit.acknowledge())),
             })

@@ -917,7 +917,14 @@ async fn handle_negotiate<H: McHostHandler>(
             .providers
             .find(&offer.transport, offer.capability_version)
         {
-            Some(provider) => {
+            Some(provider)
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::panic_boundary::redact_sync(|| {
+                        provider.preflight(offer.parameters.as_ref())
+                    })
+                }))
+                .unwrap_or(false) =>
+            {
                 let provider = Arc::clone(provider);
                 let selected = SelectedTransport {
                     transport: offer.transport.clone(),
@@ -935,6 +942,7 @@ async fn handle_negotiate<H: McHostHandler>(
                 )
                 .await;
             }
+            Some(_) => {}
             // Known transport at another version: name the real cause
             // (§7.7.3) rather than reporting it as unavailable.
             None if shared.providers.serves_transport(&offer.transport) => {
@@ -1274,6 +1282,7 @@ async fn send_candidate_response<H: McHostHandler>(
             OutboundFrame {
                 bytes,
                 tail: Vec::new(),
+                direct: None,
                 charge,
                 written: written_tx.map(|tx| {
                     Box::new(move |_completed_at: Instant| {
@@ -1350,6 +1359,7 @@ async fn reserve_catalog_frame(
     Ok(OutboundFrame {
         bytes,
         tail: Vec::new(),
+        direct: None,
         charge,
         written: None,
     })
@@ -1467,6 +1477,7 @@ async fn liveness_loop(
         let send = gen.writer.send(crate::frame_channel::OutboundFrame {
             bytes,
             tail: Vec::new(),
+            direct: None,
             charge: crate::wire::ByteCharge::none(),
             written: Some(written_hook),
         });

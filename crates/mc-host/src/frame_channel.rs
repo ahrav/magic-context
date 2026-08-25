@@ -10,6 +10,7 @@
 //! copying adapter before entering asynchronous work.
 
 use std::future::Future;
+use std::io;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -51,7 +52,7 @@ impl CopyCounter {
         self.0.load(Ordering::Relaxed)
     }
 
-    fn record_copy(&self) {
+    pub(crate) fn record_copy(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -398,6 +399,7 @@ impl LeaseTracker {
 enum ReceiveBody {
     Contiguous(Vec<u8>),
     Segmented(Vec<u8>, Vec<u8>),
+    Owned(Vec<u8>),
 }
 
 /// One admitted inbound frame. Body bytes can only be observed through
@@ -419,6 +421,20 @@ impl InboundFrame {
         Self {
             header,
             body: ReceiveBody::Contiguous(body),
+            charge,
+            copies,
+        }
+    }
+
+    pub(crate) fn owned(
+        header: EnvelopeHeader,
+        body: Vec<u8>,
+        charge: crate::wire::ByteCharge,
+        copies: CopyCounter,
+    ) -> Self {
+        Self {
+            header,
+            body: ReceiveBody::Owned(body),
             charge,
             copies,
         }
@@ -447,7 +463,7 @@ impl InboundFrame {
 
     pub fn body_len(&self) -> usize {
         match &self.body {
-            ReceiveBody::Contiguous(body) => body.len(),
+            ReceiveBody::Contiguous(body) | ReceiveBody::Owned(body) => body.len(),
             ReceiveBody::Segmented(first, second) => first.len().saturating_add(second.len()),
         }
     }
@@ -455,7 +471,9 @@ impl InboundFrame {
     /// Runs transport-byte decoding inside a non-escaping lexical scope.
     pub fn with_lease<T>(&self, decode: impl for<'lease> FnOnce(ReceiveLease<'lease>) -> T) -> T {
         match &self.body {
-            ReceiveBody::Contiguous(body) => decode(ReceiveLease::contiguous(body)),
+            ReceiveBody::Contiguous(body) | ReceiveBody::Owned(body) => {
+                decode(ReceiveLease::contiguous(body))
+            }
             ReceiveBody::Segmented(first, second) => {
                 decode(ReceiveLease::segmented(first, Some(second)))
             }
@@ -465,14 +483,19 @@ impl InboundFrame {
     /// TCP/compatibility adapter. Copy completes synchronously, then this
     /// method drops transport storage before returning owned semantic bytes.
     pub fn into_owned(self) -> OwnedInboundFrame {
-        let body = self.with_lease(|lease| lease.to_owned(&self.copies));
         let Self {
             header,
+            body,
             charge,
-            copies: _,
-            body: transport_body,
+            copies,
         } = self;
-        drop(transport_body);
+        let body = match body {
+            ReceiveBody::Owned(body) => body,
+            ReceiveBody::Contiguous(body) => ReceiveLease::contiguous(&body).to_owned(&copies),
+            ReceiveBody::Segmented(first, second) => {
+                ReceiveLease::segmented(&first, Some(&second)).to_owned(&copies)
+            }
+        };
         OwnedInboundFrame {
             header,
             body,
@@ -531,11 +554,101 @@ impl FrameReceiver for BoxedReceiver {
     }
 }
 
+pub(crate) type DirectSerializer =
+    Box<dyn FnOnce(&mut dyn io::Write) -> io::Result<()> + Send + 'static>;
+
+pub struct DirectFrame {
+    header: [u8; subc_protocol::HEADER_LEN],
+    body_len: usize,
+    serializer: DirectSerializer,
+}
+
+impl DirectFrame {
+    pub(crate) fn new(
+        header: EnvelopeHeader,
+        body_len: usize,
+        serializer: DirectSerializer,
+    ) -> Self {
+        Self {
+            header: header.encode(),
+            body_len,
+            serializer,
+        }
+    }
+
+    pub(crate) const fn header(&self) -> [u8; subc_protocol::HEADER_LEN] {
+        self.header
+    }
+
+    pub(crate) const fn body_len(&self) -> usize {
+        self.body_len
+    }
+
+    pub(crate) fn serialize(self, writer: &mut dyn io::Write) -> io::Result<()> {
+        (self.serializer)(writer)
+    }
+
+    pub(crate) fn into_owned(self) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(subc_protocol::HEADER_LEN + self.body_len);
+        bytes.extend_from_slice(&self.header);
+        {
+            let mut writer = ExactWriter::new(&mut bytes, self.body_len);
+            self.serialize(&mut writer)?;
+            writer.finish()?;
+        }
+        Ok(bytes)
+    }
+}
+
+pub(crate) struct ExactWriter<W> {
+    inner: W,
+    remaining: usize,
+}
+
+impl<W> ExactWriter<W> {
+    pub(crate) const fn new(inner: W, len: usize) -> Self {
+        Self {
+            inner,
+            remaining: len,
+        }
+    }
+
+    pub(crate) fn finish(self) -> io::Result<()> {
+        if self.remaining == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "direct serializer underfilled reservation",
+            ))
+        }
+    }
+}
+
+impl<W: io::Write> io::Write for ExactWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "direct serializer exceeded reservation",
+            ));
+        }
+        self.inner.write_all(bytes)?;
+        self.remaining -= bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// One encoded frame queued for the single logical writer.
 pub struct OutboundFrame {
     pub bytes: Vec<u8>,
     /// Body bytes written after `bytes` when encoding avoided a prepend copy.
     pub tail: Vec<u8>,
+    pub(crate) direct: Option<DirectFrame>,
     pub charge: crate::wire::ByteCharge,
     /// Local-completion hook, run after every frame byte reaches local egress.
     pub written: Option<Box<dyn FnOnce(Instant) + Send>>,

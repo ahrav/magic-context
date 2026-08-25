@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::arena::MIN_ARENA_BYTES;
 use crate::descriptor::{
@@ -359,12 +359,46 @@ impl AdmissionController {
         }
     }
 
-    /// Charges candidate before mappings or workers are created.
-    pub fn admit<'controller>(
-        &'controller self,
+    /// Checks candidate admission without changing accounting or creating resources.
+    pub fn can_admit(
+        &self,
         profile: &TargetProfile,
         physical_cores: Option<VerifiedPhysicalCores>,
-    ) -> Result<Admission<'controller>, AdmissionError> {
+    ) -> Result<(), AdmissionError> {
+        let accounting = self
+            .accounting
+            .lock()
+            .map_err(|_| AdmissionError::AccountingUnavailable)?;
+        self.check_admission(*accounting, profile, physical_cores)
+            .map(|_| ())
+    }
+
+    /// Charges candidate before mappings or workers are created.
+    pub fn admit(
+        self: &Arc<Self>,
+        profile: &TargetProfile,
+        physical_cores: Option<VerifiedPhysicalCores>,
+    ) -> Result<Admission, AdmissionError> {
+        let mut accounting = self
+            .accounting
+            .lock()
+            .map_err(|_| AdmissionError::AccountingUnavailable)?;
+        let active = self.check_admission(*accounting, profile, physical_cores)?;
+        let charges = profile.charges();
+        accounting.active = active;
+        Ok(Admission {
+            controller: Arc::clone(self),
+            charges,
+            state: AdmissionState::Active,
+        })
+    }
+
+    fn check_admission(
+        &self,
+        accounting: Accounting,
+        profile: &TargetProfile,
+        physical_cores: Option<VerifiedPhysicalCores>,
+    ) -> Result<ResourceCharges, AdmissionError> {
         let requested = profile.charges();
         if profile.descriptor().scheduling() == SchedulingMode::HotPinnedPoll {
             let verified = physical_cores.ok_or(AdmissionError::PhysicalCoresUnverified)?;
@@ -372,10 +406,6 @@ impl AdmissionController {
                 return Err(AdmissionError::PhysicalCoreBudgetExceeded);
             }
         }
-        let mut accounting = self
-            .accounting
-            .lock()
-            .map_err(|_| AdmissionError::AccountingUnavailable)?;
         let active = accounting
             .active
             .checked_add(requested)
@@ -402,12 +432,7 @@ impl AdmissionController {
         if active.pinned_workers > core_limit {
             return Err(AdmissionError::PhysicalCoreBudgetExceeded);
         }
-        accounting.active = active;
-        Ok(Admission {
-            controller: self,
-            charges: requested,
-            state: AdmissionState::Active,
-        })
+        Ok(active)
     }
 
     /// Returns redacted aggregate resource counters.
@@ -461,13 +486,13 @@ enum AdmissionState {
 
 /// RAII admission charge returned before candidate setup.
 #[must_use = "admission must remain alive while candidate resources exist"]
-pub struct Admission<'controller> {
-    controller: &'controller AdmissionController,
+pub struct Admission {
+    controller: Arc<AdmissionController>,
     charges: ResourceCharges,
     state: AdmissionState,
 }
 
-impl Admission<'_> {
+impl Admission {
     /// Releases all active charges after successful join.
     pub fn release(mut self) {
         self.controller.release(self.charges);
@@ -482,13 +507,13 @@ impl Admission<'_> {
     }
 }
 
-impl fmt::Debug for Admission<'_> {
+impl fmt::Debug for Admission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Admission(<redacted>)")
     }
 }
 
-impl Drop for Admission<'_> {
+impl Drop for Admission {
     fn drop(&mut self) {
         if self.state == AdmissionState::Active {
             self.controller.release(self.charges);

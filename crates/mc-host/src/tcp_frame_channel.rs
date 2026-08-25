@@ -374,11 +374,27 @@ where
         }
         let completion = std::sync::Arc::clone(&queued.state);
         let crate::frame_channel::OutboundFrame {
-            bytes,
-            tail,
+            mut bytes,
+            mut tail,
+            direct,
             charge,
             written,
         } = queued.frame;
+        if let Some(direct) = direct {
+            let encoded =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| direct.into_owned()));
+            match encoded {
+                Ok(Ok(encoded)) => {
+                    bytes = encoded;
+                    tail.clear();
+                }
+                Ok(Err(_)) | Err(_) => {
+                    queue.retired.cancel();
+                    queue.generation.cancel();
+                    break;
+                }
+            }
+        }
         // The completion instant is taken inside the arm, the moment
         // `write_all` returns — not after the result check — so a
         // preemption between them cannot push `completed_at` past a peer
@@ -557,6 +573,7 @@ mod tests {
         crate::frame_channel::OutboundFrame {
             bytes,
             tail: Vec::new(),
+            direct: None,
             charge: ByteCharge::none(),
             written: None,
         }
@@ -1102,6 +1119,7 @@ mod tests {
             .send(crate::frame_channel::OutboundFrame {
                 bytes,
                 tail: Vec::new(),
+                direct: None,
                 charge,
                 written: None,
             })
