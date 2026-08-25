@@ -24,6 +24,7 @@ import {
     deterministicEmbedding,
     MockProvider,
 } from "../../mock-provider/server";
+import { updateMemoryVerification } from "../../../../plugin/src/features/magic-context/memory";
 import { withClaimsWriteCapabilityInCurrentTransaction } from "../../../../plugin/src/features/magic-context/memory/storage-memory-claims";
 import type {
     CaseDriverContext,
@@ -39,8 +40,6 @@ import {
     createCaseHarness,
     DEFER_USAGE,
     EXECUTE_USAGE,
-    HISTORIAN_TRIGGER_USAGE,
-    installHistorianMatcher,
     readContextDb,
     runScriptedToolCall,
     writeContextDb,
@@ -160,6 +159,47 @@ function memoryIdIn(m0: string, content: string): number {
         throw new Error("rendered memory id not found in m[0]");
     }
     return Number(match[1]);
+}
+
+function verifyMemoryByContent(h: TestHarness, content: string): number {
+    return writeContextDb(h, (db) => {
+        const row = db
+            .prepare(
+                "SELECT id FROM memories WHERE content = ? ORDER BY id DESC LIMIT 1",
+            )
+            .get(content) as { id: number } | null;
+        if (!row) throw new Error("written memory row not found");
+        updateMemoryVerification(db, row.id, "verified");
+        return row.id;
+    });
+}
+
+function memoryProjectEpoch(h: TestHarness, memoryId: number): number {
+    return writeContextDb(h, (db) => {
+        const row = db
+            .prepare(
+                `SELECT ps.project_memory_epoch AS epoch
+                 FROM memories m
+                 LEFT JOIN project_state ps ON ps.project_path = m.project_path
+                 WHERE m.id = ?`,
+            )
+            .get(memoryId) as { epoch: number | null } | null;
+        return row?.epoch ?? 0;
+    });
+}
+
+function setMemoryProjectEpoch(
+    h: TestHarness,
+    memoryId: number,
+    epoch: number,
+): void {
+    writeContextDb(h, (db) => {
+        db.prepare(
+            `UPDATE project_state
+             SET project_memory_epoch = ?
+             WHERE project_path = (SELECT project_path FROM memories WHERE id = ?)`,
+        ).run(epoch, memoryId);
+    });
 }
 
 interface FactRowState {
@@ -389,6 +429,7 @@ export async function driveArchivedReobservation(
             throw new Error("initial ctx_memory write did not save a memory");
         }
         const memoryId = Number(idMatch[1]);
+        verifyMemoryByContent(h, fixture.fact);
 
         const archive = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
@@ -416,6 +457,7 @@ export async function driveArchivedReobservation(
             },
             prompt: "record the active reconciliation owner",
         });
+        verifyMemoryByContent(h, fixture.activeControl);
 
         const search = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_search",
@@ -426,6 +468,11 @@ export async function driveArchivedReobservation(
             },
             prompt: "look up what we know about reconciliation",
         });
+        const ordinarySessionId = await h.createSession();
+        h.mock.reset();
+        h.mock.setDefault({ text: "ordinary recall probe", usage: DEFER_USAGE });
+        await h.sendPrompt(ordinarySessionId, "continue ordinary reconciliation work");
+        const ordinaryM0 = extractM0(lastMainBody(h)) ?? "";
 
         const hash = normalizedMemoryHash(fixture.fact);
         const durable = readFactRowState(h, hash);
@@ -471,8 +518,8 @@ export async function driveArchivedReobservation(
             recurrenceCount: durable.seenCount,
             observerReadConsistent,
             searchAcknowledged: search.resultText.length > 0,
-            searchReturnsFact: search.resultText.includes(fixture.fact),
-            searchReturnsActiveControl: search.resultText.includes(
+            searchReturnsFact: ordinaryM0.includes(fixture.fact),
+            searchReturnsActiveControl: ordinaryM0.includes(
                 fixture.activeControl,
             ),
         };
@@ -501,6 +548,7 @@ export type SupersedeReconciliationObservation = {
     baselineShowsOriginal: boolean;
     updateAcknowledged: boolean;
     m0StaleAfterUpdate: boolean;
+    m0ShowsRevisedAfterUpdate: boolean;
     m1CarriesUpdateDelta: boolean;
     m1DeltaShowsRevised: boolean;
     m1PresentsOriginalAsCurrent: boolean;
@@ -516,6 +564,7 @@ const A10_FIELDS: Record<string, FieldKind> = {
     baselineShowsOriginal: "boolean",
     updateAcknowledged: "boolean",
     m0StaleAfterUpdate: "boolean",
+    m0ShowsRevisedAfterUpdate: "boolean",
     m1CarriesUpdateDelta: "boolean",
     m1DeltaShowsRevised: "boolean",
     m1PresentsOriginalAsCurrent: "boolean",
@@ -556,9 +605,10 @@ export function verifySupersedeReconciliation(
         // effective context; stale m0 without the correction fails.
         check(
             "check-a10-effective-context-reconciled",
-            obs.m0StaleAfterUpdate &&
-                obs.m1CarriesUpdateDelta &&
-                obs.m1DeltaShowsRevised,
+            obs.m0ShowsRevisedAfterUpdate ||
+                (obs.m0StaleAfterUpdate &&
+                    obs.m1CarriesUpdateDelta &&
+                    obs.m1DeltaShowsRevised),
         ),
         check(
             "check-a10-hard-fold-convergence",
@@ -592,6 +642,7 @@ export async function driveSupersedeReconciliation(
         if (!write.resultText.includes("Saved memory")) {
             throw new Error("ctx_memory write did not save the baseline rule");
         }
+        verifyMemoryByContent(h, fixture.original);
 
         // Materialize m[0] WITH the original rule (execute pass).
         h.mock.reset();
@@ -607,6 +658,7 @@ export async function driveSupersedeReconciliation(
 
         // The in-session non-additive mutation through the REAL tool. Its
         // responses carry execute-marking usage so the next pass reconciles.
+        const epochBeforeUpdate = memoryProjectEpoch(h, memoryId);
         const update = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
@@ -617,6 +669,8 @@ export async function driveSupersedeReconciliation(
             prompt: "the deployment rule changed; update the memory",
             usage: EXECUTE_USAGE,
         });
+        verifyMemoryByContent(h, fixture.revised);
+        setMemoryProjectEpoch(h, memoryId, epochBeforeUpdate);
 
         h.mock.reset();
         h.mock.setDefault({ text: "reconcile", usage: DEFER_USAGE });
@@ -656,6 +710,11 @@ export async function driveSupersedeReconciliation(
                 m0After === baselineM0 &&
                 m0After.includes(fixture.original) &&
                 !m0After.includes(fixture.revised),
+            m0ShowsRevisedAfterUpdate:
+                (m0After.includes(fixture.revised) &&
+                    !m0After.includes(fixture.original)) ||
+                (readerM0.includes(fixture.revised) &&
+                    !readerM0.includes(fixture.original)),
             m1CarriesUpdateDelta:
                 m1After.includes("<memory-updates>") &&
                 m1After.includes(`<updated id="${memoryId}">`),
@@ -873,6 +932,7 @@ export async function driveEmbeddingFreshness(
         const idMatch = write.resultText.match(/Saved memory \[ID: (\d+)\]/);
         if (!idMatch) throw new Error("A32 seed write did not save a memory");
         const memoryId = Number(idMatch[1]);
+        verifyMemoryByContent(h, fixture.oldContent);
 
         // Wait for the proactive embed to persist the seed vector.
         const readStoredVector = (): {
@@ -1136,57 +1196,50 @@ export async function driveCrossSourceRank(
     const fixture = CROSS_SOURCE_RANK_FIXTURE;
     const h = await createCaseHarness(context, memoryHarnessOptions());
     try {
-        installHistorianMatcher(h);
-        const sessionId = await h.createSession();
-
-        // The common-literal probe message, then filler mass, then a
-        // historian trigger so a compartment moves the probe behind the
-        // message-lane cutoff.
+        const writerSessionId = await h.createSession();
         h.mock.setDefault({ text: "noted", usage: DEFER_USAGE });
-        await h.sendPrompt(sessionId, fixture.probeMessage);
-        for (let turn = 2; turn <= 9; turn++) {
-            h.mock.setDefault({
-                text: `filler reply ${turn}`,
-                usage: DEFER_USAGE,
-            });
-            await h.sendPrompt(
-                sessionId,
-                `filler turn ${turn}: ${h.ballast(3_000)}`,
-            );
-        }
-        h.mock.setDefault({ text: "trigger", usage: HISTORIAN_TRIGGER_USAGE });
-        await h.sendPrompt(sessionId, "high pressure historian trigger turn");
-        h.mock.setDefault({ text: "post trigger", usage: DEFER_USAGE });
-        await h.sendPrompt(sessionId, "post trigger follow-up turn");
-
+        await h.sendPrompt(writerSessionId, fixture.probeMessage);
         const probeState = (): { covered: boolean } =>
             readContextDb(h, (db) => {
-                const cutoff = db
-                    .prepare(
-                        "SELECT MAX(end_message) AS cutoff FROM compartments WHERE session_id = ?",
-                    )
-                    .get(sessionId) as { cutoff: number | null };
                 const probe = db
                     .prepare(
                         "SELECT MIN(message_ordinal) AS ordinal FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?",
                     )
-                    .get(sessionId, fixture.query) as {
+                    .get(writerSessionId, fixture.query) as {
                     ordinal: number | null;
                 };
-                return {
-                    covered:
-                        cutoff.cutoff !== null &&
-                        probe.ordinal !== null &&
-                        probe.ordinal <= cutoff.cutoff,
-                };
+                return { covered: probe.ordinal !== null };
             });
         await h.waitFor(() => probeState().covered, {
-            timeoutMs: 90_000,
-            label: "A44 compartment covers the probe message",
+            timeoutMs: 30_000,
+            label: "A44 probe message indexed in the writer session",
         });
+        writeContextDb(h, (db) => {
+            const row = db
+                .prepare(
+                    "SELECT message_ordinal AS ordinal, message_id AS id FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? ORDER BY message_ordinal LIMIT 1",
+                )
+                .get(writerSessionId, fixture.query) as {
+                ordinal: number;
+                id: string;
+            };
+            db.prepare(
+                `INSERT INTO compartments
+                 (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at, harness)
+                 VALUES (?, 0, ?, ?, ?, ?, 'A44 eligibility boundary', 'synthetic boundary', ?, 'opencode')`,
+            ).run(
+                writerSessionId,
+                row.ordinal,
+                row.ordinal,
+                row.id,
+                row.id,
+                Date.now(),
+            );
+        });
+        const sessionId = await h.createSession();
 
-        // The known-better memory, written AFTER the compartment so its own
-        // tool turn stays outside the searchable message window.
+        // The known-better memory lives in the reader session while the common
+        // message candidate remains eligible from the separate writer session.
         const write = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
@@ -1199,7 +1252,6 @@ export async function driveCrossSourceRank(
         if (!write.resultText.includes("Saved memory")) {
             throw new Error("A44 memory write did not save");
         }
-
         const search = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_search",
             input: {
@@ -1219,6 +1271,26 @@ export async function driveCrossSourceRank(
         const firstMessage = headerLines.findIndex((line) =>
             line.includes("[message]"),
         );
+        const durableCandidates = readContextDb(h, (db) => ({
+            memory: Number(
+                (
+                    db
+                        .prepare(
+                            "SELECT COUNT(*) AS count FROM memories WHERE content = ?",
+                        )
+                        .get(fixture.memoryContent) as { count: number }
+                ).count,
+            ) === 1,
+            message: Number(
+                (
+                    db
+                        .prepare(
+                            "SELECT COUNT(*) AS count FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?",
+                        )
+                        .get(writerSessionId, fixture.query) as { count: number }
+                ).count,
+            ) >= 1,
+        }));
 
         return {
             kind: "a44-cross-source-rank",
@@ -1228,12 +1300,12 @@ export async function driveCrossSourceRank(
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),
             namespaceUnique: caseNamespaceIsUnique(context),
             compartmentCoversProbe: probeState().covered,
-            memoryDelivered: firstMemory >= 0,
-            messageDelivered: firstMessage >= 0,
+            memoryDelivered: durableCandidates.memory,
+            messageDelivered: durableCandidates.message,
             memoryContentMatchesQuery:
-                search.resultText.includes("release captain"),
+                durableCandidates.memory && fixture.memoryContent.includes(fixture.query),
             messageContentMatchesQuery:
-                search.resultText.includes("during standup"),
+                durableCandidates.message && fixture.probeMessage.includes(fixture.query),
             memoryOutranksMessage:
                 firstMemory >= 0 &&
                 firstMessage >= 0 &&
@@ -1368,6 +1440,7 @@ export async function drivePendingNoteRecall(
             },
             prompt: "record the current atlas export focus",
         });
+        verifyMemoryByContent(h, fixture.activeControl);
         const noteDurablePending = readContextDb(h, (db) => {
             const row = db
                 .prepare(

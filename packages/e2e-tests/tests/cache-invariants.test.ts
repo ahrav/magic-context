@@ -34,7 +34,6 @@ import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
-import type { Database } from "../../plugin/src/shared/sqlite";
 import {
     extractM0,
     extractM1,
@@ -199,7 +198,9 @@ function projectIdentity(): string {
     return resolveProjectIdentity(realpathSync(pathResolve(h.opencode.env.workdir)));
 }
 
-function writeContextDb<T>(fn: (db: Database) => T): T {
+function writeContextDb<T>(
+    fn: (db: ReturnType<typeof openTestDb>) => T,
+): T {
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
     const db = openTestDb(dbPath, { readwrite: true });
     try {
@@ -211,7 +212,7 @@ function writeContextDb<T>(fn: (db: Database) => T): T {
 
 function seedMemory(content: string, category: Memory["category"] = "PROJECT_RULES"): number {
     return writeContextDb((db) => {
-        const id = insertMemory(db, {
+        const id = insertMemory(db as never, {
             projectPath: projectIdentity(),
             category,
             content,
@@ -221,7 +222,7 @@ function seedMemory(content: string, category: Memory["category"] = "PROJECT_RUL
             // deterministic before the next turn materializes m[0].
             sourceType: "user",
         }).id;
-        updateMemoryVerification(db, id, "verified");
+        updateMemoryVerification(db as never, id, "verified");
         return id;
     });
 }
@@ -268,7 +269,12 @@ function queueMemoryUpdate(targetId: number, newContent: string): void {
                 (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
              VALUES (?, 'update', ?, NULL, NULL, ?, ?)`,
         ).run(projectIdentity(), targetId, newContent, Date.now());
-        updateMemoryContent(db, targetId, newContent, computeNormalizedHash(newContent));
+        updateMemoryContent(
+            db as never,
+            targetId,
+            newContent,
+            computeNormalizedHash(newContent),
+        );
     });
 }
 
@@ -706,7 +712,9 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // starts CANDIDATE); re-verify through the real API so the revised
                 // row stays render-eligible, then pin the epoch so the mutation
                 // rides the m[1] delta instead of HARD-refolding m[0].
-                writeContextDb((db) => updateMemoryVerification(db, memId, "verified"));
+                writeContextDb((db) =>
+                    updateMemoryVerification(db as never, memId, "verified"),
+                );
                 setProjectEpoch(epochBeforeUpdate);
                 setDefer("B11 reconcile");
                 await h.sendPrompt(sessionId, "B11 turn 5: execute pass renders the memory-updates delta.");

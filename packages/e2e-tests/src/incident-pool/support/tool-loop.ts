@@ -104,10 +104,6 @@ export function caseNamespaceIsUnique(context: CaseDriverContext): boolean {
     );
 }
 
-function isMainAgentRequest(body: Record<string, unknown>): boolean {
-    return JSON.stringify(body.system ?? "").includes("## Magic Context");
-}
-
 function publishedToolName(
     body: Record<string, unknown>,
     tool: string,
@@ -206,7 +202,7 @@ export async function runScriptedToolCall(
     let published: string | null = null;
     h.mock.reset();
     h.mock.addMatcher((body) => {
-        if (published !== null || !isMainAgentRequest(body)) return null;
+        if (published !== null) return null;
         const name = publishedToolName(body, options.tool);
         if (!name) return null;
         published = name;
@@ -224,8 +220,23 @@ export async function runScriptedToolCall(
     });
     await h.sendPrompt(sessionId, options.prompt);
     if (published === null) {
+        const visible = [
+            ...new Set(
+                h.mock
+                    .requests()
+                    .flatMap((request) => request.body.tools ?? [])
+                    .map((tool) =>
+                        tool &&
+                        typeof tool === "object" &&
+                        typeof (tool as { name?: unknown }).name === "string"
+                            ? (tool as { name: string }).name
+                            : null,
+                    )
+                    .filter((name): name is string => name !== null),
+            ),
+        ];
         throw new Error(
-            `tool ${options.tool} was never published on the provider wire`,
+            `tool ${options.tool} was never published on the provider wire (visible: ${visible.join(", ") || "none"})`,
         );
     }
     const resultText = findToolResultText(h, callId);

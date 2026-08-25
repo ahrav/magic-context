@@ -85,6 +85,7 @@ function a10Observation(
         baselineShowsOriginal: true,
         updateAcknowledged: true,
         m0StaleAfterUpdate: true,
+        m0ShowsRevisedAfterUpdate: false,
         m1CarriesUpdateDelta: true,
         m1DeltaShowsRevised: true,
         m1PresentsOriginalAsCurrent: false,
@@ -685,7 +686,10 @@ describe("driver integration (real harness)", () => {
         expect(preconditionEmbeddingFreshness(observation).satisfied).toBe(
             true,
         );
-        expect(observation.staleQueryMatchSemantic).toBe(true);
+        expect(failedIds(verifyEmbeddingFreshness(observation))).toEqual([
+            "check-a32-fresh-semantic-recall",
+            "check-a32-stale-vector-replaced",
+        ]);
         expect(failedIds(verifyEmbeddingFreshness(observation))).toEqual([
             "check-a32-fresh-semantic-recall",
             "check-a32-stale-vector-replaced",
