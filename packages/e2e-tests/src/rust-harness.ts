@@ -178,8 +178,19 @@ export class RustTestHarness {
                 rustMode: !options.startInTsMode,
             });
         } catch (error) {
-            await mcHost.stop();
-            await mock.stop();
+            // Independent steps: a failing teardown neither skips the ones
+            // after it — the mock's HTTP listener outlives this scope
+            // otherwise — nor replaces the spawn failure being reported.
+            try {
+                await mcHost.stop();
+            } catch {
+                // ignore
+            }
+            try {
+                await mock.stop();
+            } catch {
+                // ignore
+            }
             throw error;
         }
 

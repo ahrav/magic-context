@@ -20,6 +20,7 @@ import {
     McHostClient,
     type BindIdentity,
 } from "@magic-context/core/shared/mc-host-client";
+import { waitForChildExit } from "../process-exit";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const FIXTURE_BINARY = join(
@@ -302,25 +303,6 @@ function verifyPublication(path: string, expectedMode: number): void {
 
 function appendBounded(current: string, chunk: Buffer): string {
     return `${current}${chunk.toString()}`.slice(-MAX_LOG_BYTES);
-}
-
-function safeChildExit(
-    child: ChildProcess,
-    timeoutMs: number,
-): Promise<boolean> {
-    if (child.exitCode !== null || child.signalCode !== null)
-        return Promise.resolve(true);
-    return new Promise((resolveExit) => {
-        const timer = setTimeout(() => {
-            child.off("exit", onExit);
-            resolveExit(false);
-        }, timeoutMs);
-        const onExit = (): void => {
-            clearTimeout(timer);
-            resolveExit(true);
-        };
-        child.once("exit", onExit);
-    });
 }
 
 class FixtureControlClient {
@@ -645,7 +627,10 @@ export class HermeticMcHostStack {
             await stack.startHost();
             return stack;
         } catch (error) {
-            await stack.stop();
+            // stop() throws when the child survives its teardown escalation.
+            // Discarding that keeps the startup cause as the thrown error;
+            // the surviving child stays reachable through its PID record.
+            await stack.stop().catch(() => undefined);
             throw error;
         }
     }
@@ -729,7 +714,7 @@ export class HermeticMcHostStack {
         this.resumeBeforeTeardown(child);
         if (child.exitCode === null && child.signalCode === null)
             child.kill("SIGKILL");
-        if (!(await safeChildExit(child, 5_000))) {
+        if (!(await waitForChildExit(child, 5_000))) {
             throw new Error(
                 "direct mc-host fixture did not exit after SIGKILL",
             );
@@ -750,7 +735,7 @@ export class HermeticMcHostStack {
         this.resumeBeforeTeardown(child);
         if (child.exitCode === null && child.signalCode === null)
             child.kill("SIGTERM");
-        if (!(await safeChildExit(child, 10_000))) {
+        if (!(await waitForChildExit(child, 10_000))) {
             throw new Error(
                 "direct mc-host fixture did not exit after SIGTERM",
             );
@@ -789,14 +774,14 @@ export class HermeticMcHostStack {
             } catch {
                 // Fixture may already be unavailable.
             }
-            exited = await safeChildExit(child, 5_000);
+            exited = await waitForChildExit(child, 5_000);
             if (!exited) {
                 child.kill("SIGTERM");
-                exited = await safeChildExit(child, 5_000);
+                exited = await waitForChildExit(child, 5_000);
             }
             if (!exited) {
                 child.kill("SIGKILL");
-                exited = await safeChildExit(child, 5_000);
+                exited = await waitForChildExit(child, 5_000);
             }
         }
         this.control?.close();

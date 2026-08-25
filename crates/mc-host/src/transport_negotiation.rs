@@ -114,7 +114,6 @@ impl std::error::Error for NegotiationError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackReason {
     Unavailable,
-    NegotiationVersionMismatch,
     CapabilityVersionMismatch,
 }
 
@@ -122,7 +121,6 @@ impl FallbackReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
-            Self::NegotiationVersionMismatch => "negotiation_version_mismatch",
             Self::CapabilityVersionMismatch => "capability_version_mismatch",
         }
     }
@@ -130,7 +128,6 @@ impl FallbackReason {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "unavailable" => Some(Self::Unavailable),
-            "negotiation_version_mismatch" => Some(Self::NegotiationVersionMismatch),
             "capability_version_mismatch" => Some(Self::CapabilityVersionMismatch),
             _ => None,
         }

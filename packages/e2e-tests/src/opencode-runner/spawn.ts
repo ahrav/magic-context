@@ -8,12 +8,13 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
 import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
 import { Database } from "../../../plugin/src/shared/sqlite";
+import { waitForChildExit } from "../process-exit";
 import {
     buildDirectHostFixture,
     detectRustModePrereqs,
@@ -21,7 +22,17 @@ import {
 } from "../rust-runner/hermetic-mc-host";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-const PLUGIN_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
+// Prefer the built bundle over raw `src/index.ts`. The bundle is one file with
+// all imports inlined and loads fast even on a cold runner, while the TS-source
+// path triggers Bun's runtime transpile and dynamic resolution across hundreds
+// of submodule imports — enough on a slow CI runner to make `opencode serve`
+// look hung when it is only blocked in plugin load. Production never loads from
+// src/, so the source path also tests a slowness users never see.
+const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
+const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
+const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY)
+    ? PLUGIN_DIST_ENTRY
+    : PLUGIN_SRC_ENTRY;
 
 function initializeIsolatedContextDb(dataDir: string): void {
     const path = join(dataDir, "cortexkit", "magic-context", "context.db");
@@ -297,21 +308,6 @@ function rejectOnSpawnError(child: ChildProcess, cancellation?: AbortSignal): Pr
     });
 }
 
-function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-    return new Promise((resolveExit) => {
-        const onExit = (): void => {
-            clearTimeout(timer);
-            resolveExit(true);
-        };
-        const timer = setTimeout(() => {
-            child.off("exit", onExit);
-            resolveExit(false);
-        }, timeoutMs);
-        child.once("exit", onExit);
-    });
-}
-
 async function stopChild(child: ChildProcess, timeoutMs = 3_000): Promise<void> {
     if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
 
@@ -340,6 +336,18 @@ async function provisionRustMode(): Promise<RustSpawnResources> {
         const mcHost = await HermeticMcHostStack.start({ dataDir: env.dataDir, fixtureBin });
         return { env, connectionFile: mcHost.connectionFile, mcHost };
     } catch (error) {
+        // This env has no other owner yet: `cleanup()` only runs for a stack
+        // that started, and the process reaper only kills recorded PIDs. A
+        // surviving dataDir is the stack's record that its own teardown could
+        // not reclaim it — the leaked fixture's PID file lives there and is the
+        // next run's only handle on that process — so the tree stays put then.
+        if (!existsSync(env.dataDir)) {
+            try {
+                rmSync(dirname(env.dataDir), { recursive: true, force: true });
+            } catch {
+                // Temp litter never masks the startup failure.
+            }
+        }
         throw new Error(
             `MC_E2E_MODE=rust failed to start direct mc-host fixture: ${String(error)}`,
         );

@@ -1236,6 +1236,16 @@ fn log_cleanup_failure(
     }
 }
 
+/// Closes the producer and logs a close failure without changing the outcome
+/// being returned. Named once because the drive paths exit through several
+/// branches that each owe this same cleanup.
+async fn close_and_log<P>(producer: &mut P, session_id: &str)
+where
+    P: HistorianProducerDriver + ?Sized,
+{
+    log_cleanup_failure(session_id, "close", &producer.close().await);
+}
+
 fn cancellation_confirmed_stopped(result: &Result<(), HistorianProducerError>) -> bool {
     match result {
         Ok(()) => true,
@@ -1452,15 +1462,15 @@ where
                     log_cleanup_failure(request.session_id, "attempt close", &cleanup);
                     continue;
                 }
-                log_cleanup_failure(request.session_id, "close", &producer.close().await);
+                close_and_log(producer, request.session_id).await;
                 return Err(HistorianDriveError::Validation(err));
             }
             Err(err) => {
-                log_cleanup_failure(request.session_id, "close", &producer.close().await);
+                close_and_log(producer, request.session_id).await;
                 return Err(err);
             }
         };
-        log_cleanup_failure(request.session_id, "close", &producer.close().await);
+        close_and_log(producer, request.session_id).await;
         return Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
             row_version,
             producer_session_id,
@@ -1528,7 +1538,7 @@ where
                 (request.completion_now_ms)(),
             );
             abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
-            log_cleanup_failure(request.session_id, "close", &producer.close().await);
+            close_and_log(producer, request.session_id).await;
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
     }
@@ -1615,7 +1625,7 @@ where
         completion_now_ms: request.completion_now_ms,
         publication_fence: request.publication_fence,
     });
-    log_cleanup_failure(request.session_id, "close", &producer.close().await);
+    close_and_log(producer, request.session_id).await;
     let row_version = publish_result?;
     Ok(HistorianReattachOutcome::Published(HistorianRunSuccess {
         row_version,

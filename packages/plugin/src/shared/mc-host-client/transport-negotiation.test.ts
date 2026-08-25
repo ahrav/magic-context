@@ -127,12 +127,21 @@ describe("fallback reasons", () => {
 
     test("the closed table decodes; anything else is rejected", () => {
         const offers = [tcpOffer(1)];
+        // Pinned to §7.7.3's two literals rather than derived from the exported
+        // array: a value the code accepts but the table omits is exactly the
+        // fail-open this guards, and iterating the array alone cannot see it.
+        expect([...FALLBACK_REASONS]).toEqual(["unavailable", "capability_version_mismatch"]);
         for (const reason of FALLBACK_REASONS) {
             const body = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"${reason}"}`;
             const response = decodeNegotiateResponse(bytes(body), offers);
             if (response.kind === "tcp") expect(response.reason).toBe(reason);
         }
-        for (const rejected of ["switching_transports", "connection_in_use"]) {
+        for (const rejected of [
+            "switching_transports",
+            "connection_in_use",
+            "negotiation_version_mismatch",
+            "unsupported_operation",
+        ]) {
             const body = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"${rejected}"}`;
             expectCode(() => decodeNegotiateResponse(bytes(body), offers), "invalid_reason");
         }

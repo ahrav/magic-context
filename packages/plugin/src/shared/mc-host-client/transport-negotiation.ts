@@ -75,12 +75,16 @@ export class NegotiationError extends Error {
     }
 }
 
-/** Closed fallback vocabulary (wire doc Section 7.7.3). */
-export const FALLBACK_REASONS = [
-    "unavailable",
-    "negotiation_version_mismatch",
-    "capability_version_mismatch",
-] as const;
+/**
+ * Closed fallback vocabulary (wire doc Section 7.7.3).
+ *
+ * Only these two reasons are fallback evidence. Every other setup outcome —
+ * negotiation-version mismatch, `unsupported_operation`, `connection_in_use`,
+ * timeout, malformed content, an unoffered selection — must fail closed with no
+ * same-generation TCP continuation, so accepting one here would commit the
+ * generation to TCP on evidence the protocol rejects.
+ */
+export const FALLBACK_REASONS = ["unavailable", "capability_version_mismatch"] as const;
 export type FallbackReason = (typeof FALLBACK_REASONS)[number];
 
 function isFallbackReason(value: string): value is FallbackReason {

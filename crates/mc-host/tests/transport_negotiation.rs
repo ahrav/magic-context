@@ -146,13 +146,11 @@ fn version_mismatches_encode_the_documented_tcp_fallback_reasons() {
         RESP_TCP_FALLBACK.as_bytes()
     );
 
-    // The whole closed table round-trips; anything else is rejected.
+    // The closed table is pinned to §7.7.3's two literals rather than derived
+    // from the enum: a value the enum accepts but the table omits is exactly the
+    // fail-open this checks for.
     for (name, expected) in [
         ("unavailable", FallbackReason::Unavailable),
-        (
-            "negotiation_version_mismatch",
-            FallbackReason::NegotiationVersionMismatch,
-        ),
         (
             "capability_version_mismatch",
             FallbackReason::CapabilityVersionMismatch,
@@ -170,11 +168,24 @@ fn version_mismatches_encode_the_documented_tcp_fallback_reasons() {
         };
         assert_eq!(reason, Some(expected));
     }
-    let unknown = r#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"switching_transports"}"#;
-    assert_eq!(
-        code(decode_negotiate_response(unknown.as_bytes(), &offers)),
-        NegotiationErrorCode::InvalidReason
-    );
+    // §7.7.3 names these as not fallback evidence: a TCP selection carrying one
+    // must fail closed rather than commit the generation to TCP.
+    for rejected in [
+        "switching_transports",
+        "negotiation_version_mismatch",
+        "connection_in_use",
+        "unsupported_operation",
+    ] {
+        let body = format!(
+            r#"{{"op":"transport.negotiate","negotiation_version":1,"selected":{{"transport":"tcp","capability_version":1}},"reason":"{rejected}"}}"#
+        );
+        assert_eq!(
+            code(decode_negotiate_response(body.as_bytes(), &offers)),
+            NegotiationErrorCode::InvalidReason,
+            "{rejected} must not be accepted as fallback evidence"
+        );
+        assert_eq!(FallbackReason::parse(rejected), None);
+    }
 }
 
 #[test]
