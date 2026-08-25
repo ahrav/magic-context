@@ -80,8 +80,8 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cargo nextest run -p mc-shm-transport --test contract
-          cargo test -p mc-host --test shm_transport \
-            omitted_and_unqualified_profiles_fall_back_without_side_effects
+          cargo test -p mc-host --lib \
+            shm_provider::tests::platform_preflight_is_side_effect_free
 
       - name: Rust lease non-escape
         run: cargo test -p mc-host --doc

@@ -699,6 +699,19 @@ mod tests {
     use super::*;
     use subc_protocol::{Flags, Priority, PROTOCOL_VERSION};
 
+    #[test]
+    fn platform_preflight_is_side_effect_free() {
+        let provider = ShmProvider::for_qualified_test_profile(single_candidate_limits());
+        assert_eq!(
+            provider.preflight(Some(&qualified_test_parameters())),
+            cfg!(target_os = "linux")
+        );
+        assert_eq!(provider.preparation_count(), 0);
+        let accounting = provider.accounting().unwrap();
+        assert_eq!(accounting.active, ResourceCharges::ZERO);
+        assert_eq!(accounting.quarantined, ResourceCharges::ZERO);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
         let rings = DuplexRing::create(&qualified_test_profile()).unwrap();
