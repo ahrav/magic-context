@@ -414,14 +414,19 @@ mod tests {
             .expect("owner-only scratch dir");
         let path = dir.join("subc-connection.json");
         let _ = std::fs::remove_file(&path);
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &path,
-            rustix::fs::FileType::Fifo,
-            Mode::from_bits_truncate(0o600),
-            0,
-        )
-        .expect("mkfifo");
+        // The POSIX `mkfifo` utility, not rustix: rustix gates both `mknodat` and
+        // `mkfifoat` away from Apple targets, and this crate is
+        // `deny(unsafe_code)`, so calling `mkfifo(2)` directly is not available
+        // either. The rejection matters just as much on macOS, so the test stays
+        // compiled on every platform rather than being cfg'd out on the one whose
+        // absence let a build break reach CI unnoticed.
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo is a POSIX utility present on every supported platform");
+        assert!(made.success(), "mkfifo failed: {made:?}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only fifo");
 
         // No writer is ever opened, so a blocking open can never complete.
         // Bounded on a worker thread rather than called directly: a regression
