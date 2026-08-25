@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod claim_mirror;
 pub mod sqlite_runtime;
 
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
@@ -2718,6 +2719,67 @@ const MIGRATIONS: &[Migration] = &[
             )),
             updated_at_ms INTEGER NOT NULL
         );
+        ",
+    },
+    Migration {
+        version: 57,
+        statements: "
+        CREATE TABLE mc_claim_mirror_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            mirror_version INTEGER NOT NULL CHECK (mirror_version = 1),
+            vector_version INTEGER NOT NULL CHECK (vector_version = 1),
+            database_incarnation_id TEXT NOT NULL
+                CHECK (length(database_incarnation_id) = 32),
+            workspace_epoch TEXT NOT NULL CHECK (length(workspace_epoch) > 0),
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE mc_claim_mirror_projects (
+            database_incarnation_id TEXT NOT NULL
+                CHECK (length(database_incarnation_id) = 32),
+            project_id INTEGER NOT NULL CHECK (project_id > 0),
+            project_generation INTEGER NOT NULL CHECK (project_generation >= 0),
+            policy_generation INTEGER NOT NULL CHECK (policy_generation >= 0),
+            acked_effect_id INTEGER NOT NULL CHECK (acked_effect_id >= 0),
+            PRIMARY KEY (database_incarnation_id, project_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE mc_claim_mirror_claims (
+            database_incarnation_id TEXT NOT NULL
+                CHECK (length(database_incarnation_id) = 32),
+            public_claim_id TEXT NOT NULL CHECK (length(public_claim_id) = 36),
+            project_id INTEGER NOT NULL CHECK (project_id > 0),
+            revision_locator TEXT NOT NULL CHECK (length(revision_locator) > 0),
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            content TEXT NOT NULL,
+            content_digest TEXT NOT NULL CHECK (length(content_digest) = 64),
+            attributes_json TEXT NOT NULL CHECK (json_valid(attributes_json)),
+            lifecycle_state TEXT NOT NULL CHECK (
+                lifecycle_state IN ('active', 'archived', 'retired')
+            ),
+            applicability_json TEXT NOT NULL CHECK (json_valid(applicability_json)),
+            policy_json TEXT NOT NULL CHECK (json_valid(policy_json)),
+            provenance_label TEXT,
+            project_generation INTEGER NOT NULL CHECK (project_generation >= 0),
+            policy_generation INTEGER NOT NULL CHECK (policy_generation >= 0),
+            PRIMARY KEY (database_incarnation_id, public_claim_id),
+            UNIQUE (database_incarnation_id, revision_locator),
+            FOREIGN KEY (database_incarnation_id, project_id)
+                REFERENCES mc_claim_mirror_projects(database_incarnation_id, project_id)
+                ON DELETE CASCADE
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_mc_claim_mirror_claims_project
+            ON mc_claim_mirror_claims(database_incarnation_id, project_id, public_claim_id);
+        CREATE TABLE mc_claim_mirror_receipts (
+            database_incarnation_id TEXT NOT NULL
+                CHECK (length(database_incarnation_id) = 32),
+            receipt_id INTEGER NOT NULL CHECK (receipt_id > 0),
+            expected_effect_count INTEGER NOT NULL CHECK (expected_effect_count > 0),
+            first_effect_id INTEGER NOT NULL CHECK (first_effect_id > 0),
+            last_effect_id INTEGER NOT NULL CHECK (last_effect_id >= first_effect_id),
+            group_digest TEXT NOT NULL CHECK (length(group_digest) = 64),
+            generation_vector_json TEXT NOT NULL CHECK (json_valid(generation_vector_json)),
+            applied_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (database_incarnation_id, receipt_id)
+        ) WITHOUT ROWID;
         ",
     },
 ];
