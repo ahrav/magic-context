@@ -83,7 +83,8 @@ mod unix {
     /// matching `release-blocked-call`. That silently rewrites the fault schedule
     /// an E2E scenario is asserting against. Addressing a specific invocation
     /// makes an unconsumed release impossible to mistake for a pending one.
-    type BlockedQueue = Arc<Mutex<VecDeque<(u64, oneshot::Sender<()>)>>>;
+    /// The queued value is the ack channel the run uses to confirm it resumed.
+    type BlockedQueue = Arc<Mutex<VecDeque<(u64, oneshot::Sender<oneshot::Sender<()>>)>>>;
 
     struct ControlledBackend {
         next: Mutex<NextBehavior>,
@@ -108,12 +109,16 @@ mod unix {
             *self.next.lock().expect("fixture backend behavior mutex") = behavior;
         }
 
-        /// Hands one release to the oldest still-waiting blocked invocation.
+        /// Hands one release to a blocked invocation and waits for it to resume.
         ///
-        /// Senders whose invocation already lost the race to cancellation are
-        /// discarded rather than counted, so a release is reported accepted only
-        /// when a live run actually received it.
-        fn release_blocked(&self) -> bool {
+        /// `oneshot::Sender::send` only proves the receiver still existed, not
+        /// that the run selected the release branch: the `biased` select prefers
+        /// shutdown and cancellation, so a release handed over at that instant is
+        /// never consumed. Counting it here would report one invocation as both
+        /// released and cancelled and answer `accepted: true` for a run that never
+        /// resumed. The run therefore acknowledges consumption, and a release that
+        /// lost the race moves on to the next waiting invocation.
+        async fn release_blocked(&self) -> bool {
             loop {
                 let Some((_id, sender)) = self
                     .blocked
@@ -123,11 +128,17 @@ mod unix {
                 else {
                     return false;
                 };
-                if sender.send(()).is_ok() {
-                    take_blocked_slot(&self.counters);
-                    self.counters.released.fetch_add(1, Ordering::SeqCst);
+                let (ack, resumed) = oneshot::channel();
+                if sender.send(ack).is_err() {
+                    // The invocation ended before the handoff; it already
+                    // withdrew itself and counted its own outcome.
+                    continue;
+                }
+                if resumed.await.is_ok() {
                     return true;
                 }
+                // Handed over but not consumed: the run lost to cancellation and
+                // counted itself cancelled. Offer this release to the next one.
             }
         }
 
@@ -151,7 +162,10 @@ mod unix {
     }
 
     /// Registers one blocked invocation and returns its id and release channel.
-    fn register_blocked(queue: &BlockedQueue, next_id: &AtomicU64) -> (u64, oneshot::Receiver<()>) {
+    fn register_blocked(
+        queue: &BlockedQueue,
+        next_id: &AtomicU64,
+    ) -> (u64, oneshot::Receiver<oneshot::Sender<()>>) {
         let id = next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         queue
@@ -222,16 +236,23 @@ mod unix {
                                 counters.cancelled.fetch_add(1, Ordering::SeqCst);
                                 ControlledBackend::terminal_error("fixture run cancelled")
                             }
-                            released = release => {
-                                // `release_blocked` already accounted this run;
-                                // a dropped sender means the fixture is going
-                                // away, which the cancellation branches own.
-                                if released.is_err() {
+                            granted = release => {
+                                // This branch is the only place a release counts,
+                                // so no invocation can be both released and
+                                // cancelled. A dropped grant means the fixture is
+                                // going away, which the cancellation branches own.
+                                let Ok(ack) = granted else {
                                     withdraw_blocked(&blocked, id);
                                     take_blocked_slot(&counters);
                                     counters.cancelled.fetch_add(1, Ordering::SeqCst);
                                     return ControlledBackend::terminal_error("fixture release dropped");
-                                }
+                                };
+                                take_blocked_slot(&counters);
+                                counters.released.fetch_add(1, Ordering::SeqCst);
+                                // Acknowledged after the accounting, so a
+                                // releaser that observes the ack also observes
+                                // the counters.
+                                let _ = ack.send(());
                                 events.emit(BackendEvent::AssistantText {
                                     text: "fixture-released".to_owned(),
                                     finish_reason: None,
@@ -432,7 +453,7 @@ mod unix {
                             }
                             ControlCommand::ReleaseBlockedCall => (
                                 ControlResult::Ack {
-                                    accepted: backend.release_blocked(),
+                                    accepted: backend.release_blocked().await,
                                 },
                                 false,
                             ),
