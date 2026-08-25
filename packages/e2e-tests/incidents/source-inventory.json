@@ -766,11 +766,11 @@
         {
             "id": "src-mutation-fm-oc-5",
             "source_path": "packages/e2e-tests/mutations/fm-oc-5.json",
-            "content_digest": "0a84350bb0efa4d6a081f545aaa3161b81c396810f0e2325403f8bc95142ed3e",
+            "content_digest": "cfc111561a472eb04c0481c2ba770966eed343ffb87a44c6fa3b821187397d18",
             "claims": [
                 {
                     "id": "claim-mutation-fm-oc-5-rung-swap",
-                    "content_digest": "c37099dcecb83b6ee6e3ac7bf1be16b14540fa82f95c3606138181e1a8b69dcc",
+                    "content_digest": "94ecdeffcdcca5cd150503ee3ab827859c0ebb911536edf9c2ab8bcaac6a11e3",
                     "disposition": "verifier_evidence",
                     "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
                     "family_links": []
@@ -892,11 +892,11 @@
         {
             "id": "src-mutation-rust-ctx-reduce-roundtrip",
             "source_path": "packages/e2e-tests/mutations/rust-ctx-reduce-roundtrip.json",
-            "content_digest": "360c4b8e7de4b69b0607e9ad3a2e240b34652ac4b3aac5bb9c5575166a2f49a9",
+            "content_digest": "caa3fe45dcc88ba38a238a62acdca67411102b31b0f370e820e3254059599766",
             "claims": [
                 {
                     "id": "claim-mutation-ctx-reduce-unknown-target",
-                    "content_digest": "22dd41b55651a54e6af0704bf2617944a8d6f016e833d5833309a5eaa3194bdd",
+                    "content_digest": "dd23e7e078dc72c8de534efe62fff6ff24b79192e01b84e11e0c7ec98e0d965f",
                     "disposition": "verifier_evidence",
                     "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
                     "family_links": []
@@ -906,11 +906,11 @@
         {
             "id": "src-mutation-rust-historian-producer",
             "source_path": "packages/e2e-tests/mutations/rust-historian-producer.json",
-            "content_digest": "d19b1a3df1c4f338699fe30faac5d42352980c316c2545e26b81659e878f922a",
+            "content_digest": "de87b529e70052aa024ec72c0081e524be37c960a7c925f0d6185d07deeba099",
             "claims": [
                 {
-                    "id": "claim-mutation-rust-historian-bad-tier",
-                    "content_digest": "602b3d9707e5f52e5a9b7cb7f4e0c610f8d4c57bdc52e3e40d0537971cca866f",
+                    "id": "claim-mutation-rust-historian-typed-failure",
+                    "content_digest": "539fd6d9eadfac485220faf7fa2f448baea1444d19273a745a590605873e68c5",
                     "disposition": "verifier_evidence",
                     "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
                     "family_links": []

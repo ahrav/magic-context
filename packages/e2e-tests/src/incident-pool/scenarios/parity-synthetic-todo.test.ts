@@ -158,8 +158,8 @@ describe("Rust synthetic todo incident family", () => {
             ),
         ).toEqual({
             satisfied: false,
-            reason: "blocked_by_dependency",
-            blockedBy: ["var-todo-1-synthetic-injection"],
+            reason: "precondition_unmet",
+            blockedBy: [],
         });
         const wrongDurableState = dependent({
             durableTransitionCorrect: false,

@@ -808,15 +808,6 @@ function stageField(body: string, key: string): string {
     return match ? match[1]! : "";
 }
 
-type StableSerializable =
-    | string
-    | number
-    | boolean
-    | null
-    | undefined
-    | StableSerializable[]
-    | { [key: string]: StableSerializable };
-
 /** Serialize a value with every `cache_control` key stripped, for byte-identity checks. */
 export function stableSerialize(value: unknown): string {
     return JSON.stringify(stripCacheControl(value)) ?? "";

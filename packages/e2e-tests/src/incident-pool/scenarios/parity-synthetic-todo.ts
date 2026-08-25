@@ -532,7 +532,15 @@ function preconditionDependentTodo(
     observation: NormalizedObservation,
 ): PreconditionOutcome {
     const value = observation as DependentTodoObservation;
-    if (!value.prerequisitesMet || !value.rootSyntheticPairPresent) {
+    // A missing toolchain is a prerequisite gap, not a blocked dependency
+    // on the root injection variant. Registration-level
+    // `prerequisite: rustPrerequisite` publishes `unavailable` before the
+    // driver runs, so this branch is defense in depth for an observation
+    // produced without the toolchain.
+    if (!value.prerequisitesMet) {
+        return unmet();
+    }
+    if (!value.rootSyntheticPairPresent) {
         return blockedByTodo1();
     }
     if (
@@ -1425,6 +1433,7 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
                 driver: driveTodoDeferReplay,
                 verifier: verifyTodoDeferReplay,
             },
+            prerequisite: rustPrerequisite,
         },
         {
             variantId: "var-todo-3-newer-todo-deferral",
@@ -1443,6 +1452,7 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
                 driver: driveTodoNewerDeferral,
                 verifier: verifyTodoNewerDeferral,
             },
+            prerequisite: rustPrerequisite,
         },
         {
             variantId: "var-todo-4-legacy-anchor-heal",
@@ -1461,6 +1471,7 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
                 driver: driveTodoLegacyAnchorHeal,
                 verifier: verifyTodoLegacyAnchorHeal,
             },
+            prerequisite: rustPrerequisite,
         },
         {
             variantId: "var-todo-5-terminal-clear",
@@ -1479,6 +1490,7 @@ export function paritySyntheticTodoIncidentCases(): RegisteredIncidentCase[] {
                 driver: driveTodoTerminalClear,
                 verifier: verifyTodoTerminalClear,
             },
+            prerequisite: rustPrerequisite,
         },
     ];
 }

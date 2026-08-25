@@ -437,7 +437,10 @@ jobs:
     # Gated on Docker e2e: no point exercising the deep behavior suite if
     # the simpler install+smoke path is broken.
     needs: [e2e-opencode]
-    timeout-minutes: 40
+    # The manifest selection includes the incident-pool green wrapper, which
+    # runs its cases sequentially in an isolated second phase, each paying a
+    # cold harness boot; 40 minutes is too tight for that plus the host suite.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -484,22 +487,14 @@ jobs:
         env:
           NODE_ENV: ""
           MC_E2E_MODE: ts
-        run: |
-          # The mode validator independently checks tests/**/*.test.ts and
-          # derives this OpenCode list. Rust is intentionally absent from public
-          # CI because its private ../commons and ../subconscious path-deps are
-          # not provisioned here; the local release gate runs that host group.
-          cd packages/e2e-tests
-          files=$(
-            bun scripts/validate-mode-manifest.ts --mode ts --harness opencode |
-              tr '\n' ' '
-          )
-          echo "Running OpenCode host tests from mode manifest: $files"
-          # shellcheck disable=SC2086
-          bun test --timeout 600000 $files
-          # This oracle is outside the manifest's tests/**/*.test.ts inventory.
-          bun test --timeout 600000 \
-            packages/e2e-tests/src/cache-analysis.test.ts
+        # run-test-selection.ts derives the OpenCode list from the mode
+        # manifest, carries the standalone oracles that live outside the
+        # manifest's tests/**/*.test.ts inventory (see standaloneUnitFiles),
+        # and runs the incident-pool green wrapper alone in a second phase
+        # with --max-concurrency 1. Rust is intentionally absent from public
+        # CI because its private ../commons and ../subconscious path-deps are
+        # not provisioned here; the local release gate runs that host group.
+        run: bun run --cwd packages/e2e-tests test:opencode-e2e
 
   e2e-host-pi:
     name: E2E (Pi, host behavior)

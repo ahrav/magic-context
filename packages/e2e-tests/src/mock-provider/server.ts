@@ -154,6 +154,12 @@ export class MockProvider {
             port,
             // Bun defaults to 0.0.0.0, which exposes the scripted provider to
             // the whole network; every consumer dials 127.0.0.1 anyway.
+            // Known trade-off: opencode-runner/spawn.ts records that a server
+            // bound to 127.0.0.1 on GitHub-hosted runners can make Bun's
+            // `fetch()` time out even though curl succeeds (its reason for
+            // binding 0.0.0.0). If host e2e jobs start timing out dialing the
+            // mock provider, that loopback stack edge case is the first
+            // suspect; revert to the default bind to confirm.
             hostname: "127.0.0.1",
             fetch: async (req) => this.handle(req),
         });

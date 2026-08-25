@@ -38,6 +38,7 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
 export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         "src/cache-analysis.test.ts",
+        "src/opencode-runner/spawn.test.ts",
         "src/pi-runner/rpc-client.test.ts",
     ];
     return assertPresent(files, root);
@@ -52,6 +53,35 @@ export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
  */
 export function rustStandaloneFiles(root: string = E2E_ROOT): string[] {
     return assertPresent(["src/rust-runner/hermetic-mc-host.test.ts"], root);
+}
+
+/**
+ * Two-way guard for the hand-maintained standalone lists above: every
+ * `src/**\/*.test.ts` on disk must be claimed by exactly one selection
+ * (incident-unit glob, standalone units, or Rust standalone), mirroring the
+ * manifest's own missing/dead-path check for `tests/**`. Without this, a new
+ * test file outside `tests/` that is absent from the literals runs in no
+ * selection and silently drops coverage.
+ */
+export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
+    const onDisk = [
+        ...new Glob("src/**/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
+    ];
+    const claimed = new Set([
+        ...incidentUnitFiles(root).filter((file) => file.startsWith("src/")),
+        ...standaloneUnitFiles(root),
+        ...rustStandaloneFiles(root),
+    ]);
+    const unclassified = onDisk.filter((file) => !claimed.has(file)).sort();
+    if (unclassified.length > 0) {
+        throw new Error(
+            `src test files missing from every selection: ${unclassified.join(", ")}; ` +
+                "add them to standaloneUnitFiles, rustStandaloneFiles, or the incident-unit glob",
+        );
+    }
 }
 
 function assertPresent(files: string[], root: string): string[] {
@@ -141,6 +171,7 @@ function parseArgs(args: string[]): CliArgs {
 
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
+    assertSrcTestsClassified();
     const files = args.incidentUnit
         ? incidentUnitFiles()
         : greenTestFiles(args.mode!, args.harness);

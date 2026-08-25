@@ -15,7 +15,6 @@ import {
     parseIncidentCatalog,
     parseSourceInventory,
     EXECUTABLE_LANES,
-    VARIANT_ID_RE,
     type AdjudicationEvent,
     type EmergencyRedactionEvent,
     type IncidentCatalog,
@@ -574,6 +573,3 @@ export function compareWithAcceptedSnapshot(
 
     return { accepted: acceptedState, candidate: candidateState };
 }
-
-// Re-exported so ledger fixtures and callers share one id shape source.
-export { VARIANT_ID_RE };
