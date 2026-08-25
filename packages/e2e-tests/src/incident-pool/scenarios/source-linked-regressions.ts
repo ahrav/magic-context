@@ -15,13 +15,21 @@
  * the incident registry.
  */
 
+import { detectRustPrerequisites } from "../../../scripts/check-rust-prerequisites";
 import {
     findBusts,
     formatBustReport,
     mainAgentRequests,
 } from "../../cache-analysis";
-import type { TestHarness } from "../../harness";
+import type { TestHarness, TestHarnessOptions } from "../../harness";
 import type { MockUsage } from "../../mock-provider/server";
+import type {
+    CaseDriverContext,
+    JsonValue,
+    PreconditionOutcome,
+    RegisteredIncidentCase,
+} from "../registry";
+import { createCaseHarness } from "../support/tool-loop";
 
 export interface RegressionCheck {
     id: string;
@@ -62,6 +70,23 @@ const DEFER_USAGE: MockUsage = {
     cache_read_input_tokens: 2_000,
 };
 
+export const FIRST_RENDER_HARNESS_OPTIONS = {
+    modelContextLimit: 100_000,
+    magicContextConfig: {
+        execute_threshold_percentage: 20,
+        protected_tags: 1,
+        dreamer: { disable: true },
+        sidekick: { disable: true },
+        compressor: { enabled: false },
+        memory: {
+            enabled: true,
+            auto_promote: false,
+            auto_search: { enabled: false },
+            git_commit_indexing: { enabled: false },
+        },
+    },
+} as const satisfies TestHarnessOptions;
+
 export const FIRST_RENDER_A1_CHECKS = [
     "check-a1-defer-request-floor",
     "check-a1-zero-prefix-busts",
@@ -73,13 +98,14 @@ export const FIRST_RENDER_A3_CHECKS = [
     "check-a3-reduce-retained-final-wire",
 ] as const;
 
-export interface FirstRenderDeferObservation {
+export interface FirstRenderDeferObservation
+    extends Record<string, JsonValue> {
     mainRequestCount: number;
     bustCount: number;
     bustReport: string;
 }
 
-export interface AgedCtxReduceObservation {
+export interface AgedCtxReduceObservation extends Record<string, JsonValue> {
     sawReduceOnWire: boolean;
     bustCount: number;
     bustReport: string;
@@ -434,7 +460,8 @@ const NUDGE_MARKERS = [
     "context_critical",
 ] as const;
 
-export interface ThinkingNudgeAnchorObservation {
+export interface ThinkingNudgeAnchorObservation
+    extends Record<string, JsonValue> {
     rustMode: boolean;
     mainRequestCount: number;
     inspectedSignedAssistants: number;
@@ -556,7 +583,8 @@ export function verifyThinkingNudgeAnchor(
     ]);
 }
 
-export interface ThinkingDroppedShellObservation {
+export interface ThinkingDroppedShellObservation
+    extends Record<string, JsonValue> {
     rustMode: boolean;
     dropEmitted: boolean;
     pasteBodyAbsent: boolean;
@@ -723,7 +751,8 @@ export function verifyThinkingDroppedShell(
     ]);
 }
 
-export interface ThinkingImageSurvivalObservation {
+export interface ThinkingImageSurvivalObservation
+    extends Record<string, JsonValue> {
     rustMode: boolean;
     dropEmitted: boolean;
     droppedTextAbsent: boolean;
@@ -858,4 +887,290 @@ export function verifyThinkingImageSurvival(
                   observation.userWithImagePresent,
         },
     ]);
+}
+
+const SOURCE_LINKED_IMPLEMENTATION_FILES = [
+    "packages/e2e-tests/src/incident-pool/scenarios/source-linked-regressions.ts",
+    "packages/e2e-tests/src/incident-pool/support/tool-loop.ts",
+    "packages/e2e-tests/src/harness.ts",
+    "packages/e2e-tests/src/opencode-runner/spawn.ts",
+    "packages/plugin/src/hooks/magic-context/hook-handlers.ts",
+];
+
+export const FIRST_RENDER_A1_FIXTURE = {
+    scenario: "pure-defer-growth",
+    turns: 6,
+    modelContextLimit: 100_000,
+    executeThresholdPercentage: 20,
+} as const;
+
+export const FIRST_RENDER_A3_FIXTURE = {
+    scenario: "aged-ctx-reduce-defer-growth",
+    turns: 8,
+    drop: "99999",
+    modelContextLimit: 100_000,
+    executeThresholdPercentage: 20,
+} as const;
+
+export const THINKING_NUDGE_FIXTURE = {
+    scenario: "signed-thinking-nudge-anchor",
+    rustMode: false,
+    autoSearch: false,
+    modelContextLimit: 50_000,
+} as const;
+
+export const THINKING_DROPPED_SHELL_FIXTURE = {
+    scenario: "dropped-user-shell-boundary",
+    rustMode: false,
+    autoSearch: false,
+    modelContextLimit: 50_000,
+} as const;
+
+export const THINKING_IMAGE_FIXTURE = {
+    scenario: "dropped-text-image-survival",
+    rustMode: false,
+    autoSearch: false,
+    modelContextLimit: 50_000,
+} as const;
+
+function exactPrimitiveObservation(
+    raw: JsonValue,
+    kind: string,
+    fields: Record<string, "boolean" | "number" | "string">,
+): Record<string, JsonValue> {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+        throw new Error(`${kind} observation must be an object`);
+    }
+    const keys = Object.keys(raw).sort();
+    const expected = Object.keys(fields).sort();
+    if (keys.join("\0") !== expected.join("\0")) {
+        throw new Error(`${kind} observation fields do not match the contract`);
+    }
+    for (const [field, type] of Object.entries(fields)) {
+        if (typeof raw[field] !== type) {
+            throw new Error(`${kind}.${field} must be ${type}`);
+        }
+    }
+    return raw;
+}
+
+function numberField(
+    observation: Record<string, JsonValue>,
+    field: string,
+): number {
+    const value = observation[field];
+    if (typeof value !== "number") throw new Error(`${field} must be number`);
+    return value;
+}
+
+function stringField(
+    observation: Record<string, JsonValue>,
+    field: string,
+): string {
+    const value = observation[field];
+    if (typeof value !== "string") throw new Error(`${field} must be string`);
+    return value;
+}
+
+function booleanField(
+    observation: Record<string, JsonValue>,
+    field: string,
+): boolean {
+    const value = observation[field];
+    if (typeof value !== "boolean")
+        throw new Error(`${field} must be boolean`);
+    return value;
+}
+
+function normalizeFirstRenderA1(raw: JsonValue): FirstRenderDeferObservation {
+    const value = exactPrimitiveObservation(raw, "parity-a1", {
+        mainRequestCount: "number",
+        bustCount: "number",
+        bustReport: "string",
+    });
+    return {
+        mainRequestCount: numberField(value, "mainRequestCount"),
+        bustCount: numberField(value, "bustCount"),
+        bustReport: stringField(value, "bustReport"),
+    };
+}
+
+function normalizeFirstRenderA3(raw: JsonValue): AgedCtxReduceObservation {
+    const value = exactPrimitiveObservation(raw, "parity-a3", {
+        sawReduceOnWire: "boolean",
+        bustCount: "number",
+        bustReport: "string",
+        finalWireHasCtxReduce: "boolean",
+    });
+    return {
+        sawReduceOnWire: booleanField(value, "sawReduceOnWire"),
+        bustCount: numberField(value, "bustCount"),
+        bustReport: stringField(value, "bustReport"),
+        finalWireHasCtxReduce: booleanField(value, "finalWireHasCtxReduce"),
+    };
+}
+
+function normalizeThinkingNudge(
+    raw: JsonValue,
+): ThinkingNudgeAnchorObservation {
+    const value = exactPrimitiveObservation(raw, "thinking-nudge-anchor", {
+        rustMode: "boolean",
+        mainRequestCount: "number",
+        inspectedSignedAssistants: "number",
+        nudgeMarkerFound: "boolean",
+        thinkingByteStable: "boolean",
+        rustThinkingBlockCount: "number",
+    });
+    return {
+        rustMode: booleanField(value, "rustMode"),
+        mainRequestCount: numberField(value, "mainRequestCount"),
+        inspectedSignedAssistants: numberField(
+            value,
+            "inspectedSignedAssistants",
+        ),
+        nudgeMarkerFound: booleanField(value, "nudgeMarkerFound"),
+        thinkingByteStable: booleanField(value, "thinkingByteStable"),
+        rustThinkingBlockCount: numberField(value, "rustThinkingBlockCount"),
+    };
+}
+
+function normalizeThinkingShell(
+    raw: JsonValue,
+): ThinkingDroppedShellObservation {
+    const value = exactPrimitiveObservation(raw, "thinking-dropped-shell", {
+        rustMode: "boolean",
+        dropEmitted: "boolean",
+        pasteBodyAbsent: "boolean",
+        shellPreserved: "boolean",
+        signedReplayIntact: "boolean",
+        turnBoundaryPreserved: "boolean",
+    });
+    return {
+        rustMode: booleanField(value, "rustMode"),
+        dropEmitted: booleanField(value, "dropEmitted"),
+        pasteBodyAbsent: booleanField(value, "pasteBodyAbsent"),
+        shellPreserved: booleanField(value, "shellPreserved"),
+        signedReplayIntact: booleanField(value, "signedReplayIntact"),
+        turnBoundaryPreserved: booleanField(value, "turnBoundaryPreserved"),
+    };
+}
+
+function normalizeThinkingImage(
+    raw: JsonValue,
+): ThinkingImageSurvivalObservation {
+    const value = exactPrimitiveObservation(raw, "thinking-image-survival", {
+        rustMode: "boolean",
+        dropEmitted: "boolean",
+        droppedTextAbsent: "boolean",
+        coveredByRustHistory: "boolean",
+        imageBlockCount: "number",
+        placeholderPresent: "boolean",
+        userWithImagePresent: "boolean",
+    });
+    return {
+        rustMode: booleanField(value, "rustMode"),
+        dropEmitted: booleanField(value, "dropEmitted"),
+        droppedTextAbsent: booleanField(value, "droppedTextAbsent"),
+        coveredByRustHistory: booleanField(value, "coveredByRustHistory"),
+        imageBlockCount: numberField(value, "imageBlockCount"),
+        placeholderPresent: booleanField(value, "placeholderPresent"),
+        userWithImagePresent: booleanField(value, "userWithImagePresent"),
+    };
+}
+
+async function withCaseHarness<T extends JsonValue>(
+    context: CaseDriverContext,
+    options: TestHarnessOptions,
+    run: (harness: TestHarness) => Promise<T>,
+): Promise<T> {
+    const harness = await createCaseHarness(context, options);
+    try {
+        return await run(harness);
+    } finally {
+        await harness.dispose();
+    }
+}
+
+function rustPrerequisite(): { ok: true } | { ok: false; reason: string } {
+    const result = detectRustPrerequisites();
+    return result.ok
+        ? { ok: true }
+        : { ok: false, reason: result.missing.join("; ") };
+}
+
+function satisfiedPrecondition(): PreconditionOutcome {
+    return { satisfied: true };
+}
+
+export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] {
+    return [
+        {
+            variantId: "var-parity-a1-pure-defer-stability",
+            implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
+            fixtures: { ...FIRST_RENDER_A1_FIXTURE },
+            driver: (context) =>
+                withCaseHarness(context, FIRST_RENDER_HARNESS_OPTIONS, (h) =>
+                    driveFirstRenderPureDeferStability(h),
+                ),
+            normalizer: normalizeFirstRenderA1,
+            precondition: satisfiedPrecondition,
+            verifier: (raw) =>
+                verifyFirstRenderPureDeferStability(normalizeFirstRenderA1(raw))
+                    .checks,
+            prerequisite: rustPrerequisite,
+        },
+        {
+            variantId: "var-parity-a3-ctx-reduce-survival",
+            implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
+            fixtures: { ...FIRST_RENDER_A3_FIXTURE },
+            driver: (context) =>
+                withCaseHarness(context, FIRST_RENDER_HARNESS_OPTIONS, (h) =>
+                    driveAgedCtxReduceSurvival(h),
+                ),
+            normalizer: normalizeFirstRenderA3,
+            precondition: satisfiedPrecondition,
+            verifier: (raw) =>
+                verifyAgedCtxReduceSurvival(normalizeFirstRenderA3(raw)).checks,
+            prerequisite: rustPrerequisite,
+        },
+        {
+            variantId: "var-thinking-nudge-anchor",
+            implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
+            fixtures: { ...THINKING_NUDGE_FIXTURE },
+            driver: (context) =>
+                withCaseHarness(context, THINKING_BLOCK_HARNESS_OPTIONS, (h) =>
+                    driveThinkingNudgeAnchor(h, { rustMode: false }),
+                ),
+            normalizer: normalizeThinkingNudge,
+            precondition: satisfiedPrecondition,
+            verifier: (raw) =>
+                verifyThinkingNudgeAnchor(normalizeThinkingNudge(raw)).checks,
+        },
+        {
+            variantId: "var-thinking-dropped-shell",
+            implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
+            fixtures: { ...THINKING_DROPPED_SHELL_FIXTURE },
+            driver: (context) =>
+                withCaseHarness(context, THINKING_BLOCK_HARNESS_OPTIONS, (h) =>
+                    driveThinkingDroppedShell(h, { rustMode: false }),
+                ),
+            normalizer: normalizeThinkingShell,
+            precondition: satisfiedPrecondition,
+            verifier: (raw) =>
+                verifyThinkingDroppedShell(normalizeThinkingShell(raw)).checks,
+        },
+        {
+            variantId: "var-thinking-image-survival",
+            implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
+            fixtures: { ...THINKING_IMAGE_FIXTURE },
+            driver: (context) =>
+                withCaseHarness(context, THINKING_BLOCK_HARNESS_OPTIONS, (h) =>
+                    driveThinkingImageSurvival(h, { rustMode: false }),
+                ),
+            normalizer: normalizeThinkingImage,
+            precondition: satisfiedPrecondition,
+            verifier: (raw) =>
+                verifyThinkingImageSurvival(normalizeThinkingImage(raw)).checks,
+        },
+    ];
 }

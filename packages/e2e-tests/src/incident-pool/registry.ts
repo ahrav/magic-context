@@ -28,6 +28,7 @@ import { auditBackgroundLifecycleIncidentCases } from "./scenarios/audit-backgro
 import { auditMemorySearchIncidentCases } from "./scenarios/audit-memory-search";
 import { parityPiTodoIncidentCases } from "./scenarios/parity-pi-todo";
 import { paritySyntheticTodoIncidentCases } from "./scenarios/parity-synthetic-todo";
+import { sourceLinkedRegressionIncidentCases } from "./scenarios/source-linked-regressions";
 
 export const SEMANTIC_FINGERPRINT_CONTRACT = "incident-semantic-fingerprint/v1";
 export const IMPLEMENTATION_BUNDLE_CONTRACT =
@@ -140,6 +141,7 @@ export function builtinIncidentCaseRegistry(): IncidentCaseRegistry {
         ...auditBackgroundLifecycleIncidentCases(),
         ...paritySyntheticTodoIncidentCases(),
         ...parityPiTodoIncidentCases(),
+        ...sourceLinkedRegressionIncidentCases(),
     ]) {
         registerIncidentCase(registry, entry);
     }
@@ -222,16 +224,23 @@ export function validateRegistryCatalogCorrespondence(
             executableById.set(variant.id, variant);
         }
     }
+    for (const [variantId, variant] of executableById) {
+        if (variant.verifier_binding?.binding_status !== "live") {
+            throw new Error(
+                `executable variant ${variantId} requires a live catalog verifier binding`,
+            );
+        }
+        if (!registry.has(variantId)) {
+            throw new Error(
+                `live executable variant ${variantId} has no registered case`,
+            );
+        }
+    }
     for (const [variantId, registered] of registry) {
         const variant = executableById.get(variantId);
         if (!variant) {
             throw new Error(
                 `registered case ${variantId} has no executable catalog variant`,
-            );
-        }
-        if (variant.verifier_binding?.binding_status !== "live") {
-            throw new Error(
-                `registered case ${variantId} requires a live catalog verifier binding`,
             );
         }
         const computed = semanticFingerprint(variant, registered.fixtures);

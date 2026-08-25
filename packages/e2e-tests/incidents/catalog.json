@@ -434,8 +434,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-parity-a1-1",
-                        "fingerprint": "fcb69c8868f257942726870cb84d6273e4d74a2dcbf03488c232fb922f6b04a7"
+                        "id": "rev-parity-a1-2",
+                        "fingerprint": "7b8833b4ce281923125e7de53c672a0dd81ef1836f960c82702c9992c6c40d1a"
                     },
                     "normative_checks": [
                         "check-a1-defer-request-floor",
@@ -473,8 +473,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-parity-a3-1",
-                        "fingerprint": "43f65c562edf2966904c53543c8215cf0c60b9fd85395291798850070b44f136"
+                        "id": "rev-parity-a3-2",
+                        "fingerprint": "061f30ab29b904050955b9b52571d8829eadf21e95a5afe051ada28313b3cfb0"
                     },
                     "normative_checks": [
                         "check-a3-reduce-on-wire",
@@ -953,8 +953,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-thinking-a-1",
-                        "fingerprint": "e7ffe64e29f72a4ab283b6c8f522cdda81411cebe9854ff6d9198ecb0992017d"
+                        "id": "rev-thinking-a-2",
+                        "fingerprint": "228b53a5dda6c08533ce783d65d2f8c8a9ace081b6f12de1cf531d37c1b1bab9"
                     },
                     "normative_checks": [
                         "check-thinking-a-no-nudge-in-signed-assistant",
@@ -993,8 +993,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-thinking-b-1",
-                        "fingerprint": "5a59f4bd25141f7cddd99b8bc05e4967de5ce79dfc5e86d8d3c4e75dd8d459a6"
+                        "id": "rev-thinking-b-2",
+                        "fingerprint": "bc01f1a443ea8b27c8ade2dc37a6f3dc562e26c363fcf3b8778cd8b2687819e1"
                     },
                     "normative_checks": [
                         "check-thinking-b-drop-emitted",
@@ -1035,8 +1035,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-thinking-c-1",
-                        "fingerprint": "f1dc80b179ead53ce9783d709841f2eba2d4312f0000b97be6d8f2ea82f70001"
+                        "id": "rev-thinking-c-2",
+                        "fingerprint": "51b93ccee08956c9d4fd2b42f251ee370b05bc44bf5d568dfbcf086476342893"
                     },
                     "normative_checks": [
                         "check-thinking-c-drop-emitted",

@@ -8,7 +8,10 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Pipeline shape on every push to main and on every PR:
+permissions:
+  contents: read
+
+# Pipeline shape on every push to main and every PR:
 #
 #   check-plugin, check-pi-plugin
 #   (unit tests + lint + typecheck, parallel)
@@ -495,7 +498,8 @@ jobs:
           # shellcheck disable=SC2086
           bun test --timeout 600000 $files
           # This oracle is outside the manifest's tests/**/*.test.ts inventory.
-          bun test --timeout 600000 src/cache-analysis.test.ts
+          bun test --timeout 600000 \
+            packages/e2e-tests/src/cache-analysis.test.ts
 
   e2e-host-pi:
     name: E2E (Pi, host behavior)
@@ -544,12 +548,52 @@ jobs:
         env:
           NODE_ENV: ""
           MC_E2E_MODE: ts
+        run: bun run --cwd packages/e2e-tests test:pi-e2e
+
+  incident-regression-pool:
+    name: Incident regression pool (supported TS)
+    runs-on: ubuntu-latest
+    needs: [check-plugin, check-pi-plugin]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Install opencode
         run: |
-          cd packages/e2e-tests
-          files=$(
-            bun scripts/validate-mode-manifest.ts --mode ts --harness pi |
-              tr '\n' ' '
-          )
-          echo "Running Pi host tests from mode manifest: $files"
-          # shellcheck disable=SC2086
-          bun test --timeout 600000 $files
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Build supported TS harness plugins
+        run: |
+          bun run --cwd packages/plugin build
+          bun run --cwd packages/pi-plugin build
+
+      - name: Validate append-only incident history against trusted event base
+        run: bun run --cwd packages/e2e-tests validate:incident-history:ci
+
+      - name: Run incident unit coverage
+        run: bun run --cwd packages/e2e-tests test:incident-unit
+
+      - name: Run supported TS incident schedule
+        env:
+          NODE_ENV: ""
+        run: bun run --cwd packages/e2e-tests test:incidents --mode ts
+
+      - name: Archive explicit incident report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-pool-ts
+          path: packages/e2e-tests/artifacts/incident-pool-ts-report.json
+          if-no-files-found: warn

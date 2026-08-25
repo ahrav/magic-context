@@ -3,6 +3,10 @@
 import { Glob } from "bun";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+    parseIncidentCatalog,
+    type IncidentCatalog,
+} from "../src/incident-pool/contract";
 
 export const E2E_ROOT = resolve(import.meta.dir, "..");
 export const MANIFEST_PATH = resolve(E2E_ROOT, "mode-manifest.json");
@@ -36,12 +40,17 @@ function enumerateTestFiles(): string[] {
     return [...glob.scanSync({ cwd: E2E_ROOT, onlyFiles: true })].sort();
 }
 
-function readManifest(): unknown {
+function parseJsonFile<T>(
+    path: string,
+    parse: (raw: unknown) => T,
+): T {
+    let raw: unknown;
     try {
-        return JSON.parse(readFileSync(MANIFEST_PATH, "utf8")) as unknown;
+        raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
     } catch (error) {
-        throw new Error(`could not read ${MANIFEST_PATH}: ${String(error)}`);
+        throw new Error(`could not read ${path}: ${String(error)}`);
     }
+    return parse(raw);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -125,7 +134,7 @@ export function validateManifestDocument(
     const entries = raw.entries.map(validateEntry);
     const expectedSet = new Set(expectedFiles);
     const seen = new Map<string, number>();
-    for (const [index, entry] of entries.entries()) {
+    for (const entry of entries) {
         seen.set(entry.path, (seen.get(entry.path) ?? 0) + 1);
         if (!expectedSet.has(entry.path)) {
             throw new Error(`dead or out-of-scope manifest path: ${entry.path}`);
@@ -156,8 +165,105 @@ export function validateManifestDocument(
     };
 }
 
+export function validateGreenIncidentWrapperSource(
+    source: string,
+    catalog: IncidentCatalog,
+): string[] {
+    if (
+        /from\s+["'][^"']*\/(?:parity-pi-todo|parity-synthetic-todo)["']/.test(
+            source,
+        )
+    ) {
+        throw new Error(
+            "green incident wrapper imports a known-red-only scenario module",
+        );
+    }
+    const variants = new Map(
+        catalog.families.flatMap((family) =>
+            family.variants.map((variant) => [variant.id, variant] as const),
+        ),
+    );
+    const ids = [
+        ...new Set(source.match(/\bvar-[a-z0-9-]+\b/g) ?? []),
+    ].sort();
+    if (ids.length === 0) {
+        throw new Error("green incident wrapper selects no registry IDs");
+    }
+    for (const id of ids) {
+        const variant = variants.get(id);
+        if (!variant) {
+            throw new Error(`green incident wrapper selects unknown registry ID ${id}`);
+        }
+        if (variant.lane !== "green") {
+            throw new Error(
+                `green incident wrapper selects known-red registry ID ${id}`,
+            );
+        }
+    }
+    return ids;
+}
+
+export function validateGreenPackageScripts(raw: unknown): void {
+    if (!isRecord(raw) || !isRecord(raw.scripts)) {
+        throw new Error("package.json must define scripts");
+    }
+    const required: Record<string, string> = {
+        test: "bun scripts/run-test-selection.ts --mode ts --timeout 120000",
+        "test:opencode-e2e":
+            "bun scripts/run-test-selection.ts --mode ts --harness opencode --timeout 600000 --max-concurrency 1",
+        "test:pi-e2e":
+            "bun scripts/run-test-selection.ts --mode ts --harness pi --timeout 600000",
+        "test:rust-e2e":
+            "bun scripts/run-test-selection.ts --mode rust --timeout 600000 --max-concurrency 1",
+        "test:incident-unit":
+            "bun scripts/run-test-selection.ts --incident-unit --timeout 120000",
+    };
+    for (const [name, command] of Object.entries(required)) {
+        if (raw.scripts[name] !== command) {
+            throw new Error(
+                `package script ${name} must derive its exact file list through run-test-selection.ts`,
+            );
+        }
+    }
+}
+
 export function validateModeManifest(): ValidationResult {
-    return validateManifestDocument(readManifest());
+    const validation = parseJsonFile(MANIFEST_PATH, (raw) =>
+        validateManifestDocument(raw),
+    );
+    const catalog = parseJsonFile(
+        resolve(E2E_ROOT, "incidents", "catalog.json"),
+        parseIncidentCatalog,
+    );
+    const wrappers = validation.manifest.entries.filter((entry) =>
+        entry.path.endsWith("incident-pool-green.test.ts"),
+    );
+    if (wrappers.length !== 1) {
+        throw new Error("mode manifest must contain exactly one incident green wrapper");
+    }
+    const wrapper = wrappers[0]!;
+    if (wrapper.tier !== "both-modes") {
+        throw new Error("incident green wrapper must run in both TS and Rust modes");
+    }
+    validateGreenIncidentWrapperSource(
+        readFileSync(resolve(E2E_ROOT, wrapper.path), "utf8"),
+        catalog,
+    );
+    parseJsonFile(resolve(E2E_ROOT, "package.json"), (raw) => {
+        validateGreenPackageScripts(raw);
+        return true;
+    });
+    for (const [mode, harness] of [
+        ["ts", "all"],
+        ["ts", "opencode"],
+        ["ts", "pi"],
+        ["rust", "all"],
+    ] as const) {
+        if (filesForMode(validation, mode, harness).length === 0) {
+            throw new Error(`${mode}/${harness} manifest selector is empty`);
+        }
+    }
+    return validation;
 }
 
 export function filesForMode(

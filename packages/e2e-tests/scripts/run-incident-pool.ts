@@ -9,16 +9,25 @@ import {
     type Harness,
     type Lane,
 } from "../src/incident-pool/contract";
-import { validateIncidentHistory } from "../src/incident-pool/history";
+import {
+    validateIncidentHistory,
+    type IncidentHistoryState,
+} from "../src/incident-pool/history";
 import {
     builtinIncidentCaseRegistry,
     implementationBundleDigest,
     validateRegistryCatalogCorrespondence,
+    type IncidentCaseRegistry,
 } from "../src/incident-pool/registry";
 import {
+    buildScheduledIncidentReport,
     incidentPoolExitCode,
     publishIncidentReport,
+    publishScheduledIncidentReport,
+    scheduledIncidentExitCode,
     unexpectedIncompleteResults,
+    type IncidentMode,
+    type IncidentPoolReport,
 } from "../src/incident-pool/report";
 import {
     DEFAULT_CASE_TIMEOUT_MS,
@@ -36,7 +45,8 @@ import {
 const REPO_ROOT = resolve(E2E_ROOT, "../..");
 
 interface CliArgs {
-    harness: Harness;
+    mode: IncidentMode | null;
+    harness: Harness | null;
     lanes: Lane[];
     variants: string[];
     reportPath: string;
@@ -44,14 +54,21 @@ interface CliArgs {
 }
 
 function parseArgs(args: string[]): CliArgs {
-    let harness: Harness = "opencode";
+    let mode: IncidentMode | null = null;
+    let harness: Harness | null = null;
     let lanes: Lane[] = ["green", "known-red"];
     const variants: string[] = [];
-    let reportPath = resolve(E2E_ROOT, "incident-report.json");
+    let reportPath: string | null = null;
     let timeoutMs = DEFAULT_CASE_TIMEOUT_MS;
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
-        if (arg === "--harness") {
+        if (arg === "--mode") {
+            const value = args[++index];
+            if (value !== "ts" && value !== "rust") {
+                throw new Error("--mode requires ts or rust");
+            }
+            mode = value;
+        } else if (arg === "--harness") {
             const value = args[++index];
             if (!value || !HARNESSES.includes(value as Harness)) {
                 throw new Error(
@@ -82,25 +99,106 @@ function parseArgs(args: string[]): CliArgs {
             reportPath = resolve(value);
         } else if (arg === "--timeout") {
             const value = Number(args[++index]);
-            if (!Number.isInteger(value) || value <= 0)
+            if (!Number.isInteger(value) || value <= 0) {
                 throw new Error("--timeout requires positive milliseconds");
+            }
             timeoutMs = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-incident-pool.ts [--harness opencode|pi|rust] [--lane green|known-red|all] [--variant <id>]... [--report <path>] [--timeout <ms>]",
+                "Usage: run-incident-pool.ts [--mode ts|rust | --harness opencode|pi|rust] [--lane green|known-red|all] [--variant <id>]... [--report <path>] [--timeout <ms>]",
             );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
         }
     }
-    return { harness, lanes, variants: [...new Set(variants)], reportPath, timeoutMs };
+    if (mode !== null && harness !== null) {
+        throw new Error("--mode and --harness are mutually exclusive");
+    }
+    if (mode !== null && variants.length > 0) {
+        throw new Error("--variant requires an exact --harness selection");
+    }
+    const defaultPath = mode
+        ? resolve(E2E_ROOT, "artifacts", `incident-pool-${mode}-report.json`)
+        : resolve(E2E_ROOT, "incident-report.json");
+    return {
+        mode,
+        harness,
+        lanes,
+        variants: [...new Set(variants)],
+        reportPath: reportPath ?? defaultPath,
+        timeoutMs,
+    };
+}
+
+async function runHarness(
+    state: IncidentHistoryState,
+    adjudicationLines: readonly string[],
+    registry: IncidentCaseRegistry,
+    implementationDigests: ReadonlyMap<string, string>,
+    harness: Harness,
+    lanes: Lane[],
+    variants: string[],
+    timeoutMs: number,
+    workspaceParentDir: string,
+): Promise<IncidentPoolReport> {
+    const snapshot = buildRunSnapshot({
+        catalog: state.catalog,
+        ledger: state.ledger,
+        adjudicationLines,
+        harness,
+        lanes,
+        variantIds: variants.length > 0 ? variants : undefined,
+        implementationDigests,
+    });
+    for (const excluded of snapshot.excluded) {
+        console.error(
+            `[incident-pool:${harness}] not scheduled ${excluded.variantId}: ${excluded.reason}`,
+        );
+    }
+
+    const childScript = resolve(import.meta.dir, "run-incident-case.ts");
+    const report = await runIncidentPool(snapshot, async (selected) => {
+        const registered = registry.get(selected.variantId);
+        if (!registered) {
+            throw new Error(
+                `selected variant ${selected.variantId} has no registered case`,
+            );
+        }
+        const prerequisite = registered.prerequisite?.() ?? {
+            ok: true as const,
+        };
+        if (!prerequisite.ok) {
+            console.error(
+                `[incident-pool:${harness}] ${selected.variantId} unavailable: ${prerequisite.reason}`,
+            );
+            return unavailableCaseResult(selected);
+        }
+        const execution = await runCaseInIsolation(snapshot, selected, {
+            argv: [process.execPath, childScript],
+            timeoutMs,
+            workspaceParentDir,
+            extraEnv: {
+                MC_E2E_MODE: harness === "rust" ? "rust" : "ts",
+            },
+        });
+        console.error(
+            `[incident-pool:${harness}] ${selected.variantId}: ${execution.result.run_health} / ` +
+                `${execution.result.behavioral_verdict} / ${execution.result.baseline_comparison}`,
+        );
+        return execution.result;
+    });
+    for (const incomplete of unexpectedIncompleteResults(report)) {
+        console.error(
+            `[incident-pool:${harness}] unexpected incomplete result ${incomplete.variant_id}: ` +
+                `${incomplete.run_health} (${incomplete.reason_code ?? "no reason"})`,
+        );
+    }
+    return report;
 }
 
 async function main(): Promise<number> {
-    const { harness, lanes, variants, reportPath, timeoutMs } = parseArgs(
-        Bun.argv.slice(2),
-    );
+    const args = parseArgs(Bun.argv.slice(2));
     const files = loadHistorySnapshot(INCIDENTS_DIR, "working");
     const state = validateIncidentHistory(files);
     const registry = builtinIncidentCaseRegistry();
@@ -117,57 +215,44 @@ async function main(): Promise<number> {
         );
     }
 
-    const snapshot = buildRunSnapshot({
-        catalog: state.catalog,
-        ledger: state.ledger,
-        adjudicationLines: files.adjudicationLines,
-        harness,
-        lanes,
-        variantIds: variants.length > 0 ? variants : undefined,
-        implementationDigests,
-    });
-    for (const excluded of snapshot.excluded) {
-        console.error(
-            `[incident-pool] not scheduled ${excluded.variantId}: ${excluded.reason}`,
-        );
-    }
-
+    const harnesses: Harness[] = args.mode
+        ? args.mode === "ts"
+            ? ["opencode", "pi"]
+            : ["rust"]
+        : [args.harness ?? "opencode"];
     const workspaceParentDir = mkdtempSync(join(tmpdir(), "incident-pool-"));
-    const childScript = resolve(import.meta.dir, "run-incident-case.ts");
     try {
-        const report = await runIncidentPool(snapshot, async (selected) => {
-            const registered = registry.get(selected.variantId);
-            const prerequisite = registered?.prerequisite?.() ?? {
-                ok: true as const,
-            };
-            if (!prerequisite.ok) {
-                console.error(
-                    `[incident-pool] ${selected.variantId} unavailable: ${prerequisite.reason}`,
-                );
-                return unavailableCaseResult(selected);
-            }
-            const execution = await runCaseInIsolation(snapshot, selected, {
-                argv: [process.execPath, childScript],
-                timeoutMs,
-                workspaceParentDir,
-            });
-            console.error(
-                `[incident-pool] ${selected.variantId}: ${execution.result.run_health} / ` +
-                    `${execution.result.behavioral_verdict} / ${execution.result.baseline_comparison}`,
-            );
-            return execution.result;
-        });
-        publishIncidentReport(report, reportPath);
-        console.log(
-            `published ${reportPath}: ${report.variant_count} variants in ${report.family_count} families, ` +
-                `evaluation_complete=${report.evaluation_complete}`,
-        );
-        for (const incomplete of unexpectedIncompleteResults(report)) {
-            console.error(
-                `[incident-pool] unexpected incomplete result ${incomplete.variant_id}: ` +
-                    `${incomplete.run_health} (${incomplete.reason_code ?? "no reason"})`,
+        const reports: IncidentPoolReport[] = [];
+        for (const harness of harnesses) {
+            reports.push(
+                await runHarness(
+                    state,
+                    files.adjudicationLines,
+                    registry,
+                    implementationDigests,
+                    harness,
+                    args.lanes,
+                    args.variants,
+                    args.timeoutMs,
+                    workspaceParentDir,
+                ),
             );
         }
+        if (args.mode) {
+            const scheduled = buildScheduledIncidentReport(args.mode, reports);
+            publishScheduledIncidentReport(scheduled, args.reportPath);
+            console.log(
+                `published ${args.reportPath}: ${scheduled.variant_count} variants in ${scheduled.family_count} families, ` +
+                    `evaluation_complete=${scheduled.evaluation_complete}`,
+            );
+            return scheduledIncidentExitCode(scheduled);
+        }
+        const report = reports[0]!;
+        publishIncidentReport(report, args.reportPath);
+        console.log(
+            `published ${args.reportPath}: ${report.variant_count} variants in ${report.family_count} families, ` +
+                `evaluation_complete=${report.evaluation_complete}`,
+        );
         return incidentPoolExitCode(report);
     } finally {
         rmSync(workspaceParentDir, { recursive: true, force: true });

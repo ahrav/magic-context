@@ -28,6 +28,10 @@ import {
 } from "./contract";
 
 export const INCIDENT_REPORT_SCHEMA = "incident-pool-report/v1";
+export const SCHEDULED_INCIDENT_REPORT_SCHEMA =
+    "incident-pool-scheduled-report/v1";
+export const INCIDENT_MODES = ["ts", "rust"] as const;
+export type IncidentMode = (typeof INCIDENT_MODES)[number];
 
 export const RUN_HEALTHS = [
     "completed",
@@ -633,32 +637,171 @@ export function parseIncidentReport(raw: unknown): IncidentPoolReport {
     };
 }
 
+function publishJsonAtomically(value: unknown, path: string): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const temp = `${path}.tmp-${randomBytes(6).toString("hex")}`;
+    writeFileSync(temp, `${JSON.stringify(value, null, 4)}\n`, {
+        mode: 0o644,
+    });
+    renameSync(temp, path);
+}
+
 /** Atomic publication: write a temp file, then rename. An interrupted
  *  publication leaves no readable report at the target path. */
 export function publishIncidentReport(
     report: IncidentPoolReport,
     path: string,
 ): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temp = `${path}.tmp-${randomBytes(6).toString("hex")}`;
-    writeFileSync(temp, `${JSON.stringify(report, null, 4)}\n`, {
-        mode: 0o644,
-    });
-    renameSync(temp, path);
+    publishJsonAtomically(report, path);
 }
 
-export function readIncidentReport(path: string): IncidentPoolReport {
+function readAndParse<T>(
+    path: string,
+    label: string,
+    parse: (raw: unknown) => T,
+): T {
     const text = readFileSync(path, "utf8");
     let raw: unknown;
     try {
         raw = JSON.parse(text) as unknown;
     } catch (error) {
         fail(
-            "report",
+            label,
             `published report at ${path} is not valid JSON: ${String(error)}`,
         );
     }
-    return parseIncidentReport(raw);
+    return parse(raw);
+}
+
+export function readIncidentReport(path: string): IncidentPoolReport {
+    return readAndParse(path, "report", parseIncidentReport);
+}
+
+export interface ScheduledIncidentReport {
+    schema: typeof SCHEDULED_INCIDENT_REPORT_SCHEMA;
+    mode: IncidentMode;
+    report_count: number;
+    expected_count: number;
+    family_count: number;
+    variant_count: number;
+    reports: IncidentPoolReport[];
+    evaluation_complete: boolean;
+    completion_marker: true;
+}
+
+function harnessSchedule(mode: IncidentMode): Harness[] {
+    return mode === "ts" ? ["opencode", "pi"] : ["rust"];
+}
+
+export function buildScheduledIncidentReport(
+    mode: IncidentMode,
+    reports: IncidentPoolReport[],
+): ScheduledIncidentReport {
+    const schedule = harnessSchedule(mode);
+    if (reports.length !== schedule.length) {
+        fail(
+            "scheduled report.reports",
+            `mode ${mode} requires ${schedule.length} harness reports`,
+        );
+    }
+    for (const [index, harness] of schedule.entries()) {
+        if (reports[index]?.harness !== harness) {
+            fail(
+                `scheduled report.reports[${index}]`,
+                `must be the ${harness} harness report`,
+            );
+        }
+    }
+    const results = reports.flatMap((report) => report.results);
+    if (results.length === 0)
+        fail("scheduled report.results", "must not be empty");
+    const variantIds = new Set(results.map((result) => result.variant_id));
+    if (variantIds.size !== results.length) {
+        fail("scheduled report.results", "duplicate variant results");
+    }
+    return {
+        schema: SCHEDULED_INCIDENT_REPORT_SCHEMA,
+        mode,
+        report_count: reports.length,
+        expected_count: results.length,
+        family_count: new Set(results.map((result) => result.family_id)).size,
+        variant_count: results.length,
+        reports,
+        evaluation_complete: reports.every(
+            (report) => report.evaluation_complete,
+        ),
+        completion_marker: true,
+    };
+}
+
+export function parseScheduledIncidentReport(
+    raw: unknown,
+): ScheduledIncidentReport {
+    const record = asRecord(raw, "scheduled report");
+    requireExactKeys(
+        record,
+        [
+            "schema",
+            "mode",
+            "report_count",
+            "expected_count",
+            "family_count",
+            "variant_count",
+            "reports",
+            "evaluation_complete",
+            "completion_marker",
+        ],
+        "scheduled report",
+    );
+    if (record.schema !== SCHEDULED_INCIDENT_REPORT_SCHEMA) {
+        fail(
+            "scheduled report.schema",
+            `must be ${SCHEDULED_INCIDENT_REPORT_SCHEMA}`,
+        );
+    }
+    if (record.completion_marker !== true) {
+        fail("scheduled report.completion_marker", "must be exactly true");
+    }
+    if (!Array.isArray(record.reports)) {
+        fail("scheduled report.reports", "must be an array");
+    }
+    const mode = asEnum(record.mode, INCIDENT_MODES, "scheduled report.mode");
+    const reports = record.reports.map((entry) => parseIncidentReport(entry));
+    const parsed = buildScheduledIncidentReport(mode, reports);
+    for (const field of [
+        "report_count",
+        "expected_count",
+        "family_count",
+        "variant_count",
+    ] as const) {
+        const actual = asCount(record[field], `scheduled report.${field}`);
+        if (actual !== parsed[field]) {
+            fail(
+                `scheduled report.${field}`,
+                `must be ${parsed[field]} for these reports`,
+            );
+        }
+    }
+    if (record.evaluation_complete !== parsed.evaluation_complete) {
+        fail(
+            "scheduled report.evaluation_complete",
+            `must be ${parsed.evaluation_complete} for these reports`,
+        );
+    }
+    return parsed;
+}
+
+export function publishScheduledIncidentReport(
+    report: ScheduledIncidentReport,
+    path: string,
+): void {
+    publishJsonAtomically(report, path);
+}
+
+export function readScheduledIncidentReport(
+    path: string,
+): ScheduledIncidentReport {
+    return readAndParse(path, "scheduled report", parseScheduledIncidentReport);
 }
 
 // ---------------------------------------------------------------------------
@@ -681,4 +824,12 @@ export function unexpectedIncompleteResults(
 
 export function incidentPoolExitCode(report: IncidentPoolReport): number {
     return unexpectedIncompleteResults(report).length === 0 ? 0 : 1;
+}
+
+export function scheduledIncidentExitCode(
+    report: ScheduledIncidentReport,
+): number {
+    return report.reports.every((entry) => incidentPoolExitCode(entry) === 0)
+        ? 0
+        : 1;
 }

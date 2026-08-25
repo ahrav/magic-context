@@ -654,6 +654,13 @@ export function verifyOwnershipMatrix(
     for (const family of catalog.families) {
         for (const variant of family.variants) {
             const binding = variant.verifier_binding;
+            if (EXECUTABLE_LANES.includes(variant.lane)) {
+                if (binding?.binding_status !== "live") {
+                    throw new Error(
+                        `executable variant ${variant.id} requires a live verifier binding`,
+                    );
+                }
+            }
             if (binding === null) continue;
             checkBindingLiveness(
                 e2eRoot,

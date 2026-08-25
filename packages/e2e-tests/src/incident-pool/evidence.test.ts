@@ -304,13 +304,7 @@ describe("mutation evidence normalization (R11)", () => {
 });
 
 describe("ownership matrix (U3 approach 4)", () => {
-    it("accepts the committed catalog: live bindings resolve, declared bindings name absent modules", () => {
-        // binding_status contract: variants whose scenario module lands in
-        // U4-U6 are committed as `declared` and their module path must NOT
-        // exist yet; landing audit-memory-search.ts (etc.) makes `declared`
-        // fail validation, forcing that unit to flip the binding to `live`
-        // (with its fingerprint-bound baseline event). `live` bindings must
-        // resolve to real exports NOW. There is no third, open-ended state.
+    it("accepts the committed catalog only when every executable binding is live", () => {
         verifyOwnershipMatrix(committedInventory(), committedCatalog());
     });
 
@@ -368,7 +362,7 @@ describe("ownership matrix (U3 approach 4)", () => {
         ).toThrow(/does not export driveSomethingElse/);
     });
 
-    it("rejects a declared binding once its module exists (no pending_unit state)", () => {
+    it("rejects any declared executable binding after rollout", () => {
         const catalog = committedCatalog();
         const variant = findVariant(catalog, "var-a5-archived-reobservation");
         variant.verifier_binding!.binding_status = "declared";
@@ -376,9 +370,7 @@ describe("ownership matrix (U3 approach 4)", () => {
             "src/incident-pool/scenarios/source-linked-regressions.ts#driveArchivedReobservation";
         expect(() =>
             verifyOwnershipMatrix(committedInventory(), catalog),
-        ).toThrow(
-            /binding_status is declared but src\/incident-pool\/scenarios\/source-linked-regressions\.ts exists; flip the binding to live/,
-        );
+        ).toThrow(/requires a live verifier binding/);
     });
 
     it("rejects giving an unsupported claim an executable target (AE3)", () => {

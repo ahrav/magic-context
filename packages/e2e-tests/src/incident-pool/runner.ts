@@ -330,11 +330,9 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
             }
             const digest = input.implementationDigests.get(variant.id);
             if (digest === undefined) {
-                excluded.push({
-                    variantId: variant.id,
-                    reason: "no registered case for this variant; its scenario module has not registered a driver",
-                });
-                continue;
+                throw new Error(
+                    `selected live executable variant ${variant.id} has no registered case digest`,
+                );
             }
             const baseline =
                 input.ledger.byIdentity.get(variant.id)?.latestBaseline ?? null;

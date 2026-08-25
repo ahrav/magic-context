@@ -28,10 +28,15 @@ import {
 } from "./registry";
 import {
     buildIncidentReport,
+    buildScheduledIncidentReport,
     incidentPoolExitCode,
     parseIncidentReport,
+    parseScheduledIncidentReport,
     publishIncidentReport,
+    publishScheduledIncidentReport,
     readIncidentReport,
+    readScheduledIncidentReport,
+    scheduledIncidentExitCode,
     unexpectedIncompleteResults,
     type IncidentCaseResult,
 } from "./report";
@@ -374,10 +379,12 @@ function registeredCase(
 }
 
 describe("case registry", () => {
-    it("accepts registered cases for live variants and rejects extras", () => {
+    it("requires every live executable variant and rejects extras", () => {
         const catalog = fixtureCatalog();
         const registry: IncidentCaseRegistry = new Map();
-        validateRegistryCatalogCorrespondence(registry, catalog);
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(/has no registered case/);
         for (const variant of catalog.families[0]!.variants)
             registerIncidentCase(registry, registeredCase(variant.id));
         validateRegistryCatalogCorrespondence(registry, catalog);
@@ -409,12 +416,12 @@ describe("case registry", () => {
         registerIncidentCase(registry, registeredCase("var-green-one"));
         expect(() =>
             validateRegistryCatalogCorrespondence(registry, catalog),
-        ).toThrow(/live catalog verifier binding/);
+        ).toThrow(/requires a live catalog verifier binding/);
     });
 
     it("registers the builtin cases 1:1 against the committed catalog", () => {
         const registry = builtinIncidentCaseRegistry();
-        expect(registry.size).toBeGreaterThan(0);
+        expect(registry.size).toBe(21);
         for (const [variantId, entry] of registry) {
             expect(entry.variantId).toBe(variantId);
         }
@@ -506,7 +513,7 @@ describe("run snapshot selection", () => {
         ]);
     });
 
-    it("fails hard on a missing baseline and excludes an unregistered variant", () => {
+    it("fails hard on a missing baseline or registered case digest", () => {
         const data = fixture();
         const noBaseline = data.events.filter(
             (event) => event.identity !== "var-red-one",
@@ -524,14 +531,7 @@ describe("run snapshot selection", () => {
             }),
         ).toThrow(/no reviewed baseline/);
         data.implementationDigests.delete("var-green-one");
-        const snapshot = snapshotFor(data);
-        expect(snapshot.selected.map((entry) => entry.variantId)).not.toContain(
-            "var-green-one",
-        );
-        const excludedGreen = snapshot.excluded.find(
-            (entry) => entry.variantId === "var-green-one",
-        );
-        expect(excludedGreen?.reason).toMatch(/no registered case/);
+        expect(() => snapshotFor(data)).toThrow(/no registered case digest/);
     });
 });
 
@@ -944,6 +944,33 @@ describe("catalog-bound report", () => {
         expect(published.completion_marker).toBe(true);
         expect(published.evaluation_complete).toBe(true);
         expect(published.selected_set_digest).toBe(snapshot.selectedSetDigest);
+    }, 20_000);
+
+    it("publishes one atomic scheduled report for the TS harness schedule", async () => {
+        const result = await completedPass(snapshot, green);
+        const opencode = buildIncidentReport(reportInput(snapshot, [result]));
+        const piResult: IncidentCaseResult = {
+            ...result,
+            family_id: "fam-pi",
+            variant_id: "var-pi-one",
+        };
+        const pi = {
+            ...buildIncidentReport(reportInput(snapshot, [piResult])),
+            harness: "pi" as const,
+        };
+        const scheduled = buildScheduledIncidentReport("ts", [opencode, pi]);
+        expect(scheduled.variant_count).toBe(2);
+        expect(scheduled.evaluation_complete).toBe(true);
+        expect(scheduledIncidentExitCode(scheduled)).toBe(0);
+        const target = join(testRoot, "reports", "scheduled-report.json");
+        publishScheduledIncidentReport(scheduled, target);
+        expect(readScheduledIncidentReport(target)).toEqual(scheduled);
+        expect(() =>
+            parseScheduledIncidentReport({
+                ...scheduled,
+                completion_marker: false,
+            }),
+        ).toThrow(/completion_marker/);
     }, 20_000);
 
     it("rejects tampered completion markers and completeness flags", async () => {
