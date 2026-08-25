@@ -795,6 +795,30 @@ export function assertSafeExtraEnv(extraEnv: Record<string, string>): void {
 }
 
 /**
+ * Endpoint variables a case may repoint at its own loopback stub. Names are
+ * allowlisted by shape, not merely checked for a loopback value: this map is
+ * spread into the relocated child environment, so an unconstrained name can
+ * carry a perfectly valid loopback URL and still overwrite an isolation
+ * variable (`HOME`) or restore behavior the isolation layer strips
+ * (`HTTPS_PROXY`). The key guard runs as well, so a name that matches the
+ * shape but collides with a stripped variable is still refused.
+ */
+const PROVIDER_ENDPOINT_NAME_RE = /^MC_E2E_[A-Z0-9_]*(?:URL|ENDPOINT)$/;
+
+export function assertSafeProviderEndpointNames(
+    endpoints: Record<string, string>,
+): void {
+    for (const key of Object.keys(endpoints)) {
+        if (!PROVIDER_ENDPOINT_NAME_RE.test(key)) {
+            throw new Error(
+                `unsafe incident case providerEndpoints key ${key}`,
+            );
+        }
+    }
+    assertSafeExtraEnv(endpoints);
+}
+
+/**
  * Run one selected case in full isolation and return its terminal result
  * plus a numeric diagnostics summary (counters only — no output bytes). The
  * workspace and every diagnostic sink are deleted before this returns.
@@ -804,8 +828,10 @@ export async function runCaseInIsolation(
     selected: SelectedCase,
     options: RunCaseOptions,
 ): Promise<CaseExecution> {
-    if (options.providerEndpoints)
+    if (options.providerEndpoints) {
+        assertSafeProviderEndpointNames(options.providerEndpoints);
         assertLoopbackProviderEndpoints(options.providerEndpoints);
+    }
     if (options.extraEnv) assertSafeExtraEnv(options.extraEnv);
     const workspace = createCaseWorkspace(
         options.workspaceParentDir,

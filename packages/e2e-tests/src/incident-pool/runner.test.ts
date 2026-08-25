@@ -967,6 +967,21 @@ sendEnvelope();`;
                 },
             }),
         ).rejects.toThrow(/not a loopback/);
+        // Loopback value is not sufficient: the map is spread into the child
+        // env, so an isolation variable or a stripped-proxy name must be
+        // refused even when its URL is perfectly valid loopback.
+        await expect(
+            runFakeChild(snapshot, green, "sendEnvelope();", {
+                providerEndpoints: { HOME: "http://127.0.0.1:19999" },
+            }),
+        ).rejects.toThrow(/unsafe incident case providerEndpoints key HOME/);
+        await expect(
+            runFakeChild(snapshot, green, "sendEnvelope();", {
+                providerEndpoints: { HTTPS_PROXY: "http://127.0.0.1:19999" },
+            }),
+        ).rejects.toThrow(
+            /unsafe incident case providerEndpoints key HTTPS_PROXY/,
+        );
         const loopback = await runFakeChild(
             snapshot,
             green,
