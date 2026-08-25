@@ -135,7 +135,6 @@ export interface SubcClientOptions extends ConnectOptions {
     requestTimeoutMs?: number;
     routeOpenDeadlineMs?: number;
     shutdownDeadlineMs?: number;
-    recoveryDeadlineMs?: number;
     /** Opt-in for the trusted-symlink connection-file form (wire doc 4.2). */
     trustedSymlink?: boolean;
     /**
@@ -422,7 +421,7 @@ export class SubcClient {
     private readonly requestTimeoutMs: number;
     private readonly routeOpenDeadlineMs: number;
     private readonly shutdownDeadlineMs: number;
-    private readonly recoveryDeadlineMs: number;
+    private readonly recoveryDeadlineMs = DEFAULT_RECOVERY_DEADLINE_MS;
     private readonly defaultIdentity: BindIdentity | undefined;
     private readonly defaultTargetKind: ManagedRouteKind;
     private readonly clock: MonotonicClock | undefined;
@@ -457,7 +456,6 @@ export class SubcClient {
         this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
         this.routeOpenDeadlineMs = options.routeOpenDeadlineMs ?? DEFAULT_ROUTE_OPEN_DEADLINE_MS;
         this.shutdownDeadlineMs = options.shutdownDeadlineMs ?? DEFAULT_SHUTDOWN_DEADLINE_MS;
-        this.recoveryDeadlineMs = options.recoveryDeadlineMs ?? DEFAULT_RECOVERY_DEADLINE_MS;
         this.defaultIdentity = options.identity;
         this.defaultTargetKind = options.targetKind ?? DEFAULT_MANAGED_TARGET_KIND;
         this.clock = options.clock;
@@ -1321,12 +1319,7 @@ export class SubcClient {
         conn.role = undefined;
         this.predecessor = episode.source;
         this.active = conn;
-        this.emitDiagnostics({
-            type: "connected",
-            daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
-            pid: conn.snapshot.pid,
-            transport: conn.transport,
-        });
+        this.emitConnected(conn);
         this.maybeRetirePredecessor();
     }
 

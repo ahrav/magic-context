@@ -59,7 +59,7 @@ export interface ShmGrant {
  * `crates/mc-shm-transport/src/backend/ring.rs`): 58 bytes, hex-encoded to
  * 116 lowercase ASCII characters by the host.
  */
-export const GRANT_HEX_LEN = 116;
+const GRANT_HEX_LEN = 116;
 
 /** `LAYOUT_VERSION` in `backend/ring.rs`. */
 const LAYOUT_VERSION = 2;
