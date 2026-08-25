@@ -27,6 +27,7 @@ export interface ShmFrameChannelOptions {
     descriptor?: NativeDescriptor;
     nativeChannel?: NativeChannel;
     budget: ByteBudget;
+    maxBodyLen: number;
     handlers: FrameChannelHandlers;
 }
 
@@ -75,6 +76,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         deadline?: Deadline,
     ): FrameSendTicket {
         if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        this.assertBodyBounds(body.byteLength);
         // The native ring's fixed capacity is not the configured aggregate
         // cap: admission consults the shared budget so an over-cap body is
         // refused with `memory_cap`, exactly like the TCP channel. The
@@ -95,6 +97,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         hooks?: FrameSendHooks,
     ): BoundedFrameProducer {
         if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        this.assertBodyBounds(capacity);
         // Reservations hold ring capacity across event-loop turns, so
         // their budget charge is held until publication or abort.
         const reservedBytes = HEADER_LEN + capacity;
@@ -225,6 +228,22 @@ export class ShmFrameChannel implements SetupFrameChannel {
             throw new SubcCallError("not_sent", "shared-memory channel is not started");
         }
         return this.native;
+    }
+
+    /**
+     * The configured frame limit and integer validity are enforced before
+     * any budget charge or native call: a non-safe length (`NaN`, negative,
+     * fractional) would poison `ByteBudget.used`, and the shared-memory
+     * path must reject the same over-limit bodies TCP rejects.
+     */
+    private assertBodyBounds(byteLength: number): void {
+        if (
+            !Number.isSafeInteger(byteLength) ||
+            byteLength < 0 ||
+            byteLength > this.options.maxBodyLen
+        ) {
+            throw new RangeError("producer capacity is outside frame bounds");
+        }
     }
 
     private publishFrame(

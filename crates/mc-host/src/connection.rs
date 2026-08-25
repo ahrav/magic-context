@@ -408,9 +408,10 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                     None => ReadExit::Peer,
                 };
             }
-            Err(ReadClose::CleanEof) | Err(ReadClose::Corrupt(_)) | Err(ReadClose::Io(_)) => {
-                return ReadExit::Peer
-            }
+            Err(ReadClose::CleanEof)
+            | Err(ReadClose::Corrupt(_))
+            | Err(ReadClose::Io(_))
+            | Err(ReadClose::Overloaded) => return ReadExit::Peer,
         };
 
         match event {

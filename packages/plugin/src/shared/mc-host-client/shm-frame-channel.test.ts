@@ -65,7 +65,12 @@ async function generationHarness(): Promise<{
         port: 1,
         credentials: { key: new Uint8Array(32), daemonId: new Uint8Array(16) },
         channelFactory: ({ budget, handlers }) => {
-            channel = new ShmFrameChannel({ nativeChannel: pair.first, budget, handlers });
+            channel = new ShmFrameChannel({
+                nativeChannel: pair.first,
+                budget,
+                maxBodyLen: 1 << 20,
+                handlers,
+            });
             return channel;
         },
     });
@@ -88,6 +93,7 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
     const channel = new ShmFrameChannel({
         nativeChannel: pair.first,
         budget,
+        maxBodyLen: 1 << 20,
         handlers: {
             onFrame: (frame) => {
                 if (hook.current?.(frame)) return;
@@ -375,6 +381,7 @@ describe("explicit shared-memory provider", () => {
         const channel = new ShmFrameChannel({
             nativeChannel: pair.first,
             budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
             handlers: { onFrame: () => {}, onClosed: () => {} },
         });
         const { len: _len, ...header } = responseHeader(FrameType.Request, 8n, 4);
@@ -399,6 +406,7 @@ describe("explicit shared-memory provider", () => {
         const channel = new ShmFrameChannel({
             nativeChannel: pair.first,
             budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
             handlers: {
                 onFrame: (frame) => {
                     owned = frame.body.takeOwned();
@@ -441,6 +449,7 @@ describe("explicit shared-memory provider", () => {
         const channel = new ShmFrameChannel({
             nativeChannel: native,
             budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
             handlers: {
                 onFrame: () => {},
                 onClosed: (reason, error) => closes.push({ reason, error }),
@@ -457,6 +466,42 @@ describe("explicit shared-memory provider", () => {
         expect(nativeCloseCalls).toBe(0);
     });
 
+    test("produce and reserve enforce the configured frame limit before any charge", () => {
+        const budget = new ByteBudget(1 << 30);
+        let produceCalls = 0;
+        const native = {
+            produce: () => {
+                produceCalls++;
+            },
+            reserve: () => {
+                throw new Error("reserve must not be reached");
+            },
+            close: () => {},
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget,
+            maxBodyLen: 64,
+            handlers: { onFrame: () => {}, onClosed: () => {} },
+        });
+        const header = {
+            ver: PROTOCOL_VERSION,
+            ty: FrameType.Request,
+            flags: 0,
+            channel: 7,
+            epoch: 1,
+            corr: 1n,
+        };
+        const oversize = { byteLength: 65, fill: () => {} };
+        expect(() => channel.produce(header, oversize)).toThrow(RangeError);
+        const poisoned = { byteLength: Number.NaN, fill: () => {} };
+        expect(() => channel.produce(header, poisoned)).toThrow(RangeError);
+        expect(() => channel.reserve(header, 65)).toThrow(RangeError);
+        // Nothing was charged and the native ring was never touched.
+        expect(budget.used).toBe(0);
+        expect(produceCalls).toBe(0);
+    });
+
     test("sendControl after close is a silent no-op", () => {
         let produceCalls = 0;
         const native = {
@@ -468,6 +513,7 @@ describe("explicit shared-memory provider", () => {
         const channel = new ShmFrameChannel({
             nativeChannel: native,
             budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
             handlers: {
                 onFrame: () => {},
                 onClosed: () => {},
@@ -485,6 +531,7 @@ describe("explicit shared-memory provider", () => {
         const channel = new ShmFrameChannel({
             nativeChannel: pair.first,
             budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
             handlers: {
                 onFrame: (frame) => {
                     alias = frame.body.segment(0);

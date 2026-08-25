@@ -364,14 +364,15 @@ async fn run_endpoint(
                 Ok(true) => received = true,
                 Ok(false) => {}
                 Err(close) => {
-                    // Cancellation is ordinary retirement — the read side was
-                    // told to stop mid-receive (or the inbound consumer is
-                    // gone) and the local lease releases safely on drop — so
-                    // it must not quarantine the admission charges: with
-                    // single-candidate limits that would permanently block
-                    // every later shared-memory candidate. Only structural
-                    // faults are unclean.
-                    let clean = matches!(close, ReadClose::Cancelled);
+                    // Cancellation and budget-timeout closes are ordinary
+                    // backpressure or retirement — the read side was told to
+                    // stop (or the inbound consumer is gone, or ingress is
+                    // saturated) and the local lease releases safely on drop
+                    // — so they must not quarantine the admission charges:
+                    // with single-candidate limits that would permanently
+                    // block every later shared-memory candidate. Only
+                    // structural faults are unclean.
+                    let clean = matches!(close, ReadClose::Cancelled | ReadClose::Overloaded);
                     let _ = inbound.send(Err(close)).await;
                     queue.retired.cancel();
                     root.cancel();
@@ -459,9 +460,10 @@ async fn receive_one(
             return Err(ReadClose::Cancelled);
         }
         if StdInstant::now() >= deadline {
-            return Err(ReadClose::Corrupt(
-                "body budget wait exceeded frame deadline",
-            ));
+            // The peer and transport are healthy; only the ingress budget is
+            // saturated. Overloaded retires the generation without branding
+            // it corrupt, so the admission charge releases cleanly.
+            return Err(ReadClose::Overloaded);
         }
         // The budget wait services queued outbound frames: a slow ingress
         // drain holds only this receive, not the connection's sends, which

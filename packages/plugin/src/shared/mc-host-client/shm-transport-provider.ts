@@ -47,6 +47,7 @@ export function createExplicitShmTestProvider(
             new ShmFrameChannel({
                 descriptor: descriptor(grant),
                 budget: args.budget,
+                maxBodyLen: args.maxBodyLen,
                 handlers: args.handlers,
             }),
     };

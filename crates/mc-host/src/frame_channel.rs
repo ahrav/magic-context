@@ -36,6 +36,10 @@ pub enum ReadClose {
     Corrupt(&'static str),
     /// The generation or host was cancelled while reading.
     Cancelled,
+    /// A resource wait (ingress budget) outlasted its deadline: the peer
+    /// and the transport are healthy, so retirement is clean backpressure,
+    /// not a structural fault.
+    Overloaded,
     /// Transport-level I/O failure.
     Io(std::io::Error),
     /// Realignment after a rejected frame failed.
