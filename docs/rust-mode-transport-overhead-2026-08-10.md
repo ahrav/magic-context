@@ -20,7 +20,7 @@ An idle standalone probe puts the complete client → daemon → module echo →
 
 ## Measurement design
 
-`packages/plugin/scripts/probe-subc-transport.ts` is deliberately one long-lived Bun process using one established `SubcClient` connection and one reused route. Every sweep arm warms the route five times and then times 50 individual sequential round-trips. It does **not** spawn a process per sample; process startup would add a roughly 60 ms floor with about 90 ms spread and make this discriminator blind. Connection, route-open, and route-close times are reported separately.
+`packages/plugin/scripts/probe-mc-host-transport.ts` is deliberately one long-lived Bun process using one established `McHostClient` connection and one reused route. Every sweep arm warms the route five times and then times 50 individual sequential round-trips. It does **not** spawn a process per sample; process startup would add a roughly 60 ms floor with about 90 ms spread and make this discriminator blind. Connection, route-open, and route-close times are reported separately.
 
 The sweep uses the production request settings (`Priority.Background`, `AdmissionClass.Normal`) and exact serialized request-body sizes of 1, 4, 8, 16, and 32 KiB. A small interactive health arm is a control. The script also instruments `SubcModuleTransport` only within the probe process to timestamp its global correctness FIFO before enqueue, after dequeue, and after response. No production source or live durable module state is changed; `health`, `echo`, and read-only `session.status` are used.
 
@@ -28,7 +28,7 @@ Command:
 
 ```sh
 cd packages/plugin
-bun scripts/probe-subc-transport.ts
+bun scripts/probe-mc-host-transport.ts
 ```
 
 Live run: 2026-08-10T09:42:06Z, daemon 0.3.0 on loopback TCP, 50 samples per arm.

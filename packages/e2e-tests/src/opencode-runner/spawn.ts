@@ -447,6 +447,18 @@ async function spawnOpencodeWithProvision(
             if (key === "OPENCODE_SERVER_PASSWORD") continue;
             if (key === "OPENCODE_SERVER_USERNAME") continue;
             if (key === "NODE_ENV") continue;
+            // Strip any inherited supervised-launch identity. These are still the
+            // live variable names (`mc_host::wire::SUBC_MODULE_ID_ENV` /
+            // `SUBC_LAUNCH_NONCE_ENV`), and `historian_producer` reads them into
+            // `consumer_module_id`/`consumer_launch_nonce` on every route identity.
+            // When the test process is itself launched under a supervisor that sets
+            // them, the plugin would present THAT identity to our hermetic host,
+            // which rejects it as not matching a supervised launch nonce. A real
+            // install is never launched under a supervised identity, so clearing
+            // them matches production. Harmless for TS-mode suites, which never
+            // reach the Rust client.
+            if (key === "SUBC_MODULE_ID") continue;
+            if (key === "SUBC_LAUNCH_NONCE") continue;
             childEnv[key] = value;
         }
         childEnv.OPENCODE_CONFIG_DIR = env.configDir;

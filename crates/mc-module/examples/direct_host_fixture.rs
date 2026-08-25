@@ -639,6 +639,18 @@ mod unix {
             data_dir: Some(root.clone()),
             daemon_ver: "mc-module/direct-host-fixture".to_owned(),
             init: storage_init(&root),
+            limits: mc_host::HostLimits {
+                // This composite is the only place that knows which components
+                // are linked, so it is the only place that can size the ceiling:
+                // the default ingress floor plus every linked component's
+                // declared retention. The runtime subtracts those declarations
+                // from ingress, so omitting one would either starve ingress or
+                // fail startup.
+                max_resident_bytes: mc_host::HostLimits::default().max_resident_bytes
+                    + mc_module::DECLARED_RETAINED_RESIDENT_BYTES
+                    + mc_host::broca::config::DECLARED_RETAINED_RESIDENT_BYTES,
+                ..mc_host::HostLimits::default()
+            },
             ..Default::default()
         };
         let host_shutdown = shutdown.clone();

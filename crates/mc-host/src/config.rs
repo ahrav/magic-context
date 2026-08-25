@@ -114,14 +114,14 @@ impl Default for HostLimits {
             max_routes: 1024,
             max_pending_requests: 1024,
             max_handler_tasks: 256,
-            // 256 MiB served the two-component profile; the third (Broca)
-            // component's declared retained reservation is subtracted from
-            // ingress by the runtime, so the default grows by exactly that
-            // whole declaration — supervisor budget plus route-map and
-            // backend-capture headroom — to preserve the former ingress
-            // headroom.
-            max_resident_bytes: 256 * 1024 * 1024
-                + crate::broca::config::DECLARED_RETAINED_RESIDENT_BYTES,
+            // Sized for a host whose components declare no retention. The
+            // runtime subtracts the catalog and every declared
+            // `retained_resident_bytes` from this figure, and a default cannot
+            // know which components a composite links — so a composition site
+            // that links components with real retention must size this itself as
+            // its own floor plus the sum of their declarations. Startup refuses
+            // the composite otherwise rather than silently over-offering ingress.
+            max_resident_bytes: 256 * 1024 * 1024,
             writer_queue_frames: 64,
         }
     }

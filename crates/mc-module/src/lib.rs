@@ -2437,6 +2437,27 @@ const _: () = assert!(
         <= TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES
 );
 
+/// Every resident byte this component retains for the whole incarnation,
+/// declared to the host through [`ResourceDeclaration::retained_resident_bytes`].
+///
+/// The host subtracts this from the ingress admission pool, so
+/// `max_resident_bytes` only bounds the process when this number is truthful.
+/// Declaring zero left the transform-serving caches, the snapshot cache, the
+/// boundary-token cache, and staged state-import bytes outside the accounting
+/// entirely: the runtime kept offering those same bytes to ingress while the
+/// caches held them.
+///
+/// Enumerated per retention class rather than as one total, so a cache whose
+/// budget changes cannot silently fall out of the declaration. Broca declares
+/// its own retention the same way; each component owns its own number, and the
+/// composition site sums them when it sizes `max_resident_bytes`.
+pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES
+    as u64
+    + TRANSFORM_SNAPSHOT_BUDGET_BYTES as u64
+    + BOUNDARY_TOKEN_CACHE_BUDGET_BYTES as u64
+    + STATE_IMPORT_MAX_STAGED_BYTES as u64
+    + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64;
+
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
     after: String,
@@ -12418,7 +12439,10 @@ impl CompositeComponent for McHandler {
     }
 
     fn resources(&self) -> ResourceDeclaration {
-        ResourceDeclaration::default()
+        ResourceDeclaration {
+            retained_resident_bytes: DECLARED_RETAINED_RESIDENT_BYTES,
+            ..ResourceDeclaration::default()
+        }
     }
 
     async fn bind(&self, route: RouteHandle, identity: RouteIdentity) -> BindOutcome {
