@@ -698,6 +698,20 @@ impl Inner {
         deadline: Instant,
         cancellation: Option<CancellationToken>,
     ) -> Result<Response, CallError> {
+        // A token cancelled before the call must not enqueue anything. The
+        // `select!` below is biased toward cancellation, but admission has
+        // already handed the frame to the writer, which can claim it on another
+        // worker before this task reaches the select.
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(CallError::local(
+                SendOutcome::NotSent,
+                "cancelled",
+                "request was cancelled",
+            ));
+        }
         let (tx, rx) = oneshot::channel();
         let (key, publish) = self.admit(route, body, PendingKind::Unary(tx), deadline)?;
         let mut guard = UnaryAdmissionGuard::new(Arc::clone(self), key);
@@ -2453,6 +2467,30 @@ mod tests {
             0,
             "no live stream charged"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pre_cancelled_unary_never_enqueues_a_frame() {
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        let error = inner
+            .unary(
+                route(1),
+                b"must-not-send".to_vec(),
+                Instant::now() + Duration::from_secs(30),
+                Some(cancelled),
+            )
+            .await
+            .expect_err("an already-cancelled token admits nothing");
+        assert_eq!(error.outcome(), SendOutcome::NotSent);
+        assert_eq!(error.code(), "cancelled");
+        assert!(
+            data_rx.try_recv().is_err(),
+            "a cancelled request must not reach the writer"
+        );
+        assert!(lock_unpoisoned(&inner.pending).is_empty());
     }
 
     #[test]
