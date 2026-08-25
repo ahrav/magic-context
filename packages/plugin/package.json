@@ -55,6 +55,7 @@
     "prepublishOnly": "bun run build && bun run build:tui"
   },
   "dependencies": {
+    "@magic-context/mc-shm-native": "workspace:*",
     "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "@opencode-ai/plugin": "^1.17.11",

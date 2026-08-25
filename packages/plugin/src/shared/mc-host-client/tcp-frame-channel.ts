@@ -19,6 +19,7 @@ import {
     BoundedFrameProducer,
     type ByteBudget,
     CopyCounter,
+    type DirectFrameBody,
     type FrameChannel,
     type FrameChannelCloseReason,
     type FrameChannelDiagnosticType,
@@ -273,6 +274,22 @@ export class TcpFrameChannel implements FrameChannel {
             quarantinedBytes: this.quarantinedBytes,
             ownedAdapterCopies: this.copyCounter.copies,
         };
+    }
+
+    produce(
+        header: ProducerFrameHeader,
+        body: DirectFrameBody,
+        hooks?: FrameSendHooks,
+        _deadline?: Deadline,
+    ): FrameSendTicket {
+        const producer = this.reserve(header, body.byteLength, hooks);
+        try {
+            body.fill(producer);
+            return producer.commit(body.byteLength);
+        } catch (error) {
+            producer.abort();
+            throw error;
+        }
     }
 
     reserve(

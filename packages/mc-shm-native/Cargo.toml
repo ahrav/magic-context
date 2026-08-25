@@ -1,0 +1,18 @@
+[package]
+name = "mc-shm-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mc-shm-transport = { path = "../../crates/mc-shm-transport", default-features = false }
+napi = { version = "=3.12.2", default-features = false, features = ["napi8"] }
+napi-derive = "=3.6.3"
+
+[build-dependencies]
+napi-build = "2"

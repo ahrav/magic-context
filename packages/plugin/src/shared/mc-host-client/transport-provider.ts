@@ -259,9 +259,7 @@ export function sanitizedCandidateFactory(
                 // provider's reader callback with provider-owned text —
                 // and never a stalled published generation.
                 let snapshot: InboundFrame;
-                // Bytes charged for the owned copy, released after delivery
-                // like every channel's transient buffering (a receiver that
-                // retains a body re-charges it itself).
+                let sourceLease: ReceiveLease | null = null;
                 let charged = 0;
                 try {
                     const header = frame.header;
@@ -292,6 +290,7 @@ export function sanitizedCandidateFactory(
                     ) {
                         throw new Error("malformed provider frame");
                     }
+                    sourceLease = providerLease;
                     // Wire widths: `validateHeader` checks flag semantics and
                     // identity rules but NOT field ranges (those live in
                     // `encodeHeader`, which an inbound frame never reaches),
@@ -319,18 +318,22 @@ export function sanitizedCandidateFactory(
                     if (!Number.isSafeInteger(reported) || reported > args.maxBodyLen) {
                         throw new Error("oversize provider frame");
                     }
-                    // The copy draws on the ONE shared aggregate cap the
-                    // channel seam promises, so a provider delivery cannot
-                    // create unaccounted allocation above it.
+                    const segments = Array.from(
+                        { length: providerLease.segmentCount },
+                        (_, index) => providerLease.segment(index),
+                    );
+                    const segmentBytes = segments.reduce(
+                        (total, segment) => total + segment.byteLength,
+                        0,
+                    );
+                    if (segmentBytes !== reported) {
+                        throw new Error("provider frame length disagrees with its bytes");
+                    }
                     if (args.budget.wouldExceed(reported)) {
                         throw new Error("provider frame exceeds the aggregate cap");
                     }
                     args.budget.charge(reported);
                     charged = reported;
-                    const body = providerLease.takeOwned();
-                    if (body.length !== reported) {
-                        throw new Error("provider frame length disagrees with its bytes");
-                    }
                     const safeHeader = {
                         len,
                         ver,
@@ -346,7 +349,7 @@ export function sanitizedCandidateFactory(
                     }
                     let safeLease: ReceiveLease;
                     safeLease = new ReceiveLease(
-                        body.length === 0 ? [] : [body],
+                        segments,
                         (outcome) => {
                             receiveLeases.delete(safeLease);
                             if (outcome === "released") {
@@ -358,10 +361,18 @@ export function sanitizedCandidateFactory(
                             charged = 0;
                         },
                         copyCounter,
+                        () => (providerLease.release() ? "released" : "quarantined"),
                     );
                     receiveLeases.add(safeLease);
                     snapshot = { header: safeHeader, body: safeLease };
                 } catch {
+                    if (sourceLease && !sourceLease.isReleased()) {
+                        try {
+                            sourceLease.release();
+                        } catch {
+                            quarantinedBytes += charged;
+                        }
+                    }
                     if (charged > 0) args.budget.release(charged);
                     closeUpstream("protocol_violation", "channel");
                     return;
@@ -438,6 +449,49 @@ export function sanitizedCandidateFactory(
                 } catch {
                     throw sanitizedProviderError(transport, "channel");
                 }
+            },
+            produce: (header, body, hooks, deadline) => {
+                let published = false;
+                const trackedHooks: FrameSendHooks = {
+                    onPublish: () => {
+                        published = true;
+                        hooks?.onPublish?.();
+                    },
+                    ...(hooks?.onComplete ? { onComplete: hooks.onComplete } : {}),
+                };
+                let ticket: FrameSendTicket;
+                try {
+                    ticket = channel.produce(header, body, trackedHooks, deadline);
+                } catch (error) {
+                    const code =
+                        error instanceof SubcCallError &&
+                        error.code !== undefined &&
+                        BOUNDED_CHANNEL_CODES.has(error.code)
+                            ? error.code
+                            : undefined;
+                    if (!published) {
+                        throw new SubcCallError(
+                            "not_sent",
+                            `transport provider ${transport} failed during send`,
+                            code,
+                        );
+                    }
+                    closeUpstream("write_failed", "send");
+                    throw new SubcCallError(
+                        "outcome_unknown",
+                        `transport provider ${transport} failed during send`,
+                        code,
+                    );
+                }
+                return {
+                    cancel: () => {
+                        try {
+                            return !published && ticket.cancel() === true;
+                        } catch {
+                            return false;
+                        }
+                    },
+                };
             },
             reserve: (header, capacity, hooks) => {
                 try {

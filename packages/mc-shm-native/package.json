@@ -1,0 +1,21 @@
+{
+  "name": "@magic-context/mc-shm-native",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "build": "cargo build -p mc-shm-native && cp -f ../../target/debug/libmc_shm_native.so ./mc_shm_native.node",
+    "test": "bun test tests",
+    "test:node": "node --experimental-transform-types tests/runtime.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "typescript": "^5.8.0"
+  }
+}

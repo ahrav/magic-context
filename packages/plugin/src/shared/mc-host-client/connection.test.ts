@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { ConnectionGeneration, type RetirementInfo } from "./connection";
 import { Deadline } from "./deadline";
+import { ReceiveLease } from "./frame-channel";
 import { MAX_CORRELATION, MAX_FRAME_BODY_LEN } from "./protocol";
 import { adversarialScenarios, runAdversarialScenario } from "./test-support/adversarial-scenarios";
 import { encodePeerFrame, type FakePeerConnection, PeerFrameType } from "./test-support/fake-peer";
@@ -49,7 +50,7 @@ async function roundTrip(
     });
     const terminal = await request.result;
     expect(terminal.kind).toBe("response");
-    expect(Buffer.from(terminal.body).toString()).toBe(payload);
+    expect("text" in terminal.body ? terminal.body.text : null).toBe(payload);
 }
 
 describe("shared adversarial scenarios", () => {
@@ -417,7 +418,8 @@ describe("ingress fencing", () => {
             corr,
             body: Buffer.from("real"),
         });
-        expect(Buffer.from((await request.result).body).toString()).toBe("real");
+        const body = (await request.result).body;
+        expect("text" in body ? body.text : null).toBe("real");
         // Duplicate terminal and post-terminal stream frame.
         await connection.send({
             ty: PeerFrameType.Response,
@@ -621,7 +623,10 @@ describe("stream handling (KTD11)", () => {
         });
         const terminal = await request.result;
         expect(terminal.kind).toBe("stream_end");
-        expect(terminal.stream.map((item) => Buffer.from(item).toString())).toEqual(["s1", "s2"]);
+        expect(terminal.stream.map((item) => ("text" in item ? item.text : null))).toEqual([
+            "s1",
+            "s2",
+        ]);
         await waitUntil(() => generation.stats().memoryUsed === 0);
     });
 });
@@ -636,6 +641,7 @@ describe("memory accounting and the 64 MiB boundary", () => {
             epoch: EPOCH,
             body: Buffer.from("gimme-max"),
             deadline: Deadline.start(25_000),
+            responseMode: "binary",
         });
         await connection.waitFor(() =>
             connection.frames.some((frame) => frame.corr === request.correlation),
@@ -647,12 +653,16 @@ describe("memory accounting and the 64 MiB boundary", () => {
             epoch: EPOCH,
             corr: request.correlation,
             body,
+            flags: 1,
         });
         const terminal = await request.result;
         expect(terminal.kind).toBe("response");
-        expect(terminal.body.length).toBe(MAX_FRAME_BODY_LEN);
-        expect(terminal.body[0]).toBe(7);
-        expect(terminal.body[MAX_FRAME_BODY_LEN - 1]).toBe(7);
+        expect(terminal.body).toBeInstanceOf(ReceiveLease);
+        const leased = terminal.body as ReceiveLease;
+        expect(leased.byteLength).toBe(MAX_FRAME_BODY_LEN);
+        expect(leased.segment(0)[0]).toBe(7);
+        expect(leased.segment(leased.segmentCount - 1).at(-1)).toBe(7);
+        leased.release();
         const stats = generation.stats();
         // Accounting proof, not RSS: the body was charged exactly once (a
         // duplicate full-body copy would exceed the aggregate cap, which
@@ -731,7 +741,7 @@ describe("memory accounting and the 64 MiB boundary", () => {
         expectCallError(await rejection(first.result), "outcome_unknown", "deadline_expired");
         const terminal = await second.result;
         expect(terminal.kind).toBe("response");
-        expect(terminal.body.length).toBe(4_096);
+        expect(terminal.body.byteLength).toBe(4_096);
         expect(generation.stats().readPaused).toBe(false);
         await waitUntil(() => generation.stats().memoryUsed === 0);
     });

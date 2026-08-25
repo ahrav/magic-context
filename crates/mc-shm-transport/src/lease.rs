@@ -34,6 +34,11 @@ impl<'lease> LeaseSpan<'lease> {
         self.len
     }
 
+    /// Raw span address, valid for this span's lifetime. commentlint: allow(JUDGE)
+    pub const fn as_mut_ptr(self) -> *mut u8 {
+        self.base.as_ptr()
+    }
+
     /// Whether span is empty.
     pub const fn is_empty(self) -> bool {
         self.len == 0

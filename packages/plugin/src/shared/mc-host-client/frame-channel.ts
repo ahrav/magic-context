@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import type { Deadline } from "./deadline";
 import { type EnvelopeHeader, FrameType, isLegalHostToConsumerType } from "./protocol";
 
@@ -28,11 +29,13 @@ export type ReceiveReleaseOutcome = "released" | "quarantined";
 export class ReceiveLease {
     private released = false;
     private readonly originalLengths: readonly number[];
+    private readonly releaseObservers = new Set<(outcome: ReceiveReleaseOutcome) => void>();
 
     constructor(
         private readonly leasedSegments: readonly Uint8Array[],
         private readonly onRelease: (outcome: ReceiveReleaseOutcome) => void,
         private readonly copies: CopyCounter,
+        private readonly detachAliases?: () => ReceiveReleaseOutcome,
     ) {
         for (const segment of leasedSegments) {
             if (
@@ -80,31 +83,50 @@ export class ReceiveLease {
         if (this.released) return false;
         this.released = true;
         let outcome: ReceiveReleaseOutcome = "released";
-        for (let i = 0; i < this.leasedSegments.length; i++) {
-            const segment = this.leasedSegments[i] as Uint8Array;
-            const expected = this.originalLengths[i] as number;
-            const buffer = segment.buffer;
-            if (!(buffer instanceof ArrayBuffer) || (expected > 0 && buffer.byteLength === 0)) {
-                outcome = "quarantined";
-                continue;
-            }
+        if (this.detachAliases) {
             try {
-                structuredClone(buffer, { transfer: [buffer] });
+                outcome = this.detachAliases();
             } catch {
                 outcome = "quarantined";
-                continue;
             }
-            if (buffer.byteLength !== 0) outcome = "quarantined";
+        } else {
+            for (let i = 0; i < this.leasedSegments.length; i++) {
+                const segment = this.leasedSegments[i] as Uint8Array;
+                const expected = this.originalLengths[i] as number;
+                const buffer = segment.buffer;
+                if (!(buffer instanceof ArrayBuffer) || (expected > 0 && buffer.byteLength === 0)) {
+                    outcome = "quarantined";
+                    continue;
+                }
+                try {
+                    structuredClone(buffer, { transfer: [buffer] });
+                } catch {
+                    outcome = "quarantined";
+                    continue;
+                }
+                if (buffer.byteLength !== 0) outcome = "quarantined";
+            }
         }
         this.onRelease(outcome);
+        for (const observer of this.releaseObservers) observer(outcome);
+        this.releaseObservers.clear();
         if (outcome === "quarantined") {
             throw new Error("receive lease alias state is uncertain; storage quarantined");
         }
         return true;
     }
 
+    observeRelease(observer: (outcome: ReceiveReleaseOutcome) => void): void {
+        this.assertActive();
+        this.releaseObservers.add(observer);
+    }
+
     isReleased(): boolean {
         return this.released;
+    }
+
+    [Symbol.dispose](): void {
+        this.release();
     }
 
     private assertActive(): void {
@@ -120,6 +142,86 @@ export interface InboundFrame {
 export interface OutboundFrame {
     readonly header: EnvelopeHeader;
     readonly body: Uint8Array;
+}
+
+export interface FrameProducerCursor {
+    readonly written: number;
+    readonly remaining: number;
+    view(): Uint8Array;
+    advance(bytes: number): void;
+    write(bytes: Uint8Array): void;
+}
+
+export interface DirectFrameBody {
+    readonly byteLength: number;
+    fill(cursor: FrameProducerCursor): void;
+}
+
+export function bytesFrameBody(bytes: Uint8Array): DirectFrameBody {
+    return {
+        byteLength: bytes.byteLength,
+        fill: (cursor) => cursor.write(bytes),
+    };
+}
+
+export function utf8FrameBody(text: string): DirectFrameBody {
+    const byteLength = Buffer.byteLength(text, "utf8");
+    return {
+        byteLength,
+        fill: (cursor) => writeUtf8(cursor, text, byteLength),
+    };
+}
+
+function writeUtf8(cursor: FrameProducerCursor, text: string, byteLength: number): void {
+    const encoder = new TextEncoder();
+    const splitCodePoint = new Uint8Array(4);
+    const initialWritten = cursor.written;
+    let offset = 0;
+    while (offset < text.length) {
+        const view = cursor.view();
+        const encoded = encoder.encodeInto(text.slice(offset), view);
+        if (encoded.read > 0) {
+            cursor.advance(encoded.written);
+            offset += encoded.read;
+            continue;
+        }
+
+        // When encodeInto cannot consume the next scalar, fixed scratch lets
+        // cursor.write split that scalar across transport spans.
+        const sourceCodePoint = text.codePointAt(offset);
+        if (sourceCodePoint === undefined) throw new RangeError("invalid UTF-16 input");
+        const codePoint =
+            sourceCodePoint >= 0xd800 && sourceCodePoint <= 0xdfff ? 0xfffd : sourceCodePoint;
+        const width = encodeCodePoint(codePoint, splitCodePoint);
+        cursor.write(splitCodePoint.subarray(0, width));
+        offset += sourceCodePoint > 0xffff ? 2 : 1;
+    }
+    if (cursor.written - initialWritten !== byteLength) {
+        throw new RangeError("UTF-8 producer length mismatch");
+    }
+}
+
+function encodeCodePoint(codePoint: number, out: Uint8Array): number {
+    if (codePoint <= 0x7f) {
+        out[0] = codePoint;
+        return 1;
+    }
+    if (codePoint <= 0x7ff) {
+        out[0] = 0xc0 | (codePoint >> 6);
+        out[1] = 0x80 | (codePoint & 0x3f);
+        return 2;
+    }
+    if (codePoint <= 0xffff) {
+        out[0] = 0xe0 | (codePoint >> 12);
+        out[1] = 0x80 | ((codePoint >> 6) & 0x3f);
+        out[2] = 0x80 | (codePoint & 0x3f);
+        return 3;
+    }
+    out[0] = 0xf0 | (codePoint >> 18);
+    out[1] = 0x80 | ((codePoint >> 12) & 0x3f);
+    out[2] = 0x80 | ((codePoint >> 6) & 0x3f);
+    out[3] = 0x80 | (codePoint & 0x3f);
+    return 4;
 }
 
 export interface FrameSendHooks {
@@ -148,7 +250,7 @@ interface PreparedProducerCommit {
     publish(): FrameSendTicket;
 }
 
-export class BoundedFrameProducer {
+export class BoundedFrameProducer implements FrameProducerCursor {
     private cursor = 0;
     private active = true;
 
@@ -326,6 +428,12 @@ export interface FrameChannelStats {
 }
 
 export interface FrameChannel {
+    produce(
+        header: ProducerFrameHeader,
+        body: DirectFrameBody,
+        hooks?: FrameSendHooks,
+        deadline?: Deadline,
+    ): FrameSendTicket;
     reserve(
         header: ProducerFrameHeader,
         capacity: number,

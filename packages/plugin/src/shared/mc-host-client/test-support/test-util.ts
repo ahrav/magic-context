@@ -13,6 +13,7 @@ import { SubcCallError } from "../errors";
 import {
     BoundedFrameProducer,
     CopyCounter,
+    type DirectFrameBody,
     type FrameChannelHandlers,
     type FrameChannelStats,
     type FrameSendHooks,
@@ -268,6 +269,22 @@ class FakeCandidateChannel implements SetupFrameChannel {
         while (this.inbox.length > 0) {
             const frame = this.inbox.shift() as InboundFrame;
             this.handlers.onFrame(frame);
+        }
+    }
+
+    produce(
+        header: ProducerFrameHeader,
+        body: DirectFrameBody,
+        hooks?: FrameSendHooks,
+        _deadline?: Deadline,
+    ): FrameSendTicket {
+        const producer = this.reserve(header, body.byteLength, hooks);
+        try {
+            body.fill(producer);
+            return producer.commit(body.byteLength);
+        } catch (error) {
+            producer.abort();
+            throw error;
         }
     }
 

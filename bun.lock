@@ -66,6 +66,14 @@
         "typescript": "^5.6.0",
       },
     },
+    "packages/mc-shm-native": {
+      "name": "@magic-context/mc-shm-native",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@types/node": "^22.20.0",
+        "typescript": "^5.8.0",
+      },
+    },
     "packages/pi-plugin": {
       "name": "@cortexkit/pi-magic-context",
       "version": "0.37.0",
@@ -103,6 +111,7 @@
       "dependencies": {
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
+        "@magic-context/mc-shm-native": "workspace:*",
         "@opencode-ai/plugin": "^1.17.11",
         "@opencode-ai/sdk": "^1.17.11",
         "@opentui/core": "^0.4.2",
@@ -534,6 +543,8 @@
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
     "@magic-context/docs": ["@magic-context/docs@workspace:packages/docs"],
+
+    "@magic-context/mc-shm-native": ["@magic-context/mc-shm-native@workspace:packages/mc-shm-native"],
 
     "@mariozechner/clipboard": ["@mariozechner/clipboard@0.3.9", "", { "optionalDependencies": { "@mariozechner/clipboard-darwin-arm64": "0.3.9", "@mariozechner/clipboard-darwin-universal": "0.3.9", "@mariozechner/clipboard-darwin-x64": "0.3.9", "@mariozechner/clipboard-linux-arm64-gnu": "0.3.9", "@mariozechner/clipboard-linux-arm64-musl": "0.3.9", "@mariozechner/clipboard-linux-riscv64-gnu": "0.3.9", "@mariozechner/clipboard-linux-x64-gnu": "0.3.9", "@mariozechner/clipboard-linux-x64-musl": "0.3.9", "@mariozechner/clipboard-win32-arm64-msvc": "0.3.9", "@mariozechner/clipboard-win32-x64-msvc": "0.3.9" } }, "sha512-ABnA53mdfkGZwOFUdZNv2S0CWGO/EIuPj8Vv9xmBFmSYg/qFc7ihO6q5FcQjvoE67kZpWkEc4AhD6B/os04yuA=="],
 
