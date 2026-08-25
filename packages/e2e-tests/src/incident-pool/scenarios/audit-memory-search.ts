@@ -240,12 +240,17 @@ function readFactRowState(
     });
 }
 
+/** The plugin's memory-identity normalization, mirrored here rather than
+ *  imported (normalize-hash.ts): lowercase, collapse whitespace, trim. */
+function normalizeMemoryText(content: string): string {
+    return content.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 /** Compute the plugin-normalized memory hash without importing half the
  *  plugin: lowercase, collapse whitespace, trim, md5 (normalize-hash.ts). */
 function normalizedMemoryHash(content: string): string {
-    const normalized = content.toLowerCase().replace(/\s+/g, " ").trim();
     const hasher = new Bun.CryptoHasher("md5");
-    hasher.update(normalized);
+    hasher.update(normalizeMemoryText(content));
     return hasher.digest("hex");
 }
 
@@ -570,9 +575,19 @@ export async function driveArchivedReobservation(
             // injected m[0] block AND the explicit ctx_search response both
             // reach the model, so checking only m[0] would score a search
             // that still returns the archived row as "no recall".
+            //
+            // Compare on the product's identity normalization, not raw bytes:
+            // this case deliberately re-observes the fact as uppercase with
+            // padding, so a case-sensitive match would score an exposed
+            // archived fact as "no recall" whenever the surfaced copy carries
+            // the re-observed bytes instead of the original ones.
             agentVisibleFactRecall:
-                ordinaryM0.includes(fixture.fact) ||
-                search.resultText.includes(fixture.fact),
+                normalizeMemoryText(ordinaryM0).includes(
+                    normalizeMemoryText(fixture.fact),
+                ) ||
+                normalizeMemoryText(search.resultText).includes(
+                    normalizeMemoryText(fixture.fact),
+                ),
             searchReturnsActiveControl: ordinaryM0.includes(
                 fixture.activeControl,
             ),

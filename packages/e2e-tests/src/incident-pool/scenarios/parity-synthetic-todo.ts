@@ -1350,10 +1350,15 @@ async function driveDependent(
             // fresh call id is the same failure to clear the anchor.
             providerTransitionCorrect:
                 body !== null && findSyntheticPair(body) === null,
+            // Both halves of the frozen pair must go. Clearing the call id
+            // alone also removes the provider pair, so `providerTransitionCorrect`
+            // cannot catch a durable anchor left behind — this case would score
+            // as a resolution candidate with a stale `anchor_mid` still on disk.
             durableTransitionCorrect:
                 terminalCaptured &&
                 state?.lastTodoState === terminalState &&
-                state.syntheticCallId === null,
+                state.syntheticCallId === null &&
+                state.syntheticAnchorMessageId === null,
         };
     } finally {
         await root.h.dispose();

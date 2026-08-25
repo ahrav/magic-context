@@ -549,7 +549,15 @@ jobs:
     name: Incident regression pool (supported TS)
     runs-on: ubuntu-latest
     needs: [check-plugin, check-pi-plugin]
-    timeout-minutes: 60
+    # Sized for the aggregate sequential deadline, not the happy path. `--mode
+    # ts` runs 10 OpenCode then 4 Pi variants one at a time, each allowed the
+    # 600s budget below, so a run where cases time out can need ~140 minutes on
+    # top of setup. At a lower cap the job is killed mid-schedule and publishes
+    # no report at all, which loses the per-case classification that is the
+    # whole point of this job — strictly worse than a slow red build. Cases
+    # normally finish in seconds, so this bound is only reached when something
+    # is already wrong.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v5
         with:
