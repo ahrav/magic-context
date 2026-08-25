@@ -91,6 +91,8 @@ export interface FrameChannelContractHandle {
     channel: FrameChannel;
     budget: ByteBudget;
     peer: ContractPeer;
+    /** Whether releasing a lease must revoke aliases before backing storage is reused. */
+    reusesReceiveStorage: boolean;
     /** The contract factory retains owned bodies after the provider releases each inbound lease. */
     received: ContractReceivedFrame[];
     /** Channel-detected closes, in order (owner close never records here). */
@@ -628,7 +630,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             await waitUntil(() => held.frame !== null);
             assert.equal(held.alias?.byteLength, 5);
             h.channel.close();
-            assert.equal(held.alias?.byteLength, 0);
+            assert.equal(held.alias?.byteLength, h.reusesReceiveStorage ? 0 : 5);
             assert.equal(held.frame?.body.isReleased(), true);
             assert.equal(h.channel.stats().activeReceiveLeases, 0);
             assert.throws(() => held.frame?.body.segment(0), /released/);
@@ -656,7 +658,10 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             structuredClone(backing, { transfer: [backing] });
             uncertain.channel.close();
             assert.equal(uncertain.channel.stats().activeReceiveLeases, 0);
-            assert.equal(uncertain.channel.stats().quarantinedBytes, 5);
+            assert.equal(
+                uncertain.channel.stats().quarantinedBytes,
+                uncertain.reusesReceiveStorage ? 5 : 0,
+            );
         },
     },
 ];
@@ -728,6 +733,7 @@ export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async
         channel,
         budget,
         peer: contractPeer,
+        reusesReceiveStorage: false,
         received,
         closes,
         get frameHook() {

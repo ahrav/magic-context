@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Deadline } from "./deadline";
-import { ByteBudget, type FrameChannelCloseReason } from "./frame-channel";
+import { ByteBudget, type FrameChannelCloseReason, utf8FrameBody } from "./frame-channel";
 import { type EnvelopeHeader, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "./protocol";
 import { TcpFrameChannel } from "./tcp-frame-channel";
 import { encodePeerFrame, FakePeer, type FakePeerConnection } from "./test-support/fake-peer";
@@ -247,5 +247,24 @@ describe("TCP adapter specifics", () => {
         // Spans (capacity) and the queued copy (capacity) are both charged at
         // the commit boundary, so peak reflects the true double residency.
         expect(h.budget.peak).toBeGreaterThanOrEqual(2 * capacity);
+    });
+
+    test("the built-in UTF-8 producer queues its final TCP buffer directly", async () => {
+        const h = await createHarness();
+        h.channel.produce(
+            {
+                ver: PROTOCOL_VERSION,
+                ty: FrameType.Request,
+                flags: 0,
+                channel: CHANNEL,
+                epoch: EPOCH,
+                corr: 1n,
+            },
+            utf8FrameBody("direct"),
+        );
+
+        await waitUntil(() => h.connection.frames.length === 1);
+        expect(Buffer.from(h.connection.frames[0]?.body ?? []).toString()).toBe("direct");
+        expect(h.channel.stats().ownedAdapterCopies).toBe(0);
     });
 });

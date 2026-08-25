@@ -767,6 +767,10 @@ export class ConnectionGeneration {
                 return;
             }
             entry.sawStream = true;
+            if (entry.mode === "unary") {
+                lease.release();
+                return;
+            }
             let body: RequestReceiveBody;
             try {
                 body = this.consumeResponseBody(entry, header, lease);
@@ -775,14 +779,10 @@ export class ConnectionGeneration {
                 this.finishEntry(entry);
                 return;
             }
-            if (entry.mode === "stream") {
-                entry.streamItems.push(body);
-                if (!(body instanceof ReceiveLease)) {
-                    entry.heldBytes += body.byteLength;
-                    this.chargePending(body.byteLength);
-                }
-            } else if (body instanceof ReceiveLease) {
-                body.release();
+            entry.streamItems.push(body);
+            if (!(body instanceof ReceiveLease)) {
+                entry.heldBytes += body.byteLength;
+                this.chargePending(body.byteLength);
             }
             return;
         }

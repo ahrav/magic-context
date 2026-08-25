@@ -12,7 +12,9 @@ afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 describe("native mechanism gate", () => {
     test("proves every required runtime mechanism or omits capability", () => {
         const result = probeCapabilities();
-        expect(result.napiVersion === null || result.napiVersion >= 1).toBe(true);
+        expect(result.napiVersion === null || result.napiVersion >= 1).toBe(
+            true,
+        );
         if (result.available) {
             expect(result.napiVersion).toBeGreaterThanOrEqual(8);
             expect(result.externalArrayBuffer).toBe(true);
@@ -29,7 +31,10 @@ describe("native mechanism gate", () => {
     test("environment cleanup hook runs at runtime exit when addon loads", () => {
         const marker = join(scratch, "cleanup.marker");
         const script = join(scratch, "cleanup.mjs");
-        const addon = resolve(dirname(fileURLToPath(import.meta.url)), "../mc_shm_native.node");
+        const addon = resolve(
+            dirname(fileURLToPath(import.meta.url)),
+            "../mc_shm_native.node",
+        );
         writeFileSync(
             script,
             `import { createRequire } from "node:module";\n` +
@@ -37,7 +42,9 @@ describe("native mechanism gate", () => {
                 `addon.registerCleanupProbe(${JSON.stringify(marker)});\n` +
                 `if (process.platform === "linux") addon.createTestPair();\n`,
         );
-        const child = spawnSync(process.execPath, [script], { encoding: "utf8" });
+        const child = spawnSync(process.execPath, [script], {
+            encoding: "utf8",
+        });
         expect(child.status).toBe(0);
         expect(readFileSync(marker, "utf8")).toBe("clean");
     });

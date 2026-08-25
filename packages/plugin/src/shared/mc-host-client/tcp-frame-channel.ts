@@ -29,6 +29,7 @@ import {
     type FrameSendHooks,
     type FrameSendTicket,
     headerViolation,
+    frameBodyMaterializer,
     type OutboundFrame,
     type ProducerFrameHeader,
     ReceiveLease,
@@ -282,6 +283,23 @@ export class TcpFrameChannel implements FrameChannel {
         hooks?: FrameSendHooks,
         _deadline?: Deadline,
     ): FrameSendTicket {
+        const materialize = frameBodyMaterializer(body);
+        if (materialize) {
+            const fullHeader: EnvelopeHeader = { ...header, len: body.byteLength };
+            const admission = this.prepareDataFrame(fullHeader);
+            const materialized = materialize();
+            if (materialized.bytes.byteLength !== body.byteLength) {
+                throw new RangeError("materialized frame body length mismatch");
+            }
+            if (materialized.copied) this.copyCounter.record();
+            return this.enqueuePreparedData(
+                fullHeader,
+                admission.headerBytes,
+                materialized.bytes,
+                admission.totalBytes,
+                hooks,
+            );
+        }
         const producer = this.reserve(header, body.byteLength, hooks);
         try {
             body.fill(producer);
@@ -414,12 +432,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
-        if (this.closed) {
-            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
-        }
-        // Encoding validates every header field before any state changes,
-        // so a rejected frame can never burn a correlation upstream.
-        const headerBytes = Buffer.from(encodeHeader(frame.header));
         if (frame.header.len !== frame.body.length) {
             // A mismatched declaration would desynchronize the peer's frame
             // parser and corrupt every later frame on the connection.
@@ -427,7 +439,32 @@ export class TcpFrameChannel implements FrameChannel {
                 `frame header.len (${frame.header.len}) does not match body length (${frame.body.length})`,
             );
         }
-        const totalBytes = HEADER_LEN + frame.body.length;
+        const admission = this.prepareDataFrame(frame.header);
+        const body = Buffer.from(frame.body);
+        this.copyCounter.record();
+        return this.enqueuePreparedData(
+            frame.header,
+            admission.headerBytes,
+            body,
+            admission.totalBytes,
+            hooks,
+        );
+    }
+
+    private prepareDataFrame(header: EnvelopeHeader): {
+        headerBytes: Buffer;
+        totalBytes: number;
+    } {
+        if (this.closed) {
+            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+        }
+        if (!Number.isSafeInteger(header.len) || header.len < 0 || header.len > this.maxBodyLen) {
+            throw new RangeError("frame body length is outside transport bounds");
+        }
+        // Encoding validates every header field before any state changes,
+        // so a rejected frame can never burn a correlation upstream.
+        const headerBytes = Buffer.from(encodeHeader(header));
+        const totalBytes = HEADER_LEN + header.len;
         if (
             this.dataFramesQueued + this.reservedDataFrames + 1 > this.maxQueuedFrames ||
             this.dataBytesQueued + this.reservedDataBytes + totalBytes > this.maxQueuedBytes
@@ -441,14 +478,22 @@ export class TcpFrameChannel implements FrameChannel {
                 "memory_cap",
             );
         }
-        const body = Buffer.from(frame.body);
-        this.copyCounter.record();
+        return { headerBytes, totalBytes };
+    }
+
+    private enqueuePreparedData(
+        header: EnvelopeHeader,
+        headerBytes: Buffer,
+        body: Buffer,
+        totalBytes: number,
+        hooks?: FrameSendHooks,
+    ): FrameSendTicket {
         const item: QueuedItem = {
             buffers: body.length > 0 ? [headerBytes, body] : [headerBytes],
             bytes: totalBytes,
             control: false,
             hooks: hooks ?? null,
-            meta: metaFromHeader(frame.header),
+            meta: metaFromHeader(header),
         };
         this.enqueueItem(item);
         return {
@@ -852,6 +897,10 @@ export class TcpFrameChannel implements FrameChannel {
                 }
             },
             this.copyCounter,
+            // TCP receive buffers are never recycled. Releasing the reader
+            // charge and dropping the lease is sufficient; retained aliases
+            // own their ArrayBuffer and cannot observe reused storage.
+            () => "released",
         );
         this.receiveLeases.add(lease);
         this.handlers.onFrame({ header, body: lease });

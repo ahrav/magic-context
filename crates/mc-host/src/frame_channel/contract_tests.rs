@@ -633,7 +633,7 @@ mod ownership_contract {
     }
 
     #[tokio::test]
-    async fn tcp_owned_adapter_reports_one_copy() {
+    async fn tcp_owned_adapter_moves_contiguous_storage() {
         let mut h = crate::tcp_frame_channel::TcpChannelFactory
             .connect(ContractConfig::default())
             .await;
@@ -651,6 +651,6 @@ mod ownership_contract {
         let copies = frame.copy_counter();
         let owned = frame.into_owned();
         assert_eq!(owned.body, b"copy");
-        assert_eq!(copies.copies(), 1);
+        assert_eq!(copies.copies(), 0);
     }
 }

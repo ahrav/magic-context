@@ -150,29 +150,47 @@ export interface DirectFrameBody {
     fill(cursor: FrameProducerCursor): void;
 }
 
+interface MaterializedFrameBody {
+    bytes: Buffer;
+    copied: boolean;
+}
+
+const BODY_MATERIALIZERS = new WeakMap<DirectFrameBody, () => MaterializedFrameBody>();
+
+export function frameBodyMaterializer(
+    body: DirectFrameBody,
+): (() => MaterializedFrameBody) | undefined {
+    return BODY_MATERIALIZERS.get(body);
+}
+
 export function bytesFrameBody(bytes: Uint8Array): DirectFrameBody {
-    return {
+    const body: DirectFrameBody = {
         byteLength: bytes.byteLength,
         fill: (cursor) => cursor.write(bytes),
     };
+    BODY_MATERIALIZERS.set(body, () => ({ bytes: Buffer.from(bytes), copied: true }));
+    return body;
 }
+
+const UTF8_ENCODER = new TextEncoder();
+const SPLIT_CODE_POINT = new Uint8Array(4);
 
 export function utf8FrameBody(text: string): DirectFrameBody {
     const byteLength = Buffer.byteLength(text, "utf8");
-    return {
+    const body: DirectFrameBody = {
         byteLength,
         fill: (cursor) => writeUtf8(cursor, text, byteLength),
     };
+    BODY_MATERIALIZERS.set(body, () => ({ bytes: Buffer.from(text, "utf8"), copied: false }));
+    return body;
 }
 
 function writeUtf8(cursor: FrameProducerCursor, text: string, byteLength: number): void {
-    const encoder = new TextEncoder();
-    const splitCodePoint = new Uint8Array(4);
     const initialWritten = cursor.written;
     let offset = 0;
     while (offset < text.length) {
         const view = cursor.view();
-        const encoded = encoder.encodeInto(text.slice(offset), view);
+        const encoded = UTF8_ENCODER.encodeInto(text.slice(offset), view);
         if (encoded.read > 0) {
             cursor.advance(encoded.written);
             offset += encoded.read;
@@ -185,8 +203,8 @@ function writeUtf8(cursor: FrameProducerCursor, text: string, byteLength: number
         if (sourceCodePoint === undefined) throw new RangeError("invalid UTF-16 input");
         const codePoint =
             sourceCodePoint >= 0xd800 && sourceCodePoint <= 0xdfff ? 0xfffd : sourceCodePoint;
-        const width = encodeCodePoint(codePoint, splitCodePoint);
-        cursor.write(splitCodePoint.subarray(0, width));
+        const width = encodeCodePoint(codePoint, SPLIT_CODE_POINT);
+        cursor.write(SPLIT_CODE_POINT.subarray(0, width));
         offset += sourceCodePoint > 0xffff ? 2 : 1;
     }
     if (cursor.written - initialWritten !== byteLength) {

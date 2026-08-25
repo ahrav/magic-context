@@ -417,7 +417,7 @@ enum ReceiveBody {
 }
 
 /// One admitted inbound frame. Body bytes can only be observed through
-/// [`InboundFrame::with_lease`] or copied through [`InboundFrame::into_owned`].
+/// [`InboundFrame::with_lease`] or moved/copied through [`InboundFrame::into_owned`].
 pub struct InboundFrame {
     pub header: EnvelopeHeader,
     body: ReceiveBody,
@@ -495,8 +495,8 @@ impl InboundFrame {
         }
     }
 
-    /// TCP/compatibility adapter. Copy completes synchronously, then this
-    /// method drops transport storage before returning owned semantic bytes.
+    /// Compatibility adapter. Already-owned contiguous storage moves directly;
+    /// segmented storage is flattened synchronously before returning.
     pub fn into_owned(self) -> OwnedInboundFrame {
         let Self {
             header,
@@ -505,8 +505,7 @@ impl InboundFrame {
             copies,
         } = self;
         let body = match body {
-            ReceiveBody::Owned(body) => body,
-            ReceiveBody::Contiguous(body) => ReceiveLease::contiguous(&body).to_owned(&copies),
+            ReceiveBody::Contiguous(body) | ReceiveBody::Owned(body) => body,
             ReceiveBody::Segmented(first, second) => {
                 ReceiveLease::segmented(&first, Some(&second)).to_owned(&copies)
             }

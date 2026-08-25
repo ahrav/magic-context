@@ -71,7 +71,11 @@ interface NativeAddon {
     abortReservation(channel: number, token: number): void;
     poll(
         channel: number,
-        deliver: (token: number, header: Uint8Array, segments: Uint8Array[]) => void,
+        deliver: (
+            token: number,
+            header: Uint8Array,
+            segments: Uint8Array[],
+        ) => void,
     ): boolean;
     release(channel: number, token: number): void;
     close(channel: number): void;
@@ -83,7 +87,9 @@ let loaded: NativeAddon | null | undefined;
 function addon(): NativeAddon | null {
     if (loaded !== undefined) return loaded;
     try {
-        loaded = createRequire(import.meta.url)("./mc_shm_native.node") as NativeAddon;
+        loaded = createRequire(import.meta.url)(
+            "./mc_shm_native.node",
+        ) as NativeAddon;
     } catch {
         loaded = null;
     }
@@ -112,19 +118,32 @@ export function probeCapabilities(): NativeCapabilities {
         return { available: false, ...base, reason: "platform_unsupported" };
     }
     if (!("Bun" in globalThis) && process.release.name === "node") {
-        return { available: false, ...base, reason: "node_detachment_unavailable" };
+        return {
+            available: false,
+            ...base,
+            reason: "node_detachment_unavailable",
+        };
     }
     const native = addon();
-    if (!native) return { available: false, ...base, reason: "addon_unavailable" };
+    if (!native)
+        return { available: false, ...base, reason: "addon_unavailable" };
     try {
         const napiVersion = native.napiVersion();
         if (napiVersion < 8) {
-            return { available: false, ...base, napiVersion, reason: "napi_8_unavailable" };
+            return {
+                available: false,
+                ...base,
+                napiVersion,
+                reason: "napi_8_unavailable",
+            };
         }
         const view = native.createExternalProbe(31);
-        const externalArrayBuffer = view instanceof Uint8Array && view.byteLength === 31;
+        const externalArrayBuffer =
+            view instanceof Uint8Array && view.byteLength === 31;
         const exactBounds =
-            externalArrayBuffer && view.byteOffset === 0 && view.buffer.byteLength === 31;
+            externalArrayBuffer &&
+            view.byteOffset === 0 &&
+            view.buffer.byteLength === 31;
         if (!exactBounds) {
             return {
                 available: false,
@@ -190,7 +209,11 @@ export function probeCapabilities(): NativeCapabilities {
             cleanupHooks: typeof native.registerCleanupProbe === "function",
         };
     } catch {
-        return { available: false, ...base, reason: "runtime_mechanism_unavailable" };
+        return {
+            available: false,
+            ...base,
+            reason: "runtime_mechanism_unavailable",
+        };
     }
 }
 
@@ -201,8 +224,12 @@ export class ProducerCursor {
         private readonly segments: readonly Uint8Array[],
         readonly capacity: number,
     ) {
-        const available = segments.reduce((sum, segment) => sum + segment.byteLength, 0);
-        if (available !== capacity) throw new RangeError("producer spans disagree with reservation");
+        const available = segments.reduce(
+            (sum, segment) => sum + segment.byteLength,
+            0,
+        );
+        if (available !== capacity)
+            throw new RangeError("producer spans disagree with reservation");
     }
 
     get written(): number {
@@ -223,14 +250,19 @@ export class ProducerCursor {
     }
 
     advance(bytes: number): void {
-        if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.remaining) {
+        if (
+            !Number.isSafeInteger(bytes) ||
+            bytes < 0 ||
+            bytes > this.remaining
+        ) {
             throw new RangeError("producer overflow");
         }
         this.cursor += bytes;
     }
 
     write(bytes: Uint8Array): void {
-        if (bytes.byteLength > this.remaining) throw new RangeError("producer overflow");
+        if (bytes.byteLength > this.remaining)
+            throw new RangeError("producer overflow");
         let source = 0;
         let offset = this.cursor;
         for (const segment of this.segments) {
@@ -239,7 +271,10 @@ export class ProducerCursor {
                 offset -= segment.byteLength;
                 continue;
             }
-            const take = Math.min(segment.byteLength - offset, bytes.byteLength - source);
+            const take = Math.min(
+                segment.byteLength - offset,
+                bytes.byteLength - source,
+            );
             segment.set(bytes.subarray(source, source + take), offset);
             source += take;
             offset = 0;
@@ -260,7 +295,11 @@ export class NativeProducerReservation {
         protect(segments);
     }
 
-    commit(header: Uint8Array, written: number, beforePublish?: () => void): void {
+    commit(
+        header: Uint8Array,
+        written: number,
+        beforePublish?: () => void,
+    ): void {
         this.assertActive();
         this.native.commitReservation(
             this.channel,
@@ -298,7 +337,10 @@ export class NativeReceiveLease {
 
     get byteLength(): number {
         this.assertActive();
-        return this.segments.reduce((sum, segment) => sum + segment.byteLength, 0);
+        return this.segments.reduce(
+            (sum, segment) => sum + segment.byteLength,
+            0,
+        );
     }
 
     get segmentCount(): number {
@@ -375,7 +417,8 @@ export class NativeChannel {
                 protect(segments);
                 const cursor = new ProducerCursor(segments, capacity);
                 fill(cursor);
-                if (cursor.written !== capacity) throw new RangeError("producer underfill");
+                if (cursor.written !== capacity)
+                    throw new RangeError("producer underfill");
                 return cursor.written;
             },
             beforePublish ?? (() => {}),
@@ -386,20 +429,38 @@ export class NativeChannel {
         this.assertOpen();
         let token: number | undefined;
         let segments: Uint8Array[] | undefined;
-        this.native.reserve(this.id, capacity, timeoutMs, (reservedToken, reservedSegments) => {
-            token = reservedToken;
-            segments = reservedSegments;
-        });
+        this.native.reserve(
+            this.id,
+            capacity,
+            timeoutMs,
+            (reservedToken, reservedSegments) => {
+                token = reservedToken;
+                segments = reservedSegments;
+            },
+        );
         if (token === undefined || segments === undefined) {
             throw new Error("native reservation callback did not run");
         }
-        return new NativeProducerReservation(this.native, this.id, token, segments);
+        return new NativeProducerReservation(
+            this.native,
+            this.id,
+            token,
+            segments,
+        );
     }
 
     poll(deliver: (lease: NativeReceiveLease) => void): boolean {
         this.assertOpen();
         return this.native.poll(this.id, (token, header, segments) => {
-            deliver(new NativeReceiveLease(this.native, this.id, token, segments, header));
+            deliver(
+                new NativeReceiveLease(
+                    this.native,
+                    this.id,
+                    token,
+                    segments,
+                    header,
+                ),
+            );
         });
     }
 

@@ -169,6 +169,7 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
         channel,
         budget,
         peer,
+        reusesReceiveStorage: true,
         received,
         closes,
         get frameHook() {
