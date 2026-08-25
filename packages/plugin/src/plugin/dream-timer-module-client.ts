@@ -16,7 +16,7 @@ export type DreamTimerModuleClient = ClassifyModuleClient & {
 
 /**
  * Adapt the Rust transport without extracting methods from its class instance.
- * Subc transports read instance routing state, so every forwarded call must retain `this`.
+ * mc-host transports read instance routing state, so every forwarded call must retain `this`.
  */
 export function createDreamTimerModuleClient(
     moduleClient: RustModeModuleClient | undefined,

@@ -64,37 +64,34 @@ current JSON protocol was introduced in `0.16.0`.
   `pi-runner`. Each test creates a session, sends prompts, and asserts against
   SQLite state, log output, and captured mock requests.
 
-- **`tests/rust-*.test.ts`** — Rust-mode (ck-mc over subc) lane. Drives the FULL
-  production path opencode → plugin → subc daemon → ck-mc module through a
-  hermetic stack (`src/rust-harness.ts` + `src/rust-runner/hermetic-subc.ts`),
-  reusing the mock provider and session-driving machinery unchanged. Run it
-  separately (it is NOT part of the default `test` run or the CI host suite):
+- **`tests/rust-*.test.ts`** — Rust-mode lane. Starts the repository-local
+  `direct_host_fixture`, then drives OpenCode → plugin → `McHostModuleTransport`
+  → real `McHandler`. `src/rust-runner/hermetic-mc-host.ts` owns fixture build,
+  managed-client readiness, bounded backend controls, and teardown. Run the broad
+  lane separately:
 
   ```bash
   # From this package (or `bun run test:rust-e2e` from the repo root)
   bun run test:rust-e2e
   ```
 
-  Runtime: ~1-2 minutes locally once the binaries are warm (the first run builds
-  `ck-mc` release + reuses a prebuilt `ck-subc`). Each scenario keeps its session
-  small (tens of turns, tiny context limits) so the suite stays fast.
+  U7 qualifies only the focused fixture, smoke, and historian scenarios. Broad
+  Rust-mode matrix, mutation, performance, and release qualification remain
+  downstream work.
 
 ### Rust-mode lane: how it works
 
-The lane spawns a real `ck-subc` daemon (from the sibling `subconscious`
-workspace, the same binary `crates/mc-module/tests/real_daemon.rs` uses) and the
-`ck-mc` module (this workspace) connected to it, then boots `opencode serve` in
-Rust transform mode against them. The wiring uses no product change: the plugin's
-Rust module client reads the default connection file at
-`${XDG_DATA_HOME}/cortexkit/run/subc-connection.json`, and the harness points the
-daemon's `XDG_RUNTIME_DIR` there so its connection file lands exactly where the
-plugin looks. The module opens its own store under the same data dir (the
-production shared-cortexkit layout).
+The harness builds the `mc-module` `direct_host_fixture` example and starts it
+under each test's owner-only data directory. Fixture directly composes real Magic
+Context, Synapse, and Broca components. Readiness requires its private control
+socket, version-2 connection publication, and a successful managed-client catalog
+probe. Closed JSONL controls select backend success, blocking, release, typed
+failure, counters, or graceful shutdown. Host crash, restart, pause, and resume
+controls act on the whole direct host.
 
-Environment honesty: `RustTestHarness.detectPrereqs()` preflights the stack
-(cargo present, sibling `subconscious` workspace present, supported platform) and
-the suite SKIPs with a printed reason when any is missing — never green-washing,
-never hanging.
+`RustTestHarness.detectPrereqs()` checks Unix socket support, Cargo, and current
+repository metadata. Missing sibling checkouts and removed binaries do not affect
+this lane.
 
 **Pressure technique (load-bearing apparatus rule):** scenarios reach high fill
 by SHRINKING the context limit against REAL message bytes, never by inflating
@@ -109,42 +106,19 @@ pinned at exactly 0.0 the whole time.) If a scenario needs a shortcut, shrink
 the window; if you must inflate, document which asserted conditions become
 unreachable.
 
-Gated scenarios (skip with a printed reason until their dependency lands):
-
-- **Fold-dependent** (`fold-under-pressure`, `ctx-reduce-roundtrip`) — the Rust
-  module runs its own historian, which drives an LLM through a separate `broca`
-  runner module the current hermetic stack does not spawn. Without it no
-  compartment is published, so no fold (or drop-on-fold) can land. Set
-  `MC_RUST_E2E_FOLD=1` once a hermetic broca runner is wired.
-- **Removal reconcile** (`removal-self-heal`) — a mid-session `session.revert`
-  still wedges the Rust ordinal resolver (a distinct gap from the merged
-  tail-readopt / park-self-heal fix). Set `MC_RUST_E2E_REMOVAL=1` once the removal
-  ordinal-reconcile self-heal lands.
-- **Duplicate tool-use IDs** (`duplicate-tool-use-id`) — consuming a queued drop on
-  a selection bust needs the hermetic `broca` runner. Set
-  `MC_RUST_E2E_DUPLICATE_IDS=1` once that runner is provisioned; the test body
-  always walks every served message array, even while gated.
-
 ### CI
 
-The Rust-mode lane is intentionally NOT wired into `.github/workflows/ci.yml`.
-Beyond the Rust toolchain (which GitHub-hosted runners can install), it needs the
-sibling **`subconscious`** workspace checked out beside this repo to build the
-`ck-subc` daemon — the CI checkout does not provision that separate repo, so the
-lane cannot build there without extra wiring. When a runner (or a container image)
-provisions the subconscious sibling, add a job that runs
-`bun run --cwd packages/e2e-tests test:rust-e2e`. Until then the lane runs
-locally / on a suitably provisioned host only, and the CI host suite explicitly
-excludes `rust-*.test.ts`.
+The broad Rust-mode lane is not part of the default host suite. Focused direct-host
+coverage runs with Cargo and this repository; broader matrix qualification remains
+separate from U7.
 
 ## Requirements
 
 - `opencode` CLI available on PATH for OpenCode suites (`which opencode`).
 - Pi CLI installed for Pi suites (see `packages/pi-plugin/README.md`).
 - Bun.
-- For the Rust-mode lane (`tests/rust-*.test.ts`): `cargo` on PATH and the sibling
-  `subconscious` workspace checked out beside this repo (to build `ck-subc`). The
-  lane skips with a printed reason when these are absent.
+- For the Rust-mode lane (`tests/rust-*.test.ts`): Unix sockets, `cargo` on PATH,
+  and the current repository checkout. Fixture builds on demand.
 - No `OPENCODE_SERVER_PASSWORD` required — the spawner explicitly strips it so the
   test server runs unsecured on a random localhost port.
 

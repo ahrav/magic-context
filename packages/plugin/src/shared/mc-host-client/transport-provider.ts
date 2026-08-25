@@ -4,11 +4,11 @@
  * The production registry is empty: TCP needs no provider object because
  * the authenticated bootstrap channel IS the selected channel on a TCP
  * selection. Non-TCP providers exist only as injected test seams through
- * the internal `SubcClientOptions.transportProviders` option. Deliberately
+ * the internal `McHostClientOptions.transportProviders` option. Deliberately
  * not exported from `index.ts` (R15: no supported consumer provider hooks).
  */
 
-import { SubcCallError } from "./errors";
+import { McHostCallError } from "./errors";
 import {
     type ByteBudget,
     type FrameChannelCloseReason,
@@ -456,7 +456,7 @@ export function sanitizedCandidateFactory(
                     ticket = channel.send(frame, trackedHooks);
                 } catch (error) {
                     const code =
-                        error instanceof SubcCallError &&
+                        error instanceof McHostCallError &&
                         error.code !== undefined &&
                         BOUNDED_CHANNEL_CODES.has(error.code)
                             ? error.code
@@ -464,7 +464,7 @@ export function sanitizedCandidateFactory(
                     if (!published) {
                         // Proven refusal: nothing was published, so the
                         // bounded failure is replay-safe `not_sent`.
-                        throw new SubcCallError(
+                        throw new McHostCallError(
                             "not_sent",
                             `transport provider ${transport} failed during send`,
                             code,
@@ -474,7 +474,7 @@ export function sanitizedCandidateFactory(
                     // channel — retirement settles pending work exactly
                     // once — and classify the throw as never replayable.
                     closeUpstream("write_failed", "send");
-                    throw new SubcCallError(
+                    throw new McHostCallError(
                         "outcome_unknown",
                         `transport provider ${transport} failed during send`,
                         code,

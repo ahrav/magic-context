@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use subc_protocol::FrameType;
+use crate::wire::{Flags, FrameType, HEADER_LEN};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
@@ -125,7 +125,7 @@ async fn charged_error_body(
     if gen.writer.is_retired() || gen.token.is_cancelled() {
         return Err(());
     }
-    let frame_bytes = u32::try_from(body_len + subc_protocol::HEADER_LEN).map_err(|_| ())?;
+    let frame_bytes = u32::try_from(body_len + HEADER_LEN).map_err(|_| ())?;
     let deadline = gen.writer.admission_deadline();
     let charge = tokio::select! {
         biased;
@@ -142,7 +142,7 @@ async fn charged_error_body(
         // Header spare capacity up front: an exactly sized buffer would force
         // `encode_owned_frame`'s reserve to reallocate, transiently retaining
         // two near-maximum bodies against one charge.
-        Vec::with_capacity(body_len + subc_protocol::HEADER_LEN),
+        Vec::with_capacity(body_len + HEADER_LEN),
         code,
         message,
     );
@@ -184,7 +184,7 @@ pub async fn emit_frame(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
     ty: FrameType,
-    flags: subc_protocol::Flags,
+    flags: Flags,
     id: FrameId,
     body: Vec<u8>,
 ) -> Result<(), ()> {
@@ -198,7 +198,7 @@ pub async fn emit_frame(
     let charge = if body.is_empty() {
         crate::wire::ByteCharge::none()
     } else {
-        let frame_bytes = u32::try_from(body.len() + subc_protocol::HEADER_LEN).map_err(|_| ())?;
+        let frame_bytes = u32::try_from(body.len() + HEADER_LEN).map_err(|_| ())?;
         tokio::select! {
             biased;
             () = gen.token.cancelled() => return Err(()),
@@ -236,7 +236,7 @@ pub async fn emit_frame(
 async fn emit_reserved_frame(
     gen: &GenerationCore,
     ty: FrameType,
-    flags: subc_protocol::Flags,
+    flags: Flags,
     id: FrameId,
     body: OutputBuffer,
     deadline: Instant,
@@ -413,7 +413,7 @@ impl StreamSink {
         {
             return Err(StreamClosed);
         }
-        let bytes = u32::try_from(max_len + subc_protocol::HEADER_LEN).map_err(|_| StreamClosed)?;
+        let bytes = u32::try_from(max_len + HEADER_LEN).map_err(|_| StreamClosed)?;
         let deadline = self.gen.writer.admission_deadline();
         let charge = tokio::select! {
             biased;
@@ -434,7 +434,7 @@ impl StreamSink {
             return Err(StreamClosed);
         }
         Ok(OutputBuffer {
-            body: Vec::with_capacity(max_len + subc_protocol::HEADER_LEN),
+            body: Vec::with_capacity(max_len + HEADER_LEN),
             charge,
             max_len,
         })
@@ -567,8 +567,7 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
         return;
     }
     let deadline = gen.writer.admission_deadline();
-    let frame_bytes =
-        u32::try_from(body.len() + subc_protocol::HEADER_LEN).expect("fixed-size body");
+    let frame_bytes = u32::try_from(body.len() + HEADER_LEN).expect("fixed-size body");
     let charge = tokio::select! {
         biased;
         () = gen.token.cancelled() => return,

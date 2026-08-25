@@ -23,7 +23,7 @@ import {
 import { FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "../protocol";
 import { TcpFrameChannel } from "../tcp-frame-channel";
 import { encodePeerFrame, FakePeer, type PeerFrameFields } from "./fake-peer";
-import { expectSubcCallError, waitUntil } from "./test-util";
+import { expectMcHostCallError, waitUntil } from "./test-util";
 
 const CHANNEL = 5;
 const EPOCH = 9;
@@ -251,7 +251,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             } catch (error) {
                 refused = error;
             }
-            expectSubcCallError(refused, "not_sent", "writer_queue_full");
+            expectMcHostCallError(refused, "not_sent", "writer_queue_full");
             // Required control writes must still be admittable.
             h.channel.sendControl(pongHeader(42n));
             assert.equal(h.channel.isClosed(), false);
@@ -274,7 +274,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             } catch (error) {
                 overCap = error;
             }
-            expectSubcCallError(overCap, "not_sent", "memory_cap");
+            expectMcHostCallError(overCap, "not_sent", "memory_cap");
 
             const narrow = await create({ maxQueuedBytes: 500 });
             let overQueue: unknown;
@@ -283,7 +283,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             } catch (error) {
                 overQueue = error;
             }
-            expectSubcCallError(overQueue, "not_sent", "writer_queue_full");
+            expectMcHostCallError(overQueue, "not_sent", "writer_queue_full");
         },
     },
     {

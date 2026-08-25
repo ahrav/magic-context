@@ -22,7 +22,8 @@ const pluginTransform = resolve(
     e2eRoot,
     "../plugin/src/hooks/magic-context/rust-mode-transform.ts",
 );
-const drillFile = (drill: string) => resolve(e2eRoot, `tests/rust-fm-oc-${drill}.test.ts`);
+const drillFile = (drill: string) =>
+    resolve(e2eRoot, `tests/rust-fm-oc-${drill}.test.ts`);
 const commandFor = (drill: string) =>
     `bun run build (packages/plugin) && bun test --timeout 600000 --max-concurrency=1 tests/rust-fm-oc-${drill}.test.ts`;
 
@@ -37,7 +38,8 @@ const mutations: Record<string, MutationCase[]> = {
         {
             name: "FM_OC_1_RUNG_DELETION",
             source: pluginTransform,
-            oldText: 'sessionLog(sessionId, "rust transform failed; attempting LKG replay:", error);',
+            oldText:
+                'sessionLog(sessionId, "rust transform failed; attempting LKG replay:", error);',
             replacement: "",
         },
     ],
@@ -85,7 +87,8 @@ const mutations: Record<string, MutationCase[]> = {
         {
             name: "FM_OC_4_RUNG_DELETION",
             source: pluginTransform,
-            oldText: 'sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");',
+            oldText:
+                'sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");',
             replacement: "",
         },
     ],
@@ -93,8 +96,9 @@ const mutations: Record<string, MutationCase[]> = {
         {
             name: "FM_OC_5_RUNG_SWAP",
             source: drillFile("5"),
-            oldText: "h.subc.stopModule();\n            await h.sendPrompt",
-            replacement: "h.subc.continueModule();\n            await h.sendPrompt",
+            oldText: "h.mcHost.pauseHost();\n            await h.sendPrompt",
+            replacement:
+                "h.mcHost.resumeHost();\n            await h.sendPrompt",
         },
         {
             name: "FM_OC_5_RUNG_DELETION",
@@ -108,7 +112,8 @@ const mutations: Record<string, MutationCase[]> = {
             name: "FM_OC_6_RUNG_SWAP",
             source: drillFile("6"),
             oldText: 'expect(after[refusalIndex]).toContain("before_lkg");',
-            replacement: 'expect(after[refusalIndex]).not.toContain("before_lkg");',
+            replacement:
+                'expect(after[refusalIndex]).not.toContain("before_lkg");',
         },
         {
             name: "FM_OC_6_RUNG_DELETION",
@@ -157,7 +162,9 @@ function applyCase(mutation: MutationCase): { before: string; after: string } {
     const before = readFileSync(mutation.source, "utf8");
     const occurrences = before.split(mutation.oldText).length - 1;
     if (occurrences !== 1) {
-        throw new Error(`${mutation.name}: expected one mutation target, found ${occurrences}`);
+        throw new Error(
+            `${mutation.name}: expected one mutation target, found ${occurrences}`,
+        );
     }
     const after = before.replace(mutation.oldText, mutation.replacement);
     writeFileSync(mutation.source, after);

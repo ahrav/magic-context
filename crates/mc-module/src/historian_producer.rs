@@ -1,64 +1,34 @@
-//! llm-runner session client used by the historian writer.
+//! Broca session client used by historian writer.
 //!
-//! The client intentionally speaks only the JSON session wire over subc routes. It
-//! does not depend on llm-runner Rust crates, so Magic Context remains an origin-
-//! agnostic consumer module.
+//! Transport, authentication, correlation, liveness, and route epochs remain owned by
+//! [`mc_host::Client`]. This module interprets only Broca request and stream payloads.
 
 use std::{
     error::Error,
     fmt,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
+use async_trait::async_trait;
+use mc_host::{
+    CallError, Client, ClientError, RequestOptions, ResponseStream, RouteHandle, RouteIdentity,
+    RouteTarget, SendOutcome, StreamItem, TargetKind,
+};
 use serde_json::{json, Value};
-use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
-use subc_protocol::{
-    BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget,
-    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
-};
-use subc_transport::{
-    authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
-    FrameIoError,
-};
-use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 
-/// The owned-leg runner module the historian producer opens routes to. Renamed
-/// llm-runner -> broca in the fleet cut; this binary ships in the same deploy
-/// beat as the daemon's module-key rename, so the default flips with it
-/// atomically (a full daemon kickstart bounces every module in that window).
 const DEFAULT_RUNNER_MODULE_ID: &str = "broca";
-
-/// Output budget for a historian summarization pass. llm-runner's default (4k) truncated
-/// a real 50k-input chunk mid-XML on the rig: a tiered compartment doc for a full chunk
-/// legitimately needs five figures. The provider clamps to its own per-model limit, so a
-/// generous request costs nothing unless the model actually generates that much.
 const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
-
-/// Sampling temperature for historian runs. The prompt and this value were calibrated
-/// TOGETHER: at provider-default temperature (1.0) flash-class models drift past the
-/// prompt's exclusion rules and copy the format template and rotating-seed reference
-/// compartments into their output (observed live on the rig with the calibration model
-/// itself), while at 0.1 the same prompt extracts cleanly. Sending the prompt without
-/// the temperature is running half the calibration.
 const HISTORIAN_TEMPERATURE: f64 = 0.1;
-const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long to wait for a summarization run to finish. A historian pass legitimately
-/// generates 10k+ output tokens and can run several minutes on a flash-class model; a
-/// 120s window abandoned a run on the rig WHILE it was still successfully finishing
-/// (the terminal arrived moments after the waiter gave up). A fold is a background
-/// operation, never latency-sensitive: waiting longer and publishing always beats
-/// abandoning a completed run and re-firing the whole 50k-input pass.
 const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
-/// How long the timeout recovery path gets to re-drain a run after the main
-/// waiter gives up. A completed historian run can land moments after the
-/// 600s wait expires; one short replay salvages that durable output without
-/// letting the fallback path hang for another full production timeout.
 const RECOVERY_REDRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Fixed error-class strings used by the producer/consumer wire contract.
 pub const ERROR_CLASS_WIRE_SET: [&str; 4] = [
     "transient",
     "permanent",
@@ -77,21 +47,21 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
-    pub fn as_wire_str(self) -> &'static str {
+    pub const fn as_wire_str(self) -> &'static str {
         match self {
-            ErrorClass::Transient => ERROR_CLASS_WIRE_SET[0],
-            ErrorClass::Permanent => ERROR_CLASS_WIRE_SET[1],
-            ErrorClass::AuthRequired => ERROR_CLASS_WIRE_SET[2],
-            ErrorClass::ContextOverflow => ERROR_CLASS_WIRE_SET[3],
+            Self::Transient => ERROR_CLASS_WIRE_SET[0],
+            Self::Permanent => ERROR_CLASS_WIRE_SET[1],
+            Self::AuthRequired => ERROR_CLASS_WIRE_SET[2],
+            Self::ContextOverflow => ERROR_CLASS_WIRE_SET[3],
         }
     }
 
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
-            "transient" => Some(ErrorClass::Transient),
-            "permanent" => Some(ErrorClass::Permanent),
-            "auth_required" | "auth" => Some(ErrorClass::AuthRequired),
-            "context_overflow" => Some(ErrorClass::ContextOverflow),
+            "transient" => Some(Self::Transient),
+            "permanent" => Some(Self::Permanent),
+            "auth_required" | "auth" => Some(Self::AuthRequired),
+            "context_overflow" => Some(Self::ContextOverflow),
             _ => None,
         }
     }
@@ -103,17 +73,40 @@ pub struct ErrorClassification {
     pub retry_after_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorianSendOutcome {
+    NotSent,
+    OutcomeUnknown,
+    Terminal,
+}
+
+impl From<SendOutcome> for HistorianSendOutcome {
+    fn from(value: SendOutcome) -> Self {
+        match value {
+            SendOutcome::NotSent => Self::NotSent,
+            SendOutcome::OutcomeUnknown => Self::OutcomeUnknown,
+            SendOutcome::Terminal => Self::Terminal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProducerErrorBody {
+pub struct HistorianCallFailure {
+    pub outcome: HistorianSendOutcome,
     pub code: String,
     pub message: String,
     classification: Option<ErrorClassification>,
     class_field_present: bool,
 }
 
-impl ProducerErrorBody {
-    pub fn untagged(code: impl Into<String>, message: impl Into<String>) -> Self {
+impl HistorianCallFailure {
+    pub fn untagged(
+        outcome: HistorianSendOutcome,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
+            outcome,
             code: code.into(),
             message: message.into(),
             classification: None,
@@ -128,6 +121,7 @@ impl ProducerErrorBody {
         retry_after_secs: Option<u64>,
     ) -> Self {
         Self {
+            outcome: HistorianSendOutcome::Terminal,
             code: code.into(),
             message: message.into(),
             classification: Some(ErrorClassification {
@@ -138,38 +132,37 @@ impl ProducerErrorBody {
         }
     }
 
-    pub fn classification(&self) -> Option<ErrorClassification> {
+    pub const fn classification(&self) -> Option<ErrorClassification> {
         self.classification
     }
 
-    pub fn has_class_field(&self) -> bool {
+    pub const fn has_class_field(&self) -> bool {
         self.class_field_present
-    }
-
-    fn from_value(value: Value) -> Self {
-        let code = value
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("producer_error")
-            .to_string();
-        let message = value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("producer error")
-            .to_string();
-        let (classification, class_field_present) = classification_from_object(&value);
-        Self {
-            code,
-            message,
-            classification,
-            class_field_present,
-        }
     }
 }
 
-impl From<ErrorBody> for ProducerErrorBody {
-    fn from(body: ErrorBody) -> Self {
-        Self::untagged(body.code, body.message)
+impl From<CallError> for HistorianCallFailure {
+    fn from(error: CallError) -> Self {
+        Self::untagged(
+            error.outcome().into(),
+            error.code().to_owned(),
+            error.message().to_owned(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorianClientFailure {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<ClientError> for HistorianClientFailure {
+    fn from(error: ClientError) -> Self {
+        Self {
+            code: error.code().to_owned(),
+            message: error.to_string(),
+        }
     }
 }
 
@@ -196,9 +189,6 @@ pub struct RunHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerOutput {
     pub text: String,
-    /// True when any unit in the run reported a length-class finish reason. The run
-    /// terminal can still say completed while a model step hit its output ceiling and
-    /// cut the text mid-document, so validation failures need this to self-diagnose.
     pub length_capped: bool,
 }
 
@@ -215,9 +205,9 @@ pub struct HistorianProducerConfig {
     pub project_root: PathBuf,
     pub harness: String,
     pub module_id: String,
-    pub handshake_timeout: Duration,
     pub request_timeout: Duration,
     pub await_timeout: Duration,
+    pub cancellation: Option<CancellationToken>,
 }
 
 impl HistorianProducerConfig {
@@ -230,45 +220,28 @@ impl HistorianProducerConfig {
             connection_file: connection_file.into(),
             project_root: project_root.into(),
             harness: harness.into(),
-            module_id: DEFAULT_RUNNER_MODULE_ID.to_string(),
-            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            module_id: DEFAULT_RUNNER_MODULE_ID.to_owned(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             await_timeout: DEFAULT_AWAIT_TIMEOUT,
+            cancellation: None,
         }
     }
 }
 
 #[derive(Debug)]
 pub enum HistorianProducerError {
-    ConnectionFile {
-        path: PathBuf,
-        source: ConnectionFileError,
-    },
-    NoEndpoint {
-        path: PathBuf,
-    },
-    Connect {
-        endpoint: String,
-        source: std::io::Error,
-    },
-    Auth(AuthError),
-    FrameIo(FrameIoError),
-    FrameBuild(FrameBuildError),
+    Client(HistorianClientFailure),
+    Call(HistorianCallFailure),
     Json(serde_json::Error),
-    Subc(ProducerErrorBody),
-    UnexpectedControlResponse,
     MissingRunId,
     MissingSession,
     UnexpectedStreamEnd,
     TimedOut,
-    /// The runner answered with bytes outside the closed wire contract (an
-    /// undocumented `run.status` state, a status for a different run, ...).
-    /// Guessing a recovery state for such a reply could silently re-fire a
-    /// billable run, so the producer fails loud instead.
     Protocol(String),
-    /// Neither a primary failure nor a cleanup (cancel/delete/close) failure
-    /// may mask the other, so both ride one structured error. `primary: None`
-    /// means the operation itself succeeded and only cleanup failed.
+    CrossIncarnationUnknown {
+        daemon_changed: bool,
+        identity_changed: bool,
+    },
     CleanupFailed {
         operation: &'static str,
         primary: Option<Box<HistorianProducerError>>,
@@ -294,27 +267,36 @@ pub enum HistorianProducerError {
 
 impl HistorianProducerError {
     pub fn retryable_model_failure(message: impl Into<String>) -> Self {
-        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+        Self::Call(HistorianCallFailure::untagged(
+            HistorianSendOutcome::Terminal,
             "retryable_model_failure",
             message,
         ))
     }
 
     pub fn context_overflow(message: impl Into<String>) -> Self {
-        HistorianProducerError::Subc(ProducerErrorBody::untagged("context_overflow", message))
+        Self::Call(HistorianCallFailure::untagged(
+            HistorianSendOutcome::Terminal,
+            "context_overflow",
+            message,
+        ))
     }
 
     pub fn aborted(message: impl Into<String>) -> Self {
-        HistorianProducerError::Subc(ProducerErrorBody::untagged("aborted", message))
+        Self::Call(HistorianCallFailure::untagged(
+            HistorianSendOutcome::Terminal,
+            "aborted",
+            message,
+        ))
     }
 
-    pub fn tagged_subc(
+    pub fn tagged_call(
         code: impl Into<String>,
         message: impl Into<String>,
         class: ErrorClass,
         retry_after_secs: Option<u64>,
     ) -> Self {
-        HistorianProducerError::Subc(ProducerErrorBody::tagged(
+        Self::Call(HistorianCallFailure::tagged(
             code,
             message,
             class,
@@ -324,12 +306,11 @@ impl HistorianProducerError {
 
     pub fn classification(&self) -> Option<ErrorClassification> {
         match self {
-            HistorianProducerError::Subc(body) => body.classification(),
-            HistorianProducerError::RunFailed { classification, .. }
-            | HistorianProducerError::RunPaused { classification, .. } => *classification,
-            // Retry policy must follow the PRIMARY failure; a cleanup failure
-            // never changes what the run itself did.
-            HistorianProducerError::CleanupFailed {
+            Self::Call(failure) => failure.classification(),
+            Self::RunFailed { classification, .. } | Self::RunPaused { classification, .. } => {
+                *classification
+            }
+            Self::CleanupFailed {
                 primary: Some(primary),
                 ..
             } => primary.classification(),
@@ -339,19 +320,56 @@ impl HistorianProducerError {
 
     pub fn has_class_field(&self) -> bool {
         match self {
-            HistorianProducerError::Subc(body) => body.has_class_field(),
-            HistorianProducerError::RunFailed {
+            Self::Call(failure) => failure.has_class_field(),
+            Self::RunFailed {
                 class_field_present,
                 ..
             }
-            | HistorianProducerError::RunPaused {
+            | Self::RunPaused {
                 class_field_present,
                 ..
             } => *class_field_present,
-            HistorianProducerError::CleanupFailed {
+            Self::CleanupFailed {
                 primary: Some(primary),
                 ..
             } => primary.has_class_field(),
+            _ => false,
+        }
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Call(failure) => Some(&failure.code),
+            Self::CleanupFailed {
+                primary: Some(primary),
+                ..
+            } => primary.code(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn send_outcome(&self) -> Option<HistorianSendOutcome> {
+        match self {
+            Self::Call(failure) => Some(failure.outcome),
+            Self::CleanupFailed {
+                primary: Some(primary),
+                ..
+            } => primary.send_outcome(),
+            _ => None,
+        }
+    }
+
+    pub fn is_unknown_module(&self) -> bool {
+        self.code() == Some("unknown_module")
+    }
+
+    pub fn is_cross_incarnation_unknown(&self) -> bool {
+        match self {
+            Self::CrossIncarnationUnknown { .. } => true,
+            Self::CleanupFailed {
+                primary: Some(primary),
+                ..
+            } => primary.is_cross_incarnation_unknown(),
             _ => false,
         }
     }
@@ -381,30 +399,19 @@ impl HistorianProducerError {
         self.heuristic_decision().abort_or_overflow
     }
 
-    pub fn is_unknown_module(&self) -> bool {
-        match self {
-            HistorianProducerError::Subc(body) => body.code == "unknown_module",
-            HistorianProducerError::CleanupFailed {
-                primary: Some(primary),
-                ..
-            } => primary.is_unknown_module(),
-            _ => false,
-        }
-    }
-
     fn heuristic_decision(&self) -> DeprecatedHeuristicDecision {
         match self {
-            HistorianProducerError::CleanupFailed {
+            Self::CleanupFailed {
                 primary: Some(primary),
                 ..
             } => primary.heuristic_decision(),
-            HistorianProducerError::Subc(body) => DeprecatedHeuristicDecision {
-                retryable_model_failure: retryable_code(&body.code)
-                    || retryable_code(&body.message),
-                abort_or_overflow: abort_or_overflow(&body.code)
-                    || abort_or_overflow(&body.message),
+            Self::Call(failure) => DeprecatedHeuristicDecision {
+                retryable_model_failure: retryable_code(&failure.code)
+                    || retryable_code(&failure.message),
+                abort_or_overflow: abort_or_overflow(&failure.code)
+                    || abort_or_overflow(&failure.message),
             },
-            HistorianProducerError::RunFailed { detail, .. } => DeprecatedHeuristicDecision {
+            Self::RunFailed { detail, .. } => DeprecatedHeuristicDecision {
                 retryable_model_failure: retryable_code(detail),
                 abort_or_overflow: abort_or_overflow(detail),
             },
@@ -417,11 +424,12 @@ impl HistorianProducerError {
 
     fn heuristic_log_code(&self) -> &str {
         match self {
-            HistorianProducerError::Subc(body) => &body.code,
-            HistorianProducerError::RunFailed { .. } => "run_failed",
-            HistorianProducerError::RunPaused { .. } => "run_paused",
-            HistorianProducerError::TimedOut => "timed_out",
-            HistorianProducerError::CleanupFailed { .. } => "cleanup_failed",
+            Self::Call(failure) => &failure.code,
+            Self::RunFailed { .. } => "run_failed",
+            Self::RunPaused { .. } => "run_paused",
+            Self::TimedOut => "timed_out",
+            Self::CleanupFailed { .. } => "cleanup_failed",
+            Self::CrossIncarnationUnknown { .. } => "cross_incarnation_unknown",
             _ => "producer_error",
         }
     }
@@ -452,40 +460,28 @@ fn abort_or_overflow(s: &str) -> bool {
 impl fmt::Display for HistorianProducerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HistorianProducerError::ConnectionFile { path, source } => {
-                write!(f, "read connection file {}: {source}", path.display())
-            }
-            HistorianProducerError::NoEndpoint { path } => {
-                write!(f, "connection file {} has no endpoint", path.display())
-            }
-            HistorianProducerError::Connect { endpoint, source } => {
-                write!(f, "connect to {endpoint}: {source}")
-            }
-            HistorianProducerError::Auth(e) => write!(f, "authenticate to subc: {e}"),
-            HistorianProducerError::FrameIo(e) => write!(f, "subc frame I/O: {e}"),
-            HistorianProducerError::FrameBuild(e) => write!(f, "build subc frame: {e}"),
-            HistorianProducerError::Json(e) => write!(f, "json: {e}"),
-            HistorianProducerError::Subc(body) => {
-                write!(f, "subc error {}: {}", body.code, body.message)
-            }
-            HistorianProducerError::UnexpectedControlResponse => {
-                write!(f, "route.open returned an unexpected control response")
-            }
-            HistorianProducerError::MissingRunId => {
-                write!(f, "session.send did not return an active run_id")
-            }
-            HistorianProducerError::MissingSession => {
-                write!(f, "historian producer has no bound session")
-            }
-            HistorianProducerError::UnexpectedStreamEnd => write!(
+            Self::Client(error) => write!(f, "host client {}: {}", error.code, error.message),
+            Self::Call(failure) => write!(
                 f,
-                "subscribe stream ended before the run terminal control unit"
+                "historian call {} ({:?}): {}",
+                failure.code, failure.outcome, failure.message
             ),
-            HistorianProducerError::TimedOut => write!(f, "historian producer timed out"),
-            HistorianProducerError::Protocol(detail) => {
-                write!(f, "runner protocol violation: {detail}")
+            Self::Json(error) => write!(f, "json: {error}"),
+            Self::MissingRunId => write!(f, "session.send did not return an active run_id"),
+            Self::MissingSession => write!(f, "historian producer has no bound session"),
+            Self::UnexpectedStreamEnd => {
+                write!(f, "subscribe stream ended before the run terminal control unit")
             }
-            HistorianProducerError::CleanupFailed {
+            Self::TimedOut => write!(f, "historian producer timed out"),
+            Self::Protocol(detail) => write!(f, "runner protocol violation: {detail}"),
+            Self::CrossIncarnationUnknown {
+                daemon_changed,
+                identity_changed,
+            } => write!(
+                f,
+                "session.send outcome is unknown across replay fence (daemon_changed={daemon_changed}, identity_changed={identity_changed})"
+            ),
+            Self::CleanupFailed {
                 operation,
                 primary,
                 cleanup,
@@ -495,17 +491,12 @@ impl fmt::Display for HistorianProducerError {
                 }
                 None => write!(f, "{operation} cleanup failed after success: {cleanup}"),
             },
-            HistorianProducerError::RunFailed { run_id, detail, .. } => {
-                write!(f, "run {run_id} failed: {detail}")
-            }
-            HistorianProducerError::TerminalRunMismatch { expected, found } => {
-                write!(
-                    f,
-                    "run {expected} received terminal control unit after RunStarted {:?}",
-                    found
-                )
-            }
-            HistorianProducerError::RunPaused { run_id, reason, .. } => {
+            Self::RunFailed { run_id, detail, .. } => write!(f, "run {run_id} failed: {detail}"),
+            Self::TerminalRunMismatch { expected, found } => write!(
+                f,
+                "run {expected} received terminal control unit after RunStarted {found:?}"
+            ),
+            Self::RunPaused { run_id, reason, .. } => {
                 write!(f, "run {run_id} paused")?;
                 if let Some(reason) = reason {
                     write!(f, ": {reason}")?;
@@ -519,50 +510,19 @@ impl fmt::Display for HistorianProducerError {
 impl Error for HistorianProducerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            HistorianProducerError::ConnectionFile { source, .. } => Some(source),
-            HistorianProducerError::Connect { source, .. } => Some(source),
-            HistorianProducerError::Auth(e) => Some(e),
-            HistorianProducerError::FrameIo(e) => Some(e),
-            HistorianProducerError::FrameBuild(e) => Some(e),
-            HistorianProducerError::Json(e) => Some(e),
-            // The cleanup error is the chained cause: the primary, when
-            // present, already renders inside Display.
-            HistorianProducerError::CleanupFailed { cleanup, .. } => Some(cleanup.as_ref()),
-            HistorianProducerError::NoEndpoint { .. }
-            | HistorianProducerError::Subc(_)
-            | HistorianProducerError::UnexpectedControlResponse
-            | HistorianProducerError::MissingRunId
-            | HistorianProducerError::MissingSession
-            | HistorianProducerError::UnexpectedStreamEnd
-            | HistorianProducerError::TimedOut
-            | HistorianProducerError::Protocol(_)
-            | HistorianProducerError::RunFailed { .. }
-            | HistorianProducerError::TerminalRunMismatch { .. }
-            | HistorianProducerError::RunPaused { .. } => None,
+            Self::Json(error) => Some(error),
+            Self::CleanupFailed { cleanup, .. } => Some(cleanup.as_ref()),
+            _ => None,
         }
     }
 }
 
-impl From<FrameIoError> for HistorianProducerError {
-    fn from(e: FrameIoError) -> Self {
-        HistorianProducerError::FrameIo(e)
-    }
-}
-
-impl From<FrameBuildError> for HistorianProducerError {
-    fn from(e: FrameBuildError) -> Self {
-        HistorianProducerError::FrameBuild(e)
-    }
-}
-
 impl From<serde_json::Error> for HistorianProducerError {
-    fn from(e: serde_json::Error) -> Self {
-        HistorianProducerError::Json(e)
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
     }
 }
 
-/// Returns `CleanupFailed` whenever cleanup fails, preserving any primary
-/// error.
 pub fn with_cleanup<T>(
     primary: Result<T, HistorianProducerError>,
     cleanup: Result<(), HistorianProducerError>,
@@ -594,62 +554,187 @@ pub fn attach_cleanup(
     }
 }
 
-/// The daemon-assigned identity of an open consumer route.
-///
-/// This raw client cannot construct `subc_client_rs::RouteHandle` because that type also
-/// fences SDK-managed connections. It retains the serializable wire identity needed to
-/// stamp every data-plane frame and reject stale replies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OpenedRoute {
-    channel: u16,
-    epoch: u32,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticIdentity {
+    project_root: PathBuf,
+    harness: String,
+    session: String,
+}
+
+#[async_trait]
+trait ProducerStream: Send {
+    async fn next(&mut self) -> Result<Option<StreamItem>, HistorianProducerError>;
+}
+
+struct ManagedStream(ResponseStream);
+
+#[async_trait]
+impl ProducerStream for ManagedStream {
+    async fn next(&mut self) -> Result<Option<StreamItem>, HistorianProducerError> {
+        self.0.next().await.map_err(map_call_error)
+    }
+}
+
+#[async_trait]
+trait ProducerConnection: Send + Sync {
+    fn daemon_id(&self) -> [u8; 16];
+    async fn open_route(
+        &self,
+        target: RouteTarget,
+        identity: RouteIdentity,
+    ) -> Result<RouteHandle, HistorianProducerError>;
+    async fn request(
+        &self,
+        route: RouteHandle,
+        body: Vec<u8>,
+        options: RequestOptions,
+    ) -> Result<Vec<u8>, HistorianProducerError>;
+    async fn request_stream(
+        &self,
+        route: RouteHandle,
+        body: Vec<u8>,
+        options: RequestOptions,
+    ) -> Result<Box<dyn ProducerStream>, HistorianProducerError>;
+    async fn close_route(&self, route: RouteHandle) -> Result<(), HistorianProducerError>;
+    async fn close(&self) -> Result<(), HistorianProducerError>;
+}
+
+struct ManagedConnection(Client);
+
+#[async_trait]
+impl ProducerConnection for ManagedConnection {
+    fn daemon_id(&self) -> [u8; 16] {
+        self.0.daemon_id()
+    }
+
+    async fn open_route(
+        &self,
+        target: RouteTarget,
+        identity: RouteIdentity,
+    ) -> Result<RouteHandle, HistorianProducerError> {
+        self.0
+            .open_route(target, identity)
+            .await
+            .map_err(map_call_error)
+    }
+
+    async fn request(
+        &self,
+        route: RouteHandle,
+        body: Vec<u8>,
+        options: RequestOptions,
+    ) -> Result<Vec<u8>, HistorianProducerError> {
+        self.0
+            .request(route, body, options)
+            .await
+            .map(|response| response.body)
+            .map_err(map_call_error)
+    }
+
+    async fn request_stream(
+        &self,
+        route: RouteHandle,
+        body: Vec<u8>,
+        options: RequestOptions,
+    ) -> Result<Box<dyn ProducerStream>, HistorianProducerError> {
+        self.0
+            .request_stream(route, body, options)
+            .await
+            .map(|stream| Box::new(ManagedStream(stream)) as Box<dyn ProducerStream>)
+            .map_err(map_call_error)
+    }
+
+    async fn close_route(&self, route: RouteHandle) -> Result<(), HistorianProducerError> {
+        self.0.close_route(route).await.map_err(map_client_error)
+    }
+
+    async fn close(&self) -> Result<(), HistorianProducerError> {
+        self.0.close().await.map_err(map_client_error)
+    }
+}
+
+struct Reconnected {
+    connection: Box<dyn ProducerConnection>,
+    identity: SemanticIdentity,
+}
+
+#[async_trait]
+trait ProducerConnector: Send + Sync {
+    async fn connect(
+        &self,
+        config: &HistorianProducerConfig,
+    ) -> Result<Box<dyn ProducerConnection>, HistorianProducerError>;
+
+    async fn reconnect(
+        &self,
+        config: &HistorianProducerConfig,
+        identity: &SemanticIdentity,
+    ) -> Result<Reconnected, HistorianProducerError>;
+}
+
+struct ManagedConnector;
+
+#[async_trait]
+impl ProducerConnector for ManagedConnector {
+    async fn connect(
+        &self,
+        config: &HistorianProducerConfig,
+    ) -> Result<Box<dyn ProducerConnection>, HistorianProducerError> {
+        Client::connect(&config.connection_file)
+            .await
+            .map(|client| Box::new(ManagedConnection(client)) as Box<dyn ProducerConnection>)
+            .map_err(map_client_error)
+    }
+
+    async fn reconnect(
+        &self,
+        config: &HistorianProducerConfig,
+        identity: &SemanticIdentity,
+    ) -> Result<Reconnected, HistorianProducerError> {
+        Ok(Reconnected {
+            connection: self.connect(config).await?,
+            identity: identity.clone(),
+        })
+    }
+}
+
+fn map_call_error(error: CallError) -> HistorianProducerError {
+    HistorianProducerError::Call(error.into())
+}
+
+fn map_client_error(error: ClientError) -> HistorianProducerError {
+    HistorianProducerError::Client(error.into())
 }
 
 pub struct HistorianProducer {
     config: HistorianProducerConfig,
-    stream: TcpStream,
-    next_corr: u64,
+    connector: Arc<dyn ProducerConnector>,
+    connection: Box<dyn ProducerConnection>,
     session_id: Option<String>,
-    command_route: Option<OpenedRoute>,
-    subscribe_route: Option<OpenedRoute>,
+    command_route: Option<RouteHandle>,
+    subscribe_route: Option<RouteHandle>,
 }
 
 impl HistorianProducer {
     pub async fn connect(config: HistorianProducerConfig) -> Result<Self, HistorianProducerError> {
-        let conn = connection_file::read(&config.connection_file).map_err(|source| {
-            HistorianProducerError::ConnectionFile {
-                path: config.connection_file.clone(),
-                source,
-            }
-        })?;
-        let endpoint =
-            conn.endpoints
-                .first()
-                .ok_or_else(|| HistorianProducerError::NoEndpoint {
-                    path: config.connection_file.clone(),
-                })?;
-        let endpoint_label = format!("{}:{}", endpoint.host, endpoint.port);
-        let mut stream = TcpStream::connect(&endpoint_label)
-            .await
-            .map_err(|source| HistorianProducerError::Connect {
-                endpoint: endpoint_label,
-                source,
-            })?;
-        authenticate_client(&mut stream, &conn, config.handshake_timeout)
-            .await
-            .map_err(HistorianProducerError::Auth)?;
+        Self::connect_with(config, Arc::new(ManagedConnector)).await
+    }
+
+    async fn connect_with(
+        config: HistorianProducerConfig,
+        connector: Arc<dyn ProducerConnector>,
+    ) -> Result<Self, HistorianProducerError> {
+        let connection = connector.connect(&config).await?;
         Ok(Self {
             config,
-            stream,
-            next_corr: 1,
+            connector,
+            connection,
             session_id: None,
             command_route: None,
             subscribe_route: None,
         })
     }
 
-    /// Bind subsequent status/subscribe/cancel calls to an existing session. Reattach
-    /// probes open the route with the persisted session id and must not call send again.
     pub fn bind_session(&mut self, session_id: impl Into<String>) {
         self.session_id = Some(session_id.into());
     }
@@ -681,24 +766,10 @@ impl HistorianProducer {
         max_output_tokens: u32,
         temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
-        self.bind_session(session_id.to_string());
-        // The route identity is the session. Keeping `session` out of this body avoids
-        // a second, diverging source of truth for the run lineage.
-        //
-        // `system` rides the role-scoped SendParams.system field (delivered as a leading
-        // system message in the run's durable input, byte-exact) — NEVER concatenated
-        // into the user prompt: the historian's parse/validate contract assumes the
-        // model saw its role guidance as a system message. Empty means absent, matching
-        // the wire's empty-as-absent rule, so we omit the field entirely.
-        //
-        // The params shape mirrors llm-runner's SendParams (llmr-module-serve wire.rs):
-        // `model` is a nested {provider, model} object, split from our canonical
-        // "provider/model" string at the FIRST slash so multi-slash model names keep
-        // their remainder intact. The server decodes strictly enough that a flat model
-        // string fails the whole send with invalid_params, which a live rig drive
-        // surfaced as firings dying before any producer run existed.
+        self.bind_session(session_id.to_owned());
         let (provider, model_name) = model.split_once('/').ok_or_else(|| {
-            HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            HistorianProducerError::Call(HistorianCallFailure::untagged(
+                HistorianSendOutcome::NotSent,
                 "invalid_model",
                 format!("model '{model}' is not in canonical provider/model form"),
             ))
@@ -720,20 +791,19 @@ impl HistorianProducer {
         if !system.is_empty() {
             params.insert("system".into(), json!(system));
         }
-        let body = json!({
+        let frozen = serde_json::to_vec(&json!({
             "method": "session.send",
-            "params": params
-        });
-        // Any different byte sequence for this session is an idempotency conflict at the runner, never the original run_id. commentlint: allow(JUDGE)
-        let frozen = serde_json::to_vec(&body)?;
-        let response = match self.send_frozen(&frozen).await {
+            "params": params,
+        }))?;
+        let frozen_identity = self.semantic_identity()?;
+        let frozen_daemon = self.connection.daemon_id();
+        let response = match self.send_frozen_once(&frozen).await {
             Ok(response) => response,
-            // Resending after an answered (application) error could start a second billable run under a fresh route. commentlint: allow(JUDGE)
-            Err(err) if send_outcome_unknown(&err) => {
-                self.reconnect().await?;
-                self.send_frozen(&frozen).await?
+            Err(error) if is_outcome_unknown(&error) => {
+                self.replay_frozen_once(frozen_daemon, frozen_identity, &frozen)
+                    .await?
             }
-            Err(err) => return Err(err),
+            Err(error) => return Err(error),
         };
         let run_id = response
             .get("run_id")
@@ -741,12 +811,12 @@ impl HistorianProducer {
             .or_else(|| {
                 response
                     .get("result")
-                    .and_then(|r| r.get("run_id"))
+                    .and_then(|result| result.get("run_id"))
                     .and_then(Value::as_str)
             })
             .ok_or(HistorianProducerError::MissingRunId)?;
         Ok(RunHandle {
-            run_id: run_id.to_string(),
+            run_id: run_id.to_owned(),
         })
     }
 
@@ -795,26 +865,16 @@ impl HistorianProducer {
 
     pub async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError> {
         let route = self.ensure_command_route().await?;
-        let _ = self
-            .unary_json(
-                route,
-                json!({ "method": "run.cancel", "params": { "run_id": run_id } }),
-            )
-            .await?;
+        self.unary_json(
+            route,
+            json!({ "method": "run.cancel", "params": { "run_id": run_id } }),
+        )
+        .await?;
         Ok(())
     }
 
-    /// Delete the bound provider session before releasing its routes. Dreamer
-    /// sessions contain memory-pool snapshots, so retention settings never apply.
     pub async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
-        self.bind_session(session_id.to_string());
-        // The WHOLE operation is bounded, not just the response wait:
-        // `unary_json` starts its timer only after the request write
-        // returns, and the goodbye writes have no timer at all, so a
-        // backpressured connection could wedge cleanup indefinitely. The
-        // caller reserves a fixed margin for this after its payload
-        // deadline; overrunning it lets the caller's cancel land mid-purge
-        // and leave the already-started run executing to its own timeout.
+        self.bind_session(session_id.to_owned());
         let budget = self.config.request_timeout;
         let purge = async {
             let delete = async {
@@ -833,92 +893,58 @@ impl HistorianProducer {
         }
     }
 
+    pub async fn close_attempt(&mut self) -> Result<(), HistorianProducerError> {
+        self.close_routes().await
+    }
+
     pub async fn close(&mut self) -> Result<(), HistorianProducerError> {
-        // Both routes are always released; the first failure is reported so a
-        // wedged transport cannot silently leak the second route either.
-        let mut first_error = None;
-        if let Some(route) = self.subscribe_route.take() {
-            if let Err(err) = self.send_goodbye(route).await {
-                first_error.get_or_insert(err);
-            }
-        }
-        if let Some(route) = self.command_route.take() {
-            if let Err(err) = self.send_goodbye(route).await {
-                first_error.get_or_insert(err);
-            }
-        }
-        match first_error {
-            None => Ok(()),
-            Some(err) => Err(err),
-        }
+        self.close_routes_and_connection().await
     }
 
-    async fn subscribe_from_start(
-        &mut self,
-        run_id: &str,
-        timeout: Duration,
-    ) -> Result<ProducerOutput, HistorianProducerError> {
-        // The whole operation is bounded, not just the drain: opening the
-        // subscription route and writing the request are themselves
-        // requests that can stall for their own request timeout, and the
-        // caller's budget is a deadline for the attempt — overshooting it
-        // here would eat the transport margin reserved for cleanup and let
-        // an outer cancel land during `session.delete`.
-        match tokio::time::timeout(timeout, self.subscribe_and_drain(run_id)).await {
-            Ok(result) => result,
-            Err(_) => Err(HistorianProducerError::TimedOut),
-        }
-    }
-
-    async fn subscribe_and_drain(
-        &mut self,
-        run_id: &str,
-    ) -> Result<ProducerOutput, HistorianProducerError> {
-        let route = self.ensure_subscribe_route().await?;
-        // Subscribe from "start" instead of a cursor. Replay after a cursor is
-        // exclusive, so persisting an advancing cursor can drop units at or before
-        // it on reattach. Re-draining from the start is safe because validation
-        // and compare-and-swap checks during publish are idempotent.
-        let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
-        let corr = self.send_request(route, body).await?;
-        self.drain_subscribe(route, corr, run_id).await
-    }
-
-    /// One transmission of the frozen `session.send` bytes, split from
-    /// `start_with_generation` so the recovery resend cannot accidentally
-    /// re-serialize a different body.
-    async fn send_frozen(&mut self, frozen: &[u8]) -> Result<Value, HistorianProducerError> {
+    async fn send_frozen_once(&mut self, frozen: &[u8]) -> Result<Value, HistorianProducerError> {
         let route = self.ensure_command_route().await?;
-        let corr = self.next_corr();
-        self.write_frame(
-            FrameType::Request,
-            route.channel,
-            route.epoch,
-            corr,
-            frozen.to_vec(),
-        )
-        .await?;
-        let frame = self
-            .read_terminal_for(route, corr, self.config.request_timeout)
+        let response = self
+            .connection
+            .request(
+                route,
+                frozen.to_vec(),
+                self.request_options(self.config.request_timeout),
+            )
             .await?;
-        match frame.header.ty {
-            FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
-            FrameType::StreamEnd => Ok(Value::Null),
-            FrameType::Error => Err(HistorianProducerError::Subc(error_body(&frame.body))),
-            _ => Err(HistorianProducerError::UnexpectedControlResponse),
-        }
+        Ok(serde_json::from_slice(&response)?)
     }
 
-    /// The config is reused unchanged because the runner deduplicates the frozen resend only under the same project/harness/session route identity. commentlint: allow(JUDGE)
-    async fn reconnect(&mut self) -> Result<(), HistorianProducerError> {
-        let mut fresh = Self::connect(self.config.clone()).await?;
-        std::mem::swap(&mut self.stream, &mut fresh.stream);
+    async fn replay_frozen_once(
+        &mut self,
+        frozen_daemon: [u8; 16],
+        frozen_identity: SemanticIdentity,
+        frozen: &[u8],
+    ) -> Result<Value, HistorianProducerError> {
+        let reconnected = self
+            .connector
+            .reconnect(&self.config, &frozen_identity)
+            .await?;
+        let daemon_changed = reconnected.connection.daemon_id() != frozen_daemon;
+        let identity_changed = reconnected.identity != frozen_identity;
+
+        let old_cleanup = self.close_routes_and_connection().await;
+        if let Err(error) = old_cleanup {
+            eprintln!("mc-module: historian replay cleanup failed: {error}");
+        }
+        self.connection = reconnected.connection;
         self.command_route = None;
         self.subscribe_route = None;
-        Ok(())
+
+        if daemon_changed || identity_changed {
+            return Err(HistorianProducerError::CrossIncarnationUnknown {
+                daemon_changed,
+                identity_changed,
+            });
+        }
+        self.send_frozen_once(frozen).await
     }
 
-    async fn ensure_command_route(&mut self) -> Result<OpenedRoute, HistorianProducerError> {
+    async fn ensure_command_route(&mut self) -> Result<RouteHandle, HistorianProducerError> {
         if let Some(route) = self.command_route {
             return Ok(route);
         }
@@ -927,7 +953,7 @@ impl HistorianProducer {
         Ok(route)
     }
 
-    async fn ensure_subscribe_route(&mut self) -> Result<OpenedRoute, HistorianProducerError> {
+    async fn ensure_subscribe_route(&mut self) -> Result<RouteHandle, HistorianProducerError> {
         if let Some(route) = self.subscribe_route {
             return Ok(route);
         }
@@ -936,249 +962,183 @@ impl HistorianProducer {
         Ok(route)
     }
 
-    async fn open_bound_route(&mut self) -> Result<OpenedRoute, HistorianProducerError> {
-        let session = self
-            .session_id
-            .clone()
-            .ok_or(HistorianProducerError::MissingSession)?;
-        let request = ClientControlRequest::RouteOpen {
-            target: RouteTarget::ManagementSurface {
-                module_id: self.config.module_id.clone(),
-            },
-            identity: BindIdentity {
-                project_root: self.config.project_root.clone(),
-                harness: self.config.harness.clone(),
-                session,
-            },
-            consumer_identity: consumer_identity_from_env(),
-            consumer_capabilities: None,
-            admission_facts: None,
-        };
-        let corr = self.next_corr();
-        let body = serde_json::to_vec(&request)?;
-        self.write_frame(FrameType::Request, 0, 0, corr, body)
-            .await?;
-        let frame = self
-            .read_terminal_for(
-                OpenedRoute {
-                    channel: 0,
-                    epoch: 0,
+    async fn open_bound_route(&self) -> Result<RouteHandle, HistorianProducerError> {
+        let semantic = self.semantic_identity()?;
+        self.connection
+            .open_route(
+                RouteTarget {
+                    module_id: self.config.module_id.clone(),
+                    kind: TargetKind::ManagementSurface,
                 },
-                corr,
-                self.config.request_timeout,
+                RouteIdentity {
+                    project_root: semantic.project_root,
+                    harness: semantic.harness,
+                    session: semantic.session,
+                    consumer_module_id: nonempty_env("SUBC_MODULE_ID"),
+                    consumer_launch_nonce: nonempty_env("SUBC_LAUNCH_NONCE"),
+                    consumer_capabilities: Vec::new(),
+                    admission_facts: None,
+                },
             )
-            .await?;
-        match frame.header.ty {
-            FrameType::Response => {
-                let response: ClientControlResponse = serde_json::from_slice(&frame.body)?;
-                if let ClientControlResponse::RouteOpen {
-                    route_channel,
-                    route_epoch,
-                } = response
-                {
-                    Ok(OpenedRoute {
-                        channel: route_channel,
-                        epoch: route_epoch,
-                    })
-                } else {
-                    Err(HistorianProducerError::UnexpectedControlResponse)
-                }
-            }
-            FrameType::Error => Err(HistorianProducerError::Subc(error_body(&frame.body))),
-            _ => Err(HistorianProducerError::UnexpectedControlResponse),
-        }
+            .await
     }
 
     async fn unary_json(
-        &mut self,
-        route: OpenedRoute,
+        &self,
+        route: RouteHandle,
         body: Value,
     ) -> Result<Value, HistorianProducerError> {
-        let corr = self.send_request(route, body).await?;
-        let frame = self
-            .read_terminal_for(route, corr, self.config.request_timeout)
+        let body = serde_json::to_vec(&body)?;
+        let response = self
+            .connection
+            .request(
+                route,
+                body,
+                self.request_options(self.config.request_timeout),
+            )
             .await?;
-        match frame.header.ty {
-            FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
-            FrameType::StreamEnd => Ok(Value::Null),
-            FrameType::Error => Err(HistorianProducerError::Subc(error_body(&frame.body))),
-            _ => Err(HistorianProducerError::UnexpectedControlResponse),
-        }
+        Ok(serde_json::from_slice(&response)?)
     }
 
-    async fn send_request(
+    async fn subscribe_from_start(
         &mut self,
-        route: OpenedRoute,
-        body: Value,
-    ) -> Result<u64, HistorianProducerError> {
-        let corr = self.next_corr();
-        let bytes = serde_json::to_vec(&body)?;
-        self.write_frame(FrameType::Request, route.channel, route.epoch, corr, bytes)
-            .await?;
-        Ok(corr)
-    }
-
-    async fn drain_subscribe(
-        &mut self,
-        route: OpenedRoute,
-        corr: u64,
         run_id: &str,
-    ) -> Result<ProducerOutput, HistorianProducerError> {
-        let mut text = String::new();
-        let mut last_run_started: Option<String> = None;
-        let mut length_capped = false;
-        loop {
-            let Some(frame) = read_frame(&mut self.stream).await? else {
-                return Err(HistorianProducerError::UnexpectedStreamEnd);
-            };
-            if frame.header.channel != route.channel
-                || frame.header.epoch != route.epoch
-                || frame.header.corr != corr
-            {
-                continue;
-            }
-            match frame.header.ty {
-                FrameType::StreamData => {
-                    let event: Value = serde_json::from_slice(&frame.body)?;
-                    let Some(unit) = control_unit(&event) else {
-                        continue;
-                    };
-                    if is_run_started_unit(unit) {
-                        last_run_started = unit_run_id(unit).map(ToString::to_string);
-                    }
-                    let terminal = is_terminal_unit(unit);
-                    if !terminal && unit_run_id(unit).is_some_and(|id| id != run_id) {
-                        continue;
-                    }
-                    if is_paused_unit(unit) && unit_run_id(unit) == Some(run_id) {
-                        // A paused run still holds the slot for this historian. Return
-                        // an error so callers stop waiting and retry later instead of
-                        // hanging forever on a run that is paused but not finished.
-                        let info = unit_error_info(unit);
-                        return Err(HistorianProducerError::RunPaused {
-                            run_id: run_id.to_string(),
-                            reason: paused_reason(unit).map(ToString::to_string),
-                            classification: info.classification,
-                            class_field_present: info.class_field_present,
-                        });
-                    }
-                    if let Some(piece) = unit_text(unit) {
-                        text.push_str(&piece);
-                    }
-                    if unit_is_length_capped(unit) {
-                        length_capped = true;
-                    }
-                    if terminal {
-                        if last_run_started.as_deref() != Some(run_id) {
-                            return Err(HistorianProducerError::TerminalRunMismatch {
-                                expected: run_id.to_string(),
-                                found: last_run_started,
-                            });
-                        }
-                        if is_error_unit(unit) {
-                            let info = unit_error_info(unit);
-                            return Err(HistorianProducerError::RunFailed {
-                                run_id: run_id.to_string(),
-                                detail: info.detail.unwrap_or_else(|| "run failed".to_string()),
-                                classification: info.classification,
-                                class_field_present: info.class_field_present,
-                            });
-                        }
-                        // The run terminal control unit is authoritative. StreamEnd is only
-                        // route mechanics and can appear on detach/resubscribe without ending a run.
-                        return Ok(ProducerOutput {
-                            text,
-                            length_capped,
-                        });
-                    }
-                }
-                FrameType::Error => {
-                    return Err(HistorianProducerError::Subc(error_body(&frame.body)))
-                }
-                FrameType::StreamEnd => return Err(HistorianProducerError::UnexpectedStreamEnd),
-                _ => {}
-            }
-        }
-    }
-
-    async fn read_terminal_for(
-        &mut self,
-        route: OpenedRoute,
-        corr: u64,
         timeout: Duration,
-    ) -> Result<Frame, HistorianProducerError> {
-        match tokio::time::timeout(timeout, async {
-            loop {
-                let Some(frame) = read_frame(&mut self.stream).await? else {
-                    return Err(HistorianProducerError::UnexpectedStreamEnd);
-                };
-                if frame.header.channel == route.channel
-                    && frame.header.epoch == route.epoch
-                    && frame.header.corr == corr
-                {
-                    return Ok(frame);
-                }
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        let route = self.ensure_subscribe_route().await?;
+        let body = serde_json::to_vec(&json!({
+            "method": "session.subscribe",
+            "params": { "from": "start" },
+        }))?;
+        let mut stream = self
+            .connection
+            .request_stream(route, body, self.request_options(timeout))
+            .await?;
+        drain_subscribe(&mut *stream, run_id).await
+    }
+
+    async fn close_routes(&mut self) -> Result<(), HistorianProducerError> {
+        let mut first_error = None;
+        if let Some(route) = self.subscribe_route.take() {
+            if let Err(error) = self.connection.close_route(route).await {
+                first_error.get_or_insert(error);
             }
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(HistorianProducerError::TimedOut),
         }
+        if let Some(route) = self.command_route.take() {
+            if let Err(error) = self.connection.close_route(route).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
-    async fn write_frame(
-        &mut self,
-        ty: FrameType,
-        channel: u16,
-        epoch: u32,
-        corr: u64,
-        body: Vec<u8>,
-    ) -> Result<(), HistorianProducerError> {
-        let frame = Frame::build(
-            ty,
-            Flags::new(false, Priority::Interactive, false),
-            channel,
-            epoch,
-            corr,
-            body,
-        )?;
-        write_frame(&mut self.stream, &frame).await?;
-        Ok(())
+    async fn close_routes_and_connection(&mut self) -> Result<(), HistorianProducerError> {
+        let mut result = self.close_routes().await;
+        if let Err(error) = self.connection.close().await {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
+        result
     }
 
-    async fn send_goodbye(&mut self, route: OpenedRoute) -> Result<(), HistorianProducerError> {
-        let frame = Frame::build(
-            FrameType::Goodbye,
-            Flags::new(false, Priority::Interactive, false),
-            route.channel,
-            route.epoch,
-            0,
-            Vec::new(),
-        )?;
-        write_frame(&mut self.stream, &frame).await?;
-        Ok(())
+    fn semantic_identity(&self) -> Result<SemanticIdentity, HistorianProducerError> {
+        Ok(SemanticIdentity {
+            project_root: self.config.project_root.clone(),
+            harness: self.config.harness.clone(),
+            session: self
+                .session_id
+                .clone()
+                .ok_or(HistorianProducerError::MissingSession)?,
+        })
     }
 
-    fn next_corr(&mut self) -> u64 {
-        let corr = self.next_corr;
-        self.next_corr = self.next_corr.saturating_add(1).max(1);
-        corr
+    fn request_options(&self, timeout: Duration) -> RequestOptions {
+        RequestOptions {
+            timeout,
+            cancellation: self.config.cancellation.clone(),
+        }
     }
 }
 
-impl Drop for HistorianProducer {
-    fn drop(&mut self) {
-        // Async close is preferred by callers; drop only releases the TCP socket.
+async fn drain_subscribe(
+    stream: &mut dyn ProducerStream,
+    run_id: &str,
+) -> Result<ProducerOutput, HistorianProducerError> {
+    let mut text = String::new();
+    let mut last_run_started: Option<String> = None;
+    let mut length_capped = false;
+    while let Some(item) = stream.next().await? {
+        let event: Value = serde_json::from_slice(&item.body)?;
+        let Some(unit) = control_unit(&event) else {
+            continue;
+        };
+        if is_run_started_unit(unit) {
+            last_run_started = unit_run_id(unit).map(ToOwned::to_owned);
+        }
+        let terminal = is_terminal_unit(unit);
+        if !terminal && unit_run_id(unit).is_some_and(|id| id != run_id) {
+            continue;
+        }
+        if is_paused_unit(unit) && unit_run_id(unit) == Some(run_id) {
+            let info = unit_error_info(unit);
+            return Err(HistorianProducerError::RunPaused {
+                run_id: run_id.to_owned(),
+                reason: paused_reason(unit).map(ToOwned::to_owned),
+                classification: info.classification,
+                class_field_present: info.class_field_present,
+            });
+        }
+        if let Some(piece) = unit_text(unit) {
+            text.push_str(&piece);
+        }
+        if unit_is_length_capped(unit) {
+            length_capped = true;
+        }
+        if terminal {
+            if last_run_started.as_deref() != Some(run_id) {
+                return Err(HistorianProducerError::TerminalRunMismatch {
+                    expected: run_id.to_owned(),
+                    found: last_run_started,
+                });
+            }
+            if is_error_unit(unit) {
+                let info = unit_error_info(unit);
+                return Err(HistorianProducerError::RunFailed {
+                    run_id: run_id.to_owned(),
+                    detail: info.detail.unwrap_or_else(|| "run failed".to_owned()),
+                    classification: info.classification,
+                    class_field_present: info.class_field_present,
+                });
+            }
+            return Ok(ProducerOutput {
+                text,
+                length_capped,
+            });
+        }
     }
+    Err(HistorianProducerError::UnexpectedStreamEnd)
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn is_outcome_unknown(error: &HistorianProducerError) -> bool {
+    matches!(
+        error,
+        HistorianProducerError::Call(HistorianCallFailure {
+            outcome: HistorianSendOutcome::OutcomeUnknown,
+            ..
+        })
+    )
 }
 
 fn classify_run_state(run_id: &str, value: &Value) -> Result<RunState, HistorianProducerError> {
     let value = value.get("result").unwrap_or(value);
     let response_run_id = value.get("run_id").and_then(Value::as_str);
-    // Absence is as disqualifying as a mismatch: a response that does not
-    // name the run has not been proven to describe it, and misreading it as
-    // `missing` would authorize a second billable run.
     if response_run_id != Some(run_id) {
         return Err(HistorianProducerError::Protocol(format!(
             "run.status answered for run {response_run_id:?}, not {run_id}"
@@ -1186,7 +1146,7 @@ fn classify_run_state(run_id: &str, value: &Value) -> Result<RunState, Historian
     }
     let Some(state) = value.get("state").and_then(Value::as_str) else {
         return Err(HistorianProducerError::Protocol(
-            "run.status response has no state string".to_string(),
+            "run.status response has no state string".to_owned(),
         ));
     };
     match state {
@@ -1197,7 +1157,7 @@ fn classify_run_state(run_id: &str, value: &Value) -> Result<RunState, Historian
                 .get("detail")
                 .or_else(|| value.get("last_error"))
                 .and_then(Value::as_str)
-                .map(ToString::to_string),
+                .map(ToOwned::to_owned),
         }),
         other => Err(HistorianProducerError::Protocol(format!(
             "undocumented run state {other:?}"
@@ -1205,23 +1165,10 @@ fn classify_run_state(run_id: &str, value: &Value) -> Result<RunState, Historian
     }
 }
 
-fn send_outcome_unknown(err: &HistorianProducerError) -> bool {
-    matches!(
-        err,
-        HistorianProducerError::FrameIo(_)
-            | HistorianProducerError::TimedOut
-            | HistorianProducerError::UnexpectedStreamEnd
-    )
-}
-
 fn control_unit(event: &Value) -> Option<&Value> {
     let kind = event.get("kind").and_then(Value::as_str);
     if kind == Some("display") {
         return None;
-    }
-    if kind == Some("control") {
-        let unit = event.get("unit").unwrap_or(event);
-        return Some(unit);
     }
     Some(event.get("unit").unwrap_or(event))
 }
@@ -1238,69 +1185,60 @@ fn unit_run_id(unit: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// Extract the assistant TEXT from a control unit. llm-runner's assistant_message
-/// unit nests an assembled message with a content-block array; only `text` blocks are
-/// the historian's output. `reasoning` blocks are deliberately EXCLUDED: a reasoning
-/// model's thinking legitimately restates the prompt's format template and walks the
-/// seed examples, so folding it into the output would corrupt the parse with
-/// template/seed prose. Flat `text`/`content` fields are kept as a fallback for
-/// simpler unit shapes.
 fn unit_text(unit: &Value) -> Option<String> {
-    if !unit_type(unit).is_some_and(|ty| ty.eq_ignore_ascii_case("assistant_message")) {
+    if !unit_type(unit).is_some_and(|kind| kind.eq_ignore_ascii_case("assistant_message")) {
         return None;
     }
     if let Some(blocks) = unit
         .get("message")
-        .and_then(|m| m.get("content"))
+        .and_then(|message| message.get("content"))
         .and_then(Value::as_array)
     {
         let text: String = blocks
             .iter()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
             .collect();
         return (!text.is_empty()).then_some(text);
     }
     unit.get("text")
         .or_else(|| unit.get("content"))
-        .or_else(|| unit.get("message").and_then(|m| m.get("text")))
+        .or_else(|| unit.get("message").and_then(|message| message.get("text")))
         .and_then(Value::as_str)
-        .map(ToString::to_string)
+        .map(ToOwned::to_owned)
 }
 
 fn is_terminal_unit(unit: &Value) -> bool {
-    let Some(ty) = unit_type(unit).map(str::to_ascii_lowercase) else {
-        return false;
-    };
-    ty == "run_finished"
-        || ty == "terminal"
-        || ty == "run_terminal"
-        || ty == "finished"
-        || ty == "error"
+    unit_type(unit)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|kind| {
+            matches!(
+                kind.as_str(),
+                "run_finished" | "terminal" | "run_terminal" | "finished" | "error"
+            )
+        })
 }
 
 fn is_run_started_unit(unit: &Value) -> bool {
     unit_type(unit)
         .map(str::to_ascii_lowercase)
-        .is_some_and(|ty| ty == "run_started" || ty == "runstarted")
+        .is_some_and(|kind| kind == "run_started" || kind == "runstarted")
 }
 
-/// A length-class finish reason on ANY unit (step or terminal): providers spell it
-/// "length", "max_tokens", or "max_output_tokens" depending on the wire family.
 fn unit_is_length_capped(unit: &Value) -> bool {
     unit.get("finish_reason")
         .or_else(|| unit.get("finishReason"))
         .and_then(Value::as_str)
         .is_some_and(|reason| {
-            let reason = reason.to_ascii_lowercase();
-            reason == "length" || reason == "max_tokens" || reason == "max_output_tokens"
+            matches!(
+                reason.to_ascii_lowercase().as_str(),
+                "length" | "max_tokens" | "max_output_tokens"
+            )
         })
 }
 
 fn is_paused_unit(unit: &Value) -> bool {
-    unit_type(unit)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|ty| ty == "paused")
+    unit_type(unit).is_some_and(|kind| kind.eq_ignore_ascii_case("paused"))
 }
 
 fn paused_reason(unit: &Value) -> Option<&str> {
@@ -1312,7 +1250,7 @@ fn paused_reason(unit: &Value) -> Option<&str> {
 fn is_error_unit(unit: &Value) -> bool {
     unit_type(unit)
         .map(str::to_ascii_lowercase)
-        .is_some_and(|ty| ty == "error" || ty == "run_error")
+        .is_some_and(|kind| kind == "error" || kind == "run_error")
 }
 
 #[derive(Debug, Default)]
@@ -1330,8 +1268,8 @@ fn unit_error_info(unit: &Value) -> UnitErrorInfo {
             .and_then(Value::as_str)
             .or_else(|| unit.get("detail").and_then(Value::as_str))
             .or_else(|| unit.get("message").and_then(Value::as_str))
-            .map(ToString::to_string)
-            .or_else(|| error.as_str().map(ToString::to_string))
+            .map(ToOwned::to_owned)
+            .or_else(|| error.as_str().map(ToOwned::to_owned))
             .or_else(|| Some(error.to_string()));
         return UnitErrorInfo {
             detail,
@@ -1344,7 +1282,7 @@ fn unit_error_info(unit: &Value) -> UnitErrorInfo {
         .get("detail")
         .or_else(|| unit.get("message"))
         .and_then(Value::as_str)
-        .map(ToString::to_string);
+        .map(ToOwned::to_owned);
     let (classification, class_field_present) = detail
         .as_deref()
         .and_then(classification_from_json_text)
@@ -1353,22 +1291,6 @@ fn unit_error_info(unit: &Value) -> UnitErrorInfo {
         detail,
         classification,
         class_field_present,
-    }
-}
-
-fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
-    let module_id = std::env::var(SUBC_MODULE_ID_ENV).ok()?;
-    let launch_nonce = std::env::var(SUBC_LAUNCH_NONCE_ENV).ok()?;
-    (!module_id.is_empty() && !launch_nonce.is_empty()).then_some(ConsumerIdentity {
-        module_id,
-        launch_nonce,
-    })
-}
-
-fn error_body(body: &[u8]) -> ProducerErrorBody {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(value) => ProducerErrorBody::from_value(value),
-        Err(e) => ProducerErrorBody::untagged("invalid_error_body", e.to_string()),
     }
 }
 
@@ -1397,41 +1319,447 @@ fn classification_from_object(value: &Value) -> (Option<ErrorClassification>, bo
 }
 
 fn retry_after_secs_from_value(value: &Value) -> Option<u64> {
-    if let Some(secs) = value.as_u64() {
-        return Some(secs);
-    }
-    let secs = value.as_f64()?;
-    if secs.is_finite() && secs >= 0.0 {
-        Some(secs.ceil() as u64)
-    } else {
-        None
-    }
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value.ceil() as u64)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Mutex;
 
-    use serde_json::json;
-    use subc_transport::{
-        authenticate_server, generate_daemon_id, generate_key, write_atomic, ConnectionInfo,
-        Endpoint, SCHEMA_VERSION,
-    };
-    use tempfile::TempDir;
-    use tokio::{net::TcpListener, sync::Mutex};
+    #[derive(Clone)]
+    struct FakeConnection {
+        daemon_id: [u8; 16],
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    #[derive(Default)]
+    struct FakeState {
+        requests: Vec<Vec<u8>>,
+        identities: Vec<RouteIdentity>,
+        responses: VecDeque<Result<Vec<u8>, HistorianProducerError>>,
+        opened_routes: Vec<RouteHandle>,
+        closed_routes: Vec<RouteHandle>,
+        close_route_errors: VecDeque<HistorianProducerError>,
+        close_calls: usize,
+        next_channel: u16,
+    }
+
+    #[async_trait]
+    impl ProducerConnection for FakeConnection {
+        fn daemon_id(&self) -> [u8; 16] {
+            self.daemon_id
+        }
+
+        async fn open_route(
+            &self,
+            _target: RouteTarget,
+            identity: RouteIdentity,
+        ) -> Result<RouteHandle, HistorianProducerError> {
+            let mut state = self.state.lock().unwrap();
+            state.identities.push(identity);
+            state.next_channel += 1;
+            let route = RouteHandle {
+                channel: state.next_channel,
+                epoch: u32::from(state.next_channel),
+            };
+            state.opened_routes.push(route);
+            Ok(route)
+        }
+
+        async fn request(
+            &self,
+            _route: RouteHandle,
+            body: Vec<u8>,
+            _options: RequestOptions,
+        ) -> Result<Vec<u8>, HistorianProducerError> {
+            let mut state = self.state.lock().unwrap();
+            state.requests.push(body);
+            state
+                .responses
+                .pop_front()
+                .unwrap_or_else(|| Ok(br#"{"run_id":"run-default"}"#.to_vec()))
+        }
+
+        async fn request_stream(
+            &self,
+            _route: RouteHandle,
+            _body: Vec<u8>,
+            _options: RequestOptions,
+        ) -> Result<Box<dyn ProducerStream>, HistorianProducerError> {
+            Ok(Box::new(FakeStream(VecDeque::new())))
+        }
+
+        async fn close_route(&self, route: RouteHandle) -> Result<(), HistorianProducerError> {
+            let mut state = self.state.lock().unwrap();
+            state.closed_routes.push(route);
+            match state.close_route_errors.pop_front() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        async fn close(&self) -> Result<(), HistorianProducerError> {
+            self.state.lock().unwrap().close_calls += 1;
+            Ok(())
+        }
+    }
+
+    struct FakeStream(VecDeque<Result<Option<StreamItem>, HistorianProducerError>>);
+
+    #[async_trait]
+    impl ProducerStream for FakeStream {
+        async fn next(&mut self) -> Result<Option<StreamItem>, HistorianProducerError> {
+            self.0.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    struct FakeConnector {
+        initial: FakeConnection,
+        reconnects: Mutex<VecDeque<(FakeConnection, Option<SemanticIdentity>)>>,
+        reconnect_calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ProducerConnector for FakeConnector {
+        async fn connect(
+            &self,
+            _config: &HistorianProducerConfig,
+        ) -> Result<Box<dyn ProducerConnection>, HistorianProducerError> {
+            Ok(Box::new(self.initial.clone()))
+        }
+
+        async fn reconnect(
+            &self,
+            _config: &HistorianProducerConfig,
+            identity: &SemanticIdentity,
+        ) -> Result<Reconnected, HistorianProducerError> {
+            self.reconnect_calls.fetch_add(1, Ordering::SeqCst);
+            let (connection, override_identity) =
+                self.reconnects.lock().unwrap().pop_front().unwrap();
+            Ok(Reconnected {
+                connection: Box::new(connection),
+                identity: override_identity.unwrap_or_else(|| identity.clone()),
+            })
+        }
+    }
+
+    fn unknown() -> HistorianProducerError {
+        HistorianProducerError::Call(HistorianCallFailure::untagged(
+            HistorianSendOutcome::OutcomeUnknown,
+            "connection_retired",
+            "outcome unknown",
+        ))
+    }
+
+    fn terminal(code: &str) -> HistorianProducerError {
+        HistorianProducerError::Call(HistorianCallFailure::untagged(
+            HistorianSendOutcome::Terminal,
+            code,
+            "terminal",
+        ))
+    }
+
+    fn connection(
+        daemon: u8,
+        responses: impl IntoIterator<Item = Result<Vec<u8>, HistorianProducerError>>,
+    ) -> FakeConnection {
+        FakeConnection {
+            daemon_id: [daemon; 16],
+            state: Arc::new(Mutex::new(FakeState {
+                responses: responses.into_iter().collect(),
+                ..FakeState::default()
+            })),
+        }
+    }
+
+    async fn producer(
+        initial: FakeConnection,
+        reconnect: Option<(FakeConnection, Option<SemanticIdentity>)>,
+    ) -> (HistorianProducer, Arc<FakeConnector>) {
+        let connector = Arc::new(FakeConnector {
+            initial,
+            reconnects: Mutex::new(reconnect.into_iter().collect()),
+            reconnect_calls: AtomicU64::new(0),
+        });
+        let config = HistorianProducerConfig {
+            request_timeout: Duration::from_secs(1),
+            await_timeout: Duration::from_secs(1),
+            ..HistorianProducerConfig::new("/unused", "/project", "opencode")
+        };
+        let connected = HistorianProducer::connect_with(config, connector.clone())
+            .await
+            .unwrap();
+        (connected, connector)
+    }
+
+    #[tokio::test]
+    async fn start_opens_expected_identity_and_sends_once() {
+        let first = connection(1, [Ok(br#"{"run_id":"run-1"}"#.to_vec())]);
+        let state = Arc::clone(&first.state);
+        let (mut producer, connector) = producer(first, None).await;
+        let handle = producer
+            .start("session-1", "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        assert_eq!(handle.run_id, "run-1");
+        assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 0);
+        let state = state.lock().unwrap();
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.identities.len(), 1);
+        assert_eq!(state.identities[0].project_root, PathBuf::from("/project"));
+        assert_eq!(state.identities[0].harness, "opencode");
+        assert_eq!(state.identities[0].session, "session-1");
+        let body: Value = serde_json::from_slice(&state.requests[0]).unwrap();
+        assert_eq!(body["method"], "session.send");
+        assert_eq!(body["params"]["prompt"], "prompt");
+    }
+
+    #[tokio::test]
+    async fn same_daemon_and_identity_resends_exact_bytes_once() {
+        let first = connection(7, [Err(unknown())]);
+        let second = connection(7, [Ok(br#"{"run_id":"run-2"}"#.to_vec())]);
+        let first_state = Arc::clone(&first.state);
+        let second_state = Arc::clone(&second.state);
+        let (mut producer, connector) = producer(first, Some((second, None))).await;
+        let handle = producer
+            .start("session-2", "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        assert_eq!(handle.run_id, "run-2");
+        assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 1);
+        let first = first_state.lock().unwrap();
+        let second = second_state.lock().unwrap();
+        assert_eq!(first.requests.len(), 1);
+        assert_eq!(second.requests.len(), 1);
+        assert_eq!(first.requests[0], second.requests[0]);
+    }
+
+    #[tokio::test]
+    async fn second_unknown_outcome_stops_without_third_attempt() {
+        let first = connection(7, [Err(unknown())]);
+        let second = connection(7, [Err(unknown())]);
+        let first_state = Arc::clone(&first.state);
+        let second_state = Arc::clone(&second.state);
+        let (mut producer, connector) = producer(first, Some((second, None))).await;
+
+        assert!(producer
+            .start("session", "", "prompt", "provider/model")
+            .await
+            .is_err());
+
+        assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_state.lock().unwrap().requests.len(), 1);
+        assert_eq!(second_state.lock().unwrap().requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn changed_daemon_returns_typed_unknown_without_resend() {
+        let first = connection(1, [Err(unknown())]);
+        let second = connection(2, []);
+        let second_state = Arc::clone(&second.state);
+        let (mut producer, connector) = producer(first, Some((second, None))).await;
+        let error = producer
+            .start("session", "", "prompt", "provider/model")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianProducerError::CrossIncarnationUnknown {
+                daemon_changed: true,
+                identity_changed: false
+            }
+        ));
+        assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 1);
+        assert!(second_state.lock().unwrap().requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn any_semantic_identity_change_prevents_resend() {
+        for field in ["project", "harness", "session"] {
+            let first = connection(3, [Err(unknown())]);
+            let second = connection(3, []);
+            let second_state = Arc::clone(&second.state);
+            let mut changed = SemanticIdentity {
+                project_root: PathBuf::from("/project"),
+                harness: "opencode".to_owned(),
+                session: "session".to_owned(),
+            };
+            match field {
+                "project" => changed.project_root = PathBuf::from("/other"),
+                "harness" => changed.harness = "claude-code".to_owned(),
+                "session" => changed.session = "other-session".to_owned(),
+                _ => unreachable!(),
+            }
+            let (mut producer, _) = producer(first, Some((second, Some(changed)))).await;
+            let error = producer
+                .start("session", "", "prompt", "provider/model")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                HistorianProducerError::CrossIncarnationUnknown {
+                    daemon_changed: false,
+                    identity_changed: true
+                }
+            ));
+            assert!(second_state.lock().unwrap().requests.is_empty(), "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn not_sent_and_terminal_failures_are_never_replayed() {
+        for failure in [
+            HistorianProducerError::Call(HistorianCallFailure::untagged(
+                HistorianSendOutcome::NotSent,
+                "correlation_exhausted",
+                "not sent",
+            )),
+            terminal("idempotency_conflict"),
+        ] {
+            let first = connection(1, [Err(failure)]);
+            let state = Arc::clone(&first.state);
+            let (mut producer, connector) = producer(first, None).await;
+            assert!(producer
+                .start("session", "", "prompt", "provider/model")
+                .await
+                .is_err());
+            assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(state.lock().unwrap().requests.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_releases_subscription_and_command_routes() {
+        let first = connection(1, [Ok(br#"{"run_id":"run"}"#.to_vec())]);
+        let state = Arc::clone(&first.state);
+        let (mut producer, _) = producer(first, None).await;
+        producer.bind_session("session");
+        producer.ensure_command_route().await.unwrap();
+        producer.ensure_subscribe_route().await.unwrap();
+        producer.close().await.unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.opened_routes.iter().copied().collect::<HashSet<_>>(),
+            state.closed_routes.iter().copied().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            state.closed_routes,
+            vec![
+                RouteHandle {
+                    channel: 2,
+                    epoch: 2,
+                },
+                RouteHandle {
+                    channel: 1,
+                    epoch: 1,
+                },
+            ]
+        );
+        assert_eq!(state.close_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn attempt_cleanup_reopens_exact_routes_without_closing_connection() {
+        let first = connection(
+            1,
+            [
+                Ok(br#"{"run_id":"run-1"}"#.to_vec()),
+                Ok(br#"{"run_id":"run-2"}"#.to_vec()),
+            ],
+        );
+        let state = Arc::clone(&first.state);
+        let (mut producer, _) = producer(first, None).await;
+        producer
+            .start("session", "", "prompt-1", "provider/model-a")
+            .await
+            .unwrap();
+        producer.ensure_subscribe_route().await.unwrap();
+        producer.close_attempt().await.unwrap();
+        assert_eq!(state.lock().unwrap().close_calls, 0);
+
+        producer
+            .start("session", "", "prompt-2", "provider/model-b")
+            .await
+            .unwrap();
+        producer.ensure_subscribe_route().await.unwrap();
+        producer.close().await.unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.opened_routes.len(), 4);
+        assert_eq!(
+            state.opened_routes.iter().copied().collect::<HashSet<_>>(),
+            state.closed_routes.iter().copied().collect::<HashSet<_>>()
+        );
+        assert_eq!(state.close_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn first_route_close_failure_does_not_skip_second_route_or_client_close() {
+        let first = connection(1, []);
+        first
+            .state
+            .lock()
+            .unwrap()
+            .close_route_errors
+            .push_back(terminal("close_failed"));
+        let state = Arc::clone(&first.state);
+        let (mut producer, _) = producer(first, None).await;
+        producer.bind_session("session");
+        producer.ensure_command_route().await.unwrap();
+        producer.ensure_subscribe_route().await.unwrap();
+
+        assert!(producer.close().await.is_err());
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.opened_routes.len(), 2);
+        assert_eq!(
+            state.opened_routes.iter().copied().collect::<HashSet<_>>(),
+            state.closed_routes.iter().copied().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            state.closed_routes,
+            vec![
+                RouteHandle {
+                    channel: 2,
+                    epoch: 2,
+                },
+                RouteHandle {
+                    channel: 1,
+                    epoch: 1,
+                },
+            ],
+            "first route failure must not skip exact second route"
+        );
+        assert_eq!(state.close_calls, 1);
+    }
+
+    #[test]
+    fn run_state_mapping_is_closed_over_known_states() {
+        for state in ["queued", "running"] {
+            assert_eq!(
+                classify_run_state("run", &json!({"run_id":"run", "state":state})).unwrap(),
+                RunState::Active
+            );
+        }
+        for state in ["completed", "failed", "cancelled"] {
+            assert_eq!(
+                classify_run_state("run", &json!({"run_id":"run", "state":state})).unwrap(),
+                RunState::Terminal
+            );
+        }
+        assert!(classify_run_state("run", &json!({"run_id":"run", "state":"paused"})).is_err());
+        assert!(classify_run_state("run", &json!({"run_id":"other", "state":"missing"})).is_err());
+    }
 
     #[test]
     fn error_class_wire_strings_match_pinned_contract_set() {
-        assert_eq!(
-            ERROR_CLASS_WIRE_SET,
-            [
-                "transient",
-                "permanent",
-                "auth_required",
-                "context_overflow"
-            ]
-        );
         assert_eq!(ErrorClass::Transient.as_wire_str(), "transient");
         assert_eq!(ErrorClass::Permanent.as_wire_str(), "permanent");
         assert_eq!(ErrorClass::AuthRequired.as_wire_str(), "auth_required");
@@ -1439,938 +1767,5 @@ mod tests {
             ErrorClass::ContextOverflow.as_wire_str(),
             "context_overflow"
         );
-        assert_eq!(
-            ErrorClass::from_wire("auth"),
-            Some(ErrorClass::AuthRequired)
-        );
-    }
-
-    #[test]
-    fn parses_tagged_subc_error_body_from_contract_shape() {
-        let body = serde_json::to_vec(&json!({
-            "code": "provider_error",
-            "message": "rate limit window",
-            "class": "transient",
-            "retry_after_secs": 120,
-            "provider_code": "rate_limit_exceeded"
-        }))
-        .unwrap();
-
-        let parsed = error_body(&body);
-        assert_eq!(parsed.code, "provider_error");
-        assert_eq!(
-            parsed.classification(),
-            Some(ErrorClassification {
-                class: ErrorClass::Transient,
-                retry_after_secs: Some(120),
-            })
-        );
-    }
-
-    #[test]
-    fn parses_current_llm_runner_control_error_shape() {
-        let unit = json!({
-            "type": "error",
-            "error": {
-                "class": "permanent",
-                "message": "model id does not exist",
-                "status": 404,
-                "provider_code": "model_not_found"
-            }
-        });
-
-        let info = unit_error_info(&unit);
-        assert_eq!(info.detail.as_deref(), Some("model id does not exist"));
-        assert_eq!(
-            info.classification,
-            Some(ErrorClassification {
-                class: ErrorClass::Permanent,
-                retry_after_secs: None,
-            })
-        );
-    }
-
-    #[derive(Debug, Default)]
-    struct ServerLog {
-        route_sessions: Vec<String>,
-        route_harnesses: Vec<String>,
-        sends: Vec<Value>,
-        send_bodies: Vec<Vec<u8>>,
-        subscribes: Vec<Value>,
-        goodbyes: Vec<u16>,
-    }
-
-    struct FakeServer {
-        connection_file: PathBuf,
-        log: Arc<Mutex<ServerLog>>,
-        _temp: TempDir,
-    }
-
-    async fn fake_server(send_response: Value, stream_events: Vec<Value>) -> FakeServer {
-        let temp = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        let key = generate_key().unwrap();
-        let daemon_id = generate_daemon_id().unwrap();
-        let connection_file = temp.path().join("subc-connection.json");
-        write_atomic(
-            &connection_file,
-            &ConnectionInfo {
-                schema: SCHEMA_VERSION,
-                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
-                endpoints: vec![Endpoint {
-                    host: addr.ip().to_string(),
-                    port: addr.port(),
-                }],
-                key: key.clone(),
-                daemon_id,
-                pid: std::process::id(),
-                daemon_ver: "fake".to_string(),
-            },
-        )
-        .unwrap();
-        let log = Arc::new(Mutex::new(ServerLog::default()));
-        let log_task = Arc::clone(&log);
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            authenticate_server(
-                &mut stream,
-                &key,
-                &daemon_id,
-                "fake",
-                Duration::from_secs(2),
-            )
-            .await
-            .unwrap();
-            let mut next_route = 10u16;
-            let mut route_sessions = std::collections::HashMap::<u16, String>::new();
-            let mut stream_events: VecDeque<Value> = stream_events.into();
-            loop {
-                let Some(frame) = read_frame(&mut stream).await.unwrap() else {
-                    break;
-                };
-                match frame.header.ty {
-                    FrameType::Goodbye => {
-                        log_task.lock().await.goodbyes.push(frame.header.channel);
-                    }
-                    FrameType::Request if frame.header.channel == 0 => {
-                        let req: ClientControlRequest =
-                            serde_json::from_slice(&frame.body).unwrap();
-                        if let ClientControlRequest::RouteOpen { identity, .. } = req {
-                            let route = next_route;
-                            next_route += 1;
-                            route_sessions.insert(route, identity.session.clone());
-                            log_task.lock().await.route_sessions.push(identity.session);
-                            log_task.lock().await.route_harnesses.push(identity.harness);
-                            send_response_frame(
-                                &mut stream,
-                                frame.header.channel,
-                                frame.header.epoch,
-                                frame.header.corr,
-                                serde_json::to_vec(&ClientControlResponse::RouteOpen {
-                                    route_channel: route,
-                                    route_epoch: 1,
-                                })
-                                .unwrap(),
-                            )
-                            .await;
-                        }
-                    }
-                    FrameType::Request => {
-                        let req: Value = serde_json::from_slice(&frame.body).unwrap();
-                        match req.get("method").and_then(Value::as_str) {
-                            Some("session.send") => {
-                                log_task.lock().await.sends.push(req["params"].clone());
-                                log_task.lock().await.send_bodies.push(frame.body.clone());
-                                send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(&send_response).unwrap(),
-                                )
-                                .await;
-                            }
-                            Some("session.subscribe") => {
-                                log_task.lock().await.subscribes.push(req["params"].clone());
-                                while let Some(event) = stream_events.pop_front() {
-                                    send_stream_data(
-                                        &mut stream,
-                                        frame.header.channel,
-                                        frame.header.epoch,
-                                        frame.header.corr,
-                                        event,
-                                    )
-                                    .await;
-                                }
-                                send_stream_end(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                )
-                                .await;
-                            }
-                            Some("run.status") => {
-                                send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(
-                                        &json!({"state":"completed","run_id":"run-1"}),
-                                    )
-                                    .unwrap(),
-                                )
-                                .await;
-                            }
-                            Some("run.cancel") => {
-                                send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(&json!({"ack":true})).unwrap(),
-                                )
-                                .await;
-                            }
-                            other => panic!(
-                                "unexpected request {other:?} on route {:?}",
-                                route_sessions.get(&frame.header.channel)
-                            ),
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-        FakeServer {
-            connection_file,
-            log,
-            _temp: temp,
-        }
-    }
-
-    async fn send_response_frame(
-        stream: &mut TcpStream,
-        channel: u16,
-        epoch: u32,
-        corr: u64,
-        body: Vec<u8>,
-    ) {
-        let frame = Frame::build(
-            FrameType::Response,
-            Flags::new(false, Priority::Interactive, false),
-            channel,
-            epoch,
-            corr,
-            body,
-        )
-        .unwrap();
-        write_frame(stream, &frame).await.unwrap();
-    }
-
-    async fn send_stream_data(
-        stream: &mut TcpStream,
-        channel: u16,
-        epoch: u32,
-        corr: u64,
-        event: Value,
-    ) {
-        let frame = Frame::build(
-            FrameType::StreamData,
-            Flags::new(false, Priority::Interactive, false),
-            channel,
-            epoch,
-            corr,
-            serde_json::to_vec(&event).unwrap(),
-        )
-        .unwrap();
-        write_frame(stream, &frame).await.unwrap();
-    }
-
-    async fn send_stream_end(stream: &mut TcpStream, channel: u16, epoch: u32, corr: u64) {
-        let frame = Frame::build(
-            FrameType::StreamEnd,
-            Flags::new(false, Priority::Interactive, false),
-            channel,
-            epoch,
-            corr,
-            Vec::new(),
-        )
-        .unwrap();
-        write_frame(stream, &frame).await.unwrap();
-    }
-
-    async fn client(server: &FakeServer) -> HistorianProducer {
-        HistorianProducer::connect(HistorianProducerConfig {
-            connection_file: server.connection_file.clone(),
-            project_root: std::env::current_dir().unwrap(),
-            harness: "mc-test".to_string(),
-            module_id: "llm-runner".to_string(),
-            handshake_timeout: Duration::from_secs(2),
-            request_timeout: Duration::from_secs(2),
-            await_timeout: Duration::from_secs(2),
-        })
-        .await
-        .unwrap()
-    }
-
-    /// A fixed post-close sleep races TCP delivery of the second goodbye
-    /// frame; polling for the expected count does not. commentlint: allow(JUDGE)
-    async fn wait_for_goodbyes(server: &FakeServer, expected: usize) {
-        for _ in 0..400 {
-            if server.log.lock().await.goodbyes.len() >= expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("server never observed {expected} goodbye frames");
-    }
-
-    #[tokio::test]
-    async fn start_binds_session_at_route_open_and_omits_session_param() {
-        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
-        let mut client = client(&server).await;
-        let handle = client
-            .start(
-                "mc-historian:proj:1",
-                "role guidance",
-                "prompt",
-                "prov/model-a",
-            )
-            .await
-            .unwrap();
-        assert_eq!(handle.run_id, "run-1");
-        client.close().await.unwrap();
-        wait_for_goodbyes(&server, 1).await;
-
-        let log = server.log.lock().await;
-        assert_eq!(log.route_sessions, vec!["mc-historian:proj:1"]);
-        assert_eq!(log.sends.len(), 1);
-        assert!(
-            log.sends[0].get("session").is_none(),
-            "session id lives in BindIdentity, not params"
-        );
-        assert_eq!(
-            log.sends[0]["model"],
-            json!({ "provider": "prov", "model": "model-a" }),
-            "model is llm-runner's nested ModelParams object, split at the FIRST slash"
-        );
-        assert_eq!(log.sends[0]["tools"], json!([]));
-        assert_eq!(
-            log.sends[0]["generation"]["max_output_tokens"],
-            json!(HISTORIAN_MAX_OUTPUT_TOKENS),
-            "an explicit output budget rides every send: llm-runner's default truncated a real summarization pass"
-        );
-        assert_eq!(
-            log.sends[0]["generation"]["temperature"],
-            json!(HISTORIAN_TEMPERATURE),
-            "the calibrated temperature rides every send: prompt and sampling were calibrated together"
-        );
-        assert_eq!(
-            log.sends[0]["system"],
-            json!("role guidance"),
-            "system rides the role-scoped SendParams field, byte-exact"
-        );
-        assert_eq!(log.goodbyes, vec![10]);
-    }
-
-    #[tokio::test]
-    async fn start_omits_system_param_when_empty() {
-        // Empty means absent on the wire (the field's empty-as-absent rule); omitting it
-        // entirely keeps the send byte-shape identical to pre-system clients.
-        let server = fake_server(json!({"state":"active","run_id":"run-9"}), Vec::new()).await;
-        let mut client = client(&server).await;
-        client
-            .start("mc-historian:proj:9", "", "prompt", "prov/model-a")
-            .await
-            .unwrap();
-        client.close().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let log = server.log.lock().await;
-        assert_eq!(log.sends.len(), 1);
-        assert!(
-            log.sends[0].get("system").is_none(),
-            "empty system must be omitted, not sent as \"\""
-        );
-    }
-
-    #[test]
-    fn unit_text_collects_only_assistant_message_units() {
-        let leaked = json!({
-            "type": "example_replay",
-            "message": {"content": [{"type": "text", "text": "seed output"}]},
-            "text": "flat seed output"
-        });
-        let assistant = json!({
-            "type": "assistant_message",
-            "message": {"content": [{"type": "text", "text": "real output"}]}
-        });
-
-        assert_eq!(unit_text(&leaked), None);
-        assert_eq!(unit_text(&assistant).as_deref(), Some("real output"));
-    }
-
-    #[tokio::test]
-    async fn await_output_uses_control_terminal_not_stream_end() {
-        let terminal_text = r#"<output><compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments><meta><messages_processed>1-1</messages_processed></meta></output>"#;
-        let events = vec![
-            json!({"kind":"display","event":{"type":"text_delta","text":"ignored"}}),
-            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
-            json!({"kind":"control","unit":{"type":"assistant_message","message":{"message_id":"m-1","content":[
-                {"type":"reasoning","text":"planning prose that restates start=\"FIRST\" and walks the seed examples"},
-                {"type":"text","text":terminal_text}
-            ]}}}),
-            json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
-        ];
-        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
-        let mut client = client(&server).await;
-        client
-            .start("mc-historian:proj:2", "", "prompt", "prov/model-a")
-            .await
-            .unwrap();
-        let output = client.await_output("run-1").await.unwrap();
-        client.close().await.unwrap();
-        wait_for_goodbyes(&server, 2).await;
-
-        assert_eq!(output.text, terminal_text);
-        let log = server.log.lock().await;
-        assert_eq!(
-            log.route_sessions,
-            vec!["mc-historian:proj:2", "mc-historian:proj:2"]
-        );
-        assert_eq!(log.subscribes, vec![json!({"from":"start"})]);
-        assert_eq!(
-            log.goodbyes,
-            vec![11, 10],
-            "close releases subscribe and command routes"
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_without_matching_run_started_fails_loud() {
-        let events = vec![
-            json!({"kind":"control","unit":{"type":"run_started","run_id":"other-run"}}),
-            json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
-        ];
-        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
-        let mut client = client(&server).await;
-        client
-            .start("mc-historian:proj:3", "", "prompt", "prov/model-a")
-            .await
-            .unwrap();
-
-        let err = client.await_output("run-1").await.unwrap_err();
-        assert!(matches!(
-            err,
-            HistorianProducerError::TerminalRunMismatch {
-                expected,
-                found: Some(found),
-            } if expected == "run-1" && found == "other-run"
-        ));
-    }
-
-    #[tokio::test]
-    async fn paused_unit_returns_run_paused() {
-        let events = vec![
-            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
-            json!({"kind":"control","unit":{"type":"paused","run_id":"run-1","reason":"auth_required"}}),
-        ];
-        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
-        let mut client = client(&server).await;
-        client
-            .start("mc-historian:proj:4", "", "prompt", "prov/model-a")
-            .await
-            .unwrap();
-
-        let err = client.await_output("run-1").await.unwrap_err();
-        assert!(matches!(
-            err,
-            HistorianProducerError::RunPaused {
-                run_id,
-                reason: Some(reason),
-                ..
-            } if run_id == "run-1" && reason == "auth_required"
-        ));
-    }
-    #[test]
-    fn run_state_mapping_is_closed_over_the_exact_wire_vocabulary() {
-        let state = |state: &str| {
-            classify_run_state("run-1", &json!({ "run_id": "run-1", "state": state }))
-        };
-        assert!(matches!(state("queued"), Ok(RunState::Active)));
-        assert!(matches!(state("running"), Ok(RunState::Active)));
-        assert!(matches!(state("completed"), Ok(RunState::Terminal)));
-        assert!(matches!(state("failed"), Ok(RunState::Terminal)));
-        assert!(matches!(state("cancelled"), Ok(RunState::Terminal)));
-        assert!(matches!(state("missing"), Ok(RunState::Missing { .. })));
-        for undocumented in [
-            "terminal",
-            "active",
-            "finished",
-            "interrupted",
-            "paused",
-            "pending",
-            "COMPLETED",
-            "Running",
-            "cancel",
-            "error",
-            "",
-        ] {
-            assert!(
-                matches!(
-                    state(undocumented),
-                    Err(HistorianProducerError::Protocol(_))
-                ),
-                "state {undocumented:?} must be a protocol error, not a guessed recovery state"
-            );
-        }
-        assert!(matches!(
-            classify_run_state("run-1", &json!({ "run_id": "run-1" })),
-            Err(HistorianProducerError::Protocol(_))
-        ));
-        assert!(matches!(
-            classify_run_state("run-1", &json!({ "run_id": "other", "state": "completed" })),
-            Err(HistorianProducerError::Protocol(_))
-        ));
-        // A response that names no run has not been proven to describe this
-        // one; reading it as `missing` would authorize a refire.
-        assert!(matches!(
-            classify_run_state("run-1", &json!({ "state": "missing" })),
-            Err(HistorianProducerError::Protocol(_))
-        ));
-    }
-
-    #[test]
-    fn cleanup_helper_preserves_primary_and_cleanup_diagnostics() {
-        assert_eq!(
-            with_cleanup(Ok(7), Ok(()), "session.delete").unwrap(),
-            7,
-            "clean success stays untouched"
-        );
-
-        let cleanup_only = with_cleanup(
-            Ok(7),
-            Err(HistorianProducerError::TimedOut),
-            "session.delete",
-        )
-        .unwrap_err();
-        assert!(matches!(
-            &cleanup_only,
-            HistorianProducerError::CleanupFailed { primary: None, .. }
-        ));
-        assert!(cleanup_only
-            .to_string()
-            .contains("session.delete cleanup failed after success"));
-
-        let both = with_cleanup::<()>(
-            Err(HistorianProducerError::tagged_subc(
-                "provider_error",
-                "rate limit window",
-                ErrorClass::Transient,
-                Some(9),
-            )),
-            Err(HistorianProducerError::TimedOut),
-            "session.delete",
-        )
-        .unwrap_err();
-        assert_eq!(
-            both.classification(),
-            Some(ErrorClassification {
-                class: ErrorClass::Transient,
-                retry_after_secs: Some(9),
-            }),
-            "retry policy must keep following the primary failure"
-        );
-        assert!(both.has_class_field());
-        let rendered = both.to_string();
-        assert!(rendered.contains("rate limit window"));
-        assert!(rendered.contains("cleanup also failed"));
-
-        assert!(matches!(
-            attach_cleanup(HistorianProducerError::TimedOut, Ok(()), "session.delete"),
-            HistorianProducerError::TimedOut
-        ));
-    }
-
-    #[tokio::test]
-    async fn replay_preserves_length_finish_reason_on_assistant_steps() {
-        let events = vec![
-            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
-            json!({"kind":"control","unit":{"type":"assistant_message","run_id":"run-1","finish_reason":"length","message":{"role":"assistant","content":[{"type":"text","text":"partial output"}]}}}),
-            json!({"kind":"control","unit":{"type":"run_finished","run_id":"run-1","finish_reason":"completed"}}),
-        ];
-        let server = fake_server(json!({"run_id":"run-1"}), events).await;
-        let mut client = client(&server).await;
-        client
-            .start("mc-historian:proj:5", "", "prompt", "prov/model-a")
-            .await
-            .unwrap();
-
-        let output = client.await_output("run-1").await.unwrap();
-        assert_eq!(output.text, "partial output");
-        assert!(
-            output.length_capped,
-            "a length-class step finish reason must survive a completed terminal"
-        );
-    }
-
-    #[tokio::test]
-    async fn replay_retains_error_class_and_retry_delay_from_the_terminal() {
-        let events = vec![
-            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
-            json!({"kind":"control","unit":{"type":"error","run_id":"run-1","error":{"class":"transient","message":"rate limited","retry_after_secs":42,"provider_code":"rate_limit"}}}),
-        ];
-        let server = fake_server(json!({"run_id":"run-1"}), events).await;
-        let mut client = client(&server).await;
-        client
-            .start("mc-historian:proj:6", "", "prompt", "prov/model-a")
-            .await
-            .unwrap();
-
-        let err = client.await_output("run-1").await.unwrap_err();
-        let HistorianProducerError::RunFailed {
-            run_id,
-            detail,
-            classification,
-            ..
-        } = err
-        else {
-            panic!("expected RunFailed, got {err:?}");
-        };
-        assert_eq!(run_id, "run-1");
-        assert_eq!(detail, "rate limited");
-        assert_eq!(
-            classification,
-            Some(ErrorClassification {
-                class: ErrorClass::Transient,
-                retry_after_secs: Some(42),
-            })
-        );
-    }
-
-    enum SendAction {
-        Respond(Value),
-        DropConnection,
-        Error(Value),
-    }
-
-    /// Unlike [`fake_server`], keeps accepting connections so a client that
-    /// reconnects after a dropped send reaches the same scripted state.
-    async fn scripted_server(
-        actions: Vec<SendAction>,
-        reject_harness: Option<&'static str>,
-    ) -> FakeServer {
-        let temp = tempfile::tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        let key = generate_key().unwrap();
-        let daemon_id = generate_daemon_id().unwrap();
-        let connection_file = temp.path().join("subc-connection.json");
-        write_atomic(
-            &connection_file,
-            &ConnectionInfo {
-                schema: SCHEMA_VERSION,
-                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
-                endpoints: vec![Endpoint {
-                    host: addr.ip().to_string(),
-                    port: addr.port(),
-                }],
-                key: key.clone(),
-                daemon_id,
-                pid: std::process::id(),
-                daemon_ver: "fake".to_string(),
-            },
-        )
-        .unwrap();
-        let log = Arc::new(Mutex::new(ServerLog::default()));
-        let log_task = Arc::clone(&log);
-        tokio::spawn(async move {
-            let mut actions: VecDeque<SendAction> = actions.into();
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                if authenticate_server(
-                    &mut stream,
-                    &key,
-                    &daemon_id,
-                    "fake",
-                    Duration::from_secs(2),
-                )
-                .await
-                .is_err()
-                {
-                    continue;
-                }
-                let mut next_route = 10u16;
-                'conn: loop {
-                    let frame = match read_frame(&mut stream).await {
-                        Ok(Some(frame)) => frame,
-                        _ => break 'conn,
-                    };
-                    match frame.header.ty {
-                        FrameType::Request if frame.header.channel == 0 => {
-                            let req: ClientControlRequest =
-                                serde_json::from_slice(&frame.body).unwrap();
-                            let ClientControlRequest::RouteOpen { identity, .. } = req else {
-                                continue;
-                            };
-                            log_task
-                                .lock()
-                                .await
-                                .route_sessions
-                                .push(identity.session.clone());
-                            log_task
-                                .lock()
-                                .await
-                                .route_harnesses
-                                .push(identity.harness.clone());
-                            if reject_harness == Some(identity.harness.as_str()) {
-                                send_error_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    json!({
-                                        "code": "unsupported_harness",
-                                        "message": "harness must be opencode or pi",
-                                    }),
-                                )
-                                .await;
-                                continue;
-                            }
-                            let route = next_route;
-                            next_route += 1;
-                            send_response_frame(
-                                &mut stream,
-                                frame.header.channel,
-                                frame.header.epoch,
-                                frame.header.corr,
-                                serde_json::to_vec(&ClientControlResponse::RouteOpen {
-                                    route_channel: route,
-                                    route_epoch: 1,
-                                })
-                                .unwrap(),
-                            )
-                            .await;
-                        }
-                        FrameType::Request => {
-                            let req: Value = serde_json::from_slice(&frame.body).unwrap();
-                            if req.get("method").and_then(Value::as_str) != Some("session.send") {
-                                continue;
-                            }
-                            log_task.lock().await.sends.push(req["params"].clone());
-                            log_task.lock().await.send_bodies.push(frame.body.clone());
-                            match actions.pop_front() {
-                                Some(SendAction::Respond(body)) => {
-                                    send_response_frame(
-                                        &mut stream,
-                                        frame.header.channel,
-                                        frame.header.epoch,
-                                        frame.header.corr,
-                                        serde_json::to_vec(&body).unwrap(),
-                                    )
-                                    .await;
-                                }
-                                Some(SendAction::Error(body)) => {
-                                    send_error_frame(
-                                        &mut stream,
-                                        frame.header.channel,
-                                        frame.header.epoch,
-                                        frame.header.corr,
-                                        body,
-                                    )
-                                    .await;
-                                }
-                                // Dropping the connection leaves the send
-                                // outcome unknown to the client.
-                                Some(SendAction::DropConnection) | None => break 'conn,
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-        FakeServer {
-            connection_file,
-            log,
-            _temp: temp,
-        }
-    }
-
-    async fn send_error_frame(
-        stream: &mut TcpStream,
-        channel: u16,
-        epoch: u32,
-        corr: u64,
-        body: Value,
-    ) {
-        let frame = Frame::build(
-            FrameType::Error,
-            Flags::new(false, Priority::Interactive, false),
-            channel,
-            epoch,
-            corr,
-            serde_json::to_vec(&body).unwrap(),
-        )
-        .unwrap();
-        write_frame(stream, &frame).await.unwrap();
-    }
-
-    async fn scripted_client(server: &FakeServer, harness: &str) -> HistorianProducer {
-        HistorianProducer::connect(HistorianProducerConfig {
-            connection_file: server.connection_file.clone(),
-            project_root: std::env::current_dir().unwrap(),
-            harness: harness.to_string(),
-            module_id: "broca".to_string(),
-            handshake_timeout: Duration::from_secs(2),
-            // Short so the DropConnection scripts fail over quickly.
-            request_timeout: Duration::from_millis(500),
-            await_timeout: Duration::from_secs(2),
-        })
-        .await
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn lost_send_response_reconnects_once_with_byte_identical_body() {
-        let server = scripted_server(
-            vec![
-                SendAction::DropConnection,
-                SendAction::Respond(json!({"run_id":"run-orig"})),
-            ],
-            None,
-        )
-        .await;
-        let mut client = scripted_client(&server, "opencode").await;
-
-        let handle = client
-            .start("ses-recover", "sys", "prompt", "prov/model-a")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            handle.run_id, "run-orig",
-            "the deduplicated resend must surface the original run id"
-        );
-        let log = server.log.lock().await;
-        assert_eq!(log.send_bodies.len(), 2);
-        assert_eq!(
-            log.send_bodies[0], log.send_bodies[1],
-            "recovery must resend the frozen bytes verbatim"
-        );
-        assert_eq!(
-            log.route_sessions,
-            vec!["ses-recover", "ses-recover"],
-            "the rebind must carry the same route identity"
-        );
-        assert_eq!(log.route_harnesses, vec!["opencode", "opencode"]);
-    }
-
-    #[tokio::test]
-    async fn application_send_error_is_not_resent() {
-        let server = scripted_server(
-            vec![SendAction::Error(
-                json!({"code":"idempotency_conflict","message":"different bytes"}),
-            )],
-            None,
-        )
-        .await;
-        let mut client = scripted_client(&server, "opencode").await;
-
-        let err = client
-            .start("ses-conflict", "", "prompt", "prov/model-a")
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            &err,
-            HistorianProducerError::Subc(body) if body.code == "idempotency_conflict"
-        ));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(server.log.lock().await.send_bodies.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn second_unknown_send_outcome_fails_without_a_third_send() {
-        let server = scripted_server(
-            vec![SendAction::DropConnection, SendAction::DropConnection],
-            None,
-        )
-        .await;
-        let mut client = scripted_client(&server, "opencode").await;
-
-        let err = client
-            .start("ses-twice", "", "prompt", "prov/model-a")
-            .await
-            .unwrap_err();
-
-        assert!(send_outcome_unknown(&err), "got {err:?}");
-        // A successful `status` call would prove that `start` reconnected
-        // after the second dropped connection: the scripted server keeps
-        // accepting, so only a client parked on the dead connection fails.
-        let followup = client.status("run-x").await;
-        assert!(
-            followup.is_err(),
-            "the producer must not have reconnected after giving up: {followup:?}"
-        );
-        assert_eq!(server.log.lock().await.send_bodies.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn unsupported_harness_reaches_bind_rejection_untranslated() {
-        let server = scripted_server(Vec::new(), Some("weird")).await;
-        let mut client = scripted_client(&server, "weird").await;
-
-        let err = client
-            .start("ses-weird", "", "prompt", "prov/model-a")
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            &err,
-            HistorianProducerError::Subc(body) if body.code == "unsupported_harness"
-        ));
-        let log = server.log.lock().await;
-        assert_eq!(
-            log.route_harnesses,
-            vec!["weird"],
-            "the harness value must reach the bind untranslated"
-        );
-        assert!(log.send_bodies.is_empty(), "a rejected bind must not send");
-    }
-
-    #[tokio::test]
-    async fn real_factory_binds_routes_with_the_route_bound_harness() {
-        let server = scripted_server(
-            vec![
-                SendAction::Respond(json!({"run_id":"run-oc"})),
-                SendAction::Respond(json!({"run_id":"run-pi"})),
-            ],
-            None,
-        )
-        .await;
-        let factory = crate::RealHistorianProducerFactory {
-            connection_file: server.connection_file.clone(),
-        };
-        for harness in ["opencode", "pi"] {
-            let mut producer = crate::HistorianProducerFactory::connect(
-                &factory,
-                std::path::Path::new("/proj"),
-                harness,
-            )
-            .await
-            .unwrap();
-            producer
-                .start(&format!("ses-{harness}"), "", "prompt", "prov/model-a")
-                .await
-                .unwrap();
-            producer.close().await.unwrap();
-        }
-        let log = server.log.lock().await;
-        assert_eq!(log.route_harnesses, vec!["opencode", "pi"]);
     }
 }

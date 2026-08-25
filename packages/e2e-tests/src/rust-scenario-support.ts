@@ -3,15 +3,9 @@
  *
  * Gating layers:
  *
- *  1. Prerequisite gating — `rustPrereqs` preflights the hermetic stack (cargo,
- *     the sibling subconscious workspace, a supported platform). A scenario
- *     `describe.skipIf(!rustPrereqs.ok)`s when the stack cannot run, printing the
- *     reason so CI logs never green-wash a skipped lane.
+ *  1. Prerequisite gating checks Cargo, workspace metadata, and Unix sockets.
  *
- *  2. Fold-infrastructure readiness — the Rust module runs its own historian and
- *     the hermetic stack now starts a deterministic `broca` management-surface
- *     producer. `foldInfraEnabled()` flips when that producer is booted, so fold
- *     and drop-on-fold scenarios can assert their real outcomes.
+ *  2. Fold scenarios remain gated for broad Rust qualification.
  *
  * The tail-mutation-readopt and park-self-heal scenarios are NOT gated: the P0
  * identity-drift / park-self-heal fix is merged into this branch's base, so they
@@ -35,31 +29,20 @@ export {
 
 export const rustPrereqs = RustTestHarness.detectPrereqs();
 
-/** True once the hermetic deterministic Broca producer is registered. */
 export function foldInfraEnabled(): boolean {
     return process.env.MC_RUST_E2E_FOLD === "1";
 }
 
-/**
- * Legacy reason retained for suites that still report a fold exclusion. The
- * normal Rust harness starts Broca and activates those assertions; only suites
- * that deliberately do not boot the Rust stack should use this text.
- */
 export const FOLD_SKIP_REASON =
-    "requires the Rust harness's hermetic Broca producer; this suite does not boot that stack";
+    "requires broad Rust fold qualification beyond the focused direct backend fixture";
 
 /** Enable the duplicate-ID regression only when the stack can produce the selection refresh needed to reproduce duplicate IDs. */
 export function duplicateIdInfraEnabled(): boolean {
     return process.env.MC_RUST_E2E_DUPLICATE_IDS === "1";
 }
 
-/**
- * The hermetic stack has no broca runner, so it cannot complete the historian-backed
- * selection bust that consumes a queued ctx_reduce drop. Keep the assertion body
- * available for a provisioned runner instead of reporting a false green pass.
- */
 export const DUPLICATE_ID_SKIP_REASON =
-    "requires a broca-capable hermetic stack to reach the queued-drop selection bust (set MC_RUST_E2E_DUPLICATE_IDS=1 once that runner is provisioned)";
+    "requires broad duplicate-ID qualification beyond the focused direct backend fixture";
 
 /**
  * Print a one-line skip notice. Call from a gated scenario's single `it` so the

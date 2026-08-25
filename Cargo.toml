@@ -1,7 +1,3 @@
-# Magic Context Rust workspace — the harness-agnostic MC module (CK-in / CK-out)
-# that runs under the subc daemon. Lives in-repo alongside the bun `packages/`
-# (the session/tooling is cwd-bound, and the build needs this repo's cache-stability
-# context); the dashboard's Tauri crate is its own standalone build, excluded here.
 [workspace]
 resolver = "2"
 members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer"]
@@ -18,14 +14,6 @@ cortexkit-cache-core = { path = "../commons/crates/cortexkit-cache-core" }
 cortexkit-store = { path = "../commons/crates/cortexkit-store" }
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
 cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
-
-# subc wire contract + module SDK. Path-deps to the same sibling source so
-# subc-protocol/transport unify with subc-client-rs's transitive use (no [patch]).
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-subc-control = { path = "../subconscious/crates/subc-control" }
-subc-transport = { path = "../subconscious/crates/subc-transport" }
-subc-client-rs = { path = "../subconscious/crates/subc-client-rs" }
-subc-core = { path = "../subconscious/crates/subc-core" }
 
 # Internal crates.
 mc-core = { path = "crates/mc-core" }

@@ -116,7 +116,6 @@ pub enum FallbackReason {
     Unavailable,
     NegotiationVersionMismatch,
     CapabilityVersionMismatch,
-    ConnectionInUse,
 }
 
 impl FallbackReason {
@@ -125,7 +124,6 @@ impl FallbackReason {
             Self::Unavailable => "unavailable",
             Self::NegotiationVersionMismatch => "negotiation_version_mismatch",
             Self::CapabilityVersionMismatch => "capability_version_mismatch",
-            Self::ConnectionInUse => "connection_in_use",
         }
     }
 
@@ -134,7 +132,6 @@ impl FallbackReason {
             "unavailable" => Some(Self::Unavailable),
             "negotiation_version_mismatch" => Some(Self::NegotiationVersionMismatch),
             "capability_version_mismatch" => Some(Self::CapabilityVersionMismatch),
-            "connection_in_use" => Some(Self::ConnectionInUse),
             _ => None,
         }
     }

@@ -673,7 +673,7 @@ export const MagicContextConfigSchema = z
             .enum(["ts", "rust"])
             .default("ts")
             .describe(
-                'Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); "ts" is the current TypeScript pipeline.',
+                'Experimental: routes the project through the direct mc-host Rust runtime (requires user-level host connection config); "ts" is the current TypeScript pipeline.',
             ),
         auto_update: z
             .boolean()

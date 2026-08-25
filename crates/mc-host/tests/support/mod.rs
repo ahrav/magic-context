@@ -666,7 +666,13 @@ impl TestHost {
     pub async fn client(&self) -> raw_client::RawClient {
         raw_client::RawClient::connect(&self.info)
             .await
-            .expect("authenticated connection")
+            .expect("negotiated connection")
+    }
+
+    pub async fn setup_client(&self) -> raw_client::RawClient {
+        raw_client::RawClient::connect_setup_only(&self.info)
+            .await
+            .expect("setup-only connection")
     }
 
     /// Signals shutdown and returns the runtime's result.

@@ -121,7 +121,7 @@ export interface FrameChannelStats {
 export interface FrameChannel {
     /**
      * Synchronously admit one data frame to the single logical writer.
-     * Throws a `not_sent` `SubcCallError` (`writer_queue_full`,
+     * Throws a `not_sent` `McHostCallError` (`writer_queue_full`,
      * `memory_cap`, or `channel_closed`) when admission is refused; a
      * refusal changes no channel state.
      */

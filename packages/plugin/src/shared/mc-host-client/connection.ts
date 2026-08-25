@@ -21,7 +21,7 @@
 
 import { AuthError } from "./auth";
 import { armExpiryTimer, type Deadline } from "./deadline";
-import { SocketClosedError, SocketTimeoutError, SubcCallError } from "./errors";
+import { SocketClosedError, SocketTimeoutError, McHostCallError } from "./errors";
 import {
     ByteBudget,
     type FrameChannelCloseReason,
@@ -348,34 +348,34 @@ export class ConnectionGeneration {
     /**
      * Synchronously admit one Request to the channel's writer FIFO and
      * allocate its correlation with admission (KTD7), so writer-enqueue
-     * order equals correlation order. Throws a `not_sent` SubcCallError
+     * order equals correlation order. Throws a `not_sent` McHostCallError
      * when admission is refused; nothing was allocated or queued in that
      * case.
      */
     request(params: RequestParams): PendingRequest {
         if (this.retiredInfo) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 `connection generation is retired (${this.retiredInfo.reason})`,
                 "connection_retired",
             );
         }
         if (this.phase !== "frames") {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "connection generation has not completed setup",
                 "connection_not_ready",
             );
         }
         if (this.corrExhausted) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "correlation space exhausted after u64::MAX; retire the generation",
                 "correlations_exhausted",
             );
         }
         if (params.deadline.isExpired()) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "request deadline expired before queue admission",
                 "deadline_expired",
@@ -532,7 +532,7 @@ export class ConnectionGeneration {
                 entry.callerSettled = true;
                 if (entry.writeInvoked) {
                     entry.reject(
-                        new SubcCallError(
+                        new McHostCallError(
                             "outcome_unknown",
                             `connection generation retired (${reason}) after a possible send`,
                             "generation_retired",
@@ -541,7 +541,7 @@ export class ConnectionGeneration {
                     );
                 } else {
                     entry.reject(
-                        new SubcCallError(
+                        new McHostCallError(
                             "not_sent",
                             `connection generation retired (${reason}) before any byte was written`,
                             "generation_retired",
@@ -732,7 +732,7 @@ export class ConnectionGeneration {
             } else {
                 this.settleCallerReject(
                     entry,
-                    new SubcCallError(
+                    new McHostCallError(
                         "terminal",
                         "unary request received a stream; the sequence was drained privately",
                         "unexpected_stream",
@@ -742,7 +742,7 @@ export class ConnectionGeneration {
         } else if (entry.mode === "unary" && entry.sawStream) {
             this.settleCallerReject(
                 entry,
-                new SubcCallError(
+                new McHostCallError(
                     "terminal",
                     "unary request received a stream before its Response",
                     "unexpected_stream",
@@ -766,7 +766,7 @@ export class ConnectionGeneration {
             if (!entry.writeInvoked && this.cancelQueuedFrame(entry)) {
                 this.settleCallerReject(
                     entry,
-                    new SubcCallError(
+                    new McHostCallError(
                         "not_sent",
                         "route closed by host before any request byte was written",
                         "route_gone",
@@ -775,7 +775,7 @@ export class ConnectionGeneration {
             } else {
                 this.settleCallerReject(
                     entry,
-                    new SubcCallError(
+                    new McHostCallError(
                         "outcome_unknown",
                         "route closed by host (route Goodbye) before a matching terminal",
                         "route_gone",
@@ -862,7 +862,7 @@ export class ConnectionGeneration {
         if (!entry.writeInvoked && this.cancelQueuedFrame(entry)) {
             this.settleCallerReject(
                 entry,
-                new SubcCallError(
+                new McHostCallError(
                     "not_sent",
                     "request deadline expired before any byte was written",
                     "deadline_expired",
@@ -871,7 +871,7 @@ export class ConnectionGeneration {
         } else {
             this.settleCallerReject(
                 entry,
-                new SubcCallError(
+                new McHostCallError(
                     "outcome_unknown",
                     "request deadline expired after a possible send without a terminal",
                     "deadline_expired",
@@ -895,7 +895,7 @@ export class ConnectionGeneration {
         if (!entry.writeInvoked && this.cancelQueuedFrame(entry)) {
             this.settleCallerReject(
                 entry,
-                new SubcCallError(
+                new McHostCallError(
                     "not_sent",
                     "request aborted before any byte was written",
                     "aborted",
@@ -906,7 +906,7 @@ export class ConnectionGeneration {
         }
         this.settleCallerReject(
             entry,
-            new SubcCallError(
+            new McHostCallError(
                 "outcome_unknown",
                 "request aborted after a possible send without a terminal",
                 "aborted",

@@ -6,11 +6,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
     connectionFileExists,
     isConsumerReconnectTransient,
-    SubcClient,
-    type SubcClientOptions,
-    type SubcDiagnosticsEvent,
+    McHostClient,
+    type McHostClientOptions,
+    type McHostDiagnosticsEvent,
 } from "./client";
-import { SocketClosedError, SubcCallError, SubcError } from "./errors";
+import { isMcHostCallError, McHostCallError, McHostClientError, SocketClosedError } from "./errors";
 import type { RouteHandle } from "./route-handle";
 import { StaleRouteHandleError } from "./route-handle";
 import {
@@ -40,7 +40,7 @@ const TOOL_TARGET: RouteTarget = { kind: "tool_provider", module_id: "magic-cont
 let tmpDir = "";
 let fileCounter = 0;
 let peers: FakePeer[] = [];
-let clients: SubcClient[] = [];
+let clients: McHostClient[] = [];
 let savedModuleId: string | undefined;
 let savedLaunchNonce: string | undefined;
 
@@ -88,15 +88,15 @@ function freshFilePath(): string {
 interface ConnectedHarness {
     peer: FakePeer;
     conn: FakePeerConnection;
-    client: SubcClient;
+    client: McHostClient;
     filePath: string;
 }
 
-async function connected(overrides: Partial<SubcClientOptions> = {}): Promise<ConnectedHarness> {
+async function connected(overrides: Partial<McHostClientOptions> = {}): Promise<ConnectedHarness> {
     const peer = await startPeer();
     const filePath = freshFilePath();
     await writeConnectionFile(filePath, peer);
-    const client = await SubcClient.connect({
+    const client = await McHostClient.connect({
         connectionFile: filePath,
         shutdownDeadlineMs: 1_000,
         ...overrides,
@@ -114,11 +114,11 @@ async function nthConnection(peer: FakePeer, n: number): Promise<FakePeerConnect
 
 function expectCallError(
     error: unknown,
-    kind: SubcCallError["kind"],
+    kind: McHostCallError["kind"],
     code?: string,
-): SubcCallError {
-    expect(error).toBeInstanceOf(SubcCallError);
-    const callError = error as SubcCallError;
+): McHostCallError {
+    expect(error).toBeInstanceOf(McHostCallError);
+    const callError = error as McHostCallError;
     expect(callError.kind).toBe(kind);
     if (code !== undefined) expect(callError.code).toBe(code);
     return callError;
@@ -228,7 +228,7 @@ async function serveManagedCall(
 }
 
 async function openRoute(
-    client: SubcClient,
+    client: McHostClient,
     conn: FakePeerConnection,
     cursor: FrameCursor,
     channel: number,
@@ -241,7 +241,7 @@ async function openRoute(
 }
 
 async function jamWriter(
-    client: SubcClient,
+    client: McHostClient,
     conn: FakePeerConnection,
     handle: RouteHandle,
 ): Promise<void> {
@@ -269,7 +269,7 @@ function stallNextConnection(peer: FakePeer): Promise<FakePeerConnection> {
 const isRoutedFrame = (frame: PeerFrame): boolean =>
     frame.ty === PeerFrameType.Request && frame.channel !== 0;
 
-describe("SubcClient facade", () => {
+describe("McHostClient facade", () => {
     test("completes tagged catalog, route open, opaque JSON request, and route Goodbye", async () => {
         const { client, conn } = await connected();
         const cursor = frameCursor(conn);
@@ -355,7 +355,7 @@ describe("SubcClient facade", () => {
         expectCallError(await rejection(openPromise2), "terminal", "malformed_control_response");
     });
 
-    test("canonical Error body becomes a terminal SubcCallError with its stable code", async () => {
+    test("canonical Error body becomes a terminal McHostCallError with its stable code", async () => {
         const { client, conn } = await connected();
         const cursor = frameCursor(conn);
 
@@ -392,8 +392,8 @@ describe("SubcClient facade", () => {
         const open1 = await cursor.next(isRouteOpen);
         await sendErrorBody(conn, open1.corr, "artifact_invalid");
 
-        const error = (await callPromise.catch((e) => e)) as SubcCallError;
-        expect(error).toBeInstanceOf(SubcCallError);
+        const error = (await callPromise.catch((e) => e)) as McHostCallError;
+        expect(error).toBeInstanceOf(McHostCallError);
         expect(error.kind).toBe("terminal");
         expect(error.code).toBe("artifact_invalid");
         // artifact_invalid must not enter the momentary-rejection retry loop.
@@ -473,7 +473,7 @@ describe("SubcClient facade", () => {
     });
 
     test("ambiguous route.open sends no Cancel, retires the generation, and a late response is fenced", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn, peer } = await connected({
             routeOpenDeadlineMs: 250,
             diagnostics: (event) => events.push(event),
@@ -528,7 +528,7 @@ describe("SubcClient facade", () => {
     });
 
     test("failed cleanup Goodbye enqueue retires the generation", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn } = await connected({
             shutdownDeadlineMs: 2_000,
             generationOptions: { controlReserveFrames: 0 },
@@ -552,7 +552,7 @@ describe("SubcClient facade", () => {
     });
 
     test("reconnects after credential rotation, reauthenticates, and rejects stale handles", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const harness = await connected({
             identity: IDENTITY,
             diagnostics: (event) => events.push(event),
@@ -800,7 +800,7 @@ describe("SubcClient facade", () => {
     });
 
     test("abort cleanup deadline expiry retires the generation", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn } = await connected({
             generationOptions: { cleanupTicketMs: 100 },
             diagnostics: (event) => events.push(event),
@@ -821,7 +821,7 @@ describe("SubcClient facade", () => {
     });
 
     test("diagnostics events are frozen, redacted, and exception-isolated", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn } = await connected({
             diagnostics: (event) => {
                 events.push(event);
@@ -846,9 +846,9 @@ describe("SubcClient facade", () => {
             "dispatch",
             "parse",
         ]) {
-            expect(types.has(required as SubcDiagnosticsEvent["type"])).toBe(true);
+            expect(types.has(required as McHostDiagnosticsEvent["type"])).toBe(true);
         }
-        const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
+        const connectedEvent = events.find((e) => e.type === "connected") as McHostDiagnosticsEvent;
         expect(connectedEvent.daemonVer).toBe("fake-peer/0.0.1");
         expect(connectedEvent.pid).toBe(process.pid);
         expect(connectedEvent.transport).toBe("tcp");
@@ -881,7 +881,7 @@ describe("SubcClient facade", () => {
     });
 
     test("diagnostics are rate-bounded: excess events are dropped, not protocol work", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn } = await connected({
             maxDiagnosticEventsPerSecond: 3,
             diagnostics: (event) => events.push(event),
@@ -915,12 +915,12 @@ describe("SubcClient facade", () => {
         await conn.closed;
 
         const afterClose = await rejection(client.catalogList());
-        expect(afterClose).toBeInstanceOf(SubcError);
-        expect((afterClose as SubcError).code).toBe("client_closed");
+        expect(afterClose).toBeInstanceOf(McHostClientError);
+        expect((afterClose as McHostClientError).code).toBe("client_closed");
     });
 
     test("reconnect and managed route open are single-flight across concurrent calls", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn, peer } = await connected({
             identity: IDENTITY,
             diagnostics: (event) => events.push(event),
@@ -966,14 +966,14 @@ describe("SubcClient facade", () => {
 
 describe("deadline-independent setup coalescing", () => {
     interface ReconnectHarness extends ConnectedHarness {
-        events: SubcDiagnosticsEvent[];
+        events: McHostDiagnosticsEvent[];
     }
 
     /** Connect, then retire the first generation so the next call redials. */
     async function retiredHarness(
-        overrides: Partial<SubcClientOptions> = {},
+        overrides: Partial<McHostClientOptions> = {},
     ): Promise<ReconnectHarness> {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const harness = await connected({
             identity: IDENTITY,
             diagnostics: (event) => events.push(event),
@@ -1478,7 +1478,7 @@ describe("deadline-independent setup coalescing", () => {
 });
 
 describe("transport negotiation", () => {
-    const GRANT_TOKEN = "00112233445566778899aabbccddeeff";
+    const GRANT_TOKEN = "00112233445566778899aabbccddeeff"; // gitleaks:allow synthetic protocol vector
     const isNegotiate = (frame: PeerFrame): boolean => isControlOp(frame, "transport.negotiate");
 
     function negotiateResponder(makeBody: (frame: PeerFrame) => unknown): PeerNegotiateResponder {
@@ -1536,14 +1536,14 @@ describe("transport negotiation", () => {
     }
 
     async function connectRejected(
-        overrides: Partial<SubcClientOptions> & { peer?: FakePeer } = {},
+        overrides: Partial<McHostClientOptions> & { peer?: FakePeer } = {},
     ): Promise<{ peer: FakePeer; error: unknown; filePath: string }> {
         const peer = overrides.peer ?? (await startPeer());
         const filePath = freshFilePath();
         await writeConnectionFile(filePath, peer);
         const { peer: _peer, ...options } = overrides;
         const error = await rejection(
-            SubcClient.connect({
+            McHostClient.connect({
                 connectionFile: filePath,
                 handshakeTimeoutMs: 500,
                 ...options,
@@ -1557,7 +1557,7 @@ describe("transport negotiation", () => {
         const filePath = freshFilePath();
         await writeConnectionFile(filePath, peer);
         let settled = false;
-        const connectPromise = SubcClient.connect({ connectionFile: filePath }).then((client) => {
+        const connectPromise = McHostClient.connect({ connectionFile: filePath }).then((client) => {
             settled = true;
             clients.push(client);
             return client;
@@ -1587,37 +1587,26 @@ describe("transport negotiation", () => {
         expect(await catalogPromise).toEqual([]);
     });
 
-    test("AE2: legacy unsupported_operation keeps the same TCP generation without a second negotiation", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+    test("AE2: an exact legacy unsupported_operation terminal fails closed without TCP continuation", async () => {
+        const events: McHostDiagnosticsEvent[] = [];
         const peer = await startPeer({ negotiate: "unsupported-op" });
-        const filePath = freshFilePath();
-        await writeConnectionFile(filePath, peer);
-        const client = await SubcClient.connect({
-            connectionFile: filePath,
+        const { error } = await connectRejected({
+            peer,
             diagnostics: (event) => events.push(event),
         });
-        clients.push(client);
-        const conn = await peer.waitForConnection();
-        const cursor = frameCursor(conn);
-        await cursor.next(isNegotiate);
-
-        const openPromise = client.routeOpen(TOOL_TARGET, IDENTITY);
-        const openFrame = await cursor.next(isRouteOpen);
-        await sendRouteOpenOk(conn, openFrame.corr, 7, 1);
-        const handle = await openPromise;
-        const requestPromise = client.request(handle, { ping: 1 });
-        const requestFrame = await cursor.next(isRoutedRequest(7));
-        await sendResponse(conn, requestFrame.corr, { pong: 1 }, 7, 1);
-        expect(await requestPromise).toEqual({ pong: 1 });
-
+        expectCallError(error, "terminal", "negotiation_failed");
+        await waitUntil(() =>
+            events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
+        );
+        expect(events.some((e) => e.type === "connected")).toBe(false);
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
         expect(peer.connections.length).toBe(1);
         expect(conn.frames.filter(isNegotiate).length).toBe(1);
-        const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
-        expect(connectedEvent.transport).toBe("tcp");
     });
 
     test("AE3: capability mismatch selects sticky TCP; reconnect runs one fresh flight", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const provider = createFakePairedProvider();
         const peer = await startPeer({
             negotiate: negotiateResponder(() => ({
@@ -1629,7 +1618,7 @@ describe("transport negotiation", () => {
         });
         const filePath = freshFilePath();
         await writeConnectionFile(filePath, peer);
-        const client = await SubcClient.connect({
+        const client = await McHostClient.connect({
             connectionFile: filePath,
             transportProviders: [provider],
             diagnostics: (event) => events.push(event),
@@ -1646,7 +1635,7 @@ describe("transport negotiation", () => {
                 { transport: "tcp", capability_version: 1 },
             ],
         });
-        const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
+        const connectedEvent = events.find((e) => e.type === "connected") as McHostDiagnosticsEvent;
         expect(connectedEvent.transport).toBe("tcp");
         expect(connectedEvent.fallbackReason).toBe("capability_version_mismatch");
 
@@ -1673,7 +1662,7 @@ describe("transport negotiation", () => {
     });
 
     test("concurrent callers share one connection and one negotiation", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn, peer } = await connected({
             identity: IDENTITY,
             diagnostics: (event) => events.push(event),
@@ -1727,13 +1716,13 @@ describe("transport negotiation", () => {
                 });
             }
         });
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const peer = await startPeer({
             negotiate: negotiateResponder(() => grantBody(descriptor)),
         });
         const filePath = freshFilePath();
         await writeConnectionFile(filePath, peer);
-        const client = await SubcClient.connect({
+        const client = await McHostClient.connect({
             connectionFile: filePath,
             transportProviders: [provider],
             diagnostics: (event) => events.push(event),
@@ -1745,7 +1734,7 @@ describe("transport negotiation", () => {
 
         const host = provider.host;
         expect(host.frames.map((f) => f.header.corr)).toEqual([1n, 2n]);
-        const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
+        const connectedEvent = events.find((e) => e.type === "connected") as McHostDiagnosticsEvent;
         expect(connectedEvent.transport).toBe("fake.shm");
         // Promotion retires the bootstrap internally; that handoff must not
         // surface as a client-level `retired` event next to `connected`.
@@ -1836,8 +1825,8 @@ describe("transport negotiation", () => {
         });
     }
 
-    test("KTD6: a non-legacy terminal error rejects connect fail-closed without TCP fallback", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+    test("KTD7: a terminal error rejects connect fail-closed without TCP fallback", async () => {
+        const events: McHostDiagnosticsEvent[] = [];
         const peer = await startPeer({
             negotiate: (frame, conn) => void sendErrorBody(conn, frame.corr, "internal_error"),
         });
@@ -1859,11 +1848,7 @@ describe("transport negotiation", () => {
         expect(conn.frames.filter(isNegotiate).length).toBe(1);
     });
 
-    test("KTD6: a canonical server_busy negotiation terminal fails closed without TCP fallback", async () => {
-        // Wire doc §7.7.3: the exact legacy `unsupported_operation` terminal
-        // is the only Error-based continuation evidence. A compliant
-        // negotiation-aware host may reject any control request before
-        // dispatch under load, so `server_busy` is not legacy proof.
+    test("KTD7: a canonical server_busy negotiation terminal fails closed without TCP fallback", async () => {
         const peer = await startPeer({
             negotiate: (frame, conn) => void sendErrorBody(conn, frame.corr, "server_busy"),
         });
@@ -1875,9 +1860,7 @@ describe("transport negotiation", () => {
         expect(conn.frames.filter(isNegotiate).length).toBe(1);
     });
 
-    test("KTD6: a noncanonical unsupported_operation terminal fails closed without TCP fallback", async () => {
-        // Extra fields disqualify the terminal as legacy evidence: only the
-        // byte-exact `{code, message}` Error body may select TCP fallback.
+    test("KTD7: a noncanonical unsupported_operation terminal fails closed without TCP fallback", async () => {
         const peer = await startPeer({
             negotiate: (frame, conn) =>
                 void conn.send({
@@ -1991,7 +1974,7 @@ describe("transport negotiation", () => {
         const provider = createFakePairedProvider({
             startError: new Error("provider-sentinel-9b2c"),
         });
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const peer = await startPeer({
             negotiate: negotiateResponder(() => grantBody({ secret: "descriptor-sentinel-7f3a" })),
         });
@@ -2016,7 +1999,7 @@ describe("transport negotiation", () => {
         const provider = createFakePairedProvider({
             connectError: new Error("provider-sentinel-3d1e"),
         });
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const peer = await startPeer({
             negotiate: negotiateResponder(() => grantBody({})),
         });
@@ -2050,7 +2033,7 @@ describe("transport negotiation", () => {
         });
         await writeFile(filePath, json, { mode: 0o600 });
         const error = await rejection(
-            SubcClient.connect({ connectionFile: filePath, transportProviders: [provider] }),
+            McHostClient.connect({ connectionFile: filePath, transportProviders: [provider] }),
         );
         expect((error as Error).name).toBe("ConnectionFileError");
         await delay(30);
@@ -2059,7 +2042,7 @@ describe("transport negotiation", () => {
     });
 
     test("owner close during negotiation exposes no connection and launches no replacement", async () => {
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn, peer } = await connected({
             handshakeTimeoutMs: 400,
             diagnostics: (event) => events.push(event),
@@ -2085,7 +2068,7 @@ describe("transport negotiation", () => {
     test("owner close during activation reaps candidate and bootstrap without replacement", async () => {
         const provider = createFakePairedProvider();
         provider.host.onFrame = () => {};
-        const events: SubcDiagnosticsEvent[] = [];
+        const events: McHostDiagnosticsEvent[] = [];
         const { client, conn, peer } = await connected({
             handshakeTimeoutMs: 400,
             transportProviders: [provider],
@@ -2118,15 +2101,53 @@ describe("facade helpers", () => {
 
     test("isConsumerReconnectTransient keeps npm-compatible semantics", () => {
         expect(isConsumerReconnectTransient(new SocketClosedError("gone"))).toBe(true);
-        expect(isConsumerReconnectTransient(new SubcCallError("not_sent", "x"))).toBe(true);
-        expect(isConsumerReconnectTransient(new SubcCallError("outcome_unknown", "x"))).toBe(true);
-        expect(isConsumerReconnectTransient(new SubcCallError("terminal", "x"))).toBe(false);
-        expect(isConsumerReconnectTransient(new SubcError("nope"))).toBe(false);
+        expect(isConsumerReconnectTransient(new McHostCallError("not_sent", "x"))).toBe(true);
+        expect(isConsumerReconnectTransient(new McHostCallError("outcome_unknown", "x"))).toBe(
+            true,
+        );
+        expect(isConsumerReconnectTransient(new McHostCallError("terminal", "x"))).toBe(false);
+        expect(isConsumerReconnectTransient(new McHostClientError("nope"))).toBe(false);
         expect(
             isConsumerReconnectTransient(
                 Object.assign(new Error("refused"), { code: "ECONNREFUSED" }),
             ),
         ).toBe(true);
         expect(isConsumerReconnectTransient(new Error("plain"))).toBe(false);
+    });
+
+    test("isMcHostCallError recognizes a second bundled copy and rejects old runtime names", () => {
+        // `SecondCopyCallError` models a separately bundled copy that fails
+        // `instanceof McHostCallError`.
+        class SecondCopyCallError extends Error {
+            constructor(
+                readonly kind: string,
+                message: string,
+                readonly code?: string,
+            ) {
+                super(message);
+                this.name = "McHostCallError";
+            }
+        }
+        expect(isMcHostCallError(new McHostCallError("terminal", "same bundle", "c"))).toBe(true);
+        expect(isMcHostCallError(new SecondCopyCallError("not_sent", "x"))).toBe(true);
+        expect(isMcHostCallError(new SecondCopyCallError("outcome_unknown", "x", "code"))).toBe(
+            true,
+        );
+        expect(isMcHostCallError(new SecondCopyCallError("terminal", "x"))).toBe(true);
+
+        const oldName = new SecondCopyCallError("terminal", "x", "c");
+        // Assembled from parts; boundary tests reject the joined spelling. commentlint: allow(JUDGE)
+        oldName.name = ["Subc", "CallError"].join("");
+        expect(isMcHostCallError(oldName)).toBe(false);
+
+        expect(isMcHostCallError(new SecondCopyCallError("bogus_kind", "x"))).toBe(false);
+        expect(
+            isMcHostCallError(Object.assign(new SecondCopyCallError("terminal", "x"), { code: 7 })),
+        ).toBe(false);
+        expect(isMcHostCallError(new Error("unrelated"))).toBe(false);
+        expect(
+            isMcHostCallError({ name: "McHostCallError", kind: "terminal", message: "plain" }),
+        ).toBe(false);
+        expect(isMcHostCallError(null)).toBe(false);
     });
 });

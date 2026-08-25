@@ -31,7 +31,7 @@ export const MAX_CONNECTION_FILE_LEN = 65_536;
 export const CONNECTION_FILE_SCHEMA = 1;
 export const KEY_LEN = 32;
 export const DAEMON_ID_LEN = 16;
-/** Absent means fixed v2; any present value other than 2 fails closed. */
+/** Required in every connection file; any value other than 2 fails closed. */
 export const WIRE_VERSION = 2;
 
 export type ConnectionFileErrorCode =
@@ -311,7 +311,7 @@ function invalid(code: ConnectionFileErrorCode, message: string): ConnectionFile
 
 /**
  * Validate the decoded JSON against wire doc Section 4.1: schema 1,
- * absent-or-2 wire version, first endpoint exactly `127.0.0.1` with a port
+ * a required wire version of exactly 2, first endpoint exactly `127.0.0.1` with a port
  * in `1..=65535`, exactly 32 key bytes, exactly 16 daemon-ID bytes, a safe
  * integer PID, and a nonempty daemon version. No coercion anywhere.
  */
@@ -323,10 +323,10 @@ function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
     if (record.schema !== CONNECTION_FILE_SCHEMA) {
         throw invalid("invalid_schema", `connection file schema must be ${CONNECTION_FILE_SCHEMA}`);
     }
-    if ("wire_version" in record && record.wire_version !== WIRE_VERSION) {
+    if (record.wire_version !== WIRE_VERSION) {
         throw invalid(
             "invalid_wire_version",
-            `connection file wire_version must be absent or exactly ${WIRE_VERSION}`,
+            `connection file wire_version must be exactly ${WIRE_VERSION}`,
         );
     }
     const endpoints = record.endpoints;

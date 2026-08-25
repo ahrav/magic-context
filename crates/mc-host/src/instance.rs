@@ -16,7 +16,7 @@ use rustix::fs::{
     flock, fsync, mkdirat, openat, renameat, unlinkat, AtFlags, FlockOperation, Mode, OFlags, CWD,
 };
 
-use subc_transport::{ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
+use crate::connection_file::{ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
 
 /// Canonical publication name inside the runtime directory (protocol §4.1).
 pub const CONNECTION_FILE_NAME: &str = "subc-connection.json";
@@ -216,7 +216,7 @@ impl InstanceGuard {
     pub fn publish(&mut self, port: u16, daemon_ver: &str) -> Result<(), InstanceError> {
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
-            wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+            wire_version: crate::wire::PROTOCOL_VERSION,
             endpoints: vec![Endpoint {
                 host: "127.0.0.1".to_owned(),
                 port,

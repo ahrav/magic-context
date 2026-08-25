@@ -280,15 +280,14 @@ describe("snapshot JSON validation", () => {
         await writeInvalid(noSchema, "invalid_schema");
     });
 
-    test("accepts an absent wire_version and rejects any non-2 value", async () => {
+    test("requires wire_version to be exactly 2 and rejects every other value", async () => {
         const absent = validJson();
         delete absent.wire_version;
-        const filePath = freshPath("no-wire-version.json");
-        await writePrivateFile(filePath, JSON.stringify(absent));
-        const snapshot = await readConnectionFile(filePath, options());
-        expect(snapshot.endpoint.port).toBe(43_123);
+        await writeInvalid(absent, "invalid_wire_version");
         await writeInvalid(validJson({ wire_version: 3 }), "invalid_wire_version");
         await writeInvalid(validJson({ wire_version: null }), "invalid_wire_version");
+        await writeInvalid(validJson({ wire_version: "2" }), "invalid_wire_version");
+        await writeInvalid(validJson({ wire_version: 1 }), "invalid_wire_version");
     });
 
     test("rejects hostnames, wildcard, IPv6, and invalid ports", async () => {

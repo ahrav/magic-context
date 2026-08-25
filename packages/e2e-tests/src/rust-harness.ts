@@ -1,21 +1,11 @@
 /**
- * RustTestHarness — facade for the Rust-mode (ck-mc over subc) e2e lane.
+ * RustTestHarness drives OpenCode through U5's directly composed mc-host fixture.
  *
- * Reuses the OpenCode e2e machinery UNCHANGED — the mock Anthropic provider and
- * the `opencode serve` subprocess + SDK session driving — and layers on the two
- * things Rust mode needs that the TS lane does not:
+ * Fixture and OpenCode share one isolated data root. Fixture starts before
+ * OpenCode so plugin discovery reaches a published, authenticated host.
+ * OpenCode restarts preserve database and module-store state.
  *
- *   1. a hermetic subc daemon + ck-mc module (HermeticSubcStack) whose
- *      connection file is placed where the plugin's Rust client already looks
- *      (`${dataDir}/cortexkit/run/subc-connection.json`), and
- *   2. serve RESTART support that keeps the same data dir (opencode.db +
- *      context.db + module store all survive), for the cold-start-drop-seed and
- *      module-restart scenarios.
- *
- * Boot order matters: the env is allocated first so the daemon can write its
- * connection file BEFORE opencode boots and the plugin's first transform runs.
- *
- * Assertion surface: wire captures come from the fake provider's full request
+ * Assertion surface: wire captures come from the model mock's full request
  * bodies (the same source the TS lane asserts on). Rust transform decisions are
  * ALSO surfaced from the plugin diagnostic log (redirected per-suite via
  * MAGIC_CONTEXT_LOG_PATH) as a secondary signal — `readRustPasses()` parses the
@@ -33,11 +23,11 @@ import {
     spawnOpencode,
 } from "./opencode-runner/spawn";
 import {
-    buildHermeticBinaries,
+    buildDirectHostFixture,
     detectRustModePrereqs,
-    HermeticSubcStack,
+    HermeticMcHostStack,
     type RustModePrereqs,
-} from "./rust-runner/hermetic-subc";
+} from "./rust-runner/hermetic-mc-host";
 
 export interface RustTestHarnessOptions {
     /** magic-context USER-tier config overrides (thresholds, memory, etc.). */
@@ -49,19 +39,13 @@ export interface RustTestHarnessOptions {
     /** Default response used when the mock queue is empty. */
     mockDefault?: MockResponse;
     /**
-     * Start opencode in TS mode instead of Rust mode. The hermetic daemon still
+     * Start opencode in TS mode instead of Rust mode. Direct host still
      * runs (so a later `restart({ rust: true })` can flip to Rust against the
      * same data dir) but the plugin transforms in TS on this boot. Used by the
      * cold-start-drop-seed scenario to build TS-mode state, then restart in Rust.
      * Default: false (boot straight into Rust mode).
      */
     startInTsMode?: boolean;
-    /**
-     * Start the deterministic Broca producer. Disable it only when a scenario
-     * must observe module state before any historian publication can supersede it.
-     * Default: true.
-     */
-    startHistorianProducer?: boolean;
 }
 
 export interface SdkClient {
@@ -123,72 +107,62 @@ export interface RustPassLine {
 export class RustTestHarness {
     readonly mock: MockProvider;
     readonly env: IsolatedEnv;
-    readonly subc: HermeticSubcStack;
+    readonly mcHost: HermeticMcHostStack;
     readonly logPath: string;
 
     private opencodeInstance: SpawnedOpencode;
     private clientInstance: SdkClient;
     private contextDbCached: Database | null = null;
     private modelContextLimit: number | undefined;
-    private mockDefault: MockResponse;
     private readonly mockBaseURL: string;
 
     private constructor(args: {
         mock: MockProvider;
         mockBaseURL: string;
         env: IsolatedEnv;
-        subc: HermeticSubcStack;
+        mcHost: HermeticMcHostStack;
         opencode: SpawnedOpencode;
         client: SdkClient;
         logPath: string;
         modelContextLimit: number | undefined;
-        mockDefault: MockResponse;
     }) {
         this.mock = args.mock;
         this.mockBaseURL = args.mockBaseURL;
         this.env = args.env;
-        this.subc = args.subc;
+        this.mcHost = args.mcHost;
         this.opencodeInstance = args.opencode;
         this.clientInstance = args.client;
         this.logPath = args.logPath;
         this.modelContextLimit = args.modelContextLimit;
-        this.mockDefault = args.mockDefault;
     }
 
-    /**
-     * Preflight the lane. Cheap and never throws — call it in a describe-level
-     * guard so a machine without cargo / the subconscious sibling / a supported
-     * platform SKIPs with a printed reason instead of failing or hanging.
-     */
+    /** Preflight current repository and Cargo. */
     static detectPrereqs(): RustModePrereqs {
         return detectRustModePrereqs();
     }
 
-    static async create(options: RustTestHarnessOptions = {}): Promise<RustTestHarness> {
+    static async create(
+        options: RustTestHarnessOptions = {},
+    ): Promise<RustTestHarness> {
         const prereqs = detectRustModePrereqs();
-        if (!prereqs.ok || !prereqs.subconsciousRoot) {
+        if (!prereqs.ok) {
             throw new Error(
                 `RustTestHarness prerequisites unmet: ${prereqs.skipReason ?? "unknown"}. ` +
                     "Guard the suite with RustTestHarness.detectPrereqs() and skip instead of creating.",
             );
         }
 
-        const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot);
+        const fixtureBin = await buildDirectHostFixture();
 
         const mock = new MockProvider();
         const { baseURL } = await mock.start();
         const mockDefault = options.mockDefault ?? DEFAULT_MOCK_RESPONSE;
         mock.setDefault(mockDefault);
 
-        // Env first: the daemon must write its connection file into
-        // <dataDir>/cortexkit/run/ before opencode boots and the plugin's Rust
-        // client connects on the first transform.
         const env = createIsolatedEnv();
-        const subc = await HermeticSubcStack.start({
+        const mcHost = await HermeticMcHostStack.start({
             dataDir: env.dataDir,
-            ckMcBin,
-            ckSubcBin,
-            startProducer: options.startHistorianProducer ?? true,
+            fixtureBin,
         });
 
         const logPath = join(env.dataDir, "cortexkit", "magic-context-e2e.log");
@@ -198,30 +172,32 @@ export class RustTestHarness {
             opencode = await RustTestHarness.spawnServe({
                 env,
                 mockURL: baseURL,
-                connectionFile: subc.connectionFile,
+                connectionFile: mcHost.connectionFile,
                 logPath,
                 options,
                 rustMode: !options.startInTsMode,
             });
         } catch (error) {
-            await subc.stop();
+            await mcHost.stop();
             await mock.stop();
             throw error;
         }
 
         const sdk = await import("@opencode-ai/sdk");
-        const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
+        // SAFETY: SdkClient is bounded subset of createOpencodeClient used by this harness.
+        const client = sdk.createOpencodeClient({
+            baseUrl: opencode.url,
+        }) as unknown as SdkClient;
 
         return new RustTestHarness({
             mock,
             mockBaseURL: baseURL,
             env,
-            subc,
+            mcHost,
             opencode,
             client,
             logPath,
             modelContextLimit: options.modelContextLimit,
-            mockDefault,
         });
     }
 
@@ -239,10 +215,7 @@ export class RustTestHarness {
             modelContextLimit: args.options.modelContextLimit,
             openCodeConfigExtra: args.options.openCodeConfigExtra,
             magicContextConfig: args.options.magicContextConfig,
-            // The connection_file value is only used to flip `userTierHasSubc`
-            // true (the resolver gate). The actual transport still reads the
-            // DEFAULT connection path — which this same file happens to be.
-            userSubcConnectionFile: args.connectionFile,
+            userMcHostConnectionFile: args.connectionFile,
             projectMagicContextConfig: {
                 transform_mode: args.rustMode ? "rust" : "ts",
             },
@@ -260,11 +233,16 @@ export class RustTestHarness {
 
     /**
      * Restart `opencode serve` against the SAME data dir (opencode.db, context.db,
-     * module store, and the running daemon all persist). Optionally flip the
+     * module store, and the running direct host all persist). Optionally flip the
      * project transform_mode (ts↔rust) — the cold-start-drop-seed scenario builds
      * TS-mode state then restarts in Rust to prove drop-tag state seeds correctly.
      */
-    async restart(opts: { rust?: boolean; magicContextConfig?: Record<string, unknown> } = {}): Promise<void> {
+    async restart(
+        opts: {
+            rust?: boolean;
+            magicContextConfig?: Record<string, unknown>;
+        } = {},
+    ): Promise<void> {
         if (this.contextDbCached) {
             try {
                 this.contextDbCached.close();
@@ -277,7 +255,7 @@ export class RustTestHarness {
         this.opencodeInstance = await RustTestHarness.spawnServe({
             env: this.env,
             mockURL: this.mockBaseURL,
-            connectionFile: this.subc.connectionFile,
+            connectionFile: this.mcHost.connectionFile,
             logPath: this.logPath,
             options: {
                 modelContextLimit: this.modelContextLimit,
@@ -286,6 +264,7 @@ export class RustTestHarness {
             rustMode: opts.rust ?? true,
         });
         const sdk = await import("@opencode-ai/sdk");
+        // SAFETY: SdkClient is bounded subset of createOpencodeClient used by this harness.
         this.clientInstance = sdk.createOpencodeClient({
             baseUrl: this.opencodeInstance.url,
         }) as unknown as SdkClient;
@@ -317,10 +296,29 @@ export class RustTestHarness {
      */
     ballast(tokens: number): string {
         const words = [
-            "boundary", "historian", "compartment", "schedule", "pressure",
-            "tokens", "window", "publish", "transform", "session", "marker",
-            "budget", "eligible", "protected", "ordinal", "snapshot", "replay",
-            "decision", "threshold", "baseline", "measure", "archive", "deliver",
+            "boundary",
+            "historian",
+            "compartment",
+            "schedule",
+            "pressure",
+            "tokens",
+            "window",
+            "publish",
+            "transform",
+            "session",
+            "marker",
+            "budget",
+            "eligible",
+            "protected",
+            "ordinal",
+            "snapshot",
+            "replay",
+            "decision",
+            "threshold",
+            "baseline",
+            "measure",
+            "archive",
+            "deliver",
         ];
         const target = Math.max(0, Math.round(tokens * 4));
         const parts: string[] = [];
@@ -338,7 +336,7 @@ export class RustTestHarness {
     /**
      * Append persisted messages through OpenCode's production database shape. This keeps
      * large-session transport tests fast while the next prompt still traverses the real
-     * OpenCode → plugin → subc → module path.
+     * OpenCode → plugin → direct host → McHandler path.
      */
     appendSyntheticHistory(
         sessionId: string,
@@ -357,15 +355,21 @@ export class RustTestHarness {
                 .prepare(
                     "SELECT m.data AS message_data, p.data AS part_data FROM message m JOIN part p ON p.message_id = m.id WHERE m.session_id = ? AND json_extract(m.data, '$.role') = 'user' AND json_extract(p.data, '$.type') = 'text' ORDER BY m.time_created DESC LIMIT 1",
                 )
-                .get(sessionId) as { message_data: string; part_data: string } | undefined;
+                .get(sessionId) as
+                | { message_data: string; part_data: string }
+                | undefined;
             if (!templateRow) {
-                throw new Error("synthetic history requires an existing user text message");
+                throw new Error(
+                    "synthetic history requires an existing user text message",
+                );
             }
-            const messageTemplate = JSON.parse(templateRow.message_data) as Record<
+            const messageTemplate = JSON.parse(
+                templateRow.message_data,
+            ) as Record<string, unknown>;
+            const partTemplate = JSON.parse(templateRow.part_data) as Record<
                 string,
                 unknown
             >;
-            const partTemplate = JSON.parse(templateRow.part_data) as Record<string, unknown>;
             const insertMessage = db.prepare(
                 "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
             );
@@ -381,10 +385,15 @@ export class RustTestHarness {
                 timestamp: number,
                 counter: number,
             ): string => {
-                const encoded = ~(BigInt(timestamp) * 0x1000n + BigInt(counter));
+                const encoded = ~(
+                    BigInt(timestamp) * 0x1000n +
+                    BigInt(counter)
+                );
                 const timeBytes = Buffer.alloc(6);
                 for (let byte = 0; byte < timeBytes.length; byte += 1) {
-                    timeBytes[byte] = Number((encoded >> BigInt(40 - 8 * byte)) & 0xffn);
+                    timeBytes[byte] = Number(
+                        (encoded >> BigInt(40 - 8 * byte)) & 0xffn,
+                    );
                 }
                 return `${prefix}_${timeBytes.toString("hex")}${counter.toString(36).padStart(14, "0")}`;
             };
@@ -406,8 +415,9 @@ export class RustTestHarness {
                             id: messageId,
                             sessionID: sessionId,
                             time: {
-                                ...((messageTemplate.time as Record<string, unknown> | undefined) ??
-                                    {}),
+                                ...((messageTemplate.time as
+                                    | Record<string, unknown>
+                                    | undefined) ?? {}),
                                 created: timestamp,
                             },
                         }),
@@ -448,13 +458,17 @@ export class RustTestHarness {
                 ...(options.agent ? { agent: options.agent } : {}),
             },
         });
-        const timeout = new Promise<null>((r) => setTimeout(() => r(null), timeoutMs));
+        const timeout = new Promise<null>((r) =>
+            setTimeout(() => r(null), timeoutMs),
+        );
         const result = await Promise.race([promptPromise, timeout]);
         if (result === null) {
             throw new Error(
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencodeInstance
                     .stderr()
-                    .slice(-2000)}\nmodule log:\n${this.subc.moduleLog().slice(-2000)}`,
+                    .slice(
+                        -2000,
+                    )}\nmc-host log:\n${this.mcHost.hostLog().slice(-2000)}`,
             );
         }
         return result;
@@ -474,10 +488,16 @@ export class RustTestHarness {
     }
 
     /** Fetch the session's messages via the SDK (for choosing a mid-session id to remove). */
-    async listMessages(sessionId: string): Promise<Array<{ info?: { id?: string; role?: string } }>> {
-        const res = await this.clientInstance.session.messages({ path: { id: sessionId } });
+    async listMessages(
+        sessionId: string,
+    ): Promise<Array<{ info?: { id?: string; role?: string } }>> {
+        const res = await this.clientInstance.session.messages({
+            path: { id: sessionId },
+        });
         const data = (res as { data?: unknown }).data;
-        return Array.isArray(data) ? (data as Array<{ info?: { id?: string; role?: string } }>) : [];
+        return Array.isArray(data)
+            ? (data as Array<{ info?: { id?: string; role?: string } }>)
+            : [];
     }
 
     // ── wire captures (from the fake provider) ────────────────────────────────
@@ -486,14 +506,20 @@ export class RustTestHarness {
     mainRequests() {
         return this.mock
             .requests()
-            .filter((r) => JSON.stringify(r.body.system ?? "").includes("## Magic Context"));
+            .filter((r) =>
+                JSON.stringify(r.body.system ?? "").includes(
+                    "## Magic Context",
+                ),
+            );
     }
 
     /** The messages array of the most recent main-agent request. */
     lastMainMessages(): Array<{ role?: string; content?: unknown }> {
         const req = this.mainRequests().at(-1);
         const messages = req?.body.messages;
-        return Array.isArray(messages) ? (messages as Array<{ role?: string; content?: unknown }>) : [];
+        return Array.isArray(messages)
+            ? (messages as Array<{ role?: string; content?: unknown }>)
+            : [];
     }
 
     /**
@@ -521,7 +547,10 @@ export class RustTestHarness {
      * immediately after a prompt returns can miss the just-emitted pass. Polling
      * removes that race without a fixed sleep (the no-sleeps-as-sync rule).
      */
-    async waitForRustPasses(minCount: number, timeoutMs = 15_000): Promise<RustPassLine[]> {
+    async waitForRustPasses(
+        minCount: number,
+        timeoutMs = 15_000,
+    ): Promise<RustPassLine[]> {
         return this.waitFor(
             () => {
                 const passes = this.readRustPasses();
@@ -563,8 +592,12 @@ export class RustTestHarness {
                 wireBuildMs: Number(stageField(body, "wire_build") || "0"),
                 wireMessages: Number(stageField(body, "wire_messages") || "0"),
                 transportMs: Number(stageField(body, "transport") || "0"),
-                transportPages: Number(stageField(body, "transport_pages") || "0"),
-                transportBytes: Number(stageField(body, "transport_bytes") || "0"),
+                transportPages: Number(
+                    stageField(body, "transport_pages") || "0",
+                ),
+                transportBytes: Number(
+                    stageField(body, "transport_bytes") || "0",
+                ),
                 rowVersion: Number(field(body, "row_version") || "0"),
                 raw: line,
             });
@@ -593,14 +626,21 @@ export class RustTestHarness {
     // ── context.db access (plugin state) ──────────────────────────────────────
 
     private contextDbPath(): string {
-        return join(this.env.dataDir, "cortexkit", "magic-context", "context.db");
+        return join(
+            this.env.dataDir,
+            "cortexkit",
+            "magic-context",
+            "context.db",
+        );
     }
 
     contextDb(): Database {
         if (this.contextDbCached) return this.contextDbCached;
         const dbPath = this.contextDbPath();
         if (!existsSync(dbPath)) {
-            throw new Error(`context.db not found at ${dbPath} — plugin may not have initialized yet.`);
+            throw new Error(
+                `context.db not found at ${dbPath} — plugin may not have initialized yet.`,
+            );
         }
         this.contextDbCached = new Database(dbPath, { readonly: true });
         return this.contextDbCached;
@@ -613,7 +653,9 @@ export class RustTestHarness {
     countTagsByStatus(sessionId: string, status: string): number {
         try {
             const row = this.contextDb()
-                .prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ? AND status = ?")
+                .prepare(
+                    "SELECT COUNT(*) AS n FROM tags WHERE session_id = ? AND status = ?",
+                )
                 .get(sessionId, status) as { n: number } | null;
             return row?.n ?? 0;
         } catch {
@@ -640,10 +682,14 @@ export class RustTestHarness {
         const db = new Database(dbPath);
         try {
             const result = db
-                .prepare("UPDATE session_meta SET cache_ttl = ? WHERE session_id = ?")
+                .prepare(
+                    "UPDATE session_meta SET cache_ttl = ? WHERE session_id = ?",
+                )
                 .run(cacheTtl, sessionId) as { changes?: number };
             if (result.changes !== 1) {
-                throw new Error(`session cache TTL update affected ${result.changes ?? 0} rows`);
+                throw new Error(
+                    `session cache TTL update affected ${result.changes ?? 0} rows`,
+                );
             }
         } finally {
             db.close();
@@ -664,14 +710,14 @@ export class RustTestHarness {
             }
             this.contextDbCached = null;
         }
-        // Kill order: opencode (holds the plugin's subc client) → module → daemon.
+        // OpenCode owns client connections, so stop it before fixture.
         try {
             await this.opencodeInstance.kill();
         } catch {
             // ignore
         }
         try {
-            await this.subc.stop();
+            await this.mcHost.stop();
         } catch {
             // ignore
         }
@@ -682,7 +728,10 @@ export class RustTestHarness {
         }
         // Reclaim the per-suite temp tree (best-effort).
         try {
-            rmSync(join(this.env.dataDir, ".."), { recursive: true, force: true });
+            rmSync(join(this.env.dataDir, ".."), {
+                recursive: true,
+                force: true,
+            });
         } catch {
             // ignore
         }
@@ -705,15 +754,32 @@ export function stableSerialize(value: unknown): string {
     return JSON.stringify(stripCacheControl(value));
 }
 
-function stripCacheControl(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(stripCacheControl);
+type CacheStrippedValue =
+    | null
+    | boolean
+    | number
+    | string
+    | CacheStrippedValue[]
+    | { [key: string]: CacheStrippedValue | undefined };
+
+function stripCacheControl(value: unknown): CacheStrippedValue | undefined {
+    if (Array.isArray(value))
+        return value
+            .map(stripCacheControl)
+            .filter((item) => item !== undefined);
     if (value && typeof value === "object") {
-        const out: Record<string, unknown> = {};
+        const out: { [key: string]: CacheStrippedValue | undefined } = {};
         for (const [key, child] of Object.entries(value)) {
             if (key === "cache_control") continue;
             out[key] = stripCacheControl(child);
         }
         return out;
     }
-    return value;
+    if (
+        value === null ||
+        ["boolean", "number", "string"].includes(typeof value)
+    ) {
+        return value as null | boolean | number | string;
+    }
+    return undefined;
 }

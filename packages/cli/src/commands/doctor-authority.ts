@@ -10,7 +10,7 @@ import {
 } from "@magic-context/core/features/magic-context/context-authority";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
-import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
+import { McHostModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
 import { openExistingContextDatabaseForMutation } from "../lib/database-access";
@@ -93,7 +93,7 @@ export async function assertProjectsUseTsAuthority(args: {
 }
 
 function authorityClient(
-    transport: SubcModuleTransport,
+    transport: McHostModuleTransport,
     projectRoot: string,
 ): AuthorityModuleClient {
     return {
@@ -135,7 +135,7 @@ export async function reportAuthorityMarkers(args: {
     } catch {
         // A doctor run must still report the durable fences when cwd identity fails.
     }
-    const transport = new SubcModuleTransport();
+    const transport = new McHostModuleTransport();
     for (const marker of markers) {
         if (marker.project_path !== currentIdentity) {
             args.warn(
@@ -185,7 +185,7 @@ export async function runDoctorDrainAuthority(
             console.log(`No authority_managed marker exists for ${projectPath}.`);
             return 0;
         }
-        const module = authorityClient(new SubcModuleTransport(), projectRoot);
+        const module = authorityClient(new McHostModuleTransport(), projectRoot);
         let drainedAny = false;
         for (const domain of AUTHORITY_DOMAINS) {
             const status = await module.authorityStatus({

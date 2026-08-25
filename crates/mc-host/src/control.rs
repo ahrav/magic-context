@@ -18,9 +18,8 @@ pub const CODE_SERVER_BUSY: &str = "server_busy";
 pub const CODE_CANCELLED: &str = "cancelled";
 pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 
-pub const OP_ROUTE_OPEN: &str = subc_control::ops::ROUTE_OPEN;
-pub const OP_CATALOG_LIST: &str = subc_control::ops::CATALOG_LIST;
-/// `subc_control` does not publish this operation.
+pub const OP_ROUTE_OPEN: &str = "route.open";
+pub const OP_CATALOG_LIST: &str = "catalog.list";
 pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
 pub const OP_TRANSPORT_NEGOTIATE: &str = crate::transport_negotiation::OP_TRANSPORT_NEGOTIATE;
 
@@ -581,10 +580,18 @@ fn serialize_catalog_response(
     Ok(writer.buf.into_boxed_slice())
 }
 
-/// Tagged `route.open` success response, built from the published control
-/// shape so its tag and field names cannot drift.
+#[derive(serde::Serialize)]
+#[serde(tag = "op")]
+enum ClientControlResponse {
+    #[serde(rename = "route.open")]
+    RouteOpen {
+        route_channel: u16,
+        route_epoch: u32,
+    },
+}
+
 pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
-    serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+    serde_json::to_vec(&ClientControlResponse::RouteOpen {
         route_channel: channel,
         route_epoch: epoch,
     })

@@ -130,7 +130,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: duplicate tool-use i
             await h.sendPrompt(sessionId, `queue drop ${dropTag}: ${h.ballast(1_500)}`);
             expect(dropEmitted).toBe(true);
 
-            // Keep both opencode and ck-mc alive with their serialized-output
+            // Keep both opencode and McHandler alive with their serialized-output
             // caches warm, but make the next pass a deterministic cache-busting
             // selection pass by shortening this session's durable cache TTL.
             h.setSessionCacheTtl(sessionId, "1");

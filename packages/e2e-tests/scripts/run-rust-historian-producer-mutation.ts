@@ -7,14 +7,12 @@ type CommandResult = { exit_status: number; output: string };
 
 const e2eRoot = resolve(import.meta.dir, "..");
 const repoRoot = resolve(e2eRoot, "../..");
-const source = resolve(e2eRoot, "src/rust-runner/fake-broca.ts");
-const tierPattern = /<p[1-4]>[\s\S]*?<\/p[1-4]>/g;
+const source = resolve(e2eRoot, "tests/rust-historian-producer.test.ts");
+const oldText = "await h.mcHost.failNextBackendCall();";
+const replacement = "await h.mcHost.backendSuccess();";
 const decoder = new TextDecoder();
 
-function runTest(expectBad: boolean): CommandResult {
-    const env: Record<string, string> = { ...process.env, MC_E2E_MODE: "rust" };
-    if (expectBad) env.MC_RUST_E2E_BROCA_EXPECT_BAD = "1";
-    else delete env.MC_RUST_E2E_BROCA_EXPECT_BAD;
+function runTest(): CommandResult {
     const result = Bun.spawnSync({
         cmd: [
             "bun",
@@ -27,7 +25,7 @@ function runTest(expectBad: boolean): CommandResult {
         cwd: e2eRoot,
         stdout: "pipe",
         stderr: "pipe",
-        env,
+        env: { ...process.env, MC_E2E_MODE: "rust" },
     });
     return {
         exit_status: result.exitCode,
@@ -36,57 +34,52 @@ function runTest(expectBad: boolean): CommandResult {
 }
 
 const before = readFileSync(source, "utf8");
-const matches = before.match(tierPattern) ?? [];
-if (matches.length !== 4) {
-    throw new Error(`RUST_HISTORIAN_BAD_TIER: expected four tier blocks, found ${matches.length}`);
+if (before.split(oldText).length - 1 !== 1) {
+    throw new Error(
+        "RUST_HISTORIAN_TYPED_FAILURE: expected one mutation target",
+    );
 }
-const oldText = matches.join("\n");
-const replacement = "<tier-tags-removed>";
-const after = before.replace(tierPattern, "");
-writeFileSync(source, after);
+writeFileSync(source, before.replace(oldText, replacement));
 let observedFailure: CommandResult;
-let validationProbe: CommandResult;
 try {
-    observedFailure = runTest(false);
-    validationProbe = runTest(true);
+    observedFailure = runTest();
 } finally {
     writeFileSync(source, before);
 }
-const revertedRerun = runTest(false);
+const revertedRerun = runTest();
 if (observedFailure.exit_status === 0) {
-    throw new Error("RUST_HISTORIAN_BAD_TIER: mutation did not redden the validation assertion");
-}
-if (validationProbe.exit_status !== 0) {
-    throw new Error("RUST_HISTORIAN_BAD_TIER: invalid-output probe did not observe the validation failure");
+    throw new Error(
+        "RUST_HISTORIAN_TYPED_FAILURE: mutation did not redden the assertion",
+    );
 }
 if (revertedRerun.exit_status !== 0) {
-    throw new Error("RUST_HISTORIAN_BAD_TIER: reverted producer test did not pass");
+    throw new Error("RUST_HISTORIAN_TYPED_FAILURE: reverted test did not pass");
 }
 
-const record = {
-    drill: "RUST-HISTORIAN-PRODUCER",
-    command: "MC_E2E_MODE=rust bun test --timeout 600000 --max-concurrency=1 tests/rust-historian-producer.test.ts",
-    mutations: [
-        {
-            name: "RUST_HISTORIAN_BAD_TIER",
-            applied_diff: {
-                path: relative(repoRoot, source),
-                before: oldText,
-                after: replacement,
-                changed: before !== after,
-            },
-            observed_failure: observedFailure,
-            validation_probe: validationProbe,
-            reverted_rerun: {
-                ...revertedRerun,
-                status: "pass",
-            },
-            adequacy_finding: null,
-        },
-    ],
-};
 writeFileSync(
     resolve(e2eRoot, "mutations/rust-historian-producer.json"),
-    `${JSON.stringify(record, null, 2)}\n`,
+    `${JSON.stringify(
+        {
+            drill: "RUST-HISTORIAN-DIRECT-BACKEND",
+            command:
+                "MC_E2E_MODE=rust bun test --timeout 600000 --max-concurrency=1 tests/rust-historian-producer.test.ts",
+            mutations: [
+                {
+                    name: "RUST_HISTORIAN_TYPED_FAILURE",
+                    applied_diff: {
+                        path: relative(repoRoot, source),
+                        before: oldText,
+                        after: replacement,
+                        changed: true,
+                    },
+                    observed_failure: observedFailure,
+                    reverted_rerun: { ...revertedRerun, status: "pass" },
+                    adequacy_finding: null,
+                },
+            ],
+        },
+        null,
+        2,
+    )}\n`,
 );
 console.log("wrote mutations/rust-historian-producer.json");

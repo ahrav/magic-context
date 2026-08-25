@@ -1,18 +1,7 @@
-//! The Magic Context subc module.
+//! Magic Context component for `mc-host`.
 //!
-//! Harness-agnostic cache-stability transform: receives already-decoded CK items,
-//! classifies the pass, drives `cortexkit-cache-core` through `mc-core`, and
-//! persists per-session state in the single-writer `mc-store`. Served over the subc
-//! wire via `subc-client-rs`'s `serve` (provider role).
-//!
-//! Lifecycle (handled by `serve`): read `--subc <connection-file>`, authenticate,
-//! send HELLO{manifest}, await HELLO_ACK. [`McHandler::on_hello_ack`] is the storage
-//! seam — it resolves the descriptor (from `ack.storage`, else a local dev path) and
-//! opens the store EXACTLY ONCE (single-writer lease held for the module lifetime).
-//!
-//! Slice-1 scope: the cache-stability spine. `handle` answers `transform` (the
-//! CK-in/CK-out pass: classify → cache-core step → conditional commit), `health`
-//! (proves the store opened), and echoes otherwise.
+//! [`McHandler`] implements the host-owned primary lifecycle, transforms already-decoded
+//! CK items, and persists per-session state in the single-writer `mc-store`.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +13,7 @@ pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
 pub mod decay_render;
+pub mod dispatch;
 pub mod divergence;
 pub mod healing;
 pub mod historian;
@@ -64,10 +54,16 @@ use crate::smart_note_evaluation::{
     SmartNoteEvaluationOutcome, SmartNoteLifecycleState, SmartNoteSelectionCycle,
     SmartNoteSelectionSnapshot,
 };
+use async_trait::async_trait;
 use chrono::{Local, TimeZone};
 use cortexkit_lease::LeaseError;
 use cortexkit_store::StoreError;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+use mc_host::{
+    BindOutcome, CompositeComponent, HealthReport, HealthStatus, HostInit, InitError,
+    ManifestSnapshot, PrimaryComponent, RequestCtx, RequestOutcome, ResourceDeclaration,
+    RouteHandle, RouteIdentity, ShutdownError,
+};
 #[cfg(test)]
 use mc_store::TagNumberRow;
 use mc_store::{
@@ -87,10 +83,9 @@ use mc_store::{
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use subc_client_rs::{
-    async_trait, HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx,
-    RouteBindRequest, RouteHandle,
-};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+use crate::dispatch::{PreparedOutcome, PreparedOutput, PreparedSegment};
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use classify::{
@@ -111,18 +106,7 @@ use scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT;
 use selection::SelKind;
 #[cfg(test)]
 use session_resolver::ResolvedSession;
-use session_resolver::{
-    MissingSessionResolver, RealSessionResolver, SessionResolveError, SessionResolver,
-};
-#[cfg(test)]
-use subc_protocol::manifest::ExecutionMode;
-use subc_protocol::{
-    manifest::{
-        Bindings, Concurrency, ConsumerRole, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
-    },
-    ModuleHelloAckBody, PROTOCOL_VERSION,
-};
+use session_resolver::{MissingSessionResolver, SessionResolveError, SessionResolver};
 #[cfg(test)]
 use transform::ReductionDecision;
 
@@ -262,8 +246,6 @@ impl Default for StoreOpenPolicy {
 struct StoreOpenCoordinator {
     phase: AtomicU8,
     wait_started_at_ms: AtomicU64,
-    cancelled: AtomicBool,
-    cancel: Notify,
     active_waiters: AtomicU64,
     waiter_completed: Notify,
     waiter_starts: AtomicU64,
@@ -275,8 +257,6 @@ impl StoreOpenCoordinator {
         Self {
             phase: AtomicU8::new(STORE_OPEN_IDLE),
             wait_started_at_ms: AtomicU64::new(0),
-            cancelled: AtomicBool::new(false),
-            cancel: Notify::new(),
             active_waiters: AtomicU64::new(0),
             waiter_completed: Notify::new(),
             waiter_starts: AtomicU64::new(0),
@@ -307,11 +287,6 @@ impl StoreOpenCoordinator {
     fn finish_waiter(&self) {
         self.active_waiters.fetch_sub(1, Ordering::AcqRel);
         self.waiter_completed.notify_waiters();
-    }
-
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.cancel.notify_waiters();
     }
 }
 
@@ -796,8 +771,8 @@ struct ModuleStripSeedWire {
     strip_kind: String,
 }
 
-fn state_sync_seq_mismatch_error(expected: u64, found: u64) -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn state_sync_seq_mismatch_error(expected: u64, found: u64) -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "authority_seq_mismatch".to_string(),
         message: json!({
             "code": "authority_seq_mismatch",
@@ -808,8 +783,8 @@ fn state_sync_seq_mismatch_error(expected: u64, found: u64) -> HandlerOutcome {
     }
 }
 
-fn historian_compartment_sync_busy_error(phase: HistorianPhase) -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn historian_compartment_sync_busy_error(phase: HistorianPhase) -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "historian_compartment_sync_busy".to_string(),
         message: json!({
             "code": "historian_compartment_sync_busy",
@@ -911,7 +886,7 @@ struct CompletedStateSyncSeed {
     generation: u64,
     expected_seq: u64,
     total: usize,
-    result: Vec<u8>,
+    result: PreparedOutput,
 }
 
 #[derive(Debug)]
@@ -1037,7 +1012,7 @@ struct CompletedTransformPage {
     transform_id: String,
     generation: u64,
     final_digest: String,
-    result: Vec<u8>,
+    result: PreparedOutput,
 }
 
 #[derive(Debug)]
@@ -2996,11 +2971,14 @@ impl ProjectionCache {
     }
 }
 
-/// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
-/// and the per-route session bindings (route channel → {project, session}).
+/// Host primary for Magic Context. Owns one store lease, full-handle route state,
+/// and every module task admitted during this host incarnation.
 pub struct McHandler {
-    store: Arc<OnceLock<Arc<McStore>>>,
+    store: Arc<Mutex<Option<Arc<McStore>>>>,
     store_open: Arc<StoreOpenCoordinator>,
+    task_admission_open: Mutex<bool>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
     producer_factory: Arc<dyn HistorianProducerFactory>,
     session_resolver: Arc<dyn SessionResolver>,
     config: Mutex<ConfigCache>,
@@ -3044,12 +3022,9 @@ pub struct McHandler {
     connect_failure_commit_hook: ConnectFailureCommitHook,
     #[cfg(test)]
     publication_fence_write_hook: ConnectFailureCommitHook,
-    /// Route channel → its session binding. Populated at `on_bind`, removed at
-    /// `on_route_gone`. The SDK validates the route handle's epoch before dispatching a
-    /// request, so a channel key cannot resolve a stale route. A `Mutex<HashMap>` (not a
-    /// lock-free map) is appropriate because writes are rare (once per route open/close)
-    /// and reads are one cheap lookup per transform.
-    bindings: Mutex<HashMap<u16, SessionBinding>>,
+    /// Full route handle → its session binding. Epoch is part of every lookup and removal,
+    /// so channel reuse cannot observe or delete state owned by another incarnation.
+    bindings: Mutex<HashMap<RouteHandle, SessionBinding>>,
     /// The host state-sync payload carries this legacy per-project evaluator flag for wire
     /// compatibility. Conditioned-write gating reads live protocol-v2 registrations instead:
     /// state sync is not a liveness signal.
@@ -3058,9 +3033,9 @@ pub struct McHandler {
     /// project, so restart exposes zero evaluator capacity until a fresh route registers.
     note_evaluator_registrations: Mutex<HashMap<String, Vec<NoteEvaluatorRegistration>>>,
     note_evaluator_registration_seq: AtomicU64,
-    /// Validated transform channel → (session, route root). The root is part of provenance;
+    /// Validated transform route → (session, route root). The root is part of provenance;
     /// a cache row for the same session cannot authenticate a facade opened on another root.
-    transform_route_channels: Mutex<HashMap<u16, (String, PathBuf)>>,
+    transform_route_channels: Mutex<HashMap<RouteHandle, (String, PathBuf)>>,
     /// Roots previously observed on a validated transform for each session. This survives route
     /// teardown so durable cache state remains usable only along an authenticated route lineage.
     transform_session_roots: Mutex<HashMap<String, HashSet<PathBuf>>>,
@@ -3099,7 +3074,7 @@ struct NoteEvaluatorRegistration {
     token: String,
     registration_generation: i64,
     evaluator_instance: String,
-    channel: u16,
+    route: RouteHandle,
     policy_version: i64,
     capacity: i64,
     retina_handoff: bool,
@@ -3151,6 +3126,7 @@ pub trait HistorianProducerFactory: Send + Sync {
 
 struct RealHistorianProducerFactory {
     connection_file: PathBuf,
+    cancellation: CancellationToken,
 }
 
 #[async_trait]
@@ -3162,7 +3138,7 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Ok(Box::new(
             HistorianProducer::connect(HistorianProducerConfig {
-                handshake_timeout: Duration::from_secs(2),
+                cancellation: Some(self.cancellation.clone()),
                 ..HistorianProducerConfig::new(self.connection_file.clone(), project_root, harness)
             })
             .await?,
@@ -3501,9 +3477,12 @@ impl HistorianProducerFactory for MissingProducerFactory {
         _project_root: &Path,
         _harness: &str,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
-        Err(HistorianProducerError::NoEndpoint {
-            path: PathBuf::from("<missing --subc>"),
-        })
+        Err(HistorianProducerError::Client(
+            historian_producer::HistorianClientFailure {
+                code: "connection_unavailable".to_owned(),
+                message: "mc-module has no host connection file".to_owned(),
+            },
+        ))
     }
 }
 
@@ -3513,21 +3492,22 @@ impl McHandler {
     }
 
     pub fn new_with_connection_file(connection_file: Option<PathBuf>) -> Self {
-        let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
+        let cancel = CancellationToken::new();
+        let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file {
             Some(path) => Arc::new(RealHistorianProducerFactory {
                 connection_file: path,
+                cancellation: cancel.clone(),
             }),
             None => Arc::new(MissingProducerFactory),
         };
-        let session_resolver: Arc<dyn SessionResolver> = match connection_file {
-            Some(path) => Arc::new(RealSessionResolver::new(path)),
-            None => Arc::new(MissingSessionResolver),
-        };
         McHandler {
-            store: Arc::new(OnceLock::new()),
+            store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
+            task_admission_open: Mutex::new(true),
+            cancel,
+            tasks: TaskTracker::new(),
             producer_factory,
-            session_resolver,
+            session_resolver: Arc::new(MissingSessionResolver),
             config: Mutex::new(ConfigCache::default()),
             #[cfg(test)]
             fixed_config: None,
@@ -3583,8 +3563,42 @@ impl McHandler {
         }
     }
 
-    fn begin_store_open(&self, descriptor: StorageDescriptor) {
-        if self.store.get().is_some()
+    fn store(&self) -> Option<Arc<McStore>> {
+        self.store.lock().expect("store slot mutex").clone()
+    }
+
+    fn spawn_tracked_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let admission = self
+            .task_admission_open
+            .lock()
+            .expect("module task admission mutex");
+        if !*admission {
+            return None;
+        }
+        Some(self.tasks.spawn(future))
+    }
+
+    fn spawn_module_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn_tracked_task(future)
+    }
+
+    fn begin_store_open(&self, descriptor: StorageDescriptor) -> Result<(), InitError> {
+        if !*self
+            .task_admission_open
+            .lock()
+            .expect("module task admission mutex")
+        {
+            return Err(InitError("module task admission is closed".to_owned()));
+        }
+        if self.store().is_some()
             || self
                 .store_open
                 .phase
@@ -3596,7 +3610,7 @@ impl McHandler {
                 )
                 .is_err()
         {
-            return;
+            return Ok(());
         }
 
         self.store_open
@@ -3607,27 +3621,38 @@ impl McHandler {
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
         let coordinator = Arc::clone(&self.store_open);
-        tokio::spawn(async move {
-            let _guard = StoreOpenWaiterGuard {
-                coordinator: Arc::clone(&coordinator),
-            };
-            Self::run_store_open(store, coordinator, descriptor).await;
-        });
+        let task_coordinator = Arc::clone(&coordinator);
+        let cancel = self.cancel.clone();
+        if self
+            .spawn_tracked_task(async move {
+                let _guard = StoreOpenWaiterGuard {
+                    coordinator: Arc::clone(&task_coordinator),
+                };
+                Self::run_store_open(store, task_coordinator, descriptor, cancel).await;
+            })
+            .is_none()
+        {
+            coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+            coordinator.finish_waiter();
+            return Err(InitError("module task admission is closed".to_owned()));
+        }
+        Ok(())
     }
 
     async fn run_store_open(
-        store_slot: Arc<OnceLock<Arc<McStore>>>,
+        store_slot: Arc<Mutex<Option<Arc<McStore>>>>,
         coordinator: Arc<StoreOpenCoordinator>,
         descriptor: StorageDescriptor,
+        cancel: CancellationToken,
     ) {
         let policy = *coordinator.policy.lock().expect("store open policy mutex");
         let mut last_lease_error = match Self::open_store_once(&descriptor).await {
             Ok(opened) => {
-                if coordinator.cancelled.load(Ordering::Acquire) {
+                if cancel.is_cancelled() {
                     coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
                     return;
                 }
-                let _ = store_slot.set(Arc::new(opened));
+                *store_slot.lock().expect("store slot mutex") = Some(Arc::new(opened));
                 coordinator.phase.store(STORE_OPENED, Ordering::Release);
                 return;
             }
@@ -3655,7 +3680,7 @@ impl McHandler {
         let mut attempt = 0usize;
         loop {
             let elapsed = started.elapsed();
-            if coordinator.cancelled.load(Ordering::Acquire) {
+            if cancel.is_cancelled() {
                 eprintln!(
                     "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
                     elapsed.as_secs_f64()
@@ -3675,7 +3700,7 @@ impl McHandler {
             let delay = jittered_store_open_delay(backoff, policy.max_backoff, attempt)
                 .min(policy.wait_window.saturating_sub(elapsed));
             tokio::select! {
-                _ = coordinator.cancel.notified() => {
+                _ = cancel.cancelled() => {
                     eprintln!(
                         "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
                         started.elapsed().as_secs_f64()
@@ -3685,7 +3710,7 @@ impl McHandler {
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
-            if coordinator.cancelled.load(Ordering::Acquire) {
+            if cancel.is_cancelled() {
                 eprintln!(
                     "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
                     started.elapsed().as_secs_f64()
@@ -3699,11 +3724,11 @@ impl McHandler {
 
             match Self::open_store_once(&descriptor).await {
                 Ok(opened) => {
-                    if coordinator.cancelled.load(Ordering::Acquire) {
+                    if cancel.is_cancelled() {
                         coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
                         return;
                     }
-                    let _ = store_slot.set(Arc::new(opened));
+                    *store_slot.lock().expect("store slot mutex") = Some(Arc::new(opened));
                     coordinator.phase.store(STORE_OPENED, Ordering::Release);
                     eprintln!(
                         "mc-module: storage lease released; store opened after {:.2}s",
@@ -3791,8 +3816,11 @@ impl McHandler {
         session_resolver: Arc<dyn SessionResolver>,
     ) -> Self {
         McHandler {
-            store: Arc::new(OnceLock::new()),
+            store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
+            task_admission_open: Mutex::new(true),
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
             producer_factory: factory,
             session_resolver,
             config: Mutex::new(ConfigCache::default()),
@@ -3843,7 +3871,7 @@ impl McHandler {
     /// Record the route's session binding (called from `on_bind`). Last write wins for a
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
-    fn bind_route(&self, channel: u16, binding: SessionBinding) {
+    fn bind_route(&self, channel: RouteHandle, binding: SessionBinding) {
         self.remove_note_evaluator_registrations_for_channel(channel);
         self.transform_route_channels
             .lock()
@@ -3937,13 +3965,13 @@ impl McHandler {
         });
     }
 
-    fn remove_note_evaluator_registrations_for_channel(&self, channel: u16) {
+    fn remove_note_evaluator_registrations_for_channel(&self, channel: RouteHandle) {
         let mut registrations = self
             .note_evaluator_registrations
             .lock()
             .expect("note evaluator registrations mutex");
         registrations.retain(|_, entries| {
-            entries.retain(|entry| entry.channel != channel);
+            entries.retain(|entry| entry.route != channel);
             !entries.is_empty()
         });
     }
@@ -3978,24 +4006,27 @@ impl McHandler {
 
     /// Resolve the notes-authority project scoping this evaluator route. The
     /// body never chooses the project; only the server-side route binding does.
-    fn resolve_note_evaluator_project(&self, channel: u16) -> Result<String, HandlerOutcome> {
+    fn resolve_note_evaluator_project(
+        &self,
+        channel: RouteHandle,
+    ) -> Result<String, PreparedOutcome> {
         let binding = self
             .facade_binding(channel)
             .map_err(|_| session_unresolved_error())?;
         let route_project_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return Err(store_unavailable_error());
         };
         let authority = store
             .authority_project_state_for_route(&route_project_root, "notes")
-            .map_err(|error| HandlerOutcome::Error {
+            .map_err(|error| PreparedOutcome::Error {
                 code: "authority_route_lookup_failed".to_string(),
                 message: error.to_string(),
             })?;
         match authority {
             Some((project, state)) if state == "MODULE" => Ok(project),
             Some((_, state)) if state == "DRAINING" => Err(authority_draining_error("notes")),
-            _ => Err(HandlerOutcome::Error {
+            _ => Err(PreparedOutcome::Error {
                 code: "authority_not_module".to_string(),
                 message: "evaluator registration requires MODULE notes authority on this route"
                     .to_string(),
@@ -4006,12 +4037,12 @@ impl McHandler {
     fn validated_note_evaluator_registration(
         &self,
         project: &str,
-        channel: u16,
+        channel: RouteHandle,
         token: &str,
         registration_generation: i64,
         evaluator_instance: &str,
         now: i64,
-    ) -> Result<NoteEvaluatorRegistration, HandlerOutcome> {
+    ) -> Result<NoteEvaluatorRegistration, PreparedOutcome> {
         self.purge_expired_note_evaluator_registrations(now);
         self.note_evaluator_registrations
             .lock()
@@ -4022,7 +4053,7 @@ impl McHandler {
                     entry.token == token
                         && entry.registration_generation == registration_generation
                         && entry.evaluator_instance == evaluator_instance
-                        && entry.channel == channel
+                        && entry.route == channel
                         && entry.expires_at > now
                 })
             })
@@ -4117,8 +4148,7 @@ impl McHandler {
         // snapshot. Load the persisted epoch first, then inspect the bounded projection and native
         // cores so stale process state cannot select an outdated entry.
         let current_revert_epoch = self
-            .store
-            .get()?
+            .store()?
             .load(&parsed.session_id)
             .ok()?
             .meta
@@ -4219,8 +4249,7 @@ impl McHandler {
     ) -> Option<ProjectionCacheInput> {
         let after = request.full_array_fingerprint.as_deref()?;
         let revert_epoch = self
-            .store
-            .get()?
+            .store()?
             .load(&request.session_id)
             .ok()?
             .meta
@@ -4300,7 +4329,7 @@ impl McHandler {
     }
 
     /// Remove a route and evict process-local session state after its final binding closes.
-    fn unbind_route(&self, channel: u16) {
+    fn unbind_route(&self, channel: RouteHandle) {
         self.remove_note_evaluator_registrations_for_channel(channel);
         self.transform_route_channels
             .lock()
@@ -4374,7 +4403,7 @@ impl McHandler {
     /// transform output — a correctly-bound request resolves and proceeds identically.
     fn resolve_binding(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request_session: &str,
     ) -> Result<SessionBinding, BindingError> {
         let map = self.bindings.lock().expect("bindings mutex");
@@ -4387,22 +4416,22 @@ impl McHandler {
 
     fn state_sync_binding(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request_session: Option<&str>,
-    ) -> Result<SessionBinding, HandlerOutcome> {
+    ) -> Result<SessionBinding, PreparedOutcome> {
         let binding = self
             .bindings
             .lock()
             .expect("bindings mutex")
             .get(&channel)
             .cloned()
-            .ok_or_else(|| HandlerOutcome::Error {
+            .ok_or_else(|| PreparedOutcome::Error {
                 code: "route_unbound".to_string(),
                 message: "state sync on a channel with no session binding".to_string(),
             })?;
         if let Some(request_session) = request_session {
             if binding.session != request_session {
-                return Err(HandlerOutcome::Error {
+                return Err(PreparedOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
@@ -4415,7 +4444,7 @@ impl McHandler {
     /// Return the channel binding without comparing a request session. OpenCode Rust facade
     /// routes bind a real session id, while Claude Code facade routes bind an instance token;
     /// `resolve_facade_scope` applies the corresponding identity mode before touching the store.
-    fn facade_binding(&self, channel: u16) -> Result<SessionBinding, BindingError> {
+    fn facade_binding(&self, channel: RouteHandle) -> Result<SessionBinding, BindingError> {
         self.bindings
             .lock()
             .expect("bindings mutex")
@@ -4437,7 +4466,7 @@ impl McHandler {
                     .any(|root| canonical_root(root) == canonical_project_root)
             });
         if !root_observed {
-            let Some(store) = self.store.get() else {
+            let Some(store) = self.store() else {
                 return false;
             };
             let durable_root_observed = canonical_project_root.to_str().is_some_and(|root| {
@@ -4460,8 +4489,7 @@ impl McHandler {
             return true;
         }
         if self
-            .store
-            .get()
+            .store()
             .is_some_and(|store| store.has_cache_state(session_id).unwrap_or(false))
         {
             return true;
@@ -4481,7 +4509,7 @@ impl McHandler {
     fn bind_authority_route(
         &self,
         store: &McStore,
-        channel: u16,
+        channel: RouteHandle,
         context_store_uuid: &str,
         project: &str,
     ) -> Result<(), McStoreError> {
@@ -4793,7 +4821,7 @@ impl McHandler {
                 let fingerprint_items: Vec<_> =
                     chunk.snapshot.iter().map(|item| item.as_item()).collect();
                 let observed = historian::compute_chunk_fingerprint(&fingerprint_items);
-                tokio::spawn(async move {
+                let _ = self.spawn_module_task(async move {
                     let _guard = guard;
                     let result = async {
                         let action = historian::handle_restart_load(
@@ -4851,7 +4879,7 @@ impl McHandler {
                 Some("reattaching")
             }
             HistorianPhase::Firing | HistorianPhase::Validating | HistorianPhase::Publishing => {
-                tokio::spawn(async move {
+                let _ = self.spawn_module_task(async move {
                     let _guard = guard;
                     if let Err(e) = historian::handle_restart_load(
                         &store,
@@ -5458,7 +5486,13 @@ impl McHandler {
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
         let factory = Arc::clone(&self.producer_factory);
-        let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
+        let Some(handle) =
+            self.spawn_module_task(Self::execute_historian_firing_task(factory, task))
+        else {
+            return Err(historian::HistorianDriveError::Producer(
+                HistorianProducerError::TimedOut,
+            ));
+        };
         match tokio::time::timeout(historian::completion_wait_budget(), handle).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(join_err)) => Err(historian::HistorianDriveError::Producer(
@@ -5529,7 +5563,14 @@ impl McHandler {
         };
         let wait = historian::wrapup_round_wait_budget().min(remaining);
         let factory = Arc::clone(&self.producer_factory);
-        let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
+        let Some(handle) =
+            self.spawn_module_task(Self::execute_historian_firing_task(factory, task))
+        else {
+            return Err(WrapupFiringError::Retryable(
+                RetryableWrapupReason::SnapshotUnavailable,
+                "module task admission closed before historian round".to_owned(),
+            ));
+        };
         match tokio::time::timeout(wait, handle).await {
             Ok(Ok(Ok(outcome))) => Ok(outcome),
             Ok(Ok(Err(error))) => {
@@ -5611,7 +5652,7 @@ impl McHandler {
 
     fn spawn_historian_firing(&self, task: HistorianFiringTask) {
         let factory = Arc::clone(&self.producer_factory);
-        tokio::spawn(async move {
+        let _ = self.spawn_module_task(async move {
             let session_id = task.session_id.clone();
             let result = Self::execute_historian_firing_task(factory, task).await;
             match result {
@@ -5623,7 +5664,7 @@ impl McHandler {
         });
     }
 
-    fn handle_state_import_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    fn handle_state_import_value(&self, channel: RouteHandle, request: Value) -> PreparedOutcome {
         let raw_session_id = request
             .get("session_id")
             .and_then(Value::as_str)
@@ -5662,7 +5703,7 @@ impl McHandler {
         };
         if parsed.v != 1 {
             discard(self);
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "state_import_version".to_string(),
                 message: "state_import requires v=1".to_string(),
             };
@@ -5679,7 +5720,7 @@ impl McHandler {
         }
         if parsed.batch_count == 0 || parsed.batch_seq >= parsed.batch_count {
             discard(self);
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "batch_seq_mismatch".to_string(),
                 message: "batch_seq must be inside a nonempty batch_count".to_string(),
             };
@@ -5689,22 +5730,22 @@ impl McHandler {
             Ok(binding) => binding,
             Err(BindingError::Unbound) => {
                 discard(self);
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: "state_import on a channel with no session binding".to_string(),
                 };
             }
             Err(BindingError::SessionMismatch) => {
                 discard(self);
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
                 };
             }
         };
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
+        let store = match self.store() {
+            Some(store) => Arc::clone(&store),
             None => {
                 discard(self);
                 return store_unavailable_error();
@@ -5722,7 +5763,7 @@ impl McHandler {
             Ok(StateImportPreflight::Ready) => {}
             Err(StateImportError::SessionNotEmpty) => {
                 discard(self);
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "session_not_empty".to_string(),
                     message: "state_import only accepts a session with no durable state"
                         .to_string(),
@@ -5730,7 +5771,7 @@ impl McHandler {
             }
             Err(error) => {
                 discard(self);
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -5786,7 +5827,7 @@ impl McHandler {
                         "imported": result.imported,
                         "duplicate": result.duplicate,
                     })),
-                    Err(StateImportError::SessionNotEmpty) => HandlerOutcome::Error {
+                    Err(StateImportError::SessionNotEmpty) => PreparedOutcome::Error {
                         code: "session_not_empty".to_string(),
                         message: "state_import only accepts a session with no durable state"
                             .to_string(),
@@ -5794,23 +5835,23 @@ impl McHandler {
                     Err(StateImportError::Validation(error)) => {
                         state_import_validation_error(error)
                     }
-                    Err(StateImportError::Store(error)) => HandlerOutcome::Error {
+                    Err(StateImportError::Store(error)) => PreparedOutcome::Error {
                         code: "store_write_failed".to_string(),
                         message: error.to_string(),
                     },
                 }
             }
             Err(StateImportStageError::Validation(error)) => state_import_validation_error(error),
-            Err(StateImportStageError::Protocol { code, message }) => HandlerOutcome::Error {
+            Err(StateImportStageError::Protocol { code, message }) => PreparedOutcome::Error {
                 code: code.to_string(),
                 message: message.to_string(),
             },
         }
     }
 
-    fn handle_agent_drops_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    fn handle_agent_drops_value(&self, channel: RouteHandle, request: Value) -> PreparedOutcome {
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: "agent_drops.append requires session_id".to_string(),
             };
@@ -5818,20 +5859,20 @@ impl McHandler {
         let command_id = match command_id_from_agent_drops_request(&request) {
             Ok(command_id) => command_id,
             Err(message) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "bad_request".to_string(),
                     message,
                 };
             }
         };
         let Some(raw_drop) = request.get("drop").and_then(Value::as_str) else {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: "'drop' must be a nonempty string".to_string(),
             };
         };
         if raw_drop.trim().is_empty() {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: "'drop' must be a nonempty string".to_string(),
             };
@@ -5839,7 +5880,7 @@ impl McHandler {
         let numbers = match parse_tag_range_string(raw_drop) {
             Ok(numbers) => numbers,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "bad_request".to_string(),
                     message: format!("invalid drop range syntax: {error}"),
                 };
@@ -5848,27 +5889,27 @@ impl McHandler {
         let _binding = match self.resolve_binding(channel, session_id) {
             Ok(binding) => binding,
             Err(BindingError::Unbound) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: "agent_drops.append on a channel with no session binding".to_string(),
                 };
             }
             Err(BindingError::SessionMismatch) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
                 };
             }
         };
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
+        let store = match self.store() {
+            Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
         let tags = match store.load_tags_for_session(session_id) {
             Ok(tags) => tags,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -5891,7 +5932,7 @@ impl McHandler {
         drop_ids.sort();
         drop_ids.dedup();
         if drop_ids.is_empty() {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: format!(
                     "ctx_reduce drop request has no valid tags: {} not found",
@@ -5917,7 +5958,7 @@ impl McHandler {
                 }
                 respond(resp)
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: error.to_string(),
             },
@@ -5926,24 +5967,24 @@ impl McHandler {
 
     fn management_binding(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: &Value,
         operation: &str,
-    ) -> Result<(String, SessionBinding), HandlerOutcome> {
+    ) -> Result<(String, SessionBinding), PreparedOutcome> {
         if request.get("v").and_then(Value::as_u64) != Some(1) {
-            return Err(HandlerOutcome::Error {
+            return Err(PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: format!("{operation} requires v=1"),
             });
         }
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
-            return Err(HandlerOutcome::Error {
+            return Err(PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: format!("{operation} requires session_id"),
             });
         };
         if session_id.trim().is_empty() {
-            return Err(HandlerOutcome::Error {
+            return Err(PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: format!("{operation} requires a nonempty session_id"),
             });
@@ -5951,13 +5992,13 @@ impl McHandler {
         let binding = match self.resolve_binding(channel, session_id) {
             Ok(binding) => binding,
             Err(BindingError::Unbound) => {
-                return Err(HandlerOutcome::Error {
+                return Err(PreparedOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: format!("{operation} on a channel with no session binding"),
                 });
             }
             Err(BindingError::SessionMismatch) => {
-                return Err(HandlerOutcome::Error {
+                return Err(PreparedOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
@@ -5967,7 +6008,11 @@ impl McHandler {
         Ok((session_id.to_string(), binding))
     }
 
-    fn handle_todo_state_set_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_todo_state_set_value(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let (session_id, _binding) =
             match self.management_binding(channel, request, "todo_state.set") {
                 Ok(scope) => scope,
@@ -5989,7 +6034,7 @@ impl McHandler {
             return invalid_params_error("state_json must be a JSON todo array");
         };
         let state_hash = sha256_hex(normalized.as_bytes());
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -5997,33 +6042,37 @@ impl McHandler {
             Ok(TodoStateSetOutcome::Updated { .. }) | Ok(TodoStateSetOutcome::Noop) => {
                 respond(json!({ "ok": true }))
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_session_flush_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_session_flush_value(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
         let (session_id, _binding) =
             match self.management_binding(channel, request, "session.flush") {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
             };
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
         match store.arm_soft_refresh(&session_id) {
             Ok(armed) => respond(json!({ "ok": true, "armed": armed })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_session_recomp_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_session_recomp_value(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let (session_id, _binding) =
             match self.management_binding(channel, request, "session.recomp") {
                 Ok(scope) => scope,
@@ -6035,7 +6084,7 @@ impl McHandler {
         if command_id.is_empty() || command_id.len() > 128 {
             return invalid_params_error("command_id must contain 1..=128 bytes");
         }
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -6048,7 +6097,7 @@ impl McHandler {
             }
             Ok(None) => {}
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6067,7 +6116,7 @@ impl McHandler {
         let loaded = match store.load(&session_id) {
             Ok(loaded) => loaded,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6076,7 +6125,7 @@ impl McHandler {
         let has_compartments = match store.has_compartments(&session_id) {
             Ok(has_compartments) => has_compartments,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6094,7 +6143,7 @@ impl McHandler {
                     "ok": true,
                     "disposition": row.disposition,
                 })),
-                Err(error) => HandlerOutcome::Error {
+                Err(error) => PreparedOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
                 },
@@ -6107,13 +6156,13 @@ impl McHandler {
                 // A transform may have committed between the status reads and the reset.
                 // The recomp latch remains held; ask the caller to retry rather than
                 // claiming a reset that did not use the observed cache version.
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_conflict".to_string(),
                     message: error.to_string(),
                 };
             }
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6143,20 +6192,24 @@ impl McHandler {
                 "ok": true,
                 "disposition": row.disposition,
             })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_session_delete_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_session_delete_value(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let (session_id, binding) =
             match self.management_binding(channel, request, "session.delete") {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
             };
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -6176,20 +6229,24 @@ impl McHandler {
                     .remove(&session_id);
                 respond(json!({ "ok": true, "deleted_rows": deleted_rows }))
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_session_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_session_status_value(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let (session_id, binding) =
             match self.management_binding(channel, request, "session.status") {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
             };
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -6216,7 +6273,7 @@ impl McHandler {
             match store.load_session_status_snapshot(&session_id, include_compartments_after_seq) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -6240,7 +6297,7 @@ impl McHandler {
             {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -6310,7 +6367,7 @@ impl McHandler {
         // completion without parsing the summary or issuing another operation: a retained
         // delivered-command record includes its coverage, row version, and current wrapup state.
         let m1_signal = match crate::m1_compose::m1_revision_signal_parts_for_pass(
-            store,
+            &store,
             &binding.project_root.to_string_lossy(),
             &binding.project_root.to_string_lossy(),
             &session_id,
@@ -6320,7 +6377,7 @@ impl McHandler {
         ) {
             Ok(signal) => Some(signal),
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6467,7 +6524,7 @@ impl McHandler {
     fn retryable_wrapup_response(
         reason: RetryableWrapupReason,
         summary: impl Into<String>,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         respond(json!({
             "ok": false,
             "disposition": "retryable",
@@ -6484,7 +6541,7 @@ impl McHandler {
         expected_generation: u64,
         expected_revert_epoch: u64,
         response: TerminalWrapupResponse,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let TerminalWrapupResponse {
             disposition,
             rounds,
@@ -6521,7 +6578,7 @@ impl McHandler {
                     );
                 }
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -6560,7 +6617,7 @@ impl McHandler {
                     );
                 }
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_commit_failed".to_string(),
                         message: format!("could not record terminal wrapup result: {error}"),
                     };
@@ -6586,7 +6643,7 @@ impl McHandler {
         respond(payload)
     }
 
-    fn replayed_wrapup_response(row: mc_store::WrapupCommandRow) -> HandlerOutcome {
+    fn replayed_wrapup_response(row: mc_store::WrapupCommandRow) -> PreparedOutcome {
         if row.disposition == "failed" {
             if let Some((reason, summary, detail)) = terminal_wrapup_failure_fields(&row.summary) {
                 return respond(json!({
@@ -6609,7 +6666,11 @@ impl McHandler {
         }))
     }
 
-    async fn handle_session_wrapup_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_session_wrapup_value(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let deadline = Instant::now()
             .checked_add(self.wrapup_operation_budget())
             .unwrap_or_else(Instant::now);
@@ -6626,7 +6687,7 @@ impl McHandler {
                 Some(command_id) if !command_id.is_empty() && command_id.len() <= 128 => {
                     Some(command_id)
                 }
-                _ => return HandlerOutcome::Error {
+                _ => return PreparedOutcome::Error {
                     code: "bad_request".to_string(),
                     message:
                         "session.wrapup command_id must be a nonempty string of at most 128 bytes"
@@ -6634,8 +6695,8 @@ impl McHandler {
                 },
             },
         };
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
+        let store = match self.store() {
+            Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
         let route_project_root = binding.project_root.to_string_lossy().to_string();
@@ -6644,7 +6705,7 @@ impl McHandler {
             Ok(Some(project)) => project,
             Ok(None) => route_project_root,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6660,7 +6721,7 @@ impl McHandler {
                 Ok(Some(row)) => return Self::replayed_wrapup_response(row),
                 Ok(None) => {}
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -6678,7 +6739,7 @@ impl McHandler {
             Some(value) => match value.as_i64() {
                 Some(value) => usize::try_from(value.max(0)).unwrap_or(usize::MAX),
                 None => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "bad_request".to_string(),
                         message: "session.wrapup keep must be an integer".to_string(),
                     };
@@ -6704,7 +6765,7 @@ impl McHandler {
         let entry_state = match store.load(&session_id) {
             Ok(loaded) => loaded,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6747,7 +6808,7 @@ impl McHandler {
         let initial_snapshot = match store.load_historian_assembly_snapshot(&session_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6810,7 +6871,7 @@ impl McHandler {
                 );
             }
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -6871,7 +6932,7 @@ impl McHandler {
             let current_state = match store.load(&session_id) {
                 Ok(loaded) => loaded,
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -6903,7 +6964,7 @@ impl McHandler {
             let current_end = match store.max_compartment_end_ordinal(&session_id) {
                 Ok(ordinal) => (ordinal > 0).then_some(ordinal as u64),
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -7052,7 +7113,7 @@ impl McHandler {
         let final_compartments = match store.load_compartments(&session_id) {
             Ok(compartments) => compartments,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -7145,8 +7206,12 @@ impl McHandler {
         }
     }
 
-    fn handle_authority_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
+    fn handle_authority_status_value(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
@@ -7158,9 +7223,9 @@ impl McHandler {
             Ok(Some(row)) => {
                 if row.state == "MODULE" {
                     if let Err(error) =
-                        self.bind_authority_route(store, channel, context_store_uuid, project)
+                        self.bind_authority_route(&store, channel, context_store_uuid, project)
                     {
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "authority_route_binding_failed".to_string(),
                             message: error.to_string(),
                         };
@@ -7169,15 +7234,19 @@ impl McHandler {
                 respond(json!({ "ok": true, "authority": row }))
             }
             Ok(None) => respond(json!({ "ok": true, "authority": null })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "authority_status_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_authority_prepare_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
+    fn handle_authority_prepare_value(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
@@ -7204,7 +7273,7 @@ impl McHandler {
                     match store.authority_seed_checksum(context_store_uuid, project, domain) {
                         Ok(checksum) => checksum,
                         Err(error) => {
-                            return HandlerOutcome::Error {
+                            return PreparedOutcome::Error {
                                 code: "authority_checksum_failed".to_string(),
                                 message: error.to_string(),
                             };
@@ -7253,9 +7322,9 @@ impl McHandler {
             Ok(row) => {
                 if row.state == "MODULE" {
                     if let Err(error) =
-                        self.bind_authority_route(store, channel, context_store_uuid, project)
+                        self.bind_authority_route(&store, channel, context_store_uuid, project)
                     {
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "authority_route_binding_failed".to_string(),
                             message: error.to_string(),
                         };
@@ -7263,15 +7332,15 @@ impl McHandler {
                 }
                 respond(json!({ "ok": true, "authority": row }))
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "authority_prepare_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_authority_seed_value(&self, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
+    fn handle_authority_seed_value(&self, request: &Value) -> PreparedOutcome {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
@@ -7297,7 +7366,7 @@ impl McHandler {
             };
             let snapshot = row.get("snapshot").unwrap_or(row);
             if snapshot.get("project_path").and_then(Value::as_str) != Some(project) {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "authority_seed_project_mismatch".to_string(),
                     message: "seed snapshot project_path did not match the authority project"
                         .to_string(),
@@ -7312,7 +7381,7 @@ impl McHandler {
             match store.seed_authority_rows(context_store_uuid, project, domain, &seed_rows) {
                 Ok(ids) => ids,
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "authority_seed_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -7323,8 +7392,8 @@ impl McHandler {
         )
     }
 
-    fn handle_authority_drain_value(&self, request: &Value, method: &str) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
+    fn handle_authority_drain_value(&self, request: &Value, method: &str) -> PreparedOutcome {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
@@ -7418,22 +7487,22 @@ impl McHandler {
         match result {
             Ok(row) => respond(json!({ "ok": true, "authority": row })),
             Err(McStoreError::AuthorityFeedHeadAdvanced { captured, found }) => {
-                HandlerOutcome::Error {
+                PreparedOutcome::Error {
                     code: "authority_feed_head_advanced".to_string(),
                     message: format!(
                         "authority_feed_head_advanced: captured {captured}, found {found}"
                     ),
                 }
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "authority_drain_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_mirror_pull_value(&self, request: &Value) -> HandlerOutcome {
-        let Some(store) = self.store.get() else {
+    fn handle_mirror_pull_value(&self, request: &Value) -> PreparedOutcome {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let Some(domain) = request.get("domain").and_then(Value::as_str) else {
@@ -7455,7 +7524,7 @@ impl McHandler {
         };
         match page {
             Ok(page) => respond(json!({ "ok": true, "page": page })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "mirror_pull_failed".to_string(),
                 message: error.to_string(),
             },
@@ -7486,7 +7555,7 @@ impl McHandler {
     fn prompt_surface_selection_from_value(
         &self,
         request: &Value,
-    ) -> Result<PromptSurfaceSelection, HandlerOutcome> {
+    ) -> Result<PromptSurfaceSelection, PreparedOutcome> {
         let preset = match request
             .get("preset")
             .or_else(|| request.get("prompt_surface_preset"))
@@ -7571,9 +7640,9 @@ impl McHandler {
 
     fn handle_prompt_surface_manifest_value(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: &Value,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return invalid_params_error("manifest.get requires session_id");
         };
@@ -7581,11 +7650,11 @@ impl McHandler {
             Ok(binding) => binding,
             Err(error) => {
                 return match error {
-                    BindingError::Unbound => HandlerOutcome::Error {
+                    BindingError::Unbound => PreparedOutcome::Error {
                         code: "route_unbound".to_string(),
                         message: "manifest.get on a channel with no session binding".to_string(),
                     },
-                    BindingError::SessionMismatch => HandlerOutcome::Error {
+                    BindingError::SessionMismatch => PreparedOutcome::Error {
                         code: "session_mismatch".to_string(),
                         message: "request session_id does not match the channel's bound session"
                             .to_string(),
@@ -7618,13 +7687,13 @@ impl McHandler {
         }))
     }
 
-    fn handle_guidance_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
+    fn handle_guidance_value(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        let store = match self.store() {
+            Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: "guidance.get requires session_id".to_string(),
             };
@@ -7633,11 +7702,11 @@ impl McHandler {
             Ok(binding) => binding,
             Err(error) => {
                 return match error {
-                    BindingError::Unbound => HandlerOutcome::Error {
+                    BindingError::Unbound => PreparedOutcome::Error {
                         code: "route_unbound".to_string(),
                         message: "guidance.get on a channel with no session binding".to_string(),
                     },
-                    BindingError::SessionMismatch => HandlerOutcome::Error {
+                    BindingError::SessionMismatch => PreparedOutcome::Error {
                         code: "session_mismatch".to_string(),
                         message: "request session_id does not match the channel's bound session"
                             .to_string(),
@@ -7651,7 +7720,7 @@ impl McHandler {
             Some(value) => match value.as_bool() {
                 Some(value) => value,
                 None => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "bad_request".to_string(),
                         message: "guidance.get tool_present must be a boolean".to_string(),
                     };
@@ -7677,7 +7746,7 @@ impl McHandler {
         let expected_variant = if active { "full" } else { "no_reduce" };
         if let Some(variant) = request.get("variant").and_then(Value::as_str) {
             if variant != expected_variant {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "bad_request".to_string(),
                     message: format!(
                         "guidance variant {variant:?} contradicts tool_present={tool_present}"
@@ -7688,7 +7757,7 @@ impl McHandler {
         let date_line = match self.guidance_date_for_session(&store, session_id) {
             Ok(date) => date,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -7844,7 +7913,9 @@ impl McHandler {
                 pages.pending_transform_count,
                 completed
                     .iter()
-                    .map(|completed| completed.result.len())
+                    .filter_map(|completed| {
+                        completed.result.measure().ok().map(|output| output.len())
+                    })
                     .sum::<usize>(),
                 completed.len(),
                 pages
@@ -7897,9 +7968,9 @@ impl McHandler {
         })
     }
 
-    fn handle_status_value(&self, request: &Value) -> HandlerOutcome {
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
+    fn handle_status_value(&self, request: &Value) -> PreparedOutcome {
+        let store = match self.store() {
+            Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
@@ -7919,7 +7990,7 @@ impl McHandler {
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
                 })),
-                Err(e) => HandlerOutcome::Error {
+                Err(e) => PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
                 },
@@ -7928,7 +7999,7 @@ impl McHandler {
         let loaded = match store.load(session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
                 };
@@ -7937,7 +8008,7 @@ impl McHandler {
         let pass_trace = match store.load_pass_trace(session_id) {
             Ok(pass_trace) => pass_trace,
             Err(e) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
                 };
@@ -7946,7 +8017,7 @@ impl McHandler {
         let side_channel_status = match store.historian_side_channel_status(session_id) {
             Ok(status) => status,
             Err(e) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
                 };
@@ -7987,10 +8058,10 @@ impl McHandler {
 
     async fn handle_transform_dispatch(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: Value,
         inbound_bytes: Option<usize>,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let ticket = TransformDispatchTicket::new(&DISPATCH_HEALTH);
         let outcome = if has_transform_page_fields(&request) {
             self.handle_transform_page_value(channel, request, TransformLane::Authority, &ticket)
@@ -7999,29 +8070,29 @@ impl McHandler {
             self.handle_transform_value(channel, request, inbound_bytes, &ticket)
                 .await
         };
-        ticket.finish(matches!(outcome, HandlerOutcome::Error { .. }));
+        ticket.finish(matches!(outcome, PreparedOutcome::Error { .. }));
         outcome
     }
 
     async fn handle_transform_value(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: Value,
         inbound_bytes: Option<usize>,
         ticket: &TransformDispatchTicket<'_>,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         self.handle_transform_unpaged_value(channel, request, false, inbound_bytes, ticket)
             .await
     }
 
     async fn handle_transform_unpaged_value(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: Value,
         from_page_apply: bool,
         _inbound_bytes: Option<usize>,
         ticket: &TransformDispatchTicket<'_>,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let handler_started_at = Instant::now();
         let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
@@ -8034,7 +8105,7 @@ impl McHandler {
         let mut parsed: TransformRequest = match serde_json::from_value(request) {
             Ok(req) => req,
             Err(e) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "bad_request".to_string(),
                     message: e.to_string(),
                 };
@@ -8076,13 +8147,13 @@ impl McHandler {
                     return passthrough_transform_response(&parsed);
                 }
                 Err(BindingError::Unbound) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "route_unbound".to_string(),
                         message: "registered dreamer session has no bound route".to_string(),
                     };
                 }
                 Err(BindingError::SessionMismatch) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "session_mismatch".to_string(),
                         message: "registered dreamer session does not match the bound route"
                             .to_string(),
@@ -8090,10 +8161,10 @@ impl McHandler {
                 }
             }
         }
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
+        let store = match self.store() {
+            Some(store) => Arc::clone(&store),
             None => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "store_unavailable".to_string(),
                     message: "store not opened (no HELLO_ACK storage seam)".to_string(),
                 };
@@ -8102,13 +8173,13 @@ impl McHandler {
         let binding = match self.resolve_binding(channel, &parsed.session_id) {
             Ok(b) => b,
             Err(BindingError::Unbound) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: "transform on a channel with no session binding".to_string(),
                 };
             }
             Err(BindingError::SessionMismatch) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
@@ -8174,7 +8245,7 @@ impl McHandler {
             None
         };
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
                 message: "transform is blocked until all transform pages arrive".to_string(),
             };
@@ -8196,7 +8267,7 @@ impl McHandler {
             Ok(Some(project)) => project,
             Ok(None) => route_project_root.clone(),
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -8207,7 +8278,7 @@ impl McHandler {
                 Ok(Some(project)) => project,
                 Ok(None) => route_project_root.clone(),
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "authority_project_resolution_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -8223,7 +8294,7 @@ impl McHandler {
                         &content_hash,
                         pass_now,
                     ) {
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "mural_artifact_store_failed".to_string(),
                             message: error.to_string(),
                         };
@@ -8239,7 +8310,7 @@ impl McHandler {
                         parsed.mural = mural;
                     }
                     Err(error) => {
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "mural_artifact_store_failed".to_string(),
                             message: error.to_string(),
                         };
@@ -8339,7 +8410,7 @@ impl McHandler {
         let reject_transform = |e: crate::transform::TransformError| {
             let message = e.to_string();
             let _ = store.trace_pass_rejected(&parsed.session_id, &message, now_ms());
-            HandlerOutcome::Error {
+            PreparedOutcome::Error {
                 code: "transform_failed".to_string(),
                 message,
             }
@@ -8636,26 +8707,30 @@ impl McHandler {
     }
 
     #[cfg(test)]
-    async fn handle_transform_for_test(&self, channel: u16, request: Value) -> HandlerOutcome {
+    async fn handle_transform_for_test(
+        &self,
+        route: RouteHandle,
+        request: Value,
+    ) -> PreparedOutcome {
         let inbound_bytes = serde_json::to_vec(&request)
             .map(|bytes| bytes.len())
             .unwrap_or(MAX_TRANSFORM_FRAME_BYTES);
-        self.handle_transform_dispatch(channel, request, Some(inbound_bytes))
+        self.handle_transform_dispatch(route, request, Some(inbound_bytes))
             .await
     }
 
     #[cfg(test)]
     async fn handle_transform_for_test_with_body_size(
         &self,
-        channel: u16,
+        route: RouteHandle,
         request: Value,
         inbound_bytes: usize,
-    ) -> HandlerOutcome {
-        self.handle_transform_dispatch(channel, request, Some(inbound_bytes))
+    ) -> PreparedOutcome {
+        self.handle_transform_dispatch(route, request, Some(inbound_bytes))
             .await
     }
 
-    fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    fn handle_state_sync_value(&self, channel: RouteHandle, request: Value) -> PreparedOutcome {
         const ENVELOPE_FIELDS: [&str; 5] = [
             "seed_id",
             "seed_generation",
@@ -8682,8 +8757,8 @@ impl McHandler {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
+        let store = match self.store() {
+            Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
 
@@ -8698,7 +8773,7 @@ impl McHandler {
                     Some(
                         StateSyncSeedPhase::Collecting(_) | StateSyncSeedPhase::Applying { .. },
                     ) => {
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "state_sync_seed_in_progress".to_string(),
                             message: "a paged state-sync seed is already in progress".to_string(),
                         };
@@ -8755,9 +8830,9 @@ impl McHandler {
                 .filter(|completed| completed.seed_id == seed_id)
             {
                 if completed.final_digest == digest {
-                    return HandlerOutcome::Response(completed.result.clone());
+                    return PreparedOutcome::Response(completed.result.clone());
                 }
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "state_sync_seed_digest_mismatch".to_string(),
                     message: format!(
                         "completed seed content changed (generation={}, seq={}, total={})",
@@ -8768,21 +8843,21 @@ impl McHandler {
         }
         if parsed.shadow_generation != seed_generation {
             self.discard_state_sync_seed(&binding.session);
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "state_sync_seed_attempt_mismatch".to_string(),
                 message: "shadow_generation must match seed_generation".to_string(),
             };
         }
         if batch_total == 0 || batch_index >= batch_total {
             self.discard_state_sync_seed(&binding.session);
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "state_sync_seed_protocol_mismatch".to_string(),
                 message: "seed batch index/total is invalid".to_string(),
             };
         }
         if seed_complete != (batch_index + 1 == batch_total) {
             self.discard_state_sync_seed(&binding.session);
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "state_sync_seed_protocol_mismatch".to_string(),
                 message: "seed_complete disagrees with the final batch index".to_string(),
             };
@@ -8815,7 +8890,7 @@ impl McHandler {
             || seed_complete && scalar_tail_fields < 4
         {
             self.discard_state_sync_seed(&binding.session);
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "state_sync_seed_protocol_mismatch".to_string(),
                 message: "seed scalar tail must appear only and completely on the final batch"
                     .to_string(),
@@ -8835,14 +8910,14 @@ impl McHandler {
             let loaded = match store.load(&binding.session) {
                 Ok(loaded) => loaded,
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
                 }
             };
             if loaded.meta.shadow_generation != seed_generation {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "state_sync_generation_mismatch".to_string(),
                     message: format!(
                         "seed_generation {seed_generation} did not match durable generation {}",
@@ -8912,14 +8987,14 @@ impl McHandler {
             match phase {
                 StateSyncSeedPhase::Idle => {
                     seeds.set_phase(&binding.session, StateSyncSeedPhase::Idle);
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "state_sync_seed_not_armed".to_string(),
                         message: "paged state-sync batches must start at index zero".to_string(),
                     };
                 }
                 applying @ StateSyncSeedPhase::Applying { .. } => {
                     seeds.set_phase(&binding.session, applying);
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "state_sync_seed_in_progress".to_string(),
                         message: "the final state-sync seed batch is being applied".to_string(),
                     };
@@ -8933,7 +9008,7 @@ impl McHandler {
                         || expected_seq != parsed.expected_shadow_seq
                     {
                         seeds.release_phase(&awaiting);
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "state_sync_seed_attempt_mismatch".to_string(),
                             message: "seed batch does not match the active state-sync attempt"
                                 .to_string(),
@@ -8946,7 +9021,7 @@ impl McHandler {
                             .is_none_or(|bytes| bytes > seeds.max_staged_bytes)
                     {
                         seeds.release_phase(&awaiting);
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "state_sync_seed_buffer_overflow".to_string(),
                             message: "state-sync seed staging exceeded the handler-wide byte cap"
                                 .to_string(),
@@ -8995,7 +9070,7 @@ impl McHandler {
                     {
                         let discarded = StateSyncSeedPhase::Collecting(pending);
                         seeds.release_phase(&discarded);
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "state_sync_seed_attempt_mismatch".to_string(),
                             message: "seed envelope changed during collection".to_string(),
                         };
@@ -9016,7 +9091,7 @@ impl McHandler {
                         } else {
                             let discarded = StateSyncSeedPhase::Collecting(pending);
                             seeds.release_phase(&discarded);
-                            return HandlerOutcome::Error {
+                            return PreparedOutcome::Error {
                                 code: "state_sync_seed_digest_mismatch".to_string(),
                                 message: "redriven seed batch content changed".to_string(),
                             };
@@ -9024,7 +9099,7 @@ impl McHandler {
                     } else if batch_index > pending.next_index {
                         let discarded = StateSyncSeedPhase::Collecting(pending);
                         seeds.release_phase(&discarded);
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "state_sync_seed_order_mismatch".to_string(),
                             message: "seed batches must arrive in strict index order".to_string(),
                         };
@@ -9036,7 +9111,7 @@ impl McHandler {
                         {
                             let discarded = StateSyncSeedPhase::Collecting(pending);
                             seeds.release_phase(&discarded);
-                            return HandlerOutcome::Error {
+                            return PreparedOutcome::Error {
                                 code: "state_sync_seed_buffer_overflow".to_string(),
                                 message:
                                     "state-sync seed staging exceeded the handler-wide byte cap"
@@ -9101,10 +9176,8 @@ impl McHandler {
                 let assembled = assemble_state_sync_seed(batches, generation, expected_seq);
                 let outcome = self.apply_state_sync_wire(&binding, &store, assembled);
                 let completed_result = match &outcome {
-                    HandlerOutcome::Response(bytes) => Some(bytes.clone()),
-                    HandlerOutcome::Error { .. }
-                    | HandlerOutcome::ErrorWithDetail { .. }
-                    | HandlerOutcome::Streamed => None,
+                    PreparedOutcome::Response(bytes) => Some(bytes.clone()),
+                    PreparedOutcome::Error { .. } | PreparedOutcome::Streamed => None,
                 };
                 let mut seeds = self.state_sync_seeds.lock().expect("state sync seed mutex");
                 let phase = {
@@ -9147,7 +9220,7 @@ impl McHandler {
         binding: &SessionBinding,
         store: &McStore,
         mut parsed: ModuleStateSyncWire,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let note_evaluation_available = parsed.note_evaluation_available.unwrap_or(false);
         let user_profile_present = parsed.user_profile.is_some();
         let user_profile = parsed.user_profile.take().unwrap_or_default();
@@ -9213,7 +9286,7 @@ impl McHandler {
             let historian_phase = match store.load(&binding.session) {
                 Ok(loaded) => loaded.meta.historian.state,
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
                     };
@@ -9231,7 +9304,7 @@ impl McHandler {
         let authority_project = match store.authority_project_for_route(&root_path, "memories") {
             Ok(project) => project,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
                 };
@@ -9392,7 +9465,7 @@ impl McHandler {
                 }))
             }
             Err(ModuleStateSyncError::GenerationMismatch { expected, found }) => {
-                HandlerOutcome::Error {
+                PreparedOutcome::Error {
                     code: "state_sync_generation_mismatch".to_string(),
                     message: format!(
                         "shadow_generation {expected} is stale; current generation is {found}"
@@ -9406,12 +9479,12 @@ impl McHandler {
                 historian_compartment_sync_busy_error(phase)
             }
             Err(ModuleStateSyncError::InvalidSeedBoundary { declared, detail }) => {
-                HandlerOutcome::Error {
+                PreparedOutcome::Error {
                     code: "state_sync_seed_boundary_mismatch".to_string(),
                     message: format!("seed boundary {declared:?} rejected: {detail}"),
                 }
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "state_sync_failed".to_string(),
                 message: error.to_string(),
             },
@@ -9420,11 +9493,11 @@ impl McHandler {
 
     async fn handle_transform_page_value(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: Value,
         lane: TransformLane,
         ticket: &TransformDispatchTicket<'_>,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let present = TRANSFORM_PAGE_FIELDS
             .iter()
             .filter(|field| request.get(**field).is_some())
@@ -9536,7 +9609,7 @@ impl McHandler {
                     && page_complete
                     && completed.final_digest == page_digest
                 {
-                    return HandlerOutcome::Response(completed.result.clone());
+                    return PreparedOutcome::Response(completed.result.clone());
                 }
                 return transform_page_error(
                     lane,
@@ -9621,10 +9694,8 @@ impl McHandler {
                     )
                     .await;
                 let completed_result = match &outcome {
-                    HandlerOutcome::Response(bytes) => Some(bytes.clone()),
-                    HandlerOutcome::Error { .. }
-                    | HandlerOutcome::ErrorWithDetail { .. }
-                    | HandlerOutcome::Streamed => None,
+                    PreparedOutcome::Response(bytes) => Some(bytes.clone()),
+                    PreparedOutcome::Error { .. } | PreparedOutcome::Streamed => None,
                 };
                 let mut transforms = self.transform_pages.lock().expect("transform page mutex");
                 let phase = {
@@ -9690,13 +9761,17 @@ impl McHandler {
             .contains(session_id)
     }
 
-    async fn handle_dreamer_run_task(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_dreamer_run_task(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let (ledger_session, binding) =
             match self.management_binding(channel, request, "dreamer.run_task") {
                 Ok(value) => value,
                 Err(outcome) => return outcome,
             };
-        let Some(store) = self.store.get().cloned() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let Some(task) = request.get("task").and_then(Value::as_str) else {
@@ -9722,13 +9797,13 @@ impl McHandler {
         let Some(project) = (match store.authority_project_for_route(&route_root, "memories") {
             Ok(project) => project,
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "authority_lookup_failed".to_string(),
                     message: error.to_string(),
                 };
             }
         }) else {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "authority_not_module".to_string(),
                 message: "memories authority for this route is not MODULE".to_string(),
             };
@@ -9737,14 +9812,14 @@ impl McHandler {
             (match store.module_authority_for_project(&project, "memories") {
                 Ok(authority) => authority,
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
                     };
                 }
             })
         else {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "authority_not_module".to_string(),
                 message: "memories authority for this route is not MODULE".to_string(),
             };
@@ -9753,26 +9828,26 @@ impl McHandler {
             match store.authority_status(&context_store_uuid, &authority_project, "memories") {
                 Ok(Some(authority)) => authority,
                 Ok(None) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "authority_not_module".to_string(),
                         message: "memories authority row is missing".to_string(),
                     };
                 }
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
                     };
                 }
             };
         if authority.state != "MODULE" {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "authority_not_module".to_string(),
                 message: format!("memories authority is {}", authority.state),
             };
         }
         if authority.generation != authority_generation {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "authority_generation_mismatch".to_string(),
                 message: format!(
                     "authority generation is {}, request used {authority_generation}",
@@ -9787,7 +9862,7 @@ impl McHandler {
             return invalid_params_error("classify payload requires prompt_body");
         };
         if prompt_body.len() > MAX_CLASSIFY_PROMPT_BYTES {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "payload_too_large".to_string(),
                 message: format!("classify prompt_body exceeds {MAX_CLASSIFY_PROMPT_BYTES} bytes"),
             };
@@ -9867,7 +9942,7 @@ impl McHandler {
                 .lock()
                 .expect("dream command registry mutex");
             if !inflight.insert(command_key.clone()) {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "dreamer_run_failed".to_string(),
                     message:
                         "this command is already executing; retry replays its recorded outcome"
@@ -9887,7 +9962,7 @@ impl McHandler {
             Ok(Some(recorded)) => return replay_dream_task_response(&recorded.response_json),
             Ok(None) => {}
             Err(error) => {
-                return HandlerOutcome::Error {
+                return PreparedOutcome::Error {
                     code: "dreamer_ledger_failed".to_string(),
                     message: error.to_string(),
                 }
@@ -10025,9 +10100,9 @@ impl McHandler {
                     // response.
                     if matches!(
                         &primary,
-                        HistorianProducerError::Subc(body) if body.code == "idempotency_conflict"
+                        primary if primary.code() == Some("idempotency_conflict")
                     ) {
-                        return HandlerOutcome::Error {
+                        return PreparedOutcome::Error {
                             code: "dreamer_run_failed".to_string(),
                             message: primary.to_string(),
                         };
@@ -10055,7 +10130,7 @@ impl McHandler {
                 &response.to_string(),
                 now_ms(),
             );
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "dreamer_run_failed".to_string(),
                 message: last_error,
             };
@@ -10095,7 +10170,7 @@ impl McHandler {
             // ledger row, a retry derives the same child session and can
             // recover the completed run instead of hitting a deletion
             // tombstone.
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "dreamer_ledger_failed".to_string(),
                 message: error.to_string(),
             },
@@ -10104,9 +10179,9 @@ impl McHandler {
 
     async fn handle_memory_set_classification(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: &Value,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["rows"]) else {
             return invalid_params_error("memory.set_classification requires arguments");
         };
@@ -10121,7 +10196,7 @@ impl McHandler {
             Err(_) => return session_unresolved_error(),
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let authority_project =
@@ -10129,20 +10204,20 @@ impl McHandler {
                 Ok(Some((project, state))) if state == "MODULE" => project,
                 Ok(Some(_)) => return authority_draining_error("memories"),
                 Ok(None) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "authority_not_module".to_string(),
                         message: "classification requires MODULE memories authority".to_string(),
                     };
                 }
                 Err(error) => {
-                    return HandlerOutcome::Error {
+                    return PreparedOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
                     };
                 }
             };
         if authority_project != memory_project {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "facade_project_vocabulary_mismatch".to_string(),
                 message: format!(
                     "classification route is owned by {authority_project}, not {memory_project}"
@@ -10212,7 +10287,7 @@ impl McHandler {
                 "rejected": result.rejected.iter().map(|row| json!({ "memory_id": row.memory_id, "reason": row.reason })).collect::<Vec<_>>(),
             })),
             Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
-                HandlerOutcome::Error {
+                PreparedOutcome::Error {
                     code: "authority_generation_mismatch".to_string(),
                     message: format!("authority generation is {found}, request used {expected}"),
                 }
@@ -10221,7 +10296,7 @@ impl McHandler {
                 authority_draining_error("memories")
             }
             Err(McStoreError::AuthorityStateMismatch { expected, found }) => {
-                HandlerOutcome::Error {
+                PreparedOutcome::Error {
                     code: "authority_state_mismatch".to_string(),
                     message: format!("authority state is {found}, expected {expected}"),
                 }
@@ -10229,14 +10304,18 @@ impl McHandler {
             Err(error) if store_error_is_authority_draining(&error) => {
                 authority_draining_error("memories")
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "classification_apply_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    async fn handle_memory_set_mural_cue(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_memory_set_mural_cue(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["rows"]) else {
             return invalid_params_error("memory.set_mural_cue requires arguments");
         };
@@ -10251,7 +10330,7 @@ impl McHandler {
             Err(_) => return session_unresolved_error(),
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let command_id = args
@@ -10260,7 +10339,7 @@ impl McHandler {
             .filter(|id| !id.is_empty());
         if let Some(command_id) = command_id {
             if let Some(replayed) =
-                replayed_memory_apply_command(store, &binding.session, "set_mural_cue", command_id)
+                replayed_memory_apply_command(&store, &binding.session, "set_mural_cue", command_id)
             {
                 return replayed;
             }
@@ -10339,9 +10418,9 @@ impl McHandler {
 
     async fn handle_memory_set_verification(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: &Value,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["rows"]) else {
             return invalid_params_error("memory.set_verification requires arguments");
         };
@@ -10356,7 +10435,7 @@ impl McHandler {
             Err(_) => return session_unresolved_error(),
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let command_id = args
@@ -10365,7 +10444,7 @@ impl McHandler {
             .filter(|id| !id.is_empty());
         if let Some(command_id) = command_id {
             if let Some(replayed) = replayed_memory_apply_command(
-                store,
+                &store,
                 &binding.session,
                 "set_verification",
                 command_id,
@@ -10449,7 +10528,11 @@ impl McHandler {
         )
     }
 
-    async fn handle_memory_set_mapping(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_memory_set_mapping(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["rows"]) else {
             return invalid_params_error("memory.set_mapping requires arguments");
         };
@@ -10464,7 +10547,7 @@ impl McHandler {
             Err(_) => return session_unresolved_error(),
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let command_id = args
@@ -10473,7 +10556,7 @@ impl McHandler {
             .filter(|id| !id.is_empty());
         if let Some(command_id) = command_id {
             if let Some(replayed) =
-                replayed_memory_apply_command(store, &binding.session, "set_mapping", command_id)
+                replayed_memory_apply_command(&store, &binding.session, "set_mapping", command_id)
             {
                 return replayed;
             }
@@ -10554,7 +10637,7 @@ impl McHandler {
         )
     }
 
-    async fn handle_facade_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    async fn handle_facade_value(&self, channel: RouteHandle, request: Value) -> PreparedOutcome {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
@@ -10591,10 +10674,10 @@ impl McHandler {
 
     fn bind_facade_route_for_write(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         arguments: &Map<String, Value>,
         authority_domain: &str,
-    ) -> Result<(), HandlerOutcome> {
+    ) -> Result<(), PreparedOutcome> {
         let Some(requested_project) = non_empty_string_arg(arguments, "memory_project") else {
             return Ok(());
         };
@@ -10602,12 +10685,12 @@ impl McHandler {
             .facade_binding(channel)
             .map_err(|_| session_unresolved_error())?;
         let route_project_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return Err(store_unavailable_error());
         };
         let authority = store
             .facade_authority_for_project(requested_project, authority_domain)
-            .map_err(|error| HandlerOutcome::Error {
+            .map_err(|error| PreparedOutcome::Error {
                 code: "authority_route_lookup_failed".to_string(),
                 message: error.to_string(),
             })?;
@@ -10617,7 +10700,7 @@ impl McHandler {
             }
             store
                 .bind_authority_route(&context_store_uuid, &project, &route_project_root)
-                .map_err(|error| HandlerOutcome::Error {
+                .map_err(|error| PreparedOutcome::Error {
                     code: "authority_route_bind_failed".to_string(),
                     message: error.to_string(),
                 })?;
@@ -10627,11 +10710,11 @@ impl McHandler {
 
     async fn resolve_facade_scope(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         arguments: Option<&Map<String, Value>>,
         authority_domain: &str,
         bind_authority_for_write: bool,
-    ) -> Result<FacadeScope, HandlerOutcome> {
+    ) -> Result<FacadeScope, PreparedOutcome> {
         let binding = self
             .facade_binding(channel)
             .map_err(|_| session_unresolved_error())?;
@@ -10657,13 +10740,13 @@ impl McHandler {
                 Ok(Some(resolved)) => resolved.session_id,
                 Ok(None) => return Err(session_unresolved_error()),
                 Err(SessionResolveError::Timeout) => {
-                    return Err(HandlerOutcome::Error {
+                    return Err(PreparedOutcome::Error {
                         code: "session_resolve_timeout".to_string(),
                         message: "session.resolve timed out after 2s".to_string(),
                     });
                 }
                 Err(error) => {
-                    return Err(HandlerOutcome::Error {
+                    return Err(PreparedOutcome::Error {
                         code: "session_resolve_failed".to_string(),
                         message: error.to_string(),
                     });
@@ -10679,13 +10762,13 @@ impl McHandler {
         }
         let requested_project =
             arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
-        let memory_project_path = match self.store.get() {
+        let memory_project_path = match self.store() {
             Some(store) => match store
                 .authority_project_state_for_route(&route_project_root, authority_domain)
             {
                 Ok(Some((authority_project, authority_state))) => {
                     if requested_project.is_some_and(|requested| requested != authority_project) {
-                        return Err(HandlerOutcome::Error {
+                        return Err(PreparedOutcome::Error {
                             code: "facade_project_vocabulary_mismatch".to_string(),
                             message: format!(
                                 "{authority_domain} facade route {route_project_root} is authority-managed as {authority_project}, but the request supplied {}",
@@ -10704,7 +10787,7 @@ impl McHandler {
                 // retryable errors: silently using the route could read or write the wrong owner.
                 Ok(None) => route_project_root.clone(),
                 Err(error) => {
-                    return Err(HandlerOutcome::Error {
+                    return Err(PreparedOutcome::Error {
                         code: "authority_project_resolution_failed".to_string(),
                         message: error.to_string(),
                     });
@@ -10720,7 +10803,11 @@ impl McHandler {
         })
     }
 
-    async fn handle_ctx_reduce_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_reduce_facade(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["drop"]) else {
             return invalid_params_error("ctx_reduce arguments must be an object");
         };
@@ -10742,7 +10829,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -10824,7 +10911,11 @@ impl McHandler {
         mcp_text_result(format!("Queued: {}.", details.join("; ")), false)
     }
 
-    async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_memory_facade(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["action"]) else {
             return invalid_params_error("ctx_memory arguments must be an object");
         };
@@ -10849,7 +10940,7 @@ impl McHandler {
         if !facade_scope.memory_enabled {
             return tool_error_result("Error: memory is disabled for this project.".to_string());
         }
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -11051,7 +11142,7 @@ impl McHandler {
             }
             "get" => {
                 let ids = memory_ids(args, "get");
-                match memory_tool::get_memories(store, memory_project, &ids) {
+                match memory_tool::get_memories(&store, memory_project, &ids) {
                     Ok(memories) => {
                         let by_id = memories
                             .into_iter()
@@ -11079,7 +11170,11 @@ impl McHandler {
         }
     }
 
-    async fn handle_ctx_search_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_search_facade(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["query"]) else {
             return invalid_params_error("ctx_search arguments must be an object");
         };
@@ -11098,14 +11193,14 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
         match memory_tool::search_memories_and_compartments_for_session(
-            store,
+            &store,
             memory_project,
             conversation_key,
             query,
@@ -11139,7 +11234,11 @@ impl McHandler {
         }
     }
 
-    async fn handle_ctx_expand_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_expand_facade(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["message", "start"]) else {
             return invalid_params_error("ctx_expand arguments must be an object");
         };
@@ -11151,7 +11250,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -11254,7 +11353,11 @@ impl McHandler {
         )
     }
 
-    fn handle_note_evaluation_register(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_note_evaluation_register(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let body = match note_evaluation_body(
             request,
             &[
@@ -11279,7 +11382,7 @@ impl McHandler {
             Err(outcome) => return outcome,
         };
         if protocol_version != NOTE_EVALUATOR_PROTOCOL_VERSION {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "protocol_unsupported".to_string(),
                 message: format!(
                     "evaluator protocol {protocol_version} is unsupported; this module accepts {NOTE_EVALUATOR_PROTOCOL_VERSION}"
@@ -11319,7 +11422,7 @@ impl McHandler {
                 .expect("note evaluator registrations mutex");
             let entries = registrations.entry(project).or_default();
             entries.retain(|entry| {
-                !(entry.evaluator_instance == evaluator_instance && entry.channel == channel)
+                !(entry.evaluator_instance == evaluator_instance && entry.route == channel)
             });
             // `evaluator_instance` is caller-chosen, so without a cap a single
             // bound channel could retain unbounded live entries for a full lease
@@ -11333,7 +11436,7 @@ impl McHandler {
                 token: token.clone(),
                 registration_generation,
                 evaluator_instance,
-                channel,
+                route: channel,
                 policy_version,
                 capacity,
                 retina_handoff,
@@ -11352,7 +11455,11 @@ impl McHandler {
         }))
     }
 
-    fn handle_note_evaluation_heartbeat(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_note_evaluation_heartbeat(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let body = match note_evaluation_body(
             request,
             &[
@@ -11394,7 +11501,7 @@ impl McHandler {
                 entry.token == identity.token
                     && entry.registration_generation == identity.registration_generation
                     && entry.evaluator_instance == identity.evaluator_instance
-                    && entry.channel == channel
+                    && entry.route == channel
                     && entry.expires_at > now
             })
         }) else {
@@ -11420,7 +11527,11 @@ impl McHandler {
         }))
     }
 
-    fn handle_note_evaluation_unregister(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_note_evaluation_unregister(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let body = match note_evaluation_body(
             request,
             &[
@@ -11450,7 +11561,7 @@ impl McHandler {
                 !(entry.token == identity.token
                     && entry.registration_generation == identity.registration_generation
                     && entry.evaluator_instance == identity.evaluator_instance
-                    && entry.channel == channel)
+                    && entry.route == channel)
             });
             if entries.is_empty() {
                 registrations.remove(&project);
@@ -11459,7 +11570,11 @@ impl McHandler {
         respond(json!({ "ok": true }))
     }
 
-    fn handle_note_evaluation_next(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_note_evaluation_next(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let body = match note_evaluation_body(
             request,
             &[
@@ -11500,7 +11615,7 @@ impl McHandler {
             Err(outcome) => return outcome,
         };
         if wait_ms != 0 {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "positive_wait_unsupported".to_string(),
                 message: "protocol v2.0 accepts only wait_ms=0".to_string(),
             };
@@ -11530,7 +11645,7 @@ impl McHandler {
             // the store and leaves no replayable acquisition decision behind.
             return respond(json!({ "result": "no_work", "wake_owned": true }));
         }
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         // Fair-cycle ownership (KTD2/KTD3): hold only this slot's lock across
@@ -11629,14 +11744,18 @@ impl McHandler {
                 }
                 note_evaluation_acquire_response(outcome)
             }
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "note_store_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_note_evaluation_renew(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_note_evaluation_renew(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let body = match note_evaluation_body(
             request,
             &[
@@ -11657,7 +11776,7 @@ impl McHandler {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
             };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         match store.renew_note_evaluation_claim(
@@ -11681,14 +11800,18 @@ impl McHandler {
                 "result": kind,
                 "response": note_evaluation_response_value(response),
             })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "note_store_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_note_evaluation_complete(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_note_evaluation_complete(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let body = match note_evaluation_body(
             request,
             &[
@@ -11722,7 +11845,7 @@ impl McHandler {
                 Ok(scope) => scope,
                 Err(handler_outcome) => return handler_outcome,
             };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let project_for_apply = project.clone();
@@ -11752,14 +11875,18 @@ impl McHandler {
                 "response": note_evaluation_response_value(Some(response_json)),
             })),
             Ok(NoteEvalCompleteOutcome::Conflict { kind }) => respond(json!({ "result": kind })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "note_store_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_note_evaluation_abandon(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_note_evaluation_abandon(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let body = match note_evaluation_body(
             request,
             &[
@@ -11780,7 +11907,7 @@ impl McHandler {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
             };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         match store.abandon_note_evaluation_claim(
@@ -11796,7 +11923,7 @@ impl McHandler {
                 respond(json!({ "result": "unknown_claim" }))
             }
             Ok(NoteEvalAbandonOutcome::Invalid) => respond(json!({ "result": "invalid" })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "note_store_failed".to_string(),
                 message: error.to_string(),
             },
@@ -11805,10 +11932,10 @@ impl McHandler {
 
     fn note_evaluation_claim_scope<'a>(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         body: &'a Map<String, Value>,
         now: i64,
-    ) -> Result<(NoteEvaluationIdentity<'a>, i64, &'a str, String), HandlerOutcome> {
+    ) -> Result<(NoteEvaluationIdentity<'a>, i64, &'a str, String), PreparedOutcome> {
         let identity = note_evaluation_identity_fields(body)?;
         let evaluator_slot = note_evaluation_i64_field(body, "evaluator_slot")?;
         let claim_id = note_evaluation_id_field(body, "claim_id")?;
@@ -11831,12 +11958,12 @@ impl McHandler {
 
     async fn handle_note_delivery_value(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: &Value,
         ack: bool,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: "transform delivery acknowledgement requires session_id".to_string(),
             };
@@ -11846,7 +11973,7 @@ impl McHandler {
             .and_then(Value::as_str)
             .or_else(|| request.get("pass_id").and_then(Value::as_str));
         let Some(pass_id) = pass_id.filter(|id| !id.trim().is_empty()) else {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "bad_request".to_string(),
                 message: "transform delivery acknowledgement requires transform_pass_id"
                     .to_string(),
@@ -11860,13 +11987,13 @@ impl McHandler {
             Err(outcome) => return outcome,
         };
         if scope.conversation_key != session_id {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "session_mismatch".to_string(),
                 message: "delivery acknowledgement session_id does not match the channel binding"
                     .to_string(),
             };
         }
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         let result = if ack {
@@ -11886,14 +12013,18 @@ impl McHandler {
         };
         match result {
             Ok(changed) => respond(json!({ "ok": true, "updated": changed })),
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "note_store_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    async fn handle_ctx_note_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_note_facade(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["action", "content"]) else {
             return invalid_params_error("ctx_note arguments must be an object");
         };
@@ -11917,7 +12048,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
+        let store = match self.store() {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
@@ -11962,7 +12093,7 @@ impl McHandler {
                     .filter(|value| !value.is_empty());
                 if condition.is_some() && !self.has_live_note_evaluator(project, now) {
                     return refuse_conditioned_note_without_evaluator(
-                        store,
+                        &store,
                         session,
                         action,
                         command_id.as_deref(),
@@ -12173,7 +12304,7 @@ impl McHandler {
                     .is_some_and(|value| current.surface_condition.as_deref() != Some(value));
                 if condition_changed && !self.has_live_note_evaluator(project, now) {
                     return refuse_conditioned_note_without_evaluator(
-                        store,
+                        &store,
                         session,
                         action,
                         command_id.as_deref(),
@@ -12263,7 +12394,11 @@ impl McHandler {
 
 impl Drop for McHandler {
     fn drop(&mut self) {
-        self.store_open.cancel();
+        if let Ok(admission) = self.task_admission_open.get_mut() {
+            *admission = false;
+        }
+        self.tasks.close();
+        self.cancel.cancel();
     }
 }
 
@@ -12273,18 +12408,47 @@ impl Default for McHandler {
     }
 }
 
-#[async_trait]
-impl ModuleHandler for McHandler {
-    /// The storage seam: HELLO_ACK carries the resolved descriptor (or none in
-    /// standalone dev). Start the store open ONCE here — never at construction, because
-    /// the path isn't known until the ACK lands. Opening runs off the request lane so a
-    /// predecessor's live single-writer lease cannot block transform dispatch.
-    async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
-        self.begin_store_open(resolve_descriptor(ack.storage.as_ref()));
+impl CompositeComponent for McHandler {
+    fn manifest(&self) -> ManifestSnapshot {
+        manifest(DEFAULT_MODULE_ID)
     }
 
-    /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
-    /// channel-0 health task, so neither the store nor a handler lock is touched here.
+    fn resources(&self) -> ResourceDeclaration {
+        ResourceDeclaration::default()
+    }
+
+    async fn bind(&self, route: RouteHandle, identity: RouteIdentity) -> BindOutcome {
+        let config = self.effective_config(&identity.project_root);
+        self.bind_route(
+            route,
+            SessionBinding {
+                project_root: identity.project_root,
+                harness: identity.harness,
+                session: identity.session,
+                model_key: None,
+                config,
+                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+            },
+        );
+        BindOutcome::Accept
+    }
+
+    async fn handle(&self, ctx: RequestCtx) -> RequestOutcome {
+        if let Err(outcome) = enforce_request_byte_cap(ctx.body.as_slice()) {
+            return settle_prepared(&ctx, outcome).await;
+        }
+        let request = serde_json::from_slice::<Value>(ctx.body.as_slice()).unwrap_or(Value::Null);
+        let inbound_bytes = ctx.body.len();
+        let outcome = self
+            .dispatch_value_with_inbound_bytes(ctx.route, request, Some(inbound_bytes))
+            .await;
+        settle_prepared(&ctx, outcome).await
+    }
+
+    async fn route_gone(&self, route: RouteHandle) {
+        self.unbind_route(route);
+    }
+
     async fn health(&self) -> HealthReport {
         let now = now_ms().max(0) as u64;
         self.store_open
@@ -12292,44 +12456,164 @@ impl ModuleHandler for McHandler {
             .unwrap_or_else(|| DISPATCH_HEALTH.report(now))
     }
 
-    /// Record the route's {project_root, session} so the transform path can resolve the
-    /// project from the daemon-controlled channel (never a per-pass request field). Accept
-    /// every route — project resolution, not authorization, is the concern here.
-    async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
-        let config = self.effective_config(&req.identity.project_root);
-        self.bind_route(
-            req.handle.channel,
-            SessionBinding {
-                project_root: req.identity.project_root.clone(),
-                harness: req.identity.harness.clone(),
-                session: req.identity.session.clone(),
-                model_key: None,
-                config,
-                // Older callers may omit the per-pass budget. Keep a safe fallback on the
-                // route, while authority requests carry the harness-resolved value.
-                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
-            },
-        );
-        subc_client_rs::BindDecision::accept()
-    }
-
-    /// Drop the route's binding on teardown so a reused channel can't resolve a stale
-    /// project and the map doesn't leak.
-    async fn on_route_gone(&self, handle: &RouteHandle) {
-        self.unbind_route(handle.channel);
-    }
-
-    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        if let Err(outcome) = enforce_request_byte_cap(&body) {
-            return outcome;
+    async fn shutdown(&self) -> Result<(), ShutdownError> {
+        {
+            let mut admission = self
+                .task_admission_open
+                .lock()
+                .expect("module task admission mutex");
+            *admission = false;
+            self.tasks.close();
         }
-        let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-        self.dispatch_value_with_inbound_bytes(
-            ctx.route_handle().channel,
-            request,
-            Some(body.len()),
-        )
-        .await
+        self.cancel.cancel();
+        self.tasks.wait().await;
+
+        self.bindings.lock().expect("bindings mutex").clear();
+        self.transform_route_channels
+            .lock()
+            .expect("transform route channels mutex")
+            .clear();
+        self.note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex")
+            .clear();
+        self.note_evaluation_capabilities
+            .lock()
+            .expect("note evaluation capability mutex")
+            .clear();
+        self.transform_session_roots
+            .lock()
+            .expect("transform session roots mutex")
+            .clear();
+        *self
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex") =
+            TransformSnapshotCache::new(TRANSFORM_SNAPSHOT_BUDGET_BYTES);
+        *self
+            .serialized_outputs
+            .lock()
+            .expect("serialized output cache mutex") = SerializedOutputCache::default();
+        *self
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex") = NativeAttachmentCache::default();
+        *self.projections.lock().expect("projection cache mutex") = ProjectionCache::default();
+        *self
+            .boundary_tokens
+            .lock()
+            .expect("boundary token cache mutex") =
+            BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES);
+        *self.state_sync_seeds.lock().expect("state sync seed mutex") =
+            StateSyncSeedCoordinator::default();
+        *self.transform_pages.lock().expect("transform page mutex") =
+            TransformPageCoordinator::default();
+        *self.state_imports.lock().expect("state import mutex") = StateImportCoordinator::default();
+        self.scheduler_observations
+            .lock()
+            .expect("scheduler observations mutex")
+            .clear();
+        self.guidance_dates
+            .lock()
+            .expect("guidance dates mutex")
+            .clear();
+        self.prompt_surface_epochs
+            .lock()
+            .expect("prompt surface epoch mutex")
+            .clear();
+        *self.store.lock().expect("store slot mutex") = None;
+        Ok(())
+    }
+}
+
+impl PrimaryComponent for McHandler {
+    async fn initialize(&self, init: HostInit) -> Result<(), InitError> {
+        let descriptor = match init.storage {
+            Some(storage) => serde_json::from_value(storage)
+                .map_err(|_| InitError("invalid Magic Context storage descriptor".to_owned()))?,
+            None => dev_descriptor(),
+        };
+        self.begin_store_open(descriptor)
+    }
+}
+
+enum PreparedSettlement<W> {
+    Response(W),
+    Error { code: String, message: String },
+    Streamed,
+}
+
+async fn settle_prepared_with<W, Reserve, Reserved, Cancelled>(
+    outcome: PreparedOutcome,
+    mut cancelled: Cancelled,
+    reserve: Reserve,
+) -> PreparedSettlement<W>
+where
+    W: std::io::Write,
+    Reserve: FnOnce(usize) -> Reserved,
+    Reserved: std::future::Future<Output = Result<W, ()>>,
+    Cancelled: FnMut() -> bool,
+{
+    let PreparedOutcome::Response(output) = outcome else {
+        return match outcome {
+            PreparedOutcome::Error { code, message } => PreparedSettlement::Error { code, message },
+            PreparedOutcome::Streamed => PreparedSettlement::Streamed,
+            PreparedOutcome::Response(_) => unreachable!(),
+        };
+    };
+    let measured = match output.measure() {
+        Ok(measured) => measured,
+        Err(error) => {
+            return PreparedSettlement::Error {
+                code: "encode_failed".to_owned(),
+                message: error.to_string(),
+            };
+        }
+    };
+    if cancelled() {
+        return PreparedSettlement::Error {
+            code: "request_cancelled".to_owned(),
+            message: "request was cancelled before output reservation".to_owned(),
+        };
+    }
+    let mut body = match reserve(measured.len()).await {
+        Ok(body) => body,
+        Err(()) => {
+            return PreparedSettlement::Error {
+                code: "output_unavailable".to_owned(),
+                message: "response output reservation is unavailable".to_owned(),
+            };
+        }
+    };
+    if cancelled() {
+        return PreparedSettlement::Error {
+            code: "request_cancelled".to_owned(),
+            message: "request was cancelled before output encoding".to_owned(),
+        };
+    }
+    if let Err(error) = measured.write_to(&mut body) {
+        return PreparedSettlement::Error {
+            code: "encode_failed".to_owned(),
+            message: error.to_string(),
+        };
+    }
+    PreparedSettlement::Response(body)
+}
+
+async fn settle_prepared(ctx: &RequestCtx, outcome: PreparedOutcome) -> RequestOutcome {
+    match settle_prepared_with(
+        outcome,
+        || ctx.is_cancelled(),
+        |len| async move { ctx.reserve_output(len).await.map_err(|_| ()) },
+    )
+    .await
+    {
+        PreparedSettlement::Response(body) => RequestOutcome::Response {
+            body,
+            binary: false,
+        },
+        PreparedSettlement::Error { code, message } => RequestOutcome::Error { code, message },
+        PreparedSettlement::Streamed => RequestOutcome::Streamed,
     }
 }
 
@@ -12338,57 +12622,22 @@ impl McHandler {
     /// routing arms are unit-testable (`RequestCtx` cannot be constructed
     /// outside the transport).
     #[cfg(test)]
-    async fn dispatch_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        self.dispatch_value_with_inbound_bytes(channel, request, None)
+    async fn dispatch_value(&self, route: RouteHandle, request: Value) -> PreparedOutcome {
+        self.dispatch_value_with_inbound_bytes(route, request, None)
             .await
     }
 
-    /// Cross-crate test seam: dispatch one parsed request, bypassing the transport. `RequestCtx` is transport-owned, so the authenticated round-trip test cannot call `handle()`. commentlint: allow(JUDGE)
-    #[doc(hidden)]
-    pub async fn dispatch_value_for_integration(
-        &self,
-        channel: u16,
-        request: Value,
-    ) -> HandlerOutcome {
-        self.dispatch_value_with_inbound_bytes(channel, request, None)
-            .await
-    }
-
-    /// Cross-crate test seam mirroring `on_bind`: `RouteBindRequest` needs a `RouteHandle`, whose constructor is private to the transport crate. commentlint: allow(JUDGE)
-    #[doc(hidden)]
-    pub fn bind_route_for_integration(
-        &self,
-        channel: u16,
-        project_root: &Path,
-        harness: &str,
-        session: &str,
-    ) {
-        let config = self.effective_config(project_root);
-        self.bind_route(
-            channel,
-            SessionBinding {
-                project_root: project_root.to_path_buf(),
-                harness: harness.to_owned(),
-                session: session.to_owned(),
-                model_key: None,
-                config,
-                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
-            },
-        );
-    }
-
-    /// Cross-crate test seam mirroring the `on_hello_ack` store open: sharing one already-open handle lets the test seed and verify rows without fighting the store's single-writer lease. commentlint: allow(JUDGE)
-    #[doc(hidden)]
-    pub fn install_store_for_integration(&self, store: Arc<McStore>) {
-        let _ = self.store.set(store);
+    #[cfg(test)]
+    fn install_store_for_test(&self, store: Arc<McStore>) {
+        *self.store.lock().expect("store slot mutex") = Some(store);
     }
 
     async fn dispatch_value_with_inbound_bytes(
         &self,
-        channel: u16,
+        channel: RouteHandle,
         request: Value,
         inbound_bytes: Option<usize>,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         let method = request
             .get("method")
             .and_then(Value::as_str)
@@ -12480,9 +12729,9 @@ fn transform_page_error(
     lane: TransformLane,
     suffix: &str,
     message: impl Into<String>,
-) -> HandlerOutcome {
+) -> PreparedOutcome {
     let _ = lane;
-    HandlerOutcome::Error {
+    PreparedOutcome::Error {
         code: format!("authority_transform_page_{suffix}"),
         message: message.into(),
     }
@@ -12496,10 +12745,10 @@ fn transform_page_error(
 ///   mistake is diagnosable from the code alone.
 /// - Anything else names the discriminator fields we looked for and the
 ///   top-level keys we actually got.
-fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
+fn unrecognized_request_error(request: &Value) -> PreparedOutcome {
     let has_mcp_shape = request.get("name").is_some() && request.get("arguments").is_some();
     if has_mcp_shape {
-        return HandlerOutcome::Error {
+        return PreparedOutcome::Error {
             code: "facade_envelope_not_supported".to_string(),
             message: "MCP tools/call envelope ({name, arguments}) names a tool this module \
                       does not route on the facade; other module commands use flat bodies \
@@ -12514,7 +12763,7 @@ fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
         }
         None => format!("non-object JSON ({})", json_type_name(request)),
     };
-    HandlerOutcome::Error {
+    PreparedOutcome::Error {
         code: "unrecognized_request_shape".to_string(),
         message: format!(
             "no `method` or `kind` field matched a known request; got top-level keys: [{got_keys}]"
@@ -12543,15 +12792,15 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn unknown_serializer_profile_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn unknown_serializer_profile_error() -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "unknown_serializer_profile".to_string(),
         message: "missing or unknown serializer_profile".to_string(),
     }
 }
 
-fn serve_native_unsupported_profile_error(profile: &str) -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn serve_native_unsupported_profile_error(profile: &str) -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "serve_native_unsupported_profile".to_string(),
         message: format!("serve_native requires serializer_profile opencode-aisdk, got {profile}"),
     }
@@ -13277,14 +13526,14 @@ fn finalize_native_messages_response(
     );
 }
 
-fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn state_import_validation_error(error: StateImportValidationError) -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: error.code().to_string(),
         message: error.to_string(),
     }
 }
 
-fn passthrough_transform_response(request: &TransformRequest) -> HandlerOutcome {
+fn passthrough_transform_response(request: &TransformRequest) -> PreparedOutcome {
     let mut response = transform::TransformResponse::passthrough(
         request
             .messages
@@ -13297,7 +13546,7 @@ fn passthrough_transform_response(request: &TransformRequest) -> HandlerOutcome 
     respond_transform(request, response)
 }
 
-fn need_full_sync_response(request: &TransformRequest) -> HandlerOutcome {
+fn need_full_sync_response(request: &TransformRequest) -> PreparedOutcome {
     respond_transform(
         request,
         transform::TransformResponse::need_full_sync(request.full_array_fingerprint.clone()),
@@ -13327,15 +13576,15 @@ fn length_capped_or_invalid(
     validate_classify_manifest(&result.text, expected_ids)
 }
 
-fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
+fn replay_dream_task_response(response_json: &str) -> PreparedOutcome {
     let Ok(response) = serde_json::from_str::<Value>(response_json) else {
-        return HandlerOutcome::Error {
+        return PreparedOutcome::Error {
             code: "dreamer_ledger_corrupt".to_string(),
             message: "recorded dreamer response is not valid JSON".to_string(),
         };
     };
     if response.get("ok").and_then(Value::as_bool) == Some(false) {
-        return HandlerOutcome::Error {
+        return PreparedOutcome::Error {
             code: response
                 .get("code")
                 .and_then(Value::as_str)
@@ -13489,10 +13738,10 @@ fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFa
 fn respond_transform(
     request: &TransformRequest,
     mut response: transform::TransformResponse,
-) -> HandlerOutcome {
+) -> PreparedOutcome {
     // drive-fault: corrupt the response before it is serialized (see the SAFETY note
     // above the fault helpers). No-op unless the feature is compiled in AND MC_DRIVE_FAULT
-    // selects an arm; must run before ck_messages is taken for the streaming placeholder.
+    // selects an arm; must run before ck_messages is moved into exact prepared segments.
     //
     // The fault fires at most N times (MC_DRIVE_FAULT_COUNT, default 1) then self-disarms
     // permanently via a fetch_update claim on DRIVE_FAULT_REMAINING. This is critical for the
@@ -13514,7 +13763,7 @@ fn respond_transform(
         }
     }
     if response.status == transform::TransformStatus::Ok && request.tail_delta.is_some() {
-        return HandlerOutcome::Error {
+        return PreparedOutcome::Error {
             code: "transform_delta_unexpanded".to_string(),
             message: "successful transform response retained an unexpanded tail_delta".to_string(),
         };
@@ -13524,7 +13773,7 @@ fn respond_transform(
         && response.native_messages.is_none()
         && response.native_messages_delta.is_none()
     {
-        return HandlerOutcome::Error {
+        return PreparedOutcome::Error {
             code: "transform_native_response_omitted".to_string(),
             message: "successful serve_native response omitted native content".to_string(),
         };
@@ -13536,7 +13785,7 @@ fn respond_transform(
     let mut value = match serde_json::to_value(response) {
         Ok(value) => value,
         Err(error) => {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "encode_failed".to_string(),
                 message: error.to_string(),
             };
@@ -13548,71 +13797,46 @@ fn respond_transform(
             .expect("transform responses serialize as objects")
             .insert("ck_messages".to_string(), Value::Null);
     }
-    let encoded = match serde_json::to_vec(&value) {
-        Ok(encoded) => encoded,
-        Err(error) => {
-            return HandlerOutcome::Error {
-                code: "encode_failed".to_string(),
-                message: error.to_string(),
-            };
-        }
-    };
     let response_meta_encode_ms = response_encode_started_at.elapsed().as_secs_f64() * 1_000.0;
-    let Some(messages) = messages else {
-        let outcome = HandlerOutcome::Response(encoded);
-        emit_pass_timing(
-            session_id,
-            pass_timings.as_ref(),
-            response_encode_started_at,
-            response_meta_encode_ms,
-            0.0,
-            0.0,
-        );
-        return outcome;
-    };
-
-    const PLACEHOLDER: &[u8] = br#""ck_messages":null"#;
-    let Some(start) = encoded
-        .windows(PLACEHOLDER.len())
-        .position(|window| window == PLACEHOLDER)
-    else {
-        return HandlerOutcome::Error {
-            code: "encode_failed".to_string(),
-            message: "transform response lost ck_messages placeholder".to_string(),
-        };
-    };
-    let null_start = start + PLACEHOLDER.len() - 4;
-    let response_size_account_started_at = Instant::now();
-    let retained_bytes = messages
-        .iter()
-        .map(|message| message.canonical_bytes().len())
-        .sum::<usize>();
-    let response_size_account_ms =
-        response_size_account_started_at.elapsed().as_secs_f64() * 1_000.0;
-    let response_splice_started_at = Instant::now();
-    let mut output =
-        Vec::with_capacity(encoded.len() + retained_bytes + messages.len().saturating_sub(1) + 2);
-    output.extend_from_slice(&encoded[..null_start]);
-    output.push(b'[');
-    for (index, message) in messages.iter().enumerate() {
-        if index > 0 {
-            output.push(b',');
+    let output = match messages {
+        None => PreparedOutput::json(value),
+        Some(messages) => {
+            let response_size_account_started_at = Instant::now();
+            let segments = messages
+                .into_iter()
+                .map(PreparedSegment::served)
+                .collect::<Vec<_>>();
+            let response_size_account_ms =
+                response_size_account_started_at.elapsed().as_secs_f64() * 1_000.0;
+            let output = match PreparedOutput::transform_segments(value, segments) {
+                Ok(output) => output,
+                Err(error) => {
+                    return PreparedOutcome::Error {
+                        code: "encode_failed".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+            emit_pass_timing(
+                session_id,
+                pass_timings.as_ref(),
+                response_encode_started_at,
+                response_meta_encode_ms,
+                response_size_account_ms,
+                0.0,
+            );
+            return PreparedOutcome::Response(output);
         }
-        output.extend_from_slice(message.canonical_bytes());
-    }
-    output.push(b']');
-    output.extend_from_slice(&encoded[null_start + 4..]);
-    let response_splice_ms = response_splice_started_at.elapsed().as_secs_f64() * 1_000.0;
-    let outcome = HandlerOutcome::Response(output);
+    };
     emit_pass_timing(
         session_id,
         pass_timings.as_ref(),
         response_encode_started_at,
         response_meta_encode_ms,
-        response_size_account_ms,
-        response_splice_ms,
+        0.0,
+        0.0,
     );
-    outcome
+    PreparedOutcome::Response(output)
 }
 
 fn emit_pass_timing(
@@ -13639,14 +13863,8 @@ fn emit_pass_timing(
     }
 }
 
-fn respond(value: Value) -> HandlerOutcome {
-    match serde_json::to_vec(&value) {
-        Ok(bytes) => HandlerOutcome::Response(bytes),
-        Err(e) => HandlerOutcome::Error {
-            code: "encode_failed".to_string(),
-            message: e.to_string(),
-        },
-    }
+fn respond(value: Value) -> PreparedOutcome {
+    PreparedOutcome::Response(PreparedOutput::json(value))
 }
 
 fn guidance_bytes_for(text: &str, date_line: &str) -> String {
@@ -13996,26 +14214,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{digest:x}")
 }
 
-fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
+fn mcp_text_result(text: String, is_error: bool) -> PreparedOutcome {
     respond(json!({
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     }))
 }
 
-fn tool_error_result(message: impl Into<String>) -> HandlerOutcome {
+fn tool_error_result(message: impl Into<String>) -> PreparedOutcome {
     mcp_text_result(message.into(), true)
 }
 
-fn session_unresolved_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn session_unresolved_error() -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "session_unresolved".to_string(),
         message: SESSION_UNRESOLVED_MESSAGE.to_string(),
     }
 }
 
-fn authority_draining_error(domain: &str) -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn authority_draining_error(domain: &str) -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "authority_draining".to_string(),
         message: format!("{domain} authority is draining; retry after the ownership transition"),
     }
@@ -14035,36 +14253,36 @@ fn authority_request_key(request: &Value) -> Option<(&str, &str, &str)> {
     Some((uuid, project, domain))
 }
 
-fn invalid_params_error(message: impl Into<String>) -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn invalid_params_error(message: impl Into<String>) -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "invalid_params".to_string(),
         message: message.into(),
     }
 }
 
-fn store_unavailable_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn store_unavailable_error() -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "store_unavailable".to_string(),
         message: "store not opened (no HELLO_ACK storage seam yet)".to_string(),
     }
 }
 
-fn note_evaluation_protocol_retired() -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn note_evaluation_protocol_retired() -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "protocol_retired".to_string(),
         message: "note.evaluate verdict writes are retired; use the note.evaluation.* evaluator protocol v2".to_string(),
     }
 }
 
-fn note_evaluation_bad_request(message: impl Into<String>) -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn note_evaluation_bad_request(message: impl Into<String>) -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "bad_request".to_string(),
         message: message.into(),
     }
 }
 
-fn note_evaluation_registration_unknown() -> HandlerOutcome {
-    HandlerOutcome::Error {
+fn note_evaluation_registration_unknown() -> PreparedOutcome {
+    PreparedOutcome::Error {
         code: "registration_unknown".to_string(),
         message:
             "no live evaluator registration matches this token, generation, instance, and route"
@@ -14078,7 +14296,7 @@ fn note_evaluation_registration_unknown() -> HandlerOutcome {
 fn note_evaluation_body<'a>(
     request: &'a Value,
     allowed: &[&str],
-) -> Result<&'a Map<String, Value>, HandlerOutcome> {
+) -> Result<&'a Map<String, Value>, PreparedOutcome> {
     let Some(body) = request.as_object() else {
         return Err(note_evaluation_bad_request(
             "request body must be a JSON object",
@@ -14105,7 +14323,7 @@ struct NoteEvaluationIdentity<'a> {
 
 fn note_evaluation_identity_fields(
     body: &Map<String, Value>,
-) -> Result<NoteEvaluationIdentity<'_>, HandlerOutcome> {
+) -> Result<NoteEvaluationIdentity<'_>, PreparedOutcome> {
     Ok(NoteEvaluationIdentity {
         token: note_evaluation_id_field(body, "token")?,
         registration_generation: note_evaluation_i64_field(body, "registration_generation")?,
@@ -14116,7 +14334,7 @@ fn note_evaluation_identity_fields(
 fn note_evaluation_id_field<'a>(
     body: &'a Map<String, Value>,
     key: &str,
-) -> Result<&'a str, HandlerOutcome> {
+) -> Result<&'a str, PreparedOutcome> {
     match body.get(key).and_then(Value::as_str) {
         Some(value) if !value.is_empty() && value.len() <= NOTE_EVALUATOR_ID_MAX_BYTES => Ok(value),
         _ => Err(note_evaluation_bad_request(format!(
@@ -14125,7 +14343,7 @@ fn note_evaluation_id_field<'a>(
     }
 }
 
-fn note_evaluation_i64_field(body: &Map<String, Value>, key: &str) -> Result<i64, HandlerOutcome> {
+fn note_evaluation_i64_field(body: &Map<String, Value>, key: &str) -> Result<i64, PreparedOutcome> {
     body.get(key)
         .and_then(Value::as_i64)
         .ok_or_else(|| note_evaluation_bad_request(format!("'{key}' must be an integer")))
@@ -14134,7 +14352,7 @@ fn note_evaluation_i64_field(body: &Map<String, Value>, key: &str) -> Result<i64
 fn note_evaluation_bool_field(
     body: &Map<String, Value>,
     key: &str,
-) -> Result<bool, HandlerOutcome> {
+) -> Result<bool, PreparedOutcome> {
     body.get(key)
         .and_then(Value::as_bool)
         .ok_or_else(|| note_evaluation_bad_request(format!("'{key}' must be a boolean")))
@@ -14143,7 +14361,7 @@ fn note_evaluation_bool_field(
 fn note_evaluation_opt_bool_field(
     body: &Map<String, Value>,
     key: &str,
-) -> Result<Option<bool>, HandlerOutcome> {
+) -> Result<Option<bool>, PreparedOutcome> {
     match body.get(key) {
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -14180,7 +14398,7 @@ fn note_evaluation_response_value(response: Option<String>) -> Value {
     }
 }
 
-fn note_evaluation_acquire_response(outcome: NoteEvalAcquireOutcome) -> HandlerOutcome {
+fn note_evaluation_acquire_response(outcome: NoteEvalAcquireOutcome) -> PreparedOutcome {
     match outcome {
         NoteEvalAcquireOutcome::Claim {
             claim,
@@ -14243,7 +14461,7 @@ fn note_evaluation_acquire_response(outcome: NoteEvalAcquireOutcome) -> HandlerO
 /// cannot pass because the pairing is matched exactly.
 fn parse_note_evaluation_wire_outcome(
     value: &Value,
-) -> Result<(String, SmartNoteEvaluationOutcome), HandlerOutcome> {
+) -> Result<(String, SmartNoteEvaluationOutcome), PreparedOutcome> {
     let Some(outcome) = value.as_object() else {
         return Err(note_evaluation_bad_request("'outcome' must be an object"));
     };
@@ -14304,7 +14522,7 @@ fn parse_note_evaluation_wire_outcome(
 
 fn parse_note_evaluation_wire_artifact(
     value: &Value,
-) -> Result<CompiledCheckArtifact, HandlerOutcome> {
+) -> Result<CompiledCheckArtifact, PreparedOutcome> {
     let Some(artifact) = value.as_object() else {
         return Err(note_evaluation_bad_request("'artifact' must be an object"));
     };
@@ -14501,7 +14719,7 @@ impl RequestMethodProbe {
 /// legitimately carry a session's full message array (multi-MiB on large
 /// sessions), so they get the wider cap. Method sniffing on raw bytes avoids
 /// parsing multi-MiB JSON just to reject it.
-fn enforce_request_byte_cap(body: &[u8]) -> Result<(), HandlerOutcome> {
+fn enforce_request_byte_cap(body: &[u8]) -> Result<(), PreparedOutcome> {
     if body.len() <= MAX_FACADE_FRAME_BYTES {
         return Ok(());
     }
@@ -15521,11 +15739,13 @@ fn replayed_memory_apply_command(
     session_id: &str,
     action: &str,
     command_id: &str,
-) -> Option<HandlerOutcome> {
+) -> Option<PreparedOutcome> {
     if let Ok(Some(response)) =
         store.facade_mutation_ledger_response(session_id, "memory", action, command_id)
     {
-        return Some(HandlerOutcome::Response(response));
+        return Some(PreparedOutcome::Response(PreparedOutput::cached_bytes(
+            response,
+        )));
     }
     store
         .load_dream_task_command(session_id, command_id)
@@ -15537,28 +15757,28 @@ fn replayed_memory_apply_command(
 fn dream_apply_command_outcome(
     result: Result<FacadeMutationOutcome, McStoreError>,
     failure_code: &str,
-) -> HandlerOutcome {
+) -> PreparedOutcome {
     match result {
         Ok(FacadeMutationOutcome::Applied(bytes) | FacadeMutationOutcome::Duplicate(bytes)) => {
-            HandlerOutcome::Response(bytes)
+            PreparedOutcome::Response(PreparedOutput::cached_bytes(bytes))
         }
         Err(error) if store_error_is_authority_draining(&error) => {
             authority_draining_error("memories")
         }
         Err(error) if error.to_string().contains("authority_generation_mismatch:") => {
-            HandlerOutcome::Error {
+            PreparedOutcome::Error {
                 code: "authority_generation_mismatch".to_string(),
                 message: "memory authority generation changed while applying the command"
                     .to_string(),
             }
         }
         Err(error) if error.to_string().contains("authority_state_mismatch:") => {
-            HandlerOutcome::Error {
+            PreparedOutcome::Error {
                 code: "authority_state_mismatch".to_string(),
                 message: "memory authority state changed while applying the command".to_string(),
             }
         }
-        Err(error) => HandlerOutcome::Error {
+        Err(error) => PreparedOutcome::Error {
             code: failure_code.to_string(),
             message: error.to_string(),
         },
@@ -15568,18 +15788,20 @@ fn dream_apply_command_outcome(
 fn facade_command_outcome(
     result: Result<FacadeMutationOutcome, McStoreError>,
     domain: &str,
-) -> HandlerOutcome {
+) -> PreparedOutcome {
     match result {
-        Ok(FacadeMutationOutcome::Applied(bytes)) => HandlerOutcome::Response(bytes),
+        Ok(FacadeMutationOutcome::Applied(bytes)) => {
+            PreparedOutcome::Response(PreparedOutput::cached_bytes(bytes))
+        }
         Ok(FacadeMutationOutcome::Duplicate(bytes)) => {
             let Ok(mut envelope) = serde_json::from_slice::<Value>(&bytes) else {
-                return HandlerOutcome::Response(bytes);
+                return PreparedOutcome::Response(PreparedOutput::cached_bytes(bytes));
             };
             if let Some(object) = envelope.as_object_mut() {
                 object.insert("replayed".to_string(), Value::Bool(true));
                 return respond(envelope);
             }
-            HandlerOutcome::Response(bytes)
+            PreparedOutcome::Response(PreparedOutput::cached_bytes(bytes))
         }
         Err(error) if store_error_is_authority_draining(&error) => authority_draining_error(domain),
         Err(error) => tool_error_result(format!("Error: {error}")),
@@ -15597,7 +15819,7 @@ fn refuse_conditioned_note_without_evaluator(
     action: &str,
     command_id: Option<&str>,
     refusal: &str,
-) -> HandlerOutcome {
+) -> PreparedOutcome {
     if let Some(command_id) = command_id {
         match store.facade_mutation_ledger_response(identity_scope, "ctx_note", action, command_id)
         {
@@ -16259,36 +16481,27 @@ fn ctx_note_schema() -> Value {
     })
 }
 
-/// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
-/// bound sessions obtain preset-selected description text through `manifest.get`.
-pub fn manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: false,
-            sub_supervises: false,
-        }],
-        consumes: vec![ConsumerRole::ServiceClient {
-            of: vec!["thalamus".to_string()],
-        }],
-        bindings: Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: true,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
+pub fn manifest(module_id: &str) -> ManifestSnapshot {
+    ManifestSnapshot {
+        module_id: module_id.to_owned(),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        provides: vec![json!({
+            "role": "tool_provider",
+            "tools": prompt_surface::module_tools(&PromptSurfaceSelection::default()),
+            "identity_scope": ["project", "session"],
+            "concurrency": "module_managed",
+            "emits_push": false,
+            "sub_supervises": false,
+        })],
+        control_ops: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+fn test_route(channel_id: u16) -> RouteHandle {
+    RouteHandle {
+        channel: channel_id,
+        epoch: 1,
     }
 }
 
@@ -16297,7 +16510,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
 
@@ -16313,6 +16526,124 @@ mod tests {
         PendingAgentDrop, StoredCompartment, TagMintInput,
     };
     use tokio::sync::Notify;
+
+    struct SettlementWriter {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for SettlementWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.events.lock().unwrap().push("write");
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn production_settlement_reserves_before_write_and_returns_exact_body() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let reserve_events = Arc::clone(&events);
+        let settlement = settle_prepared_with(
+            PreparedOutcome::Response(PreparedOutput::cached_bytes(b"exact-body".to_vec())),
+            || false,
+            move |len| {
+                reserve_events.lock().unwrap().push("reserve");
+                let events = Arc::clone(&reserve_events);
+                async move {
+                    Ok::<_, ()>(SettlementWriter {
+                        events,
+                        bytes: Vec::with_capacity(len),
+                    })
+                }
+            },
+        )
+        .await;
+        let PreparedSettlement::Response(writer) = settlement else {
+            panic!("successful settlement must return a response");
+        };
+        assert_eq!(writer.bytes, b"exact-body");
+        let events = events.lock().unwrap();
+        assert_eq!(events.first(), Some(&"reserve"));
+        assert!(events[1..].iter().all(|event| *event == "write"));
+    }
+
+    #[tokio::test]
+    async fn production_settlement_error_and_stream_skip_reservation() {
+        let reservations = Arc::new(AtomicUsize::new(0));
+        for outcome in [
+            PreparedOutcome::Error {
+                code: "invalid".to_owned(),
+                message: "bad".to_owned(),
+            },
+            PreparedOutcome::Streamed,
+        ] {
+            let reservations = Arc::clone(&reservations);
+            let settlement: PreparedSettlement<Vec<u8>> = settle_prepared_with(
+                outcome,
+                || false,
+                move |_| {
+                    reservations.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Ok(Vec::new()))
+                },
+            )
+            .await;
+            assert!(!matches!(settlement, PreparedSettlement::Response(_)));
+        }
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn production_settlement_cancellation_and_denial_emit_no_body() {
+        let reservations = Arc::new(AtomicUsize::new(0));
+        let reserve_count = Arc::clone(&reservations);
+        let before: PreparedSettlement<Vec<u8>> = settle_prepared_with(
+            PreparedOutcome::Response(PreparedOutput::cached_bytes(b"body".to_vec())),
+            || true,
+            move |_| {
+                reserve_count.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(Vec::new()))
+            },
+        )
+        .await;
+        assert!(matches!(
+            before,
+            PreparedSettlement::Error { ref code, .. } if code == "request_cancelled"
+        ));
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+
+        let checks = AtomicUsize::new(0);
+        let reserve_count = Arc::clone(&reservations);
+        let between: PreparedSettlement<Vec<u8>> = settle_prepared_with(
+            PreparedOutcome::Response(PreparedOutput::cached_bytes(b"body".to_vec())),
+            || checks.fetch_add(1, Ordering::SeqCst) == 1,
+            move |_| {
+                reserve_count.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(Vec::new()))
+            },
+        )
+        .await;
+        assert!(matches!(
+            between,
+            PreparedSettlement::Error { ref code, .. } if code == "request_cancelled"
+        ));
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
+
+        let denied: PreparedSettlement<Vec<u8>> = settle_prepared_with(
+            PreparedOutcome::Response(PreparedOutput::cached_bytes(b"body".to_vec())),
+            || false,
+            |_| std::future::ready(Err(())),
+        )
+        .await;
+        assert!(matches!(
+            denied,
+            PreparedSettlement::Error { ref code, .. } if code == "output_unavailable"
+        ));
+    }
 
     #[test]
     fn usage_numbers_rejects_implausible_context_limit() {
@@ -16956,7 +17287,7 @@ mod tests {
 
     async fn wait_for_store_open(handler: &McHandler) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while handler.store.get().is_none() {
+            while handler.store().is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -16976,7 +17307,7 @@ mod tests {
         // wait.
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(30)));
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor).unwrap();
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
         let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
         assert_eq!(before.0, "store_unavailable");
@@ -16998,7 +17329,7 @@ mod tests {
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor).unwrap();
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
         let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
         wait_for_store_open_phase(&handler, STORE_OPEN_IDLE).await;
@@ -17016,9 +17347,9 @@ mod tests {
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
-        handler.begin_store_open(descriptor.clone());
+        handler.begin_store_open(descriptor.clone()).unwrap();
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         assert_eq!(handler.store_open.waiter_starts.load(Ordering::Relaxed), 1);
@@ -17036,7 +17367,7 @@ mod tests {
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(5)));
         let coordinator = Arc::clone(&handler.store_open);
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor).unwrap();
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
         drop(handler);
         tokio::time::timeout(Duration::from_millis(200), async {
@@ -17049,6 +17380,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_and_joins_tracked_historian_worker() {
+        let handler = McHandler::new();
+        let observed = Arc::new(AtomicBool::new(false));
+        let worker_observed = Arc::clone(&observed);
+        let cancel = handler.cancel.clone();
+        handler
+            .spawn_tracked_task(async move {
+                cancel.cancelled().await;
+                worker_observed.store(true, Ordering::SeqCst);
+            })
+            .expect("historian worker admitted");
+
+        <McHandler as CompositeComponent>::shutdown(&handler)
+            .await
+            .unwrap();
+
+        assert!(observed.load(Ordering::SeqCst));
+        assert!(handler.tasks.is_empty());
+    }
+
+    fn handler_with_blocking_lifecycle(
+        call: BlockingLifecycleCall,
+    ) -> (
+        McHandler,
+        Arc<McStore>,
+        Arc<BlockingLifecycleState>,
+        tempfile::TempDir,
+    ) {
+        let state = BlockingLifecycleState::new(call);
+        let factory = Arc::new(BlockingLifecycleFactory {
+            state: Arc::clone(&state),
+        });
+        let handler = McHandler::with_producer_factory_and_config(factory, default_test_config());
+        *state.cancel.lock().unwrap() = Some(handler.cancel.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let store =
+            Arc::new(McStore::open(&dev_descriptor_at(data_home.to_str().unwrap())).unwrap());
+        handler.install_store_for_test(Arc::clone(&store));
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), "ses"));
+        (handler, store, state, dir)
+    }
+
+    async fn wait_for_blocking_lifecycle(state: &BlockingLifecycleState) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("historian call site entered injected blocking future");
+    }
+
+    async fn assert_shutdown_joined_lifecycle_task(
+        handler: &McHandler,
+        state: &BlockingLifecycleState,
+    ) {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            <McHandler as CompositeComponent>::shutdown(handler),
+        )
+        .await
+        .expect("shutdown must join blocked historian call site")
+        .unwrap();
+        assert!(state.exited.load(Ordering::SeqCst));
+        assert!(handler.cancel.is_cancelled());
+        assert!(handler.tasks.is_empty());
+        assert!(!*handler.task_admission_open.lock().unwrap());
+        assert!(handler.spawn_module_task(async {}).is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_actual_spawned_historian_start_call_site() {
+        let (handler, _store, state, _dir) =
+            handler_with_blocking_lifecycle(BlockingLifecycleCall::Start);
+        let response = call_transform(&handler, big_messages()).await;
+        assert_eq!(response["historian"]["fired"], true);
+        wait_for_blocking_lifecycle(&state).await;
+        assert_shutdown_joined_lifecycle_task(&handler, &state).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_actual_spawned_historian_reattach_call_site() {
+        let (handler, store, state, _dir) =
+            handler_with_blocking_lifecycle(BlockingLifecycleCall::Reattach);
+        let messages = big_messages();
+        seed_awaiting(&store, &messages);
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["no_fire"], "reattaching");
+        wait_for_blocking_lifecycle(&state).await;
+        assert_shutdown_joined_lifecycle_task(&handler, &state).await;
+        assert!(handler.reattaching_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn lease_wait_health_detail_advances_elapsed_time() {
         let dir = tempfile::tempdir().unwrap();
         let data_home = dir.path().join("data");
@@ -17058,11 +17488,11 @@ mod tests {
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor).unwrap();
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
-        let first = <McHandler as ModuleHandler>::health(&handler).await;
+        let first = <McHandler as CompositeComponent>::health(&handler).await;
         tokio::time::sleep(Duration::from_millis(35)).await;
-        let second = <McHandler as ModuleHandler>::health(&handler).await;
+        let second = <McHandler as CompositeComponent>::health(&handler).await;
 
         assert_eq!(first.status, HealthStatus::Degraded);
         assert_eq!(second.status, HealthStatus::Degraded);
@@ -17086,19 +17516,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_declares_module_id_and_storage() {
-        let m = manifest("magic-context");
-        assert_eq!(m.module_id, "magic-context");
-        assert_eq!(m.protocol_ver, PROTOCOL_VERSION);
-        assert_eq!(
-            m.consumes,
-            vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string()]
-            }]
-        );
-        let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
-            panic!("magic-context must expose a tool provider role");
-        };
+    fn manifest_declares_module_id_and_tools_without_resolver_consumer() {
+        let manifest = manifest("magic-context");
+        assert_eq!(manifest.module_id, "magic-context");
+        assert_eq!(manifest.provides[0]["role"], "tool_provider");
+        assert!(manifest.provides[0].get("consumes").is_none());
+        let tools: Vec<prompt_surface::Tool> =
+            serde_json::from_value(manifest.provides[0]["tools"].clone()).unwrap();
         assert_eq!(
             tools
                 .iter()
@@ -17111,8 +17535,7 @@ mod tests {
                 "ctx_expand",
                 "ctx_search",
                 "ctx_note",
-            ],
-            "the default startup manifest keeps its legacy byte order"
+            ]
         );
         let by_name = tools
             .iter()
@@ -17122,10 +17545,7 @@ mod tests {
             let tool = by_name
                 .get(name)
                 .unwrap_or_else(|| panic!("missing tool {name}"));
-            assert_eq!(
-                tool.name, name,
-                "mcp.jsonc overrides use the bare tool name"
-            );
+            assert_eq!(tool.name, name);
             assert_eq!(tool.schema["type"], "object");
             assert!(tool.schema["properties"].is_object());
             assert!(tool.description.as_deref().is_some_and(|text| {
@@ -17134,9 +17554,12 @@ mod tests {
         }
         assert_eq!(
             by_name["ctx_memory"].execution_mode,
-            ExecutionMode::Mutating
+            prompt_surface::ExecutionMode::Mutating
         );
-        assert_eq!(by_name["ctx_search"].execution_mode, ExecutionMode::Pure);
+        assert_eq!(
+            by_name["ctx_search"].execution_mode,
+            prompt_surface::ExecutionMode::Pure
+        );
     }
 
     fn binding(root: &str, session: &str) -> SessionBinding {
@@ -17207,7 +17630,7 @@ mod tests {
                 default_test_config(),
                 Arc::new(MissingSessionResolver),
             );
-            handler.store.set(Arc::clone(&store)).ok().unwrap();
+            handler.install_store_for_test(Arc::clone(&store));
             let project = dir.path().join("project");
             std::fs::create_dir_all(&project).unwrap();
             let _dir = dir;
@@ -17226,14 +17649,17 @@ mod tests {
                 let channel = *channels.entry(session.clone()).or_insert_with(|| {
                     let ch = next_channel;
                     next_channel += 1;
-                    handler.bind_route(ch, binding(project.to_str().unwrap(), &session));
+                    handler
+                        .bind_route(test_route(ch), binding(project.to_str().unwrap(), &session));
                     ch
                 });
                 let started = std::time::Instant::now();
-                let outcome = handler.dispatch_value(channel, value.clone()).await;
+                let outcome = handler
+                    .dispatch_value(test_route(channel), value.clone())
+                    .await;
                 let ms = started.elapsed().as_millis();
                 match outcome {
-                    HandlerOutcome::Response(bytes) => {
+                    PreparedOutcome::Response(bytes) => {
                         // Optional: dump the raw TransformResponse bytes per pass so a
                         // consumer (e.g. the gateway plan_outcome harness) can consume the
                         // module's EXACT returned bytes (MC_REPLAY_OUT_DIR=<dir>).
@@ -17253,7 +17679,7 @@ mod tests {
                             .to_string();
                         outcomes.push((name, action, Some(parsed), ms));
                     }
-                    HandlerOutcome::Error { code, message } => {
+                    PreparedOutcome::Error { code, message } => {
                         println!("[replay] {name} ERROR code={code} ms={ms} message={message}");
                         outcomes.push((name, format!("ERROR:{code}"), None, ms));
                     }
@@ -17423,13 +17849,14 @@ mod tests {
 
     /// Resolve just the project_root (the binding's identity) for the resolve assertions.
     fn resolved_root(h: &McHandler, channel: u16, session: &str) -> Result<PathBuf, BindingError> {
-        h.resolve_binding(channel, session).map(|b| b.project_root)
+        h.resolve_binding(test_route(channel), session)
+            .map(|b| b.project_root)
     }
 
     #[test]
     fn route_binding_bind_resolve_unbind() {
         let h = McHandler::new();
-        h.bind_route(7, binding("/repo/proj", "ses_a"));
+        h.bind_route(test_route(7), binding("/repo/proj", "ses_a"));
 
         // resolve succeeds when the channel is bound AND the session matches
         assert_eq!(
@@ -17438,7 +17865,7 @@ mod tests {
         );
 
         // a teardown removes the binding → a later resolve fails loud (no stale project)
-        h.unbind_route(7);
+        h.unbind_route(test_route(7));
         assert_eq!(resolved_root(&h, 7, "ses_a"), Err(BindingError::Unbound));
     }
 
@@ -17448,7 +17875,7 @@ mod tests {
         // never bound → Unbound (NEVER a default project, which would be a cross-project read)
         assert_eq!(resolved_root(&h, 3, "ses_x"), Err(BindingError::Unbound));
 
-        h.bind_route(3, binding("/repo/own", "ses_own"));
+        h.bind_route(test_route(3), binding("/repo/own", "ses_own"));
         // bound, but a request claiming a DIFFERENT session on this channel → SessionMismatch
         assert_eq!(
             resolved_root(&h, 3, "ses_other"),
@@ -17464,13 +17891,55 @@ mod tests {
     #[test]
     fn rebind_overwrites_stale_channel_entry() {
         let h = McHandler::new();
-        h.bind_route(5, binding("/a", "s1"));
+        h.bind_route(test_route(5), binding("/a", "s1"));
         // a reused channel re-binds to a new session → last write wins (no stale leak)
-        h.bind_route(5, binding("/b", "s2"));
+        h.bind_route(test_route(5), binding("/b", "s2"));
         assert_eq!(resolved_root(&h, 5, "s2").unwrap(), PathBuf::from("/b"));
         assert_eq!(
             resolved_root(&h, 5, "s1"),
             Err(BindingError::SessionMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn old_epoch_route_gone_preserves_new_epoch_binding_and_dispatch_state() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, McModuleConfig::default());
+        let old = RouteHandle {
+            channel: 7,
+            epoch: 1,
+        };
+        let new = RouteHandle {
+            channel: 7,
+            epoch: 2,
+        };
+        handler.bind_route(new, binding(project.to_str().unwrap(), "ses"));
+        let expected_transform_state = ("ses".to_owned(), canonical_root(&project));
+        handler
+            .transform_route_channels
+            .lock()
+            .unwrap()
+            .insert(new, expected_transform_state.clone());
+
+        CompositeComponent::route_gone(&handler, old).await;
+
+        assert_eq!(
+            handler.resolve_binding(new, "ses").unwrap().project_root,
+            project
+        );
+        assert_eq!(
+            handler.transform_route_channels.lock().unwrap().get(&new),
+            Some(&expected_transform_state)
+        );
+        let outcome = handler
+            .dispatch_value(
+                new,
+                json!({"method": "session.status", "v": 1, "session_id": "ses"}),
+            )
+            .await;
+        assert!(
+            matches!(outcome, PreparedOutcome::Response(_)),
+            "new epoch must remain usable through real dispatch: {outcome:?}"
         );
     }
 
@@ -17687,6 +18156,108 @@ mod tests {
             cache.get("second"),
             TransformSnapshotLookup::Ready(_)
         ));
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BlockingLifecycleCall {
+        Start,
+        Reattach,
+    }
+
+    struct BlockingLifecycleState {
+        call: BlockingLifecycleCall,
+        cancel: Mutex<Option<CancellationToken>>,
+        entered: AtomicBool,
+        exited: AtomicBool,
+    }
+
+    impl BlockingLifecycleState {
+        fn new(call: BlockingLifecycleCall) -> Arc<Self> {
+            Arc::new(Self {
+                call,
+                cancel: Mutex::new(None),
+                entered: AtomicBool::new(false),
+                exited: AtomicBool::new(false),
+            })
+        }
+
+        async fn block(&self) -> HistorianProducerError {
+            self.entered.store(true, Ordering::SeqCst);
+            let cancel = self
+                .cancel
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("test cancellation installed");
+            cancel.cancelled().await;
+            self.exited.store(true, Ordering::SeqCst);
+            HistorianProducerError::TimedOut
+        }
+    }
+
+    struct BlockingLifecycleFactory {
+        state: Arc<BlockingLifecycleState>,
+    }
+
+    #[async_trait]
+    impl HistorianProducerFactory for BlockingLifecycleFactory {
+        async fn connect(
+            &self,
+            _project_root: &Path,
+            _harness: &str,
+        ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+            Ok(Box::new(BlockingLifecycleProducer {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    struct BlockingLifecycleProducer {
+        state: Arc<BlockingLifecycleState>,
+    }
+
+    #[async_trait]
+    impl HistorianProducerDriver for BlockingLifecycleProducer {
+        async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
+            Ok(())
+        }
+
+        async fn start(
+            &mut self,
+            _session_id: &str,
+            _system: &str,
+            _prompt: &str,
+            _model: &str,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            if self.state.call == BlockingLifecycleCall::Start {
+                return Err(self.state.block().await);
+            }
+            Ok(RunHandle {
+                run_id: "unused".to_owned(),
+            })
+        }
+
+        async fn await_output(
+            &mut self,
+            _run_id: &str,
+        ) -> Result<ProducerOutput, HistorianProducerError> {
+            Err(HistorianProducerError::TimedOut)
+        }
+
+        async fn status(&mut self, _run_id: &str) -> Result<RunState, HistorianProducerError> {
+            if self.state.call == BlockingLifecycleCall::Reattach {
+                return Err(self.state.block().await);
+            }
+            Ok(RunState::Active)
+        }
+
+        async fn cancel(&mut self, _run_id: &str) -> Result<(), HistorianProducerError> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), HistorianProducerError> {
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -17917,10 +18488,10 @@ mod tests {
             config,
             resolver,
         );
-        handler.store.set(Arc::clone(&store)).ok().unwrap();
+        handler.install_store_for_test(Arc::clone(&store));
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), "ses"));
         (handler, store, dir, project)
     }
 
@@ -18278,14 +18849,19 @@ mod tests {
         channel: u16,
         request: Value,
     ) -> Value {
-        match handler.handle_transform_for_test(channel, request).await {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+        match handler
+            .handle_transform_for_test(test_route(channel), request)
+            .await
+        {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         }
     }
 
-    async fn call_transform_outcome(handler: &McHandler, request: Value) -> HandlerOutcome {
-        handler.handle_transform_for_test(7, request).await
+    async fn call_transform_outcome(handler: &McHandler, request: Value) -> PreparedOutcome {
+        handler
+            .handle_transform_for_test(test_route(7), request)
+            .await
     }
 
     async fn call_dispatch_request(handler: &McHandler, request: Value) -> Value {
@@ -18297,24 +18873,24 @@ mod tests {
         channel: u16,
         request: Value,
     ) -> Value {
-        match handler.dispatch_value(channel, request).await {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+        match handler.dispatch_value(test_route(channel), request).await {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         }
     }
 
-    fn error_frame(outcome: HandlerOutcome) -> (String, String) {
+    fn error_frame(outcome: PreparedOutcome) -> (String, String) {
         match outcome {
-            HandlerOutcome::Error { code, message } => (code, message),
+            PreparedOutcome::Error { code, message } => (code, message),
             other => panic!("expected error outcome, got {other:?}"),
         }
     }
 
-    fn error_code(outcome: HandlerOutcome) -> String {
+    fn error_code(outcome: PreparedOutcome) -> String {
         error_frame(outcome).0
     }
 
-    async fn call_facade(handler: &McHandler, name: &str, arguments: Value) -> HandlerOutcome {
+    async fn call_facade(handler: &McHandler, name: &str, arguments: Value) -> PreparedOutcome {
         call_facade_on_channel(handler, 7, name, arguments).await
     }
 
@@ -18323,31 +18899,34 @@ mod tests {
         channel: u16,
         name: &str,
         arguments: Value,
-    ) -> HandlerOutcome {
+    ) -> PreparedOutcome {
         handler
-            .dispatch_value(channel, json!({ "name": name, "arguments": arguments }))
+            .dispatch_value(
+                test_route(channel),
+                json!({ "name": name, "arguments": arguments }),
+            )
             .await
     }
 
-    fn tool_body(outcome: HandlerOutcome) -> Value {
+    fn tool_body(outcome: PreparedOutcome) -> Value {
         match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("expected tool response, got {other:?}"),
         }
     }
 
-    fn tool_is_error(outcome: HandlerOutcome) -> bool {
+    fn tool_is_error(outcome: PreparedOutcome) -> bool {
         tool_body(outcome)["isError"].as_bool().unwrap_or(false)
     }
 
-    fn tool_text(outcome: HandlerOutcome) -> String {
+    fn tool_text(outcome: PreparedOutcome) -> String {
         tool_body(outcome)["content"][0]["text"]
             .as_str()
             .unwrap()
             .to_string()
     }
 
-    fn tool_json_array(outcome: HandlerOutcome) -> Vec<Value> {
+    fn tool_json_array(outcome: PreparedOutcome) -> Vec<Value> {
         let body = tool_body(outcome);
         let text = body["content"][0]["text"]
             .as_str()
@@ -18439,7 +19018,10 @@ mod tests {
     async fn cc_inherits_oc_project_mural_on_a_natural_hard_without_defer_first_apply() {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        handler.bind_route(8, binding(project.to_str().unwrap(), "cc-mural"));
+        handler.bind_route(
+            test_route(8),
+            binding(project.to_str().unwrap(), "cc-mural"),
+        );
         let messages = vec![ck("tail", 1, "raw")];
         let mural_a = json!({
             "enabled": true,
@@ -18529,7 +19111,7 @@ mod tests {
             handler_with_store(Arc::new(ProducerState::default()), config);
         let mut route = binding(project.to_str().unwrap(), "ses");
         route.config = route_config;
-        handler.bind_route(7, route);
+        handler.bind_route(test_route(7), route);
         let mut transform_request = request(vec![ck("a", 1, "alpha")]);
         transform_request["serializer_profile"] = json!("claude-code-anthropic");
         transform_request["model_key"] = json!("anthropic/claude-opus-4-1");
@@ -18548,7 +19130,7 @@ mod tests {
             handler_with_store(Arc::new(ProducerState::default()), config);
         let mut route = binding(project.to_str().unwrap(), "ses");
         route.config = route_config;
-        handler.bind_route(7, route);
+        handler.bind_route(test_route(7), route);
         let mut transform_request = request(vec![ck("a", 1, "alpha")]);
         transform_request["serializer_profile"] = json!("claude-code-anthropic");
 
@@ -18565,7 +19147,7 @@ mod tests {
         let expected =
             serde_json::to_vec(&serde_json::to_value(response.clone()).unwrap()).unwrap();
         let request = transform_request(vec![ck("wire-byte-cache", 1, "hello")], 1, 100);
-        let HandlerOutcome::Response(actual) = respond_transform(&request, response) else {
+        let PreparedOutcome::Response(actual) = respond_transform(&request, response) else {
             panic!("cached transform response failed to encode");
         };
         assert_eq!(actual, expected);
@@ -18619,12 +19201,12 @@ mod tests {
                 transform_id: "completed".to_string(),
                 generation: 1,
                 final_digest: "digest-final".to_string(),
-                result: vec![0; 17],
+                result: PreparedOutput::cached_bytes(vec![0; 17]),
             });
         }
 
         let outcome = handler.handle_status_value(&json!({"method": "status"}));
-        let HandlerOutcome::Response(bytes) = outcome else {
+        let PreparedOutcome::Response(bytes) = outcome else {
             panic!("module status did not respond: {outcome:?}");
         };
         let status: Value = serde_json::from_slice(&bytes).unwrap();
@@ -19589,7 +20171,10 @@ mod tests {
         let request = Arc::new(request);
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, project) = handler_with_store(producer, default_test_config());
-        handler.bind_route(7, binding(project.to_str().unwrap(), SESSION_ID));
+        handler.bind_route(
+            test_route(7),
+            binding(project.to_str().unwrap(), SESSION_ID),
+        );
 
         let projection = Arc::new(
             crate::ck_wire::project_messages(&request.messages).expect("giant projection"),
@@ -20638,7 +21223,7 @@ mod tests {
         let (handler, _store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let session = "native-delta-fingerprint-mismatch";
-        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session));
 
         let initial = native_cache_request(
             session,
@@ -20730,7 +21315,7 @@ mod tests {
         let (handler, _store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let session = "native-delta-eviction-heal";
-        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session));
 
         let initial = native_cache_request(
             session,
@@ -20819,9 +21404,9 @@ mod tests {
         let session_a = "projection-lru-a";
         let session_b = "projection-lru-b";
         let session_c = "projection-lru-oversized";
-        handler.bind_route(7, binding(project.to_str().unwrap(), session_a));
-        handler.bind_route(8, binding(project.to_str().unwrap(), session_b));
-        handler.bind_route(9, binding(project.to_str().unwrap(), session_c));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session_a));
+        handler.bind_route(test_route(8), binding(project.to_str().unwrap(), session_b));
+        handler.bind_route(test_route(9), binding(project.to_str().unwrap(), session_c));
 
         let initial_a = native_cache_request(
             session_a,
@@ -21209,7 +21794,7 @@ mod tests {
         let session = "projection-revert-epoch";
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session));
         let initial = native_cache_request(
             session,
             vec![
@@ -21255,7 +21840,7 @@ mod tests {
         let session = "projection-reconcile-recut";
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session));
         store
             .replace_compartments(
                 session,
@@ -21342,7 +21927,7 @@ mod tests {
         let session = "projection-boundary-recut-cas";
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session));
         let mut previous = crate::transform::tests::seed_astro_divergence(&store, session, 2_442);
         previous.serializer_profile = "opencode-aisdk".to_string();
         previous.serve_native = true;
@@ -21414,7 +21999,7 @@ mod tests {
         let session = "projection-tail-readopt";
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session));
         store
             .replace_compartments(session, &[stored_comp(1, 1, 1, "covered", "SUMMARY")])
             .unwrap();
@@ -21471,8 +22056,8 @@ mod tests {
         let source = "projection-lineage-source";
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        handler.bind_route(7, binding(project.to_str().unwrap(), target));
-        handler.bind_route(8, binding(project.to_str().unwrap(), source));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), target));
+        handler.bind_route(test_route(8), binding(project.to_str().unwrap(), source));
         let source_messages = (1..=10)
             .map(|ordinal| {
                 ck(
@@ -21948,7 +22533,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, project) = handler_with_store(producer, default_test_config());
         let session = "native-dreamer";
-        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(7), binding(project.to_str().unwrap(), session));
         let _registration = handler.register_dreamer_run(session);
 
         let first = native_cache_request(
@@ -22031,7 +22616,7 @@ mod tests {
         let not_due_response = call_transform_request(&handler, not_due).await;
         assert!(not_due_response.get("host_directives").is_none());
 
-        handler.bind_route(8, binding("/tmp/cc", "cc-ses"));
+        handler.bind_route(test_route(8), binding("/tmp/cc", "cc-ses"));
         let cc_response = call_transform_request_on_channel(
             &handler,
             8,
@@ -22058,7 +22643,7 @@ mod tests {
         assert!(cc_directive["armed_at_ms"].as_i64().unwrap() > 0);
         assert!(cc_response.get("host_directives").is_none());
 
-        handler.bind_route(9, binding("/tmp/pi", "pi-ses"));
+        handler.bind_route(test_route(9), binding("/tmp/pi", "pi-ses"));
         let pi_response = call_transform_request_on_channel(
             &handler,
             9,
@@ -22356,14 +22941,14 @@ mod tests {
         assert_eq!(date, trimmed_bytes.lines().last().unwrap());
         let unknown = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({ "kind": "guidance.get", "session_id": "ses", "variant": "bogus" }),
             )
             .await;
         assert_eq!(error_code(unknown), "bad_request");
         let contradictory = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "guidance.get",
                     "session_id": "ses",
@@ -22399,7 +22984,7 @@ mod tests {
         let (handler, _store, _dir, project) = handler_with_store(producer, config.clone());
         let mut route = binding(project.to_str().unwrap(), "ses");
         route.config = config;
-        handler.bind_route(7, route);
+        handler.bind_route(test_route(7), route);
         handler.guidance_dates.lock().unwrap().insert(
             "ses".to_string(),
             "Today's date: Fri Jan 01 2016".to_string(),
@@ -22442,7 +23027,7 @@ mod tests {
             ];
             for (index, session) in sessions.iter().enumerate() {
                 handler.bind_route(
-                    base_channel + index as u16,
+                    test_route(base_channel + index as u16),
                     binding("/tmp/project", session),
                 );
                 handler
@@ -22553,7 +23138,7 @@ mod tests {
     {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
-        handler.bind_route(30, binding("/tmp/project", "manifest-ses"));
+        handler.bind_route(test_route(30), binding("/tmp/project", "manifest-ses"));
         let first = call_dispatch_request_on_channel(
             &handler,
             30,
@@ -22611,10 +23196,9 @@ mod tests {
 
         let expected_tools = prompt_surface::session_tools(&PromptSurfaceSelection::default());
         for response in [&first, &transitioned] {
-            let response_tools = serde_json::from_value::<Vec<subc_protocol::manifest::Tool>>(
-                response["tools"].clone(),
-            )
-            .unwrap();
+            let response_tools =
+                serde_json::from_value::<Vec<prompt_surface::Tool>>(response["tools"].clone())
+                    .unwrap();
             assert_eq!(response_tools.len(), expected_tools.len());
             for (actual, expected) in response_tools.iter().zip(&expected_tools) {
                 assert_eq!(actual.name, expected.name);
@@ -22629,7 +23213,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         let session = "prompt-config-reload";
-        handler.bind_route(31, binding("/tmp/project", session));
+        handler.bind_route(test_route(31), binding("/tmp/project", session));
         handler.guidance_dates.lock().unwrap().insert(
             session.to_string(),
             "Today's date: Fri Jan 01 2016".to_string(),
@@ -22831,19 +23415,19 @@ mod tests {
         assert_ne!(advanced["hash"], first["hash"]);
         assert_eq!(advanced["content_hash"], first["content_hash"]);
 
-        handler.bind_route(8, binding("/tmp/other", "other"));
+        handler.bind_route(test_route(8), binding("/tmp/other", "other"));
         handler.guidance_dates.lock().unwrap().insert(
             "other".to_string(),
             "Today's date: Sun Jan 03 2016".to_string(),
         );
         let other = match handler
             .dispatch_value(
-                8,
+                test_route(8),
                 json!({ "kind": "guidance.get", "session_id": "other", "tool_present": true }),
             )
             .await
         {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected outcome: {other:?}"),
         };
         assert_ne!(other["hash"], advanced["hash"]);
@@ -22979,7 +23563,7 @@ mod tests {
 
         let state_sync = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "state_sync",
                     "session_id": "ses",
@@ -22990,7 +23574,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(state_sync, HandlerOutcome::Response(_)));
+        assert!(matches!(state_sync, PreparedOutcome::Response(_)));
         let still_refused = call_facade(&handler, "ctx_note", conditioned.clone()).await;
         assert!(
             tool_text(still_refused).contains("Smart-note evaluation is unavailable"),
@@ -23069,7 +23653,7 @@ mod tests {
         assert!(tool_text(ttl_refused).contains("Smart-note evaluation is unavailable"));
         let stale_heartbeat = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "note.evaluation.heartbeat",
                     "v": 2,
@@ -23148,7 +23732,7 @@ mod tests {
 
         let v1 = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "note.evaluation.register",
                     "v": 2,
@@ -23171,21 +23755,21 @@ mod tests {
 
         let mut positive_wait = note_evaluation_next_body(&token, generation, "eval-a", "acq-1");
         positive_wait["wait_ms"] = json!(50);
-        let positive = handler.dispatch_value(7, positive_wait).await;
+        let positive = handler.dispatch_value(test_route(7), positive_wait).await;
         assert_eq!(error_code(positive), "positive_wait_unsupported");
 
         let stale = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 note_evaluation_next_body(&stale_token, stale_generation, "eval-a", "acq-1"),
             )
             .await;
         assert_eq!(error_code(stale), "registration_unknown");
 
-        handler.bind_route(9, binding(&route_root, "ses"));
+        handler.bind_route(test_route(9), binding(&route_root, "ses"));
         let wrong_channel = handler
             .dispatch_value(
-                9,
+                test_route(9),
                 note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
             )
             .await;
@@ -23193,7 +23777,7 @@ mod tests {
 
         let unknown_field = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "note.evaluation.next",
                     "v": 2,
@@ -23234,13 +23818,13 @@ mod tests {
             register_note_evaluator(&handler, 7, "eval-a", false, false).await;
         assert!(handler.has_live_note_evaluator(&identity, now_ms()));
 
-        handler.unbind_route(7);
+        handler.unbind_route(test_route(7));
         assert!(!handler.has_live_note_evaluator(&identity, now_ms()));
 
-        handler.bind_route(7, binding(&route_root, "ses"));
+        handler.bind_route(test_route(7), binding(&route_root, "ses"));
         let stale = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
             )
             .await;
@@ -23399,7 +23983,7 @@ mod tests {
 
         let oversized = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 complete_with_outcome(json!({
                     "phase": "compile",
                     "kind": "compiled_met",
@@ -23416,7 +24000,7 @@ mod tests {
 
         let smuggled = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 complete_with_outcome(json!({ "phase": "fallback", "kind": "logic_failed" })),
             )
             .await;
@@ -24117,7 +24701,7 @@ mod tests {
         // Draining authority rejects the poll, leaving the cycle unchanged.
         let handover = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
             )
             .await;
@@ -24252,7 +24836,7 @@ mod tests {
 
         let state_sync = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "state_sync",
                     "session_id": "ses",
@@ -24264,7 +24848,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(state_sync, HandlerOutcome::Response(_)),
+            matches!(state_sync, PreparedOutcome::Response(_)),
             "{state_sync:?}"
         );
 
@@ -24427,11 +25011,11 @@ mod tests {
         );
         let project_root = project.to_str().unwrap();
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(project_root, OPENCODE_HARNESS, "opencode-session"),
         );
         handler.transform_route_channels.lock().unwrap().insert(
-            7,
+            test_route(7),
             ("opencode-session".to_string(), canonical_root(project_root)),
         );
         handler
@@ -24493,12 +25077,15 @@ mod tests {
 
         // The transform lane binds through the symlink spelling, while the facade lane binds to
         // the canonical target. Both route bindings identify the same filesystem lineage.
-        handler.bind_route(7, binding_with_harness(link_text, OPENCODE_HARNESS, "ses"));
+        handler.bind_route(
+            test_route(7),
+            binding_with_harness(link_text, OPENCODE_HARNESS, "ses"),
+        );
         let transformed =
             call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")])).await;
         assert_eq!(transformed["action"], "HARD");
         handler.bind_route(
-            8,
+            test_route(8),
             binding_with_harness(target_text, OPENCODE_HARNESS, "ses"),
         );
 
@@ -24534,13 +25121,16 @@ mod tests {
 
         // Reverse the lane spellings: transform uses the target and facade uses the symlink.
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(target_text, OPENCODE_HARNESS, "ses"),
         );
         let transformed =
             call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")])).await;
         assert_eq!(transformed["action"], "HARD");
-        handler.bind_route(8, binding_with_harness(link_text, OPENCODE_HARNESS, "ses"));
+        handler.bind_route(
+            test_route(8),
+            binding_with_harness(link_text, OPENCODE_HARNESS, "ses"),
+        );
 
         let outcome = call_facade_on_channel(
             &handler,
@@ -24566,7 +25156,7 @@ mod tests {
             resolver.clone(),
         );
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(
                 project.to_str().unwrap(),
                 OPENCODE_HARNESS,
@@ -24597,7 +25187,10 @@ mod tests {
             resolver.clone(),
         );
         let root_a = project.to_str().unwrap();
-        handler.bind_route(7, binding_with_harness(root_a, OPENCODE_HARNESS, "ses"));
+        handler.bind_route(
+            test_route(7),
+            binding_with_harness(root_a, OPENCODE_HARNESS, "ses"),
+        );
         let transformed =
             call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")])).await;
         assert_eq!(transformed["action"], "HARD");
@@ -24606,7 +25199,10 @@ mod tests {
         let root_b = project.join("other-root");
         std::fs::create_dir_all(&root_b).unwrap();
         let root_b = root_b.to_str().unwrap();
-        handler.bind_route(8, binding_with_harness(root_b, OPENCODE_HARNESS, "ses"));
+        handler.bind_route(
+            test_route(8),
+            binding_with_harness(root_b, OPENCODE_HARNESS, "ses"),
+        );
         let outcome = call_facade_on_channel(
             &handler,
             8,
@@ -24651,9 +25247,9 @@ mod tests {
                 default_test_config(),
                 Arc::new(MissingSessionResolver),
             );
-            handler.store.set(Arc::clone(&store)).ok().unwrap();
+            handler.install_store_for_test(Arc::clone(&store));
             handler.bind_route(
-                7,
+                test_route(7),
                 binding_with_harness(root_a_text, OPENCODE_HARNESS, "ses"),
             );
             let transformed =
@@ -24677,9 +25273,9 @@ mod tests {
             default_test_config(),
             resolver.clone(),
         );
-        handler.store.set(Arc::clone(&store)).ok().unwrap();
+        handler.install_store_for_test(Arc::clone(&store));
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(root_a_text, OPENCODE_HARNESS, "ses"),
         );
 
@@ -24709,7 +25305,7 @@ mod tests {
         assert!(resolver.calls().is_empty());
 
         handler.bind_route(
-            8,
+            test_route(8),
             binding_with_harness(root_b.to_str().unwrap(), OPENCODE_HARNESS, "ses"),
         );
         let cross_root = call_facade_on_channel(
@@ -24740,7 +25336,7 @@ mod tests {
             resolver.clone(),
         );
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness("/repo", "claude-code", "claude-instance-token"),
         );
 
@@ -24771,7 +25367,7 @@ mod tests {
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
         let note = store
             .insert_project_note(NoteWriteInput {
                 project_path: "/repo",
@@ -24791,7 +25387,7 @@ mod tests {
 
         let evaluated = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "note.evaluate",
                     "session_id": "session",
@@ -24818,8 +25414,11 @@ mod tests {
             default_test_config(),
             resolver,
         );
-        handler.bind_route(7, binding("/repo", "token"));
-        handler.bind_route(8, binding_with_harness("/repo", OPENCODE_HARNESS, "ses"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
+        handler.bind_route(
+            test_route(8),
+            binding_with_harness("/repo", OPENCODE_HARNESS, "ses"),
+        );
         activate_module_authority(&store, "context", "git:identity", "/repo", "notes");
         let note = store
             .insert_project_note(NoteWriteInput {
@@ -24865,7 +25464,7 @@ mod tests {
             .unwrap();
         let ack = handler
             .dispatch_value(
-                8,
+                test_route(8),
                 json!({
                     "method": "transform.ack",
                     "session_id": "ses",
@@ -24873,7 +25472,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(ack, HandlerOutcome::Response(_)));
+        assert!(matches!(ack, PreparedOutcome::Response(_)));
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "ses", note.id)
@@ -24895,7 +25494,7 @@ mod tests {
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
         store
             .seed_authority_row(
                 "context-db",
@@ -24928,7 +25527,7 @@ mod tests {
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
         for index in 0..105 {
             let note = store
                 .insert_project_note(NoteWriteInput {
@@ -25010,9 +25609,12 @@ mod tests {
         let key_a = "conversation:root|agent:alpha";
         let key_b = "conversation:root|agent:beta";
         let suffix_key = "conversation:root|scope:mc-historian:child";
-        handler.bind_route(8, binding(project.to_str().unwrap(), key_a));
-        handler.bind_route(9, binding(project.to_str().unwrap(), key_b));
-        handler.bind_route(10, binding(project.to_str().unwrap(), suffix_key));
+        handler.bind_route(test_route(8), binding(project.to_str().unwrap(), key_a));
+        handler.bind_route(test_route(9), binding(project.to_str().unwrap(), key_b));
+        handler.bind_route(
+            test_route(10),
+            binding(project.to_str().unwrap(), suffix_key),
+        );
 
         store
             .replace_compartments(key_a, &[stored_comp(1, 1, 1, "a1", "A")])
@@ -25080,20 +25682,20 @@ mod tests {
 
         // A flat body with kind="transform" routes to the transform handler.
         let transform = handler
-            .dispatch_value(7, request(vec![ck("m1", 1, "hello")]))
+            .dispatch_value(test_route(7), request(vec![ck("m1", 1, "hello")]))
             .await;
         let transform_body: Value = match transform {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("transform should respond, got {other:?}"),
         };
         assert_eq!(transform_body["status"], "ok");
 
         // Explicit echo: opt-in debugging arm still works when asked for by name.
         let echo = handler
-            .dispatch_value(7, json!({ "kind": "echo", "probe": 42 }))
+            .dispatch_value(test_route(7), json!({ "kind": "echo", "probe": 42 }))
             .await;
         let echo_body: Value = match echo {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("echo should respond, got {other:?}"),
         };
         assert_eq!(echo_body["ok"], json!(true));
@@ -25103,7 +25705,7 @@ mod tests {
         // DISTINCT error so a facade misroute is diagnosable from the code.
         let facade = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({ "name": "ctx_unknown", "arguments": { "drop": "1-3" } }),
             )
             .await;
@@ -25112,10 +25714,10 @@ mod tests {
         // Anything else: fail loud, never a silent echo. The message names the
         // keys that were present so a misrouted request is diagnosable.
         let garbage = handler
-            .dispatch_value(7, json!({ "foo": 1, "bar": 2 }))
+            .dispatch_value(test_route(7), json!({ "foo": 1, "bar": 2 }))
             .await;
         match garbage {
-            HandlerOutcome::Error { code, message } => {
+            PreparedOutcome::Error { code, message } => {
                 assert_eq!(code, "unrecognized_request_shape");
                 assert!(message.contains("foo"), "message names got keys: {message}");
             }
@@ -25123,9 +25725,11 @@ mod tests {
         }
 
         // Non-object bodies get the same loud failure with the JSON type named.
-        let non_object = handler.dispatch_value(7, json!("just a string")).await;
+        let non_object = handler
+            .dispatch_value(test_route(7), json!("just a string"))
+            .await;
         match non_object {
-            HandlerOutcome::Error { code, message } => {
+            PreparedOutcome::Error { code, message } => {
                 assert_eq!(code, "unrecognized_request_shape");
                 assert!(message.contains("string"), "message names type: {message}");
             }
@@ -25143,7 +25747,10 @@ mod tests {
         let (handler, _store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver.clone());
 
-        handler.bind_route(7, binding_with_harness("/repo", "claude-code", ""));
+        handler.bind_route(
+            test_route(7),
+            binding_with_harness("/repo", "claude-code", ""),
+        );
         let no_token = call_facade(
             &handler,
             "ctx_search",
@@ -25151,7 +25758,7 @@ mod tests {
         )
         .await;
         match no_token {
-            HandlerOutcome::Error { code, message } => {
+            PreparedOutcome::Error { code, message } => {
                 assert_eq!(code, "session_unresolved");
                 assert_eq!(message, SESSION_UNRESOLVED_MESSAGE);
             }
@@ -25160,7 +25767,7 @@ mod tests {
         assert_eq!(resolver.calls(), Vec::<String>::new());
 
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness("/repo", "claude-code", "missing-map"),
         );
         let none = call_facade(
@@ -25171,7 +25778,10 @@ mod tests {
         .await;
         assert_eq!(error_code(none), "session_unresolved");
 
-        handler.bind_route(7, binding_with_harness("/repo", "claude-code", "slow-map"));
+        handler.bind_route(
+            test_route(7),
+            binding_with_harness("/repo", "claude-code", "slow-map"),
+        );
         let timeout = call_facade(
             &handler,
             "ctx_search",
@@ -25191,7 +25801,7 @@ mod tests {
             resolver,
         );
         let project_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(project_root, "token"));
+        handler.bind_route(test_route(7), binding(project_root, "token"));
         store.fail_next_authority_project_resolution_for_test();
         let arguments = json!({
             "action": "write",
@@ -25229,8 +25839,8 @@ mod tests {
         ]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding(project_root, "token-a"));
-        handler.bind_route(8, binding(project_root, "token-b"));
+        handler.bind_route(test_route(7), binding(project_root, "token-a"));
+        handler.bind_route(test_route(8), binding(project_root, "token-b"));
         store
             .replace_compartments(
                 key_a,
@@ -25332,11 +25942,11 @@ mod tests {
         )]);
         let (handler, _store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
 
         let echo = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({ "kind": "echo", "name": "ctx_memory", "arguments": { "action": "write" } }),
             )
             .await;
@@ -25454,14 +26064,17 @@ mod tests {
             default_test_config(),
             resolver.clone(),
         );
-        handler.bind_route(8, binding("/path/that/does/not/exist", "unresolvable"));
+        handler.bind_route(
+            test_route(8),
+            binding("/path/that/does/not/exist", "unresolvable"),
+        );
 
         let response =
             call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await;
         assert_eq!(error_code(response), "session_unresolved");
         assert_eq!(resolver.calls(), vec!["unresolvable"]);
         assert!(
-            handler.store.get().is_none(),
+            handler.store().is_none(),
             "an unresolved session must not open storage to validate tags"
         );
     }
@@ -25501,7 +26114,7 @@ mod tests {
         // The response observer delivers the same mixed request later. It queues only
         // known tags, leaving acknowledgement validation side-effect free.
         let delivered = handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -25512,7 +26125,7 @@ mod tests {
         assert_eq!(tool_body(delivered), json!({ "ok": true, "queued": 2 }));
         let pending_after_delivery = store.load_pending_agent_drops("ses").unwrap();
         let retry = handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -25555,9 +26168,8 @@ mod tests {
     #[test]
     fn ctx_manifest_schemas_accept_unknown_args_without_advertising_reduced_fields() {
         let manifest = manifest("magic-context");
-        let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
-            panic!("tool provider manifest entry");
-        };
+        let tools: Vec<prompt_surface::Tool> =
+            serde_json::from_value(manifest.provides[0]["tools"].clone()).unwrap();
         let by_name = tools
             .iter()
             .map(|tool| (tool.name.as_str(), tool))
@@ -25726,7 +26338,7 @@ mod tests {
             .unwrap();
         let outcome = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "authority.seed",
                     "context_store_uuid": "store-uuid",
@@ -25775,7 +26387,7 @@ mod tests {
         )]);
         let (handler, _store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
 
         let malformed = [
             json!({ "action": "update", "content": "edited" }),
@@ -25822,7 +26434,7 @@ mod tests {
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
         let id = insert_memory(&store, "/repo", "CONSTRAINTS", "Run focused tests.", 1);
 
         let plain = tool_text(
@@ -25894,7 +26506,7 @@ mod tests {
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        handler.bind_route(test_route(7), binding("/repo", "token"));
 
         for arguments in [
             json!({"action": "write", "category": "CONSTRAINTS", "content": "first"}),
@@ -25930,7 +26542,7 @@ mod tests {
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/route/facade-ledger", "token"));
+        handler.bind_route(test_route(7), binding("/route/facade-ledger", "token"));
         let project = "/route/facade-ledger";
 
         async fn call_and_replay(
@@ -25943,7 +26555,7 @@ mod tests {
         ) {
             let first = call_facade(handler, name, arguments.clone()).await;
             let first_bytes = match first {
-                HandlerOutcome::Response(bytes) => bytes,
+                PreparedOutcome::Response(bytes) => bytes,
                 other => panic!("first {name}/{action} failed: {other:?}"),
             };
             let mut retry_arguments = arguments;
@@ -25955,7 +26567,7 @@ mod tests {
                 store
                     .facade_mutation_ledger_response("session", name, action, command_id)
                     .unwrap(),
-                Some(first_bytes),
+                Some(first_bytes.as_ref().to_vec()),
                 "ledger must retain the exact first response for {name}/{action}"
             );
             original_body["replayed"] = Value::Bool(true);
@@ -26089,7 +26701,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route_project_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(route_project_root, "token"));
+        handler.bind_route(test_route(7), binding(route_project_root, "token"));
         activate_module_authority(
             &store,
             "context",
@@ -26150,7 +26762,7 @@ mod tests {
         )
         .await;
         let response = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("classification facade failed: {other:?}"),
         };
         assert_eq!(response["accepted"], json!([fresh_id]));
@@ -26178,7 +26790,7 @@ mod tests {
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route_root = project.to_str().unwrap();
         let identity = "git:dreamer-applies";
-        handler.bind_route(7, binding(route_root, "token"));
+        handler.bind_route(test_route(7), binding(route_root, "token"));
         activate_module_authority(&store, "context", identity, route_root, "memories");
         let verified_id = insert_memory(&store, identity, "CONSTRAINTS", "verified", 1);
         let updated_id = insert_memory(&store, identity, "CONSTRAINTS", "updated", 1);
@@ -26202,7 +26814,7 @@ mod tests {
             ]
         })).await;
         let verified_body = match verified {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("verification facade failed: {other:?}"),
         };
         assert_eq!(verified_body["accepted"], json!([verified_id]));
@@ -26222,7 +26834,7 @@ mod tests {
             "command_id": "verify-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"}]
         })).await;
         let replay_body = match replay {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("verification replay failed: {other:?}"),
         };
         assert_eq!(
@@ -26245,7 +26857,7 @@ mod tests {
             "rows": [{"memory_id": updated_id, "content_hash_at_prompt": hash(updated_id), "verification_status": "update", "updated_content": "updated by verifier"}]
         })).await;
         let update_body = match update {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("update facade failed: {other:?}"),
         };
         let after_update =
@@ -26262,7 +26874,7 @@ mod tests {
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "rows": [{"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "archive", "archive_reason": "obsolete"}]
         })).await;
-        assert!(matches!(archive, HandlerOutcome::Response(_)));
+        assert!(matches!(archive, PreparedOutcome::Response(_)));
         let after_archive =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
         assert!(
@@ -26274,7 +26886,7 @@ mod tests {
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "mapped_files": ["src/lib.rs", "src/lib.rs"]}]
         })).await;
-        assert!(matches!(mapping, HandlerOutcome::Response(_)));
+        assert!(matches!(mapping, PreparedOutcome::Response(_)));
         let mapping_feed_head = store
             .pull_changefeed("memories", 0, 1000)
             .unwrap()
@@ -26284,7 +26896,7 @@ mod tests {
             "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": "stale", "mapped_files": null}]
         })).await;
         assert!(
-            matches!(mapping_replay, HandlerOutcome::Response(_)),
+            matches!(mapping_replay, PreparedOutcome::Response(_)),
             "mapping command replay must be idempotent"
         );
         assert_eq!(
@@ -26327,7 +26939,7 @@ mod tests {
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route_root = project.to_str().unwrap();
         let identity = "git:classification-race";
-        handler.bind_route(7, binding(route_root, "token"));
+        handler.bind_route(test_route(7), binding(route_root, "token"));
         activate_module_authority(&store, "context", identity, route_root, "memories");
         let memory_id = insert_memory(&store, identity, "CONSTRAINTS", "classify me", 1);
         let before = store.get_memory_full(memory_id).unwrap().unwrap();
@@ -26408,7 +27020,7 @@ mod tests {
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route_root = project.to_str().unwrap();
         let identity = "git:draining";
-        handler.bind_route(7, binding(route_root, "token"));
+        handler.bind_route(test_route(7), binding(route_root, "token"));
         for domain in ["memories", "notes"] {
             activate_module_authority(&store, "context", identity, route_root, domain);
         }
@@ -26518,7 +27130,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         let route_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(route_root, "ses"));
+        handler.bind_route(test_route(7), binding(route_root, "ses"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
         let generation = store
             .authority_status("context", "git:identity", "memories")
@@ -26528,7 +27140,7 @@ mod tests {
 
         let outcome = handler
             .handle_dreamer_run_task(
-                7,
+                test_route(7),
                 &json!({
                     "v": 1,
                     "session_id": "ses",
@@ -26544,7 +27156,7 @@ mod tests {
             )
             .await;
         let response = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("dreamer run failed: {other:?}"),
         };
 
@@ -26587,7 +27199,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         let route_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(route_root, "parent"));
+        handler.bind_route(test_route(7), binding(route_root, "parent"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
         let generation = store
             .authority_status("context", "git:identity", "memories")
@@ -26601,7 +27213,7 @@ mod tests {
         let task = tokio::spawn(async move {
             running_handler
                 .handle_dreamer_run_task(
-                    7,
+                    test_route(7),
                     &json!({
                         "v": 1,
                         "session_id": "parent",
@@ -26629,7 +27241,7 @@ mod tests {
         producer: &Arc<ProducerState>,
         payload: Value,
         command_id: &str,
-    ) -> (Arc<ProducerState>, HandlerOutcome) {
+    ) -> (Arc<ProducerState>, PreparedOutcome) {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(producer), default_test_config());
         let route_root = project.to_str().unwrap();
@@ -26637,7 +27249,7 @@ mod tests {
         // route config models.
         let mut route_binding = binding_with_harness(route_root, "pi", "ses");
         route_binding.config.model_chain = vec!["test/route-only-model".to_string()];
-        handler.bind_route(7, route_binding);
+        handler.bind_route(test_route(7), route_binding);
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
         let generation = store
             .authority_status("context", "git:identity", "memories")
@@ -26646,7 +27258,7 @@ mod tests {
             .generation;
         let outcome = handler
             .handle_dreamer_run_task(
-                7,
+                test_route(7),
                 &json!({
                     "v": 1,
                     "session_id": "ses",
@@ -26692,7 +27304,7 @@ mod tests {
         )
         .await;
         let response = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("the chain must recover from a capped attempt: {other:?}"),
         };
         assert_eq!(response["ok"], json!(true));
@@ -26735,7 +27347,7 @@ mod tests {
             let (producer, outcome) =
                 dreamer_classify_outcome(&producer, payload.clone(), "chain-shape").await;
             match outcome {
-                HandlerOutcome::Error { code, .. } => {
+                PreparedOutcome::Error { code, .. } => {
                     assert_eq!(code, "invalid_params", "payload {payload}")
                 }
                 other => panic!("expected invalid_params for {payload}, got {other:?}"),
@@ -26767,7 +27379,7 @@ mod tests {
         )
         .await;
         let response = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("dreamer run failed: {other:?}"),
         };
         assert_eq!(
@@ -26786,7 +27398,7 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         producer.await_results.lock().unwrap().extend([
             // provider failure
-            Err(HistorianProducerError::tagged_subc(
+            Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "boom",
                 ErrorClass::Transient,
@@ -26823,7 +27435,7 @@ mod tests {
         )
         .await;
         let response = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("dreamer run failed: {other:?}"),
         };
         assert_eq!(response["diagnostics"]["attempts"], json!(5));
@@ -26878,7 +27490,7 @@ mod tests {
         // recorded success anyway; the leftover session is bounded by host
         // terminal retention.
         let response = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("a recorded success must survive a cleanup failure: {other:?}"),
         };
         assert_eq!(response["ok"], json!(true));
@@ -26901,7 +27513,7 @@ mod tests {
             .await_results
             .lock()
             .unwrap()
-            .push_back(Err(HistorianProducerError::tagged_subc(
+            .push_back(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "model gone",
                 ErrorClass::Permanent,
@@ -26922,7 +27534,7 @@ mod tests {
             "cleanup-with-failure",
         )
         .await;
-        let HandlerOutcome::Error { code, message } = outcome else {
+        let PreparedOutcome::Error { code, message } = outcome else {
             panic!("expected dreamer_run_failed");
         };
         assert_eq!(code, "dreamer_run_failed");
@@ -26936,7 +27548,7 @@ mod tests {
     async fn dreamer_run_task_backs_off_on_idempotency_conflict_without_purging() {
         let producer = Arc::new(ProducerState::default());
         producer.await_results.lock().unwrap().extend([
-            Err(HistorianProducerError::tagged_subc(
+            Err(HistorianProducerError::tagged_call(
                 "idempotency_conflict",
                 "a byte-different send holds this session",
                 ErrorClass::Permanent,
@@ -26947,7 +27559,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         let route_root = project.to_str().unwrap();
-        handler.bind_route(7, binding_with_harness(route_root, "pi", "ses"));
+        handler.bind_route(test_route(7), binding_with_harness(route_root, "pi", "ses"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
         let generation = store
             .authority_status("context", "git:identity", "memories")
@@ -26967,8 +27579,10 @@ mod tests {
             },
         });
 
-        let outcome = handler.handle_dreamer_run_task(7, &request).await;
-        let HandlerOutcome::Error { code, .. } = outcome else {
+        let outcome = handler
+            .handle_dreamer_run_task(test_route(7), &request)
+            .await;
+        let PreparedOutcome::Error { code, .. } = outcome else {
             panic!("an idempotency conflict must fail the command");
         };
         assert_eq!(code, "dreamer_run_failed");
@@ -26989,9 +27603,11 @@ mod tests {
         // ledger's INSERT OR IGNORE race and mask the in-flight winner's
         // outcome. The command's slot stays open, so a later attempt can
         // still commit success.
-        let outcome = handler.handle_dreamer_run_task(7, &request).await;
+        let outcome = handler
+            .handle_dreamer_run_task(test_route(7), &request)
+            .await;
         let response = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("the command slot must remain open after a conflict: {other:?}"),
         };
         assert_eq!(response["ok"], json!(true));
@@ -27024,7 +27640,7 @@ mod tests {
             "budget-exhausted",
         )
         .await;
-        let HandlerOutcome::Error { code, message } = outcome else {
+        let PreparedOutcome::Error { code, message } = outcome else {
             panic!("expected dreamer_run_failed");
         };
         assert_eq!(code, "dreamer_run_failed");
@@ -27051,7 +27667,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
         );
 
@@ -27069,7 +27685,7 @@ mod tests {
         let (handler, _store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(project.to_str().unwrap(), "opencode", "ses"),
         );
         cache_wrapup_messages(&handler, wrapup_messages(80, 800));
@@ -27077,7 +27693,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -27103,7 +27719,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
         );
         let messages = big_messages();
@@ -27132,7 +27748,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         handler.bind_route(
-            7,
+            test_route(7),
             binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
         );
         let messages = big_messages();
@@ -27154,7 +27770,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route_project_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(route_project_root, "token"));
+        handler.bind_route(test_route(7), binding(route_project_root, "token"));
         activate_module_authority(
             &store,
             "context",
@@ -27382,7 +27998,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route_project_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(route_project_root, "token"));
+        handler.bind_route(test_route(7), binding(route_project_root, "token"));
         activate_module_authority(
             &store,
             "context",
@@ -27417,7 +28033,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         let route_project_root = project.to_str().unwrap();
-        handler.bind_route(7, binding(route_project_root, "token"));
+        handler.bind_route(test_route(7), binding(route_project_root, "token"));
 
         let outcome = call_facade(
             &handler,
@@ -27446,7 +28062,7 @@ mod tests {
             handler_with_store_and_resolver(producer, config, resolver);
         let mut disabled_binding = binding("/repo", "token");
         disabled_binding.config.memory_enabled = false;
-        handler.bind_route(7, disabled_binding);
+        handler.bind_route(test_route(7), disabled_binding);
         insert_memory(&store, "/repo", "CONSTRAINTS", "hidden needle", 1);
 
         assert!(tool_is_error(
@@ -27473,7 +28089,7 @@ mod tests {
         )]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding(own, "token"));
+        handler.bind_route(test_route(7), binding(own, "token"));
         seed_workspace(&store, own, foreign);
 
         let foreign_private_update =
@@ -27575,8 +28191,8 @@ mod tests {
         ]);
         let (handler, store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding(project_root, "token"));
-        handler.bind_route(8, binding(project_root, scope));
+        handler.bind_route(test_route(7), binding(project_root, "token"));
+        handler.bind_route(test_route(8), binding(project_root, scope));
         store
             .replace_compartments(scope, &[stored_comp(1, 1, 10, "m10", "SUMMARY")])
             .unwrap();
@@ -27612,7 +28228,10 @@ mod tests {
         assert!(synthetic_text(&update_delta, 1).contains("<memory-updates>"));
         assert!(synthetic_text(&update_delta, 1).contains("updated rule"));
 
-        handler.bind_route(9, binding(additive_project_root, additive_scope));
+        handler.bind_route(
+            test_route(9),
+            binding(additive_project_root, additive_scope),
+        );
         store
             .replace_compartments(
                 additive_scope,
@@ -27626,7 +28245,10 @@ mod tests {
         let add_before = store
             .max_memory_mutation_id(&[additive_project_root.to_string()])
             .unwrap();
-        handler.bind_route(7, binding(additive_project_root, "token-additive"));
+        handler.bind_route(
+            test_route(7),
+            binding(additive_project_root, "token-additive"),
+        );
         let resolver_scope_memory = call_facade(
             &handler,
             "ctx_memory",
@@ -27774,7 +28396,7 @@ mod tests {
             "kind": "status",
             "session_id": "ses",
         })) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("expected status response, got {other:?}"),
         };
         assert!(current_status["pass_trace"]["first_divergence"].is_string());
@@ -27786,7 +28408,7 @@ mod tests {
             "kind": "status",
             "session_id": "ses",
         })) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("expected status response, got {other:?}"),
         };
         assert!(stable_status["pass_trace"]["first_divergence"].is_null());
@@ -27813,7 +28435,7 @@ mod tests {
             "kind": "status",
             "session_id": "ses",
         })) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("expected status response, got {other:?}"),
         };
         let second_historical: Value = serde_json::from_str(
@@ -27839,7 +28461,7 @@ mod tests {
         assert!(stable_again.get("first_divergence").is_none());
 
         let session_status = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
         ));
         assert!(session_status["pass_trace"]["first_divergence"].is_null());
@@ -27880,7 +28502,7 @@ mod tests {
             .unwrap();
 
         let status = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({
                 "method": "session.status",
                 "v": 1,
@@ -27902,8 +28524,8 @@ mod tests {
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         let live_version = store.module_store_schema_version().unwrap();
 
-        let decode = |outcome: HandlerOutcome| match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+        let decode = |outcome: PreparedOutcome| match outcome {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("expected status response, got {other:?}"),
         };
 
@@ -28054,7 +28676,7 @@ mod tests {
         parsed.serializer_profile = SerializerProfile::ClaudeCodeAnthropic.wire_id().to_string();
         let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
         let projection = crate::ck_wire::project_messages(&parsed.messages).unwrap();
-        let store = handler.store.get().unwrap();
+        let store = handler.store().unwrap();
         let loaded = store.load(session_id).unwrap();
         let mut meta = loaded.meta.clone();
         meta.block_identity_by_mid
@@ -28122,7 +28744,7 @@ mod tests {
 
     fn queue_drop_command_with_id(handler: &McHandler, command_id: &str) -> Value {
         match handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -28130,7 +28752,7 @@ mod tests {
                 "command_id": command_id,
             }),
         ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         }
     }
@@ -28267,7 +28889,7 @@ mod tests {
             "request budget must reach the HARD decay renderer: {m0}"
         );
         let status = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
         ));
         let history = decay_render::extract_m0_block(&m0, "session-history").unwrap();
@@ -28290,7 +28912,7 @@ mod tests {
             .commit("ses", loaded.row_version, &loaded.core, &meta)
             .unwrap();
         let degraded = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
         ));
         assert_eq!(degraded["historian"]["consecutive_publish_failures"], 3);
@@ -28307,7 +28929,7 @@ mod tests {
             .commit("ses", loaded.row_version, &loaded.core, &meta)
             .unwrap();
         let recovered = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
         ));
         assert_eq!(recovered["historian"]["consecutive_publish_failures"], 0);
@@ -28496,7 +29118,7 @@ mod tests {
 
         let response = handler
             .handle_transform_for_test(
-                7,
+                test_route(7),
                 request(vec![
                     ck("ccm-0", 0, "first user message"),
                     ck("ccm-1", 1, "assistant reply"),
@@ -28532,7 +29154,7 @@ mod tests {
 
         let rejected = handler
             .handle_transform_for_test(
-                7,
+                test_route(7),
                 request(vec![ck("m1", 1, "actual anchor"), ck("m11", 11, "tail")]),
             )
             .await;
@@ -28607,7 +29229,7 @@ mod tests {
 
         let outcome = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 state_import_request(
                     "bundle-a",
                     0,
@@ -28650,7 +29272,7 @@ mod tests {
 
         let different = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 state_import_request(
                     "bundle-b",
                     0,
@@ -28684,7 +29306,7 @@ mod tests {
         assert_eq!(staged["staged"], 1);
         let gap = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 state_import_request(
                     "gap",
                     2,
@@ -28770,7 +29392,10 @@ mod tests {
         ];
         for (import_id, compartments, expected_code) in cases {
             let outcome = handler
-                .dispatch_value(7, state_import_request(import_id, 0, 1, compartments))
+                .dispatch_value(
+                    test_route(7),
+                    state_import_request(import_id, 0, 1, compartments),
+                )
                 .await;
             assert_eq!(error_code(outcome), expected_code, "{import_id}");
             assert!(store.load_compartments("ses").unwrap().is_empty());
@@ -28820,7 +29445,7 @@ mod tests {
         for alias in ["ctx_reduce", "append_agent_drops"] {
             let outcome = handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": alias,
                         "session_id": "ses",
@@ -28934,7 +29559,7 @@ mod tests {
         }));
 
         let body = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({
                 "method": "session.status",
                 "v": 1,
@@ -28952,7 +29577,7 @@ mod tests {
         assert!(compartments[0].get("legacy").is_none());
 
         let tail = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({
                 "method": "session.status",
                 "v": 1,
@@ -29057,7 +29682,7 @@ mod tests {
         let request = json!({ "method": "session.status", "v": 1, "session_id": "ses" });
 
         assert_eq!(
-            error_code(handler.handle_session_status_value(8, &request)),
+            error_code(handler.handle_session_status_value(test_route(8), &request)),
             "route_unbound"
         );
         let mismatch = json!({
@@ -29066,7 +29691,7 @@ mod tests {
             "session_id": "other",
         });
         assert_eq!(
-            error_code(handler.handle_session_status_value(7, &mismatch)),
+            error_code(handler.handle_session_status_value(test_route(7), &mismatch)),
             "session_mismatch"
         );
     }
@@ -29076,7 +29701,10 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
         let session_id = "ccm-8518e338-extra";
-        handler.bind_route(7, binding(project.to_str().unwrap(), session_id));
+        handler.bind_route(
+            test_route(7),
+            binding(project.to_str().unwrap(), session_id),
+        );
         store
             .commit_state_import(
                 session_id,
@@ -29129,7 +29757,7 @@ mod tests {
             .unwrap();
 
         let body = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.status", "v": 1, "session_id": session_id }),
         ));
         let summary = body["summary"].as_str().unwrap();
@@ -29154,7 +29782,10 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
         let session_id = "ses-delete";
-        handler.bind_route(7, binding(project.to_str().unwrap(), session_id));
+        handler.bind_route(
+            test_route(7),
+            binding(project.to_str().unwrap(), session_id),
+        );
         store
             .commit(
                 session_id,
@@ -29187,7 +29818,7 @@ mod tests {
             .unwrap();
 
         let deleted = tool_body(handler.handle_session_delete_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.delete", "v": 1, "session_id": session_id }),
         ));
         assert_eq!(deleted["ok"], json!(true));
@@ -29233,7 +29864,7 @@ mod tests {
         }));
 
         let body = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
         ));
         assert_eq!(body["wrapup_active"], json!(true));
@@ -29254,7 +29885,7 @@ mod tests {
             .unwrap();
 
         let body = tool_body(handler.handle_session_status_value(
-            7,
+            test_route(7),
             &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
         ));
         let summary = body["summary"].as_str().unwrap();
@@ -29270,7 +29901,7 @@ mod tests {
         mint_drop_tag(&store, "a#0");
 
         let outcome = handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29323,7 +29954,7 @@ mod tests {
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
         let outcome = handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29372,7 +30003,7 @@ mod tests {
         assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 25);
 
         let queued = match handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29380,7 +30011,7 @@ mod tests {
                 "command_id": "opencode-drop-range",
             }),
         ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
         assert_eq!(queued, json!({ "ok": true, "queued": 3 }));
@@ -29428,7 +30059,7 @@ mod tests {
 
         for command_id in [json!(""), json!(" \t "), json!("x".repeat(129))] {
             let outcome = handler.handle_agent_drops_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "agent_drops.append",
                     "session_id": "ses",
@@ -29447,7 +30078,7 @@ mod tests {
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         for drop in [Value::Null, json!(""), json!("  "), json!(["1"])] {
             let outcome = handler.handle_agent_drops_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "agent_drops.append",
                     "session_id": "ses",
@@ -29488,7 +30119,7 @@ mod tests {
         // Range syntax plus an unknown tag number: known tags queue, the unknown
         // number is skipped (the tee replays whatever the model said).
         let response = match handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29496,7 +30127,7 @@ mod tests {
                 "command_id": "raw-1",
             }),
         ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
         assert_eq!(response, json!({ "ok": true, "queued": 2 }));
@@ -29505,7 +30136,7 @@ mod tests {
 
         // Re-sending the same raw string is idempotent (structural INSERT OR IGNORE).
         let repeat = match handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29513,14 +30144,14 @@ mod tests {
                 "command_id": "raw-2",
             }),
         ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
         assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
 
         // Malformed range syntax is a typed bad_request, nothing partially queued.
         match handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29528,7 +30159,7 @@ mod tests {
                 "command_id": "raw-bad",
             }),
         ) {
-            HandlerOutcome::Error { code, .. } => assert_eq!(code, "bad_request"),
+            PreparedOutcome::Error { code, .. } => assert_eq!(code, "bad_request"),
             other => panic!("expected bad_request, got: {other:?}"),
         }
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 2);
@@ -29552,7 +30183,7 @@ mod tests {
             .unwrap();
 
         let first = match handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29560,13 +30191,13 @@ mod tests {
                 "command_id": " tool-use-raw ",
             }),
         ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
         assert_eq!(first, json!({ "ok": true, "queued": 1 }));
 
         let retry = match handler.handle_agent_drops_value(
-            7,
+            test_route(7),
             json!({
                 "method": "agent_drops.append",
                 "session_id": "ses",
@@ -29574,7 +30205,7 @@ mod tests {
                 "command_id": "tool-use-raw",
             }),
         ) {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
         assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
@@ -29592,7 +30223,11 @@ mod tests {
             "session_id": "ses",
             "command_id": "missing-retry"
         });
-        let missing = tool_body(handler.dispatch_value(7, missing_request.clone()).await);
+        let missing = tool_body(
+            handler
+                .dispatch_value(test_route(7), missing_request.clone())
+                .await,
+        );
         assert_eq!(missing["disposition"], json!("retryable"));
         assert_eq!(missing["reason"], json!("snapshot_unavailable"));
         assert!(store
@@ -29600,7 +30235,7 @@ mod tests {
             .unwrap()
             .is_none());
         cache_wrapup_messages(&handler, wrapup_messages(20, 40));
-        let retry = tool_body(handler.dispatch_value(7, missing_request).await);
+        let retry = tool_body(handler.dispatch_value(test_route(7), missing_request).await);
         assert_eq!(retry["disposition"], json!("nothing_to_compact"));
         assert!(store
             .load_wrapup_command("ses", "missing-retry")
@@ -29626,8 +30261,11 @@ mod tests {
             "session_id": "ses",
             "command_id": "malformed-retry"
         });
-        let malformed_response =
-            tool_body(handler.dispatch_value(7, malformed_request.clone()).await);
+        let malformed_response = tool_body(
+            handler
+                .dispatch_value(test_route(7), malformed_request.clone())
+                .await,
+        );
         assert_eq!(malformed_response["disposition"], json!("retryable"));
         assert_eq!(malformed_response["reason"], json!("snapshot_unavailable"));
         assert!(store
@@ -29635,7 +30273,11 @@ mod tests {
             .unwrap()
             .is_none());
         cache_wrapup_messages(&handler, wrapup_messages(20, 40));
-        let retry = tool_body(handler.dispatch_value(7, malformed_request).await);
+        let retry = tool_body(
+            handler
+                .dispatch_value(test_route(7), malformed_request)
+                .await,
+        );
         assert_eq!(retry["disposition"], json!("nothing_to_compact"));
         assert!(store
             .load_wrapup_command("ses", "malformed-retry")
@@ -29657,7 +30299,7 @@ mod tests {
             "command_id": "no-models"
         });
 
-        let response = tool_body(handler.dispatch_value(7, request.clone()).await);
+        let response = tool_body(handler.dispatch_value(test_route(7), request.clone()).await);
         assert_eq!(response["ok"], json!(false), "{response}");
         assert_eq!(response["disposition"], json!("failed"), "{response}");
         assert_eq!(response["reason"], json!("no_models"), "{response}");
@@ -29677,7 +30319,7 @@ mod tests {
         assert_eq!(row.rounds, response["rounds"].as_u64().unwrap() as usize);
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
 
-        let replay = tool_body(handler.dispatch_value(7, request).await);
+        let replay = tool_body(handler.dispatch_value(test_route(7), request).await);
         assert_eq!(replay["ok"], json!(false), "{replay}");
         assert_eq!(replay["reason"], json!("no_models"), "{replay}");
         assert_eq!(replay["replayed"], json!(true));
@@ -29692,14 +30334,16 @@ mod tests {
             .lock()
             .expect("start errors mutex")
             .extend([
-                Err(HistorianProducerError::Subc(
-                    historian_producer::ProducerErrorBody::untagged(
+                Err(HistorianProducerError::Call(
+                    historian_producer::HistorianCallFailure::untagged(
+                        historian_producer::HistorianSendOutcome::Terminal,
                         "unknown_module",
                         "runner module broca is unavailable",
                     ),
                 )),
-                Err(HistorianProducerError::Subc(
-                    historian_producer::ProducerErrorBody::untagged(
+                Err(HistorianProducerError::Call(
+                    historian_producer::HistorianCallFailure::untagged(
+                        historian_producer::HistorianSendOutcome::Terminal,
                         "unknown_module",
                         "runner module broca is unavailable",
                     ),
@@ -29719,7 +30363,7 @@ mod tests {
             "command_id": "runner-missing"
         });
 
-        let response = tool_body(handler.dispatch_value(7, request.clone()).await);
+        let response = tool_body(handler.dispatch_value(test_route(7), request.clone()).await);
         assert_eq!(response["ok"], json!(false), "{response}");
         assert_eq!(response["disposition"], json!("failed"), "{response}");
         assert_eq!(
@@ -29745,7 +30389,7 @@ mod tests {
             "failed"
         );
 
-        let replay = tool_body(handler.dispatch_value(7, request).await);
+        let replay = tool_body(handler.dispatch_value(test_route(7), request).await);
         assert_eq!(replay["replayed"], json!(true));
         assert_eq!(replay["reason"], json!("runner_module_unavailable"));
         assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
@@ -29761,7 +30405,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -29790,7 +30434,7 @@ mod tests {
         let retry = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -29817,7 +30461,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -29855,7 +30499,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -29885,7 +30529,7 @@ mod tests {
         let large = tool_body(
             handler_large
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -29929,7 +30573,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -29973,7 +30617,7 @@ mod tests {
         let response = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -30002,7 +30646,7 @@ mod tests {
         // one durable ledger key.
         let empty_id = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "session.wrapup",
                     "v": 1,
@@ -30012,7 +30656,7 @@ mod tests {
             )
             .await;
         match empty_id {
-            HandlerOutcome::Error { code, message } => {
+            PreparedOutcome::Error { code, message } => {
                 assert_eq!(code, "bad_request");
                 assert!(message.contains("nonempty"), "{message}");
             }
@@ -30027,7 +30671,7 @@ mod tests {
         let negative_keep = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30065,7 +30709,7 @@ mod tests {
         let busy = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -30092,7 +30736,7 @@ mod tests {
             "command_id": "wrapup-one"
         });
 
-        let first = tool_body(handler.dispatch_value(7, request.clone()).await);
+        let first = tool_body(handler.dispatch_value(test_route(7), request.clone()).await);
         assert_eq!(first["disposition"], json!("completed"), "{first}");
         let starts = producer.starts.load(Ordering::SeqCst);
         let stored = store
@@ -30105,7 +30749,7 @@ mod tests {
 
         let mut retry = request;
         retry["keep"] = json!("ignored-on-replay");
-        let replay = tool_body(handler.dispatch_value(7, retry).await);
+        let replay = tool_body(handler.dispatch_value(test_route(7), retry).await);
         assert_eq!(replay["replayed"], json!(true));
         assert_eq!(replay["disposition"], first["disposition"]);
         assert_eq!(replay["rounds"], first["rounds"]);
@@ -30115,7 +30759,7 @@ mod tests {
         let different = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30158,7 +30802,7 @@ mod tests {
             "command_id": "legacy-failed"
         });
 
-        let first = tool_body(handler.dispatch_value(7, request.clone()).await);
+        let first = tool_body(handler.dispatch_value(test_route(7), request.clone()).await);
         assert_ne!(first.get("replayed"), Some(&json!(true)), "{first}");
         assert_eq!(first["disposition"], json!("completed"), "{first}");
         let starts_after_lost_response = producer.starts.load(Ordering::SeqCst);
@@ -30174,7 +30818,7 @@ mod tests {
 
         // Simulate losing the first response. The same command id must replay the
         // durable terminal result without opening another producer run.
-        let replay = tool_body(handler.dispatch_value(7, request).await);
+        let replay = tool_body(handler.dispatch_value(test_route(7), request).await);
         assert_eq!(replay["replayed"], json!(true), "{replay}");
         assert_eq!(replay["disposition"], first["disposition"]);
         assert_eq!(replay["rounds"], first["rounds"]);
@@ -30192,10 +30836,12 @@ mod tests {
             .connect_errors
             .lock()
             .expect("connect errors mutex")
-            .push_back(HistorianProducerError::Connect {
-                endpoint: "127.0.0.1:1".to_string(),
-                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-            });
+            .push_back(HistorianProducerError::Client(
+                historian_producer::HistorianClientFailure {
+                    code: "dial_failed".to_owned(),
+                    message: "daemon dial failed".to_owned(),
+                },
+            ));
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         cache_wrapup_messages(&handler, wrapup_messages(80, 800));
@@ -30213,7 +30859,7 @@ mod tests {
         let response = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30246,10 +30892,12 @@ mod tests {
             .connect_errors
             .lock()
             .expect("connect errors mutex")
-            .push_back(HistorianProducerError::Connect {
-                endpoint: "127.0.0.1:1".to_string(),
-                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-            });
+            .push_back(HistorianProducerError::Client(
+                historian_producer::HistorianClientFailure {
+                    code: "dial_failed".to_owned(),
+                    message: "daemon dial failed".to_owned(),
+                },
+            ));
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         cache_wrapup_messages(&handler, wrapup_messages(80, 800));
@@ -30271,7 +30919,7 @@ mod tests {
         let response = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30320,7 +30968,7 @@ mod tests {
             "command_id": "recut-retry"
         });
 
-        let stale = tool_body(handler.dispatch_value(7, request.clone()).await);
+        let stale = tool_body(handler.dispatch_value(test_route(7), request.clone()).await);
         assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
         assert_eq!(stale["reason"], json!("snapshot_stale"));
         assert!(store
@@ -30335,7 +30983,7 @@ mod tests {
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
             .unwrap();
-        let retry = tool_body(handler.dispatch_value(7, request).await);
+        let retry = tool_body(handler.dispatch_value(test_route(7), request).await);
         assert!(matches!(
             retry["disposition"].as_str(),
             Some("completed" | "nothing_to_compact")
@@ -30389,7 +31037,7 @@ mod tests {
         let response = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30441,7 +31089,7 @@ mod tests {
         let response = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
                 )
                 .await,
@@ -30502,7 +31150,7 @@ mod tests {
         let stale = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
                 )
                 .await,
@@ -30523,7 +31171,7 @@ mod tests {
         let retry = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
                 )
                 .await,
@@ -30572,7 +31220,7 @@ mod tests {
         let stale = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
                 )
                 .await,
@@ -30599,7 +31247,7 @@ mod tests {
         let retry = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 5 }),
                 )
                 .await,
@@ -30624,7 +31272,7 @@ mod tests {
             let session_id = format!("lease-{index}");
             let channel = 20 + index as u16;
             handler.bind_route(
-                channel,
+                test_route(channel),
                 binding(project.to_str().unwrap(), session_id.as_str()),
             );
             cache_wrapup_messages_for_session(
@@ -30648,7 +31296,7 @@ mod tests {
             blocked.push(tokio::spawn(async move {
                 handler
                     .dispatch_value(
-                        20 + index as u16,
+                        test_route(20 + index as u16),
                         json!({
                             "method": "session.wrapup",
                             "v": 1,
@@ -30664,7 +31312,7 @@ mod tests {
         let overflow = tokio::time::timeout(
             Duration::from_millis(100),
             handler.dispatch_value(
-                20 + ACTIVE_LEASE_LIMIT as u16,
+                test_route(20 + ACTIVE_LEASE_LIMIT as u16),
                 json!({
                     "method": "session.wrapup",
                     "v": 1,
@@ -30691,7 +31339,7 @@ mod tests {
         let later = tool_body(
             handler
                 .dispatch_value(
-                    20 + ACTIVE_LEASE_LIMIT as u16,
+                    test_route(20 + ACTIVE_LEASE_LIMIT as u16),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30729,7 +31377,7 @@ mod tests {
         let first = tokio::spawn(async move {
             first_handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
                 )
                 .await
@@ -30739,7 +31387,7 @@ mod tests {
         let second = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30771,7 +31419,7 @@ mod tests {
         let later = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30804,7 +31452,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
                 )
                 .await,
@@ -30833,7 +31481,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses", "keep": 1 }),
                 )
                 .await,
@@ -30890,7 +31538,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -30919,7 +31567,7 @@ mod tests {
         let mismatch = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30943,7 +31591,7 @@ mod tests {
         let retry = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({
                         "method": "session.wrapup",
                         "v": 1,
@@ -30968,7 +31616,7 @@ mod tests {
         let evicted = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -31004,7 +31652,7 @@ mod tests {
             "keep": 5,
             "command_id": "budget-retry"
         });
-        let body = tool_body(handler.dispatch_value(7, request.clone()).await);
+        let body = tool_body(handler.dispatch_value(test_route(7), request.clone()).await);
         assert_eq!(body["disposition"], json!("retryable"), "{body}");
         assert_eq!(body["reason"], json!("budget_exhausted"));
         assert!(store
@@ -31024,7 +31672,7 @@ mod tests {
             .wrapup_operation_budget
             .lock()
             .expect("wrapup operation budget mutex") = None;
-        let retry = tool_body(handler.dispatch_value(7, request).await);
+        let retry = tool_body(handler.dispatch_value(test_route(7), request).await);
         assert!(matches!(
             retry["disposition"].as_str(),
             Some("completed" | "nothing_to_compact")
@@ -31053,7 +31701,7 @@ mod tests {
             "session_id": "ses",
             "command_id": "backoff-retry"
         });
-        let body = tool_body(handler.dispatch_value(7, request.clone()).await);
+        let body = tool_body(handler.dispatch_value(test_route(7), request.clone()).await);
         assert_eq!(body["disposition"], json!("retryable"));
         assert_eq!(body["reason"], json!("backoff_active"));
         assert!(body["summary"]
@@ -31073,7 +31721,7 @@ mod tests {
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
             .unwrap();
-        let retry = tool_body(handler.dispatch_value(7, request).await);
+        let retry = tool_body(handler.dispatch_value(test_route(7), request).await);
         assert_eq!(retry["disposition"], json!("nothing_to_compact"));
         assert!(store
             .load_wrapup_command("ses", "backoff-retry")
@@ -31101,7 +31749,7 @@ mod tests {
         let body = tool_body(
             handler
                 .dispatch_value(
-                    7,
+                    test_route(7),
                     json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
                 )
                 .await,
@@ -31867,10 +32515,12 @@ mod tests {
             .connect_errors
             .lock()
             .unwrap()
-            .push_back(HistorianProducerError::Connect {
-                endpoint: "127.0.0.1:1".to_string(),
-                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-            });
+            .push_back(HistorianProducerError::Client(
+                historian_producer::HistorianClientFailure {
+                    code: "dial_failed".to_owned(),
+                    message: "daemon dial failed".to_owned(),
+                },
+            ));
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         let messages = big_messages();
@@ -31948,8 +32598,8 @@ mod tests {
             }),
             config,
         );
-        handler2.store.set(Arc::clone(&store)).ok().unwrap();
-        handler2.bind_route(7, binding(_project.to_str().unwrap(), "ses"));
+        handler2.install_store_for_test(Arc::clone(&store));
+        handler2.bind_route(test_route(7), binding(_project.to_str().unwrap(), "ses"));
         let fired = call_transform(&handler2, messages).await;
         assert_eq!(fired["historian"]["fired"], true);
         // The clearing write happens in the spawned firing's persist. Durable state is
@@ -31970,7 +32620,7 @@ mod tests {
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         let session = historian::historian_producer_session_id("proj", "parent-session", 3);
-        handler.bind_route(9, binding("/tmp/nonexistent-proj", &session));
+        handler.bind_route(test_route(9), binding("/tmp/nonexistent-proj", &session));
         let messages = [ck("m1", 1, "seed block + new_messages payload")];
         let req = serde_json::json!({
             "kind": "transform",
@@ -31980,8 +32630,10 @@ mod tests {
             "render_config": "cfg0",
             "messages": messages.iter().map(|m| serde_json::to_value(m).unwrap()).collect::<Vec<_>>(),
         });
-        let out = handler.handle_transform_dispatch(9, req, None).await;
-        let HandlerOutcome::Response(bytes) = out else {
+        let out = handler
+            .handle_transform_dispatch(test_route(9), req, None)
+            .await;
+        let PreparedOutcome::Response(bytes) = out else {
             panic!("pass-through must be a response");
         };
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -32039,7 +32691,10 @@ mod tests {
         assert!(progress["eligible_chunk_tokens"].is_number());
 
         let req: TransformRequest = serde_json::from_value(request(messages)).unwrap();
-        let project_path = handler.resolve_binding(7, "ses").unwrap().project_root;
+        let project_path = handler
+            .resolve_binding(test_route(7), "ses")
+            .unwrap()
+            .project_root;
         let project_path_string = project_path.to_string_lossy().to_string();
         let response_without_historian = transform::transform(
             &store,
@@ -32398,10 +33053,10 @@ mod tests {
         full["native_messages"] = json!([]);
         let full_body_bytes = serde_json::to_vec(&full).unwrap().len();
         let outcome = handler
-            .handle_transform_for_test_with_body_size(7, full, full_body_bytes)
+            .handle_transform_for_test_with_body_size(test_route(7), full, full_body_bytes)
             .await;
         assert!(
-            matches!(outcome, HandlerOutcome::Response(_)),
+            matches!(outcome, PreparedOutcome::Response(_)),
             "{outcome:?}"
         );
         let full_charge = {
@@ -32427,10 +33082,10 @@ mod tests {
         });
         let delta_body_bytes = serde_json::to_vec(&first_delta).unwrap().len();
         let outcome = handler
-            .handle_transform_for_test_with_body_size(7, first_delta, delta_body_bytes)
+            .handle_transform_for_test_with_body_size(test_route(7), first_delta, delta_body_bytes)
             .await;
         assert!(
-            matches!(outcome, HandlerOutcome::Response(_)),
+            matches!(outcome, PreparedOutcome::Response(_)),
             "{outcome:?}"
         );
         let expanded_charge = {
@@ -32465,10 +33120,14 @@ mod tests {
         });
         let second_delta_body_bytes = serde_json::to_vec(&second_delta).unwrap().len();
         let outcome = handler
-            .handle_transform_for_test_with_body_size(7, second_delta, second_delta_body_bytes)
+            .handle_transform_for_test_with_body_size(
+                test_route(7),
+                second_delta,
+                second_delta_body_bytes,
+            )
             .await;
         assert!(
-            matches!(outcome, HandlerOutcome::Response(_)),
+            matches!(outcome, PreparedOutcome::Response(_)),
             "{outcome:?}"
         );
         assert!(matches!(
@@ -32498,7 +33157,7 @@ mod tests {
 
         let rejected = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32516,7 +33175,7 @@ mod tests {
         // the rows that could invalidate the producer's compartment snapshot.
         let metadata_only = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32526,13 +33185,13 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(metadata_only, HandlerOutcome::Response(_)));
+        assert!(matches!(metadata_only, PreparedOutcome::Response(_)));
         assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 1);
 
         seed_idle(&store);
         let retried = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32542,7 +33201,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(retried, HandlerOutcome::Response(_)));
+        assert!(matches!(retried, PreparedOutcome::Response(_)));
         assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
     }
 
@@ -32560,7 +33219,7 @@ mod tests {
 
         let rejected = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32596,23 +33255,22 @@ mod tests {
         };
 
         let (first, second) = tokio::join!(
-            handler.dispatch_value(7, request()),
-            handler.dispatch_value(7, request()),
+            handler.dispatch_value(test_route(7), request()),
+            handler.dispatch_value(test_route(7), request()),
         );
         let outcomes = [first, second];
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|outcome| matches!(outcome, HandlerOutcome::Response(_)))
+                .filter(|outcome| matches!(outcome, PreparedOutcome::Response(_)))
                 .count(),
             1
         );
         let errors = outcomes
             .into_iter()
             .filter_map(|outcome| match outcome {
-                HandlerOutcome::Error { code, .. }
-                | HandlerOutcome::ErrorWithDetail { code, .. } => Some(code),
-                HandlerOutcome::Response(_) | HandlerOutcome::Streamed => None,
+                PreparedOutcome::Error { code, .. } => Some(code),
+                PreparedOutcome::Response(_) | PreparedOutcome::Streamed => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(errors, vec!["authority_seq_mismatch"]);
@@ -32634,7 +33292,7 @@ mod tests {
 
         let mismatched = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32662,7 +33320,7 @@ mod tests {
 
         let absent = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32682,12 +33340,10 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
+        assert!(matches!(absent, PreparedOutcome::Response(_)), "{absent:?}");
         let absent_response = match &absent {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            HandlerOutcome::Error { .. }
-            | HandlerOutcome::ErrorWithDetail { .. }
-            | HandlerOutcome::Streamed => Value::Null,
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
+            PreparedOutcome::Error { .. } | PreparedOutcome::Streamed => Value::Null,
         };
         assert_eq!(absent_response["memories_skipped"], json!(true));
         assert!(store
@@ -32709,7 +33365,7 @@ mod tests {
 
         let workspace = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32739,12 +33395,10 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(workspace, HandlerOutcome::Response(_)));
+        assert!(matches!(workspace, PreparedOutcome::Response(_)));
         let workspace_response = match &workspace {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            HandlerOutcome::Error { .. }
-            | HandlerOutcome::ErrorWithDetail { .. }
-            | HandlerOutcome::Streamed => Value::Null,
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
+            PreparedOutcome::Error { .. } | PreparedOutcome::Streamed => Value::Null,
         };
         assert_eq!(workspace_response["memories_skipped"], json!(true));
         assert!(store
@@ -32769,7 +33423,7 @@ mod tests {
 
         let present = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "state_sync",
                     "session_id": "ses",
@@ -32788,14 +33442,14 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(present, HandlerOutcome::Response(_)),
+            matches!(present, PreparedOutcome::Response(_)),
             "{present:?}"
         );
         let before_absent = store.workspace_fingerprint(&project_path, 0).unwrap();
 
         let absent = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "state_sync",
                     "session_id": "ses",
@@ -32805,7 +33459,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
+        assert!(matches!(absent, PreparedOutcome::Response(_)), "{absent:?}");
         assert_eq!(
             store.workspace_fingerprint(&project_path, 0).unwrap(),
             before_absent,
@@ -32820,7 +33474,7 @@ mod tests {
 
         let explicit_empty = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "state_sync",
                     "session_id": "ses",
@@ -32833,7 +33487,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(explicit_empty, HandlerOutcome::Response(_)),
+            matches!(explicit_empty, PreparedOutcome::Response(_)),
             "{explicit_empty:?}"
         );
         assert_ne!(
@@ -32850,7 +33504,7 @@ mod tests {
         let project_path = project.to_string_lossy().to_string();
         let sync = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32875,7 +33529,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(sync, HandlerOutcome::Response(_)));
+        assert!(matches!(sync, PreparedOutcome::Response(_)));
 
         let response =
             call_transform_request(&handler, request(vec![ck("m0", 0, "live authority input")]))
@@ -32901,7 +33555,7 @@ mod tests {
         let call_id = pair.call_id.clone();
         let seeded = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "method": "state_sync",
                     "session_id": "ses",
@@ -32917,7 +33571,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(seeded, HandlerOutcome::Response(_)), "{seeded:?}");
+        assert!(matches!(seeded, PreparedOutcome::Response(_)), "{seeded:?}");
         assert!(store.load("ses").unwrap().meta.synthetic_todo.is_some());
 
         let mut first_request = request(vec![ck("tail", 0, "live tail")]);
@@ -32975,7 +33629,7 @@ mod tests {
         // The seed must add compatibility rows without replacing the module's newer fold cursor.
         let second_seed = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -32988,7 +33642,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(second_seed, HandlerOutcome::Response(_)),
+            matches!(second_seed, PreparedOutcome::Response(_)),
             "{second_seed:?}"
         );
 
@@ -33026,7 +33680,7 @@ mod tests {
 
         let first_seed = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -33040,14 +33694,14 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(first_seed, HandlerOutcome::Response(_)));
+        assert!(matches!(first_seed, PreparedOutcome::Response(_)));
         let adopted = store.load("ses").unwrap();
         assert!(adopted.meta.initialized);
         assert_eq!(adopted.core.boundary_id, "m1#0");
 
         let second_seed = handler
             .dispatch_value(
-                7,
+                test_route(7),
                 json!({
                     "kind": "state_sync",
                     "session_id": "ses",
@@ -33058,7 +33712,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(matches!(second_seed, HandlerOutcome::Response(_)));
+        assert!(matches!(second_seed, PreparedOutcome::Response(_)));
 
         let retained = store.load("ses").unwrap();
         assert!(retained.meta.initialized);
@@ -33111,10 +33765,10 @@ mod tests {
         let inbound_bytes = serde_json::to_vec(&first).unwrap().len()
             + serde_json::to_vec(&final_page).unwrap().len();
 
-        let first_ack = handler.dispatch_value(7, first).await;
-        assert!(matches!(first_ack, HandlerOutcome::Response(_)));
-        let response = handler.dispatch_value(7, final_page).await;
-        let HandlerOutcome::Response(bytes) = response else {
+        let first_ack = handler.dispatch_value(test_route(7), first).await;
+        assert!(matches!(first_ack, PreparedOutcome::Response(_)));
+        let response = handler.dispatch_value(test_route(7), final_page).await;
+        let PreparedOutcome::Response(bytes) = response else {
             panic!("authority page assembly should execute: {response:?}");
         };
         let response: Value = serde_json::from_slice(&bytes).unwrap();
@@ -33186,16 +33840,16 @@ mod tests {
                 > TRANSFORM_PAGE_MAX_BYTES
         );
 
-        let first_ack = handler.dispatch_value(7, first).await;
-        let HandlerOutcome::Response(first_ack) = first_ack else {
+        let first_ack = handler.dispatch_value(test_route(7), first).await;
+        let PreparedOutcome::Response(first_ack) = first_ack else {
             panic!("first delta page should stage: {first_ack:?}");
         };
         let first_ack: Value = serde_json::from_slice(&first_ack).unwrap();
         assert_eq!(first_ack["staged"], true);
         assert_eq!(first_ack["next_expected_index"], 1);
 
-        let response = handler.dispatch_value(7, final_page).await;
-        let HandlerOutcome::Response(response) = response else {
+        let response = handler.dispatch_value(test_route(7), final_page).await;
+        let PreparedOutcome::Response(response) = response else {
             panic!("reassembled tail delta should execute: {response:?}");
         };
         let response: Value = serde_json::from_slice(&response).unwrap();
@@ -33232,8 +33886,8 @@ mod tests {
             })],
         );
         assert!(matches!(
-            handler.dispatch_value(7, first).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), first).await,
+            PreparedOutcome::Response(_)
         ));
         let newer = paged_transform_page(
             "transform",
@@ -33250,7 +33904,7 @@ mod tests {
             })],
         );
         assert_eq!(
-            error_code(handler.dispatch_value(7, newer).await),
+            error_code(handler.dispatch_value(test_route(7), newer).await),
             "authority_transform_page_attempt_mismatch"
         );
         let retry_first = paged_transform_page(
@@ -33268,8 +33922,8 @@ mod tests {
             })],
         );
         assert!(matches!(
-            handler.dispatch_value(7, retry_first).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), retry_first).await,
+            PreparedOutcome::Response(_)
         ));
         let gap = paged_transform_page(
             "transform",
@@ -33286,7 +33940,7 @@ mod tests {
             })],
         );
         assert_eq!(
-            error_code(handler.dispatch_value(7, gap).await),
+            error_code(handler.dispatch_value(test_route(7), gap).await),
             "authority_transform_page_order_mismatch"
         );
 
@@ -33305,8 +33959,8 @@ mod tests {
             })],
         );
         assert!(matches!(
-            handler.dispatch_value(7, replacement).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), replacement).await,
+            PreparedOutcome::Response(_)
         ));
 
         let digest_first = paged_transform_page(
@@ -33324,8 +33978,8 @@ mod tests {
             })],
         );
         assert!(matches!(
-            handler.dispatch_value(7, digest_first).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), digest_first).await,
+            PreparedOutcome::Response(_)
         ));
         let mut changed_final = paged_transform_page(
             "transform",
@@ -33347,7 +34001,7 @@ mod tests {
             "ck": ck("m1", 1, "changed-final").ck,
         }]);
         assert_eq!(
-            error_code(handler.dispatch_value(7, changed_final).await),
+            error_code(handler.dispatch_value(test_route(7), changed_final).await),
             "authority_transform_page_digest_mismatch"
         );
 
@@ -33366,8 +34020,10 @@ mod tests {
             })],
         );
         assert!(matches!(
-            handler.dispatch_value(7, generation_first).await,
-            HandlerOutcome::Response(_)
+            handler
+                .dispatch_value(test_route(7), generation_first)
+                .await,
+            PreparedOutcome::Response(_)
         ));
         let generation_changed = paged_transform_page(
             "transform",
@@ -33384,7 +34040,11 @@ mod tests {
             })],
         );
         assert_eq!(
-            error_code(handler.dispatch_value(7, generation_changed).await),
+            error_code(
+                handler
+                    .dispatch_value(test_route(7), generation_changed)
+                    .await
+            ),
             "authority_transform_page_attempt_mismatch"
         );
 
@@ -33394,7 +34054,11 @@ mod tests {
             "transform_page_id": "partial",
         });
         assert_eq!(
-            error_code(handler.dispatch_value(7, partial_envelope).await),
+            error_code(
+                handler
+                    .dispatch_value(test_route(7), partial_envelope)
+                    .await
+            ),
             "invalid_params"
         );
     }
@@ -33403,8 +34067,14 @@ mod tests {
     async fn paged_transform_sessions_are_isolated() {
         let state = Arc::new(ProducerState::default());
         let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
-        handler.bind_route(8, binding(project.to_str().unwrap(), "authority-a"));
-        handler.bind_route(9, binding(project.to_str().unwrap(), "authority-b"));
+        handler.bind_route(
+            test_route(8),
+            binding(project.to_str().unwrap(), "authority-a"),
+        );
+        handler.bind_route(
+            test_route(9),
+            binding(project.to_str().unwrap(), "authority-b"),
+        );
 
         for (channel, session, mid, text) in [
             (8, "authority-a", "a0", "authority a"),
@@ -33425,8 +34095,8 @@ mod tests {
                 })],
             );
             assert!(matches!(
-                handler.dispatch_value(channel, first).await,
-                HandlerOutcome::Response(_)
+                handler.dispatch_value(test_route(channel), first).await,
+                PreparedOutcome::Response(_)
             ));
         }
         for (channel, session, mid, text) in [
@@ -33447,8 +34117,10 @@ mod tests {
                     "ck": ck(mid, 1, text).ck,
                 })],
             );
-            let response = handler.dispatch_value(channel, final_page).await;
-            assert!(matches!(response, HandlerOutcome::Response(_)));
+            let response = handler
+                .dispatch_value(test_route(channel), final_page)
+                .await;
+            assert!(matches!(response, PreparedOutcome::Response(_)));
         }
     }
 
@@ -33468,11 +34140,11 @@ mod tests {
             vec![serde_json::to_value(ck("discarded-m0", 0, "discarded first")).unwrap()],
         );
         assert!(matches!(
-            handler.dispatch_value(7, first).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), first).await,
+            PreparedOutcome::Response(_)
         ));
 
-        handler.bind_route(7, binding(project_root, "replacement"));
+        handler.bind_route(test_route(7), binding(project_root, "replacement"));
         let discard_logs = handler
             .transform_page_discard_logs
             .lock()
@@ -33486,7 +34158,7 @@ mod tests {
             ]
         );
 
-        handler.bind_route(7, binding(project_root, "ses"));
+        handler.bind_route(test_route(7), binding(project_root, "ses"));
         let fresh_first = paged_transform_page(
             "transform",
             "ses",
@@ -33498,8 +34170,8 @@ mod tests {
             vec![serde_json::to_value(ck("fresh-m0", 0, "fresh first")).unwrap()],
         );
         assert!(matches!(
-            handler.dispatch_value(7, fresh_first).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), fresh_first).await,
+            PreparedOutcome::Response(_)
         ));
         let fresh_final = paged_transform_page(
             "transform",
@@ -33512,11 +34184,11 @@ mod tests {
             vec![serde_json::to_value(ck("fresh-m1", 1, "fresh final")).unwrap()],
         );
         assert!(matches!(
-            handler.dispatch_value(7, fresh_final).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), fresh_final).await,
+            PreparedOutcome::Response(_)
         ));
 
-        handler.unbind_route(7);
+        handler.unbind_route(test_route(7));
         assert_eq!(
             handler
                 .transform_page_discard_logs
@@ -33527,7 +34199,7 @@ mod tests {
             "route teardown must not log when no transform pages were staged"
         );
 
-        handler.bind_route(7, binding(project_root, "ses"));
+        handler.bind_route(test_route(7), binding(project_root, "ses"));
         let teardown_first = paged_transform_page(
             "transform",
             "ses",
@@ -33539,10 +34211,10 @@ mod tests {
             vec![serde_json::to_value(ck("teardown-m0", 0, "teardown first")).unwrap()],
         );
         assert!(matches!(
-            handler.dispatch_value(7, teardown_first).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(7), teardown_first).await,
+            PreparedOutcome::Response(_)
         ));
-        handler.unbind_route(7);
+        handler.unbind_route(test_route(7));
         assert_eq!(
             handler
                 .transform_page_discard_logs
@@ -33612,13 +34284,14 @@ mod tests {
             .lock()
             .expect("state sync seed clock mutex") = Some(initial_now);
 
-        handler.bind_route(8, binding(project.to_str().unwrap(), "dead"));
-        handler.bind_route(9, binding(project.to_str().unwrap(), "live"));
+        handler.bind_route(test_route(8), binding(project.to_str().unwrap(), "dead"));
+        handler.bind_route(test_route(9), binding(project.to_str().unwrap(), "live"));
         let dead_first = paged_seed_batch("dead", "lost", 0, 0, 0, 2, vec![]);
         let dead_bytes = serde_json::to_vec(&dead_first).unwrap().len();
         assert_eq!(
-            match handler.dispatch_value(8, dead_first).await {
-                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            match handler.dispatch_value(test_route(8), dead_first).await {
+                PreparedOutcome::Response(bytes) =>
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
                 other => panic!("unexpected handler outcome: {other:?}"),
             }["next_expected_index"],
             json!(1)
@@ -33633,8 +34306,9 @@ mod tests {
         let live_first = paged_seed_batch("live", "active", 0, 0, 0, 2, vec![]);
         let live_bytes = serde_json::to_vec(&live_first).unwrap().len();
         assert_eq!(
-            match handler.dispatch_value(9, live_first).await {
-                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            match handler.dispatch_value(test_route(9), live_first).await {
+                PreparedOutcome::Response(bytes) =>
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
                 other => panic!("unexpected handler outcome: {other:?}"),
             }["next_expected_index"],
             json!(1)
@@ -33643,8 +34317,9 @@ mod tests {
 
         let live_final = paged_seed_batch("live", "active", 0, 0, 1, 2, vec![]);
         assert_eq!(
-            match handler.dispatch_value(9, live_final).await {
-                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            match handler.dispatch_value(test_route(9), live_final).await {
+                PreparedOutcome::Response(bytes) =>
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
                 other => panic!("unexpected handler outcome: {other:?}"),
             }["ok"],
             json!(true)
@@ -33654,8 +34329,9 @@ mod tests {
         let fresh_dead = paged_seed_batch("dead", "fresh", 0, 0, 0, 2, vec![]);
         let fresh_dead_bytes = serde_json::to_vec(&fresh_dead).unwrap().len();
         assert_eq!(
-            match handler.dispatch_value(8, fresh_dead).await {
-                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            match handler.dispatch_value(test_route(8), fresh_dead).await {
+                PreparedOutcome::Response(bytes) =>
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
                 other => panic!("unexpected handler outcome: {other:?}"),
             }["next_expected_index"],
             json!(1)
@@ -33712,7 +34388,11 @@ mod tests {
         let foreign_midstream = paged_seed_batch(session, "foreign", 0, 0, 3, 4, vec![]);
 
         assert_eq!(
-            error_code(handler.dispatch_value(7, foreign_midstream).await),
+            error_code(
+                handler
+                    .dispatch_value(test_route(7), foreign_midstream)
+                    .await
+            ),
             "state_sync_seed_attempt_mismatch"
         );
         assert_eq!(seed_accounting(&handler), (0, 0));
@@ -33743,7 +34423,7 @@ mod tests {
         let state = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
         let session = "paged-profile";
-        handler.bind_route(8, binding(project.to_str().unwrap(), session));
+        handler.bind_route(test_route(8), binding(project.to_str().unwrap(), session));
 
         let mut first = paged_seed_batch(session, "profile-seed", 0, 0, 0, 3, vec![]);
         first["user_profile"] = json!(["prefers root cause"]);
@@ -33760,18 +34440,18 @@ mod tests {
         let final_batch = paged_seed_batch(session, "profile-seed", 0, 0, 2, 3, vec![]);
 
         assert!(matches!(
-            handler.dispatch_value(8, first).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(8), first).await,
+            PreparedOutcome::Response(_)
         ));
         assert!(store.load_active_user_memories().unwrap().is_empty());
         assert!(matches!(
-            handler.dispatch_value(8, second).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(8), second).await,
+            PreparedOutcome::Response(_)
         ));
         assert!(store.load_active_user_memories().unwrap().is_empty());
         assert!(matches!(
-            handler.dispatch_value(8, final_batch).await,
-            HandlerOutcome::Response(_)
+            handler.dispatch_value(test_route(8), final_batch).await,
+            PreparedOutcome::Response(_)
         ));
 
         let profile = store.load_active_user_memories().unwrap();

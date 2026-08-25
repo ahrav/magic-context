@@ -9,8 +9,8 @@ import {
     Deadline,
     type RouteHandle,
     StaleRouteHandleError,
-    SubcCallError,
-    type SubcClient,
+    McHostCallError,
+    type McHostClient,
 } from "../../shared/mc-host-client";
 import {
     FakePeer,
@@ -24,12 +24,12 @@ import {
     waitUntil,
     writeConnectionFile,
 } from "../../shared/mc-host-client/test-support/test-util";
-import { __moduleTransportTest, SubcModuleTransport } from "./module-transport";
+import { __moduleTransportTest, McHostModuleTransport } from "./module-transport";
 
 let tempDir = "";
 let fileCounter = 0;
 let peers: FakePeer[] = [];
-let transports: SubcModuleTransport[] = [];
+let transports: McHostModuleTransport[] = [];
 let savedModuleId: string | undefined;
 let savedLaunchNonce: string | undefined;
 
@@ -76,18 +76,18 @@ async function writeConnFile(peer: FakePeer): Promise<string> {
     return filePath;
 }
 
-function trackTransport(transport: SubcModuleTransport): SubcModuleTransport {
+function trackTransport(transport: McHostModuleTransport): McHostModuleTransport {
     transports.push(transport);
     return transport;
 }
 
 async function peerTransport(
     requestTimeoutMs = 5_000,
-): Promise<{ peer: FakePeer; transport: SubcModuleTransport }> {
+): Promise<{ peer: FakePeer; transport: McHostModuleTransport }> {
     const peer = await startPeer();
     const connectionFile = await writeConnFile(peer);
     const transport = trackTransport(
-        new SubcModuleTransport(connectionFile, "magic-context", requestTimeoutMs),
+        new McHostModuleTransport(connectionFile, "magic-context", requestTimeoutMs),
     );
     return { peer, transport };
 }
@@ -187,10 +187,10 @@ function routedBodies(peer: FakePeer): PeerFrame[] {
     return peer.connections.flatMap((conn) => conn.frames.filter(isRoutedRequest()));
 }
 
-function expectCallError(error: unknown, kind: SubcCallError["kind"], code?: string): void {
-    expect((error as Error).name).toBe("SubcCallError");
-    expect((error as SubcCallError).kind).toBe(kind);
-    if (code !== undefined) expect((error as SubcCallError).code).toBe(code);
+function expectCallError(error: unknown, kind: McHostCallError["kind"], code?: string): void {
+    expect((error as Error).name).toBe("McHostCallError");
+    expect((error as McHostCallError).kind).toBe(kind);
+    if (code !== undefined) expect((error as McHostCallError).code).toBe(code);
 }
 
 function deferred<T = void>(): {
@@ -207,7 +207,7 @@ function deferred<T = void>(): {
     return { promise, resolve, reject };
 }
 
-describe("SubcModuleTransport", () => {
+describe("McHostModuleTransport", () => {
     it("uses the internal facade while preserving route identity and flat request bytes", async () => {
         const { peer, transport } = await peerTransport(1_000);
         const flatBody = {
@@ -456,7 +456,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("reconnects once when the request provably never reached the socket", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const transport = new McHostModuleTransport("unused-connection-file", "magic-context", 100);
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         let connectionCount = 0;
         let firstCloseCount = 0;
@@ -464,7 +464,7 @@ describe("SubcModuleTransport", () => {
             {
                 routeOpen: async () => route,
                 request: async () => {
-                    throw new SubcCallError("not_sent", "client closed", "connection_dropped");
+                    throw new McHostCallError("not_sent", "client closed", "connection_dropped");
                 },
                 close: () => {
                     firstCloseCount += 1;
@@ -475,10 +475,10 @@ describe("SubcModuleTransport", () => {
                 request: async () => ({ result: { reconnected: true } }),
                 close: () => undefined,
             },
-        ] as unknown as SubcClient[];
+        ] as unknown as McHostClient[];
         const internals = transport as unknown as {
-            client: SubcClient | null;
-            ensureConnected(): Promise<SubcClient>;
+            client: McHostClient | null;
+            ensureConnected(): Promise<McHostClient>;
         };
         internals.ensureConnected = async () => {
             const client = clients[connectionCount++];
@@ -500,7 +500,11 @@ describe("SubcModuleTransport", () => {
     });
 
     it("stops after not_sent then unknown_channel: the transport replay token is single-use", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const transport = new McHostModuleTransport(
+            "unused-connection-file",
+            "magic-context",
+            1_000,
+        );
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         let requestCount = 0;
         let routeOpenCount = 0;
@@ -512,15 +516,15 @@ describe("SubcModuleTransport", () => {
             request: async () => {
                 requestCount += 1;
                 if (requestCount === 1) {
-                    throw new SubcCallError("not_sent", "queued rejection", "writer_queue_full");
+                    throw new McHostCallError("not_sent", "queued rejection", "writer_queue_full");
                 }
-                throw new SubcCallError("terminal", "error unknown_channel", "unknown_channel");
+                throw new McHostCallError("terminal", "error unknown_channel", "unknown_channel");
             },
             close: () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
-            ensureConnected(): Promise<SubcClient>;
+            client: McHostClient | null;
+            ensureConnected(): Promise<McHostClient>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
@@ -542,7 +546,11 @@ describe("SubcModuleTransport", () => {
     });
 
     it("an aborted caller cannot spend an unspent replay token", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const transport = new McHostModuleTransport(
+            "unused-connection-file",
+            "magic-context",
+            1_000,
+        );
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         const controller = new AbortController();
         let requestCount = 0;
@@ -551,13 +559,13 @@ describe("SubcModuleTransport", () => {
             request: async () => {
                 requestCount += 1;
                 controller.abort();
-                throw new SubcCallError("not_sent", "request aborted", "aborted");
+                throw new McHostCallError("not_sent", "request aborted", "aborted");
             },
             close: () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
-            ensureConnected(): Promise<SubcClient>;
+            client: McHostClient | null;
+            ensureConnected(): Promise<McHostClient>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
@@ -578,20 +586,20 @@ describe("SubcModuleTransport", () => {
     });
 
     it("returns the typed generation change for pre-send recovery when generationSensitive is set", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const transport = new McHostModuleTransport("unused-connection-file", "magic-context", 100);
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         let requestCount = 0;
         const client = {
             routeOpen: async () => route,
             request: async () => {
                 requestCount += 1;
-                throw new SubcCallError("not_sent", "client closed", "connection_dropped");
+                throw new McHostCallError("not_sent", "client closed", "connection_dropped");
             },
             close: () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
-            ensureConnected(): Promise<SubcClient>;
+            client: McHostClient | null;
+            ensureConnected(): Promise<McHostClient>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
@@ -615,24 +623,24 @@ describe("SubcModuleTransport", () => {
     });
 
     it("propagates outcome_unknown as an error even when generationSensitive is set", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const transport = new McHostModuleTransport("unused-connection-file", "magic-context", 100);
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         let requestCount = 0;
         const client = {
             routeOpen: async () => route,
             request: async () => {
                 requestCount += 1;
-                throw new SubcCallError(
+                throw new McHostCallError(
                     "outcome_unknown",
                     "connection dropped mid-request",
                     "connection_dropped",
                 );
             },
             close: () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
-            ensureConnected(): Promise<SubcClient>;
+            client: McHostClient | null;
+            ensureConnected(): Promise<McHostClient>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
@@ -654,7 +662,7 @@ describe("SubcModuleTransport", () => {
 
     it("bounds a half-open route open under the single operation deadline without any body send", async () => {
         const timeoutMs = 30;
-        const transport = new SubcModuleTransport(
+        const transport = new McHostModuleTransport(
             "unused-connection-file",
             "magic-context",
             timeoutMs,
@@ -667,10 +675,10 @@ describe("SubcModuleTransport", () => {
                 return new Promise<never>(() => undefined);
             },
             close: () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
-            ensureConnected(): Promise<SubcClient>;
+            client: McHostClient | null;
+            ensureConnected(): Promise<McHostClient>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
@@ -696,7 +704,7 @@ describe("SubcModuleTransport", () => {
 
     it("bounds a hung stubbed request as outcome_unknown without a second attempt", async () => {
         const timeoutMs = 30;
-        const transport = new SubcModuleTransport(
+        const transport = new McHostModuleTransport(
             "unused-connection-file",
             "magic-context",
             timeoutMs,
@@ -711,10 +719,10 @@ describe("SubcModuleTransport", () => {
                 return new Promise<never>(() => undefined);
             },
             close: () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
-            ensureConnected(): Promise<SubcClient>;
+            client: McHostClient | null;
+            ensureConnected(): Promise<McHostClient>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
@@ -738,7 +746,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("closeSession during an in-flight route open leaves no late cached route", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         const routeOpenStarted = deferred();
         const releaseRouteOpen = deferred();
@@ -752,9 +760,9 @@ describe("SubcModuleTransport", () => {
             closeRoute: async () => {
                 closeRouteCount += 1;
             },
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             routes: Map<string, unknown>;
             ensureRoute: (sessionId: string, projectRoot: string) => Promise<unknown>;
         };
@@ -771,7 +779,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("bounds canonical-root entries with least-recently-used eviction", () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const internals = transport as unknown as {
             canonicalRoot(root: string): string;
             canonicalRootCache: Map<string, string>;
@@ -789,7 +797,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("does not expose state-sync capabilities from an earlier connection generation", () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const internals = transport as unknown as {
             connectionGeneration: number;
             stateSyncCapabilityCache: {
@@ -809,7 +817,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("allows another session to start while a long wrapup is still in flight", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         const wrapupStarted = deferred();
         const statusStarted = deferred();
@@ -826,11 +834,11 @@ describe("SubcModuleTransport", () => {
                 }
                 return { result: { ok: true } };
             },
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             ensureRoute: (sessionId: string) => Promise<{
-                client: SubcClient;
+                client: McHostClient;
                 route: RouteHandle;
                 routeKey: string;
                 generation: number;
@@ -870,7 +878,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("executes one session's state sync, transform, and status strictly in submission order", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         const stateSyncStarted = deferred();
         const transformStarted = deferred();
@@ -890,11 +898,11 @@ describe("SubcModuleTransport", () => {
                 }
                 return { result: { method } };
             },
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             ensureRoute: () => Promise<{
-                client: SubcClient;
+                client: McHostClient;
                 route: RouteHandle;
                 routeKey: string;
                 generation: number;
@@ -936,7 +944,11 @@ describe("SubcModuleTransport", () => {
     });
 
     it("coalesces concurrent connection recovery and retries two sessions on one fresh generation", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const transport = new McHostModuleTransport(
+            "unused-connection-file",
+            "magic-context",
+            1_000,
+        );
         const oldRouteA = { channel: 7, epoch: 70 } as RouteHandle;
         const oldRouteB = { channel: 8, epoch: 80 } as RouteHandle;
         const oldRequestsStarted = deferred();
@@ -948,12 +960,12 @@ describe("SubcModuleTransport", () => {
                 if (oldRequestCount === 2) oldRequestsStarted.resolve();
                 await oldRequestsStarted.promise;
                 // Proven pre-send rejections: the replay token may be spent.
-                throw new SubcCallError("not_sent", "client closed", "connection_dropped");
+                throw new McHostCallError("not_sent", "client closed", "connection_dropped");
             },
             close: () => {
                 oldCloseCount += 1;
             },
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         let routeOpenCount = 0;
         const freshRequestSessions: string[] = [];
         const freshClient = {
@@ -971,13 +983,13 @@ describe("SubcModuleTransport", () => {
                 return { result: { sessionId } };
             },
             close: () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         let connectCount = 0;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             connectionGeneration: number;
             routes: Map<string, { route: RouteHandle; generation: number }>;
-            connectClient(): Promise<SubcClient>;
+            connectClient(): Promise<McHostClient>;
         };
         internals.client = oldClient;
         internals.routes.set("session-a\0/invalidation-a", { route: oldRouteA, generation: 0 });
@@ -1013,7 +1025,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("coalesces concurrent route opens for the same session and project", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         const routeOpenStarted = deferred();
         const releaseRouteOpen = deferred();
@@ -1026,9 +1038,9 @@ describe("SubcModuleTransport", () => {
                 return route;
             },
             closeRoute: async () => undefined,
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             ensureRoute: (
                 sessionId: string,
                 projectRoot: string,
@@ -1049,7 +1061,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("keeps the aggregate queued-call ceiling across independent session lanes", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         const releaseActiveCalls = deferred();
         const allActiveCallsStarted = deferred();
@@ -1063,11 +1075,11 @@ describe("SubcModuleTransport", () => {
                 }
                 return { result: { ok: true } };
             },
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             ensureRoute: (sessionId: string) => Promise<{
-                client: SubcClient;
+                client: McHostClient;
                 route: RouteHandle;
                 routeKey: string;
                 generation: number;
@@ -1115,7 +1127,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("keeps wrapup and live status calls beyond a 20-second round without raising the generic deadline", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         let releaseWrapup: (() => void) | undefined;
         let markWrapupStarted: (() => void) | undefined;
@@ -1135,11 +1147,11 @@ describe("SubcModuleTransport", () => {
                 }
                 return { result: { ok: true } };
             },
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             ensureRoute: () => Promise<{
-                client: SubcClient;
+                client: McHostClient;
                 route: RouteHandle;
                 routeKey: string;
                 generation: number;
@@ -1182,7 +1194,7 @@ describe("SubcModuleTransport", () => {
     });
 
     it("does not reuse a route cached under an earlier connection generation", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file");
+        const transport = new McHostModuleTransport("unused-connection-file");
         const oldRoute = { channel: 7, epoch: 77 } as RouteHandle;
         const newRoute = { channel: 8, epoch: 88 } as RouteHandle;
         let routeOpenCount = 0;
@@ -1191,11 +1203,11 @@ describe("SubcModuleTransport", () => {
                 routeOpenCount += 1;
                 return newRoute;
             },
-        } as unknown as SubcClient;
+        } as unknown as McHostClient;
         const projectRoot = "/module-transport-generation-test-root";
         const routeKey = `session-generation\0${projectRoot}`;
         const internals = transport as unknown as {
-            client: SubcClient | null;
+            client: McHostClient | null;
             connectionGeneration: number;
             routes: Map<string, { route: RouteHandle; generation: number }>;
             ensureRoute: (
@@ -1223,7 +1235,7 @@ async function nthConnection(peer: FakePeer, n: number): Promise<FakePeerConnect
 
 describe("beforeDeadline orphan safety", () => {
     it("a request rejecting after the deadline lost the race never raises an unhandled rejection", async () => {
-        const transport = new SubcModuleTransport("/nonexistent-connection-file");
+        const transport = new McHostModuleTransport("/nonexistent-connection-file");
         const unhandled: unknown[] = [];
         const onUnhandled = (error: unknown) => {
             unhandled.push(error);

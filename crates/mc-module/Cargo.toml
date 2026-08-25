@@ -3,36 +3,34 @@ name = "mc-module"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "The Magic Context subc module: harness-agnostic cache-stability transform (CK-in/CK-out), backed by the single-writer mc-store, served over the subc wire."
+autobins = false
+description = "Magic Context host component: harness-agnostic cache-stability transform backed by the single-writer mc-store."
 
 [lib]
 name = "mc_module"
 path = "src/lib.rs"
 
-[[bin]]
-# Fleet convention: supervised binaries carry the ck-* prefix so they group in
-# Activity Monitor. Crate/package stays mc-module and module_id stays
-# "magic-context" — only the built executable name changes.
-name = "ck-mc"
-path = "src/main.rs"
+[[example]]
+name = "direct_host_fixture"
+path = "examples/direct_host_fixture.rs"
+required-features = ["direct-host-fixture"]
 
 [dependencies]
 mc-core = { workspace = true }
 mc-store = { workspace = true }
 mc-tokenizer = { path = "../mc-tokenizer" }
+mc-host = { path = "../mc-host" }
 cortexkit-store-types = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-lease = { workspace = true }
-subc-protocol = { workspace = true }
-subc-control = { workspace = true }
-subc-transport = { workspace = true }
-subc-client-rs = { workspace = true }
+async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Provider context-overflow error patterns (scheduler unit). Plain regex (no
 # lookarounds in those patterns); fancy-regex stays confined to mc-tokenizer.
 regex = "1"
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
@@ -52,12 +50,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Do NOT add drive-fault to a default feature set, and do NOT add new fault arms
 # without the matching absence-proof note here and the fault-shape tests in lib.rs.
 drive-fault = []
+# The `direct-host-fixture` feature enables a test-only process fixture, not a production launch surface.
+direct-host-fixture = []
 
 [dev-dependencies]
-subc-core = { workspace = true }
 chrono-tz = "0.10"
-# Dev-only host for the authenticated round-trip test; production mc-module must never link mc-host. commentlint: allow(JUDGE)
-mc-host = { path = "../mc-host" }
+tokio = { workspace = true, features = ["signal"] }
 # Enable the store's seed helpers for mc-module's compose tests (populate memories +
 # mutations). The feature is gated so the writers never reach production builds.
 mc-store = { workspace = true, features = ["test-support"] }

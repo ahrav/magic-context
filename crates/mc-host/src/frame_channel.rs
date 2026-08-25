@@ -19,8 +19,9 @@
 
 use std::future::Future;
 
-use subc_protocol::EnvelopeHeader;
 use tokio::sync::mpsc;
+
+use crate::wire::EnvelopeHeader;
 use tokio::time::{timeout_at, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 

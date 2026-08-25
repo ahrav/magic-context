@@ -171,7 +171,7 @@ pub struct Discovered {
     pub pid: u64,
     pub daemon_ver: String,
     pub schema: u64,
-    pub wire_version: Option<u64>,
+    pub wire_version: u64,
 }
 
 /// Validates and reads a publication the way a conforming client must
@@ -201,11 +201,12 @@ pub fn discover(path: &Path) -> Result<Discovered, String> {
     if schema != 1 {
         return Err(format!("unsupported schema {schema}"));
     }
-    let wire_version = json.get("wire_version").and_then(serde_json::Value::as_u64);
-    if let Some(version) = wire_version {
-        if version != u64::from(WIRE_VERSION) {
-            return Err(format!("wire version {version} is not 2"));
-        }
+    let wire_version = json
+        .get("wire_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("missing or invalid wire_version")?;
+    if wire_version != u64::from(WIRE_VERSION) {
+        return Err(format!("wire version {wire_version} is not 2"));
     }
 
     let endpoints = json["endpoints"].as_array().ok_or("missing endpoints")?;
@@ -314,13 +315,24 @@ pub struct RawClient {
 }
 
 impl RawClient {
-    /// Completes the three-message handshake, verifying the server proof and
-    /// daemon ID before sending `ClientAuth` (protocol §5.2).
     pub async fn connect(info: &Discovered) -> Result<Self, String> {
         Self::connect_with_role(info, "client").await
     }
 
     pub async fn connect_with_role(info: &Discovered, role: &str) -> Result<Self, String> {
+        let mut client = Self::connect_setup_only_with_role(info, role).await?;
+        client.negotiate_tcp().await?;
+        Ok(client)
+    }
+
+    pub async fn connect_setup_only(info: &Discovered) -> Result<Self, String> {
+        Self::connect_setup_only_with_role(info, "client").await
+    }
+
+    pub async fn connect_setup_only_with_role(
+        info: &Discovered,
+        role: &str,
+    ) -> Result<Self, String> {
         let mut stream = TcpStream::connect((info.host.as_str(), info.port))
             .await
             .map_err(|err| err.to_string())?;
@@ -379,6 +391,37 @@ impl RawClient {
             client_nonce,
             next_corr: 0,
         })
+    }
+
+    async fn negotiate_tcp(&mut self) -> Result<(), String> {
+        let corr = self
+            .control(&serde_json::json!({
+                "op": "transport.negotiate",
+                "negotiation_version": 1,
+                "offers": [{"transport": "tcp", "capability_version": 1}]
+            }))
+            .await
+            .map_err(|err| err.to_string())?;
+        let (skipped, frame) = self.frames_until_corr(corr, Duration::from_secs(5)).await?;
+        if !skipped.is_empty() {
+            return Err("unexpected frame before transport selection".to_owned());
+        }
+        if frame.ty != TY_RESPONSE
+            || frame.channel != 0
+            || frame.epoch != 0
+            || frame.flags != FLAGS_RESPONSE_TEXT_LAST
+        {
+            return Err("invalid transport selection frame".to_owned());
+        }
+        let expected = serde_json::json!({
+            "op": "transport.negotiate",
+            "negotiation_version": 1,
+            "selected": {"transport": "tcp", "capability_version": 1}
+        });
+        if frame.json() != expected {
+            return Err("invalid TCP transport selection".to_owned());
+        }
+        Ok(())
     }
 
     /// Allocates the next monotonic consumer correlation.

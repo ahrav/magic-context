@@ -1,6 +1,6 @@
 {
     "schema": 1,
-    "header": "CI intentionally runs only the manifest-derived TS invocation; the Rust invocation requires private sibling path-deps (../commons and ../subconscious) and remains a mandatory local release-gate leg.",
+    "header": "CI runs the manifest-derived TS invocation. Focused direct-host Rust tests require Cargo and this repository; broad Rust-mode qualification remains a separate gate.",
     "entries": [
         {
             "path": "tests/cache-invariants.test.ts",
@@ -546,7 +546,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "hermetic Broca producer publishes deterministic v2 compartments and proves outage/strict-validation failures",
+            "rationale": "direct Broca backend controls prove historian routing and typed backend-failure handling",
             "contract_refs": [
                 "RUST-E2E",
                 "HISTORIAN-PRODUCER"

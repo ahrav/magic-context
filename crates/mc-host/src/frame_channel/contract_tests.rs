@@ -11,8 +11,9 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use subc_protocol::{EnvelopeHeader, Flags, FrameType};
 use tokio::time::{Duration, Instant};
+
+use crate::wire::{EnvelopeHeader, Flags, FrameType};
 use tokio_util::sync::CancellationToken;
 
 use crate::frame_channel::{FrameReceiver, FrameSender, InboundEvent, OutboundFrame, ReadClose};

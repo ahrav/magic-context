@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use rustix::fd::OwnedFd;
 use rustix::fs::{flock, openat, unlinkat, AtFlags, FlockOperation, Mode, OFlags};
 
-use subc_transport::ConnectionInfo;
+use crate::connection_file::{ConnectionInfo, KEY_LEN};
 
 use crate::instance::{
     flock_bounded, flock_exclusive_bounded, hex, io_err, is_safe_ancestor, is_secure_regular,
@@ -507,16 +507,12 @@ fn instance_lock_free(dir: &OwnedFd, dir_path: &Path) -> Result<bool, InstanceEr
 fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
     let info: ConnectionInfo = serde_json::from_slice(bytes).ok()?;
     info.validate().ok()?;
-    info.validate_wire_version(subc_protocol::PROTOCOL_VERSION)
-        .ok()?;
+
     let endpoint = info.endpoints.first()?;
-    // `validate()` accepts any key of at least the minimum length; this
-    // profile and its clients (protocol §4.1) require exactly KEY_LEN bytes,
-    // so a longer key is a publication no conforming client would accept.
     if endpoint.host != "127.0.0.1"
         || endpoint.port == 0
         || info.daemon_ver.is_empty()
-        || info.key.len() != subc_transport::KEY_LEN
+        || info.key.len() != KEY_LEN
     {
         return None;
     }

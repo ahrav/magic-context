@@ -12,9 +12,11 @@
 //! frame; semantic rejection with trustworthy identity flows through the
 //! settlement path in `dispatch` instead (protocol §6.3).
 
-use subc_protocol::{
+#[cfg(test)]
+use crate::wire::Flags;
+use crate::wire::{
     decode_header, AdmissionClass, DecodeError, EnvelopeHeader, FrameType, FROZEN_PREFIX_LEN,
-    HEADER_LEN,
+    HEADER_LEN, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::{timeout_at, Duration, Instant};
@@ -69,7 +71,7 @@ impl<R: AsyncRead + Send + Unpin> TcpFrameChannel<R> {
     ) -> (
         FrameSender,
         Self,
-        impl std::future::Future<Output = ()> + Send,
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     )
     where
         W: AsyncWrite + Send + Unpin + 'static,
@@ -82,7 +84,7 @@ impl<R: AsyncRead + Send + Unpin> TcpFrameChannel<R> {
             cancel: read_cancel,
             pending_drain: None,
         };
-        let task = write_frames(write, queue, frame_deadline);
+        let task = Box::pin(write_frames(write, queue, frame_deadline));
         (sender, receiver, task)
     }
 }
@@ -167,7 +169,7 @@ where
         cancel,
     )
     .await?;
-    if header_bytes[4] != subc_protocol::PROTOCOL_VERSION {
+    if header_bytes[4] != PROTOCOL_VERSION {
         return Err(ReadClose::Corrupt("unsupported version"));
     }
     read_exact_deadline(
@@ -474,7 +476,7 @@ impl crate::frame_channel::contract_tests::PeerDriver for TcpPeer {
     async fn send_frame(
         &mut self,
         ty: FrameType,
-        flags: subc_protocol::Flags,
+        flags: Flags,
         id: crate::wire::FrameId,
         body: Vec<u8>,
     ) {
@@ -514,7 +516,6 @@ impl crate::frame_channel::contract_tests::PeerDriver for TcpPeer {
 mod tests {
     use super::*;
     use std::io;
-    use subc_protocol::PROTOCOL_VERSION;
     use tokio::io::{duplex, AsyncWriteExt};
 
     use crate::wire::{encode_frame, response_flags, FrameId};

@@ -7,7 +7,7 @@ import { adversarialScenarios, runAdversarialScenario } from "./test-support/adv
 import { encodePeerFrame, type FakePeerConnection, PeerFrameType } from "./test-support/fake-peer";
 import {
     createTrackedHarness,
-    expectSubcCallError as expectCallError,
+    expectMcHostCallError as expectCallError,
     rejection,
     type TrackedHarness,
     waitUntil,

@@ -19,10 +19,11 @@ import { Database as PluginDatabase } from "../../plugin/src/shared/sqlite";
 export function openTestDb(
 	path: string,
 	options?: { readonly?: boolean; readwrite?: boolean },
-): Database {
+): Database & PluginDatabase {
 	const db = new Database(path, options);
 	db.exec("PRAGMA busy_timeout=5000");
-	return db;
+	// SAFETY: E2E executes in Bun, so PluginDatabase selects bun:sqlite. commentlint: allow(JUDGE)
+	return db as Database & PluginDatabase;
 }
 
 /**

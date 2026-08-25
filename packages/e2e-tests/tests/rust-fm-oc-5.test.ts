@@ -28,16 +28,15 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-5: transport han
     it(
         "continues through a transport timeout and recovers after SIGCONT",
         async () => {
-            h.subc.assertModuleNotSupervised();
             const sessionId = await h.createSession();
             await driveToSteadyState(h, sessionId, 2);
             const beforeCount = h.readRustPasses().length;
 
-            h.subc.stopModule();
+            h.mcHost.pauseHost();
             await h.sendPrompt(sessionId, `FM-OC-5 stopped module: ${h.ballast(400)}`);
             assertMessagesHaveNoPlaceholders(h.lastMainMessages(), sessionId);
 
-            h.subc.continueModule();
+            h.mcHost.resumeHost();
             await h.sendPrompt(sessionId, `FM-OC-5 continued module: ${h.ballast(400)}`);
             const recovered = await h.waitForRustPasses(beforeCount + 2);
             expect(recovered.slice(beforeCount + 1).some((pass) => pass.servedFrom === "transform")).toBe(

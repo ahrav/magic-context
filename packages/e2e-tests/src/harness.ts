@@ -19,7 +19,11 @@ import { Database } from "bun:sqlite";
 import { existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
-import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
+import {
+    spawnOpencode,
+    type SpawnedOpencode,
+    type SpawnOptions,
+} from "./opencode-runner/spawn";
 
 export interface TestHarnessOptions {
     /** magic-context config overrides. Merged onto test defaults. */
@@ -66,19 +70,24 @@ export class TestHarness {
     readonly mock: MockProvider;
     readonly opencode: SpawnedOpencode;
     readonly client: SdkClient;
-    /** Provides Rust-mode-only access to the historian and status interfaces running in the module's Rust stack. */
-    readonly rustStack: SpawnedOpencode["rustStack"];
+    readonly mcHostStack: SpawnedOpencode["mcHostStack"];
 
     private contextDbCached: Database | null = null;
 
-    private constructor(mock: MockProvider, opencode: SpawnedOpencode, client: SdkClient) {
+    private constructor(
+        mock: MockProvider,
+        opencode: SpawnedOpencode,
+        client: SdkClient,
+    ) {
         this.mock = mock;
         this.opencode = opencode;
         this.client = client;
-        this.rustStack = opencode.rustStack;
+        this.mcHostStack = opencode.mcHostStack;
     }
 
-    static async create(options: TestHarnessOptions = {}): Promise<TestHarness> {
+    static async create(
+        options: TestHarnessOptions = {},
+    ): Promise<TestHarness> {
         const mock = new MockProvider();
         const { baseURL } = await mock.start();
 
@@ -94,7 +103,10 @@ export class TestHarness {
         const opencode = await spawnOpencode(spawnOpts);
 
         const sdk = await import("@opencode-ai/sdk");
-        const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
+        // SAFETY: harness uses only SdkClient methods shared with the generated SDK client.
+        const client = sdk.createOpencodeClient({
+            baseUrl: opencode.url,
+        }) as unknown as SdkClient;
 
         return new TestHarness(mock, opencode, client);
     }
@@ -102,7 +114,10 @@ export class TestHarness {
     /** Create a session bound to the isolated workdir. Throws on failure. */
     async createSession(): Promise<string> {
         return this.createSessionWithRetry(
-            () => this.client.session.create({ query: { directory: this.opencode.env.workdir } }),
+            () =>
+                this.client.session.create({
+                    query: { directory: this.opencode.env.workdir },
+                }),
             "session.create",
         );
     }
@@ -145,7 +160,10 @@ export class TestHarness {
      * heuristic cleanup without historian, no 85%/95% emergency paths, no
      * nudges, no §N§ prefix injection.
      */
-    async createChildSession(parentId: string, title?: string): Promise<string> {
+    async createChildSession(
+        parentId: string,
+        title?: string,
+    ): Promise<string> {
         return this.createSessionWithRetry(
             () =>
                 this.client.session.create({
@@ -165,7 +183,9 @@ export class TestHarness {
         try {
             const db = this.contextDb();
             const row = db
-                .prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?")
+                .prepare(
+                    "SELECT is_subagent FROM session_meta WHERE session_id = ?",
+                )
                 .get(sessionId) as { is_subagent: number } | null;
             if (!row) return null;
             return row.is_subagent === 1;
@@ -214,10 +234,29 @@ export class TestHarness {
      */
     ballast(tokens: number): string {
         const words = [
-            "boundary", "historian", "compartment", "schedule", "pressure",
-            "tokens", "window", "publish", "transform", "session", "marker",
-            "budget", "eligible", "protected", "ordinal", "snapshot", "replay",
-            "decision", "threshold", "baseline", "measure", "archive", "deliver",
+            "boundary",
+            "historian",
+            "compartment",
+            "schedule",
+            "pressure",
+            "tokens",
+            "window",
+            "publish",
+            "transform",
+            "session",
+            "marker",
+            "budget",
+            "eligible",
+            "protected",
+            "ordinal",
+            "snapshot",
+            "replay",
+            "decision",
+            "threshold",
+            "baseline",
+            "measure",
+            "archive",
+            "deliver",
         ];
         const target = Math.max(0, Math.round(tokens * 4)); // ~4 chars/token
         const parts: string[] = [];
@@ -259,7 +298,9 @@ export class TestHarness {
                 ...(options.agent ? { agent: options.agent } : {}),
             },
         });
-        const timeout = new Promise<null>((r) => setTimeout(() => r(null), timeoutMs));
+        const timeout = new Promise<null>((r) =>
+            setTimeout(() => r(null), timeoutMs),
+        );
         const result = await Promise.race([promptPromise, timeout]);
         if (result === null) {
             throw new Error(
@@ -277,7 +318,9 @@ export class TestHarness {
         if (this.contextDbCached) return this.contextDbCached;
         const dbPath = this.contextDbPath();
         if (!existsSync(dbPath)) {
-            throw new Error(`context.db not found at ${dbPath} — plugin may not have initialized yet.`);
+            throw new Error(
+                `context.db not found at ${dbPath} — plugin may not have initialized yet.`,
+            );
         }
         this.contextDbCached = new Database(dbPath, { readonly: true });
         return this.contextDbCached;
@@ -330,7 +373,9 @@ export class TestHarness {
         try {
             const db = this.contextDb();
             const row = db
-                .prepare("SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?")
+                .prepare(
+                    "SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?",
+                )
                 .get(sessionId) as { n: number } | null;
             return row?.n ?? 0;
         } catch {
@@ -367,6 +412,9 @@ export class TestHarness {
         }
         await this.opencode.kill();
         await this.mock.stop();
-        rmSync(dirname(this.opencode.env.configDir), { recursive: true, force: true });
+        rmSync(dirname(this.opencode.env.configDir), {
+            recursive: true,
+            force: true,
+        });
     }
 }

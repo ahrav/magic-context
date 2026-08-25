@@ -1,37 +1,100 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-/**
- * Dependency-boundary gate: production packages must not depend on or import
- * `@cortexkit/subc-client`. Only `PROVIDER_EXCEPTION` may import it.
- */
-
-const NPM_CLIENT = "@cortexkit/subc-client";
+const NPM_CLIENT = ["@cortexkit", ["subc", "client"].join("-")].join("/");
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 
-const PRODUCTION_PACKAGES = ["packages/plugin", "packages/cli", "packages/pi-plugin"];
+const OLD_API_NAMES = [
+    "HermeticSubcOptions",
+    "HermeticSubcStack",
+    "SubcCallError",
+    "SubcCallErrorKind",
+    "SubcCallOptions",
+    "SubcClient",
+    "SubcClientOptions",
+    "SubcDiagnosticsEvent",
+    "SubcDiagnosticsObserver",
+    "SubcError",
+    "SubcModuleTransport",
+    "SubcProvider",
+    "SubcProviderConnectOptions",
+    "SubcProviderError",
+    "SubcSocket",
+    "__hermeticSubcTest",
+    "buildHermeticBinaries",
+    "expectSubcCallError",
+    "isLegacyFallbackTerminalBody",
+    "isLegacyUnsupportedOperationBody",
+    "isSubcCallError",
+];
+type PackageManifest = {
+    workspaces?: string[] | { packages?: string[] };
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
+};
 
-const PROVIDER_EXCEPTION = "packages/e2e-tests/src/rust-runner/fake-broca.ts";
+function readManifest(file: string): PackageManifest {
+    return JSON.parse(fs.readFileSync(file, "utf-8")) as PackageManifest;
+}
 
-/** IMPORT_PATTERN matches import, export-from, require, and dynamic-import specifiers for NPM_CLIENT. */
-const IMPORT_PATTERN =
-    /(?:from\s*["']@cortexkit\/subc-client["']|import\s*\(\s*["']@cortexkit\/subc-client["']\s*\)|require\s*\(\s*["']@cortexkit\/subc-client["']\s*\)|import\s*["']@cortexkit\/subc-client["'])/;
+function workspacePackageRoots(root: string): string[] {
+    const configured = readManifest(path.join(root, "package.json")).workspaces;
+    const patterns = Array.isArray(configured) ? configured : configured?.packages;
+    if (!patterns) throw new Error("root package.json must declare workspaces");
+
+    const roots = new Set<string>();
+    for (const pattern of patterns) {
+        if (pattern.endsWith("/*") && !pattern.slice(0, -2).includes("*")) {
+            const parent = path.join(root, pattern.slice(0, -2));
+            for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+                const candidate = path.join(parent, entry.name);
+                if (entry.isDirectory() && fs.existsSync(path.join(candidate, "package.json"))) {
+                    roots.add(candidate);
+                }
+            }
+        } else if (!pattern.includes("*")) {
+            const candidate = path.join(root, pattern);
+            if (fs.existsSync(path.join(candidate, "package.json"))) roots.add(candidate);
+        } else {
+            throw new Error(`unsupported workspace pattern: ${pattern}`);
+        }
+    }
+    return [...roots].sort();
+}
 
 function* walkSourceFiles(dir: string): Generator<string> {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (entry.name === "node_modules" || entry.name === "dist" || entry.name.startsWith("."))
-            continue;
+        if (entry.name === "node_modules" || entry.name === "dist") continue;
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) yield* walkSourceFiles(full);
         else if (/\.(ts|tsx|js|mjs|cjs)$/.test(entry.name)) yield full;
     }
 }
 
-function manifestDependencies(packageDir: string): Record<string, string> {
-    const manifest = JSON.parse(
-        fs.readFileSync(path.join(repoRoot, packageDir, "package.json"), "utf-8"),
-    ) as Record<string, Record<string, string> | undefined>;
+function oldApiNames(source: string): string[] {
+    const matches: string[] = [];
+    for (const name of OLD_API_NAMES) {
+        let offset = 0;
+        for (;;) {
+            const index = source.indexOf(name, offset);
+            if (index < 0) break;
+            const before = source[index - 1];
+            const after = source[index + name.length];
+            if ((!before || !/[\w$]/.test(before)) && (!after || !/[\w$]/.test(after))) {
+                matches.push(name);
+            }
+            offset = index + name.length;
+        }
+    }
+    return matches;
+}
+
+function manifestDependencies(packageRoot: string): Record<string, string> {
+    const manifest = readManifest(path.join(packageRoot, "package.json"));
     return {
         ...manifest.dependencies,
         ...manifest.devDependencies,
@@ -40,63 +103,126 @@ function manifestDependencies(packageDir: string): Record<string, string> {
     };
 }
 
-describe("mc-host-client dependency boundary", () => {
-    test("production manifests do not depend on the npm client", () => {
-        for (const pkg of PRODUCTION_PACKAGES) {
-            expect(
-                Object.keys(manifestDependencies(pkg)),
-                `${pkg}/package.json must not declare ${NPM_CLIENT}`,
-            ).not.toContain(NPM_CLIENT);
-        }
-    });
-
-    test("production and consumer-side sources do not import the npm client", () => {
-        const offenders: string[] = [];
-        for (const pkg of [...PRODUCTION_PACKAGES, "packages/e2e-tests"]) {
-            const root = path.join(repoRoot, pkg);
-            if (!fs.existsSync(root)) continue;
-            for (const file of walkSourceFiles(root)) {
-                const relative = path.relative(repoRoot, file);
-                if (relative === PROVIDER_EXCEPTION) continue;
-                if (IMPORT_PATTERN.test(fs.readFileSync(file, "utf-8"))) offenders.push(relative);
+function sourceOffenders(
+    packageRoots: string[],
+    root: string,
+    matches: (source: string) => boolean,
+    allowlist: ReadonlySet<string> = new Set(),
+): string[] {
+    const offenders: string[] = [];
+    for (const packageRoot of packageRoots) {
+        for (const file of walkSourceFiles(packageRoot)) {
+            const relative = path.relative(root, file);
+            if (!allowlist.has(relative) && matches(fs.readFileSync(file, "utf-8"))) {
+                offenders.push(relative);
             }
         }
-        expect(offenders, `only ${PROVIDER_EXCEPTION} may import ${NPM_CLIENT}`).toEqual([]);
+    }
+    return offenders.sort();
+}
+
+function manifestOffenders(
+    packageRoots: string[],
+    root: string,
+    matches: (source: string) => boolean,
+): string[] {
+    return packageRoots
+        .map((packageRoot) => path.join(packageRoot, "package.json"))
+        .filter((file) => matches(fs.readFileSync(file, "utf-8")))
+        .map((file) => path.relative(root, file))
+        .sort();
+}
+
+describe("mc-host-client dependency boundary", () => {
+    const packageRoots = workspacePackageRoots(repoRoot);
+
+    test("workspace package manifests do not depend on the npm client", () => {
+        const offenders = packageRoots
+            .filter((packageRoot) => NPM_CLIENT in manifestDependencies(packageRoot))
+            .map((packageRoot) => path.relative(repoRoot, path.join(packageRoot, "package.json")));
+        expect(offenders).toEqual([]);
+        expect(manifestOffenders(packageRoots, repoRoot, (source) => source.includes(NPM_CLIENT))).toEqual(
+            [],
+        );
     });
 
-    test("the E2E provider exception still holds the one permitted import", () => {
-        const source = fs.readFileSync(path.join(repoRoot, PROVIDER_EXCEPTION), "utf-8");
-        expect(IMPORT_PATTERN.test(source)).toBe(true);
-        expect(Object.keys(manifestDependencies("packages/e2e-tests"))).toContain(NPM_CLIENT);
-    });
-
-    test("lockfile resolves the npm client only through the E2E package", () => {
-        const raw = fs.readFileSync(path.join(repoRoot, "bun.lock"), "utf-8");
-        // bun.lock is JSONC whose only non-JSON feature is trailing commas.
-        const lock = JSON.parse(raw.replace(/,(\s*[}\]])/g, "$1")) as {
-            workspaces: Record<string, Record<string, unknown>>;
-        };
-        const sections = [
-            "dependencies",
-            "devDependencies",
-            "optionalDependencies",
-            "peerDependencies",
-        ];
-        const declaringWorkspaces = Object.entries(lock.workspaces)
-            .filter(([, entry]) =>
-                sections.some((section) => {
-                    const deps = entry[section];
-                    return (
-                        typeof deps === "object" &&
-                        deps !== null &&
-                        NPM_CLIENT in (deps as Record<string, string>)
-                    );
-                }),
-            )
-            .map(([workspacePath]) => workspacePath);
+    test("workspace package sources do not reference the npm client", () => {
         expect(
-            declaringWorkspaces,
-            `only packages/e2e-tests may declare ${NPM_CLIENT} in bun.lock`,
-        ).toEqual(["packages/e2e-tests"]);
+            sourceOffenders(packageRoots, repoRoot, (source) => source.includes(NPM_CLIENT)),
+        ).toEqual([]);
+    });
+
+    test("workspace package sources do not reference removed client API names", () => {
+        const canonicalLiteralAllowlist = new Set([
+            path.relative(repoRoot, import.meta.path),
+        ]);
+        expect([
+            ...manifestOffenders(
+                packageRoots,
+                repoRoot,
+                (source) => oldApiNames(source).length > 0,
+            ),
+            ...sourceOffenders(
+                packageRoots,
+                repoRoot,
+                (source) => oldApiNames(source).length > 0,
+                canonicalLiteralAllowlist,
+            ),
+        ]).toEqual([]);
+    });
+
+    test("workspace discovery and matchers catch retina/dashboard-like packages", () => {
+        const root = fs.mkdtempSync(path.join(tmpdir(), "mc-host-boundary-"));
+        try {
+            fs.writeFileSync(
+                path.join(root, "package.json"),
+                JSON.stringify({ private: true, workspaces: ["packages/*"] }),
+            );
+            const retina = path.join(root, "packages", "retina-local-fs");
+            const dashboard = path.join(root, "packages", "dashboard");
+            for (const packageRoot of [retina, dashboard]) {
+                fs.mkdirSync(path.join(packageRoot, "src"), { recursive: true });
+                fs.writeFileSync(path.join(packageRoot, "package.json"), "{}");
+                fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+                fs.writeFileSync(
+                    path.join(packageRoot, "dist", "generated.js"),
+                    `import ${JSON.stringify(NPM_CLIENT)};`,
+                );
+            }
+            fs.writeFileSync(
+                path.join(retina, "src", "provider.ts"),
+                `import client from ${JSON.stringify(NPM_CLIENT)};`,
+            );
+            fs.writeFileSync(
+                path.join(dashboard, "package.json"),
+                JSON.stringify({ scripts: { legacy: OLD_API_NAMES[6] } }),
+            );
+
+            const roots = workspacePackageRoots(root);
+            expect(roots.map((packageRoot) => path.basename(packageRoot))).toEqual([
+                "dashboard",
+                "retina-local-fs",
+            ]);
+            expect(sourceOffenders(roots, root, (source) => source.includes(NPM_CLIENT))).toEqual([
+                "packages/retina-local-fs/src/provider.ts",
+            ]);
+            expect(
+                manifestOffenders(roots, root, (source) => oldApiNames(source).length > 0),
+            ).toEqual(["packages/dashboard/package.json"]);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("removed-name matcher covers E2E and client option surfaces", () => {
+        expect(oldApiNames("let stack: HermeticSubcStack;")).toEqual(["HermeticSubcStack"]);
+        expect(oldApiNames("type Options = SubcClientOptions;")).toEqual(["SubcClientOptions"]);
+        expect(
+            oldApiNames('const ops = ["subc_ops", "subc-client-v1", "subc-connection.json"];'),
+        ).toEqual([]);
+    });
+
+    test("lockfile does not resolve the npm client", () => {
+        expect(fs.readFileSync(path.join(repoRoot, "bun.lock"), "utf-8")).not.toContain(NPM_CLIENT);
     });
 });

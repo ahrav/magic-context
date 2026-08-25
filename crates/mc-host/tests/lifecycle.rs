@@ -296,7 +296,7 @@ async fn saturated_connection_capacity_closes_after_authentication() {
 
     // ServerProof must arrive before the post-authentication capacity close;
     // an accept-time capacity check would make this connect fail earlier.
-    let mut second = raw_client::RawClient::connect(&host.info)
+    let mut second = raw_client::RawClient::connect_setup_only(&host.info)
         .await
         .expect("the proof exchange completes before promotion is refused");
     assert!(
@@ -413,10 +413,8 @@ async fn ping_and_consumer_correlations_do_not_cross_settle() {
         .await
         .expect("route");
 
-    // route_open consumes correlation 1; the test leaves correlation 2
-    // pending until the host sends Ping correlation 2.
     let corr = client.next_corr();
-    assert_eq!(corr, 2);
+    assert_eq!(corr, 3);
     client
         .send_frame(
             TY_REQUEST,
@@ -1534,37 +1532,38 @@ async fn a_dying_requester_cannot_strand_the_stop() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// A second shutdown request on the same connection (after the first) also
-/// settles: an already-committed latch answers without a second commit.
 #[tokio::test]
-async fn shutdown_after_commit_reports_success_again() {
+async fn pipelined_shutdown_requests_on_one_connection_both_settle() {
     let host = TestHost::start().await;
     let mut client = host.client().await;
-    let first = client
-        .control(&serde_json::json!({"op": "host.shutdown"}))
-        .await
-        .expect("first shutdown");
-    let second = client
-        .control(&serde_json::json!({"op": "host.shutdown"}))
-        .await
-        .expect("second shutdown");
-    // Both requests are admitted before the commit, but their per-request
-    // tasks race for latch ownership, so the responses can arrive in either
-    // order; collect by correlation instead of assuming wire order.
-    // Whichever attempt commits, the other settles through the
-    // already-committed branch without a second commit.
-    let deadline = tokio::time::Instant::now() + BUDGET;
-    let mut settled: std::collections::HashMap<u64, raw_client::RawFrame> =
-        std::collections::HashMap::new();
-    while settled.len() < 2 {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let frame = client.frame_within(remaining).await.expect("settled");
-        if frame.ty != TY_PING && (frame.corr == first || frame.corr == second) {
-            settled.insert(frame.corr, frame);
-        }
-    }
+    let body = br#"{"op":"host.shutdown"}"#;
+    let first = client.next_corr();
+    let second = client.next_corr();
+    let mut wire = raw_client::header(
+        body.len() as u32,
+        TY_REQUEST,
+        FLAGS_INTERACTIVE,
+        0,
+        0,
+        first,
+    );
+    wire.extend_from_slice(body);
+    wire.extend_from_slice(&raw_client::header(
+        body.len() as u32,
+        TY_REQUEST,
+        FLAGS_INTERACTIVE,
+        0,
+        0,
+        second,
+    ));
+    wire.extend_from_slice(body);
+    client.send_raw(&wire).await.expect("pipeline shutdowns");
+
     for corr in [first, second] {
-        let response = settled.get(&corr).expect("both correlations settle");
+        let (_, response) = client
+            .frames_until_corr(corr, BUDGET)
+            .await
+            .expect("shutdown response");
         assert_eq!(response.ty, TY_RESPONSE);
         assert_eq!(response.json()["op"], "host.shutdown");
     }
@@ -1714,7 +1713,7 @@ async fn shutdown_during_candidate_setup_reaps_both_channels() {
     })
     .await;
 
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let corr = client
         .control(&serde_json::json!({
             "op": "transport.negotiate",

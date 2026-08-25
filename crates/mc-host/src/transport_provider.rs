@@ -146,7 +146,7 @@ pub struct TransportProviders {
 }
 
 impl TransportProviders {
-    /// Test seam: a registry with injected providers beside implicit TCP.
+    /// The registry retains built-in TCP when tests inject providers.
     /// Provider-authored `transport()` and `capability_version()` run once,
     /// here: negotiation lookups on a connection's read loop touch only the
     /// snapshot, so a slow or blocking metadata method cannot stall reads

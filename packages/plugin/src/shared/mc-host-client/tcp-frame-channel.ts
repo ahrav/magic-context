@@ -14,7 +14,7 @@
 import { Socket } from "node:net";
 import { type AuthByteIo, AuthError, type AuthResult, authenticateClient } from "./auth";
 import type { Deadline } from "./deadline";
-import { SocketClosedError, SocketTimeoutError, SubcCallError } from "./errors";
+import { SocketClosedError, SocketTimeoutError, McHostCallError } from "./errors";
 import {
     type ByteBudget,
     type FrameChannel,
@@ -260,7 +260,7 @@ export class TcpFrameChannel implements FrameChannel {
 
     send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
         if (this.closed) {
-            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+            throw new McHostCallError("not_sent", "frame channel is closed", "channel_closed");
         }
         // Encoding validates every header field before any state changes,
         // so a rejected frame can never burn a correlation upstream.
@@ -278,10 +278,10 @@ export class TcpFrameChannel implements FrameChannel {
             this.dataFramesQueued + 1 > this.maxQueuedFrames ||
             this.dataBytesQueued + totalBytes > this.maxQueuedBytes
         ) {
-            throw new SubcCallError("not_sent", "writer queue is full", "writer_queue_full");
+            throw new McHostCallError("not_sent", "writer queue is full", "writer_queue_full");
         }
         if (this.budget.wouldExceed(totalBytes)) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "aggregate connection memory cap would be exceeded",
                 "memory_cap",
@@ -306,7 +306,7 @@ export class TcpFrameChannel implements FrameChannel {
         if (this.controlFramesQueued >= this.controlReserveFrames) {
             this.fail(
                 "control_capacity_exhausted",
-                new SubcCallError(
+                new McHostCallError(
                     "terminal",
                     "reserved control-frame capacity exhausted; required cleanup cannot queue safely",
                     "control_capacity_exhausted",

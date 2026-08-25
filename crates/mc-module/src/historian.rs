@@ -19,7 +19,7 @@ use mc_store::{
 
 use crate::historian_producer::{
     attach_cleanup, ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError,
-    ProducerOutput, RunHandle, RunState,
+    HistorianSendOutcome, ProducerOutput, RunHandle, RunState,
 };
 use crate::historian_validate::{
     validate_historian_output, HistorianChunk, HistorianValidationError, StoredCompartmentRange,
@@ -758,7 +758,7 @@ impl From<McStoreError> for HistorianDriveError {
     }
 }
 
-#[subc_client_rs::async_trait]
+#[async_trait::async_trait]
 pub trait HistorianProducerDriver: Send {
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError>;
     async fn start(
@@ -805,6 +805,9 @@ pub trait HistorianProducerDriver: Send {
     }
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
+    async fn close_attempt(&mut self) -> Result<(), HistorianProducerError> {
+        self.close().await
+    }
     async fn close(&mut self) -> Result<(), HistorianProducerError>;
     /// Delete the provider session on every terminal path. The default calls close()
     /// for compatibility with older test producers, while production producers override
@@ -814,7 +817,7 @@ pub trait HistorianProducerDriver: Send {
     }
 }
 
-#[subc_client_rs::async_trait]
+#[async_trait::async_trait]
 impl HistorianProducerDriver for HistorianProducer {
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
         HistorianProducer::bind_session(self, session_id.to_string());
@@ -888,6 +891,10 @@ impl HistorianProducerDriver for HistorianProducer {
 
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError> {
         HistorianProducer::cancel(self, run_id).await
+    }
+
+    async fn close_attempt(&mut self) -> Result<(), HistorianProducerError> {
+        HistorianProducer::close_attempt(self).await
     }
 
     async fn close(&mut self) -> Result<(), HistorianProducerError> {
@@ -1074,6 +1081,14 @@ fn decide_producer_failure(
     now_ms: i64,
     default_failure_backoff_at_ms: i64,
 ) -> ProducerFailureDecision {
+    if err.is_cross_incarnation_unknown() {
+        *all_failures_permanent = false;
+        return ProducerFailureDecision {
+            try_next_model: false,
+            failure_backoff_at_ms: default_failure_backoff_at_ms,
+            detail_prefix: None,
+        };
+    }
     if let Some(classification) = err.classification() {
         // The producer owns classification. Once a class tag is present, the consumer
         // branches only on that field and its structured retry-after sibling; provider
@@ -1221,14 +1236,14 @@ fn log_cleanup_failure(
     }
 }
 
-/// True when a cancel could not prove the run's harness process group
-/// stopped. The host reports this as the `teardown_unconfirmed` request
-/// error, which the wire producer surfaces verbatim as a `Subc` body code.
-fn cancel_left_work_unconfirmed(result: &Result<(), HistorianProducerError>) -> bool {
-    matches!(
-        result,
-        Err(HistorianProducerError::Subc(body)) if body.code == "teardown_unconfirmed"
-    )
+fn cancellation_confirmed_stopped(result: &Result<(), HistorianProducerError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            error.send_outcome() == Some(HistorianSendOutcome::Terminal)
+                && error.code() != Some("teardown_unconfirmed")
+        }
+    }
 }
 
 pub async fn run_historian_firing<P>(
@@ -1307,11 +1322,12 @@ where
                         )),
                     ),
                 )?;
-                let close_result = producer.close().await;
                 if decision.try_next_model {
-                    log_cleanup_failure(request.session_id, "close", &close_result);
+                    let cleanup = producer.close_attempt().await;
+                    log_cleanup_failure(request.session_id, "attempt close", &cleanup);
                     continue;
                 }
+                let close_result = producer.close().await;
                 return Err(HistorianDriveError::Producer(attach_cleanup(
                     err,
                     close_result,
@@ -1386,19 +1402,16 @@ where
                         )),
                     ),
                 )?;
-                let close_result = producer.close().await;
-                // Fallback requires the failed attempt to actually be over:
-                // a cancel that reports `teardown_unconfirmed` means the
-                // host could not prove the provider descendant stopped, and
-                // starting the next model would run a second billable
-                // producer beside it under a fresh firing sequence. The
-                // firing ends here instead; the durable abandon above keeps
-                // the state recoverable and backoff-gated.
-                if decision.try_next_model && !cancel_left_work_unconfirmed(&cancel_result) {
+                // Fallback requires typed proof that the failed attempt is over.
+                // Transport failures and uncertain send outcomes cannot prove
+                // the cancellation reached and stopped the provider run.
+                if decision.try_next_model && cancellation_confirmed_stopped(&cancel_result) {
+                    let cleanup = producer.close_attempt().await;
                     log_cleanup_failure(request.session_id, "cancel", &cancel_result);
-                    log_cleanup_failure(request.session_id, "close", &close_result);
+                    log_cleanup_failure(request.session_id, "attempt close", &cleanup);
                     continue;
                 }
+                let close_result = producer.close().await;
                 return Err(HistorianDriveError::Producer(attach_cleanup(
                     attach_cleanup(err, cancel_result, "cancel"),
                     close_result,
@@ -1429,19 +1442,25 @@ where
             completion_now_ms: request.completion_now_ms,
             publication_fence: request.publication_fence,
         });
-        log_cleanup_failure(request.session_id, "close", &producer.close().await);
         let row_version = match publish_result {
             Ok(row_version) => row_version,
             Err(HistorianDriveError::Validation(err)) => {
                 // Validation rejection is model-local output failure. Exhaust the
                 // configured fallback chain before returning the final rejection.
                 if has_eligible_model(&request.model_chain[index + 1..], &auth_blocked_providers) {
+                    let cleanup = producer.close_attempt().await;
+                    log_cleanup_failure(request.session_id, "attempt close", &cleanup);
                     continue;
                 }
+                log_cleanup_failure(request.session_id, "close", &producer.close().await);
                 return Err(HistorianDriveError::Validation(err));
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                log_cleanup_failure(request.session_id, "close", &producer.close().await);
+                return Err(err);
+            }
         };
+        log_cleanup_failure(request.session_id, "close", &producer.close().await);
         return Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
             row_version,
             producer_session_id,
@@ -2132,7 +2151,9 @@ mod tests {
         observed_systems: Vec<String>,
         await_run_ids: Vec<String>,
         cancels: Vec<String>,
+        attempt_closes: usize,
         closes: usize,
+        connection_closed: bool,
         on_await_output: Option<Box<dyn FnOnce() + Send>>,
     }
 
@@ -2168,7 +2189,7 @@ mod tests {
         }
     }
 
-    #[subc_client_rs::async_trait]
+    #[async_trait::async_trait]
     impl HistorianProducerDriver for ScriptedProducer {
         async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
             self.observed_sessions.push(session_id.to_string());
@@ -2182,6 +2203,14 @@ mod tests {
             _prompt: &str,
             model: &str,
         ) -> Result<RunHandle, HistorianProducerError> {
+            if self.connection_closed {
+                return Err(HistorianProducerError::tagged_call(
+                    "connection_closed",
+                    "managed producer connection is closed",
+                    ErrorClass::Permanent,
+                    None,
+                ));
+            }
             self.observed_sessions.push(session_id.to_string());
             self.observed_systems.push(system.to_string());
             self.observed_starts
@@ -2215,8 +2244,14 @@ mod tests {
             self.cancel_results.pop_front().unwrap_or(Ok(()))
         }
 
+        async fn close_attempt(&mut self) -> Result<(), HistorianProducerError> {
+            self.attempt_closes += 1;
+            self.close_results.pop_front().unwrap_or(Ok(()))
+        }
+
         async fn close(&mut self) -> Result<(), HistorianProducerError> {
             self.closes += 1;
+            self.connection_closed = true;
             self.close_results.pop_front().unwrap_or(Ok(()))
         }
     }
@@ -2583,6 +2618,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_incarnation_unknown_records_completion_backoff_without_fallback() {
+        fn completed_at() -> i64 {
+            10_000
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_owned(), "prov/model-b".to_owned()];
+        let mut producer = ScriptedProducer::default().with_start(Err(
+            HistorianProducerError::CrossIncarnationUnknown {
+                daemon_changed: true,
+                identity_changed: false,
+            },
+        ));
+        let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+        request.completion_now_ms = completed_at;
+
+        let error = run_historian_firing(&mut producer, request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistorianDriveError::Producer(HistorianProducerError::CrossIncarnationUnknown { .. })
+        ));
+        assert_eq!(producer.observed_starts.len(), 1);
+        assert_eq!(producer.closes, 1);
+        let historian = store.load("ses").unwrap().meta.historian;
+        assert_eq!(historian.state, HistorianPhase::Idle);
+        assert_eq!(historian.failure_backoff_at_ms, Some(10_876));
+    }
+
+    #[tokio::test]
     async fn permanent_class_advances_chain_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -2591,7 +2662,7 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
-            .with_start(Err(HistorianProducerError::tagged_subc(
+            .with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "model id does not exist",
                 ErrorClass::Permanent,
@@ -2614,6 +2685,45 @@ mod tests {
         };
         assert_eq!(success.model, "prov/model-b");
         assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(producer.attempt_closes, 1);
+        assert_eq!(producer.closes, 1);
+        assert!(producer.connection_closed);
+    }
+
+    #[tokio::test]
+    async fn output_failure_closes_attempt_routes_but_keeps_connection_for_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::tagged_call(
+                "provider_error",
+                "provider unavailable",
+                ErrorClass::Transient,
+                None,
+            )))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml("fallback output"))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .expect("fallback uses still-open managed connection");
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected fallback completion");
+        };
+        assert_eq!(success.model, "other/model-b");
+        assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(producer.attempt_closes, 1);
+        assert_eq!(producer.closes, 1);
+        assert!(producer.connection_closed);
     }
 
     #[tokio::test]
@@ -2625,13 +2735,13 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
-            .with_start(Err(HistorianProducerError::tagged_subc(
+            .with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "model a is permanently unavailable",
                 ErrorClass::Permanent,
                 None,
             )))
-            .with_start(Err(HistorianProducerError::tagged_subc(
+            .with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "model b is permanently unavailable",
                 ErrorClass::Permanent,
@@ -2668,7 +2778,7 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string()];
         let mut producer =
-            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "short retry-after should not shorten our schedule",
                 ErrorClass::Transient,
@@ -2700,7 +2810,7 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string()];
         let mut producer =
-            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "rate limit reset later",
                 ErrorClass::Transient,
@@ -2732,7 +2842,7 @@ mod tests {
             "anthropic/model-c".to_string(),
         ];
         let mut producer = ScriptedProducer::default()
-            .with_start(Err(HistorianProducerError::tagged_subc(
+            .with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "credential needs re-authentication",
                 ErrorClass::AuthRequired,
@@ -2779,7 +2889,7 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["openai/model-a".to_string(), "openai/model-b".to_string()];
         let mut producer =
-            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "credential needs re-authentication",
                 ErrorClass::AuthRequired,
@@ -2815,7 +2925,7 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
         let mut producer =
-            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_subc(
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "context window exceeded",
                 ErrorClass::ContextOverflow,
@@ -2872,7 +2982,7 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
-            .with_start(Err(HistorianProducerError::tagged_subc(
+            .with_start(Err(HistorianProducerError::tagged_call(
                 "context_overflow",
                 "overflow text would block retry under the deprecated heuristic",
                 ErrorClass::Permanent,
@@ -3352,7 +3462,7 @@ mod tests {
         let models = vec!["prov/model-a".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
-            .with_output(Err(HistorianProducerError::tagged_subc(
+            .with_output(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "model gone",
                 ErrorClass::Permanent,
@@ -3414,13 +3524,13 @@ mod tests {
         // scripted queue, so completion alone proves the chain stopped.
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
-            .with_output(Err(HistorianProducerError::tagged_subc(
+            .with_output(Err(HistorianProducerError::tagged_call(
                 "provider_error",
                 "provider overloaded",
                 ErrorClass::Transient,
                 None,
             )))
-            .with_cancel_result(Err(HistorianProducerError::tagged_subc(
+            .with_cancel_result(Err(HistorianProducerError::tagged_call(
                 "teardown_unconfirmed",
                 "the harness process group could not be confirmed stopped",
                 ErrorClass::Transient,
@@ -3455,6 +3565,94 @@ mod tests {
             "the durable abandon transition still lands"
         );
         assert!(state.failure_backoff_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn uncertain_cancel_send_outcomes_stop_the_fallback_chain() {
+        for outcome in [
+            HistorianSendOutcome::NotSent,
+            HistorianSendOutcome::OutcomeUnknown,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+            let mut producer = ScriptedProducer::default()
+                .with_start(Ok(run_handle("run-1")))
+                .with_output(Err(HistorianProducerError::tagged_call(
+                    "provider_error",
+                    "provider overloaded",
+                    ErrorClass::Transient,
+                    None,
+                )))
+                .with_cancel_result(Err(HistorianProducerError::Call(
+                    crate::historian_producer::HistorianCallFailure::untagged(
+                        outcome,
+                        "cancel_transport_failure",
+                        "cancel was not confirmed",
+                    ),
+                )));
+
+            let err = run_historian_firing(
+                &mut producer,
+                fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(err, HistorianDriveError::Producer(_)));
+            assert_eq!(producer.cancels, vec!["run-1"]);
+            assert_eq!(
+                producer.observed_starts.len(),
+                1,
+                "{outcome:?} cancellation must not start fallback model"
+            );
+            let state = store.load("ses").unwrap().meta.historian;
+            assert_eq!(state.state, HistorianPhase::Idle);
+            assert_eq!(state.failure_backoff_at_ms, Some(999));
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_cancel_response_allows_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::tagged_call(
+                "provider_error",
+                "provider overloaded",
+                ErrorClass::Transient,
+                None,
+            )))
+            .with_cancel_result(Err(HistorianProducerError::Call(
+                crate::historian_producer::HistorianCallFailure::untagged(
+                    HistorianSendOutcome::Terminal,
+                    "run_already_terminal",
+                    "run is already stopped",
+                ),
+            )))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml("fallback output"))));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .expect("terminal cancel response proves fallback is safe");
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected fallback completion");
+        };
+        assert_eq!(success.model, "prov/model-b");
+        assert_eq!(producer.observed_starts.len(), 2);
     }
 
     #[tokio::test]
@@ -3598,8 +3796,12 @@ mod tests {
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string()];
         let mut producer =
-            ScriptedProducer::default().with_start(Err(HistorianProducerError::Subc(
-                subc_protocol::ErrorBody::new("route_rejected", "no such module").into(),
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::Call(
+                crate::historian_producer::HistorianCallFailure::untagged(
+                    crate::historian_producer::HistorianSendOutcome::Terminal,
+                    "route_rejected",
+                    "no such module",
+                ),
             )));
 
         let err = run_historian_firing(
@@ -3832,6 +4034,9 @@ mod tests {
         };
         assert_eq!(success.model, "other/model-b");
         assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(producer.attempt_closes, 1);
+        assert_eq!(producer.closes, 1);
+        assert!(producer.connection_closed);
         assert_eq!(
             store
                 .load_historian_assembly_snapshot("ses")
