@@ -802,22 +802,37 @@ export function sanitizedCandidateFactory(
                 };
                 let stats = zero;
                 try {
+                    // Every provider getter is read exactly once into a plain
+                    // snapshot: keeping (or spreading) the live report object
+                    // would re-run throwing getters outside this containment
+                    // and copy arbitrary extra properties past the boundary.
                     const reported = channel.stats();
+                    const snapshot: FrameChannelStats = {
+                        readerHeldBytes: reported.readerHeldBytes,
+                        queueHeldBytes: reported.queueHeldBytes,
+                        queuedDataFrames: reported.queuedDataFrames,
+                        queuedControlFrames: reported.queuedControlFrames,
+                        readPaused: reported.readPaused,
+                        activeTimers: reported.activeTimers,
+                        activeReceiveLeases: reported.activeReceiveLeases,
+                        quarantinedBytes: reported.quarantinedBytes,
+                        ownedAdapterCopies: reported.ownedAdapterCopies,
+                    };
                     const counts = [
-                        reported.readerHeldBytes,
-                        reported.queueHeldBytes,
-                        reported.queuedDataFrames,
-                        reported.queuedControlFrames,
-                        reported.activeTimers,
-                        reported.activeReceiveLeases,
-                        reported.quarantinedBytes,
-                        reported.ownedAdapterCopies,
+                        snapshot.readerHeldBytes,
+                        snapshot.queueHeldBytes,
+                        snapshot.queuedDataFrames,
+                        snapshot.queuedControlFrames,
+                        snapshot.activeTimers,
+                        snapshot.activeReceiveLeases,
+                        snapshot.quarantinedBytes,
+                        snapshot.ownedAdapterCopies,
                     ];
                     if (
                         counts.every((value) => Number.isSafeInteger(value) && value >= 0) &&
-                        typeof reported.readPaused === "boolean"
+                        typeof snapshot.readPaused === "boolean"
                     ) {
-                        stats = reported;
+                        stats = snapshot;
                     }
                 } catch {
                     stats = zero;

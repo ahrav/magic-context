@@ -301,6 +301,11 @@ export class NativeProducerReservation {
         beforePublish?: () => void,
     ): void {
         this.assertActive();
+        // Spent before the native call: commit_reservation detaches the
+        // producer token native-side before its later validation can throw,
+        // so a retry (or the abort() in an error path) would target an
+        // already-detached token and mask the original error.
+        this.active = false;
         this.native.commitReservation(
             this.channel,
             this.token,
@@ -308,13 +313,16 @@ export class NativeProducerReservation {
             written,
             beforePublish ?? (() => {}),
         );
-        this.active = false;
     }
 
     abort(): void {
         if (!this.active) return;
-        this.native.abortReservation(this.channel, this.token);
+        // Same spent-before-native rule as commit(): never leave a window
+        // where a throwing native call can be retried against a detached
+        // token. A pre-detach native failure leaves the reservation tracked
+        // in the channel registry, which close() aborts.
         this.active = false;
+        this.native.abortReservation(this.channel, this.token);
     }
 
     private assertActive(): void {
@@ -357,11 +365,16 @@ export class NativeReceiveLease {
 
     release(): void {
         if (this.released) throw new Error("receive lease is already released");
-        this.native.release(this.channel, this.token);
+        // Spent before the native call so a throwing release is never
+        // retried against a possibly-detached token. Cleanup of a
+        // live-but-failed lease is owned by channel close.
         this.released = true;
+        this.native.release(this.channel, this.token);
     }
 
     [Symbol.dispose](): void {
+        // Disposal is idempotent; explicit double release() keeps its throw.
+        if (this.released) return;
         this.release();
     }
 

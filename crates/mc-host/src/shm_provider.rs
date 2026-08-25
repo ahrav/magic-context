@@ -364,10 +364,18 @@ async fn run_endpoint(
                 Ok(true) => received = true,
                 Ok(false) => {}
                 Err(close) => {
+                    // Cancellation is ordinary retirement — the read side was
+                    // told to stop mid-receive (or the inbound consumer is
+                    // gone) and the local lease releases safely on drop — so
+                    // it must not quarantine the admission charges: with
+                    // single-candidate limits that would permanently block
+                    // every later shared-memory candidate. Only structural
+                    // faults are unclean.
+                    let clean = matches!(close, ReadClose::Cancelled);
                     let _ = inbound.send(Err(close)).await;
                     queue.retired.cancel();
                     root.cancel();
-                    return false;
+                    return clean;
                 }
             }
         }

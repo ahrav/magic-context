@@ -1,6 +1,7 @@
 import {
     NativeChannel,
     type NativeDescriptor,
+    type NativeProducerReservation,
     type NativeReceiveLease,
     type ProducerCursor,
 } from "@magic-context/mc-shm-native";
@@ -20,7 +21,7 @@ import {
     ReceiveLease,
     type SetupFrameChannel,
 } from "./frame-channel";
-import { decodeHeader, type EnvelopeHeader, encodeHeader } from "./protocol";
+import { decodeHeader, type EnvelopeHeader, encodeHeader, HEADER_LEN } from "./protocol";
 
 export interface ShmFrameChannelOptions {
     descriptor?: NativeDescriptor;
@@ -30,22 +31,35 @@ export interface ShmFrameChannelOptions {
 }
 
 export class ShmFrameChannel implements SetupFrameChannel {
-    private readonly native: NativeChannel;
+    private native: NativeChannel | null;
     private readonly copies = new CopyCounter();
     private timer: ReturnType<typeof setInterval> | null = null;
     private closed = false;
     private readonly receiveLeases = new Set<ReceiveLease>();
     private quarantinedBytes = 0;
+    private heldBytes = 0;
 
     constructor(private readonly options: ShmFrameChannelOptions) {
         if (!options.nativeChannel && !options.descriptor) {
             throw new Error("shared-memory channel requires an attachment");
         }
-        this.native =
-            options.nativeChannel ?? NativeChannel.attach(options.descriptor as NativeDescriptor);
+        // Attachment I/O (fd opens, grant validation, mappings) belongs in
+        // the deadline-raced start() phase per the provider contract, so a
+        // descriptor is only recorded here; a pre-attached channel carries
+        // no attachment I/O and is adopted directly.
+        this.native = options.nativeChannel ?? null;
     }
 
-    async start(_deadline: Deadline): Promise<{ daemonVer: string }> {
+    async start(deadline: Deadline): Promise<{ daemonVer: string }> {
+        if (this.closed) {
+            throw new SubcCallError("not_sent", "shared-memory channel closed");
+        }
+        if (!this.native) {
+            if (deadline.remainingMs() <= 0) {
+                throw new SubcCallError("not_sent", "shared-memory setup deadline expired");
+            }
+            this.native = NativeChannel.attach(this.options.descriptor as NativeDescriptor);
+        }
         return { daemonVer: "shared-memory-test" };
     }
 
@@ -61,8 +75,163 @@ export class ShmFrameChannel implements SetupFrameChannel {
         deadline?: Deadline,
     ): FrameSendTicket {
         if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        // The native ring's fixed capacity is not the configured aggregate
+        // cap: admission consults the shared budget so an over-cap body is
+        // refused with `memory_cap`, exactly like the TCP channel. The
+        // charge covers the synchronous publication window and is returned
+        // once the ring owns the bytes.
+        const reservedBytes = HEADER_LEN + body.byteLength;
+        this.admitPublication(reservedBytes);
+        try {
+            return this.publishFrame(header, body, hooks, deadline);
+        } finally {
+            this.releasePublication(reservedBytes);
+        }
+    }
+
+    reserve(
+        header: ProducerFrameHeader,
+        capacity: number,
+        hooks?: FrameSendHooks,
+    ): BoundedFrameProducer {
+        if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        // Reservations hold ring capacity across event-loop turns, so
+        // their budget charge is held until publication or abort.
+        const reservedBytes = HEADER_LEN + capacity;
+        this.admitPublication(reservedBytes);
+        let reservation: NativeProducerReservation;
+        try {
+            reservation = this.attached().reserve(capacity);
+        } catch (error) {
+            this.releasePublication(reservedBytes);
+            throw error;
+        }
+        let held = true;
+        let charged = true;
+        const releaseCharge = (): void => {
+            if (!charged) return;
+            charged = false;
+            this.releasePublication(reservedBytes);
+        };
+        return new BoundedFrameProducer(
+            reservation.segments,
+            capacity,
+            (_segments, exactLength) => ({
+                publish: () => {
+                    if (!held) throw new SubcCallError("not_sent", "reservation released");
+                    let published = false;
+                    reservation.commit(
+                        encodeHeader({ ...header, len: exactLength }),
+                        exactLength,
+                        () => {
+                            published = true;
+                            try {
+                                hooks?.onPublish?.();
+                            } catch {
+                                // Send hooks cannot change publication.
+                            }
+                        },
+                    );
+                    held = false;
+                    releaseCharge();
+                    try {
+                        hooks?.onComplete?.();
+                    } catch {
+                        // Send hooks cannot change completion.
+                    }
+                    return { cancel: () => !published };
+                },
+            }),
+            () => {
+                if (!held) return;
+                held = false;
+                try {
+                    reservation.abort();
+                } finally {
+                    releaseCharge();
+                }
+            },
+            false,
+        );
+    }
+
+    send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
+        this.copies.record();
+        return this.produce(
+            frame.header,
+            {
+                byteLength: frame.body.byteLength,
+                fill: (cursor) => cursor.write(frame.body),
+            },
+            hooks,
+        );
+    }
+
+    sendControl(header: EnvelopeHeader): void {
+        // Control frames stay uncharged, matching the TCP channel's
+        // never-cap-refused control path.
+        this.publishFrame(header, { byteLength: 0, fill: () => {} });
+    }
+
+    async flush(_deadline: Deadline): Promise<void> {}
+
+    close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        if (this.timer !== null) clearInterval(this.timer);
+        this.timer = null;
+        let quarantineError: unknown;
+        for (const lease of [...this.receiveLeases]) {
+            try {
+                lease.release();
+            } catch (error) {
+                quarantineError ??= error;
+            }
+        }
+        if (quarantineError !== undefined) {
+            // Alias state is uncertain: unmapping under a live view would
+            // trade a bounded leak for a use-after-free, so the native close
+            // is withheld and the quarantine is reported.
+            this.options.handlers.onClosed("quarantined", quarantineError);
+            throw quarantineError;
+        }
+        if (this.native) this.native.close();
+    }
+
+    isClosed(): boolean {
+        return this.closed;
+    }
+
+    stats(): FrameChannelStats {
+        return {
+            readerHeldBytes: 0,
+            queueHeldBytes: this.heldBytes,
+            queuedDataFrames: 0,
+            queuedControlFrames: 0,
+            readPaused: false,
+            activeTimers: this.timer === null ? 0 : 1,
+            activeReceiveLeases: this.receiveLeases.size,
+            quarantinedBytes: this.quarantinedBytes,
+            ownedAdapterCopies: this.copies.copies,
+        };
+    }
+
+    private attached(): NativeChannel {
+        if (!this.native) {
+            throw new SubcCallError("not_sent", "shared-memory channel is not started");
+        }
+        return this.native;
+    }
+
+    private publishFrame(
+        header: ProducerFrameHeader,
+        body: DirectFrameBody,
+        hooks?: FrameSendHooks,
+        deadline?: Deadline,
+    ): FrameSendTicket {
+        if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
         let published = false;
-        this.native.produce(
+        this.attached().produce(
             encodeHeader({ ...header, len: body.byteLength }),
             body.byteLength,
             (cursor: ProducerCursor) => body.fill(cursor),
@@ -84,112 +253,33 @@ export class ShmFrameChannel implements SetupFrameChannel {
         return { cancel: () => !published };
     }
 
-    reserve(
-        header: ProducerFrameHeader,
-        capacity: number,
-        hooks?: FrameSendHooks,
-    ): BoundedFrameProducer {
-        if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
-        const reservation = this.native.reserve(capacity);
-        let held = true;
-        return new BoundedFrameProducer(
-            reservation.segments,
-            capacity,
-            (_segments, exactLength) => ({
-                publish: () => {
-                    if (!held) throw new SubcCallError("not_sent", "reservation released");
-                    let published = false;
-                    reservation.commit(
-                        encodeHeader({ ...header, len: exactLength }),
-                        exactLength,
-                        () => {
-                            published = true;
-                            try {
-                                hooks?.onPublish?.();
-                            } catch {
-                                // Send hooks cannot change publication.
-                            }
-                        },
-                    );
-                    held = false;
-                    try {
-                        hooks?.onComplete?.();
-                    } catch {
-                        // Send hooks cannot change completion.
-                    }
-                    return { cancel: () => !published };
-                },
-            }),
-            () => {
-                if (!held) return;
-                held = false;
-                reservation.abort();
-            },
-            false,
-        );
-    }
-
-    send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
-        this.copies.record();
-        return this.produce(
-            frame.header,
-            {
-                byteLength: frame.body.byteLength,
-                fill: (cursor) => cursor.write(frame.body),
-            },
-            hooks,
-        );
-    }
-
-    sendControl(header: EnvelopeHeader): void {
-        this.produce(header, { byteLength: 0, fill: () => {} });
-    }
-
-    async flush(_deadline: Deadline): Promise<void> {}
-
-    close(): void {
-        if (this.closed) return;
-        this.closed = true;
-        if (this.timer !== null) clearInterval(this.timer);
-        this.timer = null;
-        let quarantineError: unknown;
-        for (const lease of [...this.receiveLeases]) {
-            try {
-                lease.release();
-            } catch (error) {
-                quarantineError ??= error;
-            }
+    private admitPublication(bytes: number): void {
+        if (this.options.budget.wouldExceed(bytes)) {
+            throw new SubcCallError(
+                "not_sent",
+                "aggregate connection memory cap would be exceeded",
+                "memory_cap",
+            );
         }
-        if (quarantineError !== undefined) {
-            this.options.handlers.onClosed("quarantined", quarantineError);
-            throw quarantineError;
-        }
-        this.native.close();
+        this.options.budget.charge(bytes);
+        this.heldBytes += bytes;
     }
 
-    isClosed(): boolean {
-        return this.closed;
-    }
-
-    stats(): FrameChannelStats {
-        return {
-            readerHeldBytes: 0,
-            queueHeldBytes: 0,
-            queuedDataFrames: 0,
-            queuedControlFrames: 0,
-            readPaused: false,
-            activeTimers: this.timer === null ? 0 : 1,
-            activeReceiveLeases: this.receiveLeases.size,
-            quarantinedBytes: this.quarantinedBytes,
-            ownedAdapterCopies: this.copies.copies,
-        };
+    private releasePublication(bytes: number): void {
+        this.heldBytes -= bytes;
+        this.options.budget.release(bytes);
     }
 
     private poll(): void {
         if (this.closed) return;
         try {
+            // Drains until the native side reports no progress. Consumer
+            // backpressure (retained leases at the ring's lease bound) is
+            // reported by `native.poll()` as `false`, not an error, so the
+            // drain pauses at the bound and the interval resumes delivery
+            // after a lease release; only genuine failures reach the catch.
             while (
-                this.native.poll((nativeLease: NativeReceiveLease) => {
+                this.attached().poll((nativeLease: NativeReceiveLease) => {
                     const header = decodeHeader(nativeLease.header);
                     const segments = Array.from({ length: nativeLease.segmentCount }, (_, index) =>
                         nativeLease.segment(index),
@@ -218,7 +308,13 @@ export class ShmFrameChannel implements SetupFrameChannel {
             ) {}
         } catch (error) {
             this.options.handlers.onClosed("protocol_violation", error);
-            this.close();
+            try {
+                this.close();
+            } catch {
+                // close() rethrows on quarantined leases and has already
+                // reported that outcome; an interval callback has no caller
+                // to observe the throw, so it must not escape here.
+            }
         }
     }
 }

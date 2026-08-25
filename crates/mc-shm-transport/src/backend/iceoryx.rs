@@ -19,6 +19,11 @@ use crate::profile::TargetProfile;
 
 const PREFIX_BYTES: usize = 2 + WIRE_V2_HEADER_BYTES + 16 + 4 + 8 + 8;
 
+/// Starting data-segment slice size for the publisher. Loans larger than the
+/// current slice bound trigger a PowerOfTwo segment reallocation up to
+/// `MAX_FRAME_BYTES`, so this hint only sets the initial footprint.
+const INITIAL_SLICE_HINT_BYTES: usize = 64 * 1024;
+
 type IpcService = iceoryx2::service::ipc::Service;
 type ByteFactory = PortFactory<IpcService, [u8], ()>;
 type BytePublisher = Publisher<IpcService, [u8], ()>;
@@ -82,13 +87,20 @@ impl IceoryxBackend {
             .map_err(|_| IceoryxError::SetupFailed)?;
         let publisher = factory
             .publisher_builder()
+            // A static reservation would commit descriptor_depth + max_leases +
+            // loaned samples at the full 64 MiB frame bound (hundreds of MiB,
+            // zeroed at creation), failing outright on hosts with small
+            // /dev/shm. Start from a small slice hint and let the segment grow
+            // geometrically on demand; PowerOfTwo bounds the number of
+            // reallocations (and thus segment ids) to log2 of the frame bound,
+            // unlike BestFit which reallocates per distinct size.
             .initial_max_slice_len(
-                MAX_FRAME_BYTES
+                INITIAL_SLICE_HINT_BYTES
                     .checked_add(PREFIX_BYTES)
                     .ok_or(IceoryxError::SetupFailed)?,
             )
             .max_loaned_samples(1)
-            .allocation_strategy(AllocationStrategy::Static)
+            .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .map_err(|_| IceoryxError::SetupFailed)?;
         Ok(Self {

@@ -1,5 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +41,9 @@ describe("native mechanism gate", () => {
             dirname(fileURLToPath(import.meta.url)),
             "../mc_shm_native.node",
         );
+        // The first test tolerates an unbuilt addon via probeCapabilities();
+        // this one requires the artifact, so skip rather than fail without it.
+        if (!existsSync(addon)) return;
         writeFileSync(
             script,
             `import { createRequire } from "node:module";\n` +
@@ -45,6 +54,7 @@ describe("native mechanism gate", () => {
         const child = spawnSync(process.execPath, [script], {
             encoding: "utf8",
         });
+        expect(child.stderr).toBe("");
         expect(child.status).toBe(0);
         expect(readFileSync(marker, "utf8")).toBe("clean");
     });
