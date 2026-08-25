@@ -726,6 +726,7 @@ export class HermeticMcHostStack {
         await this.closeClients();
         const child = this.child;
         if (!child) return;
+        this.resumeBeforeTeardown(child);
         if (child.exitCode === null && child.signalCode === null)
             child.kill("SIGKILL");
         if (!(await safeChildExit(child, 5_000))) {
@@ -746,6 +747,7 @@ export class HermeticMcHostStack {
         await this.closeClients();
         const child = this.child;
         if (!child) return;
+        this.resumeBeforeTeardown(child);
         if (child.exitCode === null && child.signalCode === null)
             child.kill("SIGTERM");
         if (!(await safeChildExit(child, 10_000))) {
@@ -769,7 +771,10 @@ export class HermeticMcHostStack {
             child.kill("SIGCONT");
     }
 
-    /** Graceful JSONL shutdown, then SIGTERM fallback. Always await exit and remove isolated state. */
+    /**
+     * Graceful JSONL shutdown, then SIGTERM fallback. Always await exit;
+     * isolated state is removed only once the child is gone.
+     */
     async stop(): Promise<void> {
         await this.closeStatusClient();
         const child = this.child;
@@ -778,6 +783,7 @@ export class HermeticMcHostStack {
             child.exitCode !== null ||
             child.signalCode !== null;
         if (child && !exited) {
+            this.resumeBeforeTeardown(child);
             try {
                 await this.control?.gracefulShutdown();
             } catch {
@@ -796,12 +802,16 @@ export class HermeticMcHostStack {
         this.control?.close();
         this.control = null;
         this.child = null;
-        rmSync(this.pidFilePath, { force: true });
-        rmSync(this.dataDir, { recursive: true, force: true });
-        if (!exited)
+        if (!exited) {
+            // The surviving child's PID record lives inside dataDir, so both
+            // stay on disk past this failed teardown: that record is the only
+            // identity the next run's reaper has for killing the leaked child.
             throw new Error(
                 "direct mc-host fixture did not exit during teardown",
             );
+        }
+        rmSync(this.pidFilePath, { force: true });
+        rmSync(this.dataDir, { recursive: true, force: true });
     }
 
     private async startHost(): Promise<void> {
@@ -911,10 +921,23 @@ export class HermeticMcHostStack {
         verifyPublication(this.controlPath, 0o600);
         verifyPublication(this.connectionFile, 0o600);
 
+        // The control socket and the client-visible catalog probe use unrelated
+        // sockets and share no data, so both handshakes run at once. A control
+        // client that connects is adopted even when the probe fails, which
+        // keeps teardown on its graceful-shutdown path, and a control failure
+        // takes precedence over a probe failure.
         const control = new FixtureControlClient(this.controlPath);
-        await control.connect();
-        this.control = control;
+        const [connected, probed] = await Promise.allSettled([
+            control.connect(),
+            this.probeCatalog(),
+        ]);
+        if (connected.status === "fulfilled") this.control = control;
+        if (connected.status === "rejected") throw connected.reason;
+        if (probed.status === "rejected") throw probed.reason;
+    }
 
+    /** Prove the client-visible path: connection-file read, auth handshake, catalog over the real wire. */
+    private async probeCatalog(): Promise<void> {
         const probe = await McHostClient.connect({
             connectionFile: this.connectionFile,
         });
@@ -930,6 +953,18 @@ export class HermeticMcHostStack {
         } finally {
             await probe.closeAsync();
         }
+    }
+
+    /**
+     * Continue a live child before signalling teardown. A SIGSTOPped fixture
+     * runs no graceful shutdown and holds SIGTERM pending until it resumes, so
+     * every teardown path burns its full timeout without this. SIGCONT to a
+     * running process has no effect, which is why the resume stays
+     * unconditional instead of tracking paused state.
+     */
+    private resumeBeforeTeardown(child: ChildProcess): void {
+        if (child.exitCode === null && child.signalCode === null)
+            child.kill("SIGCONT");
     }
 
     private requireControl(): FixtureControlClient {

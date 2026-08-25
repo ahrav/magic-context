@@ -507,10 +507,10 @@ mod unix {
                 return Ok(());
             }
             if host.is_finished() {
-                return match host.await? {
-                    Ok(()) => Err("host exited before readiness".into()),
-                    Err(error) => Err(Box::new(error)),
-                };
+                // Report the exit without consuming the handle: `run` owns the
+                // single await, and polling a completed `JoinHandle` twice
+                // panics, which would skip control-socket cleanup.
+                return Err("host exited before readiness".into());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("host did not publish before readiness deadline".into());
@@ -597,8 +597,10 @@ mod unix {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        ready?;
+        // The host's own error is the specific one; a readiness failure is
+        // usually its symptom, so it reports only when the host itself is fine.
         host_result?;
+        ready?;
         Ok(())
     }
 }

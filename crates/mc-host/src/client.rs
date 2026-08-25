@@ -1210,39 +1210,21 @@ impl Inner {
     }
 
     async fn join_tasks_until(&self, deadline: Instant) -> bool {
-        loop {
-            let writer_finished = self
-                .writer
-                .lock()
-                .await
-                .as_ref()
-                .is_none_or(JoinHandle::is_finished);
-            let reader_finished = self
-                .reader
-                .lock()
-                .await
-                .as_ref()
-                .is_none_or(JoinHandle::is_finished);
-            if writer_finished && reader_finished {
-                break;
+        let mut within_deadline = true;
+        // Await each task under the shared deadline rather than polling
+        // `is_finished`: a `yield_now` loop re-queues itself every iteration and
+        // spins the worker for the whole shutdown budget.
+        for slot in [&self.writer, &self.reader] {
+            let Some(mut task) = slot.lock().await.take() else {
+                continue;
+            };
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                within_deadline = false;
+                // The timeout means this task never completed, so it is safe to
+                // await again after the abort - a completed handle would panic.
+                task.abort();
+                let _ = task.await;
             }
-            if Instant::now() >= deadline {
-                if let Some(task) = self.writer.lock().await.as_ref() {
-                    task.abort();
-                }
-                if let Some(task) = self.reader.lock().await.as_ref() {
-                    task.abort();
-                }
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        let within_deadline = Instant::now() < deadline;
-        if let Some(task) = self.writer.lock().await.take() {
-            let _ = task.await;
-        }
-        if let Some(task) = self.reader.lock().await.take() {
-            let _ = task.await;
         }
         within_deadline
     }

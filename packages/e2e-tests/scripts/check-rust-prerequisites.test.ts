@@ -57,6 +57,23 @@ describe("Rust direct-host prerequisite detector", () => {
         expect(result).toEqual({ ok: true, missing: [] });
     });
 
+    it("resolves a pre-built workspace fixture without building", () => {
+        const { root, bin } = fakeWorkspace();
+        const examples = join(root, "target", "debug", "examples");
+        mkdirSync(examples, { recursive: true });
+        const fixture = join(examples, "direct_host_fixture");
+        writeFileSync(fixture, "#!/bin/sh\nexit 0\n");
+        chmodSync(fixture, 0o755);
+
+        const result = detectRustPrerequisites({
+            repoRoot: root,
+            allowBuild: false,
+            env: { PATH: bin },
+        });
+
+        expect(result).toEqual({ ok: true, missing: [], fixtureBin: fixture });
+    });
+
     it("rejects a workspace without the direct host fixture target", () => {
         const { root, bin } = fakeWorkspace(false);
         const result = detectRustPrerequisites({

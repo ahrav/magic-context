@@ -171,6 +171,25 @@ impl FixtureProcess {
         self.control_raw(format!("{}\n", json!({"id": id, "command": {"name": name}})).as_bytes())
     }
 
+    /// Best-effort graceful shutdown that reports failure instead of panicking.
+    /// `control_raw` panics loudly on purpose, which is right inside a test body
+    /// and fatal in `Drop`: a panic while unwinding a failed test aborts the
+    /// runner and hides the failure that started the unwind.
+    fn try_graceful_shutdown(&self) -> std::io::Result<()> {
+        let request = format!(
+            "{}\n",
+            json!({"id": 9_998, "command": {"name": "graceful-shutdown"}})
+        );
+        let mut stream = UnixStream::connect(self.control_path())?;
+        stream.set_read_timeout(Some(BUDGET))?;
+        stream.write_all(request.as_bytes())?;
+        let mut response = Vec::new();
+        BufReader::new(stream)
+            .take(64 * 1024 + 1)
+            .read_until(b'\n', &mut response)?;
+        Ok(())
+    }
+
     pub fn control_raw(&self, bytes: &[u8]) -> Value {
         let path = self.control_path();
         let mut stream = UnixStream::connect(&path).unwrap_or_else(|error| {
@@ -302,7 +321,7 @@ impl Drop for FixtureProcess {
         {
             return;
         }
-        let _ = self.control(9_998, "graceful-shutdown");
+        let _ = self.try_graceful_shutdown();
         let deadline = Instant::now() + BUDGET;
         while Instant::now() < deadline {
             if self

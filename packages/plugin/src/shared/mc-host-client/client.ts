@@ -1482,12 +1482,12 @@ function terminalFromErrorBody(body: Uint8Array): McHostCallError {
         if (typeof parsed === "object" && parsed !== null) {
             const code = typeof parsed.code === "string" ? parsed.code : undefined;
             const message = typeof parsed.message === "string" ? parsed.message : undefined;
-            return new McHostCallError("terminal", message ?? "subc error", code);
+            return new McHostCallError("terminal", message ?? "mc-host error", code);
         }
     } catch {
         // Fall through to the opaque-body form.
     }
-    return new McHostCallError("terminal", text || "subc error");
+    return new McHostCallError("terminal", text || "mc-host error");
 }
 
 function parseResponseJson<Response = unknown>(terminal: RequestTerminal): Response {

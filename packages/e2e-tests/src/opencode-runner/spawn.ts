@@ -339,8 +339,10 @@ async function provisionRustMode(): Promise<RustSpawnResources> {
     try {
         const mcHost = await HermeticMcHostStack.start({ dataDir: env.dataDir, fixtureBin });
         return { env, connectionFile: mcHost.connectionFile, mcHost };
-    } catch {
-        throw new Error("MC_E2E_MODE=rust failed to start direct mc-host fixture");
+    } catch (error) {
+        throw new Error(
+            `MC_E2E_MODE=rust failed to start direct mc-host fixture: ${String(error)}`,
+        );
     }
 }
 

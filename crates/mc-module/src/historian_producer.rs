@@ -1209,12 +1209,19 @@ fn unit_text(unit: &Value) -> Option<String> {
 }
 
 fn is_terminal_unit(unit: &Value) -> bool {
+    // Every error unit is terminal. Deferring to `is_error_unit` keeps the two
+    // sets from drifting: a spelling recognized as an error but not as a
+    // terminal would skip terminal handling entirely and surface as
+    // `UnexpectedStreamEnd`, discarding the run's typed classification.
+    if is_error_unit(unit) {
+        return true;
+    }
     unit_type(unit)
         .map(str::to_ascii_lowercase)
         .is_some_and(|kind| {
             matches!(
                 kind.as_str(),
-                "run_finished" | "terminal" | "run_terminal" | "finished" | "error"
+                "run_finished" | "terminal" | "run_terminal" | "finished"
             )
         })
 }
@@ -1766,6 +1773,81 @@ mod tests {
         assert_eq!(
             ErrorClass::ContextOverflow.as_wire_str(),
             "context_overflow"
+        );
+    }
+
+    fn stream_of(events: impl IntoIterator<Item = Value>) -> FakeStream {
+        FakeStream(
+            events
+                .into_iter()
+                .map(|event| {
+                    Ok(Some(StreamItem {
+                        body: serde_json::to_vec(&event).expect("event serializes"),
+                        binary: false,
+                    }))
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn every_error_spelling_terminates_the_drain_with_its_classification() {
+        // Each spelling `is_error_unit` accepts must also end the drain. A
+        // spelling that is an error but not a terminal falls through to stream
+        // end, and the typed classification the retry ladder needs is lost.
+        for kind in ["error", "run_error"] {
+            let mut stream = stream_of([
+                json!({"type": "run_started", "run_id": "r1"}),
+                json!({"type": "assistant_message", "run_id": "r1", "text": "partial"}),
+                json!({
+                    "type": kind,
+                    "run_id": "r1",
+                    "error": {"message": "model is busy", "class": "transient", "retry_after_secs": 4},
+                }),
+            ]);
+
+            let error = drain_subscribe(&mut stream, "r1")
+                .await
+                .expect_err("an error unit ends the run");
+            match error {
+                HistorianProducerError::RunFailed {
+                    run_id,
+                    detail,
+                    classification,
+                    class_field_present,
+                } => {
+                    assert_eq!(run_id, "r1");
+                    assert_eq!(detail, "model is busy");
+                    assert!(class_field_present);
+                    assert_eq!(
+                        classification,
+                        Some(ErrorClassification {
+                            class: ErrorClass::Transient,
+                            retry_after_secs: Some(4),
+                        })
+                    );
+                }
+                other => panic!("{kind} produced {other:?} instead of RunFailed"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_drain_returns_text_and_the_length_cap() {
+        let mut stream = stream_of([
+            json!({"type": "run_started", "run_id": "r1"}),
+            json!({"type": "assistant_message", "run_id": "r1", "text": "first "}),
+            json!({"type": "assistant_message", "run_id": "r1", "text": "second", "finish_reason": "max_tokens"}),
+            json!({"type": "run_finished", "run_id": "r1"}),
+        ]);
+
+        let output = drain_subscribe(&mut stream, "r1")
+            .await
+            .expect("terminal unit completes the run");
+        assert_eq!(output.text, "first second");
+        assert!(
+            output.length_capped,
+            "the cap travels with the text it truncated"
         );
     }
 }

@@ -119,6 +119,10 @@ export function detectRustPrerequisites(
     );
     let fixtureBin =
         configured && isExecutable(configured) ? configured : undefined;
+    // A fixture already compiled in the workspace satisfies detection, so
+    // callers that forbid building still resolve a usable binary.
+    if (!fixtureBin && isExecutable(workspaceFixture))
+        fixtureBin = workspaceFixture;
 
     if (!existsSync(manifest)) {
         missing.push(`cargo workspace: missing ${manifest}`);

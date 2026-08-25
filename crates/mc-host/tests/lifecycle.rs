@@ -1559,11 +1559,29 @@ async fn pipelined_shutdown_requests_on_one_connection_both_settle() {
     wire.extend_from_slice(body);
     client.send_raw(&wire).await.expect("pipeline shutdowns");
 
-    for corr in [first, second] {
-        let (_, response) = client
-            .frames_until_corr(corr, BUDGET)
-            .await
-            .expect("shutdown response");
+    // The host answers pipelined control requests from concurrent tasks, so the
+    // two responses arrive in either order. `frames_until_corr` hands back the
+    // frames it consumed while searching, and those are the only copy: asking
+    // for `second` sequentially after its response was already consumed would
+    // wait out the whole budget.
+    let (consumed, first_response) = client
+        .frames_until_corr(first, BUDGET)
+        .await
+        .expect("shutdown response");
+    let second_response = match consumed
+        .into_iter()
+        .find(|frame| frame.corr == second && frame.ty != TY_PING)
+    {
+        Some(frame) => frame,
+        None => {
+            client
+                .frames_until_corr(second, BUDGET)
+                .await
+                .expect("shutdown response")
+                .1
+        }
+    };
+    for response in [first_response, second_response] {
         assert_eq!(response.ty, TY_RESPONSE);
         assert_eq!(response.json()["op"], "host.shutdown");
     }
