@@ -251,6 +251,56 @@ export function detectRustModePrereqs(): RustModePrereqs {
     if (cargo.error || cargo.status !== 0) {
         return { ok: false, skipReason: "cargo is not available on PATH" };
     }
+    // A present `Cargo.toml` and a working `cargo` do not make the fixture
+    // buildable: the workspace has mandatory `../commons` path dependencies, so a
+    // checkout without that sibling resolves nothing. Without this, such a
+    // checkout reported the prerequisites as met, bypassed every suite's `skipIf`,
+    // and failed inside `buildDirectHostFixture` instead of skipping. `cargo
+    // metadata` resolves the whole workspace and names the target we build, which
+    // is what `scripts/check-rust-prerequisites.ts` already does.
+    const metadata = spawnSync(
+        "cargo",
+        [
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            join(REPO_ROOT, "Cargo.toml"),
+        ],
+        { encoding: "utf8" },
+    );
+    if (metadata.error || metadata.status !== 0 || typeof metadata.stdout !== "string") {
+        return {
+            ok: false,
+            skipReason: "cargo workspace does not resolve (missing path dependencies?)",
+        };
+    }
+    let fixtureAvailable = false;
+    try {
+        const parsed = JSON.parse(metadata.stdout) as {
+            packages?: Array<{
+                name?: string;
+                targets?: Array<{ name?: string; kind?: string[] }>;
+            }>;
+        };
+        fixtureAvailable =
+            parsed.packages
+                ?.find((pkg) => pkg.name === "mc-module")
+                ?.targets?.some(
+                    (target) =>
+                        target.name === "direct_host_fixture" &&
+                        target.kind?.includes("example"),
+                ) === true;
+    } catch {
+        fixtureAvailable = false;
+    }
+    if (!fixtureAvailable) {
+        return {
+            ok: false,
+            skipReason: "direct_host_fixture example is unavailable in this workspace",
+        };
+    }
     return { ok: true };
 }
 

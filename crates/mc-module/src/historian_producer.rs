@@ -348,7 +348,14 @@ impl HistorianProducerError {
         }
     }
 
-    pub(crate) fn send_outcome(&self) -> Option<HistorianSendOutcome> {
+    /// The send classification, when this failure carries one.
+    ///
+    /// `None` means the failure describes something other than a send attempt —
+    /// a transport or client error — so a consumer must not read it as "not
+    /// sent". Public alongside `code`, `classification`, and the other
+    /// accessors: whether a request may have reached the host is exactly what a
+    /// caller needs before deciding to retry.
+    pub fn send_outcome(&self) -> Option<HistorianSendOutcome> {
         match self {
             Self::Call(failure) => Some(failure.outcome),
             Self::CleanupFailed {
