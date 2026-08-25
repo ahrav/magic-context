@@ -14,14 +14,14 @@ import {
     Deadline,
     isConsumerReconnectTransient,
     isMcHostCallError,
+    McHostCallError,
+    McHostClient,
     Priority,
     type RouteHandle,
     type RouteTarget,
     SocketClosedError,
     SocketTimeoutError,
     StaleRouteHandleError,
-    McHostCallError,
-    McHostClient,
 } from "../../shared/mc-host-client";
 import { isRecord } from "../../shared/record-type-guard";
 

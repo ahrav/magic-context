@@ -14,10 +14,10 @@ export {
 } from "./deadline";
 export {
     isMcHostCallError,
-    SocketClosedError,
-    SocketTimeoutError,
     McHostCallError,
     McHostClientError,
+    SocketClosedError,
+    SocketTimeoutError,
 } from "./errors";
 export { RouteHandle, StaleRouteHandleError } from "./route-handle";
 export {

@@ -39,10 +39,8 @@ const RESP_TCP_DIRECT =
     '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1}}';
 const RESP_TCP_FALLBACK =
     '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"capability_version_mismatch"}';
-const RESP_GRANT =
-    `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{}}`;
-const ACTIVATE_REQ =
-    `{"op":"transport.activate","negotiation_version":1,"activation_token":"${VECTOR_TOKEN}"}`;
+const RESP_GRANT = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{}}`;
+const ACTIVATE_REQ = `{"op":"transport.activate","negotiation_version":1,"activation_token":"${VECTOR_TOKEN}"}`;
 const ACTIVATE_RESP = '{"op":"transport.activate","negotiation_version":1}';
 const COMMIT_REQ = '{"op":"transport.commit","negotiation_version":1}';
 const COMMIT_RESP = '{"op":"transport.commit","negotiation_version":1}';
@@ -230,8 +228,7 @@ describe("recursive duplicate-key rejection", () => {
             expectCode(() => decodeNegotiateRequest(bytes(body)), "malformed_json");
         }
 
-        const descriptor =
-            `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{"a":{"k":1,"k":2}}}`;
+        const descriptor = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{"a":{"k":1,"k":2}}}`;
         expectCode(
             () => decodeNegotiateResponse(bytes(descriptor), [shmOffer(1), tcpOffer(1)]),
             "malformed_json",
@@ -376,14 +373,12 @@ describe("grant and tcp field mixes", () => {
         const noToken =
             '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"descriptor":{}}';
         expectCode(() => decodeNegotiateResponse(bytes(noToken), offers), "missing_field");
-        const noDescriptor =
-            `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}"}`;
+        const noDescriptor = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}"}`;
         expectCode(() => decodeNegotiateResponse(bytes(noDescriptor), offers), "missing_field");
     });
 
     test("a tcp selection carrying either grant field is rejected", () => {
-        const withToken =
-            `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"activation_token":"${VECTOR_TOKEN}"}`;
+        const withToken = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"activation_token":"${VECTOR_TOKEN}"}`;
         expectCode(() => decodeNegotiateResponse(bytes(withToken), offers), "unexpected_field");
         const withDescriptor =
             '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"descriptor":{}}';
@@ -394,8 +389,7 @@ describe("grant and tcp field mixes", () => {
     });
 
     test("a grant carrying a fallback reason is rejected", () => {
-        const grantWithReason =
-            `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{},"reason":"unavailable"}`;
+        const grantWithReason = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{},"reason":"unavailable"}`;
         expectCode(
             () => decodeNegotiateResponse(bytes(grantWithReason), offers),
             "unexpected_field",

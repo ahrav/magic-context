@@ -7,10 +7,10 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
     Deadline,
-    type RouteHandle,
-    StaleRouteHandleError,
     McHostCallError,
     type McHostClient,
+    type RouteHandle,
+    StaleRouteHandleError,
 } from "../../shared/mc-host-client";
 import {
     FakePeer,

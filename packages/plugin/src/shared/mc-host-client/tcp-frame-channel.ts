@@ -14,7 +14,7 @@
 import { Socket } from "node:net";
 import { type AuthByteIo, AuthError, type AuthResult, authenticateClient } from "./auth";
 import type { Deadline } from "./deadline";
-import { SocketClosedError, SocketTimeoutError, McHostCallError } from "./errors";
+import { McHostCallError, SocketClosedError, SocketTimeoutError } from "./errors";
 import {
     type ByteBudget,
     type FrameChannel,

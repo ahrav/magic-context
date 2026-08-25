@@ -21,7 +21,7 @@
 
 import { AuthError } from "./auth";
 import { armExpiryTimer, type Deadline } from "./deadline";
-import { SocketClosedError, SocketTimeoutError, McHostCallError } from "./errors";
+import { McHostCallError, SocketClosedError, SocketTimeoutError } from "./errors";
 import {
     ByteBudget,
     type FrameChannelCloseReason,

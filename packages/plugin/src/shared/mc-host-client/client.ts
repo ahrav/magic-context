@@ -32,9 +32,9 @@ import {
 import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
 import {
     isMcHostCallError,
-    SocketTimeoutError,
     McHostCallError,
     McHostClientError,
+    SocketTimeoutError,
 } from "./errors";
 import { flagsBinary } from "./protocol";
 import {

@@ -26,9 +26,7 @@ describe("redactSecretText — token counts and scalar diagnostics stay visible"
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).toContain("<REDACTED:");
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).not.toContain(syntheticApiKey);
         const syntheticAuthToken = "tok_live_" + "9f8e7d6c5b";
-        expect(redactSecretText(`"auth_token": "${syntheticAuthToken}"`)).toContain(
-            "<REDACTED:",
-        );
+        expect(redactSecretText(`"auth_token": "${syntheticAuthToken}"`)).toContain("<REDACTED:");
     });
 
     test("value-shaped secret patterns still fire independent of key name", () => {
