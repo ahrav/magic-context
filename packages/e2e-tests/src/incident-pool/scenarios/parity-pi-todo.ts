@@ -21,13 +21,13 @@ import {
     captureTodoState,
     findSyntheticPair,
     injectedTodoPairs,
+    pairTodoInput,
     isMagicContextRequest,
     normalizedTodoJson,
     primeNextTurnAsCacheBust,
     sendAndCaptureMainRequest,
     syntheticPairBytes,
-    type SyntheticPair,
-    type Todo,
+    wireTodosMatch,
     type TodoMeta,
     type TodoParitySetup,
     type TodoScriptAdapter,
@@ -343,38 +343,6 @@ export function verifyPiTodoCapture(
     ];
 }
 
-/** The `todos` array carried by a synthetic pair's tool-use input. */
-function pairTodoInput(pair: SyntheticPair | null): unknown {
-    if (pair === null) return null;
-    const parsed = JSON.parse(pair.bytes) as unknown;
-    if (!Array.isArray(parsed)) return null;
-    const toolUse = parsed[0] as { input?: { todos?: unknown } } | undefined;
-    return toolUse?.input?.todos ?? null;
-}
-
-/**
- * Do the wire todos carry exactly the expected items with priorities already
- * defaulted? Compared field by field on purpose: running the wire side through
- * `normalizedTodoJson` would default a MISSING priority to `medium` and mask the
- * very omission this asserts.
- */
-function wireTodosCarryDefaultedPriorities(
-    wire: unknown,
-    expected: readonly Todo[],
-): boolean {
-    if (!Array.isArray(wire) || wire.length !== expected.length) return false;
-    return expected.every((todo, index) => {
-        const actual = wire[index];
-        if (!actual || typeof actual !== "object") return false;
-        const value = actual as Record<string, unknown>;
-        return (
-            value.content === todo.content &&
-            value.status === todo.status &&
-            value.priority === (todo.priority ?? "medium")
-        );
-    });
-}
-
 export async function drivePiTodoCapture(
     context: CaseDriverContext,
 ): Promise<PiTodoCaptureObservation> {
@@ -422,7 +390,7 @@ export async function drivePiTodoCapture(
             missingPriorityDefaulted:
                 readPiTodoMeta(h, missingPrioritySession)?.last_todo_state ===
                     missingPriorityState &&
-                wireTodosCarryDefaultedPriorities(
+                wireTodosMatch(
                     pairTodoInput(missingPriorityPair),
                     MISSING_PRIORITY_TODOS,
                 ),

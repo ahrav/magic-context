@@ -750,17 +750,21 @@ export async function driveLeaseLossResidualWrite(
         // A tool_result block alone proves nothing about WHICH write landed, but
         // requiring SUCCESS conflates the setup with the behavior under test.
         // Once the fence is extended to cover the archive itself, the racing
-        // write is correctly rejected with an `Error: ...` payload and the
-        // memory stays active with no mutation row — the resolution this case
-        // exists to detect. Demanding "Archived " fails the precondition there,
-        // so the durable no-write checks never get to score it. The attempt is
-        // required separately through `guardedWriteAttempted`, so either
-        // terminal response shape satisfies this field while an absent
-        // invocation still fails it.
+        // write is correctly rejected and the memory stays active with no
+        // mutation row — the resolution this case exists to detect. Demanding
+        // "Archived " fails the precondition there, so the durable no-write
+        // checks never get to score it. An unrelated failure (validation,
+        // registration, an internal error) leaves the same durable shape, so a
+        // bare `Error:` cannot stand in: the rejection must identify the lease
+        // fence. The attempt itself stays required through
+        // `guardedWriteAttempted`, and an absent invocation still fails here.
+        const archiveFenceRejected =
+            archiveResultText !== null &&
+            archiveResultText.startsWith("Error:") &&
+            /lease|fenc/i.test(archiveResultText);
         const providerToolResultObserved =
             archiveResultText !== null &&
-            (archiveResultText.startsWith("Archived ") ||
-                archiveResultText.startsWith("Error:"));
+            (archiveResultText.startsWith("Archived ") || archiveFenceRejected);
         return {
             kind: "a47-lease-loss-residual-write",
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),

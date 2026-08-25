@@ -311,6 +311,38 @@ export function syntheticPairBytes(
     return findSyntheticPair(body, callId)?.bytes ?? null;
 }
 
+/** The `todos` array carried by a pair's tool-use input. */
+export function pairTodoInput(pair: SyntheticPair | null): unknown {
+    if (pair === null) return null;
+    const parsed = JSON.parse(pair.bytes) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    const toolUse = parsed[0] as { input?: { todos?: unknown } } | undefined;
+    return toolUse?.input?.todos ?? null;
+}
+
+/**
+ * Do the wire todos carry exactly the expected items, with priorities already
+ * defaulted? Compared field by field on purpose: running the wire side through
+ * `normalizedTodoJson` would default a MISSING priority to `medium` and mask the
+ * very omission this is meant to catch.
+ */
+export function wireTodosMatch(
+    wire: unknown,
+    expected: readonly Todo[],
+): boolean {
+    if (!Array.isArray(wire) || wire.length !== expected.length) return false;
+    return expected.every((todo, index) => {
+        const actual = wire[index];
+        if (!actual || typeof actual !== "object") return false;
+        const value = actual as Record<string, unknown>;
+        return (
+            value.content === todo.content &&
+            value.status === todo.status &&
+            value.priority === (todo.priority ?? "medium")
+        );
+    });
+}
+
 export function emitTodoOnce(
     adapter: TodoScriptAdapter,
     todos: Todo[],
@@ -1184,7 +1216,15 @@ async function driveRustRoot(context: CaseDriverContext): Promise<{
                 providerRequestCaptured: body !== null,
                 moduleTodoStateCaptured,
                 providerSyntheticPairPresent: pair !== null,
-                deterministicCallIdMatched: pair?.callId === callId,
+                // The call id is a hash of the normalized state, so an id match
+                // alone says the injector DERIVED the id from the right state,
+                // not that it shipped that state. Stale or fabricated argument
+                // bytes under the expected id would otherwise read as correct
+                // while the agent sees the wrong todos, and
+                // `moduleTodoStateCaptured` only proves the durable side.
+                deterministicCallIdMatched:
+                    pair?.callId === callId &&
+                    wireTodosMatch(pairTodoInput(pair), STATE_X_TODOS),
             },
         };
     } catch (error) {
@@ -1279,6 +1319,12 @@ async function driveDependent(
                 providerTransitionCorrect: bytes0 !== null && bytes1 === bytes0,
                 durableTransitionCorrect:
                     state0?.syntheticCallId === root.callId &&
+                    // Both reads being null satisfies plain equality, so an
+                    // implementation that replays the pair while never
+                    // persisting anchor_mid reads as a correct frozen
+                    // transition. Reanchoring each defer can preserve the
+                    // compared bytes too, so the anchor must exist and hold.
+                    state0.syntheticAnchorMessageId !== null &&
                     state1?.syntheticCallId === state0.syntheticCallId &&
                     state1?.syntheticAnchorMessageId ===
                         state0.syntheticAnchorMessageId,

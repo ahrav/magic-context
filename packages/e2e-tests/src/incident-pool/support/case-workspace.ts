@@ -69,6 +69,13 @@ export function destroyCaseWorkspace(workspace: CaseWorkspace): void {
  * toolchain through `RUSTUP_HOME`, which the relocated `HOME` no longer implies,
  * and `MC_E2E_DIRECT_HOST_FIXTURE_BIN` names an already-built fixture so the
  * child does not build one at all.
+ *
+ * `CARGO_HOME` is deliberately NOT inherited: a real one holds
+ * `credentials.toml` and credential-provider configuration, so copying it would
+ * hand every case child the developer's registry tokens and contradict the
+ * guarantee above. It is relocated into the workspace instead, which leaves the
+ * variable valid for anything that reads it while resolving to an empty
+ * directory the case owns.
  */
 export const CASE_ENV_ALLOWLIST = [
     "PATH",
@@ -81,7 +88,6 @@ export const CASE_ENV_ALLOWLIST = [
     "LOGNAME",
     "SHELL",
     "RUSTUP_HOME",
-    "CARGO_HOME",
     "MC_E2E_DIRECT_HOST_FIXTURE_BIN",
 ] as const;
 
@@ -103,6 +109,7 @@ export function buildCaseEnv(
     env.XDG_DATA_HOME = join(workspace.home, ".local", "share");
     env.XDG_STATE_HOME = join(workspace.home, ".local", "state");
     env.XDG_CACHE_HOME = join(workspace.home, ".cache");
+    env.CARGO_HOME = join(workspace.home, ".cargo");
     return env;
 }
 

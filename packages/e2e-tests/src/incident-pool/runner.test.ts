@@ -960,6 +960,7 @@ describe("case isolation", () => {
         const env = buildCaseEnv(workspace, {
             PATH: "/usr/bin",
             HOME: "/real/home",
+            CARGO_HOME: "/real/home/.cargo",
             AWS_SECRET_ACCESS_KEY: "canary-credential",
             HTTPS_PROXY: "http://proxy.internal:3128",
             OPENAI_API_KEY: "canary-token",
@@ -970,7 +971,10 @@ describe("case isolation", () => {
         expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
         expect(env.HTTPS_PROXY).toBeUndefined();
         expect(env.OPENAI_API_KEY).toBeUndefined();
-        const relocated = ["HOME", "TMPDIR", "TMP", "TEMP"];
+        // A real CARGO_HOME holds registry credentials, so the parent's path is
+        // never inherited — it is relocated into the case-owned home.
+        expect(env.CARGO_HOME).toBe(join(workspace.home, ".cargo"));
+        const relocated = ["HOME", "TMPDIR", "TMP", "TEMP", "CARGO_HOME"];
         expect(
             Object.keys(env).every(
                 (key) =>
