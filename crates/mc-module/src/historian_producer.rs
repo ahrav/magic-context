@@ -800,7 +800,7 @@ impl HistorianProducer {
         let response = match self.send_frozen_once(&frozen).await {
             Ok(response) => response,
             Err(error) if is_outcome_unknown(&error) && !self.stop_requested() => {
-                self.replay_frozen_once(frozen_daemon, frozen_identity, &frozen)
+                self.replay_frozen_once(frozen_daemon, frozen_identity, &frozen, error)
                     .await?
             }
             Err(error) => return Err(error),
@@ -914,11 +914,19 @@ impl HistorianProducer {
         Ok(serde_json::from_slice(&response)?)
     }
 
+    /// Replays the frozen request on a fresh generation after an ambiguous send.
+    ///
+    /// `ambiguous` is the failure that justified the replay. Every abort inside
+    /// this function returns it unchanged: the frozen request may already have
+    /// reached the host, so reporting the cancellation itself — a `NotSent`
+    /// classification — would tell the caller a possibly-delivered request is
+    /// safe to send again.
     async fn replay_frozen_once(
         &mut self,
         frozen_daemon: [u8; 16],
         frozen_identity: SemanticIdentity,
         frozen: &[u8],
+        ambiguous: HistorianProducerError,
     ) -> Result<Value, HistorianProducerError> {
         // Release the ambiguous generation before dialing the replay
         // connection. Both hold a host connection permit, so overlapping them
@@ -933,6 +941,17 @@ impl HistorianProducer {
         self.command_route = None;
         self.subscribe_route = None;
 
+        // The caller's gate is one check, and the setup below spans three
+        // separately budgeted awaits — cleanup, a fresh dial with authentication
+        // and negotiation, and a route open. None of them observe the token, so
+        // only the final request would notice a cancellation that arrived just
+        // after the gate; a stopping handler would first spend every one of those
+        // budgets and bind a host-side route. Rechecking between stages aborts at
+        // a boundary where nothing is half-done.
+        if self.stop_requested() {
+            return Err(ambiguous);
+        }
+
         let reconnected = self
             .connector
             .reconnect(&self.config, &frozen_identity)
@@ -946,6 +965,13 @@ impl HistorianProducer {
                 daemon_changed,
                 identity_changed,
             });
+        }
+        // `send_frozen_once` opens the command route before it sends, and
+        // `open_route` carries its own 30-second budget without observing the
+        // token. The request itself does observe it, so this is the last gate
+        // that can prevent binding a route for a run nobody is waiting for.
+        if self.stop_requested() {
+            return Err(ambiguous);
         }
         self.send_frozen_once(frozen).await
     }
@@ -1404,6 +1430,7 @@ mod tests {
         close_calls: usize,
         next_channel: u16,
         stall_stream: bool,
+        cancel_on_close: Option<CancellationToken>,
     }
 
     #[async_trait]
@@ -1464,7 +1491,16 @@ mod tests {
         }
 
         async fn close(&self) -> Result<(), HistorianProducerError> {
-            self.state.lock().unwrap().close_calls += 1;
+            let cancel = {
+                let mut state = self.state.lock().unwrap();
+                state.close_calls += 1;
+                state.cancel_on_close.take()
+            };
+            // Lets a test place a cancellation exactly inside the replay's
+            // cleanup — after the caller's pre-replay gate, before any dial.
+            if let Some(cancel) = cancel {
+                cancel.cancel();
+            }
             Ok(())
         }
     }
@@ -1777,6 +1813,54 @@ mod tests {
             assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 1);
             assert_eq!(replay_state.lock().unwrap().requests.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_during_replay_setup_stops_before_dialing() {
+        // The caller's gate is one check, and the replay's setup then spans a
+        // cleanup, a fresh dial with authentication and negotiation, and a route
+        // open — none of which observe the token. A cancellation arriving in that
+        // span must stop the setup, not run to the final request: otherwise a
+        // stopping handler spends every one of those budgets and binds a
+        // host-side route for a run nobody will await.
+        let cancelled = CancellationToken::new();
+        let first = connection(9, [Err(cancelled_unknown())]);
+        first.state.lock().unwrap().cancel_on_close = Some(cancelled.clone());
+        let second = connection(9, [Ok(br#"{"run_id":"replayed"}"#.to_vec())]);
+        let second_state = Arc::clone(&second.state);
+        let connector = Arc::new(FakeConnector {
+            initial: first,
+            reconnects: Mutex::new(VecDeque::from(vec![(second, None)])),
+            reconnect_calls: AtomicU64::new(0),
+        });
+        let config = HistorianProducerConfig {
+            request_timeout: Duration::from_secs(1),
+            await_timeout: Duration::from_secs(1),
+            cancellation: Some(cancelled),
+            ..HistorianProducerConfig::new("/unused", "/project", "opencode")
+        };
+        let mut producer = HistorianProducer::connect_with(config, connector.clone())
+            .await
+            .unwrap();
+
+        let error = producer
+            .start("session", "", "prompt", "provider/model")
+            .await
+            .expect_err("a cancelled replay does not succeed");
+        assert!(
+            is_outcome_unknown(&error),
+            "the frozen request may already have been delivered, so the abort must \
+             stay ambiguous rather than reporting the cancellation as NotSent: {error:?}"
+        );
+        assert_eq!(
+            connector.reconnect_calls.load(Ordering::SeqCst),
+            0,
+            "a token that fires during replay cleanup must prevent the dial"
+        );
+        assert!(
+            second_state.lock().unwrap().opened_routes.is_empty(),
+            "no route may be bound for a cancelled replay"
+        );
     }
 
     #[tokio::test]

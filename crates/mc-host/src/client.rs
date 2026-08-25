@@ -36,8 +36,8 @@ use crate::{
     },
     wire::{
         decode_header, encode_owned_frame, pure_header_flags, AdmissionClass, EnvelopeHeader,
-        Flags, FrameId, FrameType, Priority, HEADER_LEN, MAX_BODY_LEN, MAX_CONTROL_BODY_LEN,
-        PROTOCOL_VERSION,
+        Flags, FrameId, FrameType, Priority, FROZEN_PREFIX_LEN, HEADER_LEN, MAX_BODY_LEN,
+        MAX_CONTROL_BODY_LEN, PROTOCOL_VERSION,
     },
 };
 
@@ -63,7 +63,22 @@ pub const CLIENT_DATA_QUEUE_FRAMES: usize = 256;
 pub const CLIENT_CONTROL_QUEUE_FRAMES: usize = 32;
 /// Shared queued-byte cap charged by both ordinary and reserved control frames.
 pub const CLIENT_QUEUED_BYTES: usize = MAX_BODY_LEN as usize + 1_048_576;
+/// Reservation for the body of the frame the reader is currently decoding.
+///
+/// The wire contract obliges an admitted connection to accept any otherwise
+/// valid frame, so this reservation must cover the framing maximum and must be
+/// separate from `CLIENT_RETAINED_RESPONSE_BYTES`: charging both from one pool
+/// let a stream holding a few queued megabytes make an unrelated maximum-sized
+/// terminal unreadable, which the reader could only report by retiring the whole
+/// generation. One reader task decodes one frame at a time, so this is a
+/// per-connection ceiling, not a per-frame multiplier.
+pub const CLIENT_INBOUND_FRAME_BYTES: usize = MAX_BODY_LEN as usize;
 /// Owner-wide bytes retained in pending stream queues.
+///
+/// Charged when an item is queued for a consumer, not when it is read, so
+/// exhaustion cancels the saturating stream instead of the connection. Sized to
+/// admit one maximum-sized item plus headroom; the worst-case resident total for
+/// one connection is this plus `CLIENT_INBOUND_FRAME_BYTES`.
 pub const CLIENT_RETAINED_RESPONSE_BYTES: usize = MAX_BODY_LEN as usize + 1_048_576;
 
 const NEGOTIATION_CORRELATION: u64 = 1;
@@ -328,6 +343,7 @@ impl Client {
             streams: Mutex::new(0),
             routes: Mutex::new(HashSet::new()),
             queue_budget: Arc::new(ByteCounter::new(CLIENT_QUEUED_BYTES)),
+            read_budget: Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
             retained_budget: Arc::new(ByteCounter::new(CLIENT_RETAINED_RESPONSE_BYTES)),
             data_tx,
             control_tx,
@@ -401,7 +417,21 @@ impl Client {
                 .await;
             match response {
                 Ok(response) => {
-                    let handle = parse_route_open(&response.body)?;
+                    // A successful `route.open` whose body has no usable tag,
+                    // channel, or epoch means the host bound a route the client
+                    // cannot name. It can send no route `Goodbye` for it, so
+                    // leaving the connection live lets each repeated open strand
+                    // another host-side route and channel permit until the whole
+                    // generation eventually closes. Retiring here is what obliges
+                    // the host to settle every route on this generation (§11.2),
+                    // including the unnameable one.
+                    let handle = match parse_route_open(&response.body) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            self.inner.retire("invalid_route_response");
+                            return Err(error);
+                        }
+                    };
                     // Publish under the same lock `close` drains, and recheck
                     // closure while holding it. A close that lands between the
                     // response arriving and this insert would otherwise leave a
@@ -717,6 +747,20 @@ const WRITING: u8 = 1;
 const WRITTEN: u8 = 2;
 const CANCELLED: u8 = 3;
 
+/// What removing a pending entry for a stop actually found.
+///
+/// The distinction is the caller's only evidence about who owns the request's
+/// reply channel: `Cancelled` means this stop settled it, while `AlreadyTaken`
+/// means a concurrent owner holds the sender and a terminal may still be in
+/// flight.
+#[derive(Debug)]
+enum PendingRemoval {
+    /// This stop removed the entry and settled the caller.
+    Cancelled,
+    /// The entry was gone, so another owner will settle the caller.
+    AlreadyTaken,
+}
+
 struct PendingState {
     publish: Arc<AtomicU8>,
     kind: PendingKind,
@@ -748,6 +792,10 @@ struct Inner {
     streams: Mutex<usize>,
     routes: Mutex<HashSet<RouteHandle>>,
     queue_budget: Arc<ByteCounter>,
+    /// Reserved for the body of the one frame the reader is decoding. Separate
+    /// from `retained_budget` so queue retention can never deny an otherwise
+    /// valid inbound frame; see `CLIENT_INBOUND_FRAME_BYTES`.
+    read_budget: Arc<ByteCounter>,
     retained_budget: Arc<ByteCounter>,
     data_tx: mpsc::Sender<QueuedFrame>,
     control_tx: mpsc::Sender<QueuedFrame>,
@@ -803,20 +851,26 @@ impl Inner {
         };
         let result = match stopped {
             Stopped::Terminal(result) => result,
-            Stopped::Cancelled => self.stop_or_take_terminal(
-                key,
-                &mut rx,
-                &publish,
-                "cancelled",
-                "request was cancelled",
-            ),
-            Stopped::DeadlineExpired => self.stop_or_take_terminal(
-                key,
-                &mut rx,
-                &publish,
-                "deadline_expired",
-                "request deadline expired",
-            ),
+            Stopped::Cancelled => {
+                self.stop_or_take_terminal(
+                    key,
+                    &mut rx,
+                    &publish,
+                    "cancelled",
+                    "request was cancelled",
+                )
+                .await
+            }
+            Stopped::DeadlineExpired => {
+                self.stop_or_take_terminal(
+                    key,
+                    &mut rx,
+                    &publish,
+                    "deadline_expired",
+                    "request deadline expired",
+                )
+                .await
+            }
         };
         guard.disarm();
         result
@@ -1011,10 +1065,10 @@ impl Inner {
     ///
     /// `dispatch` removes the pending entry before it publishes the terminal, so
     /// a cancellation or deadline landing in that window makes `cancel_key` see
-    /// no entry and report success. Reporting a local error there would discard
-    /// an authoritative response the host already sent, and send the caller into
-    /// outcome-unknown recovery for an operation that actually settled.
-    fn stop_or_take_terminal(
+    /// no entry. Reporting a local error there would discard an authoritative
+    /// response the host already sent, and send the caller into outcome-unknown
+    /// recovery for an operation that actually settled.
+    async fn stop_or_take_terminal(
         &self,
         key: PendingKey,
         rx: &mut oneshot::Receiver<Result<Response, CallError>>,
@@ -1022,22 +1076,38 @@ impl Inner {
         code: &'static str,
         message: &'static str,
     ) -> Result<Response, CallError> {
-        let stopped = self.cancel_key(key, code);
-        if stopped.is_ok() {
-            if let Ok(result) = rx.try_recv() {
-                return result;
+        let stopped = match self.cancel_key(key, code) {
+            // Another owner already took the entry, so it holds this caller's
+            // sender and is committed to either sending a terminal or dropping
+            // it. Both resolve this await, and no remover yields between taking
+            // an entry and settling it, so the wait is bounded by that owner's
+            // next few instructions. A single `try_recv` here loses the race
+            // whenever the terminal has not reached the channel yet, which is
+            // exactly the `remove`-before-`send` window that makes the entry
+            // absent in the first place.
+            Ok(PendingRemoval::AlreadyTaken) => {
+                return rx
+                    .await
+                    .unwrap_or_else(|_| Err(retired_error(classify(publish))));
             }
-        }
-        let outcome = stopped
-            .err()
-            .map_or_else(|| classify(publish), |error| error.outcome);
+            // This call removed the entry, so `cancel_key` has already settled
+            // the channel and `try_recv` observes its own result.
+            Ok(PendingRemoval::Cancelled) => {
+                if let Ok(result) = rx.try_recv() {
+                    return result;
+                }
+                None
+            }
+            Err(error) => Some(error.outcome),
+        };
+        let outcome = stopped.unwrap_or_else(|| classify(publish));
         Err(CallError::local(outcome, code, message))
     }
 
-    fn cancel_key(&self, key: PendingKey, code: &'static str) -> Result<(), CallError> {
+    fn cancel_key(&self, key: PendingKey, code: &'static str) -> Result<PendingRemoval, CallError> {
         let state = lock_unpoisoned(&self.pending).remove(&key);
         let Some(state) = state else {
-            return Ok(());
+            return Ok(PendingRemoval::AlreadyTaken);
         };
         let outcome = if state
             .publish
@@ -1062,7 +1132,7 @@ impl Inner {
             // the caller's OutcomeUnknown classification is already correct and
             // is what actually protects it from replaying.
             if key.channel == 0 {
-                return Ok(());
+                return Ok(PendingRemoval::Cancelled);
             }
             // The Cancel is best-effort cleanup, and the request's bytes may
             // already be on the wire. Report the failed enqueue, but keep the
@@ -1083,7 +1153,7 @@ impl Inner {
                 return Err(CallError::new(outcome, error.code, error.message));
             }
         }
-        Ok(())
+        Ok(PendingRemoval::Cancelled)
     }
 
     /// Queues one pure-header control frame.
@@ -1268,12 +1338,22 @@ impl Inner {
                         );
                     }
                     PendingKind::Stream { items, .. } => {
-                        let item = ChargedItem {
+                        // Retention is charged here, not at read time, so the
+                        // bytes a consumer holds are accounted against the queue
+                        // budget and cannot deny the reader an unrelated frame.
+                        // Exhaustion is the byte-wise form of queue saturation
+                        // and is reported the same way: cancel this stream, keep
+                        // the generation.
+                        let retained = self.retained_budget.charge(body.len());
+                        let item = retained.map(|retained| ChargedItem {
                             body,
                             binary: header.flags.is_binary(),
-                            _charge: charge,
-                        };
-                        if items.try_send(item).is_err() {
+                            _charge: retained,
+                        });
+                        // The read reservation is free the moment the bytes are
+                        // either retained under the queue budget or discarded.
+                        drop(charge);
+                        if item.is_none_or(|item| items.try_send(item).is_err()) {
                             let state = pending.remove(&key).expect("entry exists");
                             drop(pending);
                             self.finish_pending(
@@ -1643,7 +1723,29 @@ async fn read_active_frame<R: AsyncRead + Unpin>(
         return Ok(None);
     }
     let deadline = Instant::now() + CLIENT_FRAME_TIMEOUT;
-    read_exact_until(read, &mut header_bytes[1..], deadline, &inner.cancel).await?;
+    // Frozen-prefix discipline (§5): `len` and `ver` live in bytes 0..5, and an
+    // incompatible version is provable from them alone. Waiting for all 21 bytes
+    // first lets a peer that sends only the prefix hold this connection — and one
+    // of the owner's active slots — until the frame deadline, even though byte 4
+    // already proved the generation unusable. The host's reader splits the read
+    // for the same reason; see `tcp_frame_channel::read_frame`.
+    read_exact_until(
+        read,
+        &mut header_bytes[1..FROZEN_PREFIX_LEN],
+        deadline,
+        &inner.cancel,
+    )
+    .await?;
+    if header_bytes[4] != PROTOCOL_VERSION {
+        return Err(());
+    }
+    read_exact_until(
+        read,
+        &mut header_bytes[FROZEN_PREFIX_LEN..],
+        deadline,
+        &inner.cancel,
+    )
+    .await?;
     let header = decode_header(&header_bytes).map_err(|_| ())?;
     validate_inbound(&header)?;
     if header.len == 0 {
@@ -1653,7 +1755,12 @@ async fn read_active_frame<R: AsyncRead + Unpin>(
             charge: ByteCharge::none(),
         }));
     }
-    let Some(charge) = inner.retained_budget.charge(header.len as usize) else {
+    // The reservation covers the framing maximum and belongs to the reader
+    // alone, so a valid frame is never refused because a consumer is holding
+    // queued bytes. A refusal here therefore means the header declared more than
+    // the framing maximum, which `validate_inbound` has already rejected — it
+    // survives only as the structural guard for that invariant.
+    let Some(charge) = inner.read_budget.charge(header.len as usize) else {
         drain_until(read, header.len as usize, deadline, &inner.cancel).await?;
         return Err(());
     };
@@ -1913,28 +2020,51 @@ async fn read_setup_frame(
     deadline: Instant,
 ) -> Result<InboundFrame, ClientError> {
     let mut header_bytes = [0u8; HEADER_LEN];
-    timeout_at(deadline, stream.read_exact(&mut header_bytes))
-        .await
-        .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
-        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
+    // Frozen-prefix discipline: bytes 0..5 carry `len` and `ver`, and an
+    // incompatible version is provable from them alone. Reading all 21 bytes
+    // first lets a peer that sends 5 bytes and stops hold the handshake open to
+    // its whole deadline before the version is even inspected.
+    read_setup_exact(stream, &mut header_bytes[..FROZEN_PREFIX_LEN], deadline).await?;
+    if header_bytes[4] != PROTOCOL_VERSION {
+        return Err(ClientError::new(
+            "negotiation_failed",
+            "transport negotiation failed",
+        ));
+    }
+    read_setup_exact(stream, &mut header_bytes[FROZEN_PREFIX_LEN..], deadline).await?;
     let header = decode_header(&header_bytes)
         .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
-    if header.len > MAX_BODY_LEN {
+    // Negotiation is channel-zero control traffic, so §7.1's 65,536-byte cap
+    // applies — not the 64 MiB framing maximum. This path never reaches
+    // `validate_inbound`, so without the tighter check a malformed peer can make
+    // every connect attempt allocate roughly 64 MiB before the response is
+    // rejected.
+    if header.channel != 0 || header.len > MAX_CONTROL_BODY_LEN {
         return Err(ClientError::new(
             "negotiation_failed",
             "transport negotiation failed",
         ));
     }
     let mut body = vec![0u8; header.len as usize];
-    timeout_at(deadline, stream.read_exact(&mut body))
-        .await
-        .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
-        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
+    read_setup_exact(stream, &mut body, deadline).await?;
     Ok(InboundFrame {
         header,
         body,
         charge: ByteCharge::none(),
     })
+}
+
+/// Reads exactly `buf.len()` setup bytes under the shared handshake deadline.
+async fn read_setup_exact(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<(), ClientError> {
+    timeout_at(deadline, stream.read_exact(buf))
+        .await
+        .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
+        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
+    Ok(())
 }
 
 fn route_open_body(target: &RouteTarget, identity: &RouteIdentity) -> Result<Vec<u8>, CallError> {
@@ -2108,6 +2238,7 @@ mod tests {
                 streams: Mutex::new(0),
                 routes: Mutex::new(HashSet::from([route(1), route(2)])),
                 queue_budget: Arc::new(ByteCounter::new(queued_bytes)),
+                read_budget: Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
                 retained_budget: Arc::new(ByteCounter::new(CLIENT_RETAINED_RESPONSE_BYTES)),
                 data_tx,
                 control_tx,
@@ -2413,7 +2544,9 @@ mod tests {
             drop(data_rx.recv().await);
 
             match terminal {
-                None => inner.cancel_key(key, "cancelled").expect("stream settled"),
+                None => {
+                    inner.cancel_key(key, "cancelled").expect("stream settled");
+                }
                 Some(ty) => inner.dispatch(
                     EnvelopeHeader {
                         len: 0,
@@ -2778,8 +2911,96 @@ mod tests {
         let mut rx = rx;
         let response = inner
             .stop_or_take_terminal(key, &mut rx, &publish, "cancelled", "request was cancelled")
+            .await
             .expect("the observed terminal wins over the local stop");
         assert_eq!(response.body, b"authoritative");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_still_in_flight_wins_over_the_local_stop() {
+        // The remove-before-send window, reproduced with the terminal *not yet*
+        // on the channel: `dispatch` has taken the entry and is about to send.
+        // A single `try_recv` loses that race every time and would report
+        // `OutcomeUnknown` for an operation the host already answered, so the
+        // stop must wait for the owner that holds the sender.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let (kind, rx) = unary_sender();
+        let (key, publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                kind,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("admitted");
+        assert!(claim_for_write(&publish), "the writer claimed the request");
+        drop(data_rx.recv().await);
+
+        let state = lock_unpoisoned(&inner.pending)
+            .remove(&key)
+            .expect("entry exists");
+        let PendingKind::Unary(tx) = state.kind else {
+            unreachable!("admitted a unary request")
+        };
+
+        let mut rx = rx;
+        let stop = async {
+            inner
+                .stop_or_take_terminal(key, &mut rx, &publish, "cancelled", "request was cancelled")
+                .await
+        };
+        let publish_terminal = async {
+            // Let the stop observe the absent entry and start waiting before the
+            // owner publishes, which is the ordering that makes the race real.
+            tokio::task::yield_now().await;
+            tx.send(Ok(Response {
+                body: b"authoritative".to_vec(),
+                binary: false,
+            }))
+            .expect("terminal published");
+        };
+        let (result, ()) = tokio::join!(stop, publish_terminal);
+        let response = result.expect("the in-flight terminal wins over the local stop");
+        assert_eq!(response.body, b"authoritative");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_sender_after_an_absent_entry_reports_the_send_outcome() {
+        // The other way an owner can resolve the channel: it took the entry and
+        // dropped the sender (generation retirement settles in bulk). The stop
+        // must still terminate, and must classify from the publish state rather
+        // than hanging or inventing a terminal.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let (kind, rx) = unary_sender();
+        let (key, publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                kind,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("admitted");
+        assert!(claim_for_write(&publish), "the writer claimed the request");
+        drop(data_rx.recv().await);
+        drop(
+            lock_unpoisoned(&inner.pending)
+                .remove(&key)
+                .expect("entry exists"),
+        );
+
+        let mut rx = rx;
+        let error = inner
+            .stop_or_take_terminal(key, &mut rx, &publish, "cancelled", "request was cancelled")
+            .await
+            .expect_err("a dropped sender publishes no terminal");
+        assert_eq!(error.code, "generation_retired");
+        assert_eq!(
+            error.outcome,
+            SendOutcome::OutcomeUnknown,
+            "a claimed request whose sender vanished may still have been delivered"
+        );
     }
 
     #[test]
@@ -3242,6 +3463,242 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert!(task.await.expect("reader task").is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_version_fails_at_the_frozen_prefix() {
+        // Byte 4 of the frozen prefix already proves the generation unusable.
+        // Waiting for the remaining 16 header bytes lets a peer that sends five
+        // and stops hold this connection for the whole frame deadline, so the
+        // outer bound below is far shorter than `CLIENT_FRAME_TIMEOUT`: only a
+        // prefix-first rejection can satisfy it.
+        let (inner, _data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let (mut peer, mut reader) = tokio::io::duplex(64);
+        let mut prefix = [0u8; FROZEN_PREFIX_LEN];
+        prefix[4] = PROTOCOL_VERSION.wrapping_add(1);
+        peer.write_all(&prefix).await.expect("frozen prefix");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_active_frame(&mut reader, &inner),
+        )
+        .await
+        .expect("an unsupported version must be rejected on the prefix alone");
+        assert!(
+            result.is_err(),
+            "an unsupported envelope version is not a readable frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversize_negotiation_response_is_rejected_on_the_header() {
+        // Negotiation is channel-zero control traffic, so §7.1's 65,536-byte cap
+        // applies. This path never reaches `validate_inbound`, so without its own
+        // check the client accepts the header and allocates the declared body —
+        // roughly 64 MiB on every connect attempt. The peer below sends no body
+        // at all, so only a header-only rejection completes inside the bound.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let header = EnvelopeHeader {
+                len: MAX_CONTROL_BODY_LEN + 1,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::Response,
+                flags: response_flags(false, true),
+                channel: 0,
+                epoch: 0,
+                corr: NEGOTIATION_CORRELATION,
+            }
+            .encode();
+            socket.write_all(&header).await.unwrap();
+            socket
+        });
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_setup_frame(&mut stream, Instant::now() + CLIENT_HANDSHAKE_TIMEOUT),
+        )
+        .await
+        .expect("the header alone proves the violation; no body wait");
+        let Err(error) = outcome else {
+            panic!("an oversize control body is rejected");
+        };
+        assert_eq!(error.code(), "negotiation_failed");
+        drop(peer.await);
+    }
+
+    #[tokio::test]
+    async fn retained_stream_bytes_never_deny_a_maximum_sized_frame() {
+        // The wire contract obliges an admitted connection to accept any
+        // otherwise valid frame. Charging queue retention and the reader's
+        // in-flight body from one pool let a consumer holding a few megabytes
+        // make an unrelated maximum-sized terminal unreadable, which the reader
+        // could report only by retiring the whole generation.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let (items_tx, _items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+        let (terminal_tx, _terminal_rx) = oneshot::channel();
+        let (key, _publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                PendingKind::Stream {
+                    items: items_tx,
+                    terminal: terminal_tx,
+                    _settled: CancellationToken::new().drop_guard(),
+                },
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("stream admitted");
+        drop(data_rx.recv().await);
+
+        let queued = 2 * 1024 * 1024;
+        let charge = inner.read_budget.charge(queued).expect("read reservation");
+        inner.dispatch(
+            EnvelopeHeader {
+                len: u32::try_from(queued).expect("fits a frame length"),
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::StreamData,
+                flags: response_flags(true, false),
+                channel: key.channel,
+                epoch: key.epoch,
+                corr: key.corr,
+            },
+            vec![0; queued],
+            charge,
+        );
+
+        assert_eq!(
+            inner.retained_budget.used(),
+            queued,
+            "a queued item is accounted against retention, not the read reservation"
+        );
+        assert_eq!(
+            inner.read_budget.used(),
+            0,
+            "the read reservation is released once the bytes are retained"
+        );
+        assert!(
+            inner.read_budget.charge(MAX_BODY_LEN as usize).is_some(),
+            "queued bytes must not deny the reader a maximum-sized frame"
+        );
+        inner.retire("test_done");
+    }
+
+    #[tokio::test]
+    async fn exhausted_retention_cancels_only_the_saturating_stream() {
+        // Byte-wise retention exhaustion is the same local overflow as item-queue
+        // saturation and must be reported the same way: cancel this stream, keep
+        // the generation and every unrelated route on it.
+        let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let (items_tx, _items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let (key, _publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                PendingKind::Stream {
+                    items: items_tx,
+                    terminal: terminal_tx,
+                    _settled: CancellationToken::new().drop_guard(),
+                },
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("stream admitted");
+        drop(data_rx.recv().await);
+
+        let hold = inner
+            .retained_budget
+            .charge(CLIENT_RETAINED_RESPONSE_BYTES)
+            .expect("retention fully held by an existing consumer");
+        let charge = inner.read_budget.charge(1).expect("read reservation");
+        inner.dispatch(
+            EnvelopeHeader {
+                len: 1,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::StreamData,
+                flags: response_flags(false, false),
+                channel: key.channel,
+                epoch: key.epoch,
+                corr: key.corr,
+            },
+            vec![7],
+            charge,
+        );
+
+        let error = terminal_rx
+            .await
+            .expect("terminal sender")
+            .expect_err("the stream that could not retain its item fails");
+        assert_eq!(error.code(), "stream_saturated");
+        assert_eq!(error.outcome(), SendOutcome::OutcomeUnknown);
+        let cancel = control_rx.recv().await.expect("stream Cancel");
+        assert_eq!(cancel.bytes[5], FrameType::Cancel as u8);
+        assert!(
+            !inner.retired.load(Ordering::Acquire),
+            "a saturated consumer must not retire the generation"
+        );
+        assert_eq!(
+            inner.read_budget.used(),
+            0,
+            "the discarded item releases the read reservation"
+        );
+        drop(hold);
+        inner.retire("test_done");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_route_open_success_retires_the_generation() {
+        // The host bound a route whose success body names no channel or epoch, so
+        // the client can never send a route `Goodbye` for it. Leaving the
+        // connection live lets each repeated open strand another host-side route
+        // and channel permit; retiring is what obliges the host to settle them.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let client = Client {
+            inner: Arc::clone(&inner),
+        };
+        let open = tokio::spawn(async move {
+            client
+                .open_route(
+                    RouteTarget {
+                        kind: TargetKind::ManagementSurface,
+                        module_id: "magic-context".to_owned(),
+                    },
+                    identity_fixture(),
+                )
+                .await
+        });
+
+        let frame = data_rx.recv().await.expect("route.open request");
+        let header = decode_header(&frame.bytes).expect("request header");
+        inner.dispatch(
+            EnvelopeHeader {
+                len: 0,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::Response,
+                flags: response_flags(false, true),
+                channel: 0,
+                epoch: 0,
+                corr: header.corr,
+            },
+            br#"{"ok":true}"#.to_vec(),
+            ByteCharge::none(),
+        );
+
+        let error = open
+            .await
+            .expect("open task")
+            .expect_err("a success body without a route is not a route");
+        assert_eq!(error.code(), "invalid_route_response");
+        assert!(
+            inner.retired.load(Ordering::Acquire),
+            "an unnameable binding must not be left on a live generation"
+        );
+        assert!(
+            lock_unpoisoned(&inner.routes).is_empty(),
+            "retirement drops the generation's routes"
+        );
     }
 
     #[test]
