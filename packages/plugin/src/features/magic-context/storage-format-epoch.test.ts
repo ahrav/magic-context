@@ -1,9 +1,17 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    renameSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import vocabulary from "./fixtures/direct-format-vocabulary-v1.json";
 import {
@@ -17,19 +25,29 @@ import {
     validateSchemaComponents,
 } from "./storage-current-schema";
 import {
+    buildDatabaseResetMarker,
     buildDirectFormatMarker,
+    canonicalResetMarkerLines,
+    captureDatabaseFamilyIdentities,
     classifyDatabaseFormatFamily,
     computeMarkerDigest,
+    computeResetMarkerDigest,
+    DATABASE_FAMILY_MOVE_ORDER,
     DATABASE_RESET_MARKER_SUFFIX,
     DIRECT_FORMAT_EPOCH,
     DIRECT_FORMAT_MARKER_TABLE,
+    databaseFamilyFilePath,
+    databaseResetMarkerPath,
     FORMAT_MARKER_DIGEST_PROTOCOL,
     type FormatFamilyInspection,
     generateDatabaseIncarnationId,
     inspectDatabaseForClassification,
     listDatabaseFamilyArtifacts,
     MC_APPLICATION_ID,
+    readDatabaseResetMarker,
     readDirectFormatMarker,
+    verifyResetMarkerFamily,
+    writeDatabaseResetMarker,
 } from "./storage-format-epoch";
 import { computeExpectedDirectFormat, createDirectTestDatabase } from "./test-database";
 
@@ -180,6 +198,124 @@ describe("pure format-family classification", () => {
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
+    });
+});
+
+describe("reset marker and interrupted quarantine", () => {
+    it("serializes a private marker canonically and rejects digest tampering", () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-reset-marker-"));
+        try {
+            const dbPath = join(dir, "context.db");
+            writeFileSync(dbPath, "database");
+            const marker = buildDatabaseResetMarker({
+                dbPath,
+                createdAtMs: 123,
+                databaseIncarnationId: "a".repeat(32),
+                quarantineDirPath: `${dbPath}.mc-quarantine-test`,
+                fileIdentities: captureDatabaseFamilyIdentities(dbPath),
+            });
+            expect(marker.markerDigest).toBe(computeResetMarkerDigest(marker));
+            expect(canonicalResetMarkerLines(marker)).toEqual([
+                "mc-database-reset-marker-v1",
+                `db_path=${dbPath}`,
+                "created_at_ms=123",
+                `database_incarnation_id=${"a".repeat(32)}`,
+                `quarantine_dir=${dbPath}.mc-quarantine-test`,
+                `file role=main dev=${statSync(dbPath).dev} ino=${statSync(dbPath).ino} size_bytes=8`,
+            ]);
+
+            writeDatabaseResetMarker(marker);
+            expect(readDatabaseResetMarker(dbPath)).toEqual({ status: "present", marker });
+            if (process.platform !== "win32") {
+                expect(statSync(databaseResetMarkerPath(dbPath)).mode & 0o777).toBe(0o600);
+            }
+
+            const tampered = JSON.parse(
+                readFileSync(databaseResetMarkerPath(dbPath), "utf8"),
+            ) as Record<string, unknown>;
+            tampered.createdAtMs = 124;
+            writeFileSync(databaseResetMarkerPath(dbPath), JSON.stringify(tampered));
+            expect(readDatabaseResetMarker(dbPath)).toEqual({
+                status: "malformed",
+                reason: "reset marker digest mismatch",
+            });
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("captures every family identity in sidecar-first move order", () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-reset-identities-"));
+        try {
+            const dbPath = join(dir, "context.db");
+            for (const role of DATABASE_FAMILY_MOVE_ORDER) {
+                writeFileSync(databaseFamilyFilePath(dbPath, role), role);
+            }
+            const identities = captureDatabaseFamilyIdentities(dbPath);
+            expect(identities.map((identity) => identity.role)).toEqual([
+                ...DATABASE_FAMILY_MOVE_ORDER,
+            ]);
+            for (const identity of identities) {
+                const stats = statSync(databaseFamilyFilePath(dbPath, identity.role));
+                expect(identity).toMatchObject({ dev: stats.dev, ino: stats.ino });
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("classifies interrupted moves by identity and rejects a replaced destination", () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-reset-interrupted-"));
+        try {
+            const dbPath = join(dir, "context.db");
+            for (const role of DATABASE_FAMILY_MOVE_ORDER) {
+                writeFileSync(databaseFamilyFilePath(dbPath, role), role);
+            }
+            const quarantineDirPath = `${dbPath}.mc-quarantine-test`;
+            const marker = buildDatabaseResetMarker({
+                dbPath,
+                createdAtMs: 1,
+                databaseIncarnationId: null,
+                quarantineDirPath,
+                fileIdentities: captureDatabaseFamilyIdentities(dbPath),
+            });
+            mkdirSync(quarantineDirPath);
+            for (const role of ["rollback-journal", "wal"] as const) {
+                const source = databaseFamilyFilePath(dbPath, role);
+                renameSync(source, join(quarantineDirPath, basename(source)));
+            }
+
+            const interrupted = verifyResetMarkerFamily(marker);
+            expect(interrupted.problems).toEqual([]);
+            expect(interrupted.anyMoved).toBe(true);
+            expect(interrupted.files).toEqual([
+                { role: "rollback-journal", status: "moved" },
+                { role: "wal", status: "moved" },
+                { role: "shm", status: "at-source" },
+                { role: "main", status: "at-source" },
+            ]);
+
+            const walDestination = join(quarantineDirPath, "context.db-wal");
+            rmSync(walDestination);
+            writeFileSync(walDestination, "replacement");
+            const replaced = verifyResetMarkerFamily(marker);
+            expect(replaced.files).toContainEqual({ role: "wal", status: "mismatch" });
+            expect(replaced.problems.join("\n")).toContain("changed identity");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("treats a reset marker without a main database as an orphan artifact", () => {
+        expect(
+            classifyDatabaseFormatFamily(
+                pristineInspection({ mainFileExists: false, artifacts: ["reset-marker"] }),
+                EXPECTED,
+            ),
+        ).toEqual({
+            family: "orphan-artifacts",
+            reasons: ["orphan reset-marker artifact without a current main database"],
+        });
     });
 });
 

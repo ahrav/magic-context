@@ -79,9 +79,7 @@ function printUsage(): void {
         "    doctor merge-identity   Merge project rows (--from ID --to ID [--dry-run] [--yes])",
     );
     console.log("    doctor repair-db   Back up and salvage a corrupted shared database");
-    console.log(
-        "    doctor reset-db    Abandon an unsupported database family (--dry-run/--yes)",
-    );
+    console.log("    doctor reset-db    Abandon an unsupported database family (--dry-run/--yes)");
     console.log("");
     console.log("  Harness selection:");
     console.log("    --harness opencode    Target OpenCode only");

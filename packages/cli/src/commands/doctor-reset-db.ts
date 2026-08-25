@@ -11,8 +11,8 @@
  * the original family plus a pending marker (resumable) or a complete
  * quarantine.
  */
-import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { chmodSync, lstatSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import {
     buildDatabaseResetMarker,
     captureDatabaseFamilyIdentities,
@@ -23,6 +23,7 @@ import {
     databaseFamilyFilePath,
     databaseResetMarkerPath,
     type ResetMarkerFamilyVerification,
+    readDatabaseResetMarker,
     verifyResetMarkerFamily,
     writeDatabaseResetMarker,
 } from "@magic-context/core/features/magic-context/storage-format-epoch";
@@ -47,6 +48,7 @@ type ResetDbExitCode = (typeof RESET_DB_EXIT)[keyof typeof RESET_DB_EXIT];
 interface ResetDbDeps {
     now: () => Date;
     inspectHolders: (storageDir: string) => DatabaseHolderInspection;
+    renameFile: typeof renameSync;
 }
 
 export interface RunResetDbOptions {
@@ -61,6 +63,7 @@ export interface RunResetDbOptions {
 const DEFAULT_DEPS: ResetDbDeps = {
     now: () => new Date(),
     inspectHolders: defaultInspectHolders,
+    renameFile: renameSync,
 };
 
 const RETENTION_NOTE =
@@ -70,28 +73,61 @@ function timestamp(date: Date): string {
     return date.toISOString().replaceAll("-", "").replaceAll(":", "").replace(".", "");
 }
 
+function pathEntryExists(path: string): boolean {
+    try {
+        lstatSync(path);
+        return true;
+    } catch (error) {
+        if (
+            typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            (error as { code?: unknown }).code === "ENOENT"
+        ) {
+            return false;
+        }
+        throw error;
+    }
+}
+
 function allocateQuarantineDirPath(dbPath: string, stamp: string): string {
     const preferred = `${dbPath}${DATABASE_QUARANTINE_DIR_INFIX}${stamp}`;
-    if (!existsSync(preferred)) return preferred;
+    if (!pathEntryExists(preferred)) return preferred;
     for (let attempt = 1; attempt < 10_000; attempt++) {
         const candidate = `${preferred}-${attempt}`;
-        if (!existsSync(candidate)) return candidate;
+        if (!pathEntryExists(candidate)) return candidate;
     }
     throw new Error(`Could not allocate a unique quarantine path beside ${dbPath}`);
 }
 
 function ensureQuarantineDir(path: string): void {
-    mkdirSync(path, { recursive: true, mode: 0o700 });
-    // mkdirSync applies the mode only when it creates the directory; a resumed
-    // quarantine re-enforces the private permission on the existing one.
+    if (!pathEntryExists(path)) {
+        try {
+            mkdirSync(path, { mode: 0o700 });
+        } catch (error) {
+            if (!pathEntryExists(path)) throw error;
+        }
+    }
+    const stats = lstatSync(path);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        throw new Error(`quarantine path is not a private directory: ${path}`);
+    }
     chmodSync(path, 0o700);
 }
 
-function moveIntoQuarantine(sourcePath: string, quarantineDirPath: string): string {
+function moveIntoQuarantine(
+    sourcePath: string,
+    quarantineDirPath: string,
+    renameFile: typeof renameSync,
+    restrictAfterMove = true,
+): string {
     ensureQuarantineDir(quarantineDirPath);
     const destination = join(quarantineDirPath, basename(sourcePath));
-    renameSync(sourcePath, destination);
-    chmodSync(destination, 0o600);
+    if (pathEntryExists(destination)) {
+        throw new Error(`quarantine destination already exists: ${destination}`);
+    }
+    renameFile(sourcePath, destination);
+    if (restrictAfterMove) chmodSync(destination, 0o600);
     return destination;
 }
 
@@ -106,7 +142,7 @@ function describeFamilyState(state: DirectDatabaseFamilyState): string {
         case "unsupported":
             return `unsupported (${state.family})`;
         case "corrupt":
-            return `corrupt (${state.detail})`;
+            return `${state.format === "direct" ? "corrupt direct format" : "corrupt unknown format"} (${state.detail})`;
     }
 }
 
@@ -175,14 +211,28 @@ function refuseQuarantine(
         prompts.log.error(`Refusing to quarantine the database family: ${dbPath}`);
         for (const problem of cause.problems ?? []) prompts.log.error(`  ${problem}`);
     }
-    if (verification.anyMoved) {
+    if (verification.anyMoved || !verification.inspectionComplete) {
         prompts.log.info(
             `The interrupted quarantine remains pending at ${marker.quarantineDirPath}; re-run \`${DATABASE_RESET_COMMAND}\` once the blocker is resolved.`,
         );
         prompts.outro("Database reset refused; the reset marker remains for recovery");
         return RESET_DB_EXIT.refused;
     }
-    rmSync(databaseResetMarkerPath(dbPath), { force: true });
+    const markerRead = readDatabaseResetMarker(dbPath);
+    if (markerRead.status !== "present" || markerRead.marker.markerDigest !== marker.markerDigest) {
+        prompts.log.error("Reset marker identity changed; refusing to remove it during rollback.");
+        prompts.outro("Database reset refused; inspect the reset marker manually");
+        return RESET_DB_EXIT.refused;
+    }
+    try {
+        rmSync(databaseResetMarkerPath(dbPath));
+    } catch (error) {
+        prompts.log.error(
+            `Could not roll back the reset marker: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        prompts.outro("Database reset refused; the reset marker remains for recovery");
+        return RESET_DB_EXIT.refused;
+    }
     prompts.log.info(
         "No file had been quarantined; the reset marker was rolled back and the family is unchanged.",
     );
@@ -196,6 +246,34 @@ function refuseQuarantine(
     return RESET_DB_EXIT.refused;
 }
 
+function reportInterruptedMove(
+    prompts: PromptIO,
+    marker: DatabaseResetMarker,
+    role: string,
+    error: unknown,
+): ResetDbExitCode {
+    prompts.log.error(
+        `Could not quarantine ${role}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    prompts.log.info(
+        `The reset marker remains at ${databaseResetMarkerPath(marker.dbPath)}. Re-run \`${DATABASE_RESET_COMMAND}\` to resume the interrupted quarantine at ${marker.quarantineDirPath}.`,
+    );
+    prompts.outro("Database reset interrupted; recovery remains pending");
+    return RESET_DB_EXIT.failed;
+}
+
+function inspectHoldersSafely(deps: ResetDbDeps, storageDir: string): DatabaseHolderInspection {
+    try {
+        return deps.inspectHolders(storageDir);
+    } catch (error) {
+        return {
+            safe: false,
+            blockers: [],
+            uncertainty: `Database holder inspection failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+    }
+}
+
 function executeQuarantine(
     prompts: PromptIO,
     deps: ResetDbDeps,
@@ -204,32 +282,75 @@ function executeQuarantine(
     marker: DatabaseResetMarker,
 ): ResetDbExitCode {
     for (const role of DATABASE_FAMILY_MOVE_ORDER) {
+        const holders = inspectHoldersSafely(deps, storageDir);
         const verification = verifyResetMarkerFamily(marker);
+        if (!holders.safe) {
+            return refuseQuarantine(prompts, dbPath, marker, verification, { holders });
+        }
         if (verification.problems.length > 0) {
             return refuseQuarantine(prompts, dbPath, marker, verification, {
                 problems: verification.problems,
             });
         }
-        const holders = deps.inspectHolders(storageDir);
-        if (!holders.safe) {
-            return refuseQuarantine(prompts, dbPath, marker, verification, { holders });
-        }
         const fileCheck = verification.files.find((file) => file.role === role);
         if (!fileCheck) continue;
+        const destination = join(
+            marker.quarantineDirPath,
+            basename(databaseFamilyFilePath(dbPath, role)),
+        );
         if (fileCheck.status === "moved") {
+            try {
+                ensureQuarantineDir(marker.quarantineDirPath);
+                chmodSync(destination, 0o600);
+            } catch (error) {
+                return reportInterruptedMove(prompts, marker, role, error);
+            }
             prompts.log.info(`Already quarantined ${role}; resuming.`);
             continue;
         }
-        const destination = moveIntoQuarantine(
-            databaseFamilyFilePath(dbPath, role),
-            marker.quarantineDirPath,
-        );
+        try {
+            moveIntoQuarantine(
+                databaseFamilyFilePath(dbPath, role),
+                marker.quarantineDirPath,
+                deps.renameFile,
+            );
+        } catch (error) {
+            return reportInterruptedMove(prompts, marker, role, error);
+        }
         prompts.log.info(`Quarantined ${role}: ${destination}`);
     }
-    const markerDestination = moveIntoQuarantine(
-        databaseResetMarkerPath(dbPath),
-        marker.quarantineDirPath,
-    );
+
+    const holders = inspectHoldersSafely(deps, storageDir);
+    const verification = verifyResetMarkerFamily(marker);
+    if (!holders.safe) {
+        return refuseQuarantine(prompts, dbPath, marker, verification, { holders });
+    }
+    if (verification.problems.length > 0) {
+        return refuseQuarantine(prompts, dbPath, marker, verification, {
+            problems: verification.problems,
+        });
+    }
+    const markerRead = readDatabaseResetMarker(dbPath);
+    if (markerRead.status !== "present" || markerRead.marker.markerDigest !== marker.markerDigest) {
+        return reportInterruptedMove(
+            prompts,
+            marker,
+            "reset marker",
+            new Error("reset marker identity changed before finalization"),
+        );
+    }
+    let markerDestination: string;
+    try {
+        chmodSync(databaseResetMarkerPath(dbPath), 0o600);
+        markerDestination = moveIntoQuarantine(
+            databaseResetMarkerPath(dbPath),
+            marker.quarantineDirPath,
+            deps.renameFile,
+            false,
+        );
+    } catch (error) {
+        return reportInterruptedMove(prompts, marker, "reset marker", error);
+    }
     prompts.log.info(`Reset marker finalized into quarantine: ${markerDestination}`);
     prompts.log.success(`Database family quarantined: ${marker.quarantineDirPath}`);
     prompts.log.info(RETENTION_NOTE);
@@ -275,9 +396,10 @@ async function recoverPendingReset(
     prompts.log.info(
         `Database incarnation: ${marker.databaseIncarnationId ?? "none readable from this family"}`,
     );
+    reportIdentities(prompts, marker.fileIdentities, dbPath);
     prompts.log.info(`Quarantine destination: ${marker.quarantineDirPath}`);
     for (const file of verification.files) {
-        prompts.log.info(`  ${file.role}: ${file.status}`);
+        prompts.log.info(`  recovery ${file.role}: ${file.status}`);
     }
     prompts.log.info(RETENTION_NOTE);
     if (options.dryRun) {
@@ -312,10 +434,10 @@ function printHelp(): void {
 export async function runResetDb(options: RunResetDbOptions = {}): Promise<ResetDbExitCode> {
     const prompts = options.prompts ?? promptIO;
     const deps: ResetDbDeps = { ...DEFAULT_DEPS, ...options.deps };
-    const storageDir =
-        options.storageDir ??
-        dirname(options.dbPath ?? join(getMagicContextStorageDir(), "context.db"));
-    const dbPath = options.dbPath ?? join(storageDir, "context.db");
+    const requestedDbPath =
+        options.dbPath ?? join(options.storageDir ?? getMagicContextStorageDir(), "context.db");
+    const dbPath = resolve(requestedDbPath);
+    const storageDir = resolve(options.storageDir ?? dirname(dbPath));
 
     prompts.intro("Magic Context — Reset unsupported database");
     prompts.log.info(`Database: ${dbPath}`);
@@ -339,8 +461,18 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
         return RESET_DB_EXIT.refused;
     }
 
-    const identities = captureDatabaseFamilyIdentities(dbPath);
-    const quarantineDirPath = allocateQuarantineDirPath(dbPath, timestamp(deps.now()));
+    let identities: DatabaseFileIdentity[];
+    let quarantineDirPath: string;
+    try {
+        identities = captureDatabaseFamilyIdentities(dbPath);
+        quarantineDirPath = allocateQuarantineDirPath(dbPath, timestamp(deps.now()));
+    } catch (error) {
+        prompts.log.error(
+            `Could not inspect the database family safely: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        prompts.outro("Database reset failed before any file was changed");
+        return RESET_DB_EXIT.failed;
+    }
     const databaseIncarnationId =
         state.state === "unsupported" ? state.databaseIncarnationId : null;
     reportPlan(
@@ -359,7 +491,7 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
         return RESET_DB_EXIT.ok;
     }
 
-    const initialInspection = deps.inspectHolders(storageDir);
+    const initialInspection = inspectHoldersSafely(deps, storageDir);
     if (!initialInspection.safe) {
         reportSafetyRefusal(prompts, dbPath, initialInspection);
         prompts.outro("Database reset refused; the database family was not modified");

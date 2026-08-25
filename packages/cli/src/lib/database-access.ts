@@ -1,4 +1,13 @@
-import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+    closeSync,
+    copyFileSync,
+    existsSync,
+    mkdtempSync,
+    openSync,
+    readSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -17,6 +26,7 @@ import {
     type ExpectedDirectFormat,
     inspectDatabaseForClassification,
     listDatabaseFamilyArtifacts,
+    MC_APPLICATION_ID,
     readDatabaseResetMarker,
 } from "@magic-context/core/features/magic-context/storage-format-epoch";
 import { computeExpectedDirectFormat } from "@magic-context/core/features/magic-context/test-database";
@@ -213,13 +223,41 @@ export type DirectDatabaseFamilyState =
           /** Incarnation when the family carries a readable direct-format marker. */
           readonly databaseIncarnationId: string | null;
       }
-    | { readonly state: "corrupt"; readonly detail: string };
+    | {
+          readonly state: "corrupt";
+          readonly format: "direct" | "unknown";
+          readonly directFormatSignals: readonly string[];
+          readonly detail: string;
+      };
 
 let cachedExpectedDirectFormat: ExpectedDirectFormat | null = null;
 
 function getExpectedDirectFormat(): ExpectedDirectFormat {
     cachedExpectedDirectFormat ??= computeExpectedDirectFormat();
     return cachedExpectedDirectFormat;
+}
+
+function readDirectFormatHeaderSignals(dbPath: string): string[] {
+    const header = Buffer.alloc(100);
+    let fd: number | null = null;
+    try {
+        fd = openSync(dbPath, "r");
+        if (readSync(fd, header, 0, header.length, 0) < header.length) return [];
+    } catch {
+        return [];
+    } finally {
+        if (fd !== null) closeSync(fd);
+    }
+    if (header.toString("ascii", 0, 16) !== "SQLite format 3\0") return [];
+    const signals: string[] = [];
+    const userVersion = header.readUInt32BE(60);
+    const applicationId = header.readUInt32BE(68);
+    if (applicationId === MC_APPLICATION_ID) {
+        signals.push('application_id is the direct-format "MCTX" value');
+    }
+    if (userVersion !== 0)
+        signals.push(`user_version ${userVersion} is direct-format epoch vocabulary`);
+    return signals;
 }
 
 /**
@@ -272,8 +310,11 @@ export function inspectDirectDatabaseFamilyState(dbPath: string): DirectDatabase
             databaseIncarnationId,
         };
     } catch (error) {
+        const directFormatSignals = readDirectFormatHeaderSignals(dbPath);
         return {
             state: "corrupt",
+            format: directFormatSignals.length > 0 ? "direct" : "unknown",
+            directFormatSignals,
             detail: error instanceof Error ? error.message : String(error),
         };
     } finally {

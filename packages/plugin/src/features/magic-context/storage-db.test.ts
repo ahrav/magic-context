@@ -211,6 +211,30 @@ describe("upstream migration version lane", () => {
 
 describe("storage-db", () => {
     describe("#given openDatabase", () => {
+        it("#when a reset marker is pending #then refuses without opening or changing the family", () => {
+            const dir = makeTempDir("storage-db-reset-pending-");
+            const dbPath = join(dir, "context.db");
+            writeFileSync(dbPath, "database bytes");
+            writeFileSync(`${dbPath}.mc-reset`, "pending marker");
+            const beforeMain = readFileSync(dbPath);
+            const beforeMarker = readFileSync(`${dbPath}.mc-reset`);
+
+            expect(() => openDatabase(dbPath)).toThrow(/reset marker .* is pending/);
+            expect(readFileSync(dbPath)).toEqual(beforeMain);
+            expect(readFileSync(`${dbPath}.mc-reset`)).toEqual(beforeMarker);
+        });
+
+        it("#when only an orphan sidecar exists #then refuses pristine bootstrap", () => {
+            const dir = makeTempDir("storage-db-orphan-sidecar-");
+            const dbPath = join(dir, "context.db");
+            writeFileSync(`${dbPath}-wal`, "orphan wal");
+            const before = readFileSync(`${dbPath}-wal`);
+
+            expect(() => openDatabase(dbPath)).toThrow(/orphan family artifacts: wal/);
+            expect(existsSync(dbPath)).toBe(false);
+            expect(readFileSync(`${dbPath}-wal`)).toEqual(before);
+        });
+
         it("#when called first time #then creates DB with WAL mode and busy_timeout", () => {
             const dataHome = useTempDataHome("storage-db-wal-");
 

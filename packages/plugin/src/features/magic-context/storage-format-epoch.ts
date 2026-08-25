@@ -19,8 +19,18 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import {
+    chmodSync,
+    closeSync,
+    existsSync,
+    fsyncSync,
+    lstatSync,
+    openSync,
+    readFileSync,
+    type Stats,
+    writeSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Database } from "../../shared/sqlite";
 
 /** `PRAGMA application_id` value for the direct format: ASCII "MCTX". */
@@ -400,15 +410,34 @@ export interface DatabaseFileIdentity {
     readonly sizeBytes: number;
 }
 
+function isMissingPathError(error: unknown): boolean {
+    return (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        (error as { code?: unknown }).code === "ENOENT"
+    );
+}
+
+function lstatIfPresent(path: string): Stats | null {
+    try {
+        return lstatSync(path);
+    } catch (error) {
+        if (isMissingPathError(error)) return null;
+        throw error;
+    }
+}
+
 /** Identities of every family file that currently exists on disk, in move order. */
 export function captureDatabaseFamilyIdentities(dbPath: string): DatabaseFileIdentity[] {
     const identities: DatabaseFileIdentity[] = [];
     for (const role of DATABASE_FAMILY_MOVE_ORDER) {
-        let stats: ReturnType<typeof statSync>;
-        try {
-            stats = statSync(databaseFamilyFilePath(dbPath, role));
-        } catch {
-            continue;
+        const stats = lstatIfPresent(databaseFamilyFilePath(dbPath, role));
+        if (stats === null) continue;
+        if (!stats.isFile()) {
+            throw new Error(
+                `${databaseFamilyFilePath(dbPath, role)} is not a regular database-family file`,
+            );
         }
         identities.push({ role, dev: stats.dev, ino: stats.ino, sizeBytes: stats.size });
     }
@@ -468,20 +497,34 @@ export function buildDatabaseResetMarker(input: {
     ) {
         throw new Error(`invalid database incarnation ID: ${input.databaseIncarnationId}`);
     }
+    if (!Number.isSafeInteger(input.createdAtMs) || input.createdAtMs < 0) {
+        throw new Error(`invalid reset marker creation time: ${input.createdAtMs}`);
+    }
+    const pathProblem = validateResetMarkerPaths(input.dbPath, input.quarantineDirPath);
+    if (pathProblem !== null) throw new Error(pathProblem);
+    const identityProblem = validateResetMarkerIdentities(input.fileIdentities);
+    if (identityProblem !== null) throw new Error(identityProblem);
     const withoutDigest = { protocol: RESET_MARKER_PROTOCOL, ...input } as const;
     return { ...withoutDigest, markerDigest: computeResetMarkerDigest(withoutDigest) };
 }
 
 /**
- * Publish the reset marker as a private file beside the database. `wx` makes
- * publication race-safe (a concurrent reset fails instead of overwriting),
- * and a torn write fails the digest check on read, so recovery refuses it.
+ * `wx` prevents concurrent overwrite. fsync makes successful publication the
+ * crash boundary after which recovery may trust marker presence.
  */
 export function writeDatabaseResetMarker(marker: DatabaseResetMarker): void {
-    writeFileSync(databaseResetMarkerPath(marker.dbPath), `${JSON.stringify(marker)}\n`, {
-        mode: 0o600,
-        flag: "wx",
-    });
+    const path = databaseResetMarkerPath(marker.dbPath);
+    let fd: number | null = null;
+    try {
+        fd = openSync(path, "wx", 0o600);
+        writeSync(fd, `${JSON.stringify(marker)}\n`, undefined, "utf8");
+        fsyncSync(fd);
+        chmodSync(path, 0o600);
+    } catch (error) {
+        if (fd !== null) closeSync(fd);
+        throw error;
+    }
+    closeSync(fd);
 }
 
 export type DatabaseResetMarkerRead =
@@ -490,6 +533,53 @@ export type DatabaseResetMarkerRead =
     | { status: "present"; marker: DatabaseResetMarker };
 
 const FAMILY_ROLE_SET = new Set<string>(DATABASE_FAMILY_MOVE_ORDER);
+const SHA256_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+function validateResetMarkerPaths(dbPath: string, quarantineDirPath: string): string | null {
+    if (!isAbsolute(dbPath) || resolve(dbPath) !== dbPath) {
+        return "reset marker db path must be an absolute normalized path";
+    }
+    if (!isAbsolute(quarantineDirPath) || resolve(quarantineDirPath) !== quarantineDirPath) {
+        return "reset marker quarantine path must be an absolute normalized path";
+    }
+    if (dirname(quarantineDirPath) !== dirname(dbPath)) {
+        return "reset marker quarantine path is not beside the database";
+    }
+    if (
+        !basename(quarantineDirPath).startsWith(
+            `${basename(dbPath)}${DATABASE_QUARANTINE_DIR_INFIX}`,
+        )
+    ) {
+        return "reset marker quarantine path does not use the reserved database prefix";
+    }
+    return null;
+}
+
+function validateResetMarkerIdentities(
+    fileIdentities: readonly DatabaseFileIdentity[],
+): string | null {
+    let lastOrder = -1;
+    const seen = new Set<DatabaseFamilyFileRole>();
+    for (const file of fileIdentities) {
+        if (!FAMILY_ROLE_SET.has(file.role)) return "reset marker file identity role is invalid";
+        if (seen.has(file.role)) return `reset marker repeats the ${file.role} file identity`;
+        seen.add(file.role);
+        const order = DATABASE_FAMILY_MOVE_ORDER.indexOf(file.role);
+        if (order <= lastOrder) return "reset marker file identities are not in move order";
+        lastOrder = order;
+        if (
+            !Number.isSafeInteger(file.dev) ||
+            file.dev < 0 ||
+            !Number.isSafeInteger(file.ino) ||
+            file.ino < 0 ||
+            !Number.isSafeInteger(file.sizeBytes) ||
+            file.sizeBytes < 0
+        ) {
+            return "reset marker file identity entry is invalid";
+        }
+    }
+    return null;
+}
 
 /** Read and integrity-check the reset marker file (digest recomputed, never trusted). */
 export function readDatabaseResetMarker(dbPath: string): DatabaseResetMarkerRead {
@@ -511,10 +601,10 @@ export function readDatabaseResetMarker(dbPath: string): DatabaseResetMarkerRead
     if (raw.protocol !== RESET_MARKER_PROTOCOL) {
         return { status: "malformed", reason: `unknown reset marker protocol: ${raw.protocol}` };
     }
-    if (typeof raw.dbPath !== "string" || raw.dbPath.length === 0) {
-        return { status: "malformed", reason: "reset marker db path is invalid" };
+    if (typeof raw.dbPath !== "string" || raw.dbPath !== dbPath) {
+        return { status: "malformed", reason: "reset marker db path does not match its filename" };
     }
-    if (!Number.isSafeInteger(raw.createdAtMs)) {
+    if (!Number.isSafeInteger(raw.createdAtMs) || (raw.createdAtMs as number) < 0) {
         return { status: "malformed", reason: "reset marker creation time is invalid" };
     }
     if (
@@ -524,24 +614,18 @@ export function readDatabaseResetMarker(dbPath: string): DatabaseResetMarkerRead
     ) {
         return { status: "malformed", reason: "reset marker database incarnation ID is invalid" };
     }
-    if (typeof raw.quarantineDirPath !== "string" || raw.quarantineDirPath.length === 0) {
+    if (typeof raw.quarantineDirPath !== "string") {
         return { status: "malformed", reason: "reset marker quarantine path is invalid" };
     }
+    const pathProblem = validateResetMarkerPaths(raw.dbPath, raw.quarantineDirPath);
+    if (pathProblem !== null) return { status: "malformed", reason: pathProblem };
     if (!Array.isArray(raw.fileIdentities)) {
         return { status: "malformed", reason: "reset marker file identities are invalid" };
     }
     const fileIdentities: DatabaseFileIdentity[] = [];
     for (const entry of raw.fileIdentities as unknown[]) {
         const file = entry as Record<string, unknown>;
-        if (
-            typeof file !== "object" ||
-            file === null ||
-            typeof file.role !== "string" ||
-            !FAMILY_ROLE_SET.has(file.role) ||
-            !Number.isSafeInteger(file.dev) ||
-            !Number.isSafeInteger(file.ino) ||
-            !Number.isSafeInteger(file.sizeBytes)
-        ) {
+        if (typeof file !== "object" || file === null || typeof file.role !== "string") {
             return { status: "malformed", reason: "reset marker file identity entry is invalid" };
         }
         fileIdentities.push({
@@ -551,6 +635,8 @@ export function readDatabaseResetMarker(dbPath: string): DatabaseResetMarkerRead
             sizeBytes: file.sizeBytes as number,
         });
     }
+    const identityProblem = validateResetMarkerIdentities(fileIdentities);
+    if (identityProblem !== null) return { status: "malformed", reason: identityProblem };
     const withoutDigest = {
         protocol: RESET_MARKER_PROTOCOL,
         dbPath: raw.dbPath,
@@ -559,7 +645,11 @@ export function readDatabaseResetMarker(dbPath: string): DatabaseResetMarkerRead
         quarantineDirPath: raw.quarantineDirPath,
         fileIdentities,
     } as const;
-    if (computeResetMarkerDigest(withoutDigest) !== raw.markerDigest) {
+    if (
+        typeof raw.markerDigest !== "string" ||
+        !SHA256_DIGEST_PATTERN.test(raw.markerDigest) ||
+        computeResetMarkerDigest(withoutDigest) !== raw.markerDigest
+    ) {
         return { status: "malformed", reason: "reset marker digest mismatch" };
     }
     return {
@@ -581,6 +671,8 @@ export interface ResetMarkerFamilyVerification {
     readonly unexpectedFamilyFiles: readonly string[];
     /** True once any recorded file already reached quarantine. */
     readonly anyMoved: boolean;
+    /** False when an I/O error prevented a complete source/destination identity check. */
+    readonly inspectionComplete: boolean;
     /** Empty means the quarantine may proceed or resume. */
     readonly problems: readonly string[];
 }
@@ -594,52 +686,70 @@ export interface ResetMarkerFamilyVerification {
  * bootstrap to current, so a current database at this path necessarily has a
  * new inode.
  */
-export function verifyResetMarkerFamily(marker: DatabaseResetMarker): ResetMarkerFamilyVerification {
+export function verifyResetMarkerFamily(
+    marker: DatabaseResetMarker,
+): ResetMarkerFamilyVerification {
     const files: ResetFamilyFileCheck[] = [];
     const unexpectedFamilyFiles: string[] = [];
     const problems: string[] = [];
+    let inspectionComplete = true;
     for (const role of DATABASE_FAMILY_MOVE_ORDER) {
         const sourcePath = databaseFamilyFilePath(marker.dbPath, role);
+        const destinationPath = join(marker.quarantineDirPath, basename(sourcePath));
         const recorded = marker.fileIdentities.find((file) => file.role === role);
-        if (!recorded) {
-            if (existsSync(sourcePath)) {
-                unexpectedFamilyFiles.push(sourcePath);
-                problems.push(
-                    `an unrecorded ${role} file appeared at ${sourcePath} after the reset marker was published`,
-                );
-            }
-            continue;
-        }
-        let stats: ReturnType<typeof statSync> | null = null;
+        let source: Stats | null;
+        let destination: Stats | null;
         try {
-            stats = statSync(sourcePath);
-        } catch {
-            stats = null;
+            source = lstatIfPresent(sourcePath);
+            destination = lstatIfPresent(destinationPath);
+        } catch (error) {
+            inspectionComplete = false;
+            problems.push(
+                `could not inspect the ${role} file identity: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            continue;
         }
-        if (stats !== null) {
-            if (stats.dev === recorded.dev && stats.ino === recorded.ino) {
-                files.push({ role, status: "at-source" });
-            } else {
-                files.push({ role, status: "mismatch" });
+        if (!recorded) {
+            for (const path of [
+                source === null ? null : sourcePath,
+                destination === null ? null : destinationPath,
+            ]) {
+                if (path === null) continue;
+                unexpectedFamilyFiles.push(path);
                 problems.push(
-                    `the ${role} file at ${sourcePath} changed identity since the reset marker was published (recorded dev=${recorded.dev} ino=${recorded.ino}, found dev=${stats.dev} ino=${stats.ino})`,
+                    `an unrecorded ${role} file appeared at ${path} after the reset marker was published`,
                 );
             }
             continue;
         }
-        if (existsSync(join(marker.quarantineDirPath, basename(sourcePath)))) {
-            files.push({ role, status: "moved" });
-        } else {
+        if (source !== null && destination !== null) {
+            files.push({ role, status: "mismatch" });
+            problems.push(`the recorded ${role} file exists at both source and quarantine paths`);
+            continue;
+        }
+        const found = source ?? destination;
+        if (found === null) {
             files.push({ role, status: "missing" });
             problems.push(
                 `the recorded ${role} file disappeared from ${sourcePath} without reaching quarantine`,
             );
+            continue;
         }
+        if (!found.isFile() || found.dev !== recorded.dev || found.ino !== recorded.ino) {
+            files.push({ role, status: "mismatch" });
+            const foundPath = source === null ? destinationPath : sourcePath;
+            problems.push(
+                `the ${role} file at ${foundPath} changed identity since the reset marker was published (recorded dev=${recorded.dev} ino=${recorded.ino}, found dev=${found.dev} ino=${found.ino})`,
+            );
+            continue;
+        }
+        files.push({ role, status: source === null ? "moved" : "at-source" });
     }
     return {
         files,
         unexpectedFamilyFiles,
         anyMoved: files.some((file) => file.status === "moved"),
+        inspectionComplete,
         problems,
     };
 }

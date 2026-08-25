@@ -40,6 +40,7 @@ import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-per
 import { ensureContextStoreUuid } from "./context-authority";
 import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
+import { listDatabaseFamilyArtifacts } from "./storage-format-epoch";
 import {
     ensureColumn,
     healAllNullColumns,
@@ -189,6 +190,20 @@ export function resolveDatabasePath(dbPathOverride?: string): { dbDir: string; d
 
 export function getDatabasePath(db: Database): string | null {
     return pathByDatabase.get(db) ?? null;
+}
+
+function refuseUnsafePristineBootstrap(dbPath: string): void {
+    const artifacts = listDatabaseFamilyArtifacts(dbPath);
+    if (artifacts.includes("reset-marker")) {
+        throw new Error(
+            `refusing database initialization while reset marker ${dbPath}.mc-reset is pending`,
+        );
+    }
+    if (!existsSync(dbPath) && artifacts.length > 0) {
+        throw new Error(
+            `refusing database initialization with orphan family artifacts: ${artifacts.join(", ")}`,
+        );
+    }
 }
 
 /**
@@ -2168,6 +2183,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     }
 
     try {
+        refuseUnsafePristineBootstrap(dbPath);
         if (!explicitDbPath) {
             migrateLegacyStorageIfNeeded(dbPath, dbDir);
         }
@@ -2226,6 +2242,7 @@ export async function openDatabaseAsync(
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
         try {
+            refuseUnsafePristineBootstrap(dbPath);
             if (!explicitDbPath) migrateLegacyStorageIfNeeded(dbPath, dbDir);
             ensureSecureStorageDir(dbDir);
 

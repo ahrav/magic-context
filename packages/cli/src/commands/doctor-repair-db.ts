@@ -20,12 +20,12 @@ import {
     initializeDatabase,
     inspectRpcServerDiscovery,
 } from "@magic-context/core/features/magic-context/storage-db";
-import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import {
     DIRECT_FORMAT_MARKER_TABLE,
     databaseResetMarkerPath,
     MC_APPLICATION_ID,
 } from "@magic-context/core/features/magic-context/storage-format-epoch";
+import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { inspectLivePiProcesses } from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
