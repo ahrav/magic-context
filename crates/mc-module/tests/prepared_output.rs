@@ -231,8 +231,8 @@ impl Write for FailAfter {
 }
 
 #[test]
-fn serializer_failure_retains_no_partial_terminal() {
-    let output = PreparedOutput::json(json!({"value": "serializer must fail after bytes"}));
+fn destination_failure_retains_no_partial_terminal() {
+    let output = PreparedOutput::json(json!({"value": "destination must fail after bytes"}));
     let measured = output.measure().unwrap();
     let mut destination = FailAfter {
         remaining: 5,
@@ -245,7 +245,7 @@ fn serializer_failure_retains_no_partial_terminal() {
         terminal = Some(destination.accepted);
     }
 
-    assert!(matches!(result, Err(PreparedOutputError::Serialize(_))));
+    assert!(matches!(result, Err(PreparedOutputError::Write(_))));
     assert!(destination.accepted > 0);
     assert_eq!(terminal, None);
 }

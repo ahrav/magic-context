@@ -17,7 +17,7 @@ use std::{
 use async_trait::async_trait;
 use mc_host::{
     CallError, Client, ClientError, RequestOptions, ResponseStream, RouteHandle, RouteIdentity,
-    RouteTarget, SendOutcome, StreamItem, TargetKind,
+    RouteTarget, SendOutcome, StreamItem, TargetKind, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -799,7 +799,7 @@ impl HistorianProducer {
         let frozen_daemon = self.connection.daemon_id();
         let response = match self.send_frozen_once(&frozen).await {
             Ok(response) => response,
-            Err(error) if is_outcome_unknown(&error) => {
+            Err(error) if is_outcome_unknown(&error) && !self.stop_requested() => {
                 self.replay_frozen_once(frozen_daemon, frozen_identity, &frozen)
                     .await?
             }
@@ -980,8 +980,8 @@ impl HistorianProducer {
                     project_root: semantic.project_root,
                     harness: semantic.harness,
                     session: semantic.session,
-                    consumer_module_id: nonempty_env("SUBC_MODULE_ID"),
-                    consumer_launch_nonce: nonempty_env("SUBC_LAUNCH_NONCE"),
+                    consumer_module_id: nonempty_env(SUBC_MODULE_ID_ENV),
+                    consumer_launch_nonce: nonempty_env(SUBC_LAUNCH_NONCE_ENV),
                     consumer_capabilities: Vec::new(),
                     admission_facts: None,
                 },
@@ -1085,6 +1085,26 @@ impl HistorianProducer {
             timeout,
             cancellation: self.config.cancellation.clone(),
         }
+    }
+
+    /// Whether the caller has asked this producer to stop.
+    ///
+    /// Replay exists for an ambiguous *transport* loss: the request may have
+    /// been dispatched, so resending on a fresh generation is how the run gets
+    /// established. A caller cancellation produces the same `OutcomeUnknown`
+    /// classification for the same reason — the bytes may already be gone — but
+    /// the correct response is the opposite. Replaying there dials a new
+    /// connection and re-sends `session.send` after the caller explicitly said
+    /// stop, which starts a billable run if the original never went out, and
+    /// during handler shutdown makes a cancelled task perform connection setup
+    /// instead of draining. The token is the authority on that, not the error
+    /// code: it is what the caller actually signalled. The deadline and
+    /// transport-loss replays are unaffected because neither cancels it.
+    fn stop_requested(&self) -> bool {
+        self.config
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
     }
 }
 
@@ -1507,6 +1527,16 @@ mod tests {
         ))
     }
 
+    /// The shape the managed client reports when the caller's token fires after
+    /// the writer may already have claimed the request.
+    fn cancelled_unknown() -> HistorianProducerError {
+        HistorianProducerError::Call(HistorianCallFailure::untagged(
+            HistorianSendOutcome::OutcomeUnknown,
+            "cancelled",
+            "request was cancelled",
+        ))
+    }
+
     fn terminal(code: &str) -> HistorianProducerError {
         HistorianProducerError::Call(HistorianCallFailure::untagged(
             HistorianSendOutcome::Terminal,
@@ -1681,6 +1711,71 @@ mod tests {
                 .is_err());
             assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 0);
             assert_eq!(state.lock().unwrap().requests.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_prevents_replay_but_transport_loss_still_replays() {
+        // A caller cancellation and an ambiguous transport loss are both
+        // OutcomeUnknown for the same reason — the bytes may already be gone —
+        // but they need opposite handling. Replaying a cancellation dials a new
+        // connection and re-sends `session.send` after the caller said stop,
+        // starting a run if the original never went out, and during handler
+        // shutdown makes a cancelled task do connection setup instead of
+        // draining. The token is the authority, so the transport replay below
+        // must survive the gate.
+        async fn start_with_token(
+            token: Option<CancellationToken>,
+        ) -> (
+            Arc<FakeConnector>,
+            Arc<Mutex<FakeState>>,
+            Result<RunHandle, HistorianProducerError>,
+        ) {
+            let first = connection(9, [Err(cancelled_unknown())]);
+            let second = connection(9, [Ok(br#"{"run_id":"replayed"}"#.to_vec())]);
+            let second_state = Arc::clone(&second.state);
+            let connector = Arc::new(FakeConnector {
+                initial: first,
+                reconnects: Mutex::new(VecDeque::from(vec![(second, None)])),
+                reconnect_calls: AtomicU64::new(0),
+            });
+            let config = HistorianProducerConfig {
+                request_timeout: Duration::from_secs(1),
+                await_timeout: Duration::from_secs(1),
+                cancellation: token,
+                ..HistorianProducerConfig::new("/unused", "/project", "opencode")
+            };
+            let mut producer = HistorianProducer::connect_with(config, connector.clone())
+                .await
+                .unwrap();
+            let result = producer
+                .start("session", "", "prompt", "provider/model")
+                .await;
+            (connector, second_state, result)
+        }
+
+        // Cancelled: the failure surfaces to the caller and nothing is resent.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (connector, replay_state, result) = start_with_token(Some(cancelled)).await;
+        let error = result.expect_err("a cancelled start does not succeed by replaying");
+        assert!(is_outcome_unknown(&error), "{error:?}");
+        assert_eq!(
+            connector.reconnect_calls.load(Ordering::SeqCst),
+            0,
+            "a cancelled caller must not trigger connection setup"
+        );
+        assert!(
+            replay_state.lock().unwrap().requests.is_empty(),
+            "a cancelled caller must not have its request resent"
+        );
+
+        // Live token: the intentional transport-loss replay is unaffected.
+        for token in [None, Some(CancellationToken::new())] {
+            let (connector, replay_state, result) = start_with_token(token).await;
+            assert_eq!(result.expect("transport loss replays").run_id, "replayed");
+            assert_eq!(connector.reconnect_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(replay_state.lock().unwrap().requests.len(), 1);
         }
     }
 

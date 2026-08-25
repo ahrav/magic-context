@@ -88,7 +88,8 @@ impl fmt::Debug for PreparedSegment {
 }
 
 impl PreparedOutput {
-    /// Retains a JSON value for counting and serialization after reservation.
+    /// Retains a JSON value; measurement performs the single serialization
+    /// pass and the write phase reuses the encoded bytes.
     pub fn json(value: Value) -> Self {
         Self {
             source: PreparedSource::Json(Arc::new(value)),
@@ -124,13 +125,28 @@ impl PreparedOutput {
     }
 
     /// Measures this immutable source exactly before output reservation.
+    ///
+    /// JSON sources are serialized exactly once, here: the encoded bytes are
+    /// cap-checked as they are produced and carried in the returned
+    /// measurement, so `write_to` copies them instead of running the
+    /// serializer a second time.
     pub fn measure(&self) -> Result<MeasuredOutput<'_>, PreparedOutputError> {
-        let len = match &self.source {
-            PreparedSource::Json(value) => measure_json(value)?,
-            PreparedSource::Exact(bytes) => checked_body_len([bytes.len()])?,
-            PreparedSource::Transform(segments) => measure_transform(segments)?,
+        let (source, len) = match &self.source {
+            PreparedSource::Json(value) => {
+                let encoded = encode_json(value)?;
+                let len = encoded.len();
+                (MeasuredSource::Encoded(encoded), len)
+            }
+            PreparedSource::Exact(bytes) => {
+                let len = checked_body_len([bytes.len()])?;
+                (MeasuredSource::Exact(bytes), len)
+            }
+            PreparedSource::Transform(segments) => {
+                let len = measure_transform(segments)?;
+                (MeasuredSource::Transform(segments), len)
+            }
         };
-        Ok(MeasuredOutput { output: self, len })
+        Ok(MeasuredOutput { source, len })
     }
 }
 
@@ -202,8 +218,17 @@ impl fmt::Debug for PreparedOutcome {
 
 /// Exact measurement tied to the immutable source that produced it.
 pub struct MeasuredOutput<'a> {
-    output: &'a PreparedOutput,
+    source: MeasuredSource<'a>,
     len: usize,
+}
+
+/// Source view captured at measurement time. JSON arrives already encoded
+/// (measurement is the single serialization pass); the other variants borrow
+/// the prepared source and stream it during the write.
+enum MeasuredSource<'a> {
+    Encoded(Vec<u8>),
+    Exact(&'a [u8]),
+    Transform(&'a TransformSegments),
 }
 
 impl MeasuredOutput<'_> {
@@ -218,13 +243,10 @@ impl MeasuredOutput<'_> {
     /// Writes into a caller-reserved destination and verifies exact length.
     pub fn write_to<W: Write>(&self, destination: &mut W) -> Result<usize, PreparedOutputError> {
         let mut destination = BoundedWriter::new(destination, self.len);
-        match &self.output.source {
-            PreparedSource::Json(value) => {
-                serde_json::to_writer(&mut destination, value)
-                    .map_err(PreparedOutputError::Serialize)?;
-            }
-            PreparedSource::Exact(bytes) => destination.write_all(bytes)?,
-            PreparedSource::Transform(segments) => write_transform(segments, &mut destination)?,
+        match &self.source {
+            MeasuredSource::Encoded(bytes) => destination.write_all(bytes)?,
+            MeasuredSource::Exact(bytes) => destination.write_all(bytes)?,
+            MeasuredSource::Transform(segments) => write_transform(segments, &mut destination)?,
         }
         let written = destination.written();
         if written != self.len {
@@ -304,16 +326,20 @@ fn checked_body_len(
     Ok(total)
 }
 
-fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
-    let mut counter = CountingWriter::default();
-    let result = serde_json::to_writer(&mut counter, value).map_err(PreparedOutputError::Serialize);
-    finish_count(counter, result)
+/// Serializes a JSON value once, enforcing the wire cap as bytes are
+/// produced: each append is cap-checked before the buffer grows, so an
+/// over-cap body fails without buffering past the cap.
+fn encode_json(value: &Value) -> Result<Vec<u8>, PreparedOutputError> {
+    let mut writer = CountingWriter::collecting();
+    let result = serde_json::to_writer(&mut writer, value).map_err(PreparedOutputError::Serialize);
+    let writer = finish_count(writer, result)?;
+    Ok(writer.collected.unwrap_or_default())
 }
 
 fn finish_count(
     counter: CountingWriter,
     result: Result<(), PreparedOutputError>,
-) -> Result<usize, PreparedOutputError> {
+) -> Result<CountingWriter, PreparedOutputError> {
     match counter.failure {
         Some(CountFailure::Overflow) => Err(PreparedOutputError::LengthOverflow),
         Some(CountFailure::TooLarge(len)) => Err(PreparedOutputError::BodyTooLarge {
@@ -322,7 +348,7 @@ fn finish_count(
         }),
         None => {
             result?;
-            Ok(counter.len)
+            Ok(counter)
         }
     }
 }
@@ -332,7 +358,7 @@ fn measure_transform(segments: &TransformSegments) -> Result<usize, PreparedOutp
     let result = write_transform_envelope(segments, &mut counter, |counter, message| {
         counter.add_len(message.measured_len)
     });
-    finish_count(counter, result)
+    finish_count(counter, result).map(|counter| counter.len)
 }
 
 fn write_transform<W: Write>(
@@ -381,13 +407,24 @@ enum CountFailure {
     TooLarge(usize),
 }
 
+/// Counts (and optionally collects) bytes against the wire cap. The cap check
+/// precedes any buffering, so a collecting writer never allocates past the
+/// cap before reporting `TooLarge`.
 #[derive(Default)]
 struct CountingWriter {
     len: usize,
     failure: Option<CountFailure>,
+    collected: Option<Vec<u8>>,
 }
 
 impl CountingWriter {
+    fn collecting() -> Self {
+        Self {
+            collected: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
     fn add_len(&mut self, len: usize) -> Result<(), PreparedOutputError> {
         let Some(next) = self.len.checked_add(len) else {
             self.failure = Some(CountFailure::Overflow);
@@ -409,6 +446,9 @@ impl Write for CountingWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.add_len(bytes.len())
             .map_err(|error| io::Error::new(io::ErrorKind::FileTooLarge, error.to_string()))?;
+        if let Some(buffer) = &mut self.collected {
+            buffer.extend_from_slice(bytes);
+        }
         Ok(bytes.len())
     }
 

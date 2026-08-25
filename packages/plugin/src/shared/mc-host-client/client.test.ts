@@ -1853,7 +1853,7 @@ describe("transport negotiation", () => {
             negotiate: (frame, conn) => void sendErrorBody(conn, frame.corr, "server_busy"),
         });
         const { error } = await connectRejected({ peer });
-        expectCallError(error, "terminal", "negotiation_failed");
+        expectCallError(error, "terminal", "host_negotiation_rejected");
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
         expect(peer.connections.length).toBe(1);
@@ -1876,7 +1876,7 @@ describe("transport negotiation", () => {
                 }),
         });
         const { error } = await connectRejected({ peer });
-        expectCallError(error, "terminal", "negotiation_failed");
+        expectCallError(error, "terminal", "host_negotiation_rejected");
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
         expect(peer.connections.length).toBe(1);

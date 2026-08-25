@@ -33,10 +33,9 @@ mod tcp_frame_channel;
 mod wire;
 
 pub use auth::{
-    authenticate_client, authenticate_client_with_role, authenticate_server, compute_proof,
-    AuthError, AuthStage, Authenticated, ClientAuth, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN,
-    DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
-    WATCHDOG_CLIENT_ROLE,
+    authenticate_client, authenticate_server, compute_proof, AuthError, AuthStage, Authenticated,
+    ClientAuth, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE,
+    MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
 };
 pub use client::{
     CallError, Client, ClientError, RequestOptions, Response, ResponseStream, SendOutcome,
@@ -67,5 +66,9 @@ pub use runtime::{run, HostError};
 /// The version-2 body cap. Published so a consumer preparing an output can
 /// gate on the same value frame admission enforces, rather than restating it.
 pub use wire::MAX_FRAME_BODY_LEN;
+/// Launch-identity environment variable names. Published so module-side code
+/// reads the same names the host injects at spawn, rather than restating the
+/// protocol vocabulary as string literals.
+pub use wire::{SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
 
 pub use tokio_util::sync::CancellationToken;

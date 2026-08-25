@@ -19,7 +19,7 @@ use std::{
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpStream},
+    net::{tcp::OwnedWriteHalf, TcpStream},
     sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{timeout_at, Instant},
@@ -31,8 +31,8 @@ use crate::{
     connection_file::{read_for_client, ConnectionInfo, DAEMON_ID_LEN},
     handler::{RouteHandle, RouteIdentity, RouteTarget, TargetKind},
     transport_negotiation::{
-        decode_negotiate_response, NegotiateResponse, TransportOffer, NEGOTIATION_VERSION,
-        TRANSPORT_TCP,
+        decode_negotiate_response, encode_negotiate_request, NegotiateRequest, NegotiateResponse,
+        TransportOffer, NEGOTIATION_VERSION, TRANSPORT_TCP,
     },
     wire::{
         decode_header, encode_owned_frame, pure_header_flags, AdmissionClass, EnvelopeHeader,
@@ -70,6 +70,10 @@ const NEGOTIATION_CORRELATION: u64 = 1;
 const FIRST_APPLICATION_CORRELATION: u64 = 2;
 const MAX_ERROR_CODE_BYTES: usize = 128;
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
+/// Read-side socket buffer for the wire read path. Matches the framing
+/// layer's `tcp_frame_channel` read buffer so the per-frame header-then-body
+/// reads coalesce into large socket reads instead of one syscall per field.
+const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Exact send-outcome classifications used by recovery policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +295,10 @@ impl Client {
         .await
         .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
         .map_err(|_| ClientError::new("dial_failed", "daemon dial failed"))?;
+        // Interactive request/response traffic; Nagle would add up to one RTT
+        // of coalescing delay per small frame. Best-effort, as in the server's
+        // accept path.
+        let _ = stream.set_nodelay(true);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(ClientError::new(
@@ -333,7 +341,11 @@ impl Client {
         });
         let reader_inner = Arc::clone(&inner);
         let reader = tokio::spawn(async move {
-            reader_loop(reader_inner, read).await;
+            reader_loop(
+                reader_inner,
+                tokio::io::BufReader::with_capacity(READ_BUFFER_BYTES, read),
+            )
+            .await;
         });
         *inner.writer.lock().await = Some(writer);
         *inner.reader.lock().await = Some(reader);
@@ -655,6 +667,14 @@ impl ResponseStream {
             return Ok(());
         }
         self.finished = true;
+        // Items already buffered in the channel each hold a `ByteCharge` against
+        // the owner-wide retained-response budget, and `next` short-circuits on
+        // `finished`, so nothing would ever drain them. Left in place they stay
+        // charged for as long as the caller keeps this value, and a later
+        // response that cannot charge retires an otherwise healthy generation.
+        // `close` first so the reader task cannot refill what this drains.
+        self.items.close();
+        while self.items.try_recv().is_ok() {}
         if let Some(inner) = self.inner.upgrade() {
             inner.cancel_key(self.key, "cancelled")?;
         }
@@ -1134,12 +1154,7 @@ impl Inner {
             .map_err(|_| ClientError::new("connection_retired", "connection retired"))
     }
 
-    fn dispatch(
-        self: &Arc<Self>,
-        header: EnvelopeHeader,
-        body: Vec<u8>,
-        charge: Option<ByteCharge>,
-    ) {
+    fn dispatch(self: &Arc<Self>, header: EnvelopeHeader, body: Vec<u8>, charge: ByteCharge) {
         match header.ty {
             FrameType::Ping => {
                 // V35: the Pong echoes the Ping's flags exactly.
@@ -1224,7 +1239,19 @@ impl Inner {
                         self.finish_pending(
                             state,
                             Err(CallError::local(
-                                SendOutcome::Terminal,
+                                // The host violated the profile, but nothing
+                                // terminal was observed: StreamData is
+                                // nonterminal and the Cancel below is
+                                // best-effort, so the run may still be
+                                // executing or committing. `Terminal` would
+                                // claim an authoritative settlement and
+                                // suppress the recovery this needs (§10.1).
+                                // Abandoning here rather than draining to a
+                                // real terminal is deliberate — a unary
+                                // correlation has no legal stream frames, so
+                                // continuing to read them would treat a
+                                // protocol violation as a supported shape.
+                                SendOutcome::OutcomeUnknown,
                                 "unexpected_stream",
                                 "unary request received stream data",
                             )),
@@ -1241,21 +1268,6 @@ impl Inner {
                         );
                     }
                     PendingKind::Stream { items, .. } => {
-                        // An empty item is never charged, so an absent charge
-                        // means exhaustion only when there were bytes to
-                        // charge for. Reading it as exhaustion either way
-                        // retires the generation over a legal zero-length
-                        // StreamData: `validate_inbound` requires an empty body
-                        // of `StreamEnd` alone.
-                        let charge = match charge {
-                            Some(charge) => Some(charge),
-                            None if header.len == 0 => None,
-                            None => {
-                                drop(pending);
-                                self.retire("response_memory_exhausted");
-                                return;
-                            }
-                        };
                         let item = ChargedItem {
                             body,
                             binary: header.flags.is_binary(),
@@ -1492,6 +1504,18 @@ struct ByteCharge {
     bytes: usize,
 }
 
+impl ByteCharge {
+    /// A zero-byte charge for bodiless frames. Holding one keeps every
+    /// inbound frame's accounting uniform: an absent charge never reaches
+    /// `dispatch`, so "no charge" cannot be misread as an exhausted budget.
+    const fn none() -> Self {
+        Self {
+            owner: Weak::new(),
+            bytes: 0,
+        }
+    }
+}
+
 impl Drop for ByteCharge {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.upgrade() {
@@ -1504,8 +1528,9 @@ impl Drop for ByteCharge {
 struct ChargedItem {
     body: Vec<u8>,
     binary: bool,
-    /// Absent for a zero-length item, which is never charged.
-    _charge: Option<ByteCharge>,
+    /// A zero-length item holds a no-op charge; there were no bytes to
+    /// account for.
+    _charge: ByteCharge,
 }
 
 impl ChargedItem {
@@ -1575,7 +1600,7 @@ async fn writer_loop(
     let _ = write.shutdown().await;
 }
 
-async fn reader_loop(inner: Arc<Inner>, mut read: OwnedReadHalf) {
+async fn reader_loop<R: AsyncRead + Unpin>(inner: Arc<Inner>, mut read: R) {
     loop {
         let frame = match read_active_frame(&mut read, &inner).await {
             Ok(Some(frame)) => frame,
@@ -1598,7 +1623,10 @@ async fn reader_loop(inner: Arc<Inner>, mut read: OwnedReadHalf) {
 struct InboundFrame {
     header: EnvelopeHeader,
     body: Vec<u8>,
-    charge: Option<ByteCharge>,
+    /// Retained-budget accounting for `body`. A bodiless frame carries
+    /// `ByteCharge::none()`; a refused charge never constructs a frame at all
+    /// (`read_active_frame` drains and fails the connection instead).
+    charge: ByteCharge,
 }
 
 async fn read_active_frame<R: AsyncRead + Unpin>(
@@ -1618,19 +1646,18 @@ async fn read_active_frame<R: AsyncRead + Unpin>(
     read_exact_until(read, &mut header_bytes[1..], deadline, &inner.cancel).await?;
     let header = decode_header(&header_bytes).map_err(|_| ())?;
     validate_inbound(&header)?;
-    let charge = if header.len == 0 {
-        None
-    } else {
-        inner.retained_budget.charge(header.len as usize)
-    };
-    let mut body = Vec::new();
-    if let Some(_charge) = charge.as_ref() {
-        body.resize(header.len as usize, 0);
-        read_exact_until(read, &mut body, deadline, &inner.cancel).await?;
-    } else if header.len > 0 {
+    if header.len == 0 {
+        return Ok(Some(InboundFrame {
+            header,
+            body: Vec::new(),
+            charge: ByteCharge::none(),
+        }));
+    }
+    let Some(charge) = inner.retained_budget.charge(header.len as usize) else {
         drain_until(read, header.len as usize, deadline, &inner.cancel).await?;
         return Err(());
-    }
+    };
+    let body = read_body_until(read, header.len as usize, deadline, &inner.cancel).await?;
     Ok(Some(InboundFrame {
         header,
         body,
@@ -1657,6 +1684,32 @@ async fn read_exact_until<R: AsyncRead + Unpin>(
         offset += count;
     }
     Ok(())
+}
+
+/// Reads exactly `len` body bytes under one frame deadline.
+///
+/// `read_buf` appends into the vector's spare capacity without
+/// zero-initializing it, and `take` caps the read at the frame boundary even
+/// when the allocated capacity exceeds `len`.
+async fn read_body_until<R: AsyncRead + Unpin>(
+    read: &mut R,
+    len: usize,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, ()> {
+    let mut body = Vec::with_capacity(len);
+    let mut limited = read.take(len as u64);
+    while body.len() < len {
+        let count = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(()),
+            result = timeout_at(deadline, limited.read_buf(&mut body)) => result.map_err(|_| ())?.map_err(|_| ())?,
+        };
+        if count == 0 {
+            return Err(());
+        }
+    }
+    Ok(body)
 }
 
 async fn drain_until<R: AsyncRead + Unpin>(
@@ -1806,12 +1859,18 @@ fn encode_data_frame(
 }
 
 async fn negotiate_tcp(stream: &mut TcpStream, deadline: Instant) -> Result<(), ClientError> {
-    let body = serde_json::to_vec(&serde_json::json!({
-        "op": "transport.negotiate",
-        "negotiation_version": NEGOTIATION_VERSION,
-        "offers": [{"transport": TRANSPORT_TCP, "capability_version": 1}]
-    }))
-    .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
+    // One offers value feeds both the encoded request and response
+    // validation, so the selection is checked against exactly what was sent.
+    let request = NegotiateRequest {
+        negotiation_version: NEGOTIATION_VERSION,
+        offers: vec![TransportOffer {
+            transport: TRANSPORT_TCP.to_owned(),
+            capability_version: 1,
+            parameters: None,
+        }],
+    };
+    let body = encode_negotiate_request(&request)
+        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
     let bytes = encode_owned_frame(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
@@ -1837,12 +1896,7 @@ async fn negotiate_tcp(stream: &mut TcpStream, deadline: Instant) -> Result<(), 
             "transport negotiation failed closed",
         ));
     }
-    let offers = [TransportOffer {
-        transport: TRANSPORT_TCP.to_owned(),
-        capability_version: 1,
-        parameters: None,
-    }];
-    let selection = decode_negotiate_response(&frame.body, &offers).map_err(|_| {
+    let selection = decode_negotiate_response(&frame.body, &request.offers).map_err(|_| {
         ClientError::new("negotiation_failed", "transport negotiation failed closed")
     })?;
     if !matches!(selection, NegotiateResponse::Tcp { reason: None }) {
@@ -1879,7 +1933,7 @@ async fn read_setup_frame(
     Ok(InboundFrame {
         header,
         body,
-        charge: None,
+        charge: ByteCharge::none(),
     })
 }
 
@@ -2371,7 +2425,7 @@ mod tests {
                         corr: key.corr,
                     },
                     Vec::new(),
-                    None,
+                    ByteCharge::none(),
                 ),
             }
 
@@ -2544,7 +2598,7 @@ mod tests {
                 "{priority:?} is a valid Ping priority, not a reason to retire"
             );
 
-            inner.dispatch(ping, Vec::new(), None);
+            inner.dispatch(ping, Vec::new(), ByteCharge::none());
 
             let pong = control_rx.recv().await.expect("Pong queued");
             assert_eq!(pong.bytes[5], FrameType::Pong as u8);
@@ -2577,8 +2631,9 @@ mod tests {
     #[tokio::test]
     async fn a_zero_length_stream_item_is_delivered_without_retiring() {
         // Only `StreamEnd` must be empty, so a zero-length `StreamData` is
-        // legal. It carries no charge because there were no bytes to charge
-        // for, which must not read as an exhausted budget.
+        // legal. It carries a no-op charge because there were no bytes to
+        // account for, and it must reach the stream rather than retire the
+        // generation.
         let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
         let (items_tx, mut items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
         let (terminal_tx, _terminal_rx) = oneshot::channel();
@@ -2607,12 +2662,12 @@ mod tests {
                 corr: key.corr,
             },
             Vec::new(),
-            None,
+            ByteCharge::none(),
         );
 
         assert!(
             !inner.retired.load(Ordering::Acquire),
-            "an uncharged empty item is not an exhausted budget"
+            "an empty item carries a no-op charge, not an exhausted budget"
         );
         let item = items_rx.try_recv().expect("the empty item is delivered");
         assert!(item.body.is_empty());
@@ -2957,7 +3012,7 @@ mod tests {
                 corr: key.corr,
             },
             Vec::new(),
-            None,
+            ByteCharge::none(),
         );
         assert!(matches!(
             rx.try_recv(),
@@ -3009,7 +3064,7 @@ mod tests {
                     corr: stream_key.corr,
                 },
                 vec![1],
-                Some(charge),
+                charge,
             );
         }
         let error = terminal_rx
@@ -3037,11 +3092,133 @@ mod tests {
                 corr: unary_key.corr,
             },
             Vec::new(),
-            None,
+            ByteCharge::none(),
         );
         assert!(unary_rx.try_recv().expect("unary settled").is_ok());
         assert!(lock_unpoisoned(&inner.pending).is_empty());
         inner.retire("test_done");
+    }
+
+    #[tokio::test]
+    async fn unary_stream_data_is_unknown_not_terminal() {
+        // StreamData is nonterminal and the Cancel this path queues is
+        // best-effort, so the host may still be running the request. Reporting
+        // `Terminal` would claim a settlement the client never observed and
+        // suppress the recovery §10.1 requires.
+        let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let (kind, mut rx) = unary_sender();
+        let (key, _publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                kind,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("admitted");
+        drop(data_rx.recv().await);
+
+        inner.dispatch(
+            EnvelopeHeader {
+                len: 1,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::StreamData,
+                flags: response_flags(false, false),
+                channel: key.channel,
+                epoch: key.epoch,
+                corr: key.corr,
+            },
+            vec![1],
+            inner.retained_budget.charge(1).expect("retained byte"),
+        );
+
+        let error = rx
+            .try_recv()
+            .expect("unary settled")
+            .expect_err("stream data on a unary is a violation");
+        assert_eq!(error.code(), "unexpected_stream");
+        assert_eq!(error.outcome(), SendOutcome::OutcomeUnknown);
+        // The scoped cleanup is unchanged.
+        let cancel = control_rx.recv().await.expect("scoped Cancel");
+        assert_eq!(cancel.bytes[5], FrameType::Cancel as u8);
+        inner.retire("test_done");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_stream_releases_its_queued_item_charges() {
+        // Buffered items each hold a charge against the owner-wide retained
+        // budget, and `next` short-circuits on `finished`, so a cancelled stream
+        // the caller keeps alive would pin those bytes indefinitely — enough of
+        // them makes a later response fail admission and retire a healthy
+        // generation.
+        let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let (items_tx, items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let (key, publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                PendingKind::Stream {
+                    items: items_tx,
+                    terminal: terminal_tx,
+                    _settled: CancellationToken::new().drop_guard(),
+                },
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("stream admitted");
+        // The host only streams items back after receiving the request, so the
+        // writer has necessarily claimed it. That also makes the cancel
+        // OutcomeUnknown, which is the classification that emits the Cancel.
+        assert!(claim_for_write(&publish), "the writer claimed the request");
+        drop(data_rx.recv().await);
+
+        let mut stream = ResponseStream {
+            inner: Arc::downgrade(&inner),
+            key,
+            correlation: key.corr,
+            items: items_rx,
+            terminal: Some(terminal_rx),
+            finished: false,
+        };
+
+        // Queue items without draining them, exactly as a slow consumer leaves
+        // them.
+        const ITEMS: usize = 4;
+        for _ in 0..ITEMS {
+            inner.dispatch(
+                EnvelopeHeader {
+                    len: 8,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType::StreamData,
+                    flags: response_flags(false, false),
+                    channel: key.channel,
+                    epoch: key.epoch,
+                    corr: key.corr,
+                },
+                vec![7; 8],
+                inner.retained_budget.charge(8).expect("retained bytes"),
+            );
+        }
+        assert_eq!(inner.retained_budget.used(), ITEMS * 8);
+
+        stream.cancel().expect("cancel succeeds");
+        assert_eq!(
+            inner.retained_budget.used(),
+            0,
+            "cancel released every queued item's charge while the stream is still alive"
+        );
+        // The stream value is deliberately still held here: releasing on drop is
+        // what this test proves is not sufficient.
+        assert!(stream
+            .next()
+            .await
+            .expect("cancelled stream ends")
+            .is_none());
+        let cancel = control_rx.recv().await.expect("scoped Cancel");
+        assert_eq!(cancel.bytes[5], FrameType::Cancel as u8);
+        inner.retire("test_done");
+        drop(stream);
     }
 
     #[tokio::test(start_paused = true)]

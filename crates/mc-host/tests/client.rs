@@ -443,6 +443,166 @@ async fn managed_client_negotiation_failures_retire_socket_without_application_f
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn zero_length_stream_item_is_delivered_and_does_not_retire_the_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Only `StreamEnd` must be empty, so a zero-length `StreamData` item is
+    // legal. It must reach the stream consumer rather than being misread as an
+    // exhausted retained-byte budget, which would retire the generation and
+    // fail every unrelated in-flight request.
+    const STREAM_FLAGS: u8 = raw_client::FLAGS_INTERACTIVE;
+
+    async fn read_frame(socket: &mut tokio::net::TcpStream) -> raw_client::RawFrame {
+        let mut header = [0u8; raw_client::HEADER_LEN];
+        socket.read_exact(&mut header).await.expect("frame header");
+        let mut frame = raw_client::decode_header(&header);
+        if frame.len > 0 {
+            let mut body = vec![0; frame.len as usize];
+            socket.read_exact(&mut body).await.expect("frame body");
+            frame.body = body;
+        }
+        frame
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let publication = root.path().join("connection.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let key = vec![0x5a; 32];
+    let daemon_id = [0x3c; 16];
+    let info = ConnectionInfo {
+        schema: 1,
+        wire_version: 2,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".to_owned(),
+            port: listener.local_addr().unwrap().port(),
+        }],
+        key: key.clone(),
+        daemon_id,
+        pid: std::process::id(),
+        daemon_ver: "fake-peer".to_owned(),
+    };
+    std::fs::write(&publication, serde_json::to_vec(&info).unwrap()).unwrap();
+    std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        authenticate_server(
+            &mut socket,
+            &key,
+            &daemon_id,
+            "fake-peer",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("managed client authenticates");
+
+        // Negotiation (correlation 1).
+        let negotiate = read_frame(&mut socket).await;
+        assert_eq!(negotiate.corr, 1);
+        let selection = br#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1}}"#;
+        let mut reply = raw_client::header(
+            selection.len() as u32,
+            TY_RESPONSE,
+            FLAGS_RESPONSE_TEXT_LAST,
+            0,
+            0,
+            1,
+        );
+        reply.extend_from_slice(selection);
+        socket.write_all(&reply).await.expect("selection reply");
+
+        // route.open (correlation 2) grants channel 7 epoch 1.
+        let open = read_frame(&mut socket).await;
+        assert_eq!(open.corr, 2);
+        let opened = br#"{"op":"route.open","route_channel":7,"route_epoch":1}"#;
+        let mut reply = raw_client::header(
+            opened.len() as u32,
+            TY_RESPONSE,
+            FLAGS_RESPONSE_TEXT_LAST,
+            0,
+            0,
+            2,
+        );
+        reply.extend_from_slice(opened);
+        socket.write_all(&reply).await.expect("route.open reply");
+
+        // Stream request (correlation 3): first item empty, then a payload
+        // item, then StreamEnd.
+        let stream_request = read_frame(&mut socket).await;
+        assert_eq!(stream_request.corr, 3);
+        assert_eq!(stream_request.channel, 7);
+        let empty_item = raw_client::header(0, raw_client::TY_STREAM_DATA, STREAM_FLAGS, 7, 1, 3);
+        socket.write_all(&empty_item).await.expect("empty item");
+        let payload = b"payload";
+        let mut item = raw_client::header(
+            payload.len() as u32,
+            raw_client::TY_STREAM_DATA,
+            STREAM_FLAGS,
+            7,
+            1,
+            3,
+        );
+        item.extend_from_slice(payload);
+        socket.write_all(&item).await.expect("payload item");
+        let end = raw_client::header(0, raw_client::TY_STREAM_END, STREAM_FLAGS, 7, 1, 3);
+        socket.write_all(&end).await.expect("stream end");
+
+        // An unrelated unary (correlation 4) proves the generation survived.
+        let unary = read_frame(&mut socket).await;
+        assert_eq!(unary.corr, 4);
+        let mut reply = raw_client::header(
+            unary.body.len() as u32,
+            TY_RESPONSE,
+            FLAGS_RESPONSE_TEXT_LAST,
+            7,
+            1,
+            4,
+        );
+        reply.extend_from_slice(&unary.body);
+        socket.write_all(&reply).await.expect("unary echo");
+    });
+
+    let client = Client::connect(&publication)
+        .await
+        .expect("managed client connects to fake peer");
+    let route = client
+        .open_route(target(), identity("empty-item"))
+        .await
+        .expect("route opens");
+    let mut stream = client
+        .request_stream(route, b"stream".to_vec(), RequestOptions::default())
+        .await
+        .expect("stream starts");
+
+    let first = stream
+        .next()
+        .await
+        .expect("empty item does not retire the generation")
+        .expect("first item is delivered");
+    assert!(first.body.is_empty(), "the empty item arrives intact");
+    let second = stream
+        .next()
+        .await
+        .expect("stream continues past the empty item")
+        .expect("second item is delivered");
+    assert_eq!(second.body, b"payload");
+    assert!(
+        stream.next().await.expect("stream ends cleanly").is_none(),
+        "StreamEnd terminates the stream"
+    );
+
+    let body = b"after-empty-item".to_vec();
+    let response = client
+        .request(route, body.clone(), RequestOptions::default())
+        .await
+        .expect("an unrelated request still succeeds on the same generation");
+    assert_eq!(response.body, body);
+    peer.await.unwrap();
+}
+
 #[tokio::test]
 async fn close_rejects_new_sends() {
     let host = TestHost::start().await;

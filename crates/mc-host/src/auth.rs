@@ -19,7 +19,6 @@ pub const MAX_AUTH_MESSAGE_LEN: u32 = 4096;
 pub const SERVER_PROOF_DOMAIN: &str = "subc-server-v1";
 pub const CLIENT_AUTH_DOMAIN: &str = "subc-client-v1";
 pub const DEFAULT_CLIENT_ROLE: &str = "client";
-pub const WATCHDOG_CLIENT_ROLE: &str = "watchdog";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -47,19 +46,15 @@ pub struct ClientAuth {
 /// WHAT THIS PROVES: the peer possesses the connection key, and (client side)
 /// that the daemon does too. Nothing more.
 ///
-/// WHAT `role` IS NOT: it is a string the CLIENT SENT, echoed back unverified.
-/// The handshake never checks it against anything, so it carries no authority --
-/// any peer holding the key can claim any role. It exists so a caller can tell
-/// self-issued traffic (the daemon's own watchdog probe) from real clients when
-/// REPORTING, and it must never decide admission, capacity, or privilege.
-///
-/// A type called `Authenticated` invites reading every field as attested. Only
-/// the possession of the key is. Module identity, which IS attested, travels a
-/// different path entirely (spawn nonces validated at route.open).
+/// Deliberately empty: everything else in the handshake transcript is
+/// client-asserted and unverified. `ClientHello.role` in particular is parsed
+/// and then discarded — any peer holding the key can claim any role, so it
+/// must never decide admission, capacity, or privilege. A type called
+/// `Authenticated` invites reading its fields as attested, and only key
+/// possession is. Module identity, which IS attested, travels a different
+/// path entirely (spawn nonces validated at route.open).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Authenticated {
-    pub role: String,
-}
+pub struct Authenticated;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStage {
@@ -237,7 +232,7 @@ where
         return Err(AuthError::InvalidClientAuth);
     }
 
-    Ok(Authenticated { role: hello.role })
+    Ok(Authenticated)
 }
 
 pub async fn authenticate_client<S>(
@@ -248,20 +243,8 @@ pub async fn authenticate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    authenticate_client_with_role(stream, conn, deadline, DEFAULT_CLIENT_ROLE).await
-}
-
-pub async fn authenticate_client_with_role<S>(
-    stream: &mut S,
-    conn: &ConnectionInfo,
-    deadline: Duration,
-    role: &str,
-) -> Result<(), AuthError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
     let deadline = Deadline::starting_now(deadline)?;
-    let result = authenticate_client_inner(stream, conn, deadline, role).await;
+    let result = authenticate_client_inner(stream, conn, deadline).await;
     if result.is_err() {
         let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
     }
@@ -272,7 +255,6 @@ async fn authenticate_client_inner<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
     deadline: Deadline,
-    role: &str,
 ) -> Result<(), AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -285,7 +267,7 @@ where
         AuthStage::ClientHello,
         &ClientHello {
             client_nonce,
-            role: role.to_owned(),
+            role: DEFAULT_CLIENT_ROLE.to_owned(),
         },
         deadline,
     )
@@ -832,11 +814,10 @@ mod tests {
             &server_proof.daemon_id,
         );
         write_auth_json(&mut client, &ClientAuth { client_auth }).await;
-        let authenticated = server_task
+        server_task
             .await
             .expect("join")
             .expect("handshake completes");
-        assert_eq!(authenticated.role, TEST_ROLE);
         server_proof
     }
 

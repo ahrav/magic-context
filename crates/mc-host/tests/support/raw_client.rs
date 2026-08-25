@@ -394,10 +394,13 @@ impl RawClient {
     }
 
     async fn negotiate_tcp(&mut self) -> Result<(), String> {
+        // The body stays hand-rolled (this oracle never calls mc-host's
+        // encoders), but the version is the shared public protocol constant
+        // rather than a second copy of the literal.
         let corr = self
             .control(&serde_json::json!({
                 "op": "transport.negotiate",
-                "negotiation_version": 1,
+                "negotiation_version": mc_host::transport_negotiation::NEGOTIATION_VERSION,
                 "offers": [{"transport": "tcp", "capability_version": 1}]
             }))
             .await
@@ -415,7 +418,7 @@ impl RawClient {
         }
         let expected = serde_json::json!({
             "op": "transport.negotiate",
-            "negotiation_version": 1,
+            "negotiation_version": mc_host::transport_negotiation::NEGOTIATION_VERSION,
             "selected": {"transport": "tcp", "capability_version": 1}
         });
         if frame.json() != expected {
