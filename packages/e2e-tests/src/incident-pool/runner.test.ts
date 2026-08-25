@@ -489,6 +489,23 @@ describe("run snapshot selection", () => {
         ).toEqual(["var-blocked-one", "var-red-one"]);
     });
 
+    it("filters by exact requested variants", () => {
+        const data = fixture();
+        const snapshot = buildRunSnapshot({
+            catalog: data.catalog,
+            ledger: replayAdjudicationLedger(data.events),
+            adjudicationLines: data.adjudicationLines,
+            harness: "opencode",
+            lanes: ["green", "known-red"],
+            variantIds: ["var-green-one", "var-red-one"],
+            implementationDigests: data.implementationDigests,
+        });
+        expect(snapshot.selected.map((entry) => entry.variantId).sort()).toEqual([
+            "var-green-one",
+            "var-red-one",
+        ]);
+    });
+
     it("fails hard on a missing baseline and excludes an unregistered variant", () => {
         const data = fixture();
         const noBaseline = data.events.filter(

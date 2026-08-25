@@ -130,24 +130,27 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a28-1",
-                        "fingerprint": "1d65f3fb16d1ff93202d9b4f60be639a3b0eca305849115b10f28ffb69173d3b"
+                        "id": "rev-a28-2",
+                        "fingerprint": "17d53cbf04656bc409bc0d5e81782807f48d6250842f633d3083ebf3ae34f773"
                     },
                     "normative_checks": [
                         "check-a28-project-local-dump",
                         "check-a28-gitignore-coverage",
+                        "check-a28-intentional-retention",
                         "check-a28-report-redaction",
                         "check-a28-metacharacter-safety"
                     ],
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/audit-background-lifecycle.ts#driveHistorianFailureDump",
                         "verifier": "src/incident-pool/scenarios/audit-background-lifecycle.ts#verifyHistorianFailureDump",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
                             "dump written outside the isolated project",
                             "dump not covered by gitignore",
+                            "failed dump removed before intentional retention can be observed",
                             "synthetic canary present in published artifacts",
-                            "terminal metacharacters escape as a command or side effect"
+                            "terminal metacharacters escape as a command or side effect",
+                            "dynamic raw dump data added to the static observation"
                         ]
                     },
                     "blocked_by": [],
@@ -303,22 +306,26 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a47-1",
-                        "fingerprint": "acf4b1eccfc3002194325a1d6b2d412c63a72c61d09470523c63ded848e70c76"
+                        "id": "rev-a47-2",
+                        "fingerprint": "9e9cd069f3a0df1760f4d2bc0980b6a777b6ea601d799b8d493499bdfbee3272"
                     },
                     "normative_checks": [
                         "check-a47-no-post-lease-loss-commit",
+                        "check-a47-durable-happens-before",
                         "check-a47-single-terminal-lease-event",
                         "check-a47-child-released"
                     ],
                     "verifier_binding": {
                         "driver": "src/incident-pool/scenarios/audit-background-lifecycle.ts#driveLeaseLossResidualWrite",
                         "verifier": "src/incident-pool/scenarios/audit-background-lifecycle.ts#verifyLeaseLossResidualWrite",
-                        "binding_status": "declared",
+                        "binding_status": "live",
                         "invalid_state_evidence": [
+                            "ordered callbacks without durable ownership or mutation commits",
                             "lease never acquired before the guarded write",
                             "replacement ownership never committed",
-                            "guarded write never attempted so the trace is vacuous"
+                            "unique mutation already existed before the barrier release",
+                            "guarded write never attempted so the trace is vacuous",
+                            "crash or incomplete no-commit trace presented as a resolution"
                         ]
                     },
                     "blocked_by": [],

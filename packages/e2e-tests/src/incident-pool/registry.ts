@@ -24,6 +24,7 @@ import {
     type IncidentVariant,
 } from "./contract";
 import { rowDigest } from "./history";
+import { auditBackgroundLifecycleIncidentCases } from "./scenarios/audit-background-lifecycle";
 import { auditMemorySearchIncidentCases } from "./scenarios/audit-memory-search";
 
 export const SEMANTIC_FINGERPRINT_CONTRACT = "incident-semantic-fingerprint/v1";
@@ -132,7 +133,10 @@ export function registerIncidentCase(
 
 export function builtinIncidentCaseRegistry(): IncidentCaseRegistry {
     const registry: IncidentCaseRegistry = new Map();
-    for (const entry of auditMemorySearchIncidentCases()) {
+    for (const entry of [
+        ...auditMemorySearchIncidentCases(),
+        ...auditBackgroundLifecycleIncidentCases(),
+    ]) {
         registerIncidentCase(registry, entry);
     }
     return registry;

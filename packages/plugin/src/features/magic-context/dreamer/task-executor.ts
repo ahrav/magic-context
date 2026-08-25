@@ -130,6 +130,10 @@ export interface DreamTaskExecutorDeps {
     retinaHandoff?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
+    curateLifecycle?: {
+        beforePrompt?: () => Promise<void> | void;
+        afterPrompt?: (declareLeaseLost: () => void) => Promise<void> | void;
+    };
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
             context_store_uuid: string;
@@ -1197,14 +1201,15 @@ async function runAgenticTask(
 
     const abortController = new AbortController();
     let leaseLost = false;
+    const declareLeaseLost = (): void => {
+        leaseLost = true;
+        abortController.abort();
+    };
     const heartbeat = startLeaseHeartbeat(
         db,
         holderId,
         leaseKey,
-        () => {
-            leaseLost = true;
-            abortController.abort();
-        },
+        declareLeaseLost,
         ctx.leaseAcquisition,
     );
 
@@ -1247,6 +1252,7 @@ async function runAgenticTask(
         });
 
         const remainingMs = Math.max(0, deadline - Date.now());
+        if (task === "curate") await deps.curateLifecycle?.beforePrompt?.();
         const run = await shared.promptSyncWithValidatedOutputRetry(
             deps.client,
             {
@@ -1291,6 +1297,9 @@ async function runAgenticTask(
                 },
             },
         );
+        if (task === "curate") {
+            await deps.curateLifecycle?.afterPrompt?.(declareLeaseLost);
+        }
 
         if (leaseLost) throw new Error("Dream lease lost during task");
 

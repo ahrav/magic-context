@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseIncidentCatalog } from "../contract";
 import { E2E_ROOT } from "../evidence";
+import * as auditBackgroundLifecycle from "./audit-background-lifecycle";
 import * as auditMemorySearch from "./audit-memory-search";
 import * as regressions from "./source-linked-regressions";
 import {
@@ -282,6 +283,8 @@ describe("registry binding surface", () => {
         );
         const liveModules: Record<string, Record<string, unknown>> = {
             [MODULE_PATH]: regressions as Record<string, unknown>,
+            "src/incident-pool/scenarios/audit-background-lifecycle.ts":
+                auditBackgroundLifecycle as Record<string, unknown>,
             "src/incident-pool/scenarios/audit-memory-search.ts":
                 auditMemorySearch as Record<string, unknown>,
         };
@@ -303,7 +306,7 @@ describe("registry binding surface", () => {
                 liveBindings++;
             }
         }
-        expect(liveBindings).toBe(10);
+        expect(liveBindings).toBe(12);
     });
 
     it("keeps the committed normative checks equal to the verifier-emitted check ids", () => {

@@ -38,6 +38,7 @@ const REPO_ROOT = resolve(E2E_ROOT, "../..");
 interface CliArgs {
     harness: Harness;
     lanes: Lane[];
+    variants: string[];
     reportPath: string;
     timeoutMs: number;
 }
@@ -45,6 +46,7 @@ interface CliArgs {
 function parseArgs(args: string[]): CliArgs {
     let harness: Harness = "opencode";
     let lanes: Lane[] = ["green", "known-red"];
+    const variants: string[] = [];
     let reportPath = resolve(E2E_ROOT, "incident-report.json");
     let timeoutMs = DEFAULT_CASE_TIMEOUT_MS;
     for (let index = 0; index < args.length; index += 1) {
@@ -70,6 +72,10 @@ function parseArgs(args: string[]): CliArgs {
             } else {
                 throw new Error("--lane requires green, known-red, or all");
             }
+        } else if (arg === "--variant") {
+            const value = args[++index];
+            if (!value) throw new Error("--variant requires a variant id");
+            variants.push(value);
         } else if (arg === "--report") {
             const value = args[++index];
             if (!value) throw new Error("--report requires a file path");
@@ -81,18 +87,18 @@ function parseArgs(args: string[]): CliArgs {
             timeoutMs = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-incident-pool.ts [--harness opencode|pi|rust] [--lane green|known-red|all] [--report <path>] [--timeout <ms>]",
+                "Usage: run-incident-pool.ts [--harness opencode|pi|rust] [--lane green|known-red|all] [--variant <id>]... [--report <path>] [--timeout <ms>]",
             );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
         }
     }
-    return { harness, lanes, reportPath, timeoutMs };
+    return { harness, lanes, variants: [...new Set(variants)], reportPath, timeoutMs };
 }
 
 async function main(): Promise<number> {
-    const { harness, lanes, reportPath, timeoutMs } = parseArgs(
+    const { harness, lanes, variants, reportPath, timeoutMs } = parseArgs(
         Bun.argv.slice(2),
     );
     const files = loadHistorySnapshot(INCIDENTS_DIR, "working");
@@ -117,6 +123,7 @@ async function main(): Promise<number> {
         adjudicationLines: files.adjudicationLines,
         harness,
         lanes,
+        variantIds: variants.length > 0 ? variants : undefined,
         implementationDigests,
     });
     for (const excluded of snapshot.excluded) {

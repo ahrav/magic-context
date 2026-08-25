@@ -273,6 +273,8 @@ export interface BuildSnapshotInput {
     adjudicationLines: readonly string[];
     harness: Harness;
     lanes: readonly Lane[];
+    /** Optional exact variant selection; absent means every matching variant. */
+    variantIds?: readonly string[];
     /** variantId -> implementation-bundle digest for every executable case. */
     implementationDigests: ReadonlyMap<string, string>;
 }
@@ -285,12 +287,20 @@ export interface BuildSnapshotInput {
 export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
     const selected: SelectedCase[] = [];
     const excluded: ExcludedCase[] = [];
+    const requestedVariants = input.variantIds ? new Set(input.variantIds) : null;
     for (const family of input.catalog.families) {
         for (const variant of family.variants) {
             if (!EXECUTABLE_LANES.includes(variant.lane)) {
                 excluded.push({
                     variantId: variant.id,
                     reason: "adjudication-only variants are never scheduled",
+                });
+                continue;
+            }
+            if (requestedVariants && !requestedVariants.has(variant.id)) {
+                excluded.push({
+                    variantId: variant.id,
+                    reason: "variant was not requested",
                 });
                 continue;
             }

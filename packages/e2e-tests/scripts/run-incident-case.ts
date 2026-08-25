@@ -121,10 +121,12 @@ async function main(): Promise<void> {
     writeSync(3, `${JSON.stringify(envelope)}\n`);
 }
 
-main().catch((error: unknown) => {
-    // Diagnostics only — the parent classifies a missing envelope as crash.
-    console.error(
-        `incident case failed: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    process.exit(1);
-});
+main()
+    .then(() => process.exit(0))
+    .catch((error: unknown) => {
+        // Diagnostics only — the parent classifies a missing envelope as crash.
+        console.error(
+            `incident case failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        process.exit(1);
+    });
