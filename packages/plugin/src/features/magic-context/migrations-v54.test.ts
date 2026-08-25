@@ -5,9 +5,7 @@ import { join } from "node:path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import {
-    applyMirrorPage,
     ensureContextStoreUuid,
-    getMirrorCursor,
     installAuthorityManagedMarker,
 } from "./context-authority";
 import { runMigrations } from "./migrations";
@@ -230,95 +228,5 @@ describe("authority-managed context.db schema", () => {
                 )
                 .run("session"),
         ).toThrow(/managed by the Rust module/i);
-    });
-});
-
-describe("module changefeed mirror", () => {
-    it("keeps identities stable and removes stale vectors in the apply transaction", () => {
-        const db = freshDatabase();
-        applyMirrorPage({
-            db,
-            page: {
-                domain: "memories",
-                cursor: 0,
-                next_cursor: 1,
-                has_more: true,
-                rows: [
-                    {
-                        feed_seq: 1,
-                        domain: "memories",
-                        op: "insert",
-                        module_row_id: 41,
-                        content_hash: "hash-a",
-                        full_row_snapshot: {
-                            id: 41,
-                            project_path: "/project",
-                            category: "CONSTRAINTS",
-                            content: "one",
-                            normalized_hash: "hash-a",
-                            status: "active",
-                            scope: "project",
-                            shareable: 0,
-                            created_at: 1,
-                            updated_at: 1,
-                            first_seen_at: 1,
-                            last_seen_at: 1,
-                        },
-                    },
-                ],
-            },
-        });
-        const identity = db
-            .prepare(
-                "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
-            )
-            .get("/project", 41) as { context_row_id: number };
-        db.prepare(
-            "INSERT INTO memory_embeddings(memory_id, embedding, model_id) VALUES (?, ?, ?)",
-        ).run(identity.context_row_id, Buffer.from([1]), "model");
-
-        applyMirrorPage({
-            db,
-            page: {
-                domain: "memories",
-                cursor: 1,
-                next_cursor: 2,
-                has_more: false,
-                rows: [
-                    {
-                        feed_seq: 2,
-                        domain: "memories",
-                        op: "update",
-                        module_row_id: 41,
-                        content_hash: "hash-b",
-                        full_row_snapshot: {
-                            id: 41,
-                            project_path: "/project",
-                            category: "CONSTRAINTS",
-                            content: "two",
-                            normalized_hash: "hash-b",
-                            status: "active",
-                            scope: "project",
-                            shareable: 0,
-                            created_at: 1,
-                            updated_at: 2,
-                            first_seen_at: 1,
-                            last_seen_at: 2,
-                        },
-                    },
-                ],
-            },
-        });
-        expect(getMirrorCursor(db, "memories")).toBe(2);
-        expect(
-            db.prepare("SELECT COUNT(*) AS count FROM memory_embeddings").get() as {
-                count: number;
-            },
-        ).toEqual({ count: 0 });
-        expect(
-            db
-                .prepare("SELECT id, content FROM memories WHERE id = ?")
-                .get(identity.context_row_id) as { id: number; content: string },
-        ).toEqual({ id: identity.context_row_id, content: "two" });
     });
 });

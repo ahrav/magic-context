@@ -32,7 +32,6 @@ export {
     listAuthorityManagedMarkers,
     type PrepareAuthorityArgs,
     prepareAuthority,
-    pullAndApplyMirrorPage,
     reconcileAuthorityMarker,
     removeAuthorityManagedMarker,
 } from "./context-authority";

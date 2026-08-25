@@ -8,7 +8,6 @@ import {
     drainAuthority,
     ensureContextStoreUuid,
     prepareAuthority,
-    pullMemoryMirrorOnce,
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
@@ -18,11 +17,6 @@ import {
     type SnapshotVector,
 } from "../../features/magic-context/memory/claim-operation-contract";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import {
-    hasMemoryStatsTable,
-    MemoryStatsIntegrityError,
-} from "../../features/magic-context/memory/storage-memory";
-import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
@@ -1008,72 +1002,22 @@ function authoritySeedRows(
     projectPath: string,
     domain: "memories" | "notes",
 ): Record<string, unknown>[] {
-    const memoriesSeedSql = hasMemoryStatsTable(db)
-        ? `SELECT m.*,
-                  s.seen_count AS __stats_seen_count,
-                  s.retrieval_count AS __stats_retrieval_count,
-                  s.last_seen_at AS __stats_last_seen_at,
-                  s.last_retrieved_at AS __stats_last_retrieved_at,
-                  MAX(m.updated_at, s.updated_at) AS __stats_effective_updated_at
-             FROM memories m LEFT JOIN memory_stats s ON s.memory_id = m.id
-            WHERE m.project_path = ? ORDER BY m.id ASC`
-        : "SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC";
-    const snapshots =
-        domain === "memories"
-            ? db
-                  .prepare(memoriesSeedSql)
-                  .all(projectPath)
-                  .map((raw) => {
-                      if (!isRecord(raw) || !("__stats_seen_count" in raw)) return raw;
-                      const {
-                          __stats_seen_count,
-                          __stats_retrieval_count,
-                          __stats_last_seen_at,
-                          __stats_last_retrieved_at,
-                          __stats_effective_updated_at,
-                          ...base
-                      } = raw as Record<string, unknown>;
-                      if (__stats_seen_count === null || __stats_seen_count === undefined) {
-                          throw new MemoryStatsIntegrityError(Number(base.id));
-                      }
-                      return {
-                          ...base,
-                          seen_count: __stats_seen_count,
-                          retrieval_count: __stats_retrieval_count,
-                          last_seen_at: __stats_last_seen_at,
-                          last_retrieved_at: __stats_last_retrieved_at,
-                          updated_at: __stats_effective_updated_at,
-                      };
-                  })
-            : db
-                  .prepare(
-                      `SELECT n.*
-                         FROM notes n
-                        WHERE n.project_path = ?
-                           OR (n.project_path IS NULL AND EXISTS (
-                               SELECT 1 FROM session_projects sp
-                                WHERE sp.session_id = n.session_id AND sp.project_path = ?
-                           ))
-                        ORDER BY n.id ASC`,
-                  )
-                  .all(projectPath, projectPath);
-    const memoryRows = snapshots.filter(isRecord);
-    const mappings =
-        domain === "memories"
-            ? getMemoryVerifications(
-                  db,
-                  memoryRows.map((row) => Number(row.id)),
-              )
-            : new Map<number, { files: string[]; hasSentinel: boolean }>();
-    return memoryRows.map((snapshot) => {
-        const id = Number(snapshot.id);
-        const mapping = mappings.get(id);
+    if (domain === "memories") return [];
+    const snapshots = db
+        .prepare(
+            `SELECT n.*
+               FROM notes n
+              WHERE n.project_path = ?
+                 OR (n.project_path IS NULL AND EXISTS (
+                     SELECT 1 FROM session_projects sp
+                      WHERE sp.session_id = n.session_id AND sp.project_path = ?
+                 ))
+              ORDER BY n.id ASC`,
+        )
+        .all(projectPath, projectPath);
+    return snapshots.filter(isRecord).map((snapshot) => {
         const seededSnapshot =
-            domain === "memories" && mapping
-                ? { ...snapshot, mapping: mapping.hasSentinel ? null : mapping.files }
-                : domain === "notes" && snapshot.project_path == null
-                  ? { ...snapshot, project_path: projectPath }
-                  : snapshot;
+            snapshot.project_path == null ? { ...snapshot, project_path: projectPath } : snapshot;
         return { source_row_id: snapshot.id, snapshot: seededSnapshot };
     });
 }
@@ -1174,12 +1118,14 @@ async function prepareRustMemoryAuthority(args: {
                 module: authorityModule,
                 checksum: () =>
                     checksumSeedRows(
-                        db
-                            .prepare(
-                                `SELECT * FROM ${domain === "memories" ? "memories" : "notes"} WHERE project_path = ? ORDER BY id ASC`,
-                            )
-                            .all(projectPath)
-                            .filter(isRecord),
+                        domain === "memories"
+                            ? []
+                            : db
+                                  .prepare(
+                                      "SELECT * FROM notes WHERE project_path = ? ORDER BY id ASC",
+                                  )
+                                  .all(projectPath)
+                                  .filter(isRecord),
                     ),
             });
             if (!("code" in drained)) break;
@@ -2910,58 +2856,37 @@ export function createRustModeTransform(
             }
             wireCaches.set(sessionId, pendingWireCache);
             appliedAt = performance.now();
-            // Mirrors feed later RPC reads and tolerate seconds of staleness. Run the two pulls in
-            // their established order, but do not keep the transform hook pending while a backlog
-            // page or SQLite apply is slow. pullMemoryMirrorOnce still coalesces overlapping passes.
+            // The detached task prevents a slow mirror page from delaying the transform hook.
             const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            if (options.moduleClient.mirrorPull || getCompartmentsAfter) {
+            if (getCompartmentsAfter) {
                 void (async () => {
-                    if (options.moduleClient.mirrorPull) {
-                        const mirrorPullStartedAt = performance.now();
-                        try {
-                            await pullMemoryMirrorOnce({
-                                db: deps.db,
-                                module: options.moduleClient as AuthorityModuleClient,
-                            });
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust memory mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
-                        }
-                    }
-                    if (getCompartmentsAfter) {
-                        const compartmentMirrorStartedAt = performance.now();
-                        try {
-                            await mirrorModuleCompartments({
-                                db: deps.db,
-                                sessionId,
-                                reader: {
-                                    getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                        getCompartmentsAfter.call(
-                                            options.moduleClient,
-                                            mirroredSessionId,
-                                            afterSequence,
-                                        ),
-                                } satisfies ModuleCompartmentReader,
-                            });
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust compartment mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(
-                                sessionId,
-                                "compartmentMirror",
-                                compartmentMirrorStartedAt,
-                                timings,
-                            );
-                        }
+                    const compartmentMirrorStartedAt = performance.now();
+                    try {
+                        await mirrorModuleCompartments({
+                            db: deps.db,
+                            sessionId,
+                            reader: {
+                                getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
+                                    getCompartmentsAfter.call(
+                                        options.moduleClient,
+                                        mirroredSessionId,
+                                        afterSequence,
+                                    ),
+                            } satisfies ModuleCompartmentReader,
+                        });
+                    } catch (error) {
+                        sessionLog(
+                            sessionId,
+                            "rust compartment mirror-back failed (ignored):",
+                            error,
+                        );
+                    } finally {
+                        logStage(
+                            sessionId,
+                            "compartmentMirror",
+                            compartmentMirrorStartedAt,
+                            timings,
+                        );
                     }
                 })();
             }

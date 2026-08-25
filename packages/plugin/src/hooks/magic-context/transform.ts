@@ -412,9 +412,9 @@ export async function recoverTsAuthorityProject(args: {
                 domain,
                 module,
                 checksum: () => {
-                    const table = domain === "memories" ? "memories" : "notes";
+                    if (domain === "memories") return checksumAuthoritySeedRows([]);
                     const rows = args.db
-                        .prepare(`SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`)
+                        .prepare("SELECT * FROM notes WHERE project_path = ? ORDER BY id ASC")
                         .all(args.projectPath)
                         .filter(
                             (row): row is Record<string, unknown> =>

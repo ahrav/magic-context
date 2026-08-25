@@ -809,7 +809,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
-    const runModuleDomainSync = async (domain: "memories" | "notes"): Promise<void> => {
+    const runModuleDomainSync = async (domain: "notes"): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
         for (;;) {
             const cursor = getMirrorCursor(db, domain);
@@ -825,7 +825,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Chained process-globally per (store, domain): several plugin instances
     // can share this database file, and interleaved pulls throw a cursor
     // mismatch in applyMirrorPage.
-    const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> =>
+    const syncModuleDomain = (domain: "notes"): Promise<void> =>
         chainMirrorDomainSync(db, domain, () => runModuleDomainSync(domain));
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
     const rustToolBackends: RustToolBackends | undefined =

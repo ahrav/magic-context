@@ -2972,36 +2972,16 @@ describe("Rust mode authority adapter", () => {
 });
 
 describe("prepareRustMemoryAuthority mixed restore", () => {
-    it("resumes a schema-57 DRAINING restart through the real prepare path", async () => {
+    it("fails closed when a legacy memories DRAINING restart has unreplayed feed rows", async () => {
         const db = makeDb();
         const projectPath = "git:schema-57-restart";
         const projectRoot = "/worktrees/schema-57-restart";
-        db.exec(`
-            DROP TABLE mirror_live_staging;
-            DROP TABLE mirror_resnapshot_state;
-            DROP TABLE mirror_live_memory_rows;
-            DELETE FROM schema_migrations WHERE version >= 58;
-        `);
         withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (9395, ?, 'CONFIG_VALUES', 'drive model', 'same-hash', 0, 0, 0, 0)",
-            ).run(projectPath);
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/legacy', 100, 9395)",
-            ).run();
             db.prepare(
                 "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 20, 0)",
             ).run();
         });
-        runMigrations(db);
-        db.prepare(
-            "UPDATE mirror_resnapshot_state SET status = 'resnapshotting' WHERE domain = 'memories'",
-        ).run();
-        db.prepare(
-            "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale', NULL)",
-        ).run();
 
-        const calls: Array<{ liveOnly?: boolean; cursor: number }> = [];
         const statuses = new Map<string, AuthorityStatus | null>([
             [
                 "memories",
@@ -3026,14 +3006,6 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
                 },
             ],
         ]);
-        const memoryRow = (id: number, sourceProject: string) => ({
-            id,
-            project_path: sourceProject,
-            category: "CONFIG_VALUES",
-            content: "drive model",
-            normalized_hash: "same-hash",
-            status: "active",
-        });
         const module: RustModeModuleClient = {
             call: async () => ({ ok: true }),
             authorityStatus: async (args) => ({ authority: statuses.get(args.domain) ?? null }),
@@ -3041,68 +3013,26 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
                 throw new Error("prepare should not run during DRAINING recovery");
             },
             authoritySeed: async () => ({ seeded: 0 }),
-            authorityDrain: async (args) => {
-                if (args.action === "finish") {
-                    statuses.set("memories", {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "TS",
-                        generation: 4,
-                    });
-                }
-                return {
-                    authority: {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: args.action === "finish" ? "TS" : "DRAINING",
-                        generation: args.action === "finish" ? 4 : 3,
-                        captured_upper_bound: 21,
-                        coordinator_token: "restart-token",
-                    },
-                };
-            },
-            mirrorPull: async (args) => {
-                calls.push({ liveOnly: args.live_only, cursor: args.cursor });
-                return args.live_only
-                    ? {
-                          page: {
-                              domain: "memories",
-                              cursor: 0,
-                              next_cursor: 200,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 0,
-                                      domain: "memories",
-                                      op: "insert",
-                                      module_row_id: 200,
-                                      full_row_snapshot: memoryRow(200, projectPath),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      }
-                    : {
-                          page: {
-                              domain: "memories",
-                              cursor: args.cursor,
-                              next_cursor: 21,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 21,
-                                      domain: "memories",
-                                      op: "tombstone",
-                                      module_row_id: 100,
-                                      full_row_snapshot: memoryRow(100, "/legacy"),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      };
-            },
+            authorityDrain: async () => ({
+                authority: {
+                    context_store_uuid: "store",
+                    project: projectPath,
+                    domain: "memories",
+                    state: "DRAINING",
+                    generation: 3,
+                    captured_upper_bound: 21,
+                    coordinator_token: "restart-token",
+                },
+            }),
+            mirrorPull: async (args) => ({
+                page: {
+                    domain: args.domain as "memories" | "notes",
+                    cursor: args.cursor,
+                    next_cursor: args.cursor,
+                    has_more: false,
+                    rows: [],
+                },
+            }),
         };
         const state = {
             initialized: false,
@@ -3135,29 +3065,23 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             memoryAuthorityReady: false,
         };
 
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot,
-            state,
-        });
-
-        expect(calls.map((call) => call.liveOnly)).toEqual([true, undefined]);
+        await expect(
+            __rustModeTransformTest.prepareRustMemoryAuthority({
+                db,
+                module,
+                projectPath,
+                projectRoot,
+                state,
+            }),
+        ).rejects.toThrow("legacy module feed rows");
         expect(
             db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
         ).toEqual({
-            cursor: 21,
+            cursor: 20,
         });
-        expect(db.prepare("SELECT id FROM memories WHERE id = 9395").get()).toEqual({ id: 9395 });
-        expect(db.prepare("SELECT status FROM mirror_resnapshot_state").get()).toEqual({
-            status: "complete",
-        });
-        expect(db.prepare("SELECT COUNT(*) AS count FROM mirror_live_staging").get()).toEqual({
-            count: 0,
-        });
-        expect(state.memoryAuthorityReady).toBe(true);
+        expect(state.memoryAuthorityReady).toBe(false);
     });
+
 
     it("reconciles remaining MODULE domains after a DRAINING resume before tools open", async () => {
         const db = makeDb();

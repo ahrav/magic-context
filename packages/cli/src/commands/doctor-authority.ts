@@ -109,9 +109,9 @@ function checksumFor(
     projectPath: string,
     domain: (typeof AUTHORITY_DOMAINS)[number],
 ): string {
-    const table = domain === "memories" ? "memories" : "notes";
+    if (domain === "memories") return checksumAuthoritySeedRows([]);
     const rows = db
-        .prepare(`SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`)
+        .prepare("SELECT * FROM notes WHERE project_path = ? ORDER BY id ASC")
         .all(projectPath)
         .filter((row): row is Record<string, unknown> => row !== null && typeof row === "object");
     return checksumAuthoritySeedRows(rows);
