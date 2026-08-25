@@ -35,8 +35,8 @@ use crate::{
         TRANSPORT_TCP,
     },
     wire::{
-        decode_header, encode_owned_frame, pure_header_flags, EnvelopeHeader, Flags, FrameId,
-        FrameType, Priority, HEADER_LEN, MAX_BODY_LEN, PROTOCOL_VERSION,
+        decode_header, encode_owned_frame, pure_header_flags, AdmissionClass, EnvelopeHeader,
+        Flags, FrameId, FrameType, Priority, HEADER_LEN, MAX_BODY_LEN, PROTOCOL_VERSION,
     },
 };
 
@@ -915,6 +915,7 @@ impl Inner {
             // is replay-safe.
             if let Err(error) = self.send_control(
                 FrameType::Cancel,
+                pure_header_flags(),
                 FrameId {
                     channel: key.channel,
                     epoch: key.epoch,
@@ -928,16 +929,22 @@ impl Inner {
         Ok(())
     }
 
+    /// Queues one pure-header control frame.
+    ///
+    /// `flags` is explicit because a `Pong` must echo the `Ping`'s flags exactly
+    /// (conformance vector V35), and §6.1 lets a conforming peer pick any valid
+    /// priority - so no single flag byte is correct for every control frame.
     fn send_control(
         &self,
         ty: FrameType,
+        flags: Flags,
         id: FrameId,
         ack: Option<oneshot::Sender<()>>,
     ) -> Result<(), CallError> {
         if self.retired.load(Ordering::Acquire) {
             return Err(retired_error(SendOutcome::NotSent));
         }
-        let bytes = encode_owned_frame(ty, pure_header_flags(), id, Vec::new()).map_err(|_| {
+        let bytes = encode_owned_frame(ty, flags, id, Vec::new()).map_err(|_| {
             CallError::local(
                 SendOutcome::NotSent,
                 "encode_failed",
@@ -977,12 +984,13 @@ impl Inner {
         deadline: Instant,
     ) -> Result<(), ClientError> {
         let (tx, rx) = oneshot::channel();
-        self.send_control(ty, id, Some(tx)).map_err(|_| {
-            ClientError::new(
-                "control_capacity_exhausted",
-                "client control admission failed",
-            )
-        })?;
+        self.send_control(ty, pure_header_flags(), id, Some(tx))
+            .map_err(|_| {
+                ClientError::new(
+                    "control_capacity_exhausted",
+                    "client control admission failed",
+                )
+            })?;
         timeout_at(deadline, rx)
             .await
             .map_err(|_| ClientError::new("shutdown_timeout", "client shutdown timed out"))?
@@ -997,7 +1005,13 @@ impl Inner {
     ) {
         match header.ty {
             FrameType::Ping => {
-                let _ = self.send_control(FrameType::Pong, FrameId::control(header.corr), None);
+                // V35: the Pong echoes the Ping's flags exactly.
+                let _ = self.send_control(
+                    FrameType::Pong,
+                    header.flags,
+                    FrameId::control(header.corr),
+                    None,
+                );
             }
             FrameType::Goodbye if header.channel == 0 => self.retire("connection_goodbye"),
             FrameType::Goodbye => {
@@ -1080,6 +1094,7 @@ impl Inner {
                         );
                         let _ = self.send_control(
                             FrameType::Cancel,
+                            pure_header_flags(),
                             FrameId {
                                 channel: key.channel,
                                 epoch: key.epoch,
@@ -1112,6 +1127,7 @@ impl Inner {
                             );
                             let _ = self.send_control(
                                 FrameType::Cancel,
+                                pure_header_flags(),
                                 FrameId {
                                     channel: key.channel,
                                     epoch: key.epoch,
@@ -1542,7 +1558,16 @@ fn validate_inbound(header: &EnvelopeHeader) -> Result<(), ()> {
         }
         _ => return Err(()),
     }
-    if header.ty.is_pure_header() && (header.flags != pure_header_flags() || header.len != 0) {
+    // Pure-header frames must set binary 0, last 0, and admission Normal, but
+    // §6.1 permits any valid priority — matching the framing layer's own check
+    // in `tcp_frame_channel`. Comparing the whole flag byte would retire the
+    // generation over a conforming Ping that merely chose Interactive.
+    if header.ty.is_pure_header()
+        && (header.len != 0
+            || header.flags.is_binary()
+            || header.flags.is_last()
+            || header.flags.admission_class() != Some(AdmissionClass::Normal))
+    {
         return Err(());
     }
     Ok(())
@@ -1680,9 +1705,14 @@ fn route_open_body(target: &RouteTarget, identity: &RouteIdentity) -> Result<Vec
             "harness": identity.harness,
             "session": identity.session
         },
-        "consumer_capabilities": identity.consumer_capabilities,
-        "admission_facts": identity.admission_facts
+        "consumer_capabilities": identity.consumer_capabilities
     });
+    // Present-with-null is not absent: the host reads any present member as
+    // `Some(..)`, so a `json!` null would make bind observe facts the caller
+    // never supplied.
+    if let Some(facts) = identity.admission_facts.as_ref() {
+        request["admission_facts"] = facts.clone();
+    }
     if let (Some(module_id), Some(launch_nonce)) = (
         identity.consumer_module_id.as_ref(),
         identity.consumer_launch_nonce.as_ref(),
@@ -2238,6 +2268,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_ping_at_any_valid_priority_is_answered_with_an_exact_flag_echo() {
+        // §6.1 fixes binary, last, and admission on pure-header frames but lets
+        // priority be any valid value, and V35 requires the Pong to echo the
+        // Ping's flags exactly.
+        for priority in [
+            Priority::Passive,
+            Priority::Interactive,
+            Priority::Background,
+        ] {
+            let (inner, _data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+            let flags = Flags::new(false, priority, false);
+            let ping = EnvelopeHeader {
+                len: 0,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::Ping,
+                flags,
+                channel: 0,
+                epoch: 0,
+                corr: 41,
+            };
+            assert!(
+                validate_inbound(&ping).is_ok(),
+                "{priority:?} is a valid Ping priority, not a reason to retire"
+            );
+
+            inner.dispatch(ping, Vec::new(), None);
+
+            let pong = control_rx.recv().await.expect("Pong queued");
+            assert_eq!(pong.bytes[5], FrameType::Pong as u8);
+            assert_eq!(
+                pong.bytes[6], flags.0,
+                "the Pong must echo the Ping's flag byte, not the client's default"
+            );
+            assert!(!inner.retired.load(Ordering::Acquire));
+            drop(pong);
+        }
+
+        // The mandated bits are still fixed.
+        for flags in [
+            Flags::new(true, Priority::Passive, false),
+            Flags::new(false, Priority::Passive, true),
+        ] {
+            let ping = EnvelopeHeader {
+                len: 0,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::Ping,
+                flags,
+                channel: 0,
+                epoch: 0,
+                corr: 41,
+            };
+            assert!(validate_inbound(&ping).is_err());
+        }
+    }
+
+    #[test]
+    fn absent_admission_facts_are_omitted_rather_than_sent_as_null() {
+        // The host reads any present member as `Some(..)`, so a null would make
+        // bind observe facts the caller never supplied.
+        let target = RouteTarget {
+            kind: TargetKind::ToolProvider,
+            module_id: "magic-context".to_owned(),
+        };
+        let mut identity = identity_fixture();
+        let body = route_open_body(&target, &identity).expect("body encodes");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert!(
+            value.get("admission_facts").is_none(),
+            "absent facts must not appear as an explicit null"
+        );
+
+        identity.admission_facts = Some(serde_json::json!({"tier": "gold"}));
+        let body = route_open_body(&target, &identity).expect("body encodes");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(
+            value["admission_facts"],
+            serde_json::json!({"tier": "gold"})
+        );
+    }
+
+    fn identity_fixture() -> RouteIdentity {
+        RouteIdentity {
+            project_root: std::path::PathBuf::from("/tmp/project"),
+            harness: "opencode".to_owned(),
+            session: "session".to_owned(),
+            consumer_module_id: None,
+            consumer_launch_nonce: None,
+            consumer_capabilities: Vec::new(),
+            admission_facts: None,
+        }
+    }
+
+    #[tokio::test]
     async fn dropped_unary_future_cleans_pending_and_possibly_sent_request() {
         let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
         let task_inner = Arc::clone(&inner);
@@ -2324,7 +2447,12 @@ mod tests {
         assert_eq!(lock_unpoisoned(&inner.correlations).next, next_before);
 
         inner
-            .send_control(FrameType::Pong, FrameId::control(99), None)
+            .send_control(
+                FrameType::Pong,
+                pure_header_flags(),
+                FrameId::control(99),
+                None,
+            )
             .expect("reserved control remains available");
         let pong = control_rx.recv().await.expect("queued Pong");
         assert_eq!(pong.bytes[5], FrameType::Pong as u8);
@@ -2343,11 +2471,21 @@ mod tests {
         let (inner, data_rx, control_rx) = test_inner(CLIENT_QUEUED_BYTES);
         for corr in 1..=CLIENT_CONTROL_QUEUE_FRAMES as u64 {
             inner
-                .send_control(FrameType::Pong, FrameId::control(corr), None)
+                .send_control(
+                    FrameType::Pong,
+                    pure_header_flags(),
+                    FrameId::control(corr),
+                    None,
+                )
                 .expect("reserved slot");
         }
         let error = inner
-            .send_control(FrameType::Pong, FrameId::control(99), None)
+            .send_control(
+                FrameType::Pong,
+                pure_header_flags(),
+                FrameId::control(99),
+                None,
+            )
             .expect_err("33rd control retires generation");
         assert_eq!(error.code(), "control_capacity_exhausted");
         assert!(inner.retired.load(Ordering::Acquire));
@@ -2361,7 +2499,12 @@ mod tests {
     async fn data_and_control_charge_one_shared_byte_cap() {
         let (inner, data_rx, control_rx) = test_inner(HEADER_LEN * 2);
         inner
-            .send_control(FrameType::Pong, FrameId::control(1), None)
+            .send_control(
+                FrameType::Pong,
+                pure_header_flags(),
+                FrameId::control(1),
+                None,
+            )
             .expect("first header");
         let (kind, _rx) = unary_sender();
         inner
@@ -2374,7 +2517,12 @@ mod tests {
             .expect("data header uses remaining shared bytes");
         assert_eq!(inner.queue_budget.used(), HEADER_LEN * 2);
         assert!(inner
-            .send_control(FrameType::Pong, FrameId::control(2), None)
+            .send_control(
+                FrameType::Pong,
+                pure_header_flags(),
+                FrameId::control(2),
+                None
+            )
             .is_err());
         drop(data_rx);
         drop(control_rx);
