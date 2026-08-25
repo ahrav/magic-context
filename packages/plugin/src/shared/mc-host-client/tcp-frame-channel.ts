@@ -16,7 +16,10 @@ import { type AuthByteIo, AuthError, type AuthResult, authenticateClient } from 
 import type { Deadline } from "./deadline";
 import { SocketClosedError, SocketTimeoutError, SubcCallError } from "./errors";
 import {
+    BoundedFrameProducer,
     type ByteBudget,
+    CopyCounter,
+    type DirectFrameBody,
     type FrameChannel,
     type FrameChannelCloseReason,
     type FrameChannelDiagnosticType,
@@ -25,8 +28,11 @@ import {
     type FrameMeta,
     type FrameSendHooks,
     type FrameSendTicket,
+    frameBodyMaterializer,
     headerViolation,
     type OutboundFrame,
+    type ProducerFrameHeader,
+    ReceiveLease,
 } from "./frame-channel";
 import {
     DecodeError,
@@ -69,6 +75,8 @@ export interface TcpFrameChannelOptions {
     maxQueuedFrames?: number;
     maxQueuedBytes?: number;
     controlReserveFrames?: number;
+    /** Test/profile seam for segmented direct producer reservations. */
+    producerSpanBytes?: number;
     /** Nonce source passthrough to the pure auth handshake. */
     generateNonce?: (length: number) => Uint8Array;
     handlers: FrameChannelHandlers;
@@ -116,6 +124,7 @@ export class TcpFrameChannel implements FrameChannel {
     private readonly maxQueuedFrames: number;
     private readonly maxQueuedBytes: number;
     private readonly controlReserveFrames: number;
+    private readonly producerSpanBytes: number;
     private readonly generateNonce?: (length: number) => Uint8Array;
     private readonly handlers: FrameChannelHandlers;
 
@@ -157,6 +166,8 @@ export class TcpFrameChannel implements FrameChannel {
     }[] = [];
     private dataFramesQueued = 0;
     private dataBytesQueued = 0;
+    private reservedDataFrames = 0;
+    private reservedDataBytes = 0;
     private controlFramesQueued = 0;
     private pumping = false;
     private awaitingDrain = false;
@@ -165,6 +176,10 @@ export class TcpFrameChannel implements FrameChannel {
     // Byte charges this channel currently holds against the shared budget.
     private readerHeld = 0;
     private queueHeld = 0;
+    private quarantinedBytes = 0;
+    private readonly receiveLeases = new Set<ReceiveLease>();
+    private readonly producerReservations = new Set<BoundedFrameProducer>();
+    private readonly copyCounter = new CopyCounter();
 
     constructor(options: TcpFrameChannelOptions) {
         this.host = options.host;
@@ -176,6 +191,7 @@ export class TcpFrameChannel implements FrameChannel {
         this.maxQueuedFrames = options.maxQueuedFrames ?? DEFAULT_MAX_QUEUED_FRAMES;
         this.maxQueuedBytes = options.maxQueuedBytes ?? this.maxBodyLen + 65_536;
         this.controlReserveFrames = options.controlReserveFrames ?? DEFAULT_CONTROL_RESERVE_FRAMES;
+        this.producerSpanBytes = options.producerSpanBytes ?? this.maxBodyLen;
         this.generateNonce = options.generateNonce;
         this.handlers = options.handlers;
         this.budget.onRelease = () => {
@@ -255,28 +271,221 @@ export class TcpFrameChannel implements FrameChannel {
             queuedControlFrames: this.controlFramesQueued,
             readPaused: this.readPaused,
             activeTimers: this.timers.size,
+            activeReceiveLeases: this.receiveLeases.size,
+            quarantinedBytes: this.quarantinedBytes,
+            ownedAdapterCopies: this.copyCounter.copies,
         };
+    }
+
+    produce(
+        header: ProducerFrameHeader,
+        body: DirectFrameBody,
+        hooks?: FrameSendHooks,
+        _deadline?: Deadline,
+    ): FrameSendTicket {
+        const materialize = frameBodyMaterializer(body);
+        if (materialize) {
+            const fullHeader: EnvelopeHeader = { ...header, len: body.byteLength };
+            const admission = this.prepareDataFrame(fullHeader);
+            const materialized = materialize();
+            if (materialized.bytes.byteLength !== body.byteLength) {
+                throw new RangeError("materialized frame body length mismatch");
+            }
+            if (materialized.copied) this.copyCounter.record();
+            return this.enqueuePreparedData(
+                fullHeader,
+                admission.headerBytes,
+                materialized.bytes,
+                admission.totalBytes,
+                hooks,
+            );
+        }
+        const producer = this.reserve(header, body.byteLength, hooks);
+        try {
+            body.fill(producer);
+            return producer.commit(body.byteLength);
+        } catch (error) {
+            producer.abort();
+            throw error;
+        }
+    }
+
+    reserve(
+        header: ProducerFrameHeader,
+        capacity: number,
+        hooks?: FrameSendHooks,
+    ): BoundedFrameProducer {
+        if (this.closed) {
+            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+        }
+        if (!Number.isSafeInteger(capacity) || capacity < 0 || capacity > this.maxBodyLen) {
+            throw new RangeError("producer capacity is outside frame bounds");
+        }
+        encodeHeader({ ...header, len: capacity });
+        const reservedBytes = HEADER_LEN + capacity;
+        if (
+            this.dataFramesQueued + this.reservedDataFrames + 1 > this.maxQueuedFrames ||
+            this.dataBytesQueued + this.reservedDataBytes + reservedBytes > this.maxQueuedBytes
+        ) {
+            throw new SubcCallError("not_sent", "writer queue is full", "writer_queue_full");
+        }
+        if (this.budget.wouldExceed(reservedBytes)) {
+            throw new SubcCallError(
+                "not_sent",
+                "aggregate connection memory cap would be exceeded",
+                "memory_cap",
+            );
+        }
+
+        this.reservedDataFrames++;
+        this.reservedDataBytes += reservedBytes;
+        this.chargeQueue(reservedBytes);
+        let held = true;
+        // The compatibility-copy charge taken in prepareCommit, until a
+        // publish transfers its ownership to the queued item. Releasing it
+        // with the reservation keeps commit failures between prepareCommit
+        // and publish (alias detachment) from stranding the charge.
+        let copyCharge = 0;
+        let producer: BoundedFrameProducer | undefined;
+        const release = (): void => {
+            if (!held) return;
+            held = false;
+            if (producer) this.producerReservations.delete(producer);
+            this.reservedDataFrames--;
+            this.reservedDataBytes -= reservedBytes;
+            this.releaseQueue(reservedBytes);
+            if (copyCharge > 0) {
+                this.releaseQueue(copyCharge);
+                copyCharge = 0;
+            }
+        };
+        const spans: Uint8Array[] = [];
+        let remaining = capacity;
+        const spanBytes = Math.max(1, this.producerSpanBytes);
+        try {
+            while (remaining > 0) {
+                const length = Math.min(remaining, spanBytes);
+                spans.push(new Uint8Array(new ArrayBuffer(length)));
+                remaining -= length;
+            }
+
+            producer = new BoundedFrameProducer(
+                spans,
+                capacity,
+                (segments, exactLength) => {
+                    const fullHeader: EnvelopeHeader = { ...header, len: exactLength };
+                    const headerBytes = Buffer.from(encodeHeader(fullHeader));
+                    // The compatibility copy is double-resident with the
+                    // reserved spans until publication detaches them, so it
+                    // takes its own charge and shows up in memoryUsed and
+                    // memoryPeak. No cap refusal here: a successful reserve
+                    // guarantees commit (the producer contract), and the
+                    // overshoot is bounded to one frame body.
+                    if (exactLength > 0) {
+                        this.chargeQueue(exactLength);
+                        copyCharge = exactLength;
+                    }
+                    let body: Buffer;
+                    try {
+                        body = Buffer.allocUnsafeSlow(exactLength);
+                        let offset = 0;
+                        for (const segment of segments) {
+                            body.set(segment, offset);
+                            offset += segment.byteLength;
+                        }
+                    } catch (error) {
+                        if (copyCharge > 0) {
+                            this.releaseQueue(copyCharge);
+                            copyCharge = 0;
+                        }
+                        throw error;
+                    }
+                    this.copyCounter.record();
+                    const bytes = HEADER_LEN + exactLength;
+                    const item: QueuedItem = {
+                        buffers: exactLength > 0 ? [headerBytes, body] : [headerBytes],
+                        bytes,
+                        control: false,
+                        hooks: hooks ?? null,
+                        meta: metaFromHeader(fullHeader),
+                    };
+                    return {
+                        publish: () => {
+                            if (!held || this.closed) {
+                                // release() also returns the copy charge
+                                // still owned by the reservation.
+                                release();
+                                throw new SubcCallError(
+                                    "not_sent",
+                                    "producer reservation was released",
+                                    "channel_closed",
+                                );
+                            }
+                            held = false;
+                            if (producer) this.producerReservations.delete(producer);
+                            this.reservedDataFrames--;
+                            this.reservedDataBytes -= reservedBytes;
+                            // Commit detached the span buffers, so their whole
+                            // charge (capacity) releases here; the copy's own
+                            // charge plus the retained header now cover the
+                            // queued item until the socket drains it.
+                            if (capacity > 0) this.releaseQueue(capacity);
+                            copyCharge = 0;
+                            this.enqueueReservedItem(item);
+                            return { cancel: () => this.cancelQueuedItem(item) };
+                        },
+                    };
+                },
+                release,
+            );
+        } catch (error) {
+            release();
+            throw error;
+        }
+        this.producerReservations.add(producer);
+        return producer;
     }
 
     send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
         if (this.closed) {
             throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
         }
-        // Encoding validates every header field before any state changes,
-        // so a rejected frame can never burn a correlation upstream.
-        const headerBytes = Buffer.from(encodeHeader(frame.header));
-        const body = asBuffer(frame.body);
-        if (frame.header.len !== body.length) {
+        if (frame.header.len !== frame.body.length) {
             // A mismatched declaration would desynchronize the peer's frame
             // parser and corrupt every later frame on the connection.
             throw new RangeError(
-                `frame header.len (${frame.header.len}) does not match body length (${body.length})`,
+                `frame header.len (${frame.header.len}) does not match body length (${frame.body.length})`,
             );
         }
-        const totalBytes = HEADER_LEN + body.length;
+        const admission = this.prepareDataFrame(frame.header);
+        const body = Buffer.from(frame.body);
+        this.copyCounter.record();
+        return this.enqueuePreparedData(
+            frame.header,
+            admission.headerBytes,
+            body,
+            admission.totalBytes,
+            hooks,
+        );
+    }
+
+    private prepareDataFrame(header: EnvelopeHeader): {
+        headerBytes: Buffer;
+        totalBytes: number;
+    } {
+        if (this.closed) {
+            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+        }
+        if (!Number.isSafeInteger(header.len) || header.len < 0 || header.len > this.maxBodyLen) {
+            throw new RangeError("frame body length is outside transport bounds");
+        }
+        // Encoding validates every header field before any state changes,
+        // so a rejected frame can never burn a correlation upstream.
+        const headerBytes = Buffer.from(encodeHeader(header));
+        const totalBytes = HEADER_LEN + header.len;
         if (
-            this.dataFramesQueued + 1 > this.maxQueuedFrames ||
-            this.dataBytesQueued + totalBytes > this.maxQueuedBytes
+            this.dataFramesQueued + this.reservedDataFrames + 1 > this.maxQueuedFrames ||
+            this.dataBytesQueued + this.reservedDataBytes + totalBytes > this.maxQueuedBytes
         ) {
             throw new SubcCallError("not_sent", "writer queue is full", "writer_queue_full");
         }
@@ -287,12 +496,22 @@ export class TcpFrameChannel implements FrameChannel {
                 "memory_cap",
             );
         }
+        return { headerBytes, totalBytes };
+    }
+
+    private enqueuePreparedData(
+        header: EnvelopeHeader,
+        headerBytes: Buffer,
+        body: Buffer,
+        totalBytes: number,
+        hooks?: FrameSendHooks,
+    ): FrameSendTicket {
         const item: QueuedItem = {
             buffers: body.length > 0 ? [headerBytes, body] : [headerBytes],
             bytes: totalBytes,
             control: false,
             hooks: hooks ?? null,
-            meta: metaFromHeader(frame.header),
+            meta: metaFromHeader(header),
         };
         this.enqueueItem(item);
         return {
@@ -378,6 +597,14 @@ export class TcpFrameChannel implements FrameChannel {
     private teardown(error?: unknown): void {
         if (this.closed) return;
         this.closed = true;
+        for (const producer of [...this.producerReservations]) producer.abort();
+        for (const lease of [...this.receiveLeases]) {
+            try {
+                lease.release();
+            } catch (error) {
+                void error;
+            }
+        }
         for (const timer of this.timers) clearTimeout(timer);
         this.timers.clear();
         this.frameTimer = null;
@@ -397,6 +624,8 @@ export class TcpFrameChannel implements FrameChannel {
         this.currentItem = null;
         this.dataFramesQueued = 0;
         this.dataBytesQueued = 0;
+        this.reservedDataFrames = 0;
+        this.reservedDataBytes = 0;
         this.controlFramesQueued = 0;
         for (const waiter of this.flushWaiters.splice(0)) {
             waiter.resolve();
@@ -647,7 +876,7 @@ export class TcpFrameChannel implements FrameChannel {
             return false;
         }
         this.bodyHeader = header;
-        this.bodyBuf = Buffer.allocUnsafe(header.len);
+        this.bodyBuf = Buffer.allocUnsafeSlow(header.len);
         this.bodyFilled = 0;
         this.chargeReader(header.len);
         return true;
@@ -659,7 +888,7 @@ export class TcpFrameChannel implements FrameChannel {
         if (this.budget.wouldExceed(header.len)) return;
         this.deferredHeader = null;
         this.bodyHeader = header;
-        this.bodyBuf = Buffer.allocUnsafe(header.len);
+        this.bodyBuf = Buffer.allocUnsafeSlow(header.len);
         this.bodyFilled = 0;
         this.chargeReader(header.len);
         if (this.readPaused) {
@@ -674,16 +903,37 @@ export class TcpFrameChannel implements FrameChannel {
             this.disarmTimer(this.frameTimer);
             this.frameTimer = null;
         }
-        // The transient reader charge releases at delivery; a receiver that
-        // retains the body re-charges the retained bytes itself (a
-        // transfer, not a duplicate full-body copy).
-        if (header.len > 0) this.releaseReader(header.len);
-        this.handlers.onFrame({ header, body });
+        let lease: ReceiveLease;
+        lease = new ReceiveLease(
+            header.len === 0 ? [] : [body],
+            (outcome) => {
+                this.receiveLeases.delete(lease);
+                if (outcome === "released") {
+                    if (header.len > 0) this.releaseReader(header.len);
+                } else {
+                    this.quarantinedBytes += header.len;
+                }
+            },
+            this.copyCounter,
+            // TCP receive buffers are never recycled. Releasing the reader
+            // charge and dropping the lease is sufficient; retained aliases
+            // own their ArrayBuffer and cannot observe reused storage.
+            () => "released",
+        );
+        this.receiveLeases.add(lease);
+        this.handlers.onFrame({ header, body: lease });
     }
 
     // ------------------------------------------------------------------
     // Single bounded FIFO writer.
     // ------------------------------------------------------------------
+
+    private enqueueReservedItem(item: QueuedItem): void {
+        this.queue.push(item);
+        this.dataFramesQueued++;
+        this.dataBytesQueued += item.bytes;
+        this.pump();
+    }
 
     private enqueueItem(item: QueuedItem): void {
         this.queue.push(item);

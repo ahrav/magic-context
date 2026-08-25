@@ -275,6 +275,20 @@ impl CompositeComponent for BrocaComponent {
 
 impl SecondaryComponent for BrocaComponent {
     async fn initialize(&self) -> Result<(), InitError> {
+        // The crash-ownership registry proves process identity through
+        // Linux `/proc` semantics (stat starttime, boot_id, group-member
+        // scans). No other platform provides those proofs, so the
+        // component refuses to initialize with a named platform error
+        // instead of surfacing an incidental `/proc` read failure from the
+        // sweep — and the post-spawn registration path that would kill
+        // every run before prompt delivery stays unreachable.
+        if cfg!(not(target_os = "linux")) {
+            return Err(InitError(
+                "broca requires Linux: crash-ownership records and sweeps \
+                 depend on /proc process identity"
+                    .to_owned(),
+            ));
+        }
         // No artifact to load: the deterministic or subprocess backend was
         // constructed by the caller, and run state is process-local (R11).
         //

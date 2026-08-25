@@ -43,7 +43,7 @@ export class SubcCallError extends Error {
      * classification accepts only a byte-exact `unsupported_operation`
      * terminal, which the parsed `code` alone cannot prove.
      */
-    errorTerminal?: { body: Uint8Array; flags: number; streamed: boolean };
+    errorTerminal?: { bodyText: string | null; flags: number; streamed: boolean };
 
     constructor(
         readonly kind: SubcCallErrorKind,

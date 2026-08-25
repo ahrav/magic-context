@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[lints.clippy]
+# Shared integration helpers are intentionally compiled into independent test targets.
+duplicate_mod = "allow"
+
 [dependencies]
 # The host implements the published wire authority; module crates continue to
 # use the workspace's sibling dependencies for local SDK co-development.
@@ -21,6 +25,7 @@ tokio = { workspace = true, features = ["process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
 getrandom = "0.2"
+mc-shm-transport = { path = "../mc-shm-transport", default-features = false }
 
 [dev-dependencies]
 hmac = "0.12"

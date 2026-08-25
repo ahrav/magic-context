@@ -929,6 +929,15 @@ struct UmaskGuard {
 }
 
 impl UmaskGuard {
+    #[cfg(target_os = "macos")]
+    fn set(mask: u32) -> Self {
+        let mask = u16::try_from(mask).expect("test umask fits mode_t");
+        Self {
+            previous: rustix::process::umask(rustix::fs::Mode::from_raw_mode(mask)),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn set(mask: u32) -> Self {
         Self {
             previous: rustix::process::umask(rustix::fs::Mode::from_raw_mode(mask)),

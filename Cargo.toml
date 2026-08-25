@@ -4,7 +4,7 @@
 # context); the dashboard's Tauri crate is its own standalone build, excluded here.
 [workspace]
 resolver = "2"
-members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer"]
+members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
 # The evidence probe depends on the PUBLISHED subc crates from crates.io rather than the
 # sibling sources, so it must never join this workspace's dependency graph.
 exclude = ["packages/dashboard/src-tauri", "docs/evidence/subc-surface-probe"]

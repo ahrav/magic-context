@@ -234,9 +234,9 @@ impl std::fmt::Debug for RequestOutcome {
     }
 }
 
-/// Request body with its resident-byte charge attached: moving the bytes
-/// anywhere moves the charge with them, so handler code that retains the
-/// body past the callback cannot separate it from its ingress accounting.
+/// Owned semantic request body with its resident-byte charge attached.
+/// Transport bytes are decoded or copied synchronously before construction,
+/// so asynchronous handler work never retains a receive lease.
 pub struct InputBuffer {
     pub(crate) body: Vec<u8>,
     pub(crate) _charge: crate::wire::ByteCharge,
@@ -280,8 +280,19 @@ impl std::fmt::Debug for InputBuffer {
 /// the charge moves with the body into the connection writer.
 pub struct OutputBuffer {
     pub(crate) body: Vec<u8>,
+    pub(crate) direct: Option<DirectOutput>,
     pub(crate) charge: crate::wire::ByteCharge,
     pub(crate) max_len: usize,
+}
+
+pub(crate) struct DirectOutput {
+    pub(crate) len: usize,
+    pub(crate) serializer: crate::frame_channel::DirectSerializer,
+}
+
+pub(crate) enum OutputParts {
+    Owned(Vec<u8>, crate::wire::ByteCharge),
+    Direct(DirectOutput, crate::wire::ByteCharge),
 }
 
 impl std::fmt::Debug for OutputBuffer {
@@ -290,19 +301,22 @@ impl std::fmt::Debug for OutputBuffer {
         // diagnostics (protocol V24) — mirror RequestCtx's body_len-only
         // policy.
         f.debug_struct("OutputBuffer")
-            .field("len", &self.body.len())
+            .field("len", &self.len())
             .field("max_len", &self.max_len)
+            .field("direct", &self.direct.is_some())
             .finish()
     }
 }
 
 impl OutputBuffer {
     pub fn len(&self) -> usize {
-        self.body.len()
+        self.direct
+            .as_ref()
+            .map_or(self.body.len(), |body| body.len)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.body.is_empty()
+        self.len() == 0
     }
 
     pub fn capacity(&self) -> usize {
@@ -315,7 +329,7 @@ impl OutputBuffer {
 
     /// Appends bytes without permitting allocation beyond the host reservation.
     pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), StreamClosed> {
-        if bytes.len() > self.max_len.saturating_sub(self.body.len()) {
+        if self.direct.is_some() || bytes.len() > self.max_len.saturating_sub(self.body.len()) {
             return Err(StreamClosed);
         }
         self.body.extend_from_slice(bytes);
@@ -324,15 +338,18 @@ impl OutputBuffer {
 
     /// Resizes within the fixed reservation without permitting further growth.
     pub fn resize(&mut self, new_len: usize, value: u8) -> Result<(), StreamClosed> {
-        if new_len > self.max_len {
+        if self.direct.is_some() || new_len > self.max_len {
             return Err(StreamClosed);
         }
         self.body.resize(new_len, value);
         Ok(())
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<u8>, crate::wire::ByteCharge) {
-        (self.body, self.charge)
+    pub(crate) fn into_parts(self) -> OutputParts {
+        match self.direct {
+            Some(direct) => OutputParts::Direct(direct, self.charge),
+            None => OutputParts::Owned(self.body, self.charge),
+        }
     }
 }
 
@@ -368,8 +385,8 @@ impl io::Write for OutputBuffer {
 /// ```
 pub struct RequestCtx {
     pub route: RouteHandle,
-    /// Opaque request body. Binary or JSON per `binary`. Carries its
-    /// resident-byte charge, so retaining it keeps its ingress accounting.
+    /// Opaque owned semantic body. Binary or JSON per `binary`.
+    /// Retaining the body retains its ingress byte charge.
     pub body: InputBuffer,
     pub binary: bool,
     pub(crate) cancel: CancellationToken,
@@ -398,6 +415,15 @@ impl RequestCtx {
     /// transfers into either a unary response or a stream item.
     pub async fn reserve_output(&self, max_len: usize) -> Result<OutputBuffer, StreamClosed> {
         self.stream.reserve(max_len).await
+    }
+
+    /// `output_from_writer` reserves `exact_len` bytes and defers serialization.
+    pub async fn output_from_writer(
+        &self,
+        exact_len: usize,
+        serializer: impl FnOnce(&mut dyn io::Write) -> io::Result<()> + Send + 'static,
+    ) -> Result<OutputBuffer, StreamClosed> {
+        self.stream.reserve_direct(exact_len, serializer).await
     }
 
     pub(crate) fn try_reserve_resident(&self, bytes: usize) -> Option<crate::wire::ByteCharge> {

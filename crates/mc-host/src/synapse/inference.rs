@@ -13,8 +13,8 @@ use fastembed::{
 };
 
 #[cfg(target_os = "linux")]
-use super::bundle::{open_regular_file, OpenRegularFileError};
-use super::bundle::{validate_sha256_hex, Corpus, SelectedOutput, VerifiedBundle};
+use super::bundle::{open_regular_file, validate_sha256_hex, OpenRegularFileError};
+use super::bundle::{Corpus, SelectedOutput, VerifiedBundle};
 
 /// How far a returned vector's L2 norm may sit from 1.0 before the backend
 /// treats it as an invariant failure rather than rounding noise.

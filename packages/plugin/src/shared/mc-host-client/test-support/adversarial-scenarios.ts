@@ -115,7 +115,10 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
                 );
                 const terminal = await request.result;
                 assert.equal(terminal.kind, "response");
-                assert.deepEqual(Buffer.from(terminal.body), body);
+                assert.deepEqual(
+                    Buffer.from("text" in terminal.body ? (terminal.body.text ?? "") : ""),
+                    body,
+                );
             }
             // Three-way split across header and body boundaries.
             const request = generation.request({
@@ -181,8 +184,16 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
                 }),
             ]);
             await connection.sendRaw(coalesced);
-            assert.deepEqual(Buffer.from((await first.result).body), Buffer.from("ra"));
-            assert.deepEqual(Buffer.from((await second.result).body), Buffer.from("rb"));
+            const firstBody = (await first.result).body;
+            const secondBody = (await second.result).body;
+            assert.deepEqual(
+                Buffer.from("text" in firstBody ? (firstBody.text ?? "") : ""),
+                Buffer.from("ra"),
+            );
+            assert.deepEqual(
+                Buffer.from("text" in secondBody ? (secondBody.text ?? "") : ""),
+                Buffer.from("rb"),
+            );
             await connection.waitFor(() =>
                 connection.frames.some(
                     (frame) => frame.ty === PeerFrameType.Pong && frame.corr === 77n,
@@ -319,7 +330,10 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
             });
             const terminal = await errored.result;
             assert.equal(terminal.kind, "error");
-            assert.deepEqual(Buffer.from(terminal.body), errorBody);
+            assert.deepEqual(
+                Buffer.from("text" in terminal.body ? (terminal.body.text ?? "") : ""),
+                errorBody,
+            );
             assert.ok(!generationC.isRetired());
         },
     },

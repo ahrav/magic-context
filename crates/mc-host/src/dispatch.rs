@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use subc_protocol::FrameType;
+use subc_protocol::{EnvelopeHeader, FrameType};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
@@ -17,9 +17,9 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::connection::{GenerationCore, PendingEntry, PendingKey};
 use crate::control::{CODE_CANCELLED, CODE_INTERNAL_ERROR, CODE_SERVER_BUSY, CODE_UNKNOWN_CHANNEL};
-use crate::frame_channel::{InboundFrame, OutboundFrame};
+use crate::frame_channel::{DirectFrame, OutboundFrame, OwnedInboundFrame};
 use crate::handler::{
-    McHostHandler, OutputBuffer, RequestCtx, RequestOutcome, RouteHandle, StreamClosed,
+    McHostHandler, OutputBuffer, OutputParts, RequestCtx, RequestOutcome, RouteHandle, StreamClosed,
 };
 use crate::routing::{BindInstall, CloseDecision};
 use crate::runtime::HostShared;
@@ -150,6 +150,7 @@ async fn charged_error_body(
     Ok((
         OutputBuffer {
             body,
+            direct: None,
             charge,
             max_len: body_len,
         },
@@ -217,6 +218,7 @@ pub async fn emit_frame(
             OutboundFrame {
                 bytes,
                 tail,
+                direct: None,
                 charge,
                 written: None,
             },
@@ -244,13 +246,37 @@ async fn emit_reserved_frame(
     if gen.writer.is_retired() || gen.token.is_cancelled() {
         return Err(());
     }
-    let (body, charge) = body.into_parts();
-    let (bytes, tail) = crate::wire::encode_split_frame(ty, flags, id, body).map_err(|_| ())?;
+    let (bytes, tail, direct, charge) = match body.into_parts() {
+        OutputParts::Owned(body, charge) => {
+            let (bytes, tail) =
+                crate::wire::encode_split_frame(ty, flags, id, body).map_err(|_| ())?;
+            (bytes, tail, None, charge)
+        }
+        OutputParts::Direct(body, charge) => {
+            let len = u32::try_from(body.len).map_err(|_| ())?;
+            let header = EnvelopeHeader {
+                len,
+                ver: subc_protocol::PROTOCOL_VERSION,
+                ty,
+                flags,
+                channel: id.channel,
+                epoch: id.epoch,
+                corr: id.corr,
+            };
+            (
+                Vec::new(),
+                Vec::new(),
+                Some(DirectFrame::new(header, body.len, body.serializer)),
+                charge,
+            )
+        }
+    };
     gen.writer
         .send_before(
             OutboundFrame {
                 bytes,
                 tail,
+                direct,
                 charge,
                 written: None,
             },
@@ -435,8 +461,52 @@ impl StreamSink {
         }
         Ok(OutputBuffer {
             body: Vec::with_capacity(max_len + subc_protocol::HEADER_LEN),
+            direct: None,
             charge,
             max_len,
+        })
+    }
+
+    pub(crate) async fn reserve_direct(
+        &self,
+        exact_len: usize,
+        serializer: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()> + Send + 'static,
+    ) -> Result<OutputBuffer, StreamClosed> {
+        if exact_len > crate::wire::MAX_BODY_LEN as usize
+            || self.cancel.is_cancelled()
+            || self.settlement.won.load(Ordering::SeqCst)
+        {
+            return Err(StreamClosed);
+        }
+        let bytes =
+            u32::try_from(exact_len + subc_protocol::HEADER_LEN).map_err(|_| StreamClosed)?;
+        let deadline = self.gen.writer.admission_deadline();
+        let charge = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Err(StreamClosed),
+            () = self.gen.token.cancelled() => return Err(StreamClosed),
+            charge = timeout_at(deadline, self.budget.charge(bytes)) => match charge {
+                Ok(charge) => charge,
+                Err(_) => {
+                    self.gen.token.cancel();
+                    return Err(StreamClosed);
+                }
+            },
+        };
+        if self.cancel.is_cancelled()
+            || self.gen.token.is_cancelled()
+            || self.settlement.won.load(Ordering::SeqCst)
+        {
+            return Err(StreamClosed);
+        }
+        Ok(OutputBuffer {
+            body: Vec::new(),
+            direct: Some(crate::handler::DirectOutput {
+                len: exact_len,
+                serializer: Box::new(serializer),
+            }),
+            charge,
+            max_len: exact_len,
         })
     }
 
@@ -598,6 +668,7 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
             OutboundFrame {
                 bytes,
                 tail: Vec::new(),
+                direct: None,
                 charge,
                 written: Some(Box::new({
                     let shared = Arc::clone(shared);
@@ -654,7 +725,9 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
     else {
         return;
     };
-    let (body, charge) = body.into_parts();
+    let OutputParts::Owned(body, charge) = body.into_parts() else {
+        return;
+    };
     let Ok(bytes) = encode_owned_frame(FrameType::Error, response_flags(false, true), id, body)
     else {
         return;
@@ -665,6 +738,7 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
             OutboundFrame {
                 bytes,
                 tail: Vec::new(),
+                direct: None,
                 charge,
                 written: Some(Box::new(move |_completed_at| {
                     let _ = written_tx.send(());
@@ -683,7 +757,7 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
 pub async fn dispatch_request<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    frame: InboundFrame,
+    frame: OwnedInboundFrame,
 ) {
     let header = frame.header;
     let route = RouteHandle {
@@ -791,7 +865,7 @@ pub async fn dispatch_request<H: McHostHandler>(
             return;
         }
 
-        let InboundFrame {
+        let OwnedInboundFrame {
             body,
             charge: body_charge,
             ..
@@ -1313,6 +1387,7 @@ pub async fn send_connection_goodbye(gen: &GenerationCore) {
         .send(OutboundFrame {
             bytes,
             tail: Vec::new(),
+            direct: None,
             charge: crate::wire::ByteCharge::none(),
             written: None,
         })

@@ -10,14 +10,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ConnectionGeneration, type ConnectionGenerationOptions } from "../connection";
 import { Deadline } from "../deadline";
 import { SubcCallError } from "../errors";
-import type {
-    FrameChannelHandlers,
-    FrameChannelStats,
-    FrameSendHooks,
-    FrameSendTicket,
-    InboundFrame,
-    OutboundFrame,
-    SetupFrameChannel,
+import {
+    BoundedFrameProducer,
+    CopyCounter,
+    type DirectFrameBody,
+    type FrameChannelHandlers,
+    type FrameChannelStats,
+    type FrameSendHooks,
+    type FrameSendTicket,
+    type InboundFrame,
+    type OutboundFrame,
+    type ProducerFrameHeader,
+    ReceiveLease,
+    type SetupFrameChannel,
 } from "../frame-channel";
 import { type EnvelopeHeader, FrameType, PROTOCOL_VERSION } from "../protocol";
 import type { OpaqueObject } from "../transport-negotiation";
@@ -185,10 +190,10 @@ export class FakeCandidateHost {
 
     /** Deliver one frame to the client half. */
     send(header: Omit<EnvelopeHeader, "len" | "ver">, body: Uint8Array = new Uint8Array(0)): void {
-        this.channel?.deliver({
-            header: { ...header, len: body.length, ver: PROTOCOL_VERSION },
-            body,
-        });
+        this.channel?.deliver(
+            { ...header, len: body.length, ver: PROTOCOL_VERSION },
+            new Uint8Array(body),
+        );
     }
 
     /** Deliver one JSON Response on channel 0 to the client half. */
@@ -243,6 +248,8 @@ class FakeCandidateChannel implements SetupFrameChannel {
     private closed = false;
     private began = false;
     private readonly inbox: InboundFrame[] = [];
+    private readonly leases = new Set<ReceiveLease>();
+    private readonly copies = new CopyCounter();
 
     constructor(
         private readonly host: FakeCandidateHost,
@@ -265,12 +272,74 @@ class FakeCandidateChannel implements SetupFrameChannel {
         }
     }
 
+    produce(
+        header: ProducerFrameHeader,
+        body: DirectFrameBody,
+        hooks?: FrameSendHooks,
+        _deadline?: Deadline,
+    ): FrameSendTicket {
+        const producer = this.reserve(header, body.byteLength, hooks);
+        try {
+            body.fill(producer);
+            return producer.commit(body.byteLength);
+        } catch (error) {
+            producer.abort();
+            throw error;
+        }
+    }
+
+    reserve(
+        header: ProducerFrameHeader,
+        capacity: number,
+        hooks?: FrameSendHooks,
+    ): BoundedFrameProducer {
+        const spans = capacity === 0 ? [] : [new Uint8Array(new ArrayBuffer(capacity))];
+        let held = true;
+        return new BoundedFrameProducer(
+            spans,
+            capacity,
+            (segments, exactLength) => {
+                const body = new Uint8Array(exactLength);
+                let offset = 0;
+                for (const segment of segments) {
+                    body.set(segment, offset);
+                    offset += segment.byteLength;
+                }
+                this.copies.record();
+                return {
+                    publish: () => {
+                        if (!held || this.closed) {
+                            throw new SubcCallError(
+                                "not_sent",
+                                "frame channel is closed",
+                                "channel_closed",
+                            );
+                        }
+                        held = false;
+                        hooks?.onPublish?.();
+                        this.host.receive({
+                            header: { ...header, len: exactLength },
+                            body,
+                        });
+                        hooks?.onComplete?.();
+                        return { cancel: () => false };
+                    },
+                };
+            },
+            () => {
+                held = false;
+            },
+        );
+    }
+
     send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
         if (this.closed) {
             throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
         }
+        const body = new Uint8Array(frame.body);
+        this.copies.record();
         hooks?.onPublish?.();
-        this.host.receive({ header: frame.header, body: frame.body });
+        this.host.receive({ header: frame.header, body });
         hooks?.onComplete?.();
         return { cancel: () => false };
     }
@@ -285,6 +354,13 @@ class FakeCandidateChannel implements SetupFrameChannel {
     }
 
     close(_error?: unknown): void {
+        for (const lease of [...this.leases]) {
+            try {
+                lease.release();
+            } catch (error) {
+                void error;
+            }
+        }
         this.closed = true;
     }
 
@@ -300,11 +376,24 @@ class FakeCandidateChannel implements SetupFrameChannel {
             queuedControlFrames: 0,
             readPaused: false,
             activeTimers: 0,
+            activeReceiveLeases: this.leases.size,
+            quarantinedBytes: 0,
+            ownedAdapterCopies: this.copies.copies,
         };
     }
 
-    deliver(frame: InboundFrame): void {
+    deliver(header: EnvelopeHeader, body: Uint8Array): void {
         if (this.closed) return;
+        let lease: ReceiveLease;
+        lease = new ReceiveLease(
+            body.byteLength === 0 ? [] : [body],
+            () => {
+                this.leases.delete(lease);
+            },
+            this.copies,
+        );
+        this.leases.add(lease);
+        const frame = { header, body: lease };
         if (!this.began) {
             this.inbox.push(frame);
             return;
