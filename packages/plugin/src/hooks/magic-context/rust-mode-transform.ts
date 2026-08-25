@@ -1445,6 +1445,7 @@ function buildTransformBody(args: {
         prompt_surface_guidance_override: args.passInputs.prompt_surface_guidance_override,
         mural: args.passInputs.mural,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
+        claim_lane: args.passInputs.claim_lane,
         auto_search_enabled: args.passInputs.auto_search_enabled === true,
         auto_search_score_threshold: args.passInputs.auto_search_score_threshold,
         auto_search_min_prompt_chars: args.passInputs.auto_search_min_prompt_chars,
@@ -2308,6 +2309,14 @@ export function createRustModeTransform(
             } finally {
                 logStage(sessionId, "stateSync", stateSyncStartedAt, timings);
             }
+            const claimLaneEnabled =
+                state.claimMirrorSeeded === true &&
+                state.claimMirrorSuppressed !== true &&
+                state.claimMirrorVector !== null;
+            passInputs.claim_lane = {
+                enabled: claimLaneEnabled,
+                snapshot_vector: claimLaneEnabled ? state.claimMirrorVector : null,
+            };
             const wireBuildStartedAt = performance.now();
             const encodedInput = encodeOpenCodeMessagesToCk(resolved.annotatedInput);
             timings.wireMessages = wireDelta

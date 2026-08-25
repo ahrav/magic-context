@@ -1892,6 +1892,7 @@ mod tests {
 
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
+            claim_lane: None,
             cache_ttl: None,
             effective_execute_threshold: None,
             auto_search_enabled: true,
@@ -1955,6 +1956,7 @@ mod tests {
 
     fn pctx<'a>() -> ProducerContext<'a> {
         ProducerContext {
+            claim_lane: None,
             project_path: "git:proj",
             note_project_path: "git:proj",
             project_directory: "/nonexistent-docs",

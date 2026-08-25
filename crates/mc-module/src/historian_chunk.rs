@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use chrono::{Local, TimeZone};
+use mc_core::claim_operation::{canonical_snapshot_vector, SnapshotVector};
 use mc_store::{
     BlockIdentity, CompartmentSetGeneration, HistorianSelectedMessageIdentity, McStore,
     StoredCompartment,
@@ -17,11 +18,12 @@ use crate::ck_wire::{CkIngressMessage, CkKind, FlatBlock};
 use crate::historian::{compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest};
 use crate::historian_prompt::{
     build_compartment_agent_prompt, build_reference_blocks_from_stored,
-    render_historian_memory_block, CompartmentPromptInputs,
+    render_historian_claim_block, render_historian_memory_block, CompartmentPromptInputs,
 };
 use crate::historian_validate::{
     ChunkLine, HistorianChunk, MessageRange, StoredCompartmentRange, ValidateOptions,
 };
+use crate::memory_render::MirroredClaimMemory;
 
 const MAX_COMMITS_PER_BLOCK: usize = 5;
 const SYSTEM_DIRECTIVE_PREFIX: &str = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
@@ -459,6 +461,7 @@ pub struct HistorianAssemblerConfig {
     pub token_budget: usize,
     pub boundary: BoundaryResolution,
     pub memory_enabled: bool,
+    pub claim_snapshot_vector: Option<SnapshotVector>,
     pub auto_promote: bool,
     pub user_memory_collection_enabled: bool,
     pub extraction_free: bool,
@@ -555,6 +558,52 @@ impl AssembledHistorianFiring {
 pub enum AssembleHistorianFiringOutcome {
     Fire(Box<AssembledHistorianFiring>),
     NoFire(HistorianNoFireReason),
+}
+
+fn historian_claim_block(store: &McStore, expected: Option<&SnapshotVector>) -> String {
+    let Some(expected) = expected else {
+        return String::new();
+    };
+    let Some(before) = store.claim_mirror_state().ok().flatten() else {
+        return String::new();
+    };
+    let vector = SnapshotVector {
+        vector_version: before.vector_version,
+        database_incarnation_id: before.database_incarnation_id.clone(),
+        workspace_epoch: before.workspace_epoch.clone(),
+        project_generations: before
+            .projects
+            .iter()
+            .map(|(id, project)| (id.to_string(), project.project_generation))
+            .collect(),
+        policy_generations: before
+            .projects
+            .iter()
+            .map(|(id, project)| (id.to_string(), project.policy_generation))
+            .collect(),
+    };
+    if canonical_snapshot_vector(&vector).ok() != canonical_snapshot_vector(expected).ok() {
+        return String::new();
+    }
+    let Some(claims) = store
+        .list_claim_mirror(&before.database_incarnation_id, None)
+        .ok()
+        .and_then(|rows| {
+            rows.iter()
+                .map(MirroredClaimMemory::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        })
+    else {
+        return String::new();
+    };
+    let Some(after) = store.claim_mirror_state().ok().flatten() else {
+        return String::new();
+    };
+    if before != after {
+        return String::new();
+    }
+    render_historian_claim_block(&claims)
 }
 
 pub fn assemble_historian_firing(
@@ -680,8 +729,12 @@ pub fn assemble_historian_firing(
         chunk.chunk.start_index as i64,
         &compartments,
     );
-    let memories = store.load_active_memories(&config.project_path, now_ms)?;
-    let memory_block = render_historian_memory_block(&memories);
+    let memory_block = if cfg!(test) && config.claim_snapshot_vector.is_none() {
+        let memories = store.load_active_memories(&config.project_path, now_ms)?;
+        render_historian_memory_block(&memories)
+    } else {
+        historian_claim_block(store, config.claim_snapshot_vector.as_ref())
+    };
     let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
         seed_examples: &reference_blocks.seed_examples,
         session_references: &reference_blocks.session_references,
@@ -1518,6 +1571,7 @@ mod tests {
                     boundary_reason: "test".to_string(),
                 },
                 memory_enabled: false,
+                claim_snapshot_vector: None,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 extraction_free: false,
@@ -1573,6 +1627,7 @@ mod tests {
                     boundary_reason: "test".to_string(),
                 },
                 memory_enabled: false,
+                claim_snapshot_vector: None,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 extraction_free: false,
@@ -1653,6 +1708,7 @@ mod tests {
                     boundary_reason: "test".to_string(),
                 },
                 memory_enabled: false,
+                claim_snapshot_vector: None,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 extraction_free: false,

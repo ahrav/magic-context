@@ -364,6 +364,27 @@ describe("U10 claim mirror wire", () => {
             }),
         ).toThrow("mirrorVersion is unsupported");
         expect(() =>
+            buildClaimMirrorSnapshotWireBody({
+                ...snapshotRequest,
+                snapshot: {
+                    ...snapshotRequest.snapshot,
+                    legacyMaxMemoryId: 7,
+                } as ClaimMirrorSnapshotRequest["snapshot"],
+            }),
+        ).toThrow("legacyMaxMemoryId is unsupported");
+        expect(() =>
+            buildClaimMirrorSnapshotWireBody({
+                ...snapshotRequest,
+                snapshot: {
+                    ...snapshotRequest.snapshot,
+                    vector: {
+                        ...snapshotRequest.snapshot.vector,
+                        policyGenerations: {},
+                    },
+                },
+            }),
+        ).toThrow("generation vectors must name the same projects");
+        expect(() =>
             buildClaimMirrorReceiptWireBody({
                 ...receiptRequest,
                 receipt: { ...receiptRequest.receipt, expectedEffectCount: 2 },

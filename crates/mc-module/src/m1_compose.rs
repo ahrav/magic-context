@@ -17,6 +17,7 @@ use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
+use mc_core::claim_operation::{canonical_snapshot_vector, SnapshotVector};
 use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredMemory, StoredNote};
 
 use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, CoverageGap};
@@ -161,6 +162,49 @@ pub fn m1_revision_signal_parts_for_pass(
 /// The timed variant keeps the established revision bytes while exposing the memory and note
 /// query families that every transform pass reads before its scheduler decision.
 #[allow(clippy::too_many_arguments)]
+pub fn m1_revision_signal_parts_for_claims_timed(
+    store: &McStore,
+    note_project_path: &str,
+    session_id: &str,
+    user_profile_version: u64,
+    memory_enabled: bool,
+    vector: Option<&SnapshotVector>,
+    timings: Option<&mut M1RevisionReadTimings>,
+) -> Result<M1RevisionSignal, McStoreError> {
+    let snapshot_started_at = Instant::now();
+    let snapshot = store.load_m1_revision_snapshot("", note_project_path, session_id, false, 0)?;
+    if let Some(timings) = timings {
+        timings.memories_ms += snapshot_started_at.elapsed().as_secs_f64() * 1_000.0;
+    }
+    let vector = if memory_enabled {
+        vector
+            .map(canonical_snapshot_vector)
+            .transpose()
+            .map_err(|error| McStoreError::Serde(error.to_string()))?
+    } else {
+        None
+    };
+    let mut in_session = DefaultHasher::new();
+    "mc-m1-claim-in-session-v1".hash(&mut in_session);
+    vector.hash(&mut in_session);
+    snapshot.max_compartment_seq.hash(&mut in_session);
+    snapshot.note_status_version.hash(&mut in_session);
+    user_profile_version.hash(&mut in_session);
+    let mut external = DefaultHasher::new();
+    "mc-m1-claim-external-v1".hash(&mut external);
+    vector.hash(&mut external);
+    Ok(M1RevisionSignal {
+        revision: in_session.finish() | 1,
+        external_revision: external.finish() | 1,
+        max_compartment_seq: snapshot.max_compartment_seq,
+        max_memory_id: 0,
+        max_memory_mutation_id: 0,
+        note_status_version: snapshot.note_status_version,
+        user_profile_version,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn m1_revision_signal_parts_for_pass_timed(
     store: &McStore,
     project_path: &str,
@@ -302,6 +346,65 @@ pub fn compose_m1_from_store(
     temporal_awareness: bool,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M1Composition, M1ComposeError> {
+    compose_m1(
+        store,
+        project_path,
+        note_project_path,
+        session_id,
+        meta,
+        now_ms,
+        memory_enabled,
+        memory_enabled,
+        memory_budget_tokens,
+        user_profile_budget_tokens,
+        temporal_awareness,
+        estimate_tokens,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compose_m1_from_claim_mirror(
+    store: &McStore,
+    note_project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    now_ms: i64,
+    memory_enabled: bool,
+    user_profile_budget_tokens: f64,
+    temporal_awareness: bool,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
+    compose_m1(
+        store,
+        "",
+        note_project_path,
+        session_id,
+        meta,
+        now_ms,
+        false,
+        memory_enabled,
+        1.0,
+        user_profile_budget_tokens,
+        temporal_awareness,
+        estimate_tokens,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_m1(
+    store: &McStore,
+    project_path: &str,
+    note_project_path: &str,
+    session_id: &str,
+    meta: &ModuleMeta,
+    now_ms: i64,
+    project_memory_enabled: bool,
+    profile_enabled: bool,
+    memory_budget_tokens: f64,
+    user_profile_budget_tokens: f64,
+    temporal_awareness: bool,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M1Composition, M1ComposeError> {
     // --- new compartments (seq past the folded watermark) at P1 + coverage extension ---
     // Store-only ordering deliberately allows sparse ordinal gaps; transform has
     // the live array and rejects any coverage advance that would trim present,
@@ -332,7 +435,7 @@ pub fn compose_m1_from_store(
         _ => None,
     };
 
-    let (mutations, memory_updates_block, new_memories_block) = if memory_enabled {
+    let (mutations, memory_updates_block, new_memories_block) = if project_memory_enabled {
         // Resolve membership from the calling project. The sorted union's first member is not
         // necessarily the caller, so using it as `own_identity` would hide own private categories.
         let membership = store.resolve_workspace_membership(project_path)?;
@@ -446,7 +549,7 @@ pub fn compose_m1_from_store(
     // after a version change, and leave the applied version behind when trimming leaves no body
     // to send; that makes the next real render consume the pending delta instead of losing it.
     let (new_user_profile_block, profile_rendered) =
-        if memory_enabled && meta.user_profile_version != meta.m1_user_profile_version {
+        if profile_enabled && meta.user_profile_version != meta.m1_user_profile_version {
             let profile_rows = store.load_active_user_memories()?;
             // Allocate one quarter of the baseline profile budget to profile deltas, matching
             // the quarter-budget allocation used for memory deltas.

@@ -428,6 +428,27 @@ fn u10_scenario_7_delete_and_reseed_require_drained_u5_intents() {
 }
 
 #[test]
+fn u10_scenario_7_equivalent_restart_seed_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let source = snapshot(
+        INCARNATION,
+        &[(41, 1)],
+        &[(41, 9)],
+        vec![claim(CLAIM_A, 41, 1, "Restart-safe claim.", 1)],
+    );
+    store.replace_claim_mirror_snapshot(&source, 1).unwrap();
+    store.replace_claim_mirror_snapshot(&source, 2).unwrap();
+
+    let mut changed = source.clone();
+    changed.project_checkpoints.insert(41, 10);
+    assert!(matches!(
+        store.replace_claim_mirror_snapshot(&changed, 3),
+        Err(ClaimMirrorError::ResetRequired)
+    ));
+}
+
+#[test]
 fn u10_scenario_8_reseed_reproduces_state_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let descriptor = descriptor(dir.path());

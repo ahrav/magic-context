@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use mc_store::{
+    claim_mirror::{ClaimMirrorError, CommittedClaimMirrorRow},
     ClaimIntentRecord, McStore, McStoreError, StoredCompartmentSearchRow, StoredMemoryFull,
     StoredMemorySearchRow, StoredNoteSearchRow,
 };
@@ -23,6 +24,7 @@ pub use mc_store::FOREIGN_VISIBLE_SQL;
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),
+    ClaimMirror(ClaimMirrorError),
     EmptyContent,
     EmptyMerge,
     DuplicateSourceId {
@@ -59,6 +61,7 @@ impl std::fmt::Display for MemoryToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MemoryToolError::Store(e) => write!(f, "store: {e}"),
+            MemoryToolError::ClaimMirror(e) => write!(f, "claim mirror: {e}"),
             MemoryToolError::EmptyContent => write!(f, "memory content is required"),
             MemoryToolError::EmptyMerge => write!(f, "merge requires at least one source memory"),
             MemoryToolError::DuplicateSourceId { id } => {
@@ -98,6 +101,29 @@ impl From<McStoreError> for MemoryToolError {
     fn from(e: McStoreError) -> Self {
         MemoryToolError::Store(e)
     }
+}
+impl From<ClaimMirrorError> for MemoryToolError {
+    fn from(e: ClaimMirrorError) -> Self {
+        MemoryToolError::ClaimMirror(e)
+    }
+}
+
+pub fn list_committed_claims(
+    store: &McStore,
+    public_claim_ids: &BTreeSet<String>,
+    limit: usize,
+) -> Result<Vec<CommittedClaimMirrorRow>, MemoryToolError> {
+    let Some(state) = store.claim_mirror_state()? else {
+        return Ok(Vec::new());
+    };
+    Ok(store
+        .list_claim_mirror(&state.database_incarnation_id, None)?
+        .into_iter()
+        .filter(|row| {
+            public_claim_ids.is_empty() || public_claim_ids.contains(&row.public_claim_id)
+        })
+        .take(limit)
+        .collect())
 }
 
 fn require_intent_protocol(version: u32) -> Result<(), MemoryToolError> {

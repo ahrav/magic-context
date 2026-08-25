@@ -21,9 +21,9 @@ use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use mc_core::claim_operation::{
-    canonical_json_encode, compute_claim_operation_request_digest, decode_claim_operation_result,
-    ClaimCommandIdentity, ClaimIntentAckKind, ClaimIntentBinding, ClaimIntentState,
-    ClaimResultOutcome, CLAIM_REQUEST_ENCODING_VERSION,
+    canonical_json_encode, canonical_snapshot_vector, compute_claim_operation_request_digest,
+    decode_claim_operation_result, ClaimCommandIdentity, ClaimIntentAckKind, ClaimIntentBinding,
+    ClaimIntentState, ClaimResultOutcome, SnapshotVector, CLAIM_REQUEST_ENCODING_VERSION,
 };
 use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -3954,6 +3954,12 @@ pub struct ModuleMeta {
     /// `<memory-updates>` correction. Persisted atomically with the m0 bytes.
     #[serde(default)]
     pub rendered_memory_ids: Vec<i64>,
+    /// The frozen m0 contains these claim revisions.
+    #[serde(default)]
+    pub rendered_revision_locators: Vec<String>,
+    /// The frozen m0/m1 pair represents this claim generation vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_snapshot_vector: Option<SnapshotVector>,
     /// The memory-mutation-log id folded as of the last HARD. m1 renders corrections with
     /// `id > memory_mutation_cursor`; a HARD reconciles them into m0 and advances this.
     #[serde(default)]
@@ -4267,6 +4273,8 @@ pub struct TransformCommit<'a> {
     pub consumed_drop_ids: &'a [i64],
     pub first_applied_command_ids: &'a [String],
     pub memory_revision: Option<&'a MemoryRevision>,
+    /// Snapshot vector fenced by this cache commit.
+    pub claim_snapshot_vector: Option<&'a SnapshotVector>,
     /// Highest compartment sequence observed while composing a bust. The fenced commit
     /// re-reads this scalar so a publication interleaved between signal read and commit
     /// cannot be hidden behind the older rendered m1 bytes.
@@ -9877,6 +9885,7 @@ impl McStore {
                 consumed_drop_ids,
                 first_applied_command_ids: &[],
                 memory_revision,
+                claim_snapshot_vector: None,
                 compartment_max_seq: None,
                 project_root: None,
                 first_divergence: None,
@@ -9906,6 +9915,7 @@ impl McStore {
             consumed_drop_ids,
             first_applied_command_ids,
             memory_revision,
+            claim_snapshot_vector,
             compartment_max_seq,
             project_root,
             first_divergence,
@@ -10042,6 +10052,16 @@ impl McStore {
                 if current_memory != revision.max_memory_id
                     || current_mutation != revision.mutation_cursor
                 {
+                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                }
+            }
+            if let Some(expected_vector) = claim_snapshot_vector {
+                let current_vector = claim_mirror::snapshot_vector_from_connection(tx)?;
+                let vector_matches = current_vector
+                    .as_ref()
+                    .and_then(|vector| canonical_snapshot_vector(vector).ok())
+                    == canonical_snapshot_vector(expected_vector).ok();
+                if !vector_matches {
                     return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
                 }
             }
@@ -19807,6 +19827,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: produced_output_divergence.then_some("{}"),
@@ -20070,6 +20091,7 @@ mod tests {
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
+                        claim_snapshot_vector: None,
                         compartment_max_seq: None,
                         project_root: Some("/root-a"),
                         first_divergence: None,
@@ -20149,6 +20171,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: Some(link_text),
                     first_divergence: None,
@@ -20225,6 +20248,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: Some(missing_text),
                     first_divergence: None,
@@ -20364,6 +20388,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
@@ -20450,6 +20475,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
@@ -20608,6 +20634,7 @@ mod tests {
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
                     memory_revision: None,
+                    claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
@@ -21318,6 +21345,7 @@ mod tests {
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
+                        claim_snapshot_vector: None,
                         compartment_max_seq: None,
                         project_root: None,
                         first_divergence: None,
@@ -21383,6 +21411,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
@@ -22058,6 +22087,7 @@ mod tests {
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
+                        claim_snapshot_vector: None,
                         compartment_max_seq: None,
                         project_root: None,
                         first_divergence,

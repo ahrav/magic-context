@@ -9,14 +9,18 @@
 //! caller, never read here from a live clock) so a later defer replays identical bytes.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use mc_core::claim_operation::SnapshotVector;
 use mc_store::{McStore, McStoreError, MemoryRevision};
 use sha2::{Digest, Sha256};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
 use crate::decay_render::{extract_m0_block, DecayRenderCompartment};
-use crate::memory_render::{render_m0, render_memory_line, workspace_source_names, M0Inputs};
+use crate::memory_render::{
+    render_claim_memory_block, render_claim_memory_line, render_m0, render_memory_line,
+    workspace_source_names, M0Inputs, MirroredClaimMemory,
+};
 use crate::project_docs::read_project_docs_canonical;
 
 pub(crate) const MEMORY_MURAL_BLOCK: &str =
@@ -71,6 +75,10 @@ pub struct M0Composition {
     /// The memory ids actually rendered into m0 (the supersede manifest), after the
     /// deterministic budget trim.
     pub rendered_memory_ids: Vec<i64>,
+    /// m0 contains these rendered claim revision locators.
+    pub rendered_revision_locators: Vec<String>,
+    /// The claim rows supply this generation vector.
+    pub claim_snapshot_vector: Option<SnapshotVector>,
     /// The mutation-log cursor as of this HARD (corrections at/below it are folded in).
     pub memory_mutation_cursor: i64,
     /// The highest memory id folded into m0.
@@ -306,6 +314,74 @@ pub(crate) fn trim_memories_to_budget(
     selected
 }
 
+pub(crate) fn trim_claims_to_budget(
+    claims: &[MirroredClaimMemory],
+    budget_tokens: f64,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Vec<MirroredClaimMemory> {
+    let budget = budget_tokens.max(1.0);
+    let mut ordered = claims.to_vec();
+    ordered.sort_by(|left, right| {
+        right
+            .importance
+            .cmp(&left.importance)
+            .then_with(|| left.public_claim_id.cmp(&right.public_claim_id))
+    });
+    let project_count = ordered
+        .iter()
+        .map(|claim| claim.project_id)
+        .collect::<HashSet<_>>()
+        .len()
+        .max(1);
+    let floor = budget / project_count as f64;
+    let mut selected = Vec::new();
+    let mut selected_ids = HashSet::new();
+    let mut categories = HashSet::<String>::new();
+    let mut used = estimate_tokens("<project-memory>\n</project-memory>") as f64;
+    for project_id in ordered
+        .iter()
+        .map(|claim| claim.project_id)
+        .collect::<BTreeSet<_>>()
+    {
+        let mut member_used = 0.0;
+        for claim in ordered
+            .iter()
+            .filter(|claim| claim.project_id == project_id)
+        {
+            let mut cost = estimate_tokens(&(render_claim_memory_line(claim) + "\n"));
+            if !categories.contains(&claim.category) {
+                cost += estimate_tokens(&format!("<{}>\n</{}>\n", claim.category, claim.category));
+            }
+            let cost = cost as f64;
+            if member_used + cost > floor || used + cost > budget {
+                continue;
+            }
+            member_used += cost;
+            used += cost;
+            categories.insert(claim.category.clone());
+            selected_ids.insert(claim.public_claim_id.clone());
+            selected.push(claim.clone());
+        }
+    }
+    for claim in ordered {
+        if selected_ids.contains(&claim.public_claim_id) {
+            continue;
+        }
+        let mut cost = estimate_tokens(&(render_claim_memory_line(&claim) + "\n"));
+        if !categories.contains(&claim.category) {
+            cost += estimate_tokens(&format!("<{}>\n</{}>\n", claim.category, claim.category));
+        }
+        if used + cost as f64 > budget {
+            continue;
+        }
+        used += cost as f64;
+        categories.insert(claim.category.clone());
+        selected_ids.insert(claim.public_claim_id.clone());
+        selected.push(claim);
+    }
+    selected
+}
+
 pub(crate) fn trim_user_profile_to_budget(
     profile: Vec<String>,
     budget_tokens: f64,
@@ -373,6 +449,24 @@ pub fn compose_m0_from_store(
     inputs: &M0ComposeInputs<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M0Composition, M0ComposeError> {
+    compose_m0(store, inputs, None, estimate_tokens)
+}
+
+pub fn compose_m0_from_claim_mirror(
+    store: &McStore,
+    inputs: &M0ComposeInputs<'_>,
+    claims: &[MirroredClaimMemory],
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M0Composition, M0ComposeError> {
+    compose_m0(store, inputs, Some(claims), estimate_tokens)
+}
+
+fn compose_m0(
+    store: &McStore,
+    inputs: &M0ComposeInputs<'_>,
+    claims: Option<&[MirroredClaimMemory]>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<M0Composition, M0ComposeError> {
     // --- compartments: the session history, coverage anchor, and folded watermark ---
     let compartments = store.load_compartments(inputs.session_id)?;
     // Store-pure coverage checks enforce strict ordering without assuming integer
@@ -392,9 +486,12 @@ pub fn compose_m0_from_store(
             None => (String::new(), None, None, 0),
         };
 
-    // --- memories: rows and watermarks share one SQLite snapshot ---
-    let membership = store.resolve_workspace_membership(inputs.project_path)?;
-    let snapshot = if inputs.memory_enabled {
+    let membership = claims
+        .is_none()
+        .then(|| store.resolve_workspace_membership(inputs.project_path))
+        .transpose()?
+        .flatten();
+    let snapshot = if inputs.memory_enabled && claims.is_none() {
         store.load_memory_render_snapshot(
             inputs.project_path,
             membership.as_ref(),
@@ -417,7 +514,20 @@ pub fn compose_m0_from_store(
         inputs.memory_budget_tokens,
         estimate_tokens,
     );
-    let rendered_memory_ids: Vec<i64> = selected_memories.iter().map(|memory| memory.id).collect();
+    let selected_claims = if inputs.memory_enabled {
+        claims
+            .map(|claims| {
+                trim_claims_to_budget(claims, inputs.memory_budget_tokens, estimate_tokens)
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let rendered_memory_ids = selected_memories.iter().map(|memory| memory.id).collect();
+    let rendered_revision_locators = selected_claims
+        .iter()
+        .map(|claim| claim.revision_locator.clone())
+        .collect();
     let max_memory_id = snapshot.revision.max_memory_id;
     let memory_mutation_cursor = snapshot.revision.mutation_cursor;
 
@@ -465,6 +575,11 @@ pub fn compose_m0_from_store(
         },
         estimate_tokens,
     );
+    let claim_memory = render_claim_memory_block(&selected_claims, "project-memory");
+    if !claim_memory.is_empty() {
+        m0_bytes.push_str("\n\n");
+        m0_bytes.push_str(&claim_memory);
+    }
     if mural.is_some() {
         m0_bytes.push_str("\n\n");
         m0_bytes.push_str(MEMORY_MURAL_BLOCK);
@@ -478,6 +593,8 @@ pub fn compose_m0_from_store(
         first_covered_ordinal,
         folded_compartment_seq,
         rendered_memory_ids,
+        rendered_revision_locators,
+        claim_snapshot_vector: None,
         memory_mutation_cursor,
         max_memory_id,
         memory_revision: snapshot.revision,

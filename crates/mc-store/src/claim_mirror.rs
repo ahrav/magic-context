@@ -552,6 +552,25 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommittedClaimMirro
     })
 }
 
+fn read_claims(
+    conn: &rusqlite::Connection,
+    database_incarnation_id: &str,
+    project_id: Option<i64>,
+) -> rusqlite::Result<Vec<CommittedClaimMirrorRow>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT public_claim_id, project_id, revision_locator, content,
+                content_digest, attributes_json, lifecycle_state,
+                applicability_json, policy_json, provenance_label,
+                project_generation, policy_generation
+           FROM mc_claim_mirror_claims
+          WHERE database_incarnation_id = ?1
+            AND (?2 IS NULL OR project_id = ?2)
+          ORDER BY project_id, public_claim_id",
+    )?;
+    let rows = statement.query_map(params![database_incarnation_id, project_id], row_from_sql)?;
+    rows.collect()
+}
+
 fn insert_claim(
     tx: &rusqlite::Transaction<'_>,
     incarnation: &str,
@@ -627,6 +646,42 @@ fn read_project_states(
     rows.collect()
 }
 
+pub(crate) fn snapshot_vector_from_connection(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<Option<SnapshotVector>> {
+    let state = conn
+        .query_row(
+            "SELECT vector_version, database_incarnation_id, workspace_epoch
+               FROM mc_claim_mirror_state WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((vector_version, database_incarnation_id, workspace_epoch)) = state else {
+        return Ok(None);
+    };
+    let projects = read_project_states(conn, &database_incarnation_id)?;
+    Ok(Some(SnapshotVector {
+        vector_version,
+        database_incarnation_id,
+        workspace_epoch,
+        project_generations: projects
+            .iter()
+            .map(|(project_id, state)| (project_id.to_string(), state.project_generation))
+            .collect(),
+        policy_generations: projects
+            .iter()
+            .map(|(project_id, state)| (project_id.to_string(), state.policy_generation))
+            .collect(),
+    }))
+}
+
 fn claim_intent_control(conn: &rusqlite::Connection) -> rusqlite::Result<Option<(String, String)>> {
     conn.query_row(
         "SELECT database_incarnation_id, transition_state
@@ -692,21 +747,7 @@ impl McStore {
         project_id: Option<i64>,
     ) -> Result<Vec<CommittedClaimMirrorRow>, ClaimMirrorError> {
         self.inner
-            .with_conn(|conn| {
-                let mut statement = conn.prepare_cached(
-                    "SELECT public_claim_id, project_id, revision_locator, content,
-                            content_digest, attributes_json, lifecycle_state,
-                            applicability_json, policy_json, provenance_label,
-                            project_generation, policy_generation
-                       FROM mc_claim_mirror_claims
-                      WHERE database_incarnation_id = ?1
-                        AND (?2 IS NULL OR project_id = ?2)
-                      ORDER BY project_id, public_claim_id",
-                )?;
-                let rows = statement
-                    .query_map(params![database_incarnation_id, project_id], row_from_sql)?;
-                rows.collect()
-            })
+            .with_conn(|conn| read_claims(conn, database_incarnation_id, project_id))
             .map_err(Into::into)
     }
 
@@ -736,19 +777,41 @@ impl McStore {
                 )
                 .optional()?;
             let control = claim_intent_control(tx)?;
-            if let Some((control_incarnation, state)) = control.as_ref() {
+            if let Some((control_incarnation, _)) = control.as_ref() {
                 if control_incarnation != incarnation {
                     return Ok(Err(ClaimMirrorError::IncarnationMismatch {
                         expected: control_incarnation.clone(),
                         found: incarnation.clone(),
                     }));
                 }
-                if (existing.is_some() && state != "resetting")
-                    || (existing.is_none() && state == "draining")
+            }
+            if existing.is_some() {
+                let projects = read_project_states(tx, incarnation)?;
+                let vector_matches = snapshot_vector_from_connection(tx)?
+                    .as_ref()
+                    .is_some_and(|vector| vector == &snapshot.vector);
+                let checkpoints_match = projects.iter().all(|(project_id, project)| {
+                    snapshot.project_checkpoints.get(project_id) == Some(&project.acked_effect_id)
+                });
+                let mut expected_claims = snapshot.claims.clone();
+                expected_claims.sort_by(|left, right| {
+                    left.project_id
+                        .cmp(&right.project_id)
+                        .then_with(|| left.public_claim_id.cmp(&right.public_claim_id))
+                });
+                if vector_matches
+                    && checkpoints_match
+                    && read_claims(tx, incarnation, None)? == expected_claims
                 {
+                    return Ok(Ok(()));
+                }
+                if !matches!(control.as_ref(), Some((_, state)) if state == "resetting") {
                     return Ok(Err(ClaimMirrorError::ResetRequired));
                 }
-            } else if existing.is_some() {
+            }
+            if existing.is_none()
+                && matches!(control.as_ref(), Some((_, state)) if state == "draining")
+            {
                 return Ok(Err(ClaimMirrorError::ResetRequired));
             }
 

@@ -215,6 +215,16 @@ function wireRecord(value: unknown, label: string): Record<string, unknown> {
     return value as Record<string, unknown>;
 }
 
+function wireExactKeys(
+    record: Record<string, unknown>,
+    keys: readonly string[],
+    label: string,
+): void {
+    const expected = new Set(keys);
+    const unknown = Object.keys(record).find((key) => !expected.has(key));
+    if (unknown) throw new Error(`${label}.${unknown} is unsupported`);
+}
+
 function wireString(record: Record<string, unknown>, key: string, label: string): string {
     const value = record[key];
     if (typeof value !== "string" || value.length === 0) {
@@ -254,6 +264,17 @@ function wireIntegerRecord(value: unknown, label: string, minimum = 0): Record<s
 
 function validateClaimMirrorVector(value: unknown, label: string): SnapshotVector {
     const record = wireRecord(value, label);
+    wireExactKeys(
+        record,
+        [
+            "vectorVersion",
+            "databaseIncarnationId",
+            "workspaceEpoch",
+            "projectGenerations",
+            "policyGenerations",
+        ],
+        label,
+    );
     if (record.vectorVersion !== 1) throw new Error(`${label}.vectorVersion is unsupported`);
     const databaseIncarnationId = wireString(record, "databaseIncarnationId", label);
     if (!/^[0-9a-f]{32}$/.test(databaseIncarnationId)) {
@@ -286,6 +307,24 @@ function validateCommittedClaimMirrorRow(
     label: string,
 ): CommittedClaimMirrorRow {
     const record = wireRecord(value, label);
+    wireExactKeys(
+        record,
+        [
+            "publicClaimId",
+            "projectId",
+            "revisionLocator",
+            "content",
+            "contentDigest",
+            "attributes",
+            "lifecycle",
+            "applicability",
+            "policy",
+            "provenanceLabel",
+            "projectGeneration",
+            "policyGeneration",
+        ],
+        label,
+    );
     const publicClaimId = wireString(record, "publicClaimId", label);
     const projectId = wireSafeInteger(record, "projectId", label, 1);
     const revisionLocator = wireString(record, "revisionLocator", label);
@@ -340,6 +379,7 @@ function validateCommittedClaimMirrorRow(
 
 function validateClaimMirrorSnapshot(value: unknown): ClaimMirrorSnapshot {
     const record = wireRecord(value, "claim mirror snapshot");
+    wireExactKeys(record, ["mirrorVersion", "vector", "projectCheckpoints", "claims"], "claim mirror snapshot");
     if (record.mirrorVersion !== CLAIM_MIRROR_VERSION) {
         throw new Error("claim mirror snapshot.mirrorVersion is unsupported");
     }
@@ -369,6 +409,11 @@ function validateClaimMirrorSnapshot(value: unknown): ClaimMirrorSnapshot {
 
 function validateClaimMirrorReceipt(value: unknown): ClaimMirrorReceiptGroup {
     const record = wireRecord(value, "claim mirror receipt");
+    wireExactKeys(
+        record,
+        ["mirrorVersion", "receiptId", "expectedEffectCount", "vector", "effects"],
+        "claim mirror receipt",
+    );
     if (record.mirrorVersion !== CLAIM_MIRROR_VERSION) {
         throw new Error("claim mirror receipt.mirrorVersion is unsupported");
     }
@@ -384,7 +429,23 @@ function validateClaimMirrorReceipt(value: unknown): ClaimMirrorReceiptGroup {
         throw new Error("claim mirror receipt effect group is incomplete");
     }
     const effects = record.effects.map((value, index): ClaimMirrorEffect => {
-        const effect = wireRecord(value, `claim mirror receipt.effects[${index}]`);
+        const label = `claim mirror receipt.effects[${index}]`;
+        const effect = wireRecord(value, label);
+        wireExactKeys(
+            effect,
+            [
+                "effectId",
+                "previousProjectEffectId",
+                "effectKey",
+                "projectId",
+                "generation",
+                "changeKind",
+                "publicClaimId",
+                "revisionLocator",
+                "claim",
+            ],
+            label,
+        );
         const effectId = wireSafeInteger(
             effect,
             "effectId",

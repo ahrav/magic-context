@@ -305,7 +305,7 @@ pub fn compute_policy_heads_digest(counts: &PolicyHeadCounts) -> Result<String, 
 /// Publication-freshness state, separate from mutation fencing: database
 /// incarnation, workspace epoch, and per-project claim/policy generations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotVector {
     pub vector_version: u32,
     pub database_incarnation_id: String,
