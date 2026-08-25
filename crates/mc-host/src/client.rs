@@ -24,7 +24,7 @@ use tokio::{
     task::JoinHandle,
     time::{timeout_at, Instant},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     auth::authenticate_client,
@@ -661,10 +661,13 @@ enum PendingKind {
     Stream {
         items: mpsc::Sender<ChargedItem>,
         terminal: oneshot::Sender<Result<(), CallError>>,
-        /// Fired once when this stream settles, so the detached deadline
-        /// watcher stops sleeping instead of outliving the stream by up to the
-        /// caller's whole timeout.
-        settled: CancellationToken,
+        /// Retires the detached deadline watcher when this entry is dropped, so
+        /// the watcher cannot outlive the stream by up to the caller's whole
+        /// timeout. A guard rather than a bare token because settlement has
+        /// several sites - the terminal-frame branch in `dispatch` settles the
+        /// caller directly without `finish_pending` - and dropping the entry is
+        /// the one thing every path, present or future, already does.
+        _settled: DropGuard,
     },
 }
 
@@ -742,7 +745,7 @@ impl Inner {
             PendingKind::Stream {
                 items: item_tx,
                 terminal: terminal_tx,
-                settled: settled.clone(),
+                _settled: settled.clone().drop_guard(),
             },
             deadline,
         );
@@ -1034,6 +1037,10 @@ impl Inner {
                         let _ = tx.send(result);
                     }
                     PendingKind::Stream { terminal, .. } => {
+                        // Settles the caller directly rather than through
+                        // `finish_pending`, so the deadline watcher is retired
+                        // by dropping the rest of the entry; see
+                        // `PendingKind::Stream::_settled`.
                         let terminal_result = match header.ty {
                             FrameType::StreamEnd => Ok(()),
                             FrameType::Error => Err(CallError::host_terminal(&body)),
@@ -1125,15 +1132,11 @@ impl Inner {
             PendingKind::Unary(tx) => {
                 let _ = tx.send(result);
             }
-            PendingKind::Stream {
-                terminal, settled, ..
-            } => {
+            PendingKind::Stream { terminal, .. } => {
                 let terminal_result = result.map(|_| ());
                 let _ = terminal.send(terminal_result);
-                // Every settle path — terminal frame, caller cancel, stream
-                // drop, route settle, generation retire — funnels through here,
-                // so this is the single point that retires the watcher task.
-                settled.cancel();
+                // Dropping the rest of the entry retires the deadline watcher;
+                // see `PendingKind::Stream::_settled`.
                 self.release_stream();
             }
         }
@@ -1144,6 +1147,17 @@ impl Inner {
         *streams = streams.saturating_sub(1);
     }
 
+    /// Settles every pending request on one route and drops the route.
+    ///
+    /// Emits no per-correlation `Cancel`. Route `Goodbye` — the frame this
+    /// settlement accompanies on close, or the inbound frame that triggered it —
+    /// already obliges the host to stop dispatch and settle or cancel that
+    /// route's work (protocol §11.2). Sending one `Cancel` per possibly-sent
+    /// request would add nothing and can exceed the 32 reserved control slots,
+    /// and `send_control` retires the whole generation on overflow: a routine
+    /// route teardown carrying more than 32 claimed requests would take down
+    /// every unrelated route with it. `settle_all` is silent for the same
+    /// reason.
     fn settle_route(&self, route: RouteHandle) -> bool {
         let pending = {
             let _admission = lock_unpoisoned(&self.admission);
@@ -1160,23 +1174,12 @@ impl Inner {
                 .filter_map(|key| pending.remove(&key).map(|state| (key, state)))
                 .collect::<Vec<_>>()
         };
-        for (key, state) in pending {
+        for (_key, state) in pending {
             let outcome = cancel_classification(&state.publish);
             self.finish_pending(
                 state,
                 Err(CallError::local(outcome, "route_gone", "request stopped")),
             );
-            if outcome == SendOutcome::OutcomeUnknown {
-                let _ = self.send_control(
-                    FrameType::Cancel,
-                    FrameId {
-                        channel: key.channel,
-                        epoch: key.epoch,
-                        corr: key.corr,
-                    },
-                    None,
-                );
-            }
         }
         true
     }
@@ -2101,34 +2104,94 @@ mod tests {
 
     #[tokio::test]
     async fn settled_stream_retires_its_deadline_watcher() {
-        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
-        let (items_tx, _items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        let settled = CancellationToken::new();
-        let (key, _publish) = inner
-            .admit(
-                route(1),
-                Vec::new(),
-                PendingKind::Stream {
-                    items: items_tx,
-                    terminal: terminal_tx,
-                    settled: settled.clone(),
-                },
-                Instant::now() + Duration::from_secs(600),
-            )
-            .expect("stream admitted");
-        assert!(
-            !settled.is_cancelled(),
-            "the watcher must stay armed while the stream is live"
-        );
-        drop(data_rx.recv().await);
+        // Both settle shapes must retire the watcher: `cancel_key` funnels
+        // through `finish_pending`, while a terminal frame settles the caller
+        // directly inside `dispatch`. Only dropping the entry covers both.
+        for terminal in [None, Some(FrameType::StreamEnd)] {
+            let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+            let (items_tx, _items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+            let (terminal_tx, terminal_rx) = oneshot::channel();
+            let settled = CancellationToken::new();
+            let (key, _publish) = inner
+                .admit(
+                    route(1),
+                    Vec::new(),
+                    PendingKind::Stream {
+                        items: items_tx,
+                        terminal: terminal_tx,
+                        _settled: settled.clone().drop_guard(),
+                    },
+                    Instant::now() + Duration::from_secs(600),
+                )
+                .expect("stream admitted");
+            assert!(
+                !settled.is_cancelled(),
+                "the watcher must stay armed while the stream is live"
+            );
+            drop(data_rx.recv().await);
 
-        inner.cancel_key(key, "cancelled").expect("stream settled");
+            match terminal {
+                None => inner.cancel_key(key, "cancelled").expect("stream settled"),
+                Some(ty) => inner.dispatch(
+                    EnvelopeHeader {
+                        len: 0,
+                        ver: PROTOCOL_VERSION,
+                        ty,
+                        flags: response_flags(false, true),
+                        channel: key.channel,
+                        epoch: key.epoch,
+                        corr: key.corr,
+                    },
+                    Vec::new(),
+                    None,
+                ),
+            }
+
+            assert!(
+                settled.is_cancelled(),
+                "settling via {terminal:?} must retire the watcher instead of \
+                 leaving it asleep until the deadline"
+            );
+            assert!(lock_unpoisoned(&inner.pending).is_empty());
+            let _ = terminal_rx.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn route_settlement_never_floods_the_reserved_control_queue() {
+        // One Cancel per claimed request overruns the 32 reserved control slots,
+        // and `send_control` retires the generation on overflow - so a routine
+        // route teardown would take every unrelated route with it.
+        let (inner, mut data_rx, mut control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let route = route(1);
+        lock_unpoisoned(&inner.routes).insert(route);
+        for _ in 0..CLIENT_CONTROL_QUEUE_FRAMES + 1 {
+            let (kind, _rx) = unary_sender();
+            let (_key, publish) = inner
+                .admit(
+                    route,
+                    Vec::new(),
+                    kind,
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .expect("admitted");
+            // Claim each request so settlement classifies it possibly-sent,
+            // which is the case that used to emit a Cancel.
+            assert!(claim_for_write(&publish));
+            drop(data_rx.recv().await);
+        }
+
+        assert!(inner.settle_route(route));
+
         assert!(
-            settled.is_cancelled(),
-            "settlement must retire the watcher instead of leaving it asleep until the deadline"
+            !inner.retired.load(Ordering::Acquire),
+            "route settlement must not retire the generation"
         );
-        let _ = terminal_rx.await;
+        assert!(
+            control_rx.try_recv().is_err(),
+            "route Goodbye already settles the host side; per-correlation Cancel adds only overflow risk"
+        );
+        assert!(lock_unpoisoned(&inner.pending).is_empty());
     }
 
     #[test]
@@ -2364,7 +2427,7 @@ mod tests {
                 PendingKind::Stream {
                     items: items_tx,
                     terminal: terminal_tx,
-                    settled: CancellationToken::new(),
+                    _settled: CancellationToken::new().drop_guard(),
                 },
                 Instant::now() + Duration::from_secs(1),
             )
