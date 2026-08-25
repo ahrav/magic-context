@@ -280,12 +280,6 @@ describe("A47 lease-loss residual-write verifier", () => {
                 trace: noCommitTrace,
             },
             {
-                terminalLeaseLossEvents: 0,
-                postCommitMemoryStatus: "active",
-                postCommitMutationCount: 0,
-                trace: noCommitTrace,
-            },
-            {
                 taskReportedLeaseLoss: false,
                 postCommitMemoryStatus: "active",
                 postCommitMutationCount: 0,
@@ -350,6 +344,35 @@ describe("A47 lease-loss residual-write verifier", () => {
             failedIds(
                 verifyLeaseLossResidualWrite(
                     a47Observation({ terminalLeaseLossEvents: 2 }),
+                ),
+            ),
+        ).toContain("check-a47-single-terminal-lease-event");
+        // The precondition no longer restates this check, so a missing terminal
+        // event now reaches the verifier and fails it instead of leaving the
+        // case unscored.
+        expect(
+            failedIds(
+                verifyLeaseLossResidualWrite(
+                    a47Observation({ terminalLeaseLossEvents: 0 }),
+                ),
+            ),
+        ).toContain("check-a47-single-terminal-lease-event");
+        // The counter alone is the harness's own instrumentation: production
+        // must also report the loss, and the durable trace must carry exactly
+        // one marker.
+        expect(
+            failedIds(
+                verifyLeaseLossResidualWrite(
+                    a47Observation({ taskReportedLeaseLoss: false }),
+                ),
+            ),
+        ).toContain("check-a47-single-terminal-lease-event");
+        expect(
+            failedIds(
+                verifyLeaseLossResidualWrite(
+                    a47Observation({
+                        trace: [...A47_CURRENT_TRACE, "terminal-lease-loss"],
+                    }),
                 ),
             ),
         ).toContain("check-a47-single-terminal-lease-event");

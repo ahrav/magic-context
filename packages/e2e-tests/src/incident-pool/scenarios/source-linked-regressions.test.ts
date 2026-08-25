@@ -54,6 +54,7 @@ function nudgeObservation(
     return {
         rustMode: false,
         mainRequestCount: 3,
+        assistantCandidates: 2,
         inspectedSignedAssistants: 2,
         nudgeMarkerFound: false,
         thinkingByteStable: true,

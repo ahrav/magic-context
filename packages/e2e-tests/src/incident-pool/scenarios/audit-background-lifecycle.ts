@@ -365,7 +365,11 @@ export function preconditionLeaseLossResidualWrite(
         value.mutationAbsentBeforeRelease,
         value.barrierReleased,
         value.guardedWriteAttempted,
-        value.terminalLeaseLossEvents === 1,
+        // `terminalLeaseLossEvents === 1` is deliberately NOT required here.
+        // `check-a47-single-terminal-lease-event` asserts it, and requiring it
+        // as setup too made that check unfailable: the verifier only ran when it
+        // already held. Production's own lease-loss report stays a precondition
+        // because it IS setup — the lease really was lost.
         value.taskReportedLeaseLoss,
         value.childReleased,
     ].every(Boolean);
@@ -424,7 +428,16 @@ export function verifyLeaseLossResidualWrite(
         check("check-a47-durable-happens-before", durableTrace),
         check(
             "check-a47-single-terminal-lease-event",
-            value.terminalLeaseLossEvents === 1,
+            // The counter is incremented by the harness's own `afterPrompt`
+            // closure, so on its own it measures this test's instrumentation
+            // rather than production behavior. Pairing it with production's
+            // lease-loss report makes the check fail when the executor never
+            // detects the loss, and the trace marker ties the count to the
+            // durable ordering the neighbouring check reads.
+            value.terminalLeaseLossEvents === 1 &&
+                value.taskReportedLeaseLoss &&
+                value.trace.filter((entry) => entry === "terminal-lease-loss")
+                    .length === 1,
         ),
         check("check-a47-child-released", value.childReleased),
     ];

@@ -210,10 +210,17 @@ interface FactRowState {
     rowId: number;
 }
 
+/**
+ * The dedup fixtures expect a two-row state, and SQLite leaves the order of an
+ * unordered query unspecified — so `rows[0]` would let the in-process read and
+ * the fresh-process observer read pick different rows between runs. Ordering by
+ * id makes both reads name the same (original) row.
+ */
 function factRowStateSql(): string {
     return `SELECT m.id AS id, m.status AS status,
                 COALESCE((SELECT s.seen_count FROM memory_stats s WHERE s.memory_id = m.id), m.seen_count) AS seen
-            FROM memories m WHERE m.normalized_hash = ?`;
+            FROM memories m WHERE m.normalized_hash = ?
+            ORDER BY m.id`;
 }
 
 function readFactRowState(

@@ -210,7 +210,11 @@ export function validateGreenIncidentWrapperSource(
     catalog: IncidentCatalog,
 ): string[] {
     if (
-        /from\s+["'][^"']*\/(?:parity-pi-todo|parity-synthetic-todo)["']/.test(
+        // The extension is optional: an explicit `.ts` specifier resolves to the
+        // same module as the extensionless one, and without `\.tsx?` an import
+        // written that way would slip a known-red-only scenario into the green
+        // suite past this guard.
+        /from\s+["'][^"']*\/(?:parity-pi-todo|parity-synthetic-todo)(?:\.tsx?)?["']/.test(
             source,
         )
     ) {

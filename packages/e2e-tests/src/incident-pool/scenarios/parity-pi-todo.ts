@@ -690,9 +690,14 @@ export async function drivePiTodoDeferReplay(
                 newerMeta.todo_synthetic_state_json ===
                     normalizedTodoJson(STATE_X_TODOS),
             legacyAnchorExisted,
+            // A rebuilt pair plus a correct state json is not a healed anchor:
+            // the durable linkage is the third field, and leaving it unset is
+            // the catalog's invalid wrong-persisted-state-linkage shape. The
+            // Rust twin requires the same non-null anchor after healing.
             legacyAnchorHealed:
                 legacyBytes !== null &&
                 legacyDeferBytes === legacyBytes &&
+                (legacyMeta?.todo_synthetic_anchor_message_id ?? "") !== "" &&
                 legacyMeta?.todo_synthetic_state_json ===
                     normalizedTodoJson(STATE_X_TODOS),
         };

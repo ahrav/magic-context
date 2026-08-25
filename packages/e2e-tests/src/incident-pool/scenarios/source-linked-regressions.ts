@@ -519,6 +519,7 @@ export interface ThinkingNudgeAnchorObservation
     extends Record<string, JsonValue> {
     rustMode: boolean;
     mainRequestCount: number;
+    assistantCandidates: number;
     inspectedSignedAssistants: number;
     nudgeMarkerFound: boolean;
     thinkingByteStable: boolean;
@@ -605,6 +606,7 @@ export async function driveThinkingNudgeAnchor(
     return {
         rustMode: options.rustMode,
         mainRequestCount: reqs.length,
+        assistantCandidates: assistants.length,
         inspectedSignedAssistants: inspected,
         nudgeMarkerFound,
         thinkingByteStable,
@@ -630,8 +632,15 @@ export function verifyThinkingNudgeAnchor(
         },
         {
             id: "check-thinking-a-nonvacuous-inspection",
+            // Rust CLEARS historical reasoning, so zero signature-carrying
+            // assistants is the correct Rust shape and cannot be required. But
+            // the inspection loop skips every assistant in that mode, which
+            // makes the no-nudge and byte-stability checks pass for free when a
+            // regression drops the assistant messages outright. Requiring
+            // candidates to exist restores non-vacuity for both shapes.
             passed:
                 observation.mainRequestCount >= 3 &&
+                observation.assistantCandidates > 0 &&
                 (observation.rustMode ||
                     observation.inspectedSignedAssistants > 0),
         },
@@ -1095,6 +1104,7 @@ function normalizeThinkingNudge(
     const value = exactPrimitiveObservation(raw, "thinking-nudge-anchor", {
         rustMode: "boolean",
         mainRequestCount: "number",
+        assistantCandidates: "number",
         inspectedSignedAssistants: "number",
         nudgeMarkerFound: "boolean",
         thinkingByteStable: "boolean",
@@ -1103,6 +1113,7 @@ function normalizeThinkingNudge(
     return {
         rustMode: booleanField(value, "rustMode"),
         mainRequestCount: numberField(value, "mainRequestCount"),
+        assistantCandidates: numberField(value, "assistantCandidates"),
         inspectedSignedAssistants: numberField(
             value,
             "inspectedSignedAssistants",

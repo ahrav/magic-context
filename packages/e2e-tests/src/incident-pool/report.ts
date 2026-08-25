@@ -553,6 +553,26 @@ export function buildIncidentReport(
             );
         }
     }
+    // `parseIncidentReport` recomputes this digest from the parsed results and
+    // rejects a mismatch, so accepting the caller's value unchecked here left
+    // publication as the only place the invariant was enforced. Today
+    // `runIncidentPool` passes the run snapshot's digest and it agrees by
+    // construction; a caller that derived it from the wrong row set would
+    // otherwise build a self-inconsistent report and only trip the reader.
+    const recomputedSelectedSetDigest = computeSelectedSetDigest(
+        input.results.map((result) => [
+            result.variant_id,
+            result.semantic_fingerprint,
+            result.implementation_digest,
+            result.baseline_event_id,
+        ]),
+    );
+    if (input.selectedSetDigest !== recomputedSelectedSetDigest) {
+        fail(
+            "report.selected_set_digest",
+            "does not match the terminal result set it is built from",
+        );
+    }
     return {
         schema: INCIDENT_REPORT_SCHEMA,
         run_nonce: asRunNonce(input.runNonce, "report.run_nonce"),

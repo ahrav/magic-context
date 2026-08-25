@@ -963,6 +963,13 @@ export async function runOpenCodeTodoScenario(
         return [
             baselineBytes === null ? "baseline-pair" : null,
             deferBytes === baselineBytes ? null : "newer-todo-deferred",
+            // Byte-comparing the frozen call id cannot see a SECOND injected
+            // pair emitted for the newer state beside it, and every durable
+            // assertion below stays frozen in that case too. The Rust branch
+            // requires the same single-pair invariant.
+            deferBody !== null && injectedTodoPairs(deferBody).length === 1
+                ? null
+                : "newer-todo-single-pair",
             meta?.todo_synthetic_call_id === prepared.callId
                 ? null
                 : "frozen-call-id",
@@ -1029,10 +1036,15 @@ export async function runOpenCodeTodoScenario(
         pressureUsedRealBytes ? null : "real-byte-pressure",
         // Any synthetic pair, not just the prior call id: a terminal state must
         // clear the anchor outright, so a REBUILT pair under a fresh call id is
-        // the same defect and must not read as a clean clear.
-        body && findSyntheticPair(body)
-            ? "terminal-pair-still-present"
-            : null,
+        // the same defect and must not read as a clean clear. An UNCAPTURED
+        // request is not a clean clear either: `body && …` would short-circuit
+        // to null and report the anchor as cleared when the terminal turn never
+        // reached the provider at all.
+        body === null
+            ? "terminal-request-captured"
+            : findSyntheticPair(body)
+              ? "terminal-pair-still-present"
+              : null,
         meta?.last_todo_state === normalizedTodoJson(TERMINAL_TODOS)
             ? null
             : "terminal-state",
