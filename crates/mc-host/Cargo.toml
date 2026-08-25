@@ -36,7 +36,6 @@ tokio = { workspace = true, features = ["test-util", "signal"] }
 rustix = { version = "1.1.4", features = ["stdio"] }
 criterion = "=0.8.2"
 hdrhistogram = "=7.6.0"
-trybuild = "1"
 
 [[test]]
 name = "broca_subprocess"

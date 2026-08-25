@@ -74,6 +74,9 @@ jobs:
           cargo nextest run
           -p mc-shm-native -p mc-host -p mc-shm-transport
 
+      - name: Rust lease non-escape
+        run: cargo test -p mc-host --doc
+
       - name: Build package-relative addon from source
         run: bun run --cwd packages/mc-shm-native build:source
 

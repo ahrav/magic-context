@@ -1313,6 +1313,7 @@ mod tests {
     /// signal unambiguous and bounded: the harness reports a failure, and no
     /// wedged thread outlives it. The fixed build returns in microseconds and
     /// never reaches the deadline.
+    #[cfg(target_os = "linux")]
     fn within<T: Send + 'static>(
         budget: Duration,
         diagnosis: &str,
@@ -1339,6 +1340,7 @@ mod tests {
     /// reading blocks until a writer arrives. Without `O_NONBLOCK` both
     /// evidence readers hang forever; the probe must instead classify the
     /// hostile shape.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_fifo_at_an_evidence_name_cannot_hang_the_probe() {
         for name in [LIFECYCLE_RECORD_NAME, CONNECTION_FILE_NAME] {
@@ -1379,6 +1381,7 @@ mod tests {
     /// A FIFO at the record name must not hang fenced removal either: that
     /// runs from `Drop` while the instance lock is held, so a hang would
     /// retain the lock and fail every later start.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_fifo_at_the_record_name_cannot_hang_fenced_removal() {
         let root = temp_root();

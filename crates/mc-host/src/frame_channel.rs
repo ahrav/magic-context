@@ -257,6 +257,20 @@ impl<C> ProducedBody<'_, C> {
 ///
 /// The type borrows both spans, so it is also non-`'static`. Only values
 /// decoded from the bytes may leave the synchronous scope.
+///
+/// ```compile_fail
+/// use mc_host::frame_channel::ReceiveLease;
+/// fn require_send<T: Send>(_: T) {}
+/// let bytes = [1u8, 2, 3];
+/// require_send(ReceiveLease::contiguous(&bytes));
+/// ```
+///
+/// ```compile_fail
+/// use mc_host::frame_channel::ReceiveLease;
+/// fn require_static<T: 'static>(_: T) {}
+/// let bytes = [1u8, 2, 3];
+/// require_static(ReceiveLease::contiguous(&bytes));
+/// ```
 pub struct ReceiveLease<'lease> {
     first: &'lease [u8],
     second: Option<&'lease [u8]>,
