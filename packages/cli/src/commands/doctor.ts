@@ -11,6 +11,7 @@
  */
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { databaseResetMarkerPath } from "@magic-context/core/features/magic-context/storage-format-epoch";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter } from "../adapters/types";
@@ -23,6 +24,7 @@ import {
     openExistingContextDatabase,
     openExistingContextDatabaseForMutation,
 } from "../lib/database-access";
+import { DATABASE_RESET_COMMAND } from "../lib/database-repair-guidance";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { confirm, intro, log, outro, selectMany, spinner } from "../lib/prompts";
 import {
@@ -43,6 +45,13 @@ export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfill
 
 export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     if (options.clear) return runClear();
+
+    const sharedDbPath = join(getMagicContextStorageDir(), "context.db");
+    if (existsSync(databaseResetMarkerPath(sharedDbPath))) {
+        log.warn(
+            `A database reset is pending for ${sharedDbPath}. Run \`${DATABASE_RESET_COMMAND}\` to complete or roll it back.`,
+        );
+    }
 
     let sharedCommandExitCode: number | null = null;
 

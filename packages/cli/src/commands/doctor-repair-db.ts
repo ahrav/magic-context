@@ -5,11 +5,13 @@ import {
     constants,
     copyFileSync,
     existsSync,
+    mkdtempSync,
     openSync,
     renameSync,
     rmSync,
     statSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-authority";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
@@ -19,9 +21,15 @@ import {
     inspectRpcServerDiscovery,
 } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import {
+    DIRECT_FORMAT_MARKER_TABLE,
+    databaseResetMarkerPath,
+    MC_APPLICATION_ID,
+} from "@magic-context/core/features/magic-context/storage-format-epoch";
 import { inspectLivePiProcesses } from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
+import { DATABASE_RESET_COMMAND } from "../lib/database-repair-guidance";
 import { type PromptIO, promptIO } from "../lib/prompts";
 
 const ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"] as const;
@@ -70,7 +78,7 @@ interface SalvageResult {
     schemaVersionAfter?: number;
 }
 
-function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
+export function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
     const rpc = inspectRpcServerDiscovery(storageDir);
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";
@@ -97,6 +105,52 @@ function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
 
 export function defaultSqliteExecutable(): string {
     return process.env.MAGIC_CONTEXT_SQLITE3 ?? "sqlite3";
+}
+
+// A file too damaged to answer pragmas yields no signals here; the
+// post-`.recover` check in migrateAndCheckRecoveredDatabase catches that case
+// once the contents are readable again.
+function directFormatSignalsFromOpenDatabase(db: DatabaseType): string[] {
+    const signals: string[] = [];
+    const applicationId = Number(
+        Object.values(db.prepare("PRAGMA application_id").get() as Record<string, unknown>)[0],
+    );
+    const userVersion = Number(
+        Object.values(db.prepare("PRAGMA user_version").get() as Record<string, unknown>)[0],
+    );
+    const marker = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get(DIRECT_FORMAT_MARKER_TABLE);
+    if (applicationId === MC_APPLICATION_ID) {
+        signals.push('application_id is the direct-format "MCTX" value');
+    }
+    if (userVersion !== 0) {
+        signals.push(`user_version ${userVersion} is direct-format epoch vocabulary`);
+    }
+    if (marker) signals.push(`the direct-format marker table ${DIRECT_FORMAT_MARKER_TABLE} exists`);
+    return signals;
+}
+
+// A read-only SQLite open can rewrite an existing SHM file, so the probe runs
+// against a private scratch copy of the family.
+function detectDirectFormatSignals(dbPath: string): string[] {
+    let probeDir: string | null = null;
+    let db: DatabaseType | null = null;
+    try {
+        probeDir = mkdtempSync(join(tmpdir(), "mc-repair-format-probe-"));
+        const probePath = join(probeDir, "probe.db");
+        for (const suffix of DATABASE_SUFFIXES) {
+            const source = `${dbPath}${suffix}`;
+            if (existsSync(source)) copyFileSync(source, `${probePath}${suffix}`);
+        }
+        db = new Database(probePath, { readonly: true });
+        return directFormatSignalsFromOpenDatabase(db);
+    } catch {
+        return [];
+    } finally {
+        db?.close();
+        if (probeDir !== null) rmSync(probeDir, { recursive: true, force: true });
+    }
 }
 
 const DEFAULT_DEPS: RepairDbDeps = {
@@ -293,6 +347,15 @@ function migrateAndCheckRecoveredDatabase(path: string): SalvageResult {
     let db: DatabaseType | null = null;
     try {
         db = new Database(path);
+        const directSignals = directFormatSignalsFromOpenDatabase(db);
+        if (directSignals.length > 0) {
+            return {
+                ok: false,
+                detail:
+                    `the recovered contents carry direct-format identity (${directSignals.join("; ")}); ` +
+                    `refusing to migrate a direct-format database through the legacy chain — run \`${DATABASE_RESET_COMMAND}\` instead`,
+            };
+        }
         const recognized = db
             .prepare(
                 `SELECT name FROM sqlite_master WHERE type='table' AND name IN (${RECOGNIZABLE_TABLES.map(() => "?").join(",")})`,
@@ -429,6 +492,9 @@ function printHelp(): void {
     console.log(
         "Salvage needs a sqlite3 shell built with SQLITE_ENABLE_DBPAGE_VTAB; without one, the command backs up and stops without modifying the database.",
     );
+    console.log(
+        "Direct-format and reset-pending databases are refused; use `magic-context doctor reset-db` for those.",
+    );
 }
 
 export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<RepairDbExitCode> {
@@ -449,8 +515,32 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
         return REPAIR_DB_EXIT.failed;
     }
 
+    // Repair salvages the legacy migration lane only: running the legacy chain
+    // over direct-format contents would silently migrate them, and a pending
+    // reset marker means only `doctor reset-db` may touch the family.
+    if (existsSync(databaseResetMarkerPath(dbPath))) {
+        prompts.log.error(`A database reset is pending for this family: ${dbPath}`);
+        prompts.log.info(
+            `Complete or roll back the reset first: run \`${DATABASE_RESET_COMMAND}\`. No salvage was attempted and no file was changed.`,
+        );
+        prompts.outro("Database repair refused; a reset is pending");
+        return REPAIR_DB_EXIT.refused;
+    }
+
     const initialInspection = deps.inspectHolders(storageDir);
     if (!initialInspection.safe) return reportSafetyRefusal(prompts, dbPath, initialInspection);
+
+    const directSignals = detectDirectFormatSignals(dbPath);
+    if (directSignals.length > 0) {
+        prompts.log.error(
+            `This database carries direct-format identity: ${directSignals.join("; ")}`,
+        );
+        prompts.log.info(
+            `doctor repair-db repairs only the legacy-lane database. For an unsupported or direct-format family the only supported action is an explicit reset: run \`${DATABASE_RESET_COMMAND}\`. No salvage was attempted and no file was changed.`,
+        );
+        prompts.outro("Database repair refused; use doctor reset-db");
+        return REPAIR_DB_EXIT.refused;
+    }
 
     let backup: BackupBundle;
     try {

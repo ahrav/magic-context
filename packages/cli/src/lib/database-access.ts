@@ -1,4 +1,6 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
     ensureContextStoreUuid,
@@ -8,6 +10,16 @@ import {
     getPersistedSchemaVersion as getCorePersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
+import {
+    classifyDatabaseFormatFamily,
+    type DatabaseFormatFamily,
+    type DatabaseResetMarker,
+    type ExpectedDirectFormat,
+    inspectDatabaseForClassification,
+    listDatabaseFamilyArtifacts,
+    readDatabaseResetMarker,
+} from "@magic-context/core/features/magic-context/storage-format-epoch";
+import { computeExpectedDirectFormat } from "@magic-context/core/features/magic-context/test-database";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
 
@@ -86,8 +98,9 @@ export function openExistingDatabase(
     // database file") but honors { create: false }, while node:sqlite has no
     // create option and needs the URI's mode=rw.
     if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
-        // create/readwrite are bun:sqlite-only options, absent from the shared
-        // better-sqlite3-shaped Options type the wrapper exports.
+        // SAFETY: create/readwrite are bun:sqlite-only options, absent from the
+        // shared better-sqlite3-shaped Options type the wrapper exports; the Bun
+        // branch above guarantees the bun:sqlite constructor receives them.
         const db = new Database(path, { create: false, readwrite: true } as unknown as {
             readonly: boolean;
         });
@@ -175,4 +188,96 @@ export async function backupDatabaseSnapshot(db: DatabaseType, destination: stri
         throw new Error("The active SQLite runtime does not provide a snapshot backup API");
     }
     await sqlite.backup(db, destination);
+}
+
+// ---------------------------------------------------------------------------
+// U11 direct-format family state (KTD11, R15): read-only CLI access that
+// distinguishes current, pristine, unsupported, reset-pending, and corrupt
+// direct-format state without initializing schema or mutating the family.
+// ---------------------------------------------------------------------------
+
+export type DirectDatabaseFamilyState =
+    | { readonly state: "pristine" }
+    | { readonly state: "current"; readonly databaseIncarnationId: string }
+    | {
+          readonly state: "reset-pending";
+          /** Present marker, or the malformed-read reason recovery must refuse on. */
+          readonly marker:
+              | { readonly status: "present"; readonly marker: DatabaseResetMarker }
+              | { readonly status: "malformed"; readonly reason: string };
+      }
+    | {
+          readonly state: "unsupported";
+          readonly family: DatabaseFormatFamily;
+          readonly reasons: readonly string[];
+          /** Incarnation when the family carries a readable direct-format marker. */
+          readonly databaseIncarnationId: string | null;
+      }
+    | { readonly state: "corrupt"; readonly detail: string };
+
+let cachedExpectedDirectFormat: ExpectedDirectFormat | null = null;
+
+function getExpectedDirectFormat(): ExpectedDirectFormat {
+    cachedExpectedDirectFormat ??= computeExpectedDirectFormat();
+    return cachedExpectedDirectFormat;
+}
+
+/**
+ * Classify the on-disk database family for CLI diagnostics and reset. Never
+ * initializes schema. Content is read from a private temp copy of the family
+ * (main, WAL, SHM) because even a read-only SQLite open rewrites an existing
+ * SHM file; artifact presence is still checked at the real path.
+ */
+export function inspectDirectDatabaseFamilyState(dbPath: string): DirectDatabaseFamilyState {
+    const markerRead = readDatabaseResetMarker(dbPath);
+    if (markerRead.status !== "absent") return { state: "reset-pending", marker: markerRead };
+    if (!existsSync(dbPath)) {
+        const artifacts = listDatabaseFamilyArtifacts(dbPath);
+        if (artifacts.length === 0) return { state: "pristine" };
+        return {
+            state: "unsupported",
+            family: "orphan-artifacts",
+            reasons: artifacts.map(
+                (artifact) => `orphan ${artifact} artifact without a current main database`,
+            ),
+            databaseIncarnationId: null,
+        };
+    }
+    let probeDir: string | null = null;
+    let db: DatabaseType | null = null;
+    try {
+        probeDir = mkdtempSync(join(tmpdir(), "mc-family-probe-"));
+        const probePath = join(probeDir, basename(dbPath));
+        for (const suffix of ["", "-wal", "-shm"]) {
+            const source = `${dbPath}${suffix}`;
+            if (existsSync(source)) copyFileSync(source, `${probePath}${suffix}`);
+        }
+        db = new Database(probePath, { readonly: true });
+        // Content comes from the probe connection; existence and artifact
+        // checks inside inspectDatabaseForClassification use the real path.
+        const inspection = inspectDatabaseForClassification(db, dbPath);
+        const classification = classifyDatabaseFormatFamily(inspection, getExpectedDirectFormat());
+        const databaseIncarnationId =
+            inspection.marker.status === "present"
+                ? inspection.marker.marker.databaseIncarnationId
+                : null;
+        if (classification.family === "current" && databaseIncarnationId !== null) {
+            return { state: "current", databaseIncarnationId };
+        }
+        if (classification.family === "pristine") return { state: "pristine" };
+        return {
+            state: "unsupported",
+            family: classification.family,
+            reasons: classification.reasons,
+            databaseIncarnationId,
+        };
+    } catch (error) {
+        return {
+            state: "corrupt",
+            detail: error instanceof Error ? error.message : String(error),
+        };
+    } finally {
+        db?.close();
+        if (probeDir !== null) rmSync(probeDir, { recursive: true, force: true });
+    }
 }
