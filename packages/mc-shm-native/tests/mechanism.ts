@@ -6,6 +6,7 @@ import {
     rmSync,
     writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,5 +58,217 @@ describe("native mechanism gate", () => {
         expect(child.stderr).toBe("");
         expect(child.status).toBe(0);
         expect(readFileSync(marker, "utf8")).toBe("clean");
+    });
+});
+
+interface RawAttachAddon {
+    attach(descriptor: unknown): number;
+    activeChannelCount(): number;
+    activeExternalRefCount(): number;
+    nativeLeakDiagnostics(): number;
+}
+
+function loadRawAddon(): RawAttachAddon | null {
+    const path = resolve(
+        dirname(fileURLToPath(import.meta.url)),
+        "../mc_shm_native.node",
+    );
+    if (!existsSync(path)) return null;
+    return createRequire(import.meta.url)(path) as RawAttachAddon;
+}
+
+/**
+ * Encodes one RingGrant wire image (layout version 2) as lowercase hex:
+ * layout_version u16, incarnation [16], lane u32, descriptor_depth u64,
+ * arena_bytes u64, max_leases u64, total_bytes u64, reserved u32 zero —
+ * all little-endian.
+ */
+function testGrantHex(lane: number, incarnation: number): string {
+    const bytes = new Uint8Array(58);
+    const view = new DataView(bytes.buffer);
+    view.setUint16(0, 2, true);
+    bytes[2] = incarnation;
+    view.setUint32(18, lane, true);
+    view.setBigUint64(22, 32n, true);
+    view.setBigUint64(30, 67_108_864n, true);
+    view.setBigUint64(38, 32n, true);
+    view.setBigUint64(46, 67_108_864n + 12_288n, true);
+    view.setUint32(54, 0, true);
+    return [...bytes]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+}
+
+function validRawDescriptor(): Record<string, unknown> {
+    return {
+        profile: "mc-host-test-ring-v1",
+        pid: 1234,
+        hostToPeerFd: 10,
+        hostToPeerGrant: testGrantHex(0, 0xab),
+        peerToHostFd: 11,
+        peerToHostGrant: testGrantHex(1, 0xcd),
+    };
+}
+
+describe("raw N-API descriptor boundary", () => {
+    const DESCRIPTOR_ERROR = /invalid shared-memory descriptor/;
+
+    function expectRejectedWithoutEffects(
+        addon: RawAttachAddon,
+        descriptor: unknown,
+        pattern: RegExp = DESCRIPTOR_ERROR,
+    ): void {
+        const channels = addon.activeChannelCount();
+        const refs = addon.activeExternalRefCount();
+        const leaks = addon.nativeLeakDiagnostics();
+        expect(() => addon.attach(descriptor)).toThrow(pattern);
+        expect(addon.activeChannelCount()).toBe(channels);
+        expect(addon.activeExternalRefCount()).toBe(refs);
+        expect(addon.nativeLeakDiagnostics()).toBe(leaks);
+    }
+
+    test("rejects non-object and structurally hostile arguments", () => {
+        const addon = loadRawAddon();
+        if (!addon || process.platform !== "linux") return;
+        for (const hostile of [
+            null,
+            undefined,
+            42,
+            "descriptor",
+            true,
+            [],
+            () => {},
+        ]) {
+            expectRejectedWithoutEffects(addon, hostile);
+        }
+        // A missing field and an explicit undefined are both absent.
+        const { pid: _pid, ...missingPid } = validRawDescriptor();
+        expectRejectedWithoutEffects(addon, missingPid);
+        expectRejectedWithoutEffects(addon, {
+            ...validRawDescriptor(),
+            pid: undefined,
+        });
+    });
+
+    test("rejects every unsafe numeric representation before narrowing", () => {
+        const addon = loadRawAddon();
+        if (!addon || process.platform !== "linux") return;
+        const hostilePids = [
+            Number.NaN,
+            Number.POSITIVE_INFINITY,
+            Number.NEGATIVE_INFINITY,
+            2.5,
+            -1,
+            0,
+            -0,
+            2 ** 32,
+            2 ** 53,
+            "1234",
+            1234n,
+            { valueOf: () => 1234 },
+        ];
+        for (const pid of hostilePids) {
+            expectRejectedWithoutEffects(addon, {
+                ...validRawDescriptor(),
+                pid,
+            });
+        }
+        const hostileFds = [-1, -0, 2 ** 31, 3.5, Number.NaN, "10"];
+        for (const fd of hostileFds) {
+            expectRejectedWithoutEffects(addon, {
+                ...validRawDescriptor(),
+                hostToPeerFd: fd,
+            });
+            expectRejectedWithoutEffects(addon, {
+                ...validRawDescriptor(),
+                peerToHostFd: fd,
+            });
+        }
+    });
+
+    test("rejects malformed, non-ASCII, and aliased grant text", () => {
+        const addon = loadRawAddon();
+        if (!addon || process.platform !== "linux") return;
+        const valid = validRawDescriptor();
+        const hostileGrants = [
+            "\u00e9".repeat(58), // UTF-8 length 116, non-ASCII
+            testGrantHex(0, 0xab).toUpperCase(),
+            testGrantHex(0, 0xab).slice(0, 115), // truncation
+            `${testGrantHex(0, 0xab)}0`, // trailing digit
+            `${testGrantHex(0, 0xab).slice(0, 114)}g0`, // non-hex tail
+            "SENTINEL_GRANT_TEXT".padEnd(116, "0"),
+            "",
+            42,
+        ];
+        for (const grant of hostileGrants) {
+            expectRejectedWithoutEffects(addon, {
+                ...valid,
+                hostToPeerGrant: grant,
+            });
+        }
+        // One fd or one grant backing both lanes aliases the duplex pair.
+        expectRejectedWithoutEffects(addon, {
+            ...validRawDescriptor(),
+            peerToHostFd: 10,
+        });
+        expectRejectedWithoutEffects(addon, {
+            ...validRawDescriptor(),
+            peerToHostGrant: testGrantHex(0, 0xab),
+        });
+    });
+
+    test("accessor objects and proxies get one bounded redacted error", () => {
+        const addon = loadRawAddon();
+        if (!addon || process.platform !== "linux") return;
+        let reads = 0;
+        const accessor = {
+            ...validRawDescriptor(),
+            get pid(): number {
+                reads += 1;
+                throw new Error("SENTINEL_ACCESSOR_THROW");
+            },
+        };
+        try {
+            addon.attach(accessor);
+            throw new Error("attach unexpectedly succeeded");
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : String(error);
+            expect(message).toBe("invalid shared-memory descriptor");
+            expect(message).not.toContain("SENTINEL");
+            expect((error as { cause?: unknown }).cause).toBeUndefined();
+        }
+        expect(reads).toBe(1);
+        expect(addon.activeChannelCount()).toBe(0);
+
+        const flipping = new Proxy(validRawDescriptor(), {
+            get(target, property, receiver) {
+                if (property === "pid") return Number.NaN;
+                return Reflect.get(target, property, receiver);
+            },
+        });
+        expectRejectedWithoutEffects(addon, flipping);
+    });
+
+    test("a wrong profile is refused before any attachment effect", () => {
+        const addon = loadRawAddon();
+        if (!addon || process.platform !== "linux") return;
+        expectRejectedWithoutEffects(
+            addon,
+            { ...validRawDescriptor(), profile: "SENTINEL_PROFILE" },
+            /shared-memory profile is unavailable/,
+        );
+    });
+
+    test("a well-formed but unresolvable descriptor fails without registry effects", () => {
+        const addon = loadRawAddon();
+        if (!addon || process.platform !== "linux") return;
+        // pid 4294967295 is above the Linux pid_max ceiling: validation
+        // passes, the /proc open fails, and no channel is registered.
+        expectRejectedWithoutEffects(
+            addon,
+            { ...validRawDescriptor(), pid: 4_294_967_295 },
+            /shared-memory attachment failed/,
+        );
     });
 });
