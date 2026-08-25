@@ -247,12 +247,19 @@ fn cleanup_env(raw_env: usize) {
     let env = Env::from_raw(raw_env);
     REGISTRY.with(|registry| {
         if let Ok(mut registry) = registry.try_borrow_mut() {
-            for channel in registry.channels.values_mut() {
+            registry.channels.retain(|_, channel| {
                 if close_channel(&env, channel).is_err() {
+                    // Env teardown offers no later retry, so a failed close
+                    // leaves both directions' alias state unknown.
+                    channel.to_host.enter_quarantine();
                     channel.from_host.enter_quarantine();
                 }
-            }
-            registry.channels.clear();
+                // Same retention rule as close: only alias-free channels may
+                // drop their mapping.
+                !(channel.producers.is_empty()
+                    && channel.active.is_empty()
+                    && channel.stranded.is_empty())
+            });
         }
     });
 }

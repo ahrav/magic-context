@@ -168,6 +168,10 @@ export class ShmFrameChannel implements SetupFrameChannel {
     }
 
     sendControl(header: EnvelopeHeader): void {
+        // Late control sends on a closed channel are silent no-ops per the
+        // FrameChannel contract; callers such as enqueueControlHeader do not
+        // catch, so a throw here would unwind frame dispatch or teardown.
+        if (this.closed) return;
         // Control frames stay uncharged, matching the TCP channel's
         // never-cap-refused control path.
         this.publishFrame(header, { byteLength: 0, fill: () => {} });

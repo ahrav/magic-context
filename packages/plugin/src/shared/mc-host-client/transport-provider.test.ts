@@ -235,6 +235,42 @@ describe("sanitized provider channel", () => {
         expect(wrapped.stats().quarantinedBytes).toBe(5);
     });
 
+    test("a throwing isReleased on the rejected source lease is contained as quarantined", () => {
+        const budget = new ByteBudget(1024);
+        const { handlers, wrapped, closes } = wrap(fakeProviderChannel({}), budget);
+        const segment = new Uint8Array(new ArrayBuffer(5));
+        // isReleased() is provider-overridable: a throw during the rejection
+        // path must not unwind the provider's reader callback, and the lease
+        // whose state cannot be read keeps its charge quarantined.
+        const sourceLease = new (class extends ReceiveLease {
+            override isReleased(): boolean {
+                throw new Error("state unavailable");
+            }
+        })(
+            [segment],
+            () => {},
+            new CopyCounter(),
+            () => "released",
+        );
+        expect(() =>
+            handlers.onFrame({
+                header: {
+                    len: 3,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType.Response,
+                    flags: 0,
+                    channel: 7,
+                    epoch: 1,
+                    corr: 1n,
+                },
+                body: sourceLease,
+            }),
+        ).not.toThrow();
+        expect(closes.map((entry) => entry.reason)).toEqual(["protocol_violation"]);
+        expect(budget.used).toBe(5);
+        expect(wrapped.stats().quarantinedBytes).toBe(5);
+    });
+
     test("a duplicate still-active source lease is rejected without touching the original", () => {
         const budget = new ByteBudget(1024);
         const dispatched: unknown[] = [];
@@ -246,7 +282,7 @@ describe("sanitized provider channel", () => {
             [segment],
             () => {},
             new CopyCounter(),
-            () => true,
+            () => "released",
         );
         const frame = {
             header: {
@@ -287,7 +323,7 @@ describe("sanitized provider channel", () => {
             [segment],
             () => {},
             new CopyCounter(),
-            () => true,
+            () => "released",
         );
         handlers.onFrame({
             header: {

@@ -457,6 +457,27 @@ describe("explicit shared-memory provider", () => {
         expect(nativeCloseCalls).toBe(0);
     });
 
+    test("sendControl after close is a silent no-op", () => {
+        let produceCalls = 0;
+        const native = {
+            produce: () => {
+                produceCalls++;
+            },
+            close: () => {},
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget: new ByteBudget(1024),
+            handlers: {
+                onFrame: () => {},
+                onClosed: () => {},
+            },
+        });
+        channel.close();
+        expect(() => channel.sendControl(responseHeader(FrameType.Pong, 1n, 0))).not.toThrow();
+        expect(produceCalls).toBe(0);
+    });
+
     test("handler throw releases JSON lease before fail-close", async () => {
         if (!probeCapabilities().available) return;
         const pair = NativeChannel.createTestPair();

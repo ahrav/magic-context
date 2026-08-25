@@ -421,13 +421,17 @@ export function sanitizedCandidateFactory(
                     let retained = false;
                     if (sourceLease) {
                         activeSourceLeases.delete(sourceLease);
-                        if (!sourceLease.isReleased()) {
-                            try {
-                                sourceLease.release();
-                            } catch {
-                                quarantinedBytes += charged;
-                                retained = true;
-                            }
+                        // isReleased() and release() are provider-overridable
+                        // and may throw; both share one containment so the
+                        // rejection always reaches the sanitized close below.
+                        // A lease whose state cannot even be read counts as
+                        // retained: its storage may still be aliased, so the
+                        // charge is quarantined rather than released.
+                        try {
+                            if (!sourceLease.isReleased()) sourceLease.release();
+                        } catch {
+                            quarantinedBytes += charged;
+                            retained = true;
                         }
                     }
                     if (charged > 0 && !retained) args.budget.release(charged);

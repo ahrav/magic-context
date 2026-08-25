@@ -86,6 +86,13 @@ fn main() {
     let executable = std::env::current_exe().unwrap();
     let mut attempts = Vec::new();
     for scheduling in ["hot", "cold"] {
+        // Fallback records carry the same canonical schedule label as child
+        // measurements, so grouping by `scheduling` never splits an arm
+        // between the CLI token and the canonical name.
+        let canonical_scheduling = scheduling_name(match scheduling {
+            "hot" => SchedulingMode::HotPinnedPoll,
+            _ => SchedulingMode::ColdParkWake,
+        });
         for block in 0..periods {
             let forward = block % 2 == 0;
             for pass in 0..4 {
@@ -111,7 +118,13 @@ fn main() {
                         .rev()
                         .find_map(|line| serde_json::from_str::<Measurement>(line).ok())
                         .unwrap_or_else(|| {
-                            failed(arm, scheduling, payload, iterations, "arm process failed")
+                            failed(
+                                arm,
+                                canonical_scheduling,
+                                payload,
+                                iterations,
+                                "arm process failed",
+                            )
                         });
                     attempts.push(record);
                 }
@@ -301,6 +314,11 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
     Ok((start.elapsed(), 0, 0, 0, 0, checksum))
 }
 
+// Smoke-only ring shape: "smoke-unqualified" never names a qualified
+// candidate, so every record built from it stays `qualified: false`. It
+// deliberately diverges from the host's qualified profile (Fused workers,
+// depth 8, lease limit 8) — the caller thread drives both ends here and the
+// depth/lease limit of 32 keeps the smoke loop from stalling on backpressure.
 fn ring_profile(scheduling: SchedulingMode) -> Result<TargetProfile, &'static str> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(

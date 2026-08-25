@@ -9,7 +9,8 @@ use mc_shm_transport::descriptor::{
 use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::lifecycle::{CloseState, Lifecycle, LifecycleError};
 use mc_shm_transport::profile::{
-    ring_profile, AdmissionController, AdmissionError, HostLimits, ResourceCharges,
+    ring_profile, AdmissionController, AdmissionError, CompletionMode, HostLimits,
+    ProducerTopology, ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
 };
 
 fn header(len: usize) -> [u8; WIRE_V2_HEADER_BYTES] {
@@ -338,6 +339,62 @@ fn host_admission_retains_quarantined_commitments() {
             | Err(AdmissionError::LeaseLimit)
             | Err(AdmissionError::MappingLimit)
     ));
+}
+
+fn span_profile(max_spans: usize) -> TargetProfile {
+    TargetProfile::new(ProfileConfig {
+        descriptor: TransportDescriptor::new(
+            BackendId::Ring,
+            MemoryLayout::TwoSpanWrap,
+            OwnershipMode::DirectLeased,
+            SchedulingMode::ColdParkWake,
+            WorkloadClass::MixedDuplex,
+            PlatformKind::Linux,
+            RuntimeKind::Rust,
+            HardwareProfileId::new("contract-spans").unwrap(),
+        ),
+        descriptor_depth: 8,
+        arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
+        max_spans,
+        max_leases: 8,
+        mappings: 2,
+        pinned_workers: 0,
+        producer_topology: ProducerTopology::CallerConfined,
+        worker_topology: WorkerTopology::CallerThread,
+        completion_mode: CompletionMode::SynchronousPull,
+    })
+    .unwrap()
+}
+
+#[test]
+fn released_admissions_recompute_active_span_charge() {
+    let wide = span_profile(2);
+    let narrow = span_profile(1);
+    let controller = Arc::new(AdmissionController::new(HostLimits {
+        descriptors: 1024,
+        arena_bytes: 1 << 30,
+        leases: 1024,
+        mappings: 1024,
+        pinned_workers: 0,
+    }));
+
+    // The active span charge is the maximum over live admissions: it drops
+    // to the widest survivor on release and reaches zero only once every
+    // admission is gone.
+    let wide_admission = controller.admit(&wide, None).unwrap();
+    let narrow_admission = controller.admit(&narrow, None).unwrap();
+    assert_eq!(controller.snapshot().unwrap().active.spans_per_frame, 2);
+    wide_admission.release();
+    assert_eq!(controller.snapshot().unwrap().active.spans_per_frame, 1);
+    drop(narrow_admission);
+    assert_eq!(controller.snapshot().unwrap().active.spans_per_frame, 0);
+
+    // Quarantine moves the span charge out of the active maximum too.
+    let wide_admission = controller.admit(&wide, None).unwrap();
+    let _quarantine = wide_admission.quarantine().unwrap();
+    let snapshot = controller.snapshot().unwrap();
+    assert_eq!(snapshot.active.spans_per_frame, 0);
+    assert_eq!(snapshot.quarantined.spans_per_frame, 2);
 }
 
 #[test]

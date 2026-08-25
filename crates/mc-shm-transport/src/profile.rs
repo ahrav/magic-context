@@ -85,6 +85,8 @@ impl ResourceCharges {
         Some(Self {
             descriptors: self.descriptors.checked_sub(other.descriptors)?,
             arena_bytes: self.arena_bytes.checked_sub(other.arena_bytes)?,
+            // A maximum, not a sum: release paths recompute it from the
+            // per-admission span counts in `Accounting`.
             spans_per_frame: self.spans_per_frame,
             leases: self.leases.checked_sub(other.leases)?,
             mappings: self.mappings.checked_sub(other.mappings)?,
@@ -327,6 +329,37 @@ fn allowed_linux_cpus() -> Option<Vec<u32>> {
 struct Accounting {
     active: ResourceCharges,
     quarantined: ResourceCharges,
+    // Active admissions per span charge; slot `i` counts admissions
+    // charging `i + 1` spans. `active.spans_per_frame` is the maximum over
+    // active admissions, so releasing one must recompute it from these
+    // counts instead of subtracting.
+    active_span_counts: [u64; MAX_SPANS],
+}
+
+impl Accounting {
+    fn span_slot(spans: u64) -> Option<usize> {
+        usize::try_from(spans)
+            .ok()
+            .and_then(|spans| spans.checked_sub(1))
+            .filter(|slot| *slot < MAX_SPANS)
+    }
+
+    fn charge_spans(&mut self, spans: u64) {
+        if let Some(slot) = Self::span_slot(spans) {
+            self.active_span_counts[slot] = self.active_span_counts[slot].saturating_add(1);
+        }
+    }
+
+    fn release_spans(&mut self, spans: u64) {
+        if let Some(slot) = Self::span_slot(spans) {
+            self.active_span_counts[slot] = self.active_span_counts[slot].saturating_sub(1);
+        }
+        self.active.spans_per_frame = self
+            .active_span_counts
+            .iter()
+            .rposition(|count| *count > 0)
+            .map_or(0, |slot| slot as u64 + 1);
+    }
 }
 
 /// Observable aggregate admission counters without candidate identities.
@@ -352,6 +385,7 @@ impl AdmissionController {
             accounting: Mutex::new(Accounting {
                 active: ResourceCharges::ZERO,
                 quarantined: ResourceCharges::ZERO,
+                active_span_counts: [0; MAX_SPANS],
             }),
         }
     }
@@ -383,6 +417,7 @@ impl AdmissionController {
         let active = self.check_admission(*accounting, profile, physical_cores)?;
         let charges = profile.charges();
         accounting.active = active;
+        accounting.charge_spans(charges.spans_per_frame);
         Ok(Admission {
             controller: Arc::clone(self),
             charges,
@@ -450,6 +485,7 @@ impl AdmissionController {
         };
         if let Some(active) = accounting.active.checked_sub(charges) {
             accounting.active = active;
+            accounting.release_spans(charges.spans_per_frame);
         }
     }
 
@@ -462,6 +498,7 @@ impl AdmissionController {
             .active
             .checked_sub(charges)
             .ok_or(AdmissionError::AccountingUnavailable)?;
+        accounting.release_spans(charges.spans_per_frame);
         let retained = ResourceCharges {
             pinned_workers: 0,
             ..charges
