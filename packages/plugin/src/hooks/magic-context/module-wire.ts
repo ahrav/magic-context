@@ -2,8 +2,8 @@ import * as crypto from "node:crypto";
 import {
     computeClaimOperationRequestDigest,
     parseRevisionLocator,
-    sha256HexUtf8,
     type SnapshotVector,
+    sha256HexUtf8,
 } from "../../features/magic-context/memory/claim-operation-contract";
 import {
     getRawSessionStoredMessageCount,
@@ -379,7 +379,11 @@ function validateCommittedClaimMirrorRow(
 
 function validateClaimMirrorSnapshot(value: unknown): ClaimMirrorSnapshot {
     const record = wireRecord(value, "claim mirror snapshot");
-    wireExactKeys(record, ["mirrorVersion", "vector", "projectCheckpoints", "claims"], "claim mirror snapshot");
+    wireExactKeys(
+        record,
+        ["mirrorVersion", "vector", "projectCheckpoints", "claims"],
+        "claim mirror snapshot",
+    );
     if (record.mirrorVersion !== CLAIM_MIRROR_VERSION) {
         throw new Error("claim mirror snapshot.mirrorVersion is unsupported");
     }

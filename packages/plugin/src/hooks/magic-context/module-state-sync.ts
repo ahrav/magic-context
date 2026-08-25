@@ -1,17 +1,13 @@
 import { createHmac, randomUUID } from "node:crypto";
-import {
-    reconcileCompatibilityVerifications,
-    seedLateCompatibilityRevisions,
-} from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
+import { readAuthorizedClaimMemorySnapshot } from "../../features/magic-context/memory/claim-memory-render";
 import {
-    canonicalSnapshotVector,
     type ClaimOperationResult,
+    canonicalSnapshotVector,
     decodeClaimOperationResult,
     parseRevisionLocator,
     type SnapshotVector,
 } from "../../features/magic-context/memory/claim-operation-contract";
-import { readAuthorizedClaimMemorySnapshot } from "../../features/magic-context/memory/claim-memory-render";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemorySnapshotVector,
@@ -81,9 +77,9 @@ import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import {
-    type ClaimEffectDeliveryReceipt,
     CLAIM_MIRROR_PROTOCOL_VERSION,
     CLAIM_MIRROR_VERSION,
+    type ClaimEffectDeliveryReceipt,
     type ClaimMirrorChangeKind,
     type ClaimMirrorReceiptRequest,
     type ClaimMirrorReceiptResponse,
@@ -1523,31 +1519,6 @@ export async function buildModuleStateSyncPayload(args: {
     // One authority pool has one writer. While MODULE owns memories, this sender only mirrors
     // module changes back to TypeScript and must not send the TypeScript view in the other direction.
     const omitAuthorityMemorySections = args.options?.authorityState === "MODULE";
-    // A held-open v85 writer can append compatibility verification events at
-    // any time, not just before startup; reconcile them before reading
-    // watermarks so a resulting epoch bump is visible to THIS pass. The
-    // reconciler is watermark-guarded (one MAX probe when idle) and its
-    // failure must not fail the sync — an unmoved watermark retries next pass.
-    try {
-        reconcileCompatibilityVerifications(args.pass.db);
-    } catch (error) {
-        sessionLog(
-            args.pass.sessionId,
-            `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
-        );
-    }
-    // Sibling straggler probe: a held-open v85 writer can also append a NEW
-    // revision after the startup seeder completed; unseeded revisions read
-    // as automatic-hidden until seeded. One single-row anti-join when idle;
-    // the seed itself runs async and must not fail the sync.
-    try {
-        seedLateCompatibilityRevisions(args.pass.db);
-    } catch (error) {
-        sessionLog(
-            args.pass.sessionId,
-            `late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
-        );
-    }
     const currentWatermarks = loadModuleWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
@@ -3051,16 +3022,8 @@ export async function syncModuleState(args: {
             force = true;
             continue;
         }
-        // Post-send revalidation: a held-open pre-v86 compatibility writer
-        // appends stale/flagged verification events WITHOUT bumping the
-        // project epoch — including while the awaited sends above were in
-        // flight, a window the pre-send completing-batch check cannot see.
-        // Reconcile first (it projects those events into policy state and
-        // bumps the epoch when any exist), then compare against the built
-        // snapshot; accepting the old watermarks here would leave the module
-        // serving a row the current policy already soft-hides.
+        // Revalidate after sends because state can change while they await; the module must not serve a row the current policy soft-hides.
         if (args.pass.projectPath && completingBatchParams !== null) {
-            reconcileCompatibilityVerifications(args.pass.db);
             const params = completingBatchParams as {
                 project_memory_epoch?: number;
                 acked_watermarks?: { workspace_fingerprint?: string | null };

@@ -1,5 +1,4 @@
 import * as crypto from "node:crypto";
-import { revalidateEnforcementArtifacts } from "../../features/magic-context/claim-policy-backfill";
 import {
     type AuthorityModuleClient,
     checksumAuthoritySeedRows,
@@ -7,6 +6,7 @@ import {
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
+import { revalidateEnforcementArtifacts } from "../../features/magic-context/memory/enforcement-artifact-revalidation";
 import {
     isLinkedGitWorktree,
     resolveProjectIdentity,

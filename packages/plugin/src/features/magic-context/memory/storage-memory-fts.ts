@@ -1,4 +1,5 @@
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import { sanitizeFtsQuery } from "../fts-query";
 import {
     buildWorkspaceMemorySqlFilter,
     getMemorySelectColumns,
@@ -53,12 +54,7 @@ function uniqueProjectPaths(projectPaths: readonly string[]): string[] {
     return [...new Set(projectPaths.filter((path) => path.length > 0))];
 }
 
-export function sanitizeFtsQuery(query: string): string {
-    const tokens = query.split(/\s+/).filter((token) => token.length > 0);
-    if (tokens.length === 0) return "";
-
-    return tokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(" ");
-}
+export { sanitizeFtsQuery };
 
 export function searchMemoriesFTS(
     db: Database,

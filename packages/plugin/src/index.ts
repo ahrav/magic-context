@@ -10,8 +10,6 @@ import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
-import { runClaimPolicySeedStartup } from "./features/magic-context/claim-policy-backfill-startup";
-import { runClaimsBackfillStartup } from "./features/magic-context/claims-backfill-startup";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -289,36 +287,9 @@ const server: Plugin = async (ctx) => {
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
     });
 
-    // createSessionHooks() opens the shared DB and runs migrations before
-    // returning a non-null hook, so this fire-and-forget runner starts only
-    // after the schema is ready. Batch transactions serialize with concurrent
-    // ctx_memory writes.
-    if (pluginConfig.enabled && magicContextRuntime.magicContext) {
-        try {
-            const db = openDatabase();
-            if (db && isDatabasePersisted(db)) {
-                scheduleAfterBootQuiet(() => {
-                    runClaimsBackfillStartup(db).catch((err) => {
-                        log(`[claims-backfill] background runner failed: ${err}`);
-                    });
-                });
-                // Independent of the backfill above: an unseeded revision reads
-                // as automatic-hidden, so chaining this behind that backfill
-                // would hide every pre-existing memory whenever it fails.
-                scheduleAfterBootQuiet(() => {
-                    runClaimPolicySeedStartup(db).catch((err) => {
-                        log(`[claim-policy-seed] background runner failed: ${err}`);
-                    });
-                });
-            }
-        } catch (err) {
-            log(`[claims-backfill] failed to start background runner: ${err}`);
-        }
-    }
-
-    // Gated like the v22 backfill above: a conflict-disabled plugin must not
-    // touch storage at all (openDatabase() would CREATE context.db, breaking
-    // the disabled-path invariant that no state is written).
+    // A conflict-disabled plugin must not touch storage at all
+    // (openDatabase() would CREATE context.db, breaking the disabled-path
+    // invariant that no state is written).
     if (pluginConfig.enabled && magicContextRuntime.magicContext) {
         scheduleAfterBootQuiet(() => {
             void (async () => {

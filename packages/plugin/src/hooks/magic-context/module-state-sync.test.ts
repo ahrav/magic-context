@@ -29,13 +29,13 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     buildDirectFormatMarker,
     createDirectFormatMarkerSchema,
     readDirectFormatMarker,
     stampDirectFormatMarker,
 } from "../../features/magic-context/storage-format-epoch";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
 import {
     insertTag,

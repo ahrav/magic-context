@@ -34,8 +34,6 @@ import type {
 	MagicContextConfig,
 	SidekickConfig,
 } from "@magic-context/core/config/schema/magic-context";
-import { runClaimPolicySeedStartup } from "@magic-context/core/features/magic-context/claim-policy-backfill-startup";
-import { runClaimsBackfillStartup } from "@magic-context/core/features/magic-context/claims-backfill-startup";
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
@@ -473,28 +471,10 @@ export const __test = {
 	isPiMagicContextActiveInProcess,
 	markPiMagicContextActive,
 	clearPiMagicContextActive,
-	scheduleStartupBackfills,
 };
 
 function formatTokens(value: number): string {
 	return value.toLocaleString();
-}
-
-function scheduleStartupBackfills(
-	db: ContextDatabase,
-	run = runClaimsBackfillStartup,
-): Promise<unknown> {
-	// The two runners are independent: an unseeded revision reads as
-	// automatic-hidden, so chaining the policy seed behind the claims backfill
-	// would hide every pre-existing memory whenever that backfill fails.
-	return Promise.all([
-		run(db, { log: warn }).catch((err) => {
-			warn(`[claims-backfill] background runner failed: ${err}`);
-		}),
-		runClaimPolicySeedStartup(db, { log: warn }).catch((err) => {
-			warn(`[claim-policy-seed] background runner failed: ${err}`);
-		}),
-	]);
 }
 
 function getPiMessageModel(message: unknown): {
@@ -991,13 +971,6 @@ async function startPiMagicContextRuntime(
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
-
-	// Behind the enabled gate: the claims backfill mutates the shared DB, so a
-	// disabled plugin must not schedule it (same gating the OpenCode plugin
-	// applies before runClaimsBackfillStartup).
-	scheduleAfterBootQuiet(() => {
-		scheduleStartupBackfills(db);
-	});
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
 	info(
@@ -2125,6 +2098,7 @@ async function startPiMagicContextRuntime(
 				| undefined;
 			const sessionId = sm?.getSessionId?.();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
+			// SAFETY: id and role are re-checked below before use.
 			const endedMsg = event.message as unknown as {
 				id?: string;
 				role?: string;
@@ -2347,6 +2321,7 @@ async function startPiMagicContextRuntime(
 		// resolved we just skip — Pi resets module state on /reload
 		// anyway.
 		try {
+			// SAFETY: sessionManager and getSessionId are checked before use.
 			const sm = (
 				ctx as unknown as {
 					sessionManager?: { getSessionId?: () => string | undefined };
@@ -2386,6 +2361,7 @@ async function startPiMagicContextRuntime(
 	// OpenCode's `session.deleted` handler in `event-handler.ts`.
 	pi.on("session_before_switch", (_event, ctx) => {
 		try {
+			// SAFETY: sessionManager and getSessionId are checked before use.
 			const sm = (
 				ctx as unknown as {
 					sessionManager?: { getSessionId?: () => string | undefined };
