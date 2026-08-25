@@ -288,6 +288,21 @@ const A32_IMPLEMENTATION_FILES = [
     "packages/plugin/src/features/magic-context/memory/storage-memory-embeddings.ts",
 ];
 
+// A54 drives the note path, which the shared memory/search bundle does not
+// cover: its precondition gates on `noteToolPublished` (so tool registration is
+// load-bearing), `noteCreateAcknowledged`, and `noteDurablePending` — the last
+// read straight off `notes.status`. Without these files, editing note creation
+// or note persistence could flip the A54 verdict while `implementation_digest`
+// stayed constant.
+const A54_IMPLEMENTATION_FILES = [
+    ...IMPLEMENTATION_FILES,
+    "packages/plugin/src/tools/ctx-note/index.ts",
+    "packages/plugin/src/tools/ctx-note/tools.ts",
+    "packages/plugin/src/tools/ctx-note/types.ts",
+    "packages/plugin/src/tools/ctx-note/constants.ts",
+    "packages/plugin/src/features/magic-context/storage-notes.ts",
+];
+
 // ---------------------------------------------------------------------------
 // A5 — archived re-observation (accepted behavior, green)
 // ---------------------------------------------------------------------------
@@ -1631,7 +1646,7 @@ export function auditMemorySearchIncidentCases(): RegisteredIncidentCase[] {
         },
         {
             variantId: "var-a54-pending-note-recall",
-            implementationFiles: IMPLEMENTATION_FILES,
+            implementationFiles: A54_IMPLEMENTATION_FILES,
             fixtures: { ...PENDING_NOTE_RECALL_FIXTURE },
             driver: drivePendingNoteRecall,
             normalizer: normalizePendingNoteRecall,
