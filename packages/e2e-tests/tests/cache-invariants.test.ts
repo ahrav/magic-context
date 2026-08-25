@@ -34,7 +34,7 @@ import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
-import { Database } from "../../plugin/src/shared/sqlite";
+import type { Database } from "../../plugin/src/shared/sqlite";
 import {
     extractM0,
     extractM1,
@@ -366,11 +366,11 @@ function thrownMessage(fn: () => unknown): string {
 }
 
 async function waitForRustCompartment(sessionId: string): Promise<void> {
-    const stack = h.rustStack;
+    const stack = h.mcHostStack;
     if (!stack) throw new Error("Rust compartment wait requires the hermetic module stack");
     const deadline = Date.now() + 60_000;
     while (Date.now() < deadline) {
-        const status = await stack.moduleStatus(sessionId, h.opencode.env.workdir, "session.status");
+        const status = await stack.primaryStatus(sessionId, h.opencode.env.workdir, "session.status");
         if (Number(status.compartment_count ?? 0) > 0) return;
         await Bun.sleep(100);
     }

@@ -75,13 +75,16 @@ export class NegotiationError extends Error {
     }
 }
 
-/** Closed fallback vocabulary (wire doc Section 7.7.3). */
-export const FALLBACK_REASONS = [
-    "unavailable",
-    "negotiation_version_mismatch",
-    "capability_version_mismatch",
-    "connection_in_use",
-] as const;
+/**
+ * Closed fallback vocabulary (wire doc Section 7.7.3).
+ *
+ * Only these two reasons are fallback evidence. Every other setup outcome —
+ * negotiation-version mismatch, `unsupported_operation`, `connection_in_use`,
+ * timeout, malformed content, an unoffered selection — must fail closed with no
+ * same-generation TCP continuation, so accepting one here would commit the
+ * generation to TCP on evidence the protocol rejects.
+ */
+export const FALLBACK_REASONS = ["unavailable", "capability_version_mismatch"] as const;
 export type FallbackReason = (typeof FALLBACK_REASONS)[number];
 
 function isFallbackReason(value: string): value is FallbackReason {
@@ -689,61 +692,6 @@ function decodeTaggedOnly(bytes: JsonInput, op: string): void {
     checkClosedFields(fields, ["op", "negotiation_version"], "body");
     requireOp(fields, op);
     requireExactVersion(fields);
-}
-
-/**
- * The closed set of legacy Error terminal codes that prove
- * `transport.negotiate` was never dispatched, so selecting TCP on this
- * connection is safe (KTD6). Wire doc §7.7.3 names the exact legacy
- * `unsupported_operation` terminal as the ONLY Error-based continuation
- * evidence. `server_busy` is deliberately excluded: the doc permits a
- * compliant negotiation-aware host to reject any control request before
- * dispatch under load, so the code is not unambiguous legacy evidence —
- * and it is independently retryable, which retirement plus reconnect
- * already provides.
- *
- * Every other Error body is malformed negotiation content and fails closed.
- */
-const LEGACY_FALLBACK_CODES: readonly string[] = ["unsupported_operation"];
-
-/**
- * The `code` of a strict legacy Error terminal: UTF-8 JSON `{code, message}`
- * with both fields strings, no extra fields, and no duplicate keys.
- * `undefined` for anything else, so a malformed body can never be read as
- * fallback evidence.
- */
-function legacyErrorCode(bytes: JsonInput): string | undefined {
-    let fields: Map<string, StrictValue>;
-    try {
-        fields = requireRootObject(bytes);
-        checkClosedFields(fields, ["code", "message"], "body");
-    } catch {
-        return undefined;
-    }
-    const code = fields.get("code");
-    const message = fields.get("message");
-    if (code === undefined || code.kind !== "string") return undefined;
-    if (message === undefined || message.kind !== "string") return undefined;
-    return code.value;
-}
-
-/**
- * True only for the exact legacy `unsupported_operation` Error terminal:
- * strict UTF-8 JSON `{code, message}` with both fields strings, no extras,
- * and no duplicate keys.
- */
-export function isLegacyUnsupportedOperationBody(bytes: JsonInput): boolean {
-    return legacyErrorCode(bytes) === "unsupported_operation";
-}
-
-/**
- * True for the closed set of legacy Error terminals that may select TCP
- * fallback (KTD6); see {@link LEGACY_FALLBACK_CODES}. A body with extra
- * fields, a non-string message, or any other code fails closed.
- */
-export function isLegacyFallbackTerminalBody(bytes: JsonInput): boolean {
-    const code = legacyErrorCode(bytes);
-    return code !== undefined && LEGACY_FALLBACK_CODES.includes(code);
 }
 
 function requireExactVersion(fields: Map<string, StrictValue>): void {

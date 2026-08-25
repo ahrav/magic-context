@@ -29,7 +29,7 @@ import {
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
 import * as logger from "../../shared/logger";
-import { SubcCallError } from "../../shared/mc-host-client";
+import { McHostCallError } from "../../shared/mc-host-client";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -1792,7 +1792,7 @@ describe("Rust mode authority adapter", () => {
                 if (page.transform_page_index === 1) {
                     // Possible-send failures throw; they never surface as a
                     // typed generation-change result.
-                    throw new SubcCallError(
+                    throw new McHostCallError(
                         "outcome_unknown",
                         "connection dropped after a possible send",
                         "connection_dropped",

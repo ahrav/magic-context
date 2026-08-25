@@ -322,25 +322,24 @@ async fn degraded_storage_is_an_application_error_not_a_disconnect() {
     host.shutdown_gracefully().await;
 }
 
-/// A raw client that never negotiates commits TCP with its first request and
-/// observes no negotiation timeout, even one far past the setup deadline.
+/// A negotiated TCP connection remains live after the optional-candidate setup
+/// deadline has elapsed.
 #[tokio::test]
-async fn a_legacy_first_request_commits_tcp_without_negotiation_timeout() {
+async fn negotiated_connection_stays_live_beyond_setup_deadline() {
     let host = TestHost::start_with(|config| {
         config.timing.transport_setup_deadline = Duration::from_millis(100);
     })
     .await;
     let mut client = host.client().await;
 
-    // Idle well past the candidate setup deadline before the first request.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let (channel, epoch) = client
-        .route_open(LINKED_MODULE_ID, ROOT, "opencode", "legacy-omission")
+        .route_open(LINKED_MODULE_ID, ROOT, "opencode", "negotiated")
         .await
-        .expect("route.open as the first request");
+        .expect("route.open after negotiation");
     let corr = client.next_corr();
-    let body = support::echo_body("legacy");
+    let body = support::echo_body("negotiated");
     client
         .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, channel, epoch, corr, &body)
         .await

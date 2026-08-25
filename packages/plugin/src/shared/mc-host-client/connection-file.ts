@@ -22,8 +22,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { type FileHandle, lstat, open, readlink } from "node:fs/promises";
-import path from "node:path";
+import { type FileHandle, lstat, open } from "node:fs/promises";
 import type { Deadline } from "./deadline";
 
 /** Snapshot cap from wire doc Section 4.1: 65,536 bytes. */
@@ -31,7 +30,7 @@ export const MAX_CONNECTION_FILE_LEN = 65_536;
 export const CONNECTION_FILE_SCHEMA = 1;
 export const KEY_LEN = 32;
 export const DAEMON_ID_LEN = 16;
-/** Absent means fixed v2; any present value other than 2 fails closed. */
+/** Required in every connection file; any value other than 2 fails closed. */
 export const WIRE_VERSION = 2;
 
 export type ConnectionFileErrorCode =
@@ -39,7 +38,6 @@ export type ConnectionFileErrorCode =
     | "deadline_expired"
     | "open_failed"
     | "not_regular_file"
-    | "not_symlink"
     | "foreign_owner"
     | "insecure_permissions"
     | "oversize"
@@ -80,12 +78,6 @@ export interface ConnectionSnapshot {
 export interface ReadConnectionFileOptions {
     /** Bounds the whole snapshot; checked between every filesystem step. */
     deadline: Deadline;
-    /**
-     * Explicit opt-in for the trusted-symlink publication form (wire doc
-     * Section 4.2). Never auto-detected; a symlink at the path without this
-     * flag fails closed.
-     */
-    trustedSymlink?: boolean;
     /** Test seam for the unsupported-platform check. Defaults to the real one. */
     platform?: NodeJS.Platform;
     /** Test seam for the owning UID. Defaults to `process.getuid()`. */
@@ -208,7 +200,7 @@ async function snapshotDirect(
     const before = await lstat(filePath);
     if (before.isSymbolicLink()) {
         throw new ConnectionFileError(
-            `connection file ${filePath} is a symlink; the trusted-symlink form requires explicit opt-in`,
+            `connection file ${filePath} is a symlink; client discovery must reject symbolic links`,
             "not_regular_file",
         );
     }
@@ -246,72 +238,13 @@ async function snapshotDirect(
     }
 }
 
-/** Trusted-symlink snapshot. Any link or target replacement fails closed. */
-async function snapshotTrustedSymlink(
-    linkPath: string,
-    deadline: Deadline,
-    uid: number,
-    afterOpen?: () => void | Promise<void>,
-): Promise<Uint8Array> {
-    checkDeadline(deadline);
-    const linkBefore = await lstat(linkPath);
-    if (!linkBefore.isSymbolicLink()) {
-        throw new ConnectionFileError(
-            `trusted connection-file path ${linkPath} is not a symlink`,
-            "not_symlink",
-        );
-    }
-    if (linkBefore.uid !== uid) {
-        throw new ConnectionFileError(
-            `trusted connection-file link ${linkPath} is not owned by the current user`,
-            "foreign_owner",
-        );
-    }
-    const linkText = await readlink(linkPath);
-    const targetPath = path.resolve(path.dirname(linkPath), linkText);
-    checkDeadline(deadline);
-    const handle = await openNoFollow(targetPath);
-    try {
-        await afterOpen?.();
-        const target = await handle.stat();
-        validateOpenStat(target, uid, `connection file target ${targetPath}`);
-        checkDeadline(deadline);
-        const bytes = await readBounded(handle, deadline);
-        checkDeadline(deadline);
-        const linkAfter = await lstat(linkPath);
-        if (!linkAfter.isSymbolicLink() || !sameIdentity(linkBefore, linkAfter)) {
-            throw new ConnectionFileError(
-                `trusted connection-file link ${linkPath} changed during the snapshot`,
-                "replaced_during_read",
-            );
-        }
-        const linkTextAfter = await readlink(linkPath);
-        if (linkTextAfter !== linkText) {
-            throw new ConnectionFileError(
-                `trusted connection-file link ${linkPath} was retargeted during the snapshot`,
-                "replaced_during_read",
-            );
-        }
-        const targetAfter = await lstat(targetPath);
-        if (!targetAfter.isFile() || !sameIdentity(target, targetAfter)) {
-            throw new ConnectionFileError(
-                `trusted connection-file target ${targetPath} was replaced during the snapshot`,
-                "replaced_during_read",
-            );
-        }
-        return bytes;
-    } finally {
-        await handle.close().catch(() => {});
-    }
-}
-
 function invalid(code: ConnectionFileErrorCode, message: string): ConnectionFileError {
     return new ConnectionFileError(message, code);
 }
 
 /**
  * Validate the decoded JSON against wire doc Section 4.1: schema 1,
- * absent-or-2 wire version, first endpoint exactly `127.0.0.1` with a port
+ * a required wire version of exactly 2, first endpoint exactly `127.0.0.1` with a port
  * in `1..=65535`, exactly 32 key bytes, exactly 16 daemon-ID bytes, a safe
  * integer PID, and a nonempty daemon version. No coercion anywhere.
  */
@@ -323,10 +256,10 @@ function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
     if (record.schema !== CONNECTION_FILE_SCHEMA) {
         throw invalid("invalid_schema", `connection file schema must be ${CONNECTION_FILE_SCHEMA}`);
     }
-    if ("wire_version" in record && record.wire_version !== WIRE_VERSION) {
+    if (record.wire_version !== WIRE_VERSION) {
         throw invalid(
             "invalid_wire_version",
-            `connection file wire_version must be absent or exactly ${WIRE_VERSION}`,
+            `connection file wire_version must be exactly ${WIRE_VERSION}`,
         );
     }
     const endpoints = record.endpoints;
@@ -414,15 +347,6 @@ export async function readConnectionFile(
         );
     }
     const uid = options.uid ?? currentUid();
-    if (options.trustedSymlink) {
-        const bytes = await snapshotTrustedSymlink(
-            filePath,
-            options.deadline,
-            uid,
-            options.afterOpen,
-        );
-        return decodeAndValidate(bytes);
-    }
     let bytes: Uint8Array;
     try {
         bytes = await snapshotDirect(filePath, options.deadline, uid, options.afterOpen);

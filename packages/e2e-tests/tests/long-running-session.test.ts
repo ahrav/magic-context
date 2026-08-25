@@ -5,7 +5,7 @@ import { realpathSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
 import { insertMemory, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
-import { Database } from "../../plugin/src/shared/sqlite";
+import type { Database } from "../../plugin/src/shared/sqlite";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
@@ -304,8 +304,8 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
                             const flags = [
                                 p.synthetic ? "synth" : null,
                                 p.ignored ? "ignored" : null,
-                                p.auto !== null ? `auto=${p.auto}` : null,
-                                p.overflow !== null ? `overflow=${p.overflow}` : null,
+                                p.auto === null ? null : `auto=${p.auto}`,
+                                p.overflow === null ? null : `overflow=${p.overflow}`,
                                 p.callID ? `callID=${p.callID.slice(0, 12)}` : null,
                                 p.tool ? `tool=${p.tool}` : null,
                             ].filter(Boolean).join(",");
@@ -535,12 +535,12 @@ describe("long-running OpenCode Magic Context session", () => {
             // a5b7d61d publishes through the out-of-band module stack; context.db
             // is not the Rust compartment authority. Observe the committed count
             // directly rather than waiting on a legacy TypeScript mirror row.
-            const stack = h.rustStack;
+            const stack = h.mcHostStack;
             if (!stack) throw new Error("Rust historian check requires the hermetic module stack");
             const deadline = Date.now() + 120_000;
             let compartmentCount = 0;
             while (Date.now() < deadline) {
-                const status = await stack.moduleStatus(sessionId, h.opencode.env.workdir, "session.status");
+                const status = await stack.primaryStatus(sessionId, h.opencode.env.workdir, "session.status");
                 compartmentCount = Number(status.compartment_count ?? 0);
                 if (compartmentCount > 0) break;
                 await Bun.sleep(100);

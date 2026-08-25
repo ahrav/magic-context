@@ -203,13 +203,13 @@ describe("deferred compaction marker (plan v6)", () => {
             // a5b7d61d moved Rust publication and its pending delta into the
             // module transaction. `pending_m1_delta` is the authority-level
             // equivalent of the legacy context.db marker blob.
-            const stack = h.rustStack;
+            const stack = h.mcHostStack;
             if (!stack)
                 throw new Error("Rust marker check requires the hermetic module stack");
             const deadline = Date.now() + 60_000;
             let afterPublish: Record<string, unknown> = {};
             while (Date.now() < deadline) {
-                afterPublish = await stack.moduleStatus(
+                afterPublish = await stack.primaryStatus(
                     sessionId,
                     h.opencode.env.workdir,
                     "session.status",
@@ -226,7 +226,7 @@ describe("deferred compaction marker (plan v6)", () => {
             expect(afterPublish.pending_m1_delta).toBe(true);
 
             await h.sendPrompt(sessionId, "small defer turn — no mutation expected");
-            const pendingAfter = await stack.moduleStatus(
+            const pendingAfter = await stack.primaryStatus(
                 sessionId,
                 h.opencode.env.workdir,
                 "session.status",

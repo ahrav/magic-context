@@ -31,7 +31,7 @@ import {
     selectRelocatableMemoryIds,
 } from "@magic-context/core/features/magic-context/memory/relocate-memory";
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
-import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
+import { McHostModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
@@ -649,7 +649,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         }
         const deps = realDeps(opencodeDb, contextDb);
         const plan = planMigrateSession(sessionId, expandedTo, deps);
-        const transport = new SubcModuleTransport();
+        const transport = new McHostModuleTransport();
         const safety = await assertMigrateSessionIsSafeToRehome({
             plan,
             contextDb: contextDb as DatabaseType,

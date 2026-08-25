@@ -14,7 +14,7 @@
  * The assertion targets the outcome: after a real removal the transform keeps
  * serving and the session never permanently parks.
  *
- * Drives the FULL production path: opencode → plugin → subc daemon → ck-mc.
+ * Drives the FULL production path: opencode → plugin → direct mc-host → McHandler.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";

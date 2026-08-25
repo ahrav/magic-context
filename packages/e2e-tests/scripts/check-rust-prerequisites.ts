@@ -13,9 +13,7 @@ export interface RustPrerequisiteOptions {
 export interface RustPrerequisiteResult {
     ok: boolean;
     missing: string[];
-    ckMcBin?: string;
-    commonsRoot?: string;
-    subconsciousRoot?: string;
+    fixtureBin?: string;
 }
 
 function isExecutable(path: string): boolean {
@@ -26,7 +24,10 @@ function isExecutable(path: string): boolean {
     }
 }
 
-function pathCommand(command: string, pathEnv: string | undefined): string | undefined {
+function pathCommand(
+    command: string,
+    pathEnv: string | undefined,
+): string | undefined {
     for (const directory of (pathEnv ?? "").split(":").filter(Boolean)) {
         const candidate = join(directory, command);
         if (isExecutable(candidate)) return candidate;
@@ -34,77 +35,118 @@ function pathCommand(command: string, pathEnv: string | undefined): string | und
     return undefined;
 }
 
-function cargoMetadata(cargo: string, repoRoot: string, env: NodeJS.ProcessEnv): boolean {
+function cargoMetadata(
+    cargo: string,
+    repoRoot: string,
+    env: NodeJS.ProcessEnv,
+): boolean {
     const result = spawnSync(
         cargo,
-        ["metadata", "--no-deps", "--format-version", "1", "--manifest-path", join(repoRoot, "Cargo.toml")],
-        { env, stdio: "ignore" },
+        [
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            join(repoRoot, "Cargo.toml"),
+        ],
+        { env, encoding: "utf8" },
     );
-    return !result.error && result.status === 0;
+    if (
+        result.error ||
+        result.status !== 0 ||
+        typeof result.stdout !== "string"
+    )
+        return false;
+    try {
+        const metadata = JSON.parse(result.stdout) as {
+            packages?: Array<{
+                name?: string;
+                targets?: Array<{ name?: string; kind?: string[] }>;
+            }>;
+        };
+        return (
+            metadata.packages
+                ?.find((pkg) => pkg.name === "mc-module")
+                ?.targets?.some(
+                    (target) =>
+                        target.name === "direct_host_fixture" &&
+                        target.kind?.includes("example"),
+                ) === true
+        );
+    } catch {
+        return false;
+    }
 }
 
-function buildCkMc(cargo: string, repoRoot: string, env: NodeJS.ProcessEnv): boolean {
+function buildFixture(
+    cargo: string,
+    repoRoot: string,
+    env: NodeJS.ProcessEnv,
+): boolean {
     const result = spawnSync(
         cargo,
-        ["build", "--release", "-p", "mc-module", "--manifest-path", join(repoRoot, "Cargo.toml")],
+        [
+            "build",
+            "-p",
+            "mc-module",
+            "--example",
+            "direct_host_fixture",
+            "--features",
+            "direct-host-fixture",
+            "--manifest-path",
+            join(repoRoot, "Cargo.toml"),
+        ],
         { cwd: repoRoot, env, stdio: "inherit" },
     );
     return !result.error && result.status === 0;
 }
 
-/**
- * Check the release-gate inputs without treating an unavailable Rust lane as a skip.
- * The optional PATH lookup makes the check testable with a fake ck-mc; the normal
- * workspace build still prefers target/release/ck-mc and can rebuild it in place.
- */
-export function detectRustPrerequisites(options: RustPrerequisiteOptions = {}): RustPrerequisiteResult {
-    const repoRoot = resolve(options.repoRoot ?? resolve(import.meta.dir, "../../.."));
+export function detectRustPrerequisites(
+    options: RustPrerequisiteOptions = {},
+): RustPrerequisiteResult {
+    const repoRoot = resolve(
+        options.repoRoot ?? resolve(import.meta.dir, "../../.."),
+    );
     const env = options.env ?? process.env;
     const missing: string[] = [];
     const cargo = pathCommand("cargo", env.PATH);
-    const commonsRoot = resolve(repoRoot, "../commons");
-    const subconsciousRoot = resolve(repoRoot, "../subconscious");
+    const manifest = join(repoRoot, "Cargo.toml");
+    const configured = env.MC_E2E_DIRECT_HOST_FIXTURE_BIN;
+    const workspaceFixture = join(
+        repoRoot,
+        "target/debug/examples/direct_host_fixture",
+    );
+    let fixtureBin =
+        configured && isExecutable(configured) ? configured : undefined;
+    // A fixture already compiled in the workspace satisfies detection, so
+    // callers that forbid building still resolve a usable binary.
+    if (!fixtureBin && isExecutable(workspaceFixture))
+        fixtureBin = workspaceFixture;
 
-    if (!existsSync(join(repoRoot, "Cargo.toml"))) {
-        missing.push(`cargo workspace: missing ${join(repoRoot, "Cargo.toml")}`);
+    if (!existsSync(manifest)) {
+        missing.push(`cargo workspace: missing ${manifest}`);
     } else if (!cargo) {
         missing.push("cargo workspace: cargo is not available on PATH");
     } else if (!cargoMetadata(cargo, repoRoot, env)) {
-        missing.push("cargo workspace: cargo metadata failed");
-    }
-    if (!existsSync(join(commonsRoot, "Cargo.toml"))) {
-        missing.push(`sibling checkout: ../commons is missing (${join(commonsRoot, "Cargo.toml")})`);
-    }
-    if (!existsSync(join(subconsciousRoot, "Cargo.toml"))) {
         missing.push(
-            `sibling checkout: ../subconscious is missing (${join(subconsciousRoot, "Cargo.toml")})`,
+            "cargo workspace: direct_host_fixture example is unavailable",
         );
-    }
-
-    const configuredCkMc = env.MC_E2E_CK_MC_BIN;
-    let ckMcBin = configuredCkMc && isExecutable(configuredCkMc) ? configuredCkMc : undefined;
-    if (!ckMcBin) {
-        const workspaceCkMc = join(repoRoot, "target/release/ck-mc");
-        ckMcBin = isExecutable(workspaceCkMc) ? workspaceCkMc : pathCommand("ck-mc", env.PATH);
-    }
-    if (!ckMcBin && options.allowBuild && cargo && missing.length === 0) {
-        if (buildCkMc(cargo, repoRoot, env)) {
-            const workspaceCkMc = join(repoRoot, "target/release/ck-mc");
-            if (isExecutable(workspaceCkMc)) ckMcBin = workspaceCkMc;
+    } else if (options.allowBuild && !fixtureBin) {
+        if (
+            buildFixture(cargo, repoRoot, env) &&
+            isExecutable(workspaceFixture)
+        ) {
+            fixtureBin = workspaceFixture;
+        } else {
+            missing.push("direct mc-host fixture build failed");
         }
-    }
-    if (!ckMcBin) {
-        missing.push(
-            "ck-mc binary: target/release/ck-mc is absent and no ck-mc executable was found on PATH",
-        );
     }
 
     return {
         ok: missing.length === 0,
         missing,
-        ...(ckMcBin ? { ckMcBin } : {}),
-        ...(existsSync(join(commonsRoot, "Cargo.toml")) ? { commonsRoot } : {}),
-        ...(existsSync(join(subconsciousRoot, "Cargo.toml")) ? { subconsciousRoot } : {}),
+        ...(fixtureBin ? { fixtureBin } : {}),
     };
 }
 
@@ -115,7 +157,9 @@ function parseArgs(args: string[]): { build: boolean; print: boolean } {
         if (arg === "--build") build = true;
         else if (arg === "--print") print = true;
         else if (arg === "--help" || arg === "-h") {
-            console.log("Usage: check-rust-prerequisites.ts [--build] [--print]");
+            console.log(
+                "Usage: check-rust-prerequisites.ts [--build] [--print]",
+            );
             process.exit(0);
         } else throw new Error(`unknown argument: ${arg}`);
     }
@@ -127,11 +171,12 @@ if (import.meta.main) {
         const { build, print } = parseArgs(Bun.argv.slice(2));
         const result = detectRustPrerequisites({ allowBuild: build });
         if (!result.ok) {
-            for (const reason of result.missing) console.error(`missing prerequisite: ${reason}`);
+            for (const reason of result.missing)
+                console.error(`missing prerequisite: ${reason}`);
             process.exit(1);
         }
-        if (print) console.log(result.ckMcBin);
-        else console.log("Rust e2e prerequisites resolved");
+        if (print) console.log(result.fixtureBin ?? "build-on-demand");
+        else console.log("Rust e2e direct-host prerequisites resolved");
     } catch (error) {
         console.error(`Rust prerequisite detector failed: ${String(error)}`);
         process.exit(1);

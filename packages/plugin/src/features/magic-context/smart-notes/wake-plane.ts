@@ -1,7 +1,7 @@
 import { join } from "node:path";
 
 import { getDataDir } from "../../../shared/data-path";
-import { SubcClient } from "../../../shared/mc-host-client";
+import { McHostClient } from "../../../shared/mc-host-client";
 
 /** The sole wire-level coupling between standalone smart notes and scheduled wakes. */
 export const WAKE_PLANE_CAPABILITY = "wake.create";
@@ -31,7 +31,7 @@ function connectionFile(): string {
 }
 
 async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
-    const client = await SubcClient.connect({
+    const client = await McHostClient.connect({
         connectionFile: connectionFile(),
         handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
         requestTimeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS,

@@ -9,7 +9,7 @@ import { writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { ConnectionGeneration, type ConnectionGenerationOptions } from "../connection";
 import { Deadline } from "../deadline";
-import { SubcCallError } from "../errors";
+import { McHostCallError } from "../errors";
 import {
     BoundedFrameProducer,
     CopyCounter,
@@ -49,12 +49,12 @@ export async function waitUntil(check: () => boolean, timeoutMs = 3_000): Promis
     }
 }
 
-export function expectSubcCallError(
+export function expectMcHostCallError(
     error: unknown,
-    kind: SubcCallError["kind"],
+    kind: McHostCallError["kind"],
     code?: string,
-): SubcCallError {
-    assert.ok(error instanceof SubcCallError, `expected SubcCallError, got ${String(error)}`);
+): McHostCallError {
+    assert.ok(error instanceof McHostCallError, `expected McHostCallError, got ${String(error)}`);
     assert.equal(error.kind, kind);
     if (code !== undefined) assert.equal(error.code, code);
     return error;
@@ -309,7 +309,7 @@ class FakeCandidateChannel implements SetupFrameChannel {
                 return {
                     publish: () => {
                         if (!held || this.closed) {
-                            throw new SubcCallError(
+                            throw new McHostCallError(
                                 "not_sent",
                                 "frame channel is closed",
                                 "channel_closed",
@@ -334,7 +334,7 @@ class FakeCandidateChannel implements SetupFrameChannel {
 
     send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
         if (this.closed) {
-            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+            throw new McHostCallError("not_sent", "frame channel is closed", "channel_closed");
         }
         const body = new Uint8Array(frame.body);
         this.copies.record();

@@ -1366,11 +1366,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                     "exchanges_per_sec": output.exchanges_per_sec(),
                     "clock_bracket_ns": output.clock_bracket_ns,
                     "batches": batches,
-                    "exchanges_per_batch": if batches == 0 {
-                        0
-                    } else {
-                        output.total_exchanges / batches
-                    },
+                    "exchanges_per_batch": output.total_exchanges.checked_div(batches).unwrap_or(0),
                 });
                 let manifest_results = a
                     .manifest

@@ -146,18 +146,15 @@ fn version_mismatches_encode_the_documented_tcp_fallback_reasons() {
         RESP_TCP_FALLBACK.as_bytes()
     );
 
-    // The whole closed table round-trips; anything else is rejected.
+    // The closed table is pinned to §7.7.3's two literals rather than derived
+    // from the enum: a value the enum accepts but the table omits is exactly the
+    // fail-open this checks for.
     for (name, expected) in [
         ("unavailable", FallbackReason::Unavailable),
-        (
-            "negotiation_version_mismatch",
-            FallbackReason::NegotiationVersionMismatch,
-        ),
         (
             "capability_version_mismatch",
             FallbackReason::CapabilityVersionMismatch,
         ),
-        ("connection_in_use", FallbackReason::ConnectionInUse),
     ] {
         assert_eq!(FallbackReason::parse(name), Some(expected));
         assert_eq!(expected.as_str(), name);
@@ -171,11 +168,24 @@ fn version_mismatches_encode_the_documented_tcp_fallback_reasons() {
         };
         assert_eq!(reason, Some(expected));
     }
-    let unknown = r#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"switching_transports"}"#;
-    assert_eq!(
-        code(decode_negotiate_response(unknown.as_bytes(), &offers)),
-        NegotiationErrorCode::InvalidReason
-    );
+    // §7.7.3 names these as not fallback evidence: a TCP selection carrying one
+    // must fail closed rather than commit the generation to TCP.
+    for rejected in [
+        "switching_transports",
+        "negotiation_version_mismatch",
+        "connection_in_use",
+        "unsupported_operation",
+    ] {
+        let body = format!(
+            r#"{{"op":"transport.negotiate","negotiation_version":1,"selected":{{"transport":"tcp","capability_version":1}},"reason":"{rejected}"}}"#
+        );
+        assert_eq!(
+            code(decode_negotiate_response(body.as_bytes(), &offers)),
+            NegotiationErrorCode::InvalidReason,
+            "{rejected} must not be accepted as fallback evidence"
+        );
+        assert_eq!(FallbackReason::parse(rejected), None);
+    }
 }
 
 #[test]
@@ -746,7 +756,7 @@ async fn grant_over(
     host: &TestHost,
     peers: &mut tokio::sync::mpsc::UnboundedReceiver<tokio::io::DuplexStream>,
 ) -> (raw_client::RawClient, RawCandidate, String) {
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let frame = control_response(&mut client, &negotiate_body(fake_and_tcp_offers())).await;
     assert_eq!(frame.ty, TY_RESPONSE, "grant expected: {frame:?}");
     let json = frame.json();
@@ -801,7 +811,7 @@ async fn commit_ok(candidate: &mut RawCandidate) {
 #[tokio::test]
 async fn tcp_only_selection_is_exact_and_the_generation_serves_requests() {
     let host = TestHost::start().await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
 
     let frame = control_response(&mut client, &negotiate_body(tcp_only_offers())).await;
     assert_eq!(frame.ty, TY_RESPONSE);
@@ -840,7 +850,7 @@ async fn tcp_only_selection_is_exact_and_the_generation_serves_requests() {
 #[tokio::test]
 async fn unprovided_non_tcp_offer_selects_tcp_with_unavailable() {
     let host = TestHost::start().await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
 
     let offers = serde_json::json!([
         {"transport": "shm", "capability_version": 1, "parameters": {}},
@@ -860,34 +870,25 @@ async fn unprovided_non_tcp_offer_selects_tcp_with_unavailable() {
 }
 
 #[tokio::test]
-async fn version_mismatches_select_tcp_with_their_exact_reason() {
-    // Unsupported negotiation version, parsed under version-1 grammar.
+async fn negotiation_version_mismatch_retires_but_capability_mismatch_falls_back() {
     let host = TestHost::start().await;
-    let mut client = host.client().await;
-    let body = serde_json::json!({
-        "op": "transport.negotiate",
-        "negotiation_version": 2,
-        "offers": [{"transport": "tcp", "capability_version": 1}]
-    });
-    let frame = control_response(&mut client, &body).await;
-    assert_eq!(frame.ty, TY_RESPONSE);
-    let json = frame.json();
-    // The response echoes the request's grammar version (§7.7.2), not the
-    // host's. Stamping the host's version would make this fallback reason
-    // unconsumable: the peer's decoder requires its own version, so it would
-    // reject the response and fail closed instead of retaining TCP (R8).
-    assert_eq!(json["negotiation_version"], 2);
-    assert_eq!(json["selected"]["transport"], "tcp");
-    assert_eq!(json["reason"], "negotiation_version_mismatch");
-    let frame = control_response(&mut client, &serde_json::json!({"op": "catalog.list"})).await;
-    assert_eq!(frame.ty, TY_RESPONSE, "the generation stays usable");
+    let mut client = host.setup_client().await;
+    client
+        .control(&serde_json::json!({
+            "op": "transport.negotiate",
+            "negotiation_version": 2,
+            "offers": [{"transport": "tcp", "capability_version": 1}]
+        }))
+        .await
+        .expect("send mismatched negotiation");
+    assert!(client.closed_within(HOST_BUDGET).await);
     host.shutdown_gracefully().await;
 
     // The fake transport is installed at capability 2 but offered at 1.
     let (provider, _peers) = FakeProvider::install(2, serde_json::json!({}), 64 * 1024);
     let registry = FakeProvider::registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = registry).await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let frame = control_response(&mut client, &negotiate_body(fake_and_tcp_offers())).await;
     assert_eq!(frame.ty, TY_RESPONSE);
     let json = frame.json();
@@ -900,44 +901,64 @@ async fn version_mismatches_select_tcp_with_their_exact_reason() {
 }
 
 #[tokio::test]
-async fn late_negotiation_reports_connection_in_use_once_then_retires() {
+async fn application_before_negotiation_retires_without_side_effects() {
+    for body in [
+        serde_json::json!({"op": "catalog.list"}),
+        serde_json::json!({"op": "host.shutdown"}),
+        serde_json::json!({
+            "op": "route.open",
+            "target": {"kind": "tool_provider", "module_id": LINKED_MODULE_ID},
+            "identity": {"project_root": ROOT, "harness": "opencode", "session": "setup"}
+        }),
+        serde_json::json!({"op": "unknown.operation"}),
+    ] {
+        let host = TestHost::start().await;
+        let mut client = host.setup_client().await;
+        client.control(&body).await.expect("send setup violation");
+        assert!(client.closed_within(HOST_BUDGET).await);
+        assert!(host.handler.binds().is_empty());
+
+        let mut negotiated = host.client().await;
+        let frame =
+            control_response(&mut negotiated, &serde_json::json!({"op": "catalog.list"})).await;
+        assert_eq!(frame.ty, TY_RESPONSE);
+        host.shutdown_gracefully().await;
+    }
+
+    let host = TestHost::start().await;
+    let mut client = host.setup_client().await;
+    client
+        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, 1, 1, 1, b"{}")
+        .await
+        .expect("send routed setup violation");
+    assert!(client.closed_within(HOST_BUDGET).await);
+    assert!(host.handler.binds().is_empty());
+    host.shutdown_gracefully().await;
+
+    let host = TestHost::start().await;
+    let mut client = host.setup_client().await;
+    client
+        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, 0, 0, 1, &vec![b' '; 65_537])
+        .await
+        .expect("send oversized setup violation");
+    assert!(client.closed_within(HOST_BUDGET).await);
+    assert!(host.handler.binds().is_empty());
+    host.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn normal_raw_client_returns_after_tcp_negotiation() {
     let host = TestHost::start().await;
     let mut client = host.client().await;
-
     let frame = control_response(&mut client, &serde_json::json!({"op": "catalog.list"})).await;
-    assert_eq!(frame.ty, TY_RESPONSE, "application traffic commits TCP");
-
-    let frame = control_response(&mut client, &negotiate_body(tcp_only_offers())).await;
     assert_eq!(frame.ty, TY_RESPONSE);
-    let json = frame.json();
-    assert_eq!(json["selected"]["transport"], "tcp");
-    assert_eq!(json["reason"], "connection_in_use");
-
-    let frame = control_response(&mut client, &serde_json::json!({"op": "catalog.list"})).await;
-    assert_eq!(
-        frame.ty, TY_RESPONSE,
-        "one late negotiation keeps the generation"
-    );
-
-    let _ = client
-        .control(&negotiate_body(tcp_only_offers()))
-        .await
-        .expect("send repeated negotiation");
-    assert!(
-        client.closed_within(HOST_BUDGET).await,
-        "a repeated negotiation is a protocol failure"
-    );
-
     host.shutdown_gracefully().await;
 }
 
 #[tokio::test]
 async fn repeated_negotiation_after_negotiated_tcp_selection_retires() {
-    // A negotiation that itself selects TCP consumes the late-negotiation
-    // allowance: the allowance exists only for a first negotiation arriving
-    // after an implicit TCP commit (§7.7.5).
     let host = TestHost::start().await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
 
     let frame = control_response(&mut client, &negotiate_body(tcp_only_offers())).await;
     assert_eq!(frame.ty, TY_RESPONSE);
@@ -980,7 +1001,7 @@ async fn stalled_provider_prepare_fails_setup_within_the_deadline() {
         config.timing.transport_setup_deadline = Duration::from_millis(100);
     })
     .await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let _ = client
         .control(&negotiate_body(fake_and_tcp_offers()))
         .await
@@ -1002,7 +1023,7 @@ async fn duplicate_key_negotiation_settles_with_its_terminal_and_retires() {
     // path, never the generic rejection that would commit TCP and leave the
     // generation usable (§7.7.1).
     let host = TestHost::start().await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
 
     let dup = r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":1,"a":2}}]}"#;
     let corr = client.next_corr();
@@ -1024,7 +1045,7 @@ async fn duplicate_key_negotiation_settles_with_its_terminal_and_retires() {
 #[tokio::test]
 async fn malformed_negotiation_settles_with_its_terminal_and_never_reaches_dispatch() {
     let host = TestHost::start().await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
 
     let missing_tcp = serde_json::json!({
         "op": "transport.negotiate",
@@ -1052,7 +1073,7 @@ async fn injected_grant_activates_commits_and_serves_application_traffic() {
     let registry = FakeProvider::registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = registry).await;
 
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let frame = control_response(&mut client, &negotiate_body(fake_and_tcp_offers())).await;
     let json = frame.json();
     assert_eq!(json["descriptor"], serde_json::json!({"kind": "fake"}));
@@ -1185,7 +1206,7 @@ async fn ktd9_attachment_failures_fail_closed_before_any_candidate_exists() {
         ProviderFailure::StaleDescriptor,
     ] {
         provider.fail_next(failure);
-        let mut client = host.client().await;
+        let mut client = host.setup_client().await;
         let _ = client
             .control(&negotiate_body(fake_and_tcp_offers()))
             .await
@@ -1310,7 +1331,7 @@ async fn liveness_hands_off_from_bootstrap_to_candidate_around_the_grant() {
         });
     })
     .await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
 
     // Bootstrap liveness runs before negotiation.
     let ping = client
@@ -1508,7 +1529,7 @@ async fn max_connections_bounds_prepared_candidates_and_failure_releases_them() 
 
     // The setup retains the sole connection permit: a second authenticated
     // connection is refused while the candidate is prepared.
-    let mut second = raw_client::RawClient::connect(&host.info)
+    let mut second = raw_client::RawClient::connect_setup_only(&host.info)
         .await
         .expect("handshake completes");
     assert!(
@@ -1572,7 +1593,7 @@ async fn sentinel_provider_data_stays_off_diagnostic_surfaces() {
 
     // A malformed negotiation whose unknown field name carries the sentinel
     // gets the bounded terminal with no sentinel bytes echoed.
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let body = format!(
         r#"{{"op":"transport.negotiate","negotiation_version":1,"offers":[{{"transport":"tcp","capability_version":1}}],"{SENTINEL}":1}}"#
     );
@@ -1588,7 +1609,7 @@ async fn sentinel_provider_data_stays_off_diagnostic_surfaces() {
 
     // Offer parameters carrying the sentinel never reach the fallback
     // response.
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let offers = serde_json::json!([
         {"transport": "shm", "capability_version": 1, "parameters": {"secret": SENTINEL}},
         {"transport": "tcp", "capability_version": 1}

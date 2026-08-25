@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Deadline } from "./deadline";
-import { SubcCallError } from "./errors";
+import { McHostCallError } from "./errors";
 import { ByteBudget, type FrameChannelCloseReason, utf8FrameBody } from "./frame-channel";
 import { type EnvelopeHeader, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "./protocol";
 import { TcpFrameChannel } from "./tcp-frame-channel";
@@ -240,9 +240,9 @@ describe("TCP adapter specifics", () => {
         } catch (error) {
             refused = error;
         }
-        expect(refused).toBeInstanceOf(SubcCallError);
-        expect((refused as SubcCallError).kind).toBe("not_sent");
-        expect((refused as SubcCallError).code).toBe("channel_closed");
+        expect(refused).toBeInstanceOf(McHostCallError);
+        expect((refused as McHostCallError).kind).toBe("not_sent");
+        expect((refused as McHostCallError).code).toBe("channel_closed");
     });
 
     test("a body stalled mid-transfer hits the frame deadline", async () => {

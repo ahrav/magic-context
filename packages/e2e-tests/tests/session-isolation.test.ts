@@ -21,10 +21,10 @@ let h: TestHarness;
 async function rustSessionStatus(
     sessionId: string,
 ): Promise<Record<string, unknown>> {
-    const stack = h.rustStack;
+    const stack = h.mcHostStack;
     if (!stack)
         throw new Error("Rust lifecycle check requires the hermetic module stack");
-    return stack.moduleStatus(
+    return stack.primaryStatus(
         sessionId,
         h.opencode.env.workdir,
         "session.status",

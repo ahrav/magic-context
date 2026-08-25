@@ -32,14 +32,13 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-2: park transiti
     it(
         "continues through the outage and emits a machine-readable park transition",
         async () => {
-            h.subc.assertModuleNotSupervised();
             const sessionId = await h.createSession();
             await driveToSteadyState(h, sessionId, 2);
             const beforeCount = h.readRustPasses().length;
             const droppedBefore = lineageScopedTagCount(h, sessionId, "dropped");
             const outagePasses = RUST_FAILURE_PARK_THRESHOLD * 2;
 
-            await h.subc.killModuleAndWait();
+            await h.mcHost.crashHost();
             await sendOutagePasses(h, sessionId, 4, outagePasses, "FM-OC-2 outage");
             await h.waitFor(
                 () =>

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SubcCallError } from "./errors";
+import { McHostCallError } from "./errors";
 import {
     BoundedFrameProducer,
     ByteBudget,
@@ -127,7 +127,7 @@ describe("sanitized provider channel", () => {
         } catch (error) {
             thrown = error;
         }
-        expect(thrown).toBeInstanceOf(SubcCallError);
+        expect(thrown).toBeInstanceOf(McHostCallError);
         expect(String(thrown)).not.toContain("secret");
     });
 
@@ -159,8 +159,8 @@ describe("sanitized provider channel", () => {
         } catch (error) {
             thrown = error;
         }
-        expect(thrown).toBeInstanceOf(SubcCallError);
-        expect((thrown as SubcCallError).kind).toBe("not_sent");
+        expect(thrown).toBeInstanceOf(McHostCallError);
+        expect((thrown as McHostCallError).kind).toBe("not_sent");
         expect(String(thrown)).not.toContain("secret");
         expect(abortCalls).toBe(1);
     });

@@ -30,7 +30,6 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-4: emergency ref
     it(
         "continues briefly through SIGKILL, then bails loudly at the provider-proven wall",
         async () => {
-            h.subc.assertModuleNotSupervised();
             const sessionId = await h.createSession();
             await driveToSteadyState(h, sessionId, 2);
 
@@ -49,7 +48,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-4: emergency ref
                 };
             });
 
-            await h.subc.killModuleAndWait();
+            await h.mcHost.crashHost();
             try {
                 await h.sendPrompt(sessionId, `FM-OC-4 continue after SIGKILL: ${h.ballast(400)}`);
             } catch {

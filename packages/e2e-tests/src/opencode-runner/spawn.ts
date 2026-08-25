@@ -8,30 +8,31 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
 import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
 import { Database } from "../../../plugin/src/shared/sqlite";
+import { waitForChildExit } from "../process-exit";
 import {
-    buildHermeticBinaries,
+    buildDirectHostFixture,
     detectRustModePrereqs,
-    HermeticSubcStack,
-} from "../rust-runner/hermetic-subc";
+    HermeticMcHostStack,
+} from "../rust-runner/hermetic-mc-host";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-// Prefer the bundled `dist/index.js` (what published users actually run)
-// over raw `src/index.ts`. The bundled file is one ~5MB file with all imports
-// inlined; loading it is fast even on cold runners. The TS-source path
-// triggers Bun's runtime TS transpile + dynamic resolution across hundreds
-// of submodule imports — on slow Linux CI runners this can take long enough
-// to make `opencode serve` appear hung when it's just blocked in plugin
-// load. Production never loads from src/, so testing src/ doesn't reflect
-// reality and exposes us to a slowness path users never see.
+// Prefer the built bundle over raw `src/index.ts`. The bundle is one file with
+// all imports inlined and loads fast even on a cold runner, while the TS-source
+// path triggers Bun's runtime transpile and dynamic resolution across hundreds
+// of submodule imports — enough on a slow CI runner to make `opencode serve`
+// look hung when it is only blocked in plugin load. Production never loads from
+// src/, so the source path also tests a slowness users never see.
 const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
 const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
-const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
+const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY)
+    ? PLUGIN_DIST_ENTRY
+    : PLUGIN_SRC_ENTRY;
 
 function initializeIsolatedContextDb(dataDir: string): void {
     const path = join(dataDir, "cortexkit", "magic-context", "context.db");
@@ -60,8 +61,8 @@ export interface SpawnedOpencode {
     kill: () => Promise<void>;
     stdout: () => string;
     stderr: () => string;
-    /** The hermetic Rust stack is provisioned only when MC_E2E_MODE is set to "rust"; this property exposes it when available. */
-    rustStack?: HermeticSubcStack;
+    /** Direct host fixture provisioned for MC_E2E_MODE=rust. */
+    mcHostStack?: HermeticMcHostStack;
 }
 
 export interface SpawnOptions {
@@ -75,28 +76,11 @@ export interface SpawnOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
-    /**
-     * Reuse a pre-created isolated env instead of allocating a fresh one. The
-     * Rust-mode harness creates the env first so a hermetic subc daemon can
-     * write its connection file into `${dataDir}/cortexkit/run/` BEFORE opencode
-     * boots, and so a serve restart can re-attach to the same data dir (keeping
-     * opencode.db + context.db across the restart). Default: allocate a new env.
-     */
+    /** Reuse an isolated env so direct host starts before OpenCode and survives serve restarts. */
     existingEnv?: IsolatedEnv;
-    /**
-     * When set, add `subc: { connection_file }` to the USER-tier magic-context
-     * config. This is the only tier that gates `userTierHasSubc` (project-tier
-     * `subc` is stripped by project-security), so Rust mode needs it here to
-     * activate. Default: no user-tier subc block (TS mode).
-     */
-    userSubcConnectionFile?: string;
-    /**
-     * When set, ALSO write `<workdir>/.cortexkit/magic-context.jsonc` (the
-     * project-tier config). Rust mode is opted in per-project via
-     * `transform_mode: "rust"` here, mirroring production where a repo selects
-     * the runtime while the user supplies daemon credentials. Default: no
-     * project-tier config file.
-     */
+    /** User-tier host connection file used by Rust mode. */
+    userMcHostConnectionFile?: string;
+    /** `projectMagicContextConfig` is written to `<workdir>/.cortexkit/magic-context.jsonc` when set. */
     projectMagicContextConfig?: Record<string, unknown>;
     /**
      * Extra environment variables for the opencode child (e.g.
@@ -121,9 +105,8 @@ async function pickFreePort(): Promise<number> {
  * Create isolated config/data/cache dirs under a unique temp subdir.
  *
  * Exported so the Rust-mode harness can allocate the env up front: it needs the
- * concrete `dataDir` before opencode boots to place a hermetic subc daemon's
- * connection file at `${dataDir}/cortexkit/run/subc-connection.json` (the path
- * the plugin's Rust module client reads), and it reuses the same env across a
+ * concrete `dataDir` before OpenCode boots so direct host can publish its
+ * connection file, and it reuses the same env across a
  * serve restart so opencode.db + context.db survive the restart.
  */
 export function createIsolatedEnv(): IsolatedEnv {
@@ -196,13 +179,7 @@ function writeConfigs(
         ...(opts.openCodeConfigExtra ?? {}),
     };
 
-    // magic-context defaults tuned for fast triggering in tests. This is the
-    // USER-tier config: thresholds live here because project-tier thresholds are
-    // security-clamped raise-only, so a small/fast threshold must come from the
-    // trusted user tier. Rust mode's `subc.connection_file` is also user-tier —
-    // it is the only tier that flips `userTierHasSubc`, which the transform-mode
-    // resolver requires before Rust can activate (project-tier `subc` is stripped
-    // by project-security hardening).
+    // User-tier thresholds stay below project-security raise-only clamps.
     const magicContext: Record<string, unknown> = {
         $schema:
             "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
@@ -212,8 +189,10 @@ function writeConfigs(
         sidekick: { disable: true },
         ...(opts.magicContextConfig ?? {}),
     };
-    if (opts.userSubcConnectionFile) {
-        magicContext.subc = { connection_file: opts.userSubcConnectionFile };
+    if (opts.userMcHostConnectionFile) {
+        Object.assign(magicContext, {
+            subc: { connection_file: opts.userMcHostConnectionFile },
+        });
     }
 
     writeFileSync(join(env.configDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
@@ -232,12 +211,6 @@ function writeConfigs(
         JSON.stringify(magicContext, null, 2),
     );
 
-    // Project-tier config: written to the hard-cutover location the loader reads,
-    // `<workdir>/.cortexkit/magic-context.jsonc`. Rust mode is opted in here via
-    // `transform_mode: "rust"`, matching production where a repository selects the
-    // runtime while the user supplies the daemon credentials above. This file is
-    // (re)written on every spawn so a serve restart can flip the mode in place
-    // (the cold-start-drop-seed scenario switches ts→rust across a restart).
     if (opts.projectMagicContextConfig) {
         const projectConfigDir = join(env.workdir, ".cortexkit");
         mkdirSync(projectConfigDir, { recursive: true });
@@ -277,24 +250,31 @@ function writeConfigs(
 // take a few minutes" on first boot per fresh CI XDG_DATA_HOME). Local hardware
 // finishes in <2s. The bump to 300s covers CI cold-start without papering over
 // genuine readiness failures — 5 minutes is still far above any realistic boot.
-async function waitForReady(url: string, timeoutMs = 300_000): Promise<void> {
+async function waitForReady(
+    url: string,
+    timeoutMs = 300_000,
+    cancellation?: AbortSignal,
+): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     const FETCH_TIMEOUT_MS = 2_000;
     let lastFetchErr: unknown = null;
     let fetchAttempts = 0;
 
     while (Date.now() < deadline) {
+        if (cancellation?.aborted) throw new Error("opencode readiness cancelled");
         try {
             fetchAttempts++;
+            const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
             const res = await fetch(`${url}/doc`, {
                 method: "GET",
-                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+                signal: cancellation ? AbortSignal.any([timeout, cancellation]) : timeout,
             });
             if (res.ok || res.status === 404 || res.status === 401) {
                 // Server is responding — any HTTP response means it booted.
                 return;
             }
         } catch (err) {
+            if (cancellation?.aborted) throw new Error("opencode readiness cancelled");
             lastFetchErr = err;
         }
         await Bun.sleep(200);
@@ -310,168 +290,254 @@ async function waitForReady(url: string, timeoutMs = 300_000): Promise<void> {
 interface RustSpawnResources {
     env: IsolatedEnv;
     connectionFile: string;
-    stack: HermeticSubcStack;
+    mcHost: HermeticMcHostStack;
 }
 
 /**
- * Provision the Rust stack at the shared OpenCode spawn seam. Keeping this
- * decision here means a suite body never needs a mode branch: the same harness
- * creates either a regular isolated process or the real ck-subc + ck-mc path.
+ * Reject when the child fails to spawn or exits before readiness. A child that
+ * starts and then dies (bad flag, unusable config, taken port) emits no
+ * `error`, so without the `exit` arm the startup race only ends when
+ * `waitForReady` burns its whole timeout. Every settle path detaches both child
+ * listeners, so a child that outlives the race retains neither.
  */
+function rejectOnSpawnError(child: ChildProcess, cancellation?: AbortSignal): Promise<never> {
+    return new Promise((_, rejectSpawn) => {
+        const detach = (): void => {
+            child.off("error", onError);
+            child.off("exit", onExit);
+        };
+        const onError = (error: Error): void => {
+            detach();
+            cancellation?.removeEventListener("abort", onAbort);
+            rejectSpawn(error);
+        };
+        const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+            detach();
+            cancellation?.removeEventListener("abort", onAbort);
+            rejectSpawn(
+                new Error(
+                    `opencode serve exited before readiness (code=${code}, signal=${signal})`,
+                ),
+            );
+        };
+        const onAbort = (): void => {
+            detach();
+        };
+        if (cancellation?.aborted) return;
+        child.once("error", onError);
+        child.once("exit", onExit);
+        cancellation?.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+async function stopChild(child: ChildProcess, timeoutMs = 3_000): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+
+    const exitedAfterTerm = waitForChildExit(child, timeoutMs);
+    child.kill("SIGTERM");
+    if (await exitedAfterTerm) return;
+
+    const exitedAfterKill = waitForChildExit(child, timeoutMs);
+    child.kill("SIGKILL");
+    if (!(await exitedAfterKill)) {
+        throw new Error("opencode serve did not exit after SIGKILL");
+    }
+}
+
+/** Provision direct host before OpenCode so it can publish its connection file. */
 async function provisionRustMode(): Promise<RustSpawnResources> {
     const prereqs = detectRustModePrereqs();
-    if (!prereqs.ok || !prereqs.subconsciousRoot) {
+    if (!prereqs.ok) {
         throw new Error(
             `MC_E2E_MODE=rust prerequisite failure: ${prereqs.skipReason ?? "unknown prerequisite"}`,
         );
     }
-    const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot);
+    const fixtureBin = await buildDirectHostFixture();
     const env = createIsolatedEnv();
     try {
-        const stack = await HermeticSubcStack.start({ dataDir: env.dataDir, ckMcBin, ckSubcBin });
-        return { env, connectionFile: stack.connectionFile, stack };
+        const mcHost = await HermeticMcHostStack.start({ dataDir: env.dataDir, fixtureBin });
+        return { env, connectionFile: mcHost.connectionFile, mcHost };
     } catch (error) {
-        throw new Error(`MC_E2E_MODE=rust failed to start the hermetic stack: ${String(error)}`);
+        // This env has no other owner yet: `cleanup()` only runs for a stack
+        // that started, and the process reaper only kills recorded PIDs. A
+        // surviving dataDir is the stack's record that its own teardown could
+        // not reclaim it — the leaked fixture's PID file lives there and is the
+        // next run's only handle on that process — so the tree stays put then.
+        if (!existsSync(env.dataDir)) {
+            try {
+                rmSync(dirname(env.dataDir), { recursive: true, force: true });
+            } catch {
+                // Temp litter never masks the startup failure.
+            }
+        }
+        throw new Error(
+            `MC_E2E_MODE=rust failed to start direct mc-host fixture: ${String(error)}`,
+        );
     }
 }
 
-export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
+async function spawnOpencodeWithProvision(
+    opts: SpawnOptions,
+    provision: () => Promise<RustSpawnResources>,
+): Promise<SpawnedOpencode> {
     // MC_E2E_MODE is intentionally read only at this shared spawn seam. Rust
-    // suites that already supplied a daemon connection keep their existing
+    // suites that already supplied a host connection keep their existing
     // stack; ordinary suites get one provisioned here for the rust invocation.
     const rustMode = process.env.MC_E2E_MODE === "rust";
-    const resources = rustMode && !opts.userSubcConnectionFile ? await provisionRustMode() : null;
-    const resolvedOpts: SpawnOptions = resources
-        ? {
-              ...opts,
-              existingEnv: resources.env,
-              userSubcConnectionFile: resources.connectionFile,
-              projectMagicContextConfig: {
-                  ...(opts.projectMagicContextConfig ?? {}),
-                  transform_mode: "rust",
-              },
-          }
-        : opts;
+    const resources = rustMode && !opts.userMcHostConnectionFile ? await provision() : null;
 
-    // Reuse a caller-provided env for the Rust-mode harness (connection file
-    // pre-placed, data dir shared across a serve restart); otherwise allocate.
-    const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
-    const port = resolvedOpts.port ?? (await pickFreePort());
-
-    const compaction = resolvedOpts.openCodeConfigExtra?.compaction as
-        | { auto?: unknown }
-        | undefined;
-    if (compaction?.auto !== true) initializeIsolatedContextDb(env.dataDir);
-    writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
-
-    // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
-    // our tests run unsecured on a random localhost port, and inherited auth would
-    // force every SDK request to carry Basic auth headers we don't set.
-    // Also strip NODE_ENV=test: Bun's test runner sets it automatically and the
-    // plugin's logger (src/shared/logger.ts) silences all output when NODE_ENV=test.
-    // We want the subprocess to behave like a real install, so the log file gets
-    // populated normally for diagnostics.
-    const childEnv: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-        if (value === undefined) continue;
-        if (key === "OPENCODE_SERVER_PASSWORD") continue;
-        if (key === "OPENCODE_SERVER_USERNAME") continue;
-        if (key === "NODE_ENV") continue;
-        // Strip any inherited subc supervised-launch identity. When the test
-        // process is itself launched under a subc supervisor (e.g. an AFT/Alfonso
-        // worktree sets SUBC_MODULE_ID=aft), the plugin's Rust module client would
-        // present THAT supervised identity to our hermetic daemon, which rejects it
-        // ("consumer_identity for module_id 'aft' did not match a supervised launch
-        // nonce"). A real opencode install is never launched under a supervised subc
-        // identity, so clearing these matches production and lets the plugin connect
-        // as an ordinary client. Harmless for TS-mode suites, which never touch subc.
-        if (key === "SUBC_MODULE_ID") continue;
-        if (key === "SUBC_LAUNCH_NONCE") continue;
-        childEnv[key] = value;
-    }
-    childEnv.OPENCODE_CONFIG_DIR = env.configDir;
-    childEnv.XDG_CONFIG_HOME = env.configDir;
-    childEnv.XDG_DATA_HOME = env.dataDir;
-    childEnv.XDG_CACHE_HOME = env.cacheDir;
-    // Ensure anthropic doesn't bail for missing env vars — we use a fake key.
-    childEnv.ANTHROPIC_API_KEY = "test-key-not-real";
-    // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
-    // per-suite file so Rust-mode scenarios can assert on transform decisions).
-    // Merged last so an explicit override wins over the inherited value.
-    for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
-        childEnv[key] = value;
-    }
-
-    // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
-    // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results
-    // in Bun's `fetch()` timing out even though `curl` succeeds. Binding all
-    // interfaces removes any loopback-specific stack-resolution edge case
-    // (IPv4-only AF_INET vs IPv4-mapped IPv6, AF_UNSPEC name resolution, etc.).
-    // Clients still connect to `127.0.0.1:${port}` — only the listen socket
-    // changes. Safe locally too: process is short-lived, port is random.
-    const child: ChildProcess = spawn(
-        "opencode",
-        ["serve", "--port", String(port), "--hostname", "0.0.0.0"],
-        {
-            cwd: env.workdir,
-            env: childEnv,
-            stdio: ["ignore", "pipe", "pipe"],
-        },
-    );
+    let child: ChildProcess | undefined;
+    let cleanupPromise: Promise<void> | undefined;
+    const cleanup = (): Promise<void> => {
+        cleanupPromise ??= (async () => {
+            let cleanupError: unknown;
+            if (child) {
+                try {
+                    await stopChild(child);
+                } catch (error) {
+                    cleanupError = error;
+                }
+            }
+            try {
+                await resources?.mcHost.stop();
+            } catch (error) {
+                cleanupError ??= error;
+            }
+            if (cleanupError !== undefined) throw cleanupError;
+        })();
+        return cleanupPromise;
+    };
 
     let stdoutBuf = "";
     let stderrBuf = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-        stdoutBuf += chunk.toString();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-        stderrBuf += chunk.toString();
-    });
-
-    const url = `http://127.0.0.1:${port}`;
     try {
-        await waitForReady(url);
-    } catch (err) {
-        // Surface captured output on boot failure to help debugging.
-        child.kill("SIGTERM");
-        await resources?.stack.stop();
+        const resolvedOpts: SpawnOptions = resources
+            ? {
+                  ...opts,
+                  existingEnv: resources.env,
+                  userMcHostConnectionFile: resources.connectionFile,
+                  projectMagicContextConfig: {
+                      ...(opts.projectMagicContextConfig ?? {}),
+                      transform_mode: "rust",
+                  },
+              }
+            : opts;
+
+        // Reuse a caller-provided env for the Rust-mode harness (connection file
+        // pre-placed, data dir shared across a serve restart); otherwise allocate.
+        const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
+        const port = resolvedOpts.port ?? (await pickFreePort());
+
+        const compaction = resolvedOpts.openCodeConfigExtra?.compaction as
+            | { auto?: unknown }
+            | undefined;
+        if (compaction?.auto !== true) initializeIsolatedContextDb(env.dataDir);
+        writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
+
+        // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
+        // our tests run unsecured on a random localhost port, and inherited auth would
+        // force every SDK request to carry Basic auth headers we don't set.
+        // Also strip NODE_ENV=test: Bun's test runner sets it automatically and the
+        // plugin's logger (src/shared/logger.ts) silences all output when NODE_ENV=test.
+        // We want the subprocess to behave like a real install, so the log file gets
+        // populated normally for diagnostics.
+        const childEnv: Record<string, string> = {};
+        for (const [key, value] of Object.entries(process.env)) {
+            if (value === undefined) continue;
+            if (key === "OPENCODE_SERVER_PASSWORD") continue;
+            if (key === "OPENCODE_SERVER_USERNAME") continue;
+            if (key === "NODE_ENV") continue;
+            // Strip any inherited supervised-launch identity. These are still the
+            // live variable names (`mc_host::wire::SUBC_MODULE_ID_ENV` /
+            // `SUBC_LAUNCH_NONCE_ENV`), and `historian_producer` reads them into
+            // `consumer_module_id`/`consumer_launch_nonce` on every route identity.
+            // When the test process is itself launched under a supervisor that sets
+            // them, the plugin would present THAT identity to our hermetic host,
+            // which rejects it as not matching a supervised launch nonce. A real
+            // install is never launched under a supervised identity, so clearing
+            // them matches production. Harmless for TS-mode suites, which never
+            // reach the Rust client.
+            if (key === "SUBC_MODULE_ID") continue;
+            if (key === "SUBC_LAUNCH_NONCE") continue;
+            childEnv[key] = value;
+        }
+        childEnv.OPENCODE_CONFIG_DIR = env.configDir;
+        childEnv.XDG_CONFIG_HOME = env.configDir;
+        childEnv.XDG_DATA_HOME = env.dataDir;
+        childEnv.XDG_CACHE_HOME = env.cacheDir;
+        // Ensure anthropic doesn't bail for missing env vars — we use a fake key.
+        childEnv.ANTHROPIC_API_KEY = "test-key-not-real";
+        // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
+        // per-suite file so Rust-mode scenarios can assert on transform decisions).
+        // Merged last so an explicit override wins over the inherited value.
+        for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
+            childEnv[key] = value;
+        }
+
+        // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
+        // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results
+        // in Bun's `fetch()` timing out even though `curl` succeeds. Binding all
+        // interfaces removes any loopback-specific stack-resolution edge case
+        // (IPv4-only AF_INET vs IPv4-mapped IPv6, AF_UNSPEC name resolution, etc.).
+        // Clients still connect to `127.0.0.1:${port}` — only the listen socket
+        // changes. Safe locally too: process is short-lived, port is random.
+        child = spawn(
+            "opencode",
+            ["serve", "--port", String(port), "--hostname", "0.0.0.0"],
+            {
+                cwd: env.workdir,
+                env: childEnv,
+                stdio: ["ignore", "pipe", "pipe"],
+            },
+        );
+
+        child.stdout?.on("data", (chunk: Buffer) => {
+            stdoutBuf += chunk.toString();
+        });
+        child.stderr?.on("data", (chunk: Buffer) => {
+            stderrBuf += chunk.toString();
+        });
+
+        const url = `http://127.0.0.1:${port}`;
+        const startup = new AbortController();
+        try {
+            await Promise.race([
+                waitForReady(url, 300_000, startup.signal),
+                rejectOnSpawnError(child, startup.signal),
+            ]);
+        } finally {
+            startup.abort();
+        }
+
+        return {
+            url,
+            port,
+            env,
+            stdout: () => stdoutBuf,
+            stderr: () => stderrBuf,
+            mcHostStack: resources?.mcHost,
+            kill: cleanup,
+        };
+    } catch (error) {
+        let cleanupError: unknown;
+        try {
+            await cleanup();
+        } catch (failure) {
+            cleanupError = failure;
+        }
         throw new Error(
-            `opencode serve failed to start.\n--- stdout ---\n${stdoutBuf}\n--- stderr ---\n${stderrBuf}\n\n${String(err)}`,
+            `opencode serve failed to start.\n--- stdout ---\n${stdoutBuf}\n--- stderr ---\n${stderrBuf}\n\n${String(error)}` +
+                (cleanupError === undefined ? "" : `\ncleanup failed: ${String(cleanupError)}`),
         );
     }
-
-    let rustStackStopped = false;
-    const stopProvisionedRustStack = async (): Promise<void> => {
-        if (!resources || rustStackStopped) return;
-        rustStackStopped = true;
-        await resources.stack.stop();
-    };
-
-    return {
-        url,
-        port,
-        env,
-        stdout: () => stdoutBuf,
-        stderr: () => stderrBuf,
-        rustStack: resources?.stack,
-        kill: async () => {
-            try {
-                if (child.exitCode === null && child.signalCode === null) {
-                    child.kill("SIGTERM");
-                    await new Promise<void>((resolveKill) => {
-                        const timer = setTimeout(() => {
-                            child.kill("SIGKILL");
-                            resolveKill();
-                        }, 3000);
-                        child.once("exit", () => {
-                            clearTimeout(timer);
-                            resolveKill();
-                        });
-                    });
-                }
-            } finally {
-                await stopProvisionedRustStack();
-            }
-        },
-    };
 }
+
+export function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
+    return spawnOpencodeWithProvision(opts, provisionRustMode);
+}
+
+export const __spawnOpencodeTest = {
+    rejectOnSpawnError,
+    stopChild,
+    spawnOpencodeWithProvision,
+};

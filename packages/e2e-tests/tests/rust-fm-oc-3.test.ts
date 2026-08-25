@@ -32,7 +32,6 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
     it(
         "recovers within the exported retry budget without restarting the session",
         async () => {
-            h.subc.assertModuleNotSupervised();
             const sessionId = await h.createSession();
             await driveToSteadyState(h, sessionId, 2);
             const healthyVersions = h
@@ -41,7 +40,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 .filter((version) => version > 0);
             const outagePasses = RUST_FAILURE_PARK_THRESHOLD * 2;
 
-            await h.subc.killModuleAndWait();
+            await h.mcHost.crashHost();
             await sendOutagePasses(h, sessionId, 4, outagePasses, "FM-OC-3 outage");
             await h.waitFor(
                 () =>
@@ -51,7 +50,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 { label: "FM-OC-3 park transition" },
             );
 
-            await h.subc.restoreModule();
+            await h.mcHost.restartHost();
             const recoveryStart = h.readRustPasses().length;
             await sendOutagePasses(
                 h,

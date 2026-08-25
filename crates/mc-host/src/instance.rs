@@ -16,7 +16,7 @@ use rustix::fs::{
     flock, fsync, mkdirat, openat, renameat, unlinkat, AtFlags, FlockOperation, Mode, OFlags, CWD,
 };
 
-use subc_transport::{ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
+use crate::connection_file::{ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
 
 /// Canonical publication name inside the runtime directory (protocol §4.1).
 pub const CONNECTION_FILE_NAME: &str = "subc-connection.json";
@@ -216,7 +216,7 @@ impl InstanceGuard {
     pub fn publish(&mut self, port: u16, daemon_ver: &str) -> Result<(), InstanceError> {
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
-            wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+            wire_version: crate::wire::PROTOCOL_VERSION,
             endpoints: vec![Endpoint {
                 host: "127.0.0.1".to_owned(),
                 port,
@@ -311,25 +311,13 @@ impl Drop for InstanceGuard {
 /// normalizing newly created components to 0700. Returns a pinned descriptor
 /// for the final directory after validating its ownership and mode.
 pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
-    let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
-    let mut current = openat(
-        CWD,
-        if dir_path.is_absolute() { "/" } else { "." },
-        flags,
-        Mode::empty(),
-    )
-    .map_err(|e| io_err("open_anchor", dir_path, e))?;
-    // The anchor is part of the resolved path: for a relative root it is the
-    // process working directory, which another principal may control and
-    // could use to replace an otherwise secure first component.
-    let anchor_stat =
-        rustix::fs::fstat(&current).map_err(|e| io_err("fstat_anchor", dir_path, e))?;
-    if !is_safe_ancestor(&anchor_stat) {
-        return Err(InstanceError::Insecure {
+    let flags = HARDENED_DIR_FLAGS;
+    let mut current = open_safe_anchor(dir_path)
+        .map_err(|e| io_err("open_anchor", dir_path, e))?
+        .ok_or_else(|| InstanceError::Insecure {
             what: "runtime directory ancestor",
             path: dir_path.to_path_buf(),
-        });
-    }
+        })?;
     let mut walked = if dir_path.is_absolute() {
         PathBuf::from("/")
     } else {
@@ -340,19 +328,10 @@ pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceErr
     // directories we do not own, such as /tmp or $HOME), while the final
     // directory is validated and then tightened to 0700 through its pinned
     // descriptor below.
-    let mut names = Vec::new();
-    for component in dir_path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => names.push(name),
-            Component::ParentDir | Component::Prefix(_) => {
-                return Err(InstanceError::Insecure {
-                    what: "runtime directory path",
-                    path: dir_path.to_path_buf(),
-                });
-            }
-        }
-    }
+    let names = normal_components(dir_path).ok_or_else(|| InstanceError::Insecure {
+        what: "runtime directory path",
+        path: dir_path.to_path_buf(),
+    })?;
     let saw_component = !names.is_empty();
 
     let last = names.len().saturating_sub(1);
@@ -585,6 +564,52 @@ pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
     stat.st_mode
+}
+
+/// Open flags for every hardened directory traversal: a directory, never
+/// following a link, read-only, close-on-exec.
+///
+/// Shared so a traversal cannot be hardened in one caller and not the other.
+pub(crate) const HARDENED_DIR_FLAGS: OFlags = OFlags::DIRECTORY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::RDONLY)
+    .union(OFlags::CLOEXEC);
+
+/// The path components a hardened traversal may walk.
+///
+/// `RootDir` and `CurDir` are the anchor, already opened, so they are skipped.
+/// Everything else — `ParentDir`, `Prefix` — is refused rather than resolved:
+/// walking `..` would let a pathname climb out of the tree the anchor pinned.
+/// Single-sourced because a missed variant here is a path-traversal hole, and
+/// two copies of this rule can drift apart silently.
+pub(crate) fn normal_components(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => names.push(name),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(names)
+}
+
+/// Opens the anchor a hardened traversal starts from and proves it is not
+/// replaceable.
+///
+/// The anchor is part of the resolved path: for a relative path it is the
+/// process working directory, which another principal may control and could use
+/// to replace an otherwise secure first component. `Ok(None)` means the anchor
+/// opened but is unsafe, which each caller reports in its own error type.
+pub(crate) fn open_safe_anchor(path: &Path) -> Result<Option<OwnedFd>, rustix::io::Errno> {
+    let anchor = openat(
+        CWD,
+        if path.is_absolute() { "/" } else { "." },
+        HARDENED_DIR_FLAGS,
+        Mode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&anchor)?;
+    Ok(is_safe_ancestor(&stat).then_some(anchor))
 }
 
 /// A directory no other principal can replace: owned by us or by root, and

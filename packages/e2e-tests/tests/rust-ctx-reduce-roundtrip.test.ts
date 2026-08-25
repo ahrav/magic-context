@@ -97,7 +97,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => 
                 };
             });
             await h.sendPrompt(sessionId, `ctx_reduce turn 4: reduce tag ${dropTag}`);
-            const queued = (await h.subc.moduleStatus(
+            const queued = (await h.mcHost.primaryStatus(
                 sessionId,
                 h.env.workdir,
                 "session.status",
@@ -123,14 +123,14 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => 
             // replacing the transient drop sentinel with m0. The module ledger is
             // therefore the durable proof that the queued command completed.
             expect(dropEmitted).toBe(true);
-            const finalStatus = (await h.subc.moduleStatus(
+            const finalStatus = (await h.mcHost.primaryStatus(
                 sessionId,
                 h.env.workdir,
                 "session.status",
             )) as ModuleStatus;
             expect(finalStatus.pending_drop_count ?? -1).toBe(0);
             expect(finalStatus.compartment_count ?? 0).toBeGreaterThan(0);
-            expect(h.subc.producerRequestCount()).toBeGreaterThan(0);
+            expect(await h.mcHost.backendRequestCount()).toBeGreaterThan(0);
             const finalWire = h.lastMainWireSerialized();
             expect(finalWire).toContain("<session-history>");
             expect(finalWire).toContain("Rust reduce e2e chunk");

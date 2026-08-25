@@ -30,8 +30,8 @@ use super::backend::{
 /// (R17): a harness child inheriting these could reconnect to the daemon as
 /// the supervised module itself.
 pub const HOST_LAUNCH_IDENTITY_VARS: [&str; 2] = [
-    subc_protocol::SUBC_MODULE_ID_ENV,
-    subc_protocol::SUBC_LAUNCH_NONCE_ENV,
+    crate::wire::SUBC_MODULE_ID_ENV,
+    crate::wire::SUBC_LAUNCH_NONCE_ENV,
 ];
 
 /// Immutable copy of the daemon-startup environment (R17): provider

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use subc_protocol::FrameType;
+use crate::wire::{FrameType, HEADER_LEN};
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{timeout_at, Instant};
@@ -145,7 +145,7 @@ pub async fn run_connection<H: McHostHandler>(
     handshake_permit: OwnedSemaphorePermit,
 ) {
     let _ = stream.set_nodelay(true);
-    let auth = subc_transport::authenticate_server(
+    let auth = crate::auth::authenticate_server(
         &mut stream,
         shared.auth_key.bytes(),
         &shared.daemon_id,
@@ -427,11 +427,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                     return ReadExit::Peer;
                 }
                 watermark = corr;
-                // An over-cap channel-0 Request is still a consumer request:
-                // it commits the generation to TCP, and during candidate
-                // setup it is a protocol failure (protocol §7.7.5), exactly
-                // like the requests that pass the cap.
-                if commit_transport(setup).is_err() {
+                if !transport_ready(setup) {
                     return ReadExit::Peer;
                 }
                 // Off-reader like the other rejections (contended egress
@@ -484,11 +480,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                             if header.epoch == 0 {
                                 return ReadExit::Peer;
                             }
-                            // A routed request is application-bearing: it
-                            // commits the generation to TCP, and during
-                            // candidate setup it is a protocol failure
-                            // (protocol §7.7.5).
-                            if commit_transport(setup).is_err() {
+                            if !transport_ready(setup) {
                                 return ReadExit::Peer;
                             }
                             dispatch_request(shared, gen, frame.into_owned()).await;
@@ -500,7 +492,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         if header.channel == 0 || header.epoch == 0 || header.corr == 0 {
                             return ReadExit::Peer;
                         }
-                        if matches!(setup.state, TransportState::CandidateSetup) {
+                        if !transport_ready(setup) {
                             return ReadExit::Peer;
                         }
                         handle_cancel(gen, (header.channel, header.epoch, header.corr));
@@ -557,7 +549,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         if header.epoch == 0 || header.corr != 0 {
                             return ReadExit::Peer;
                         }
-                        if matches!(setup.state, TransportState::CandidateSetup) {
+                        if !transport_ready(setup) {
                             return ReadExit::Peer;
                         }
                         // The Closing transition is synchronous, so any later
@@ -647,9 +639,10 @@ async fn handle_control<H: McHostHandler>(
         }
         action => action,
     };
-    // Non-negotiation channel-0 requests commit the generation to TCP;
-    // during candidate setup they are a protocol failure (protocol §7.7.5).
-    if commit_transport(setup).is_err() {
+    if !matches!(
+        setup.state,
+        TransportState::TcpCommitted | TransportState::ProviderActive
+    ) {
         return ControlFlow::Close(ReadExit::Peer);
     }
 
@@ -766,14 +759,8 @@ enum ControlFlow {
 /// [`run_candidate_setup`]; the bootstrap observes them all as
 /// [`TransportState::CandidateSetup`].
 enum TransportState {
-    /// Authenticated bootstrap; nothing selected or committed yet.
     BootstrapTcp,
-    /// The generation is committed to TCP. `late_used` is false only while
-    /// the one allowed late negotiation (a first negotiation arriving after
-    /// a non-negotiation request implicitly committed TCP) remains
-    /// available; a negotiation that itself selects TCP consumes the
-    /// allowance, so any further negotiation is a protocol failure.
-    TcpCommitted { late_used: bool },
+    TcpCommitted,
     /// A candidate is being activated; the bootstrap accepts no further
     /// requests.
     CandidateSetup,
@@ -818,18 +805,11 @@ pub(crate) struct CandidateHandoff {
     io: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-/// The first consumer request that is not `transport.negotiate` commits the
-/// generation to TCP (protocol §7.7); during candidate setup any such
-/// request is a protocol failure.
-fn commit_transport(setup: &mut ConnectionSetup) -> Result<(), ()> {
-    match setup.state {
-        TransportState::BootstrapTcp => {
-            setup.state = TransportState::TcpCommitted { late_used: false };
-            Ok(())
-        }
-        TransportState::CandidateSetup => Err(()),
-        TransportState::TcpCommitted { .. } | TransportState::ProviderActive => Ok(()),
-    }
+fn transport_ready(setup: &ConnectionSetup) -> bool {
+    matches!(
+        setup.state,
+        TransportState::TcpCommitted | TransportState::ProviderActive
+    )
 }
 
 async fn handle_negotiate<H: McHostHandler>(
@@ -839,16 +819,8 @@ async fn handle_negotiate<H: McHostHandler>(
     decoded: Result<NegotiateRequest, NegotiationError>,
     setup: &mut ConnectionSetup,
 ) -> ControlFlow {
-    match setup.state {
-        // Selection is sticky (§7.7.5): a repeated negotiation, or any
-        // negotiation while a candidate is being set up or after promotion,
-        // is a protocol failure.
-        TransportState::CandidateSetup
-        | TransportState::ProviderActive
-        | TransportState::TcpCommitted { late_used: true } => {
-            return ControlFlow::Close(ReadExit::Peer);
-        }
-        TransportState::BootstrapTcp | TransportState::TcpCommitted { late_used: false } => {}
+    if !matches!(setup.state, TransportState::BootstrapTcp) {
+        return ControlFlow::Close(ReadExit::Peer);
     }
     let request = match decoded {
         Ok(request) => request,
@@ -886,29 +858,8 @@ async fn handle_negotiate<H: McHostHandler>(
     }) {
         return ControlFlow::Close(ReadExit::Peer);
     }
-    if matches!(setup.state, TransportState::TcpCommitted { .. }) {
-        setup.state = TransportState::TcpCommitted { late_used: true };
-        return respond_tcp(
-            shared,
-            gen,
-            corr,
-            request.negotiation_version,
-            Some(FallbackReason::ConnectionInUse),
-        )
-        .await;
-    }
     if request.negotiation_version != NEGOTIATION_VERSION {
-        // Negotiation itself selected TCP, so the late-negotiation
-        // allowance (implicit-commit-first only, §7.7.5) is consumed.
-        setup.state = TransportState::TcpCommitted { late_used: true };
-        return respond_tcp(
-            shared,
-            gen,
-            corr,
-            request.negotiation_version,
-            Some(FallbackReason::NegotiationVersionMismatch),
-        )
-        .await;
+        return ControlFlow::Close(ReadExit::Peer);
     }
     // The first serveable offer in client preference order wins.
     let mut capability_mismatch = false;
@@ -945,7 +896,6 @@ async fn handle_negotiate<H: McHostHandler>(
                     shared,
                     gen,
                     corr,
-                    request.negotiation_version,
                     selected,
                     provider,
                     offer.parameters.clone(),
@@ -969,9 +919,7 @@ async fn handle_negotiate<H: McHostHandler>(
     } else {
         None
     };
-    // Negotiation itself selected TCP: the late-negotiation allowance is
-    // consumed, so a repeated negotiation is a protocol failure (§7.7.5).
-    setup.state = TransportState::TcpCommitted { late_used: true };
+    setup.state = TransportState::TcpCommitted;
     respond_tcp(shared, gen, corr, request.negotiation_version, reason).await
 }
 
@@ -1012,15 +960,10 @@ async fn respond_tcp<H: McHostHandler>(
     ControlFlow::Continue
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "candidate grant keeps authenticated setup inputs explicit"
-)]
 async fn grant_candidate<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
     corr: u64,
-    negotiation_version: u32,
     selected: SelectedTransport,
     provider: Arc<dyn InjectedProvider>,
     offer_parameters: Option<serde_json::Value>,
@@ -1081,7 +1024,7 @@ async fn grant_candidate<H: McHostHandler>(
             activation_token: token,
             descriptor,
         },
-        negotiation_version,
+        NEGOTIATION_VERSION,
         TCP_CAPABILITY_VERSION,
     ) {
         Ok(body) => body,
@@ -1256,7 +1199,7 @@ async fn send_candidate_response<H: McHostHandler>(
     written_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ()> {
     let deadline = handoff.sender.admission_deadline();
-    let frame_bytes = u32::try_from(body.len() + subc_protocol::HEADER_LEN).map_err(|_| ())?;
+    let frame_bytes = u32::try_from(body.len() + HEADER_LEN).map_err(|_| ())?;
     let charge = tokio::select! {
         biased;
         () = handoff.root.cancelled() => return Err(()),
@@ -1320,10 +1263,7 @@ async fn reserve_catalog_frame(
     id: FrameId,
     body: &[u8],
 ) -> Result<OutboundFrame, ()> {
-    let frame_bytes = body
-        .len()
-        .checked_add(subc_protocol::HEADER_LEN)
-        .ok_or(())?;
+    let frame_bytes = body.len().checked_add(HEADER_LEN).ok_or(())?;
     let charged_bytes = u32::try_from(frame_bytes).map_err(|_| ())?;
     let charge = tokio::select! {
         biased;
@@ -1505,19 +1445,21 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, DuplexStream};
 
+    use crate::wire::decode_header;
+
     #[derive(Clone, Copy)]
     enum FencedProducer {
         Catalog,
         CapacityRejection,
     }
 
-    async fn read_frame_from(stream: &mut DuplexStream) -> subc_protocol::EnvelopeHeader {
-        let mut header_bytes = [0; subc_protocol::HEADER_LEN];
+    async fn read_frame_from(stream: &mut DuplexStream) -> crate::wire::EnvelopeHeader {
+        let mut header_bytes = [0; HEADER_LEN];
         stream
             .read_exact(&mut header_bytes)
             .await
             .expect("frame header");
-        let header = subc_protocol::decode_header(&header_bytes).expect("valid frame header");
+        let header = decode_header(&header_bytes).expect("valid frame header");
         let mut body = vec![0; header.len as usize];
         stream.read_exact(&mut body).await.expect("frame body");
         header
@@ -1628,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn cached_catalog_clone_holds_one_full_frame_charge() {
         let body = br#"{"op":"catalog.list","modules":[]}"#;
-        let frame_bytes = subc_protocol::HEADER_LEN + body.len();
+        let frame_bytes = HEADER_LEN + body.len();
         let budget = crate::wire::ByteBudget::new(frame_bytes as u64);
         let generation = CancellationToken::new();
         let (server, client) = tokio::io::duplex(64);
@@ -1664,7 +1606,7 @@ mod tests {
         .expect("catalog frame reservation");
 
         assert_eq!(budget.available(), 0);
-        assert_eq!(&frame.bytes[subc_protocol::HEADER_LEN..], body);
+        assert_eq!(&frame.bytes[HEADER_LEN..], body);
         drop(frame);
         assert_eq!(budget.available(), frame_bytes);
 

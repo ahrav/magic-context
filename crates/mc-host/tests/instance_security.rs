@@ -80,9 +80,14 @@ async fn publication_is_an_owner_only_regular_file_in_an_owner_only_dir() {
 #[tokio::test]
 async fn discovery_validates_the_publication_the_way_a_client_must() {
     let host = TestHost::start().await;
+    let owned = mc_host::read_connection_file(host.publication_path())
+        .expect("host-owned discovery accepts publication");
+    assert_eq!(owned.wire_version, 2);
+    assert_eq!(owned.key.len(), 32);
+
     let info = raw_client::discover(&host.publication_path()).expect("valid publication");
     assert_eq!(info.schema, 1);
-    assert_eq!(info.wire_version, Some(2));
+    assert_eq!(info.wire_version, 2);
     assert_eq!(info.host, "127.0.0.1");
     assert_ne!(info.port, 0);
     assert_eq!(info.key.len(), 32);
@@ -98,6 +103,65 @@ async fn discovery_validates_the_publication_the_way_a_client_must() {
         raw_client::discover(&loose).is_err(),
         "an insecure mode must fail client validation"
     );
+    assert!(mc_host::read_connection_file(&loose).is_err());
+
+    let oversized = host.runtime_dir().join("oversized.json");
+    std::fs::write(&oversized, vec![b' '; mc_host::MAX_CONNECTION_FILE_LEN + 1])
+        .expect("write oversized publication");
+    std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o600))
+        .expect("owner-only oversized publication");
+    assert!(mc_host::read_connection_file(&oversized).is_err());
+
+    host.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn discovery_requires_numeric_wire_version_two() {
+    let host = TestHost::start().await;
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(host.publication_path()).expect("read publication"))
+            .expect("parse publication");
+
+    for (name, value) in [
+        ("missing", None),
+        ("null", Some(serde_json::Value::Null)),
+        ("string", Some(serde_json::json!("2"))),
+        ("other", Some(serde_json::json!(1))),
+    ] {
+        let path = host.runtime_dir().join(format!("{name}.json"));
+        let mut candidate = original.clone();
+        let object = candidate.as_object_mut().expect("object");
+        match value {
+            Some(value) => {
+                object.insert("wire_version".to_owned(), value);
+            }
+            None => {
+                object.remove("wire_version");
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&candidate).expect("serialize"))
+            .expect("write candidate");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only candidate");
+        assert!(
+            mc_host::read_connection_file(&path).is_err(),
+            "{name} wire_version must fail discovery"
+        );
+    }
+
+    host.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn discovery_rejects_symlink_and_hard_link_publications() {
+    let host = TestHost::start().await;
+    let symlink = host.runtime_dir().join("symlink.json");
+    std::os::unix::fs::symlink(host.publication_path(), &symlink).expect("create symlink");
+    assert!(mc_host::read_connection_file(&symlink).is_err());
+
+    let hard_link = host.runtime_dir().join("hard-link.json");
+    std::fs::hard_link(host.publication_path(), &hard_link).expect("create hard link");
+    assert!(mc_host::read_connection_file(&hard_link).is_err());
 
     host.shutdown_gracefully().await;
 }

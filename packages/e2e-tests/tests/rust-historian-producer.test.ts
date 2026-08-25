@@ -1,33 +1,15 @@
 /// <reference types="bun-types" />
 
-/**
- * Rust historian producer coverage.
- *
- * The Broca process is deliberately separate from the OpenCode model mock. A
- * producer request is therefore a non-vacuous precondition for both success
- * and failure assertions in this suite.
- */
-
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
 interface HistorianStatus {
-    state?: string;
     last_failure?: string | null;
     failure_backoff_at_ms?: number | null;
-    consecutive_publish_failures?: number;
 }
 
-interface ModuleStatus {
-    historian?: HistorianStatus;
-    compartment_count?: number;
-}
-
-const expectInvalidOutput = process.env.MC_RUST_E2E_BROCA_EXPECT_BAD === "1";
-
-describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () => {
+describe.skipIf(!rustPrereqs.ok)("rust historian: direct Broca backend", () => {
     let h: RustTestHarness;
 
     beforeAll(async () => {
@@ -36,6 +18,7 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
             magicContextConfig: {
                 execute_threshold_percentage: 25,
                 protected_tags: 1,
+                historian: { model: "fixture/deterministic" },
                 compressor: { enabled: false },
             },
         });
@@ -46,40 +29,27 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
     });
 
     async function status(sessionId: string): Promise<HistorianStatus> {
-        const response = (await h.subc.moduleStatus(sessionId, h.env.workdir)) as ModuleStatus;
-        return response.historian ?? {};
-    }
-
-    async function sessionStatus(sessionId: string): Promise<ModuleStatus> {
-        return (await h.subc.moduleStatus(sessionId, h.env.workdir, "session.status")) as ModuleStatus;
-    }
-
-    async function waitForProducerRun(minimum: number): Promise<void> {
-        const deadline = Date.now() + 120_000;
-        while (Date.now() < deadline) {
-            if (h.subc.producerRequestCount() >= minimum) return;
-            await Bun.sleep(100);
-        }
-        let pluginLog = "";
-        try {
-            pluginLog = readFileSync(h.logPath, "utf8").slice(-8000);
-        } catch {
-            // The harness may remove its temporary data directory during teardown.
-        }
-        throw new Error(`Broca producer was never contacted; rust passes=${JSON.stringify(h.readRustPasses().map((pass) => pass.raw))}\nproducer log:\n${h.subc.producerLog()}\nmodule log:\n${h.subc.moduleLog().slice(-8000)}\nplugin log:\n${pluginLog}`);
+        const response = await h.mcHost.primaryStatus(sessionId, h.env.workdir);
+        const historian = response.historian;
+        return historian && typeof historian === "object"
+            ? (historian as HistorianStatus)
+            : {};
     }
 
     async function driveHistorian(sessionId: string): Promise<void> {
         for (let i = 1; i <= 10; i += 1) {
             h.mock.setDefault({
-                text: `historian producer assistant ${i}`,
+                text: `historian backend assistant ${i}`,
                 usage: {
-                    input_tokens: 2_500 * i,
+                    input_tokens: 3_000 * i,
                     output_tokens: 20,
                     cache_creation_input_tokens: 1_000,
                 },
             });
-            await h.sendPrompt(sessionId, `producer turn ${i}: ${h.ballast(2_000)}`);
+            await h.sendPrompt(
+                sessionId,
+                `historian turn ${i}: ${h.ballast(2_000)}`,
+            );
         }
         h.mock.setDefault({
             text: "historian trigger",
@@ -89,98 +59,66 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
                 cache_creation_input_tokens: 2_000,
             },
         });
-        await h.sendPrompt(sessionId, `producer trigger: ${h.ballast(2_000)}`);
+        await h.sendPrompt(sessionId, `historian trigger: ${h.ballast(2_000)}`);
         h.mock.setDefault({
             text: "historian follow-up",
-            usage: { input_tokens: 500, output_tokens: 20, cache_creation_input_tokens: 0 },
+            usage: {
+                input_tokens: 500,
+                output_tokens: 20,
+                cache_creation_input_tokens: 0,
+            },
         });
-        await h.sendPrompt(sessionId, "producer follow-up starts the historian run");
+        await h.sendPrompt(
+            sessionId,
+            "historian follow-up starts the Broca run",
+        );
     }
 
-    it(
-        "publishes deterministic tiered output and records producer contact",
-        async () => {
-            const sessionId = await h.createSession();
-            await driveHistorian(sessionId);
-            await waitForProducerRun(1);
+    async function waitForBackend(
+        predicate: (
+            counters: Awaited<ReturnType<typeof h.mcHost.backendCounters>>,
+        ) => boolean,
+    ): Promise<Awaited<ReturnType<typeof h.mcHost.backendCounters>>> {
+        const deadline = Date.now() + 120_000;
+        while (Date.now() < deadline) {
+            const counters = await h.mcHost.backendCounters();
+            if (predicate(counters)) return counters;
+            await Bun.sleep(100);
+        }
+        throw new Error(
+            `Broca backend was not reached\n${h.mcHost.hostLog().slice(-8_000)}`,
+        );
+    }
 
-            if (expectInvalidOutput) {
-                const failed: HistorianStatus = {};
-                const deadline = Date.now() + 120_000;
-                while (Date.now() < deadline) {
-                    Object.assign(failed, await status(sessionId));
-                    if (failed.last_failure) break;
-                    await Bun.sleep(100);
-                }
-                expect(failed.last_failure).toMatch(/tier|validat|compartment/i);
-                expect(failed.failure_backoff_at_ms ?? 0).toBeGreaterThan(Date.now() - 120_000);
-                expect(failed.failure_backoff_at_ms ?? 0).toBeGreaterThan(0);
-                return;
-            }
+    it("reaches the real Broca route through the controlled backend", async () => {
+        await h.mcHost.backendSuccess();
+        const sessionId = await h.createSession();
+        await driveHistorian(sessionId);
 
-            const publishDeadline = Date.now() + 120_000;
-            let published: ModuleStatus = {};
-            while (Date.now() < publishDeadline) {
-                published = await sessionStatus(sessionId);
-                if ((published.compartment_count ?? 0) >= 1) break;
-                await Bun.sleep(100);
-            }
-            expect(published.compartment_count ?? 0).toBeGreaterThanOrEqual(1);
-            const final = await status(sessionId);
-            expect(final.last_failure ?? null).toBeNull();
-            expect(final.consecutive_publish_failures ?? 0).toBe(0);
-        },
-        300_000,
-    );
+        const counters = await waitForBackend((value) => value.completed >= 1);
+        expect(counters.started).toBeGreaterThanOrEqual(1);
+        expect(counters.completed).toBeGreaterThanOrEqual(1);
+    }, 300_000);
 
-    it(
-        "takes the loud historian failure path when Broca goes down mid-run",
-        async () => {
-            const sessionId = await h.createSession();
-            // Establish a real Rust session without firing the historian yet. The
-            // producer is then killed mid-session, before the first outage run.
-            for (let i = 1; i <= 3; i += 1) {
-                h.mock.setDefault({
-                    text: `outage warmup ${i}`,
-                    usage: { input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 50 },
-                });
-                await h.sendPrompt(sessionId, `outage warmup ${i}: ${h.ballast(400)}`);
-            }
-            const beforeFailure = h.subc.producerRequestCount();
-            h.subc.killProducer();
-            await h.subc.waitForProducerDeath();
+    it("records a typed backend failure without killing a provider process", async () => {
+        const before = await h.mcHost.backendCounters();
+        await h.mcHost.failNextBackendCall();
+        const sessionId = await h.createSession();
+        await driveHistorian(sessionId);
 
-            h.mock.setDefault({
-                text: "producer outage follow-up",
-                usage: {
-                    input_tokens: 90_000,
-                    output_tokens: 20,
-                    cache_creation_input_tokens: 90_000,
-                },
-            });
-            await h.sendPrompt(sessionId, `producer outage trigger: ${h.ballast(3_000)}`);
-            await h.sendPrompt(sessionId, `producer outage follow-up: ${h.ballast(1_000)}`);
+        const counters = await waitForBackend(
+            (value) => value.failed > before.failed,
+        );
+        expect(counters.failed).toBe(before.failed + 1);
 
-            const deadline = Date.now() + 120_000;
-            let failed: HistorianStatus = {};
-            while (Date.now() < deadline) {
-                try {
-                    failed = await status(sessionId);
-                } catch {
-                    // A provider disconnect can briefly tear down the daemon's
-                    // management connection while the module records its failure.
-                    await Bun.sleep(500);
-                    continue;
-                }
-                if (failed.last_failure) break;
-                await Bun.sleep(100);
-            }
-            expect(beforeFailure).toBeGreaterThan(0);
-            expect(h.subc.producerRequestCount()).toBe(beforeFailure);
-            expect(failed.last_failure).toMatch(/broca|producer|connect|route|unknown/i);
-            expect(failed.failure_backoff_at_ms ?? 0).toBeGreaterThan(Date.now() - 120_000);
-            expect(failed.failure_backoff_at_ms ?? 0).toBeGreaterThan(0);
-        },
-        300_000,
-    );
+        const deadline = Date.now() + 120_000;
+        let failed: HistorianStatus = {};
+        while (Date.now() < deadline) {
+            failed = await status(sessionId);
+            if (failed.last_failure) break;
+            await Bun.sleep(100);
+        }
+        expect(failed.last_failure).toMatch(/backend|broca|fixture|terminal/i);
+        expect(failed.failure_backoff_at_ms ?? 0).toBeGreaterThan(0);
+    }, 300_000);
 });

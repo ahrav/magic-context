@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SubcCallError } from "../../../shared/mc-host-client";
+import { McHostCallError } from "../../../shared/mc-host-client";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
@@ -591,7 +591,7 @@ describe("connect discovery and retry policy", () => {
                 ({
                     async call() {
                         calls += 1;
-                        throw new SubcCallError("outcome_unknown", "ambiguous send");
+                        throw new McHostCallError("outcome_unknown", "ambiguous send");
                     },
                     close() {},
                 }) as SynapseClientLike,
@@ -616,10 +616,10 @@ describe("connect discovery and retry policy", () => {
                         if (method !== "embed.query") throw new Error(`unexpected ${method}`);
                         queryCalls += 1;
                         if (queryCalls <= 2) {
-                            const error = new SubcCallError(
+                            const error = new McHostCallError(
                                 "outcome_unknown",
                                 "ambiguous send",
-                            ) as SubcCallError & { retry_after_ms: number };
+                            ) as McHostCallError & { retry_after_ms: number };
                             error.retry_after_ms = 0;
                             throw error;
                         }
@@ -650,10 +650,10 @@ describe("connect discovery and retry policy", () => {
                 ({
                     async call() {
                         queryCalls += 1;
-                        const error = new SubcCallError(
+                        const error = new McHostCallError(
                             "outcome_unknown",
                             "ambiguous send",
-                        ) as SubcCallError & { retry_after_ms: number };
+                        ) as McHostCallError & { retry_after_ms: number };
                         error.retry_after_ms = 0;
                         throw error;
                     },
@@ -715,10 +715,10 @@ describe("connect discovery and retry policy", () => {
                 ({
                     async call() {
                         queryCalls += 1;
-                        const error = new SubcCallError(
+                        const error = new McHostCallError(
                             "outcome_unknown",
                             "ambiguous send",
-                        ) as SubcCallError & { retry_after_ms: number };
+                        ) as McHostCallError & { retry_after_ms: number };
                         error.retry_after_ms = 10_000;
                         throw error;
                     },
@@ -739,11 +739,11 @@ describe("connect discovery and retry policy", () => {
                 ({
                     async call() {
                         listCalls += 1;
-                        const error = new SubcCallError(
+                        const error = new McHostCallError(
                             "terminal",
                             "route.open failed for module synapse: target_unavailable",
                             "target_unavailable",
-                        ) as SubcCallError & { retry_after_ms: number };
+                        ) as McHostCallError & { retry_after_ms: number };
                         error.retry_after_ms = 0;
                         throw error;
                     },

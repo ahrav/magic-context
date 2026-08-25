@@ -98,7 +98,7 @@ import {
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { dropSlot } from "./lkg-slot";
-import { SubcModuleTransport } from "./module-transport";
+import { McHostModuleTransport } from "./module-transport";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -744,7 +744,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
         (() => {
-            const transport = new SubcModuleTransport();
+            const transport = new McHostModuleTransport();
             const client: RustModeModuleClient = {
                 call: (args) => transport.call(args),
                 stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
@@ -946,7 +946,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // than the plugin's launch directory (a /cd switch, multi-project hosts).
     // Registration is therefore an idempotent ensure invoked for every project
     // that reaches rust-mode preparation, not a one-shot at construction.
-    const evaluatorTransport = rustModeModuleClient ? new SubcModuleTransport() : undefined;
+    const evaluatorTransport = rustModeModuleClient ? new McHostModuleTransport() : undefined;
     // Bridge keys this hook instance registered. Instance disposal must tear
     // down only these: the registry is process-global and Desktop hosts several
     // plugin instances in one process.

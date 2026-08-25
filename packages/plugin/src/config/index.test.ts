@@ -954,7 +954,8 @@ describe("transform_mode resolution", () => {
         );
 
         expect(result.transform_mode).toBe("rust");
-        expect(result.subc?.connection_file).not.toContain("project-controlled.sock");
+        const { subc } = result;
+        expect(subc?.connection_file).not.toContain("project-controlled.sock");
     });
 });
 

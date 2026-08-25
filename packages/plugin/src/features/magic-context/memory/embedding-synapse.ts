@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
-import { isSubcCallError, SubcClient } from "../../../shared/mc-host-client";
+import { isMcHostCallError, McHostClient } from "../../../shared/mc-host-client";
 import {
     createSynapseLedgerPage,
     findSynapseLedgerPage,
@@ -463,7 +463,7 @@ async function getSharedClient(
     if (sharedClientPromise && sharedClientFile === options.connectionFile)
         return sharedClientPromise;
     const file = options.connectionFile;
-    const promise = SubcClient.connect({
+    const promise = McHostClient.connect({
         connectionFile: file,
         handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
     }).then((client) => {
@@ -1441,7 +1441,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 // R21: module_restarted bypasses generic retry entirely; the
                 // caller owns the single durable restart resubmission.
                 if (classified.code === "module_restarted") throw classified;
-                const outcomeUnknown = isSubcCallError(error) && error.kind === "outcome_unknown";
+                const outcomeUnknown = isMcHostCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
                 // A queue-full reply creates no host state. Retry it through
                 // the request deadline so the host's bounded query lane sheds

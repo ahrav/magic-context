@@ -1,7 +1,7 @@
 /**
  * Focused real-host Synapse smoke: starts the `synapse_host` example over a
  * model bundle, then drives all four application operations through the
- * managed SubcClient — discovery, one query, an ambiguous batch replay, a
+ * managed McHostClient — discovery, one query, an ambiguous batch replay, a
  * host restart with resubmission, and the degraded (unconfigured) lane.
  *
  * Hermetic mode (default) uses the committed synapse-tiny bundle and needs a
@@ -33,7 +33,7 @@ import {
 } from "../src/features/magic-context/storage-embedding-measurements";
 import { initializeDatabase } from "../src/features/magic-context/storage-db";
 import { Database } from "../src/shared/sqlite";
-import { SubcClient } from "../src/shared/mc-host-client";
+import { McHostClient } from "../src/shared/mc-host-client";
 
 const OVERALL_DEADLINE_MS = 180_000;
 const READY_DEADLINE_MS = 20_000;
@@ -175,19 +175,31 @@ const bundleDir =
 if (!existsSync(join(bundleDir, "manifest.json"))) {
     fail(`bundle manifest missing at ${bundleDir}`);
 }
-function readBundleJson(name: string): unknown {
+interface BundleManifest {
+    model?: unknown;
+    dims?: unknown;
+    table_epoch?: unknown;
+    fingerprint?: unknown;
+    corpus?: { name?: unknown };
+    provenance?: { production?: unknown };
+    model_file?: { sha256?: unknown };
+}
+
+interface BundleCorpus {
+    tolerance: number;
+    items: { text: string; expected: number[] }[];
+}
+
+function readBundleJson<T>(name: string): T {
     try {
-        return JSON.parse(readFileSync(join(bundleDir, name), "utf8"));
+        return JSON.parse(readFileSync(join(bundleDir, name), "utf8")) as T;
     } catch (error) {
         fail(`bundle file ${name} is unreadable or not JSON: ${String(error)}`);
     }
 }
 
-const manifest = readBundleJson("manifest.json") as Record<string, any>;
-const corpus = readBundleJson(String(manifest.corpus?.name ?? "corpus.json")) as {
-    tolerance: number;
-    items: { text: string; expected: number[] }[];
-};
+const manifest = readBundleJson<BundleManifest>("manifest.json");
+const corpus = readBundleJson<BundleCorpus>(String(manifest.corpus?.name ?? "corpus.json"));
 
 if (mode === "production") {
     // The release smoke must never silently pass on the toy bundle or a
@@ -296,7 +308,7 @@ function body(value: unknown): Record<string, unknown> {
 }
 
 async function pollJob(
-    client: SubcClient,
+    client: McHostClient,
     jobId: string,
     key: string,
 ): Promise<{ id: string; vector: number[] }[]> {
@@ -342,7 +354,7 @@ try {
     log("starting synapse_host with no bundle (degraded lane)");
     let connectionFile = await startHost("-");
     {
-        const client = await SubcClient.connect({ connectionFile });
+        const client = await McHostClient.connect({ connectionFile });
         try {
             await client.call("synapse", "models.list", {}, callOptions);
             fail("a degraded lane must reject its bind");
@@ -366,7 +378,7 @@ try {
     // ---------------- Certified lane: all four operations. -----------------
     log(`starting synapse_host with bundle ${bundleDir} (${mode} mode)`);
     connectionFile = await startHost(bundleDir);
-    const client = await SubcClient.connect({ connectionFile });
+    const client = await McHostClient.connect({ connectionFile });
     let jobId: string;
     let key: string;
     const batchItems = corpus.items.slice(0, 3).map((item, index) => ({
@@ -432,7 +444,7 @@ try {
     log("restarting the host to fence the retained job");
     await stopHost(true);
     connectionFile = await startHost(bundleDir);
-    const restarted = await SubcClient.connect({ connectionFile });
+    const restarted = await McHostClient.connect({ connectionFile });
     try {
         try {
             await restarted.call(

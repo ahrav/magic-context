@@ -1,9 +1,24 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use subc_protocol::manifest::{ExecutionMode, Tool};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Pure,
+    Mutating,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub execution_mode: ExecutionMode,
+    pub schema: Value,
+}
 
 use super::{
     ctx_expand_description, ctx_expand_schema, ctx_memory_description, ctx_memory_schema,

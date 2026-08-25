@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { wakePlaneStatus } from "../src/features/magic-context/smart-notes/wake-plane";
-import { SubcClient, type SubcDiagnosticsEvent } from "../src/shared/mc-host-client";
+import { McHostClient, type McHostDiagnosticsEvent } from "../src/shared/mc-host-client";
 
 const OVERALL_DEADLINE_MS = 60_000;
 const READY_DEADLINE_MS = 15_000;
@@ -149,8 +149,8 @@ try {
     }
     log("production wake-plane probe returned absent");
 
-    const events: SubcDiagnosticsEvent[] = [];
-    const client = await SubcClient.connect({
+    const events: McHostDiagnosticsEvent[] = [];
+    const client = await McHostClient.connect({
         connectionFile,
         diagnostics: (event) => events.push(event),
     });

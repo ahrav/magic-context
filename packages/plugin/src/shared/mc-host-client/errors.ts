@@ -9,15 +9,20 @@
  * Leaf module: no imports from connection or facade code.
  */
 
+const CALL_ERROR_KINDS: readonly string[] = ["not_sent", "outcome_unknown", "terminal"];
+
 /**
- * Cross-bundle recognition of {@link SubcCallError}: `instanceof` for a
- * same-bundle error, wire-visible `name` for an error thrown by a different
- * bundled copy of this class.
+ * Cross-bundle recognition of {@link McHostCallError}. A different bundled
+ * copy of this class fails `instanceof`, so recognition is structural; old
+ * runtime names (the previous `Subc`-prefixed spellings) are deliberately
+ * rejected.
  */
-export function isSubcCallError(error: unknown): error is SubcCallError {
-    return (
-        error instanceof SubcCallError || (error instanceof Error && error.name === "SubcCallError")
-    );
+export function isMcHostCallError(error: unknown): error is McHostCallError {
+    if (error instanceof McHostCallError) return true;
+    if (!(error instanceof Error) || error.name !== "McHostCallError") return false;
+    const { kind, code } = error as { kind?: unknown; code?: unknown };
+    if (typeof kind !== "string" || !CALL_ERROR_KINDS.includes(kind)) return false;
+    return code === undefined || typeof code === "string";
 }
 
 /**
@@ -30,39 +35,38 @@ export function isSubcCallError(error: unknown): error is SubcCallError {
  * - `terminal`: a matching terminal Error (or non-retryable setup failure)
  *   was observed; it applies only to that correlation.
  */
-export type SubcCallErrorKind = "not_sent" | "outcome_unknown" | "terminal";
+export type McHostCallErrorKind = "not_sent" | "outcome_unknown" | "terminal";
 
 /** Managed call failure carrying send-outcome semantics. */
-export class SubcCallError extends Error {
+export class McHostCallError extends Error {
     /** The facade attaches `cleanup` when a caller abort produces this error. */
     cleanup?: Promise<void>;
 
     /**
-     * Raw wire Error terminal (body plus frame flags) for callers that must
-     * validate the exact terminal shape — negotiation's legacy-fallback
-     * classification accepts only a byte-exact `unsupported_operation`
-     * terminal, which the parsed `code` alone cannot prove.
+     * Captured only during transport negotiation, which replaces
+     * peer-controlled Error terminals with a bounded failure before
+     * exposing them to callers.
      */
     errorTerminal?: { bodyText: string | null; flags: number; streamed: boolean };
 
     constructor(
-        readonly kind: SubcCallErrorKind,
+        readonly kind: McHostCallErrorKind,
         message: string,
         readonly code?: string,
         readonly cause?: unknown,
     ) {
         super(message);
-        this.name = "SubcCallError";
+        this.name = "McHostCallError";
     }
 }
 
-export class SubcError extends Error {
+export class McHostClientError extends Error {
     constructor(
         message: string,
         readonly code?: string,
     ) {
         super(message);
-        this.name = "SubcError";
+        this.name = "McHostClientError";
     }
 }
 

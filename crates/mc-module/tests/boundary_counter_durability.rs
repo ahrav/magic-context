@@ -1,37 +1,35 @@
-use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+#![cfg(unix)]
+#![forbid(unsafe_code)]
+
+mod support;
+
 use mc_core::CoreState;
+use mc_host::TargetKind;
 use mc_store::{McStore, McStoreError, ModuleMeta};
+use support::direct_host::{storage_descriptor, wait_for_store, FixtureProcess};
 
-fn descriptor(path: &std::path::Path) -> StorageDescriptor {
-    StorageDescriptor {
-        module_id: "mc-module-boundary-counter-test".to_string(),
-        storage_namespace: "mc_cache".to_string(),
-        isolation: Isolation::Module,
-        backend: StorageBackend::Sqlite {
-            path: path.join("store.db").to_string_lossy().to_string(),
-        },
-    }
-}
-
-#[test]
-fn competing_module_passes_keep_one_increment_and_reopen_keeps_it() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = McStore::open(&descriptor(directory.path())).unwrap();
+#[tokio::test]
+async fn competing_pass_counter_survives_direct_primary_lifecycle_and_reopen() {
+    let root = tempfile::tempdir().expect("state root");
+    let descriptor = storage_descriptor(root.path());
+    let store = McStore::open(&descriptor).expect("seed store opens");
     let session = "module-counter";
     let core = CoreState::default();
     let initial = ModuleMeta {
         boundary_divergence_pending_count: 0,
         ..Default::default()
     };
-    store.commit(session, None, &core, &initial).unwrap();
+    store
+        .commit(session, None, &core, &initial)
+        .expect("initial state commits");
 
-    let winner = store.load(session).unwrap();
-    let loser = store.load(session).unwrap();
+    let winner = store.load(session).expect("winner snapshot");
+    let loser = store.load(session).expect("loser snapshot");
     let mut winner_meta = winner.meta.clone();
     winner_meta.boundary_divergence_pending_count = 1;
     store
         .commit(session, winner.row_version, &winner.core, &winner_meta)
-        .unwrap();
+        .expect("winner commits");
 
     let mut loser_meta = loser.meta.clone();
     loser_meta.boundary_divergence_pending_count = 1;
@@ -42,21 +40,23 @@ fn competing_module_passes_keep_one_increment_and_reopen_keeps_it() {
             found: 2
         })
     ));
-    assert_eq!(
-        store
-            .load(session)
-            .unwrap()
-            .meta
-            .boundary_divergence_pending_count,
-        1
-    );
-
     drop(store);
-    let reopened = McStore::open(&descriptor(directory.path())).unwrap();
+
+    let fixture = FixtureProcess::start_at(root.path().to_path_buf());
+    let client = fixture.client().await;
+    let route = fixture
+        .open_route(&client, "magic-context", TargetKind::ToolProvider, session)
+        .await;
+    let status = wait_for_store(&client, route, session).await;
+    assert_eq!(status["session_id"], session);
+    client.close().await.expect("managed client closes");
+    fixture.shutdown();
+
+    let reopened = McStore::open(&descriptor).expect("store reopens after fixture drain");
     assert_eq!(
         reopened
             .load(session)
-            .unwrap()
+            .expect("state reloads")
             .meta
             .boundary_divergence_pending_count,
         1

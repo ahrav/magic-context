@@ -485,13 +485,18 @@ async fn retained_declaration_raises_the_resident_floor_exactly() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// The default resident cap absorbs the whole Broca declaration: it is the
-/// former two-component 256 MiB default plus exactly the declared retained
-/// reservation (the 64 MiB supervisor budget plus the route-map and
-/// backend-capture headroom), so ingress headroom is preserved, and the
-/// default-limit three-component host starts.
+/// The default resident cap is the no-retention ingress floor, and a composite
+/// that links components with real retention must size the ceiling itself.
+///
+/// The default used to pre-add Broca's declaration, which only worked because
+/// Broca lives inside this crate: a default cannot name the declaration of an
+/// external component such as `mc_module::McHandler`, so every composite that
+/// linked one silently under-sized its ceiling. The knowledge of which
+/// components are linked lives at the composition site, so the number does too —
+/// and startup refuses an under-sized composite rather than over-offering
+/// ingress.
 #[tokio::test]
-async fn the_default_resident_cap_absorbs_the_broca_reservation() {
+async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
     const RETAINED: u64 = 64 * 1024 * 1024
         + 1024 * (4096 + 256 + 128)
         + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024)
@@ -500,16 +505,33 @@ async fn the_default_resident_cap_absorbs_the_broca_reservation() {
         + 3 * 8 * (96 * 1024 + 8 * 1024);
     let defaults = HostLimits::default();
     assert_eq!(
-        defaults.max_resident_bytes - RETAINED,
+        defaults.max_resident_bytes,
         256 * 1024 * 1024,
-        "the default grew by exactly the declared retained reservation"
+        "the default carries no component's retention"
     );
 
+    // Defaults alone cannot hold a declaring component: startup must refuse it
+    // rather than hand ingress bytes the component is already holding.
+    let refused = CompositeTestHost::try_start(
+        three_child_composite(broca_declaration(RETAINED)),
+        |config| {
+            config.limits = HostLimits::default();
+        },
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a declaration the ceiling cannot cover must fail startup"
+    );
+
+    // Sized at the composition site, the same composite starts.
     let host = CompositeTestHost::start(
         three_child_composite(broca_declaration(RETAINED)),
         |config| {
-            // Default limits: the production declaration must fit them.
-            config.limits = HostLimits::default();
+            config.limits = HostLimits {
+                max_resident_bytes: HostLimits::default().max_resident_bytes + RETAINED,
+                ..HostLimits::default()
+            };
         },
     )
     .await;

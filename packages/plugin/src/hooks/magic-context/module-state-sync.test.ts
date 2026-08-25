@@ -26,7 +26,7 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
-import { SubcCallError } from "../../shared/mc-host-client";
+import { McHostCallError } from "../../shared/mc-host-client";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -741,7 +741,7 @@ describe("module state sync section deltas", () => {
             async call() {
                 callCount += 1;
                 // Possible-send drops throw; never a typed generation-change result.
-                throw new SubcCallError(
+                throw new McHostCallError(
                     "outcome_unknown",
                     "connection dropped after a possible send",
                     "connection_dropped",
@@ -757,7 +757,7 @@ describe("module state sync section deltas", () => {
                 projectRoot: "/tmp/project",
                 force: false,
             }),
-        ).rejects.toMatchObject({ name: "SubcCallError", kind: "outcome_unknown" });
+        ).rejects.toMatchObject({ name: "McHostCallError", kind: "outcome_unknown" });
 
         expect(callCount).toBe(1);
         expect(statusCalls).toBe(0);

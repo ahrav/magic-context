@@ -15,7 +15,7 @@
  * This file has TWO arms exercising different fault shapes; both assert the
  * shipped OUTCOME (no permanent park; transform resumes) not the mechanism:
  *
- *  A. module-restart recovery — kill and restart the ck-mc module mid-session
+ *  A. module-restart recovery — kill and restart the McHandler module mid-session
  *     against the same daemon + store. The raw array is unchanged, so the
  *     adapter's ordinal state stays valid; the only failure window is the brief
  *     reconnect. A module restart mid-session must recover on the following
@@ -59,7 +59,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
         // clean fault-injection window the daemon supervises: the store's
         // single-writer lease is released and re-acquired, and the plugin's subc
         // client transparently reconnects on its next call.
-        await h.subc.restartModule();
+        await h.mcHost.restartHost();
         await Bun.sleep(500);
 
         // Subsequent passes must recover. The first may fail during the reconnect
@@ -96,7 +96,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
 
             // Prolonged outage: kill the module and keep it down across several
             // passes so the adapter crosses its three-failure park threshold.
-            await h.subc.killModuleAndWait();
+            await h.mcHost.crashHost();
             for (let i = 4; i <= 8; i += 1) {
                 h.mock.setDefault({
                     text: `outage assistant ${i}`,
@@ -112,7 +112,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
 
             // Restore the module and drive enough passes for the self-heal probe
             // cadence to retry and recover.
-            await h.subc.restartModule();
+            await h.mcHost.restartHost();
             await Bun.sleep(500);
             for (let i = 9; i <= 18; i += 1) {
                 h.mock.setDefault({

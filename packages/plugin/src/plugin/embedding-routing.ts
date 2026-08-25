@@ -53,6 +53,7 @@ function fallbackConfig(
     config: EmbeddingConfig,
     provider: EmbeddingFallbackProvider | undefined,
 ): EmbeddingConfig {
+    // SAFETY: each fallback field is narrowed before use.
     const raw = config as unknown as Record<string, unknown>;
     const model = typeof raw.model === "string" ? raw.model.trim() : "";
     const endpoint = typeof raw.endpoint === "string" ? raw.endpoint.trim() : "";
@@ -176,7 +177,7 @@ export async function resolveEmbeddingRouting(args: {
     session?: string;
 }): Promise<ResolvedEmbeddingRouting> {
     const config = args.config.embedding;
-    const subc = args.config.subc;
+    const { subc } = args.config;
     const shadowEnabled = args.config.shadow_embedding?.enabled === true;
     const warnings: string[] = [];
 

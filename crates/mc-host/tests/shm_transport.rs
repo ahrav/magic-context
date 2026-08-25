@@ -1,5 +1,10 @@
 mod support;
 
+// These tests drive `transport.negotiate` themselves, so they need a client that
+// is authenticated but has not negotiated yet. `client()` completes a TCP
+// negotiation during connect, and selection is sticky (§7.7.5): a second
+// negotiation on the same generation is a protocol failure that closes it.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,8 +13,8 @@ use mc_host::shm_provider::{
     TestPeerError, TestShmPeer, SHM_CAPABILITY_VERSION, SHM_TRANSPORT,
 };
 use mc_host::transport_provider::{InjectedProvider, TransportProviders};
+use mc_host::wire::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
 use mc_shm_transport::profile::{AdmissionController, AdmissionError, HostLimits as ShmHostLimits};
-use subc_protocol::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
 use support::raw_client::{RawClient, RawFrame, FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
 use support::{TestHost, LINKED_MODULE_ID};
 
@@ -91,7 +96,7 @@ async fn wait_for_no_active(provider: &ShmProvider) {
 #[tokio::test]
 async fn omitted_and_unqualified_profiles_fall_back_without_side_effects() {
     let host = TestHost::start().await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let response = control_response(&mut client, &offers(qualified_test_parameters())).await;
     assert_eq!(response.json()["selected"]["transport"], "tcp");
     assert_eq!(response.json()["reason"], "unavailable");
@@ -102,7 +107,7 @@ async fn omitted_and_unqualified_profiles_fall_back_without_side_effects() {
     ));
     let providers = registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = providers).await;
-    let mut client = host.client().await;
+    let mut client = host.setup_client().await;
     let response = control_response(&mut client, &offers(serde_json::json!({}))).await;
     assert_eq!(response.json()["selected"]["transport"], "tcp");
     assert_eq!(response.json()["reason"], "unavailable");
@@ -126,7 +131,7 @@ async fn qualified_provider_grants_activates_correlates_and_closes() {
     ));
     let providers = registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = providers).await;
-    let mut bootstrap = host.client().await;
+    let mut bootstrap = host.setup_client().await;
     let grant = control_response(&mut bootstrap, &offers(qualified_test_parameters())).await;
     assert_eq!(grant.ty, TY_RESPONSE);
     let grant = grant.json();
@@ -214,7 +219,7 @@ async fn quarantine_next_close_retains_charges_and_rejects_readmission() {
     ));
     let providers = registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = providers).await;
-    let mut bootstrap = host.client().await;
+    let mut bootstrap = host.setup_client().await;
     let grant = control_response(&mut bootstrap, &offers(qualified_test_parameters())).await;
     let grant = grant.json();
     let token = grant["activation_token"]
@@ -284,7 +289,7 @@ async fn failure_after_prepare_closes_without_tcp_fallback_or_replay() {
     ));
     let providers = registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = providers).await;
-    let mut bootstrap = host.client().await;
+    let mut bootstrap = host.setup_client().await;
     let grant = control_response(&mut bootstrap, &offers(qualified_test_parameters())).await;
     assert_eq!(grant.json()["selected"]["transport"], SHM_TRANSPORT);
     assert_eq!(provider.preparation_count(), 1);

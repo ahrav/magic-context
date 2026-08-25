@@ -6,8 +6,8 @@
       "name": "FM_OC_5_RUNG_SWAP",
       "applied_diff": {
         "path": "packages/e2e-tests/tests/rust-fm-oc-5.test.ts",
-        "before": "h.subc.stopModule();\n            await h.sendPrompt",
-        "after": "h.subc.continueModule();\n            await h.sendPrompt",
+        "before": "h.mcHost.pauseHost();\n            await h.sendPrompt",
+        "after": "h.mcHost.resumeHost();\n            await h.sendPrompt",
         "changed": true
       },
       "observed_failure": {

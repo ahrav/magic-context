@@ -10,9 +10,9 @@
  * Defaults to the ckdev-rig connection file.
  */
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { readFileSync } from "node:fs";
-import { SubcClient } from "../src/shared/mc-host-client";
+import { McHostClient } from "../src/shared/mc-host-client";
 
 const args = process.argv.slice(2);
 const session = args[0];
@@ -25,8 +25,8 @@ const connectionFile =
     connIdx >= 0
         ? args[connIdx + 1]
         : join(homedir(), ".local", "share", "cortexkit", "ckdev-rig", "runtime", "subc-connection.json");
-const payloadPath = join(dirname(new URL(import.meta.url).pathname), "drive-preseed-payload.json");
 let payload: { compartments: unknown[] };
+const payloadPath = join(import.meta.dir, "drive-preseed-payload.json");
 try {
     payload = JSON.parse(readFileSync(payloadPath, "utf8")) as { compartments: unknown[] };
     if (!Array.isArray(payload.compartments)) {
@@ -37,7 +37,7 @@ try {
     process.exit(1);
 }
 
-const client = await SubcClient.connect({ connectionFile, handshakeTimeoutMs: 10_000 });
+const client = await McHostClient.connect({ connectionFile, handshakeTimeoutMs: 10_000 });
 try {
     const route = await client.routeOpen(
         { kind: "tool_provider", module_id: "magic-context" },

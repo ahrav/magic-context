@@ -14,7 +14,7 @@ import { Deadline } from "../deadline";
 import { encodePeerFrame, PeerFrameType } from "./fake-peer";
 import {
     createTrackedHarness,
-    expectSubcCallError,
+    expectMcHostCallError,
     rejection,
     type ScenarioContext,
 } from "./test-util";
@@ -286,7 +286,7 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
                 deadline: Deadline.start(10_000),
             });
             const abortHandle = queued.abort();
-            expectSubcCallError(await rejection(queued.result), "not_sent", "aborted");
+            expectMcHostCallError(await rejection(queued.result), "not_sent", "aborted");
             await abortHandle.cleanup;
             wedge.abort();
             generationA.retire("owner_close");
@@ -303,7 +303,7 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
                 deadline: Deadline.start(5_000),
             });
             connectionB.destroy();
-            expectSubcCallError(await rejection(reset.result), "outcome_unknown");
+            expectMcHostCallError(await rejection(reset.result), "outcome_unknown");
             assert.ok(generationB.isRetired());
 
             // terminal: a matching Error frame after invocation is the
@@ -356,7 +356,7 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
                 connection.frames.some((frame) => frame.corr === request.correlation),
             );
             const handle = request.abort();
-            expectSubcCallError(await rejection(request.result), "outcome_unknown", "aborted");
+            expectMcHostCallError(await rejection(request.result), "outcome_unknown", "aborted");
             generation.enqueueCancel(CHANNEL, EPOCH, request.correlation);
             let cleanupResolved = 0;
             void handle.cleanup.then(() => {

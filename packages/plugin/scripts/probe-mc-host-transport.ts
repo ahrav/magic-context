@@ -8,13 +8,13 @@ import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import {
     AdmissionClass,
     Priority,
-    SubcClient,
+    McHostClient,
     type RequestOptions,
     type RouteHandle,
-    type SubcDiagnosticsEvent,
+    type McHostDiagnosticsEvent,
 } from "../src/shared/mc-host-client";
 
-import { SubcModuleTransport } from "../src/hooks/magic-context/module-transport";
+import { McHostModuleTransport } from "../src/hooks/magic-context/module-transport";
 import { buildPagedModuleTransformPayloads } from "../src/hooks/magic-context/module-wire";
 
 type JsonRecord = Record<string, unknown>;
@@ -140,7 +140,11 @@ function codecProxy(value: unknown, samples: number): {
         JSON.stringify(value);
         stringifySamples.push(performance.now() - startedAt);
         startedAt = performance.now();
-        JSON.parse(serialized);
+        try {
+            JSON.parse(serialized);
+        } catch {
+            // Benchmark round-trip of freshly stringified data. commentlint: allow(JUDGE)
+        }
         parseSamples.push(performance.now() - startedAt);
     }
     return {
@@ -288,7 +292,7 @@ let activeTrace: PhaseTrace | null = null;
 let activeChannel = -1;
 let daemonPid: number | null = null;
 
-function observeDiagnostics(event: SubcDiagnosticsEvent): void {
+function observeDiagnostics(event: McHostDiagnosticsEvent): void {
     if (event.type === "connected") {
         daemonPid = event.pid ?? null;
         return;
@@ -314,7 +318,7 @@ function observeDiagnostics(event: SubcDiagnosticsEvent): void {
 }
 
 async function instrumentedRequest(
-    client: SubcClient,
+    client: McHostClient,
     route: RouteHandle,
     body: JsonRecord,
     options: RequestOptions,
@@ -348,7 +352,7 @@ async function instrumentedRequest(
 }
 
 if (argv.includes("--help")) {
-    console.log(`usage: bun packages/plugin/scripts/probe-subc-transport.ts [options]
+    console.log(`usage: bun packages/plugin/scripts/probe-mc-host-transport.ts [options]
 
 options:
   --connection-file <path>       daemon connection file
@@ -398,7 +402,7 @@ const scenarios: Scenario[] = [
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 1 });
 eventLoopDelay.enable();
 const connectStartedAt = performance.now();
-const client = await SubcClient.connect({
+const client = await McHostClient.connect({
     connectionFile,
     handshakeTimeoutMs: timeoutMs,
     diagnostics: observeDiagnostics,
@@ -592,7 +596,7 @@ try {
 
 if (!realResponse) throw new Error("real-shape transform arm returned no measured response");
 
-const transport = new SubcModuleTransport(connectionFile, moduleId, timeoutMs);
+const transport = new McHostModuleTransport(connectionFile, moduleId, timeoutMs);
 const fifoSessions = Array.from(
     { length: fifoConcurrency },
     (_, index) => `${session}-fifo-${index}`,

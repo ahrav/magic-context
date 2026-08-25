@@ -19,7 +19,7 @@
  * is edited in place in opencode.db (same message id, appended content),
  * mirroring the reminder-wrapper mutation OpenCode performs on a queued message.
  *
- * Drives the FULL production path: opencode → plugin → subc daemon → ck-mc.
+ * Drives the FULL production path: opencode → plugin → direct mc-host → McHandler.
  */
 
 import { Database } from "bun:sqlite";

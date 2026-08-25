@@ -6,7 +6,7 @@ import {
     type ProducerCursor,
 } from "@magic-context/mc-shm-native";
 import type { Deadline } from "./deadline";
-import { SubcCallError } from "./errors";
+import { McHostCallError } from "./errors";
 import {
     BoundedFrameProducer,
     type ByteBudget,
@@ -53,11 +53,11 @@ export class ShmFrameChannel implements SetupFrameChannel {
 
     async start(deadline: Deadline): Promise<{ daemonVer: string }> {
         if (this.closed) {
-            throw new SubcCallError("not_sent", "shared-memory channel closed");
+            throw new McHostCallError("not_sent", "shared-memory channel closed");
         }
         if (!this.native) {
             if (deadline.remainingMs() <= 0) {
-                throw new SubcCallError("not_sent", "shared-memory setup deadline expired");
+                throw new McHostCallError("not_sent", "shared-memory setup deadline expired");
             }
             this.native = NativeChannel.attach(this.options.descriptor as NativeDescriptor);
         }
@@ -75,7 +75,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         hooks?: FrameSendHooks,
         deadline?: Deadline,
     ): FrameSendTicket {
-        if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         this.assertBodyBounds(body.byteLength);
         // The native ring's fixed capacity is not the configured aggregate
         // cap: admission consults the shared budget so an over-cap body is
@@ -96,7 +96,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         capacity: number,
         hooks?: FrameSendHooks,
     ): BoundedFrameProducer {
-        if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         this.assertBodyBounds(capacity);
         // Reservations hold ring capacity across event-loop turns, so
         // their budget charge is held until publication or abort.
@@ -121,7 +121,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
             capacity,
             (_segments, exactLength) => ({
                 publish: () => {
-                    if (!held) throw new SubcCallError("not_sent", "reservation released");
+                    if (!held) throw new McHostCallError("not_sent", "reservation released");
                     let published = false;
                     reservation.commit(
                         encodeHeader({ ...header, len: exactLength }),
@@ -225,7 +225,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
 
     private attached(): NativeChannel {
         if (!this.native) {
-            throw new SubcCallError("not_sent", "shared-memory channel is not started");
+            throw new McHostCallError("not_sent", "shared-memory channel is not started");
         }
         return this.native;
     }
@@ -252,7 +252,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         hooks?: FrameSendHooks,
         deadline?: Deadline,
     ): FrameSendTicket {
-        if (this.closed) throw new SubcCallError("not_sent", "shared-memory channel closed");
+        if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         let published = false;
         this.attached().produce(
             encodeHeader({ ...header, len: body.byteLength }),
@@ -278,7 +278,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
 
     private admitPublication(bytes: number): void {
         if (this.options.budget.wouldExceed(bytes)) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "aggregate connection memory cap would be exceeded",
                 "memory_cap",

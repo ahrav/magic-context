@@ -2,7 +2,7 @@
  * Thin routed and managed consumer facade over the connection-generation
  * engine.
  *
- * `SubcClient` owns connection coalescing (single-flight connect), reconnect
+ * `McHostClient` owns connection coalescing (single-flight connect), reconnect
  * after generation retirement (reread the connection file plus full reauth),
  * the managed-route cache, control-plane response validation, and bounded
  * redacted diagnostics. The generation layer below never imports this file.
@@ -31,7 +31,12 @@ import {
     readConnectionFile,
 } from "./connection-file";
 import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
-import { isSubcCallError, SocketTimeoutError, SubcCallError, SubcError } from "./errors";
+import {
+    isMcHostCallError,
+    McHostCallError,
+    McHostClientError,
+    SocketTimeoutError,
+} from "./errors";
 import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
 import { flagsBinary } from "./protocol";
 import {
@@ -50,7 +55,6 @@ import {
     encodeActivateRequest,
     encodeNegotiateRequest,
     type FallbackReason,
-    isLegacyFallbackTerminalBody,
     NEGOTIATION_VERSION,
     type NegotiateResponse,
     NegotiationError,
@@ -60,7 +64,6 @@ import {
     type ClientTransportProvider,
     ClientTransportRegistry,
     sanitizedCandidateFactory,
-    TCP_CAPABILITY_VERSION,
 } from "./transport-provider";
 import type {
     BindIdentity,
@@ -102,7 +105,7 @@ const DEFAULT_MANAGED_TARGET_KIND: ManagedRouteKind = "management_surface";
  * byte counts, and connection metadata only — never key, proof, nonce,
  * body bytes, or full bind identity.
  */
-export interface SubcDiagnosticsEvent {
+export interface McHostDiagnosticsEvent {
     readonly type: ConnectionDiagnosticEvent["type"] | "connected" | "parse" | "retired";
     /** Wall-clock milliseconds assigned at emission. */
     readonly atMs: number;
@@ -120,13 +123,13 @@ export interface SubcDiagnosticsEvent {
     readonly fallbackReason?: FallbackReason;
 }
 
-export type SubcDiagnosticsObserver = (event: SubcDiagnosticsEvent) => void;
+export type McHostDiagnosticsObserver = (event: McHostDiagnosticsEvent) => void;
 
 /**
  * Facade construction options. `ConnectOptions` is the consumer surface;
  * the rest are bounded policy knobs and injectable test seams.
  */
-export interface SubcClientOptions extends ConnectOptions {
+export interface McHostClientOptions extends ConnectOptions {
     /** Injectable monotonic clock for every operation deadline. */
     clock?: MonotonicClock;
     /** Injectable backoff sleep for deterministic retry tests. */
@@ -134,8 +137,6 @@ export interface SubcClientOptions extends ConnectOptions {
     requestTimeoutMs?: number;
     routeOpenDeadlineMs?: number;
     shutdownDeadlineMs?: number;
-    /** Opt-in for the trusted-symlink connection-file form (wire doc 4.2). */
-    trustedSymlink?: boolean;
     /**
      * Test seam forwarded to the connection-file read's `afterOpen` hook;
      * lets tests race a snapshot against deadlines deterministically.
@@ -147,7 +148,7 @@ export interface SubcClientOptions extends ConnectOptions {
      * rate-bounded, and redacted; observer exceptions are swallowed and
      * excess events are dropped rather than blocking protocol work.
      */
-    diagnostics?: SubcDiagnosticsObserver;
+    diagnostics?: McHostDiagnosticsObserver;
     maxDiagnosticEventsPerSecond?: number;
     /** Bounded generation-policy overrides for tests (queue caps, deadlines). */
     generationOptions?: Partial<
@@ -246,8 +247,8 @@ function connectionStageError(): SocketTimeoutError {
     );
 }
 
-function routeStageError(): SubcCallError {
-    return new SubcCallError(
+function routeStageError(): McHostCallError {
+    return new McHostCallError(
         "not_sent",
         "route.open deadline expired before a route was opened",
         "deadline_expired",
@@ -351,18 +352,18 @@ export async function connectionFileExists(path: string): Promise<boolean> {
  * `kind`/`code` shape, not only `instanceof`.
  */
 export function isConsumerReconnectTransient(err: unknown): boolean {
-    if (err instanceof SubcCallError) {
+    if (err instanceof McHostCallError) {
         return err.kind === "not_sent" || err.kind === "outcome_unknown";
     }
     const name = err instanceof Error ? err.name : undefined;
     if (name === "SocketClosedError" || name === "SocketTimeoutError" || name === "AuthError") {
         return true;
     }
-    if (name === "SubcCallError") {
+    if (name === "McHostCallError") {
         const kind = (err as { kind?: unknown }).kind;
         return kind === "not_sent" || kind === "outcome_unknown";
     }
-    if (name === "SubcError" || name === "ConnectionFileError") return false;
+    if (name === "McHostClientError" || name === "ConnectionFileError") return false;
     const code = errorCode(err);
     return (
         code === "ECONNREFUSED" ||
@@ -377,7 +378,7 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
  * The consumer-facing client: connect, route open, raw request, managed
  * call, catalog, and bounded close over one active connection generation.
  */
-export class SubcClient {
+export class McHostClient {
     private readonly connectionFile: string;
     private readonly handshakeTimeoutMs: number;
     private readonly requestTimeoutMs: number;
@@ -387,10 +388,9 @@ export class SubcClient {
     private readonly defaultTargetKind: ManagedRouteKind;
     private readonly clock: MonotonicClock | undefined;
     private readonly sleep: (ms: number) => Promise<void>;
-    private readonly trustedSymlink: boolean;
     private readonly connectionFileAfterOpen: (() => void | Promise<void>) | undefined;
-    private readonly generationOptions: SubcClientOptions["generationOptions"];
-    private readonly diagnostics: SubcDiagnosticsObserver | undefined;
+    private readonly generationOptions: McHostClientOptions["generationOptions"];
+    private readonly diagnostics: McHostDiagnosticsObserver | undefined;
     private readonly maxDiagnosticEventsPerSecond: number;
     private readonly transportRegistry: ClientTransportRegistry;
 
@@ -406,7 +406,7 @@ export class SubcClient {
     private diagWindowStartMs = 0;
     private diagWindowCount = 0;
 
-    private constructor(options: SubcClientOptions) {
+    private constructor(options: McHostClientOptions) {
         this.connectionFile = options.connectionFile;
         this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
         this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -417,7 +417,6 @@ export class SubcClient {
         this.clock = options.clock;
         this.sleep =
             options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-        this.trustedSymlink = options.trustedSymlink ?? false;
         this.connectionFileAfterOpen = options.connectionFileAfterOpen;
         this.generationOptions = options.generationOptions;
         this.diagnostics = options.diagnostics;
@@ -430,8 +429,8 @@ export class SubcClient {
      * Read the connection file, dial, and authenticate under one handshake
      * deadline, then return the ready client.
      */
-    static async connect(options: SubcClientOptions): Promise<SubcClient> {
-        const client = new SubcClient(options);
+    static async connect(options: McHostClientOptions): Promise<McHostClient> {
+        const client = new McHostClient(options);
         await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
         return client;
     }
@@ -497,7 +496,7 @@ export class SubcClient {
             binary: true,
         });
         if (terminal.kind !== "response" || !(terminal.body instanceof ReceiveLease)) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "terminal",
                 "binary request did not receive a binary response",
                 "expected_binary_response",
@@ -534,7 +533,7 @@ export class SubcClient {
                     deadline,
                     options,
                 });
-                return parseResponseJson(terminal) as Response;
+                return parseResponseJson<Response>(terminal);
             } catch (error) {
                 const err = toManagedCallError(error);
                 const callerActive = !this.closeStarted && options.signal?.aborted !== true;
@@ -563,7 +562,7 @@ export class SubcClient {
         const parsed = await this.controlRequest(active, bodyText, "catalog.list", deadline);
         const modules = parsed.modules ?? [];
         if (!Array.isArray(modules)) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "terminal",
                 "catalog.list response carried a non-array modules field",
                 "malformed_control_response",
@@ -622,7 +621,7 @@ export class SubcClient {
         const stage = deadline.stage(this.handshakeTimeoutMs);
         const pace = makeReplacementPacer(stage, this.sleep);
         for (;;) {
-            if (this.closeStarted) throw new SubcError("client closed", "client_closed");
+            if (this.closeStarted) throw new McHostClientError("client closed", "client_closed");
             const active = this.active;
             if (active && !active.generation.isRetired()) return active;
             let flight = this.connecting;
@@ -678,7 +677,6 @@ export class SubcClient {
         try {
             snapshot = await readConnectionFile(this.connectionFile, {
                 deadline: stage,
-                trustedSymlink: this.trustedSymlink,
                 afterOpen: this.connectionFileAfterOpen,
             });
         } catch (error) {
@@ -724,7 +722,7 @@ export class SubcClient {
         }
         if (this.closeStarted) {
             generation.retire("owner_close");
-            throw new SubcError("client closed", "client_closed");
+            throw new McHostClientError("client closed", "client_closed");
         }
         // KTD4 stale-success: a generation that retired during its own setup
         // (for example a Goodbye coalesced into the final handshake chunk)
@@ -746,7 +744,7 @@ export class SubcClient {
         }
         if (this.closeStarted) {
             generation.retire("owner_close");
-            throw new SubcError("client closed", "client_closed");
+            throw new McHostClientError("client closed", "client_closed");
         }
         if (selection.kind === "grant") {
             try {
@@ -782,11 +780,10 @@ export class SubcClient {
     }
 
     /**
-     * Send the versioned offer as the generation's first channel-0 request
-     * and classify the outcome under KTD6: an exact legacy
-     * `unsupported_operation` terminal or a strictly decoded selection
-     * continues; every other failure propagates so setup fails closed
-     * without same-generation TCP fallback.
+     * Send the versioned offer as the generation's first channel-0 request.
+     * Only a strictly decoded selection continues; every failure — including
+     * any wire Error terminal — propagates so setup fails closed without
+     * same-generation TCP fallback (KTD7).
      */
     private async negotiateTransport(
         generation: ConnectionGeneration,
@@ -806,36 +803,21 @@ export class SubcClient {
             });
         } catch (error) {
             if (
-                error instanceof SubcCallError &&
+                error instanceof McHostCallError &&
                 error.kind === "terminal" &&
                 error.errorTerminal !== undefined
             ) {
-                if (
-                    !flagsBinary(error.errorTerminal.flags) &&
-                    !error.errorTerminal.streamed &&
-                    isLegacyFallbackTerminalBody(error.errorTerminal.bodyText ?? "")
-                ) {
-                    // Only the closed set of legacy Error terminals proves
-                    // the negotiation was never dispatched (KTD6). A body
-                    // with extra fields, a non-string message, a binary
-                    // flag, or any other code is malformed negotiation
-                    // content and fails closed.
-                    return {
-                        kind: "tcp",
-                        selected: {
-                            transport: TRANSPORT_TCP,
-                            capabilityVersion: TCP_CAPABILITY_VERSION,
-                        },
-                    };
-                }
-                // Every other Error terminal fails closed with a bounded
-                // error: the raw body is peer-controlled and was consumed
-                // solely by the legacy classification above; its message
-                // must not enter caller-visible error graphs (R14).
-                throw new SubcCallError(
+                // Every Error terminal fails closed with a bounded error:
+                // the raw body is peer-controlled and its message must not
+                // enter caller-visible error graphs (R14). There is no
+                // `unsupported_operation` continuation. The distinct code
+                // makes version skew self-describing: a host that does not
+                // implement `transport.negotiate` answers this request with
+                // an Error terminal.
+                throw new McHostCallError(
                     "terminal",
-                    "transport negotiation failed: host error terminal",
-                    "negotiation_failed",
+                    "transport negotiation failed: host returned an error terminal (host may predate transport negotiation; restart or upgrade the mc-host daemon)",
+                    "host_negotiation_rejected",
                 );
             }
             throw error;
@@ -877,7 +859,7 @@ export class SubcClient {
         if (!provider) {
             // Unreachable through the decoder (a selection must name a sent
             // offer), kept as a fail-closed guard.
-            const failure = new SubcCallError(
+            const failure = new McHostCallError(
                 "terminal",
                 "host granted a transport with no installed provider",
                 "negotiation_failed",
@@ -960,8 +942,8 @@ export class SubcClient {
         }
         if (this.closeStarted || candidate.isRetired()) {
             const failure = this.closeStarted
-                ? new SubcError("client closed", "client_closed")
-                : new SubcCallError(
+                ? new McHostClientError("client closed", "client_closed")
+                : new McHostCallError(
                       "not_sent",
                       "candidate channel retired before promotion",
                       "negotiation_failed",
@@ -1045,7 +1027,7 @@ export class SubcClient {
 
     /**
      * Run one request to its terminal. A wire Error terminal becomes a
-     * `terminal` SubcCallError with the canonical body's stable code. On a
+     * `terminal` McHostCallError with the canonical body's stable code. On a
      * caller abort, the rejection carries the cleanup ticket, and a
      * post-write routed abort enqueues a correlation-scoped Cancel; channel
      * 0 never sees Cancel (KTD9 handles it by retirement in the caller).
@@ -1093,7 +1075,7 @@ export class SubcClient {
             }
             return terminal;
         } catch (error) {
-            if (cleanup !== null && error instanceof SubcCallError) {
+            if (cleanup !== null && error instanceof McHostCallError) {
                 if (error.kind === "outcome_unknown" && params.channel !== 0) {
                     generation.enqueueCancel(params.channel, params.epoch, pending.correlation);
                 }
@@ -1114,7 +1096,7 @@ export class SubcClient {
     ): Promise<Record<string, unknown>> {
         const body = Buffer.from(bodyText, "utf8");
         if (body.length > MAX_CONTROL_BODY_LEN) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 `channel-0 control body of ${body.length} bytes exceeds the ${MAX_CONTROL_BODY_LEN}-byte cap`,
                 "control_body_too_large",
@@ -1135,7 +1117,7 @@ export class SubcClient {
             Array.isArray(parsed) ||
             (parsed as { op?: unknown }).op !== expectedOp
         ) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "terminal",
                 `control response was not a tagged ${expectedOp} object`,
                 "malformed_control_response",
@@ -1186,7 +1168,7 @@ export class SubcClient {
             // KTD9: an ambiguous channel-0 route.open (possible send, no
             // terminal) has no handle and Cancel is illegal on channel 0,
             // so retire the generation before any recovery.
-            if (error instanceof SubcCallError && error.kind === "outcome_unknown") {
+            if (error instanceof McHostCallError && error.kind === "outcome_unknown") {
                 active.generation.retire("ambiguous_route_open", error);
             }
             throw error;
@@ -1200,7 +1182,7 @@ export class SubcClient {
             }
             handle = createRouteHandle(channel, epoch, active.token);
         } catch (error) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "terminal",
                 `route.open returned a malformed route handle${causeMessage(error)}`,
                 "malformed_control_response",
@@ -1211,7 +1193,7 @@ export class SubcClient {
             // KTD9 owner-close race: never cache the late route; best-effort
             // Goodbye (a failed enqueue retires the generation internally).
             active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "route was closed before route.open completed",
                 "route_closed",
@@ -1232,9 +1214,9 @@ export class SubcClient {
     ): Promise<RouteHandle> {
         const identity = options.identity ?? this.defaultIdentity;
         if (!identity) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "terminal",
-                "managed call requires a BindIdentity in SubcClient.connect({ identity }) or call(..., { identity })",
+                "managed call requires a BindIdentity in McHostClient.connect({ identity }) or call(..., { identity })",
                 "missing_identity",
             );
         }
@@ -1329,7 +1311,7 @@ export class SubcClient {
         };
         for (;;) {
             if (cached.closed || this.closeStarted) {
-                throw new SubcCallError(
+                throw new McHostCallError(
                     "not_sent",
                     "route was closed before route.open completed",
                     "route_closed",
@@ -1344,7 +1326,7 @@ export class SubcClient {
             try {
                 active = await this.ensureConnection(deadline);
             } catch (error) {
-                if (error instanceof SubcCallError) throw error;
+                if (error instanceof McHostCallError) throw error;
                 // KTD3: a snapshot that outlives its stage names the clamped
                 // handshake budget, not the route budget, so it reconnects
                 // like any transient setup failure; every other
@@ -1358,7 +1340,7 @@ export class SubcClient {
                     // owner's budget ran out.
                     flight.replaceable = true;
                 }
-                throw new SubcCallError(
+                throw new McHostCallError(
                     transient ? "not_sent" : "terminal",
                     `route.open could not run because connect failed${causeMessage(error)}`,
                     errorCode(error),
@@ -1377,7 +1359,7 @@ export class SubcClient {
                 if (cached.closed) {
                     this.liveRoutes.delete(handle.channel);
                     active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
-                    throw new SubcCallError(
+                    throw new McHostCallError(
                         "not_sent",
                         "route was closed before route.open completed",
                         "route_closed",
@@ -1386,8 +1368,8 @@ export class SubcClient {
                 cached.handle = handle;
                 return handle;
             } catch (error) {
-                if (!isSubcCallError(error)) {
-                    throw new SubcCallError(
+                if (!isMcHostCallError(error)) {
+                    throw new McHostCallError(
                         "terminal",
                         `route.open failed for module ${cached.target.module_id}${causeMessage(error)}`,
                         errorCode(error),
@@ -1399,7 +1381,7 @@ export class SubcClient {
                     if (await backoff()) continue;
                     // KTD3: the allowlisted retry budget is owner budget.
                     flight.replaceable = true;
-                    throw new SubcCallError(
+                    throw new McHostCallError(
                         "not_sent",
                         `route.open failed for module ${cached.target.module_id}: ${error.code} (route-open retry budget exhausted)`,
                         error.code,
@@ -1464,7 +1446,7 @@ export class SubcClient {
     // Bounded, redacted diagnostics.
     // ------------------------------------------------------------------
 
-    private emitDiagnostics(event: Omit<SubcDiagnosticsEvent, "atMs">): void {
+    private emitDiagnostics(event: Omit<McHostDiagnosticsEvent, "atMs">): void {
         const observer = this.diagnostics;
         if (!observer) return;
         const now = Date.now();
@@ -1543,7 +1525,7 @@ function requireJsonReceiveBody(body: RequestTerminal["body"]): JsonReceiveBody 
                 // Quarantine is already accounted by onRelease before the throw.
             }
         }
-        throw new SubcCallError(
+        throw new McHostCallError(
             "terminal",
             "response body was unexpectedly binary",
             "unexpected_binary_response",
@@ -1552,21 +1534,21 @@ function requireJsonReceiveBody(body: RequestTerminal["body"]): JsonReceiveBody 
     return body;
 }
 
-/** Canonical `ErrorBody {code, message}` into a `terminal` SubcCallError. */
-function terminalFromErrorBody(body: JsonReceiveBody): SubcCallError {
+/** Canonical `ErrorBody {code, message}` into a `terminal` McHostCallError. */
+function terminalFromErrorBody(body: JsonReceiveBody): McHostCallError {
     if (typeof body.value === "object" && body.value !== null && !Array.isArray(body.value)) {
         const parsed = body.value as { code?: unknown; message?: unknown };
         const code = typeof parsed.code === "string" ? parsed.code : undefined;
         const message = typeof parsed.message === "string" ? parsed.message : undefined;
-        return new SubcCallError("terminal", message ?? "subc error", code);
+        return new McHostCallError("terminal", message ?? "mc-host error", code);
     }
-    return new SubcCallError("terminal", body.text || "subc error");
+    return new McHostCallError("terminal", body.text || "mc-host error");
 }
 
-function parseResponseJson(terminal: RequestTerminal): JsonValue {
+function parseResponseJson<Response = JsonValue>(terminal: RequestTerminal): Response {
     const body = requireJsonReceiveBody(terminal.body);
-    if (body.valid) return body.value as JsonValue;
-    throw new SubcCallError(
+    if (body.valid) return body.value as Response;
+    throw new McHostCallError(
         "terminal",
         "response body was not valid JSON",
         "invalid_response_body",
@@ -1575,7 +1557,7 @@ function parseResponseJson(terminal: RequestTerminal): JsonValue {
 
 function wrapNegotiationError(error: unknown): Error {
     if (error instanceof NegotiationError) {
-        return new SubcCallError(
+        return new McHostCallError(
             "terminal",
             `transport negotiation failed: ${error.message}`,
             "negotiation_failed",
@@ -1593,11 +1575,11 @@ function wrapNegotiationError(error: unknown): Error {
  */
 function boundedNegotiationFailure(error: unknown): Error {
     if (
-        error instanceof SubcCallError &&
+        error instanceof McHostCallError &&
         error.kind === "terminal" &&
         error.errorTerminal !== undefined
     ) {
-        return new SubcCallError(
+        return new McHostCallError(
             "terminal",
             "transport negotiation failed: host error terminal",
             "negotiation_failed",
@@ -1606,17 +1588,17 @@ function boundedNegotiationFailure(error: unknown): Error {
     return wrapNegotiationError(error);
 }
 
-function toManagedCallError(error: unknown): SubcCallError {
-    if (error instanceof SubcCallError) return error;
+function toManagedCallError(error: unknown): McHostCallError {
+    if (error instanceof McHostCallError) return error;
     if (error instanceof StaleRouteHandleError) {
-        return new SubcCallError(
+        return new McHostCallError(
             "not_sent",
             `managed request used a stale route handle${causeMessage(error)}`,
             error.code,
             error,
         );
     }
-    return new SubcCallError(
+    return new McHostCallError(
         "terminal",
         `managed call failed${causeMessage(error)}`,
         errorCode(error),
