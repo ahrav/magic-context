@@ -36,7 +36,8 @@ use crate::{
     },
     wire::{
         decode_header, encode_owned_frame, pure_header_flags, AdmissionClass, EnvelopeHeader,
-        Flags, FrameId, FrameType, Priority, HEADER_LEN, MAX_BODY_LEN, PROTOCOL_VERSION,
+        Flags, FrameId, FrameType, Priority, HEADER_LEN, MAX_BODY_LEN, MAX_CONTROL_BODY_LEN,
+        PROTOCOL_VERSION,
     },
 };
 
@@ -336,6 +337,19 @@ impl Client {
         });
         *inner.writer.lock().await = Some(writer);
         *inner.reader.lock().await = Some(reader);
+        // The reader runs on another worker and can retire this generation
+        // before the constructor returns — a peer that closes or sends
+        // connection `Goodbye` right after negotiation does exactly that.
+        // Returning a "ready" client then defers the failure to the first
+        // operation, which reports `connection_retired` as `NotSent`; the
+        // historian does not reconnect on that path, so a daemon reload race
+        // would abort the run instead of establishing a replacement.
+        if inner.retired.load(Ordering::Acquire) {
+            return Err(ClientError::new(
+                "connection_retired",
+                "connection retired during setup",
+            ));
+        }
         Ok(Self { inner })
     }
 
@@ -1622,6 +1636,14 @@ fn validate_inbound(header: &EnvelopeHeader) -> Result<(), ()> {
     if header.ver != PROTOCOL_VERSION || header.len > MAX_BODY_LEN {
         return Err(());
     }
+    // §7.1 caps a channel-0 body at 65,536 bytes even though framing permits
+    // more. Rejecting on the header keeps one oversize control response from
+    // being allocated and retained at all — `parse_route_open` ignores unknown
+    // fields, so a padded response would otherwise open a route and leave the
+    // generation live while holding roughly 64 MiB.
+    if header.channel == 0 && header.len > MAX_CONTROL_BODY_LEN {
+        return Err(());
+    }
     match header.ty {
         FrameType::Response | FrameType::Error | FrameType::StreamData | FrameType::StreamEnd => {
             // `decode_header` already rejects a mixed zero/nonzero
@@ -2359,6 +2381,30 @@ mod tests {
 
         // Push is unsolicited, so it carries no correlation.
         assert!(validate_inbound(&header(FrameType::Push, 3, 9, 5, 4)).is_err());
+
+        // §7.1 caps a channel-0 body at 65,536 bytes; framing alone permits far
+        // more, and an accepted oversize control response would be allocated
+        // and retained before anything could reject it.
+        assert!(
+            validate_inbound(&header(FrameType::Response, 0, 0, 7, MAX_CONTROL_BODY_LEN)).is_ok()
+        );
+        assert!(validate_inbound(&header(
+            FrameType::Response,
+            0,
+            0,
+            7,
+            MAX_CONTROL_BODY_LEN + 1
+        ))
+        .is_err());
+        // A routed body is opaque and keeps the framing cap.
+        assert!(validate_inbound(&header(
+            FrameType::Response,
+            3,
+            9,
+            7,
+            MAX_CONTROL_BODY_LEN + 1
+        ))
+        .is_ok());
 
         // Pre-existing rules keep holding.
         assert!(validate_inbound(&header(FrameType::Response, 3, 9, 0, 4)).is_err());

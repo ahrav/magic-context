@@ -96,6 +96,11 @@ pub enum AuthError {
         stage: AuthStage,
         source: serde_json::Error,
     },
+    /// The configured total is not representable as an absolute deadline, so no
+    /// handshake can be attempted against it.
+    InvalidDeadline {
+        total: Duration,
+    },
     Random(getrandom::Error),
     KeyTooShort {
         len: usize,
@@ -133,11 +138,15 @@ struct Deadline {
 }
 
 impl Deadline {
-    fn starting_now(total: Duration) -> Self {
-        Self {
-            at: time::Instant::now() + total,
-            total,
-        }
+    /// Fallible because the total is operator configuration: `Instant +
+    /// Duration` panics when the sum is unrepresentable, and a `Duration::MAX`
+    /// auth deadline would take down the connection task rather than reporting
+    /// a bad setting.
+    fn starting_now(total: Duration) -> Result<Self, AuthError> {
+        let at = time::Instant::now()
+            .checked_add(total)
+            .ok_or(AuthError::InvalidDeadline { total })?;
+        Ok(Self { at, total })
     }
 
     /// Time left until the deadline, or `Timeout` if it has already elapsed.
@@ -170,7 +179,7 @@ pub async fn authenticate_server<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let deadline = Deadline::starting_now(deadline);
+    let deadline = Deadline::starting_now(deadline)?;
     let result = authenticate_server_inner(stream, key, daemon_id, daemon_ver, deadline).await;
     if result.is_err() {
         // Bound teardown by the SAME absolute deadline so a failed handshake (and
@@ -251,7 +260,7 @@ pub async fn authenticate_client_with_role<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let deadline = Deadline::starting_now(deadline);
+    let deadline = Deadline::starting_now(deadline)?;
     let result = authenticate_client_inner(stream, conn, deadline, role).await;
     if result.is_err() {
         let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
@@ -542,6 +551,9 @@ impl fmt::Display for AuthError {
                 write!(f, "auth {stage:?} JSON decode error: {source}")
             }
             Self::Random(source) => write!(f, "auth random generation failed: {source}"),
+            Self::InvalidDeadline { total } => {
+                write!(f, "auth deadline {total:?} is not a representable instant")
+            }
             Self::KeyTooShort { len, min } => {
                 write!(f, "auth key is too short: {len} bytes, need at least {min}")
             }
@@ -564,6 +576,7 @@ impl Error for AuthError {
             | Self::KeyTooShort { .. }
             | Self::InvalidServerProof
             | Self::DaemonIdMismatch
+            | Self::InvalidDeadline { .. }
             | Self::InvalidClientAuth => None,
         }
     }
@@ -572,6 +585,20 @@ impl Error for AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unrepresentable_auth_deadline_is_rejected_not_panicked() {
+        // The total is operator configuration, so `Duration::MAX` must report a
+        // bad setting rather than panic inside the connection task.
+        let error = Deadline::starting_now(Duration::MAX)
+            .err()
+            .expect("an unrepresentable total has no absolute deadline");
+        assert!(
+            matches!(error, AuthError::InvalidDeadline { .. }),
+            "{error:?}"
+        );
+        assert!(Deadline::starting_now(Duration::from_secs(2)).is_ok());
+    }
     use tokio::{
         io::{duplex, DuplexStream},
         task::yield_now,
