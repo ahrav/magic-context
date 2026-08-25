@@ -27,16 +27,8 @@ import {
     matchesPluginEntry,
 } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
-import {
-    type ClaimsBackfillCommandArgs,
-    runClaimsBackfillCommands,
-} from "../lib/claims-backfill-commands";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
-import {
-    openExistingContextDatabase,
-    openExistingContextDatabaseForMutation,
-    UnsupportedSchemaVersionError,
-} from "../lib/database-access";
+import { openExistingContextDatabase, UnsupportedSchemaVersionError } from "../lib/database-access";
 import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
@@ -69,7 +61,6 @@ import {
     formatStorageVersions,
     readStorageVersions,
 } from "../lib/storage-versions";
-import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { reportAuthorityMarkers } from "./doctor-authority";
 import { clearPluginCache } from "./doctor-opencode-cache";
 
@@ -625,63 +616,13 @@ function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[
 }
 
 export async function runDoctor(
-    options: { force?: boolean; issue?: boolean } & V22BackfillCommandArgs &
-        ClaimsBackfillCommandArgs = {},
+    options: { force?: boolean; issue?: boolean } = {},
 ): Promise<number> {
     migrateConfigLocationsForCli(process.cwd(), log);
 
     if (options.issue) {
         return runIssueFlow();
     }
-
-    let sharedCommandExitCode: number | null = null;
-
-    let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
-    const v22Result = await runV22BackfillCommands(
-        {
-            name: "OpenCode",
-            openDatabase: (readonly = true) => {
-                const dbPath = join(getMagicContextStorageDir(), "context.db");
-                v22Db = readonly
-                    ? openExistingContextDatabase(dbPath, { readonly: true })
-                    : openExistingContextDatabaseForMutation(dbPath);
-                return v22Db;
-            },
-            closeDatabase: () => {
-                v22Db?.close();
-                v22Db = null;
-            },
-            log,
-        },
-        options,
-    );
-    if (v22Result.handled) {
-        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, v22Result.exitCode);
-    }
-
-    let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
-    const claimsResult = await runClaimsBackfillCommands(
-        {
-            name: "OpenCode",
-            openDatabase: (readonly = true) => {
-                const dbPath = join(getMagicContextStorageDir(), "context.db");
-                claimsDb = readonly
-                    ? openExistingContextDatabase(dbPath, { readonly: true })
-                    : openExistingContextDatabaseForMutation(dbPath);
-                return claimsDb;
-            },
-            closeDatabase: () => {
-                claimsDb?.close();
-                claimsDb = null;
-            },
-            log,
-        },
-        options,
-    );
-    if (claimsResult.handled) {
-        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, claimsResult.exitCode);
-    }
-    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
 
     intro("Magic Context Doctor");
 
