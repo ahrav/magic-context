@@ -1104,10 +1104,20 @@ impl Inner {
                         );
                     }
                     PendingKind::Stream { items, .. } => {
-                        let Some(charge) = charge else {
-                            drop(pending);
-                            self.retire("response_memory_exhausted");
-                            return;
+                        // An empty item is never charged, so an absent charge
+                        // means exhaustion only when there were bytes to
+                        // charge for. Reading it as exhaustion either way
+                        // retires the generation over a legal zero-length
+                        // StreamData: `validate_inbound` requires an empty body
+                        // of `StreamEnd` alone.
+                        let charge = match charge {
+                            Some(charge) => Some(charge),
+                            None if header.len == 0 => None,
+                            None => {
+                                drop(pending);
+                                self.retire("response_memory_exhausted");
+                                return;
+                            }
                         };
                         let item = ChargedItem {
                             body,
@@ -1350,7 +1360,8 @@ impl Drop for ByteCharge {
 struct ChargedItem {
     body: Vec<u8>,
     binary: bool,
-    _charge: ByteCharge,
+    /// Absent for a zero-length item, which is never charged.
+    _charge: Option<ByteCharge>,
 }
 
 impl ChargedItem {
@@ -2321,6 +2332,51 @@ mod tests {
             };
             assert!(validate_inbound(&ping).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn a_zero_length_stream_item_is_delivered_without_retiring() {
+        // Only `StreamEnd` must be empty, so a zero-length `StreamData` is
+        // legal. It carries no charge because there were no bytes to charge
+        // for, which must not read as an exhausted budget.
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        let (items_tx, mut items_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
+        let (terminal_tx, _terminal_rx) = oneshot::channel();
+        let (key, _publish) = inner
+            .admit(
+                route(1),
+                Vec::new(),
+                PendingKind::Stream {
+                    items: items_tx,
+                    terminal: terminal_tx,
+                    _settled: CancellationToken::new().drop_guard(),
+                },
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("stream admitted");
+        drop(data_rx.recv().await);
+
+        inner.dispatch(
+            EnvelopeHeader {
+                len: 0,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::StreamData,
+                flags: response_flags(false, false),
+                channel: key.channel,
+                epoch: key.epoch,
+                corr: key.corr,
+            },
+            Vec::new(),
+            None,
+        );
+
+        assert!(
+            !inner.retired.load(Ordering::Acquire),
+            "an uncharged empty item is not an exhausted budget"
+        );
+        let item = items_rx.try_recv().expect("the empty item is delivered");
+        assert!(item.body.is_empty());
+        assert!(lock_unpoisoned(&inner.pending).contains_key(&key));
     }
 
     #[test]
