@@ -69,10 +69,18 @@ jobs:
           cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
           cargo check -p mc-shm-transport --features iceoryx
 
-      - name: Rust contracts and lifecycle
+      - name: Rust contracts and lifecycle (Linux)
+        if: runner.os == 'Linux'
         run: >-
           cargo nextest run
           -p mc-shm-native -p mc-host -p mc-shm-transport
+
+      - name: Rust contracts and clean host omission (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo nextest run -p mc-shm-native -p mc-shm-transport
+          cargo test -p mc-host --test shm_transport \
+            omitted_and_unqualified_profiles_fall_back_without_side_effects
 
       - name: Rust lease non-escape
         run: cargo test -p mc-host --doc
