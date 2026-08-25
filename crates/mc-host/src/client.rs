@@ -393,7 +393,7 @@ impl Client {
         options: RequestOptions,
     ) -> Result<Response, CallError> {
         self.require_route(route)?;
-        let deadline = Instant::now() + options.timeout;
+        let deadline = request_deadline(options.timeout)?;
         self.inner
             .unary(route, body, deadline, options.cancellation)
             .await
@@ -724,6 +724,22 @@ impl Inner {
         body: Vec<u8>,
         options: RequestOptions,
     ) -> Result<ResponseStream, CallError> {
+        let deadline = request_deadline(options.timeout)?;
+        // A token cancelled before the call must not enqueue anything: the
+        // watcher is spawned after admission, so the writer could otherwise
+        // claim and transmit a side-effecting request before the first cancel
+        // observation. A token cancelled after this point is the watcher's job.
+        if options
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(CallError::local(
+                SendOutcome::NotSent,
+                "cancelled",
+                "request was cancelled",
+            ));
+        }
         {
             let mut streams = lock_unpoisoned(&self.streams);
             if *streams >= CLIENT_MAX_LIVE_STREAMS {
@@ -737,7 +753,6 @@ impl Inner {
         }
         let (item_tx, item_rx) = mpsc::channel(CLIENT_STREAM_QUEUE_ITEMS);
         let (terminal_tx, terminal_rx) = oneshot::channel();
-        let deadline = Instant::now() + options.timeout;
         let settled = CancellationToken::new();
         let admitted = self.admit(
             route,
@@ -1530,6 +1545,22 @@ async fn drain_until<R: AsyncRead + Unpin>(
     Ok(())
 }
 
+/// Turns a caller-supplied timeout into an absolute deadline.
+///
+/// `Instant + Duration` panics when the sum is unrepresentable, and the timeout
+/// is public configuration — `Duration::MAX` is a conventional spelling of "no
+/// timeout" — so an out-of-range value must be a typed rejection rather than a
+/// crash in the consumer.
+fn request_deadline(timeout: Duration) -> Result<Instant, CallError> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        CallError::local(
+            SendOutcome::NotSent,
+            "invalid_timeout",
+            "request timeout is out of range",
+        )
+    })
+}
+
 fn validate_inbound(header: &EnvelopeHeader) -> Result<(), ()> {
     if header.ver != PROTOCOL_VERSION || header.len > MAX_BODY_LEN {
         return Err(());
@@ -1640,10 +1671,13 @@ async fn negotiate_tcp(stream: &mut TcpStream, deadline: Instant) -> Result<(), 
         .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
         .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
     let frame = read_setup_frame(stream, deadline).await?;
+    // Channel 0 accepts UTF-8 JSON only (§7.1), so a binary setup response is a
+    // nonconforming generation even when its body happens to parse.
     if frame.header.ty != FrameType::Response
         || frame.header.channel != 0
         || frame.header.epoch != 0
         || frame.header.corr != NEGOTIATION_CORRELATION
+        || frame.header.flags.is_binary()
     {
         return Err(ClientError::new(
             "negotiation_failed",
@@ -2377,6 +2411,48 @@ mod tests {
         let item = items_rx.try_recv().expect("the empty item is delivered");
         assert!(item.body.is_empty());
         assert!(lock_unpoisoned(&inner.pending).contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_timeout_is_rejected_instead_of_panicking() {
+        // `Duration::MAX` is a conventional spelling of "no timeout" and is
+        // public configuration, so an unrepresentable deadline must be a typed
+        // rejection rather than a panic inside the consumer.
+        let error = request_deadline(Duration::MAX).expect_err("unrepresentable");
+        assert_eq!(error.outcome(), SendOutcome::NotSent);
+        assert_eq!(error.code(), "invalid_timeout");
+        assert!(request_deadline(Duration::from_secs(30)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_pre_cancelled_stream_never_enqueues_a_frame() {
+        let (inner, mut data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
+        lock_unpoisoned(&inner.routes).insert(route(1));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        let error = inner
+            .start_stream(
+                route(1),
+                b"must-not-send".to_vec(),
+                RequestOptions {
+                    timeout: Duration::from_secs(30),
+                    cancellation: Some(cancelled),
+                },
+            )
+            .expect_err("an already-cancelled token admits nothing");
+        assert_eq!(error.outcome(), SendOutcome::NotSent);
+        assert_eq!(error.code(), "cancelled");
+        assert!(
+            data_rx.try_recv().is_err(),
+            "a cancelled stream must not reach the writer"
+        );
+        assert!(lock_unpoisoned(&inner.pending).is_empty());
+        assert_eq!(
+            *lock_unpoisoned(&inner.streams),
+            0,
+            "no live stream charged"
+        );
     }
 
     #[test]

@@ -758,7 +758,10 @@ export class HermeticMcHostStack {
     async crashHost(): Promise<void> {
         await this.closeClients();
         const child = this.child;
-        if (!child) return;
+        if (!child || child.pid === undefined) {
+            this.child = null;
+            return;
+        }
         this.resumeBeforeTeardown(child);
         if (child.exitCode === null && child.signalCode === null)
             child.kill("SIGKILL");
@@ -779,7 +782,10 @@ export class HermeticMcHostStack {
     async terminateHost(): Promise<void> {
         await this.closeClients();
         const child = this.child;
-        if (!child) return;
+        if (!child || child.pid === undefined) {
+            this.child = null;
+            return;
+        }
         this.resumeBeforeTeardown(child);
         if (child.exitCode === null && child.signalCode === null)
             child.kill("SIGTERM");
@@ -815,8 +821,13 @@ export class HermeticMcHostStack {
     async stop(): Promise<void> {
         await this.closeStatusClient();
         const child = this.child;
+        // A child whose spawn failed has no pid while both exit fields stay
+        // null: there is no process to signal, so treating it as live burns
+        // every escalation window and then preserves the data tree for a
+        // reaper that has no pid record to act on.
         let exited =
             child === null ||
+            child.pid === undefined ||
             child.exitCode !== null ||
             child.signalCode !== null;
         if (child && !exited) {
