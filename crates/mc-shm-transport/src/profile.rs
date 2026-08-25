@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};

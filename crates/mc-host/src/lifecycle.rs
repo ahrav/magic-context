@@ -17,7 +17,7 @@ use subc_transport::ConnectionInfo;
 
 use crate::instance::{
     flock_bounded, flock_exclusive_bounded, hex, io_err, is_safe_ancestor, is_secure_regular,
-    read_all_fd, runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard,
+    mode_bits, read_all_fd, runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard,
     CONNECTION_FILE_NAME, S_IFDIR, S_IFMT,
 };
 
@@ -350,9 +350,10 @@ fn open_validated_dir(dir_path: &Path) -> Result<Option<OwnedFd>, InstanceError>
                 return Err(insecure());
             }
         } else {
-            let is_dir = (stat.st_mode & S_IFMT) == S_IFDIR;
+            let mode = mode_bits(&stat);
+            let is_dir = (mode & S_IFMT) == S_IFDIR;
             let owner_ok = stat.st_uid == rustix::process::geteuid().as_raw();
-            if !is_dir || !owner_ok || stat.st_mode & 0o077 != 0 {
+            if !is_dir || !owner_ok || mode & 0o077 != 0 {
                 return Err(insecure());
             }
         }

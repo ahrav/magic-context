@@ -357,8 +357,8 @@ class FakeCandidateChannel implements SetupFrameChannel {
         for (const lease of [...this.leases]) {
             try {
                 lease.release();
-            } catch {
-                continue;
+            } catch (error) {
+                void error;
             }
         }
         this.closed = true;

@@ -1,0 +1,17 @@
+error[E0597]: `bytes` does not live long enough
+ --> tests/compile_fail/receive_lease_not_static.rs:7:42
+  |
+6 |     let bytes = [1u8, 2, 3];
+  |         ----- binding `bytes` declared here
+7 |     let lease = ReceiveLease::contiguous(&bytes);
+  |                                          ^^^^^^ borrowed value does not live long enough
+8 |     require_static(lease);
+  |     --------------------- argument requires that `bytes` is borrowed for `'static`
+9 | }
+  | - `bytes` dropped here while still borrowed
+  |
+note: requirement that the value outlives `'static` introduced here
+ --> tests/compile_fail/receive_lease_not_static.rs:3:22
+  |
+3 | fn require_static<T: 'static>(_: T) {}
+  |                      ^^^^^^^

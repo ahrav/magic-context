@@ -15,10 +15,10 @@ import {
 } from "./frame-channel";
 import {
     decodeHeader,
+    type EnvelopeHeader,
+    encodeHeader,
     FrameType,
     PROTOCOL_VERSION,
-    encodeHeader,
-    type EnvelopeHeader,
 } from "./protocol";
 import { ShmFrameChannel } from "./shm-frame-channel";
 import { createExplicitShmTestProvider } from "./shm-transport-provider";
@@ -30,12 +30,7 @@ import {
 } from "./test-support/frame-channel-contract";
 import { waitUntil } from "./test-support/test-util";
 
-function responseHeader(
-    ty: FrameType,
-    corr: bigint,
-    length: number,
-    flags = 0,
-): EnvelopeHeader {
+function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0): EnvelopeHeader {
     return {
         len: length,
         ver: PROTOCOL_VERSION,
@@ -85,7 +80,7 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
     const frames: ContractPeerFrame[] = [];
     const received: { header: EnvelopeHeader; body: Uint8Array }[] = [];
     const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
-    const hook: { current: ((frame: InboundFrame) => boolean | void) | null } = {
+    const hook: { current: ((frame: InboundFrame) => boolean | undefined) | null } = {
         current: null,
     };
     let reading = true;
@@ -147,18 +142,19 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
                 body,
             );
         },
-        async sendBurst(fields: readonly {
-            ty: number;
-            flags?: number;
-            channel?: number;
-            epoch?: number;
-            corr?: bigint;
-            body?: Uint8Array;
-        }[]): Promise<void> {
+        async sendBurst(
+            fields: readonly {
+                ty: number;
+                flags?: number;
+                channel?: number;
+                epoch?: number;
+                corr?: bigint;
+                body?: Uint8Array;
+            }[],
+        ): Promise<void> {
             for (const frame of fields) await this.send(frame);
         },
-        waitFor: async (check: () => boolean, timeoutMs?: number) =>
-            waitUntil(check, timeoutMs),
+        waitFor: async (check: () => boolean, timeoutMs?: number) => waitUntil(check, timeoutMs),
         pauseReading: () => {
             reading = false;
         },
@@ -271,11 +267,15 @@ describe("explicit shared-memory provider", () => {
                 responseHeader(FrameType.StreamData, stream.correlation, item.length),
                 item,
             );
-            publish(peer, responseHeader(FrameType.StreamEnd, stream.correlation, 0), new Uint8Array());
+            publish(
+                peer,
+                responseHeader(FrameType.StreamEnd, stream.correlation, 0),
+                new Uint8Array(),
+            );
             const streamTerminal = await stream.result;
-            expect(streamTerminal.stream.map((body) => ("value" in body ? body.value : null))).toEqual([
-                { item: 1 },
-            ]);
+            expect(
+                streamTerminal.stream.map((body) => ("value" in body ? body.value : null)),
+            ).toEqual([{ item: 1 }]);
             expect(channel.stats().activeReceiveLeases).toBe(0);
 
             const binary = generation.request({

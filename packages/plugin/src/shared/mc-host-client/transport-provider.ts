@@ -608,8 +608,8 @@ export function sanitizedCandidateFactory(
                 for (const lease of [...receiveLeases]) {
                     try {
                         lease.release();
-                    } catch {
-                        continue;
+                    } catch (error) {
+                        void error;
                     }
                 }
                 // Owner close never fires onClosed (FrameChannel contract),

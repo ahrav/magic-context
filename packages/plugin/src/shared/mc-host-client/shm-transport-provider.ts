@@ -1,7 +1,7 @@
 import {
+    type NativeDescriptor,
     probeCapabilities,
     QUALIFIED_TEST_PROFILE,
-    type NativeDescriptor,
 } from "@magic-context/mc-shm-native";
 import { ShmFrameChannel } from "./shm-frame-channel";
 import type { ClientTransportProvider } from "./transport-provider";

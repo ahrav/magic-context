@@ -343,47 +343,47 @@ export class TcpFrameChannel implements FrameChannel {
             }
 
             producer = new BoundedFrameProducer(
-            spans,
-            capacity,
-            (segments, exactLength) => {
-                const fullHeader: EnvelopeHeader = { ...header, len: exactLength };
-                const headerBytes = Buffer.from(encodeHeader(fullHeader));
-                const body = Buffer.allocUnsafeSlow(exactLength);
-                let offset = 0;
-                for (const segment of segments) {
-                    body.set(segment, offset);
-                    offset += segment.byteLength;
-                }
-                this.copyCounter.record();
-                const bytes = HEADER_LEN + exactLength;
-                const item: QueuedItem = {
-                    buffers: exactLength > 0 ? [headerBytes, body] : [headerBytes],
-                    bytes,
-                    control: false,
-                    hooks: hooks ?? null,
-                    meta: metaFromHeader(fullHeader),
-                };
-                return {
-                    publish: () => {
-                        if (!held || this.closed) {
-                            release();
-                            throw new SubcCallError(
-                                "not_sent",
-                                "producer reservation was released",
-                                "channel_closed",
-                            );
-                        }
-                        held = false;
-                        if (producer) this.producerReservations.delete(producer);
-                        this.reservedDataFrames--;
-                        this.reservedDataBytes -= reservedBytes;
-                        const excess = reservedBytes - bytes;
-                        if (excess > 0) this.releaseQueue(excess);
-                        this.enqueueReservedItem(item);
-                        return { cancel: () => this.cancelQueuedItem(item) };
-                    },
-                };
-            },
+                spans,
+                capacity,
+                (segments, exactLength) => {
+                    const fullHeader: EnvelopeHeader = { ...header, len: exactLength };
+                    const headerBytes = Buffer.from(encodeHeader(fullHeader));
+                    const body = Buffer.allocUnsafeSlow(exactLength);
+                    let offset = 0;
+                    for (const segment of segments) {
+                        body.set(segment, offset);
+                        offset += segment.byteLength;
+                    }
+                    this.copyCounter.record();
+                    const bytes = HEADER_LEN + exactLength;
+                    const item: QueuedItem = {
+                        buffers: exactLength > 0 ? [headerBytes, body] : [headerBytes],
+                        bytes,
+                        control: false,
+                        hooks: hooks ?? null,
+                        meta: metaFromHeader(fullHeader),
+                    };
+                    return {
+                        publish: () => {
+                            if (!held || this.closed) {
+                                release();
+                                throw new SubcCallError(
+                                    "not_sent",
+                                    "producer reservation was released",
+                                    "channel_closed",
+                                );
+                            }
+                            held = false;
+                            if (producer) this.producerReservations.delete(producer);
+                            this.reservedDataFrames--;
+                            this.reservedDataBytes -= reservedBytes;
+                            const excess = reservedBytes - bytes;
+                            if (excess > 0) this.releaseQueue(excess);
+                            this.enqueueReservedItem(item);
+                            return { cancel: () => this.cancelQueuedItem(item) };
+                        },
+                    };
+                },
                 release,
             );
         } catch (error) {
@@ -519,8 +519,8 @@ export class TcpFrameChannel implements FrameChannel {
         for (const lease of [...this.receiveLeases]) {
             try {
                 lease.release();
-            } catch {
-                continue;
+            } catch (error) {
+                void error;
             }
         }
         for (const timer of this.timers) clearTimeout(timer);

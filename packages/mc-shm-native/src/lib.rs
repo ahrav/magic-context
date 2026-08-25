@@ -6,15 +6,20 @@ mod scheduling;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mc_shm_transport::backend::ring::{ProducerReservation, Ring, RingGrant};
-use mc_shm_transport::descriptor::{
-    HardwareProfileId, ReleaseIdentity, SchedulingMode, WIRE_V2_HEADER_BYTES,
-};
+#[cfg(target_os = "linux")]
+use mc_shm_transport::backend::ring::RingGrant;
+use mc_shm_transport::backend::ring::{ProducerReservation, Ring};
+#[cfg(target_os = "linux")]
+use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode};
+use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
+#[cfg(target_os = "linux")]
 use mc_shm_transport::profile::ring_profile;
 use napi::bindgen_prelude::{Buffer, FnArgs, Function};
 use napi::{Env, Error, Result, Status, Unknown};
@@ -22,6 +27,7 @@ use napi_derive::napi;
 
 use napi_buffers::ExternalRef;
 
+#[cfg(target_os = "linux")]
 const PROFILE: &str = "mc-host-test-ring-v1";
 
 #[napi(object)]
@@ -64,8 +70,10 @@ struct Channel {
 
 #[derive(Default)]
 struct Registry {
+    #[cfg(target_os = "linux")]
     next_channel: u32,
     channels: HashMap<u32, Channel>,
+    #[cfg(target_os = "linux")]
     cleanup_registered: bool,
 }
 
@@ -77,6 +85,7 @@ fn error(message: &'static str) -> Error {
     Error::new(Status::GenericFailure, message)
 }
 
+#[cfg(target_os = "linux")]
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
     if text.len() != N * 2 {
         return Err(error("invalid attachment grant"));
@@ -184,6 +193,7 @@ fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn insert_channel(registry: &mut Registry, channel: Channel) -> Result<u32> {
     registry.next_channel = registry
         .next_channel
@@ -194,6 +204,7 @@ fn insert_channel(registry: &mut Registry, channel: Channel) -> Result<u32> {
     Ok(id)
 }
 
+#[cfg(target_os = "linux")]
 fn cleanup_env(raw_env: usize) {
     let raw_env = raw_env as napi::sys::napi_env;
     let env = Env::from_raw(raw_env);
@@ -209,6 +220,7 @@ fn cleanup_env(raw_env: usize) {
     });
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_cleanup(env: &Env, registry: &mut Registry) -> Result<()> {
     if registry.cleanup_registered {
         return Ok(());

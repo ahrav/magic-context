@@ -22,12 +22,7 @@ import {
     ProducerError,
     type ProducerFrameHeader,
 } from "../frame-channel";
-import {
-    type EnvelopeHeader,
-    FrameType,
-    MAX_FRAME_BODY_LEN,
-    PROTOCOL_VERSION,
-} from "../protocol";
+import { type EnvelopeHeader, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "../protocol";
 import { TcpFrameChannel } from "../tcp-frame-channel";
 import { encodePeerFrame, FakePeer, type PeerFrameFields } from "./fake-peer";
 import { expectSubcCallError, waitUntil } from "./test-util";
@@ -101,7 +96,7 @@ export interface FrameChannelContractHandle {
     /** Channel-detected closes, in order (owner close never records here). */
     closes: { reason: FrameChannelCloseReason; error: unknown }[];
     /** Scenario-installed hook, run before each delivery is recorded. */
-    frameHook: ((frame: InboundFrame) => boolean | void) | null;
+    frameHook: ((frame: InboundFrame) => boolean | undefined) | null;
     cleanup(): Promise<void>;
 }
 
@@ -501,6 +496,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 depth++;
                 maxDepth = Math.max(maxDepth, depth);
                 depth--;
+                return undefined;
             };
             await h.peer.sendBurst(
                 [1n, 2n, 3n].map((corr) => ({
@@ -594,6 +590,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 const segment = frame.body.segment(0);
                 assert.equal(segment.byteOffset, 0);
                 assert.equal(segment.byteLength, segment.buffer.byteLength);
+                return undefined;
             };
             await h.peer.send({
                 ty: FrameType.Response,
@@ -696,7 +693,7 @@ export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async
     const budget = new ByteBudget(overrides.memoryCapBytes ?? maxBodyLen + 1_048_576);
     const received: ContractReceivedFrame[] = [];
     const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
-    const hookSlot: { fn: ((frame: InboundFrame) => boolean | void) | null } = { fn: null };
+    const hookSlot: { fn: ((frame: InboundFrame) => boolean | undefined) | null } = { fn: null };
     const channel = new TcpFrameChannel({
         host: "127.0.0.1",
         port: peer.port,
@@ -736,7 +733,7 @@ export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async
         get frameHook() {
             return hookSlot.fn;
         },
-        set frameHook(fn: ((frame: InboundFrame) => boolean | void) | null) {
+        set frameHook(fn: ((frame: InboundFrame) => boolean | undefined) | null) {
             hookSlot.fn = fn;
         },
         cleanup: async () => {

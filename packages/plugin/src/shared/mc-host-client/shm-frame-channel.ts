@@ -20,7 +20,7 @@ import {
     ReceiveLease,
     type SetupFrameChannel,
 } from "./frame-channel";
-import { decodeHeader, encodeHeader, type EnvelopeHeader } from "./protocol";
+import { decodeHeader, type EnvelopeHeader, encodeHeader } from "./protocol";
 
 export interface ShmFrameChannelOptions {
     descriptor?: NativeDescriptor;
@@ -41,7 +41,8 @@ export class ShmFrameChannel implements SetupFrameChannel {
         if (!options.nativeChannel && !options.descriptor) {
             throw new Error("shared-memory channel requires an attachment");
         }
-        this.native = options.nativeChannel ?? NativeChannel.attach(options.descriptor as NativeDescriptor);
+        this.native =
+            options.nativeChannel ?? NativeChannel.attach(options.descriptor as NativeDescriptor);
     }
 
     async start(_deadline: Deadline): Promise<{ daemonVer: string }> {

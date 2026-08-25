@@ -12,7 +12,6 @@ export {
     type ExpiryTimerScheduler,
     type MonotonicClock,
 } from "./deadline";
-export { ReceiveLease, type ReceiveReleaseOutcome } from "./frame-channel";
 export {
     isSubcCallError,
     SocketClosedError,
@@ -20,6 +19,7 @@ export {
     SubcCallError,
     SubcError,
 } from "./errors";
+export { ReceiveLease, type ReceiveReleaseOutcome } from "./frame-channel";
 export { RouteHandle, StaleRouteHandleError } from "./route-handle";
 export {
     AdmissionClass,

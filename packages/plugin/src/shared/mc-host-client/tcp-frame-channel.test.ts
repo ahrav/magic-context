@@ -8,12 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Deadline } from "./deadline";
 import { ByteBudget, type FrameChannelCloseReason } from "./frame-channel";
-import {
-    type EnvelopeHeader,
-    FrameType,
-    MAX_FRAME_BODY_LEN,
-    PROTOCOL_VERSION,
-} from "./protocol";
+import { type EnvelopeHeader, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "./protocol";
 import { TcpFrameChannel } from "./tcp-frame-channel";
 import { encodePeerFrame, FakePeer, type FakePeerConnection } from "./test-support/fake-peer";
 import {

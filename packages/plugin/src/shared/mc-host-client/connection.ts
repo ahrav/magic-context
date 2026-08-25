@@ -443,8 +443,7 @@ export class ConnectionGeneration {
             false,
             params.admissionClass ?? AdmissionClass.Normal,
         );
-        const body =
-            params.body instanceof Uint8Array ? bytesFrameBody(params.body) : params.body;
+        const body = params.body instanceof Uint8Array ? bytesFrameBody(params.body) : params.body;
         const corr = this.nextCorr;
         const header: EnvelopeHeader = {
             len: body.byteLength,

@@ -26,18 +26,13 @@ import {
     type RetirementReason,
 } from "./connection";
 import {
-    bytesFrameBody,
-    type DirectFrameBody,
-    ReceiveLease,
-    utf8FrameBody,
-} from "./frame-channel";
-import {
     ConnectionFileError,
     type ConnectionSnapshot,
     readConnectionFile,
 } from "./connection-file";
 import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
 import { isSubcCallError, SocketTimeoutError, SubcCallError, SubcError } from "./errors";
+import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
 import { flagsBinary } from "./protocol";
 import {
     belongsToConnection,
@@ -853,7 +848,10 @@ export class SubcClient {
             if (flagsBinary(terminal.flags)) {
                 throw new NegotiationError("malformed_json", "flags");
             }
-            return decodeNegotiateResponse(requireJsonReceiveBody(terminal.body).text ?? "", offers);
+            return decodeNegotiateResponse(
+                requireJsonReceiveBody(terminal.body).text ?? "",
+                offers,
+            );
         } catch (error) {
             throw wrapNegotiationError(error);
         }

@@ -291,7 +291,10 @@ export class BoundedFrameProducer implements FrameProducerCursor {
         let offset = this.cursor;
         for (const segment of this.producerSegments) {
             if (offset < segment.byteLength) {
-                return segment.subarray(offset, Math.min(segment.byteLength, offset + this.remaining));
+                return segment.subarray(
+                    offset,
+                    Math.min(segment.byteLength, offset + this.remaining),
+                );
             }
             offset -= segment.byteLength;
         }
