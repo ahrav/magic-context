@@ -11,6 +11,7 @@ import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
     computeProjectMemoryMutationToken,
     createProjectMemoryClaim,
+    readOutboxConsumerCheckpoint,
     recordProjectMemoryVerification,
     runClaimOperation,
 } from "../../features/magic-context/memory/storage-claim-operations";
@@ -28,6 +29,12 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
+import {
+    buildDirectFormatMarker,
+    createDirectFormatMarkerSchema,
+    readDirectFormatMarker,
+    stampDirectFormatMarker,
+} from "../../features/magic-context/storage-format-epoch";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
 import {
@@ -1808,6 +1815,17 @@ class DeterministicClaimMirrorFacade {
 }
 
 function seedU10Claim(db: Database, projectPath: string, key: string, content: string) {
+    if (readDirectFormatMarker(db).status === "absent") {
+        const marker = buildDirectFormatMarker({
+            databaseIncarnationId: "a".repeat(32),
+            componentManifestDigest: "b".repeat(64),
+            createdAtMs: 1,
+        });
+        db.transaction(() => {
+            createDirectFormatMarkerSchema(db);
+            stampDirectFormatMarker(db, marker);
+        }).immediate();
+    }
     const projectId = ensureProject(db, projectPath);
     const created = createProjectMemoryClaim(
         db,
