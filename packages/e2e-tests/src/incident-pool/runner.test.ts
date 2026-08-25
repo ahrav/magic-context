@@ -590,6 +590,38 @@ describe("run snapshot selection", () => {
         ).toEqual(["var-green-one", "var-red-one"]);
     });
 
+    it("rejects a requested variant that no filter selected", () => {
+        const data = fixture();
+        const request = (variantIds: string[]) => () =>
+            buildRunSnapshot({
+                catalog: data.catalog,
+                ledger: replayAdjudicationLedger(data.events),
+                adjudicationLines: data.adjudicationLines,
+                harness: "opencode",
+                lanes: ["green", "known-red"],
+                variantIds,
+                implementationDigests: data.implementationDigests,
+            });
+        // An unknown id alongside a valid one keeps the selection nonempty, so
+        // only an explicit check stops the run from reporting green on a subset.
+        expect(request(["var-green-one", "var-typo-one"])).toThrow(
+            /var-typo-one \(unknown variant id\)/,
+        );
+        // A real id filtered out by lane carries its documented exclusion.
+        expect(request(["var-green-one"])).not.toThrow();
+        expect(() =>
+            buildRunSnapshot({
+                catalog: data.catalog,
+                ledger: replayAdjudicationLedger(data.events),
+                adjudicationLines: data.adjudicationLines,
+                harness: "opencode",
+                lanes: ["green"],
+                variantIds: ["var-green-one", "var-red-one"],
+                implementationDigests: data.implementationDigests,
+            }),
+        ).toThrow(/var-red-one \(lane known-red was not requested\)/);
+    });
+
     it("fails hard on a missing baseline or registered case digest", () => {
         const data = fixture();
         const noBaseline = data.events.filter(
@@ -1224,6 +1256,27 @@ describe("catalog-bound report", () => {
             ),
         ).toEqual(["var-blocked-one"]);
         expect(incidentPoolExitCode(missingDependencyReport)).toBe(1);
+
+        // A dependency that now passes has stopped blocking, so its dependent
+        // owes an evaluation. Presence of the dependency id is not enough.
+        const resolvedDependency = await runFakeChild(
+            snapshot,
+            red,
+            'sendEnvelope({ verdict: "pass" });',
+        );
+        const resolvedReport = buildIncidentReport(
+            reportInput(snapshot, [
+                resolvedDependency.result,
+                blockedResult.result,
+            ]),
+        );
+        expect(resolvedDependency.result.behavioral_verdict).toBe("pass");
+        expect(
+            unexpectedIncompleteResults(resolvedReport).map(
+                (entry) => entry.variant_id,
+            ),
+        ).toEqual(["var-blocked-one"]);
+        expect(incidentPoolExitCode(resolvedReport)).toBe(1);
 
         const crashed = await runFakeChild(snapshot, green, "process.exit(3);");
         const crashReport = buildIncidentReport(

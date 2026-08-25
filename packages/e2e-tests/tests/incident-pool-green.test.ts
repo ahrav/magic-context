@@ -11,7 +11,6 @@ import {
 } from "../src/incident-pool/registry";
 import type { IncidentCaseResult } from "../src/incident-pool/report";
 import {
-    DEFAULT_CASE_TIMEOUT_MS,
     buildRunSnapshot,
     runCaseInIsolation,
     unavailableCaseResult,
@@ -21,6 +20,15 @@ import {
     INCIDENTS_DIR,
     loadHistorySnapshot,
 } from "../scripts/validate-incident-history";
+
+// Each isolated child here pays a fresh TestHarness plus `opencode serve` cold
+// start, which the surrounding e2e-host job documents as able to exceed 120s —
+// so the runner's 120s library default would classify a correct case as
+// `deadline_exceeded`. Derive the child budget from the per-test budget instead
+// of restating a number: the child's own deadline must fire first so the runner
+// still produces a classified result rather than being killed by bun:test.
+const GREEN_TEST_TIMEOUT_MS = 300_000;
+const GREEN_CASE_TIMEOUT_MS = GREEN_TEST_TIMEOUT_MS - 60_000;
 
 const OPENCODE_GREEN_VARIANT_IDS = [
     "var-a5-archived-reobservation",
@@ -89,7 +97,7 @@ async function runGreenVariant(variantId: string): Promise<IncidentCaseResult> {
             process.execPath,
             resolve(E2E_ROOT, "scripts", "run-incident-case.ts"),
         ],
-        timeoutMs: DEFAULT_CASE_TIMEOUT_MS,
+        timeoutMs: GREEN_CASE_TIMEOUT_MS,
         workspaceParentDir,
         extraEnv: { MC_E2E_MODE: mode },
     });
@@ -108,7 +116,7 @@ describe(`incident pool baseline-green wrappers (${harness})`, () => {
                 expect(result.baseline_comparison).toBe("expected_green");
                 expect(result.reason_code).toBeNull();
             },
-            300_000,
+            GREEN_TEST_TIMEOUT_MS,
         );
     }
 });

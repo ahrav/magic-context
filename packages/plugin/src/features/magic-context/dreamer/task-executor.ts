@@ -1258,7 +1258,16 @@ async function runAgenticTask(
         const remainingMs = Math.max(0, deadline - Date.now());
         const promptTimeoutMs = Math.min(remainingMs, config.timeoutMinutes * 60 * 1000);
         if (promptTimeoutMs <= 0) {
-            throw new Error(`Dreamer ${task} deadline expired before the prompt was submitted.`);
+            // Mark this transient explicitly. Each executor invocation
+            // recomputes `startedAt`, so a hot retry gets a full deadline and
+            // this exhaustion is recoverable — but classifyFailure keys off the
+            // error shape, and "deadline expired" matches none of its timeout
+            // patterns, so an unflagged throw would advance to the next cron
+            // slot instead of using the bounded hot-retry path.
+            throw Object.assign(
+                new Error(`Dreamer ${task} deadline expired before the prompt was submitted.`),
+                { transient: true },
+            );
         }
         const run = await shared.promptSyncWithValidatedOutputRetry(
             deps.client,

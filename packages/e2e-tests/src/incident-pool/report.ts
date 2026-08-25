@@ -848,11 +848,27 @@ export function readScheduledIncidentReport(
 // scored result must agree with its reviewed baseline.
 // ---------------------------------------------------------------------------
 
+/**
+ * A dependency excuses an unevaluated dependent only while that dependency
+ * still exhibits the blocking condition: it is itself unevaluated in this run,
+ * or it was evaluated and its defect still reproduces (`assertion_fail`). A
+ * dependency that now passes — `expected_green` or the reviewed
+ * `resolution_candidate` transition — blocks nothing, so its dependent must be
+ * evaluated instead of being carried forward as blocked. Presence of the
+ * dependency's id in the report is therefore necessary but not sufficient.
+ */
+function dependencyStillBlocks(dependency: IncidentCaseResult): boolean {
+    return (
+        !isEvaluationComplete(dependency) ||
+        dependency.behavioral_verdict === "assertion_fail"
+    );
+}
+
 export function unexpectedIncompleteResults(
     report: IncidentPoolReport,
 ): IncidentCaseResult[] {
-    const resultIds = new Set(
-        report.results.map((result) => result.variant_id),
+    const resultsById = new Map(
+        report.results.map((result) => [result.variant_id, result]),
     );
     return report.results.filter(
         (result) =>
@@ -860,9 +876,13 @@ export function unexpectedIncompleteResults(
             !(
                 result.reason_code === "blocked_by_dependency" &&
                 result.blocked_by.length > 0 &&
-                result.blocked_by.every((dependency) =>
-                    resultIds.has(dependency),
-                )
+                result.blocked_by.every((dependency) => {
+                    const upstream = resultsById.get(dependency);
+                    return (
+                        upstream !== undefined &&
+                        dependencyStillBlocks(upstream)
+                    );
+                })
             ),
     );
 }

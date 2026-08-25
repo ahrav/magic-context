@@ -395,6 +395,28 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
                 entry.baselineEventId,
             ] as const,
     );
+    // `variantIds` is an EXACT selection, so a requested id that filtered out
+    // (typo, retired, wrong lane, wrong harness) must be a hard error. Without
+    // this, one surviving id keeps the selection nonempty and the run reports
+    // green while silently omitting the rest of the request.
+    if (requestedVariants) {
+        const selectedIds = new Set(selected.map((entry) => entry.variantId));
+        const reasonById = new Map(
+            excluded.map((entry) => [entry.variantId, entry.reason]),
+        );
+        const unmatched = [...requestedVariants]
+            .filter((variantId) => !selectedIds.has(variantId))
+            .sort()
+            .map(
+                (variantId) =>
+                    `${variantId} (${reasonById.get(variantId) ?? "unknown variant id"})`,
+            );
+        if (unmatched.length > 0) {
+            throw new Error(
+                `requested variants were not selected: ${unmatched.join("; ")}`,
+            );
+        }
+    }
     return {
         runNonce: newRunNonce(),
         harness: input.harness,

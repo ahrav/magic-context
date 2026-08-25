@@ -797,11 +797,18 @@ const A28_IMPLEMENTATION_FILES = [
     "packages/plugin/src/shared/data-path.ts",
 ];
 
+// The A47 verdict is read straight off two durable writes — the `memories.status`
+// row `archiveMemory` updates and the `memory_mutation_log` row
+// `queueMemoryMutation` emits — so both implementations belong in the bundle.
+// Without them, editing either durable-write path could change the observed
+// residual-write behavior while `implementation_digest` stayed constant.
 const A47_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/incident-pool/scenarios/audit-background-lifecycle.ts",
     "packages/e2e-tests/src/incident-pool/support/tool-loop.ts",
     "packages/plugin/src/features/magic-context/dreamer/task-executor.ts",
     "packages/plugin/src/features/magic-context/dreamer/lease.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-memory.ts",
+    "packages/plugin/src/features/magic-context/storage-memory-mutation-log.ts",
     "packages/plugin/src/tools/ctx-memory/tools.ts",
 ];
 
