@@ -640,12 +640,12 @@
         },
         {
             "id": "src-pi-todo-declared-red-suite",
-            "source_path": "packages/e2e-tests/src/incident-pool/scenarios/parity-pi-todo.ts",
-            "content_digest": "100369ded930fddc1fd017013610857ba969ea60a4026cb625308ec4e5d5e9da",
+            "source_path": "packages/e2e-tests/incidents/pi-todo-provenance.md",
+            "content_digest": "8912e33646c0b6a39bf6c440d8862a61230537fa8cc511468c24f171c75b99a7",
             "claims": [
                 {
                     "id": "claim-pi-todo-synthesis-gap",
-                    "content_digest": "100369ded930fddc1fd017013610857ba969ea60a4026cb625308ec4e5d5e9da",
+                    "content_digest": "8912e33646c0b6a39bf6c440d8862a61230537fa8cc511468c24f171c75b99a7",
                     "disposition": "executable_known_defect",
                     "rationale": "U6 preserves every declared-red Pi assertion in four live incident variants outside the Pi green selection; current passing observations remain resolution candidates until reviewed adjudication",
                     "family_links": [

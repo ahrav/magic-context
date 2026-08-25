@@ -11,6 +11,7 @@ import * as regressions from "./source-linked-regressions";
 import {
     failedCheckIds,
     FIRST_RENDER_A1_CHECKS,
+    hasCtxReducePair,
     FIRST_RENDER_A3_CHECKS,
     THINKING_DROPPED_SHELL_CHECKS,
     THINKING_IMAGE_SURVIVAL_CHECKS,
@@ -118,6 +119,46 @@ describe("first-render tag stability verifiers (parity A1/A3)", () => {
         expect(result.checks.map((check) => check.id)).toEqual([
             ...FIRST_RENDER_A3_CHECKS,
         ]);
+    });
+
+    it("rejects a tool declaration after the emitted ctx_reduce pair vanished", () => {
+        const callId = "toolu_incident_a3_ctx_reduce";
+        const declarationOnly = {
+            tools: [{ name: "ctx_reduce" }],
+            messages: [{ role: "user", content: "continue" }],
+        };
+        expect(hasCtxReducePair(declarationOnly, callId)).toBe(false);
+        expect(
+            hasCtxReducePair(
+                {
+                    ...declarationOnly,
+                    messages: [
+                        {
+                            role: "assistant",
+                            content: [
+                                {
+                                    type: "tool_use",
+                                    id: callId,
+                                    name: "ctx_reduce",
+                                    input: { drop: "99999" },
+                                },
+                            ],
+                        },
+                        {
+                            role: "user",
+                            content: [
+                                {
+                                    type: "tool_result",
+                                    tool_use_id: callId,
+                                    content: "ok",
+                                },
+                            ],
+                        },
+                    ],
+                },
+                callId,
+            ),
+        ).toBe(true);
     });
 
     it("rejects a vanished ctx_reduce call, a bust, and a never-on-wire call", () => {

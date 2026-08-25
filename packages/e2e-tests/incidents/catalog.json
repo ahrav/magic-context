@@ -28,8 +28,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a5-2",
-                        "fingerprint": "52c064a247706da3be73c684f1a6a06c9f5bdbb8cd13309a18775424c492a6af"
+                        "id": "rev-a5-3",
+                        "fingerprint": "250663f863b6f109dcd266b12a3fb0090a49e2c3893ff2467b45e851dd94a713"
                     },
                     "normative_checks": [
                         "check-a5-archived-row-preserved",
@@ -306,8 +306,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a47-2",
-                        "fingerprint": "9e9cd069f3a0df1760f4d2bc0980b6a777b6ea601d799b8d493499bdfbee3272"
+                        "id": "rev-a47-3",
+                        "fingerprint": "c92dc181ac4b7b6cdff1437f29eba0ac59edd1d8ade959f3e4089cd4dd89d48d"
                     },
                     "normative_checks": [
                         "check-a47-no-post-lease-loss-commit",
@@ -360,8 +360,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-a54-2",
-                        "fingerprint": "5525750f509e3a23abe70f131ca06dfc6fd5963ac0749ce3a729f1bbd4e039ea"
+                        "id": "rev-a54-3",
+                        "fingerprint": "e19a02d3830c055e98677e1fc5eaf2deaa87432641942b23ee29fd429cd05800"
                     },
                     "normative_checks": [
                         "check-a54-explicit-search-pending-status",
@@ -473,8 +473,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-parity-a3-2",
-                        "fingerprint": "061f30ab29b904050955b9b52571d8829eadf21e95a5afe051ada28313b3cfb0"
+                        "id": "rev-parity-a3-3",
+                        "fingerprint": "af71cc64538894320f7b777a67e5c2d6d18576a4d4326a8c1fecd884601f86c3"
                     },
                     "normative_checks": [
                         "check-a3-reduce-on-wire",
@@ -847,8 +847,8 @@
                         ]
                     },
                     "semantic_revision": {
-                        "id": "rev-pi-todo-anchor-2",
-                        "fingerprint": "db7c760f3ceb7caf2830bca4796f30d8f986c2b4221cab456bc1117cd9a4627e"
+                        "id": "rev-pi-todo-anchor-4",
+                        "fingerprint": "815c1b87fdd4454a1e39225d67fcc91427c906e26f805521e9673fe0a48163ad"
                     },
                     "normative_checks": [
                         "check-pi-todo-subagent-gated",

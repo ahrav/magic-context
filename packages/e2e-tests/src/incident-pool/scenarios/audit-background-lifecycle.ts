@@ -42,7 +42,7 @@ function unmet(): PreconditionOutcome {
 function exactRecord<T>(
     raw: unknown,
     kind: string,
-    fields: Record<string, "boolean" | "number" | "string-array">,
+    fields: Record<string, "boolean" | "number" | "string" | "string-array">,
 ): T {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
         throw new Error(`${kind} observation must be an object`);
@@ -254,10 +254,9 @@ const A47_FIELDS = {
     mutationAbsentBeforeRelease: "boolean",
     barrierReleased: "boolean",
     guardedWriteAttempted: "boolean",
-    mutationCommitted: "boolean",
-    mutationIdUnique: "boolean",
-    postCommitMemoryRead: "boolean",
-    postCommitMutationRead: "boolean",
+    postCommitMemoryStatus: "string",
+    postCommitMutationCount: "number",
+    mutationIdsUnique: "boolean",
     terminalLeaseLossEvents: "number",
     taskReportedLeaseLoss: "boolean",
     childReleased: "boolean",
@@ -281,10 +280,9 @@ export type LeaseLossResidualWriteObservation = {
     mutationAbsentBeforeRelease: boolean;
     barrierReleased: boolean;
     guardedWriteAttempted: boolean;
-    mutationCommitted: boolean;
-    mutationIdUnique: boolean;
-    postCommitMemoryRead: boolean;
-    postCommitMutationRead: boolean;
+    postCommitMemoryStatus: string;
+    postCommitMutationCount: number;
+    mutationIdsUnique: boolean;
     terminalLeaseLossEvents: number;
     taskReportedLeaseLoss: boolean;
     childReleased: boolean;
@@ -294,7 +292,8 @@ export type LeaseLossResidualWriteObservation = {
 export const LEASE_LOSS_RESIDUAL_WRITE_FIXTURE = {
     task: "curate agentic child with one real ctx_memory archive",
     race: "replacement lease commits while child waits at an injected pre-prompt barrier",
-    observation: "independent ownership, memory, and mutation-log reads",
+    observation: "separate durable memory status and mutation-log row count",
+    resolution: "memory remains active and mutation-log row count remains zero",
     terminal: "one injected delivery through the executor lease-loss handler",
 } as const;
 
@@ -356,17 +355,26 @@ export function verifyLeaseLossResidualWrite(
     observation: NormalizedObservation,
 ): VerifierCheck[] {
     const value = normalizeLeaseLossResidualWrite(observation);
-    const expectedTrace = value.mutationCommitted ? A47_TRACE_WITH_COMMIT : A47_TRACE_WITHOUT_COMMIT;
+    const postLeaseMutationObserved =
+        value.postCommitMemoryStatus !== "active" ||
+        value.postCommitMutationCount !== 0;
+    const expectedTrace = postLeaseMutationObserved
+        ? A47_TRACE_WITH_COMMIT
+        : A47_TRACE_WITHOUT_COMMIT;
     const durableTrace =
         traceEquals(value.trace, expectedTrace) &&
         value.originalOwnershipRead &&
         value.replacementOwnershipRead &&
         value.fencingIdUnique &&
-        value.postCommitMemoryRead &&
-        value.postCommitMutationRead &&
-        (!value.mutationCommitted || value.mutationIdUnique);
+        value.postCommitMemoryStatus !== "missing" &&
+        value.postCommitMutationCount >= 0 &&
+        (value.postCommitMutationCount === 0 || value.mutationIdsUnique);
     return [
-        check("check-a47-no-post-lease-loss-commit", !value.mutationCommitted),
+        check(
+            "check-a47-no-post-lease-loss-commit",
+            value.postCommitMemoryStatus === "active" &&
+                value.postCommitMutationCount === 0,
+        ),
         check("check-a47-durable-happens-before", durableTrace),
         check("check-a47-single-terminal-lease-event", value.terminalLeaseLossEvents === 1),
         check("check-a47-child-released", value.childReleased),
@@ -453,10 +461,9 @@ export async function driveLeaseLossResidualWrite(
     let guardedWriteAttempted = false;
     let curatePathUsed = false;
     let memoryToolPublished = false;
-    let postCommitMemoryRead = false;
-    let postCommitMutationRead = false;
-    let mutationCommitted = false;
-    let mutationIdUnique = false;
+    let postCommitMemoryStatus = "missing";
+    let postCommitMutationCount = -1;
+    let mutationIdsUnique = false;
     let taskReportedLeaseLoss = false;
     let executorPromise: Promise<unknown> | null = null;
     let executorJoined = false;
@@ -566,16 +573,20 @@ export async function driveLeaseLossResidualWrite(
                                 "SELECT id FROM memory_mutation_log WHERE project_path = ? AND target_memory_id = ? ORDER BY id",
                             )
                             .all(seed.project_path, seed.id) as Array<{ id: number }>;
-                        postCommitMemoryRead = memory !== undefined;
-                        postCommitMutationRead = true;
-                        mutationCommitted = memory?.status === "archived" && mutations.length === 1;
-                        const mutation = mutations[0];
-                        mutationIdUnique =
-                            mutations.length === 1 && mutation !== undefined && mutation.id > 0;
+                        postCommitMemoryStatus = memory?.status ?? "missing";
+                        postCommitMutationCount = mutations.length;
+                        mutationIdsUnique =
+                            new Set(mutations.map((mutation) => mutation.id)).size ===
+                            mutations.length;
                     } finally {
                         observer.close();
                     }
-                    if (mutationCommitted) trace.push("mutation-commit");
+                    if (
+                        postCommitMemoryStatus !== "active" ||
+                        postCommitMutationCount !== 0
+                    ) {
+                        trace.push("mutation-commit");
+                    }
                     terminalLeaseLossEvents += 1;
                     trace.push("terminal-lease-loss");
                     declareLeaseLost();
@@ -660,10 +671,9 @@ export async function driveLeaseLossResidualWrite(
             mutationAbsentBeforeRelease,
             barrierReleased,
             guardedWriteAttempted,
-            mutationCommitted,
-            mutationIdUnique,
-            postCommitMemoryRead,
-            postCommitMutationRead,
+            postCommitMemoryStatus,
+            postCommitMutationCount,
+            mutationIdsUnique,
             terminalLeaseLossEvents,
             taskReportedLeaseLoss,
             childReleased,

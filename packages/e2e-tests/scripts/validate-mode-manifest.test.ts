@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseIncidentCatalog } from "../src/incident-pool/contract";
+import { incidentUnitFiles } from "./run-test-selection";
 import {
     E2E_ROOT,
     filesForMode,
@@ -17,6 +18,10 @@ const catalog = parseIncidentCatalog(
     JSON.parse(
         readFileSync(resolve(E2E_ROOT, "incidents", "catalog.json"), "utf8"),
     ),
+);
+const greenWrapperSource = readFileSync(
+    resolve(E2E_ROOT, "tests", "incident-pool-green.test.ts"),
+    "utf8",
 );
 
 function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
@@ -92,25 +97,58 @@ describe("mode manifest validator", () => {
         expect(filesForMode(both, "rust")).toContain(entries[0]!.path);
     });
 
-    it("rejects a green wrapper that selects or imports known-red cases", () => {
+    it("accepts only complete canonical green wrapper arrays", () => {
+        const selected = validateGreenIncidentWrapperSource(
+            greenWrapperSource,
+            catalog,
+        );
+        expect(selected).toContain("var-a5-archived-reobservation");
+        expect(selected).toContain("var-parity-a3-ctx-reduce-survival");
+
         expect(() =>
             validateGreenIncidentWrapperSource(
-                'const ids = ["var-a32-stale-embedding-recall"]',
+                greenWrapperSource.replace(
+                    '"var-a5-archived-reobservation",',
+                    "",
+                ),
+                catalog,
+            ),
+        ).toThrow(/must equal complete catalog green set/);
+        expect(() =>
+            validateGreenIncidentWrapperSource(
+                greenWrapperSource.replace(
+                    '"var-a5-archived-reobservation",',
+                    '// "var-a5-archived-reobservation",',
+                ),
+                catalog,
+            ),
+        ).toThrow(/must equal complete catalog green set/);
+        expect(() =>
+            validateGreenIncidentWrapperSource(
+                greenWrapperSource.replace(
+                    '"var-a5-archived-reobservation",',
+                    '"var-a32-stale-embedding-recall",',
+                ),
                 catalog,
             ),
         ).toThrow(/known-red registry ID/);
         expect(() =>
             validateGreenIncidentWrapperSource(
-                'import { parityPiTodoIncidentCases } from "../src/incident-pool/scenarios/parity-pi-todo";\nconst ids = ["var-a5-archived-reobservation"]',
+                `import { parityPiTodoIncidentCases } from "../src/incident-pool/scenarios/parity-pi-todo";\n${greenWrapperSource}`,
                 catalog,
             ),
         ).toThrow(/known-red-only scenario module/);
-        expect(
-            validateGreenIncidentWrapperSource(
-                'const ids = ["var-a5-archived-reobservation"]',
-                catalog,
-            ),
-        ).toEqual(["var-a5-archived-reobservation"]);
+    });
+
+    it("keeps incident-unit selection closed over manifest negative tests", () => {
+        expect(incidentUnitFiles()).toEqual(
+            expect.arrayContaining([
+                "scripts/check-rust-prerequisites.test.ts",
+                "scripts/validate-incident-history.test.ts",
+                "scripts/validate-incident-verifiers.test.ts",
+                "scripts/validate-mode-manifest.test.ts",
+            ]),
+        );
     });
 
     it("rejects broad-glob green package scripts", () => {

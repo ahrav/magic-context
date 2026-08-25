@@ -23,7 +23,7 @@ import {
     type IncidentCatalog,
     type Lane,
 } from "./contract";
-import { rowDigest, type LedgerState } from "./history";
+import type { LedgerState } from "./history";
 import {
     asEnum,
     asHex64,
@@ -40,6 +40,7 @@ import {
     type ResultReasonCode,
     type RunHealth,
     buildIncidentReport,
+    computeSelectedSetDigest,
 } from "./report";
 import { ledgerFingerprint } from "./registry";
 import {
@@ -374,21 +375,22 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
             });
         }
     }
-    const digestRows = [...selected]
-        .sort((a, b) => (a.variantId < b.variantId ? -1 : 1))
-        .map((entry) => [
-            entry.variantId,
-            entry.semanticFingerprint,
-            entry.implementationDigest,
-            entry.baselineEventId,
-        ]);
+    const digestRows = selected.map(
+        (entry) =>
+            [
+                entry.variantId,
+                entry.semanticFingerprint,
+                entry.implementationDigest,
+                entry.baselineEventId,
+            ] as const,
+    );
     return {
         runNonce: newRunNonce(),
         harness: input.harness,
         ledgerFingerprint: ledgerFingerprint(input.adjudicationLines),
         selected,
         excluded,
-        selectedSetDigest: rowDigest(["incident-selected-set/v1", digestRows]),
+        selectedSetDigest: computeSelectedSetDigest(digestRows),
         familyCount: new Set(selected.map((entry) => entry.familyId)).size,
         variantCount: selected.length,
     };
@@ -428,6 +430,8 @@ export interface CaseExecution {
 
 interface ProcessOutcome {
     timedOut: boolean;
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
     envelopeBytes: Buffer;
     envelopeOversized: boolean;
 }
@@ -495,10 +499,29 @@ function spawnCaseProcess(
         let envelopeLength = 0;
         let oversized = false;
         let timedOut = false;
+        let exitCode: number | null = null;
+        let signal: NodeJS.Signals | null = null;
         let settled = false;
+        let diagnosticError = false;
 
-        child.stdout?.on("data", (chunk: Buffer) => stdoutSink.write(chunk));
-        child.stderr?.on("data", (chunk: Buffer) => stderrSink.write(chunk));
+        const writeDiagnostic = (sink: DiagnosticSink, chunk: Buffer): void => {
+            try {
+                sink.write(chunk);
+            } catch {
+                diagnosticError = true;
+                try {
+                    if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+                } catch {
+                    // Child exited before the diagnostic failure could stop it.
+                }
+            }
+        };
+        child.stdout?.on("data", (chunk: Buffer) =>
+            writeDiagnostic(stdoutSink, chunk),
+        );
+        child.stderr?.on("data", (chunk: Buffer) =>
+            writeDiagnostic(stderrSink, chunk),
+        );
         const channel = child.stdio[3] as Readable | null;
         channel?.on("data", (chunk: Buffer) => {
             if (oversized) return;
@@ -535,14 +558,24 @@ function spawnCaseProcess(
                 ]),
                 sleep(2_000),
             ]);
+            if (diagnosticError) {
+                rejectOutcome(new Error("diagnostic sink write failed"));
+                return;
+            }
             resolveOutcome({
                 timedOut,
+                exitCode,
+                signal,
                 envelopeBytes: Buffer.concat(chunks),
                 envelopeOversized: oversized,
             });
         };
 
-        child.once("exit", () => void settle().catch(rejectOutcome));
+        child.once("exit", (code, exitSignal) => {
+            exitCode = code;
+            signal = exitSignal;
+            void settle().catch(rejectOutcome);
+        });
         child.once("error", () => void settle().catch(rejectOutcome));
     });
 }
@@ -610,8 +643,8 @@ function classifyEnvelope(
     if (envelope.preconditions === "failed") {
         const reviewed =
             envelope.precondition_reason === "blocked_by_dependency" &&
-            envelope.blocked_by.length > 0 &&
-            envelope.blocked_by.every((id) => selected.blockedBy.includes(id));
+            selected.blockedBy.length > 0 &&
+            sameCheckSet(envelope.blocked_by, selected.blockedBy);
         return {
             ...base,
             run_health: "completed",
@@ -660,6 +693,9 @@ function classifyOutcome(
         return unhealthyResult(selected, "timeout", "deadline_exceeded");
     if (outcome.envelopeOversized)
         return unhealthyResult(selected, "malformed", "envelope_oversized");
+    if (outcome.exitCode !== 0 || outcome.signal !== null) {
+        return unhealthyResult(selected, "crash", "child_exit_failure");
+    }
     const text = outcome.envelopeBytes.toString("utf8");
     const lines = text.split("\n").filter((line) => line.trim().length > 0);
     // A child that exits without an envelope crashed, whatever it printed to
@@ -695,6 +731,35 @@ function caseIdentityEnv(
     };
 }
 
+const ISOLATION_ENV_KEYS = new Set([
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+]);
+
+export function assertSafeExtraEnv(extraEnv: Record<string, string>): void {
+    for (const key of Object.keys(extraEnv)) {
+        const unsafe =
+            key.startsWith("MC_INCIDENT_") ||
+            key.startsWith("XDG_") ||
+            ISOLATION_ENV_KEYS.has(key) ||
+            /PROXY/i.test(key) ||
+            /^(?:AWS|AZURE|GOOGLE|GCP|OPENAI|ANTHROPIC|COHERE|HUGGINGFACE|SSH)_/i.test(
+                key,
+            ) ||
+            /(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY|PRIVATE_KEY|COOKIE|AUTH)/i.test(
+                key,
+            );
+        if (unsafe) {
+            throw new Error(`unsafe incident case extraEnv key ${key}`);
+        }
+    }
+}
+
 /**
  * Run one selected case in full isolation and return its terminal result
  * plus a numeric diagnostics summary (counters only — no output bytes). The
@@ -707,6 +772,7 @@ export async function runCaseInIsolation(
 ): Promise<CaseExecution> {
     if (options.providerEndpoints)
         assertLoopbackProviderEndpoints(options.providerEndpoints);
+    if (options.extraEnv) assertSafeExtraEnv(options.extraEnv);
     const workspace = createCaseWorkspace(
         options.workspaceParentDir,
         selected.variantId,
@@ -725,9 +791,9 @@ export async function runCaseInIsolation(
     try {
         const env = {
             ...buildCaseEnv(workspace, options.baseEnv ?? process.env),
-            ...caseIdentityEnv(snapshot, selected, workspace),
             ...(options.providerEndpoints ?? {}),
             ...(options.extraEnv ?? {}),
+            ...caseIdentityEnv(snapshot, selected, workspace),
         };
         outcome = await spawnCaseProcess(
             options.argv,
@@ -762,7 +828,17 @@ export async function runIncidentPool(
 ): Promise<IncidentPoolReport> {
     const results: IncidentCaseResult[] = [];
     for (const selected of snapshot.selected) {
-        results.push(await runCase(selected));
+        try {
+            results.push(await runCase(selected));
+        } catch {
+            results.push(
+                unhealthyResult(
+                    selected,
+                    "crash",
+                    "case_execution_failed",
+                ),
+            );
+        }
     }
     return buildIncidentReport({
         runNonce: snapshot.runNonce,

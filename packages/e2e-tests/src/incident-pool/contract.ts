@@ -386,6 +386,9 @@ function parseVerifierBinding(raw: unknown, label: string): VerifierBinding {
             `${label}.invalid_state_evidence`,
             "must name at least one crafted invalid state",
         );
+    if (new Set(evidence).size !== evidence.length) {
+        fail(`${label}.invalid_state_evidence`, "must not contain duplicates");
+    }
     return {
         driver: asNonEmptyString(record.driver, `${label}.driver`),
         verifier: asNonEmptyString(record.verifier, `${label}.verifier`),

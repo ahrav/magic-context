@@ -23,6 +23,9 @@ bun run --cwd packages/e2e-tests test:pi-e2e
 # Incident contracts, verifiers, runner, evidence, and history fixtures
 bun run --cwd packages/e2e-tests test:incident-unit
 
+# Conservative contributor gate against mutation-bound verifier drift
+bun run --cwd packages/e2e-tests validate:incident-verifiers
+
 # Supported TS incident schedule: OpenCode plus applicable Pi variants
 bun run --cwd packages/e2e-tests test:incidents --mode ts
 

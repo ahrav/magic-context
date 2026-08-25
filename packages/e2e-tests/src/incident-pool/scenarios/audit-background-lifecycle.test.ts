@@ -80,10 +80,9 @@ function a47Observation(
         mutationAbsentBeforeRelease: true,
         barrierReleased: true,
         guardedWriteAttempted: true,
-        mutationCommitted: true,
-        mutationIdUnique: true,
-        postCommitMemoryRead: true,
-        postCommitMutationRead: true,
+        postCommitMemoryStatus: "archived",
+        postCommitMutationCount: 1,
+        mutationIdsUnique: true,
         terminalLeaseLossEvents: 1,
         taskReportedLeaseLoss: true,
         childReleased: true,
@@ -169,8 +168,9 @@ describe("A47 lease-loss residual-write verifier", () => {
     it("accepts a complete future no-commit trace as the resolution shape", () => {
         const trace = A47_CURRENT_TRACE.filter((event) => event !== "mutation-commit");
         const observation = a47Observation({
-            mutationCommitted: false,
-            mutationIdUnique: false,
+            postCommitMemoryStatus: "active",
+            postCommitMutationCount: 0,
+            mutationIdsUnique: true,
             trace,
         });
         expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(true);
@@ -180,7 +180,7 @@ describe("A47 lease-loss residual-write verifier", () => {
     it("rejects ordered callbacks without durable ownership or commit reads", () => {
         const observation = a47Observation({
             replacementOwnershipRead: false,
-            postCommitMutationRead: false,
+            postCommitMemoryStatus: "missing",
         });
         expect(preconditionLeaseLossResidualWrite(observation).satisfied).toBe(false);
         expect(failedIds(verifyLeaseLossResidualWrite(observation))).toContain(
@@ -225,13 +225,44 @@ describe("A47 lease-loss residual-write verifier", () => {
     it("leaves crash or incomplete no-commit traces unscored", () => {
         const noCommitTrace = A47_CURRENT_TRACE.filter((event) => event !== "mutation-commit");
         for (const overrides of [
-            { driverCompleted: false, mutationCommitted: false, trace: noCommitTrace },
-            { terminalLeaseLossEvents: 0, mutationCommitted: false, trace: noCommitTrace },
-            { taskReportedLeaseLoss: false, mutationCommitted: false, trace: noCommitTrace },
-            { childReleased: false, mutationCommitted: false, trace: noCommitTrace },
+            { driverCompleted: false, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
+            { terminalLeaseLossEvents: 0, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
+            { taskReportedLeaseLoss: false, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
+            { childReleased: false, postCommitMemoryStatus: "active", postCommitMutationCount: 0, trace: noCommitTrace },
         ] as const) {
             expect(preconditionLeaseLossResidualWrite(a47Observation(overrides)).satisfied).toBe(false);
         }
+    });
+
+    it("rejects archived-only and mutation-log-only partial writes", () => {
+        const noCommitTrace = A47_CURRENT_TRACE.filter(
+            (event) => event !== "mutation-commit",
+        );
+        for (const observation of [
+            a47Observation({
+                postCommitMemoryStatus: "archived",
+                postCommitMutationCount: 0,
+            }),
+            a47Observation({
+                postCommitMemoryStatus: "active",
+                postCommitMutationCount: 1,
+            }),
+        ]) {
+            expect(failedIds(verifyLeaseLossResidualWrite(observation))).toContain(
+                "check-a47-no-post-lease-loss-commit",
+            );
+        }
+        expect(
+            failedIds(
+                verifyLeaseLossResidualWrite(
+                    a47Observation({
+                        postCommitMemoryStatus: "archived",
+                        postCommitMutationCount: 0,
+                        trace: noCommitTrace,
+                    }),
+                ),
+            ),
+        ).toContain("check-a47-durable-happens-before");
     });
 
     it("rejects near-correct out-of-order traces and duplicate terminal events", () => {

@@ -379,21 +379,6 @@ function setupSatisfied(setup: TodoParitySetup): boolean {
     return Object.values(setup).every(Boolean);
 }
 
-export function compareDeclaredParitySetup(
-    expected: TodoParitySetup,
-    actual: TodoParitySetup,
-): boolean {
-    return (
-        expected.promptMatched === actual.promptMatched &&
-        expected.toolRegistryMatched === actual.toolRegistryMatched &&
-        expected.environmentMatched === actual.environmentMatched &&
-        expected.clonedStateMatched === actual.clonedStateMatched &&
-        expected.modeMatched === actual.modeMatched &&
-        expected.harnessMatched === actual.harnessMatched &&
-        expected.prerequisitesMet === actual.prerequisitesMet
-    );
-}
-
 function exactBooleanObservation<T>(
     raw: unknown,
     kind: string,

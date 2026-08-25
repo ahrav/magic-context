@@ -28,6 +28,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import * as ts from "typescript";
 import type {
     IncidentCatalog,
     IncidentVariant,
@@ -48,7 +49,7 @@ export const PARITY_SOURCE_PATH = "packages/e2e-tests/parity-findings-s2.md";
 export const THINKING_BLOCK_SOURCE_PATH =
     "packages/e2e-tests/mutations/thinking-block-adjudication.md";
 export const PI_TODO_SOURCE_PATH =
-    "packages/e2e-tests/src/incident-pool/scenarios/parity-pi-todo.ts";
+    "packages/e2e-tests/incidents/pi-todo-provenance.md";
 export const BEAD_SOURCE_PATH = "bead:magic-context-x4l.9";
 
 /** Task-level provenance-mismatch wording recorded from `magic-context-x4l.9`;
@@ -603,12 +604,41 @@ function checkBindingLiveness(
         );
     }
     const moduleText = readFileSync(absolute, "utf8");
-    const exportRe = new RegExp(
-        `export (?:async )?(?:function|const) ${symbol}\\b`,
+    const source = ts.createSourceFile(
+        absolute,
+        moduleText,
+        ts.ScriptTarget.Latest,
+        true,
     );
-    if (!exportRe.test(moduleText)) {
+    const exported = (node: ts.Node): boolean =>
+        ts.canHaveModifiers(node) &&
+        ts
+            .getModifiers(node)
+            ?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) ===
+            true;
+    const hasFunctionExport = source.statements.some((statement) => {
+        if (
+            ts.isFunctionDeclaration(statement) &&
+            exported(statement) &&
+            statement.name?.text === symbol
+        ) {
+            return true;
+        }
+        if (!ts.isVariableStatement(statement) || !exported(statement)) {
+            return false;
+        }
+        return statement.declarationList.declarations.some(
+            (declaration) =>
+                ts.isIdentifier(declaration.name) &&
+                declaration.name.text === symbol &&
+                declaration.initializer !== undefined &&
+                (ts.isArrowFunction(declaration.initializer) ||
+                    ts.isFunctionExpression(declaration.initializer)),
+        );
+    });
+    if (!hasFunctionExport) {
         throw new Error(
-            `variant ${variantId}: live binding ${path} does not export ${symbol}`,
+            `variant ${variantId}: live binding ${path} does not export function ${symbol}`,
         );
     }
 }
@@ -618,6 +648,14 @@ export function verifyOwnershipMatrix(
     catalog: IncidentCatalog,
     e2eRoot: string = E2E_ROOT,
 ): void {
+    const claims = new Map(
+        inventory.items.flatMap((item) =>
+            item.claims.map((claim) => [claim.id, claim] as const),
+        ),
+    );
+    const families = new Map(
+        catalog.families.map((family) => [family.id, family] as const),
+    );
     const executableVariantsByClaim = new Map<string, IncidentVariant[]>();
     for (const family of catalog.families) {
         for (const variant of family.variants) {
@@ -630,8 +668,27 @@ export function verifyOwnershipMatrix(
         }
     }
 
+    for (const family of catalog.families) {
+        for (const claimId of family.source_claims) {
+            const claim = claims.get(claimId);
+            if (!claim?.family_links.includes(family.id)) {
+                throw new Error(
+                    `family ${family.id} source claim ${claimId} lacks reciprocal inventory family_link`,
+                );
+            }
+        }
+    }
+
     for (const item of inventory.items) {
         for (const claim of item.claims) {
+            for (const familyId of claim.family_links) {
+                const family = families.get(familyId);
+                if (!family?.source_claims.includes(claim.id)) {
+                    throw new Error(
+                        `inventory claim ${claim.id} family_link ${familyId} lacks reciprocal family source_claim`,
+                    );
+                }
+            }
             const owners = executableVariantsByClaim.get(claim.id) ?? [];
             if (EXECUTABLE_DISPOSITIONS.has(claim.disposition)) {
                 if (claim.family_links.length === 0 || owners.length === 0) {

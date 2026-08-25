@@ -239,20 +239,48 @@ export class MockProvider {
         const isEmbeddings =
             url.pathname === "/embeddings" || url.pathname === "/v1/embeddings";
         if (method === "POST" && isEmbeddings) {
-            let body: Record<string, unknown> = {};
+            let rawBody: unknown;
             try {
-                body = (await req.json()) as Record<string, unknown>;
+                rawBody = await req.json();
             } catch {
-                body = {};
+                rawBody = null;
             }
-            const rawInput = body.input;
-            const inputs = Array.isArray(rawInput)
-                ? rawInput.map((entry) => String(entry))
-                : [String(rawInput ?? "")];
-            const model =
-                typeof body.model === "string"
-                    ? body.model
-                    : "mock-embedding-model";
+            const bodyIsObject =
+                rawBody !== null &&
+                typeof rawBody === "object" &&
+                !Array.isArray(rawBody);
+            const body = bodyIsObject
+                ? (rawBody as Record<string, unknown>)
+                : null;
+            const rawInput = body?.input;
+            const inputIsValid =
+                typeof rawInput === "string" ||
+                (Array.isArray(rawInput) &&
+                    rawInput.length > 0 &&
+                    rawInput.every((entry) => typeof entry === "string"));
+            const inputTypeIsValid =
+                body !== null &&
+                (!("input_type" in body) ||
+                    typeof body.input_type === "string");
+            if (
+                body === null ||
+                typeof body.model !== "string" ||
+                !inputTypeIsValid ||
+                !inputIsValid
+            ) {
+                return new Response(
+                    JSON.stringify({
+                        error: "bad_request",
+                        message: "invalid embedding request",
+                    }),
+                    {
+                        status: 400,
+                        headers: { "content-type": "application/json" },
+                    },
+                );
+            }
+            const inputs = Array.isArray(rawInput) ? rawInput : [rawInput];
+            const model = body.model;
             this.capturedEmbeddings.push({
                 receivedAt: Date.now(),
                 model,

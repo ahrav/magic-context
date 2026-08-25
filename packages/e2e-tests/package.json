@@ -13,6 +13,8 @@
         "validate-mode-manifest": "bun scripts/validate-mode-manifest.ts --mode ts",
         "validate:incident-history": "bun scripts/validate-incident-history.ts",
         "validate:incident-history:ci": "bun scripts/validate-incident-history.ts --ci",
+        "validate:incident-verifiers": "bun scripts/validate-incident-verifiers.ts --base origin/main",
+        "validate:incident-verifiers:ci": "bun scripts/validate-incident-verifiers.ts --ci",
         "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
         "test:incident-unit": "bun scripts/run-test-selection.ts --incident-unit --timeout 120000",
         "test:incidents": "bun scripts/run-incident-pool.ts --report artifacts/incident-pool-ts-report.json",

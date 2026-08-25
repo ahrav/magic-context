@@ -3,6 +3,7 @@
 import { Glob } from "bun";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import ts from "typescript";
 import {
     parseIncidentCatalog,
     type IncidentCatalog,
@@ -183,24 +184,100 @@ export function validateGreenIncidentWrapperSource(
             family.variants.map((variant) => [variant.id, variant] as const),
         ),
     );
-    const ids = [
-        ...new Set(source.match(/\bvar-[a-z0-9-]+\b/g) ?? []),
-    ].sort();
-    if (ids.length === 0) {
-        throw new Error("green incident wrapper selects no registry IDs");
-    }
-    for (const id of ids) {
-        const variant = variants.get(id);
-        if (!variant) {
-            throw new Error(`green incident wrapper selects unknown registry ID ${id}`);
+    const parsed = ts.createSourceFile(
+        "incident-pool-green.test.ts",
+        source,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TS,
+    );
+    const arrayIds = (name: string): string[] => {
+        const findDeclaration = (
+            node: ts.Node,
+        ): ts.VariableDeclaration | undefined => {
+            if (
+                ts.isVariableDeclaration(node) &&
+                ts.isIdentifier(node.name) &&
+                node.name.text === name &&
+                node.initializer
+            ) {
+                return node;
+            }
+            let found: ts.VariableDeclaration | undefined;
+            node.forEachChild((child) => {
+                found ??= findDeclaration(child);
+            });
+            return found;
+        };
+        const declaration = findDeclaration(parsed);
+        if (!declaration?.initializer) {
+            throw new Error(`green incident wrapper lacks ${name}`);
         }
-        if (variant.lane !== "green") {
+        const expression = ts.isAsExpression(declaration.initializer)
+            ? declaration.initializer.expression
+            : declaration.initializer;
+        if (!ts.isArrayLiteralExpression(expression)) {
+            throw new Error(`green incident wrapper ${name} must be an array`);
+        }
+        const ids = expression.elements.map((element) => {
+            if (!ts.isStringLiteral(element)) {
+                throw new Error(
+                    `green incident wrapper ${name} must contain only string literals`,
+                );
+            }
+            return element.text;
+        });
+        if (new Set(ids).size !== ids.length) {
+            throw new Error(`green incident wrapper ${name} contains duplicates`);
+        }
+        return [...ids].sort();
+    };
+    const expected = (harness: "opencode" | "rust"): string[] =>
+        [...variants.values()]
+            .filter(
+                (variant) =>
+                    variant.lane === "green" &&
+                    variant.applicability?.harness === harness,
+            )
+            .map((variant) => variant.id)
+            .sort();
+    const arrays = [
+        ["OPENCODE_GREEN_VARIANT_IDS", "opencode"],
+        ["RUST_GREEN_VARIANT_IDS", "rust"],
+    ] as const;
+    const selected: string[] = [];
+    for (const [name, harness] of arrays) {
+        const actual = arrayIds(name);
+        for (const id of actual) {
+            const variant = variants.get(id);
+            if (!variant) {
+                throw new Error(
+                    `green incident wrapper selects unknown registry ID ${id}`,
+                );
+            }
+            if (variant.lane !== "green") {
+                throw new Error(
+                    `green incident wrapper selects known-red registry ID ${id}`,
+                );
+            }
+            if (variant.applicability?.harness !== harness) {
+                throw new Error(
+                    `green incident wrapper selects ${id} in the wrong canonical harness array`,
+                );
+            }
+        }
+        const complete = expected(harness);
+        if (
+            actual.length !== complete.length ||
+            actual.some((id, index) => id !== complete[index])
+        ) {
             throw new Error(
-                `green incident wrapper selects known-red registry ID ${id}`,
+                `green incident wrapper ${name} must equal complete catalog green set: ${complete.join(", ")}`,
             );
         }
+        selected.push(...actual);
     }
-    return ids;
+    return selected.sort();
 }
 
 export function validateGreenPackageScripts(raw: unknown): void {
@@ -311,10 +388,10 @@ if (import.meta.main) {
     try {
         const { mode, harness } = parseArgs(Bun.argv.slice(2));
         const validation = validateModeManifest();
-        if (!mode) {
-            console.log(`validated ${validation.files.length} e2e test entries`);
-        } else {
+        if (mode) {
             for (const path of filesForMode(validation, mode, harness)) console.log(path);
+        } else {
+            console.log(`validated ${validation.files.length} e2e test entries`);
         }
     } catch (error) {
         console.error(`mode manifest validation failed: ${String(error)}`);

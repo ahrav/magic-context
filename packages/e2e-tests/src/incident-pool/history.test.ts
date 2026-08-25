@@ -307,6 +307,24 @@ describe("adjudication ledger replay", () => {
         );
     });
 
+    it("rejects correction, resolution, or retirement superseding a baseline", () => {
+        for (const kind of ["correction", "resolution", "retirement"] as const) {
+            const data = fixture();
+            data.events.push(
+                event({
+                    event_id: `adj-${kind}`,
+                    identity: "var-red-one",
+                    seq: 3,
+                    kind,
+                    supersedes: "adj-red-two",
+                }),
+            );
+            expect(() => validateIncidentHistory(snapshot(data))).toThrow(
+                /only a baseline event may supersede baseline adj-red-two/,
+            );
+        }
+    });
+
     it("rejects a baseline that does not supersede the current baseline", () => {
         const data = fixture();
         data.events.push(
@@ -535,6 +553,21 @@ describe("repository-baseline comparison", () => {
         ).toThrow(/reordered/);
     });
 
+    it("rejects inserting a new row before the accepted prefix", () => {
+        const accepted = snapshot(fixture());
+        const inserted = fixture();
+        claims(inserted).unshift({
+            id: "claim-new-one",
+            content_digest: HEX("9"),
+            disposition: "informational",
+            rationale: "new appended provenance was inserted in the wrong position",
+            family_links: ["fam-demo"],
+        });
+        expect(() =>
+            compareWithAcceptedSnapshot(accepted, snapshot(inserted)),
+        ).toThrow(/preceded by an insertion/);
+    });
+
     it("rejects a variant edit without a new baseline and accepts a fingerprint-bound revision", () => {
         const accepted = snapshot(fixture());
         const edited = fixture();
@@ -610,7 +643,9 @@ describe("repository-baseline comparison", () => {
         ).not.toThrow();
         expect(() =>
             compareWithAcceptedSnapshot(snapshot(withNew), snapshot(reworked)),
-        ).toThrow(/adjudication ledger prefix changed|accepted variant edited/);
+        ).toThrow(
+            /adjudication ledger prefix changed|accepted variant edited|may change only rationale and source_revision/,
+        );
     });
 
     it("rejects a ledger prefix change without a redaction and accepts an exact digest-bound one", () => {
@@ -639,6 +674,29 @@ describe("repository-baseline comparison", () => {
         expect(() =>
             compareWithAcceptedSnapshot(accepted, snapshot(redactedData)),
         ).not.toThrow();
+    });
+
+    it("rejects an exact digest-bound redaction that changes baseline oracle fields", () => {
+        const acceptedData = fixture();
+        const accepted = snapshot(acceptedData);
+        const before = acceptedData.events[1]!;
+        const after = {
+            ...before,
+            observation_signature: HEX("8"),
+        };
+        const redacted = fixture();
+        redacted.events[1] = after;
+        redacted.redactions.push(
+            redactionFor(
+                "adjudication_event",
+                before.event_id,
+                before,
+                after,
+            ),
+        );
+        expect(() =>
+            compareWithAcceptedSnapshot(accepted, snapshot(redacted)),
+        ).toThrow(/may change only rationale and source_revision/);
     });
 
     it("rejects a redaction with the wrong base, digests, or rewritten logical identity", () => {

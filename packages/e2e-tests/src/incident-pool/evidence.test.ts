@@ -73,9 +73,20 @@ describe("source inventory completeness (R1)", () => {
         const byId = new Map(
             inventory.items.map((item) => [item.id, item] as const),
         );
+        const auditClaimIds = byId
+            .get("src-audit-known-issues")!
+            .claims.map((claim) => claim.id);
+        expect(auditClaimIds).toHaveLength(65);
         expect(
-            byId.get("src-audit-known-issues")!.claims.length,
-        ).toBeGreaterThanOrEqual(60);
+            auditClaimIds.filter((id) => /^claim-audit-a\d+$/.test(id)),
+        ).toHaveLength(54);
+        expect(
+            auditClaimIds.filter((id) => /^claim-audit-g\d+$/.test(id)),
+        ).toEqual(["claim-audit-g1", "claim-audit-g2"]);
+        expect(auditClaimIds).toContain("claim-audit-a6b");
+        expect(auditClaimIds).toContain(
+            "claim-audit-note-a14-update-session-facts-is-now-fully-retired-no-live-reader",
+        );
         expect(byId.get("src-parity-findings-s2")!.claims).toHaveLength(16);
         expect(
             byId.get("src-thinking-block-adjudication")!.claims,
@@ -359,7 +370,30 @@ describe("ownership matrix (U3 approach 4)", () => {
             "src/incident-pool/scenarios/source-linked-regressions.ts#driveSomethingElse";
         expect(() =>
             verifyOwnershipMatrix(committedInventory(), catalog2),
-        ).toThrow(/does not export driveSomethingElse/);
+        ).toThrow(/does not export function driveSomethingElse/);
+    });
+
+    it("rejects comment-only text that looks like an exported function", () => {
+        const relative = `src/incident-pool/scenarios/comment-only-${Date.now()}.ts`;
+        const absolute = resolve(E2E_ROOT, relative);
+        writeFileSync(
+            absolute,
+            "// export function driveFirstRenderPureDeferStability() {}\n",
+        );
+        try {
+            const catalog = committedCatalog();
+            const variant = findVariant(
+                catalog,
+                "var-parity-a1-pure-defer-stability",
+            );
+            variant.verifier_binding!.driver =
+                `${relative}#driveFirstRenderPureDeferStability`;
+            expect(() =>
+                verifyOwnershipMatrix(committedInventory(), catalog),
+            ).toThrow(/does not export function driveFirstRenderPureDeferStability/);
+        } finally {
+            rmSync(absolute, { force: true });
+        }
     });
 
     it("rejects any declared executable binding after rollout", () => {
@@ -371,6 +405,23 @@ describe("ownership matrix (U3 approach 4)", () => {
         expect(() =>
             verifyOwnershipMatrix(committedInventory(), catalog),
         ).toThrow(/requires a live verifier binding/);
+    });
+
+    it("requires reciprocal inventory and family ownership links", () => {
+        const inventoryMissing = committedInventory();
+        findClaim(inventoryMissing, "claim-audit-a5").family_links = [];
+        expect(() =>
+            verifyOwnershipMatrix(inventoryMissing, committedCatalog()),
+        ).toThrow(/lacks reciprocal inventory family_link/);
+
+        const catalogMissing = committedCatalog();
+        const family = catalogMissing.families.find(
+            (entry) => entry.id === "fam-archived-reobservation",
+        )!;
+        family.source_claims = [];
+        expect(() =>
+            verifyOwnershipMatrix(committedInventory(), catalogMissing),
+        ).toThrow(/lacks reciprocal family source_claim/);
     });
 
     it("rejects giving an unsupported claim an executable target (AE3)", () => {

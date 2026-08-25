@@ -412,6 +412,47 @@ describe("incident catalog contract", () => {
         ).toThrow(/blocked_by references unknown variant var-ghost/);
     });
 
+    it("rejects duplicate values in contract arrays", () => {
+        expect(() =>
+            parseSourceInventory(
+                inventory([
+                    claim("claim-red-one", {
+                        family_links: ["fam-demo", "fam-demo"],
+                    }),
+                ]),
+            ),
+        ).toThrow(/must not contain duplicates/);
+        expect(() =>
+            parseIncidentCatalog(
+                catalog([
+                    variant("var-red-one", {
+                        normative_checks: [
+                            "check-durable-state",
+                            "check-durable-state",
+                        ],
+                    }),
+                ]),
+            ),
+        ).toThrow(/must not contain duplicates/);
+        expect(() =>
+            parseIncidentCatalog(
+                catalog([
+                    variant("var-red-one", {
+                        verifier_binding: {
+                            driver: "d",
+                            verifier: "v",
+                            binding_status: "declared",
+                            invalid_state_evidence: [
+                                "crafted invalid state",
+                                "crafted invalid state",
+                            ],
+                        },
+                    }),
+                ]),
+            ),
+        ).toThrow(/must not contain duplicates/);
+    });
+
     it("rejects a malformed semantic revision fingerprint", () => {
         expect(() =>
             parseIncidentCatalog(
@@ -481,25 +522,28 @@ describe("adjudication event contract", () => {
         ).toThrow(/observation_signature/);
     });
 
-    it("rejects a green baseline carrying red-only fields", () => {
+    it("rejects a green baseline carrying a forbidden observation signature", () => {
         expect(() =>
             parseAdjudicationEvent(
                 event({
                     baseline_verdict: "green",
-                    observation_signature: null,
+                    expected_failed_checks: null,
+                    observation_signature: HEX("d"),
                 }),
                 "e",
             ),
         ).toThrow(/green baseline must not carry/);
     });
 
-    it("rejects non-baseline events carrying baseline fields", () => {
+    it("rejects non-baseline events carrying failed checks and a signature", () => {
         expect(() =>
             parseAdjudicationEvent(
                 event({
                     kind: "resolution",
-                    expected_failed_checks: null,
-                    observation_signature: null,
+                    baseline_verdict: null,
+                    semantic_fingerprint: null,
+                    expected_failed_checks: ["check-durable-state"],
+                    observation_signature: HEX("d"),
                 }),
                 "e",
             ),

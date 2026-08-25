@@ -245,20 +245,21 @@ export function loadHistorySnapshotFromGit(
     commit: string,
     git: GitRunner,
 ): HistorySnapshot {
-    const text = new Map<string, string>();
-    const missing: string[] = [];
-    for (const name of INCIDENT_FILES) {
-        const result = git(
-            ["show", `${commit}:packages/e2e-tests/incidents/${name}`],
-            repoRoot,
+    const incidentDir = "packages/e2e-tests/incidents";
+    const tree = git(
+        ["ls-tree", "-r", "--name-only", commit, "--", incidentDir],
+        repoRoot,
+    );
+    if (tree.status !== 0) {
+        throw new Error(
+            `could not inspect trusted incident baseline: ${tree.stderr.trim() || `git ls-tree exited ${tree.status}`}`,
         );
-        if (result.status === 0) {
-            text.set(name, result.stdout);
-        } else {
-            missing.push(name);
-        }
     }
-    if (missing.length === INCIDENT_FILES.length) {
+    const listed = tree.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+    if (listed.length === 0) {
         return {
             baseLabel: commit,
             inventoryText: JSON.stringify({
@@ -273,10 +274,25 @@ export function loadHistorySnapshotFromGit(
             redactionLines: [],
         };
     }
+
+    const text = new Map<string, string>();
+    const missing = INCIDENT_FILES.filter(
+        (name) => !listed.includes(`${incidentDir}/${name}`),
+    );
     if (missing.length > 0) {
         throw new Error(
             `trusted baseline has only part of incident history: missing ${missing.join(", ")}`,
         );
+    }
+    for (const name of INCIDENT_FILES) {
+        const path = `${incidentDir}/${name}`;
+        const result = git(["show", `${commit}:${path}`], repoRoot);
+        if (result.status !== 0) {
+            throw new Error(
+                `could not read trusted incident file ${path}: ${result.stderr.trim() || `git show exited ${result.status}`}`,
+            );
+        }
+        text.set(name, result.stdout);
     }
     return {
         baseLabel: commit,

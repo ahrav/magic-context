@@ -555,8 +555,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [check-plugin, check-pi-plugin]
     timeout-minutes: 60
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -581,6 +579,9 @@ jobs:
 
       - name: Validate append-only incident history against trusted event base
         run: bun run --cwd packages/e2e-tests validate:incident-history:ci
+
+      - name: Reject changed mutation-bound verifiers without replay evidence
+        run: bun run --cwd packages/e2e-tests validate:incident-verifiers:ci
 
       - name: Run incident unit coverage
         run: bun run --cwd packages/e2e-tests test:incident-unit

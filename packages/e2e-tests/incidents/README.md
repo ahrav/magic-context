@@ -67,6 +67,11 @@ Changing an executable verifier requires serial replay of every mutation record
 bound to that verifier. Each crafted invalid state must still produce the
 reviewed red result before merge. Keep observed-red and reverted-green evidence.
 
+CI currently enforces a conservative contributor gate: it derives each bound
+verifier's bytes from the trusted event base and rejects any drift. The gate
+does not claim replay occurred and has no replay-evidence ingestion path yet.
+Land verifier changes only after adding reviewed replay support to that gate.
+
 ## Publication and privacy
 
 Use synthetic fixtures only. Published reports allow only schema IDs, family and

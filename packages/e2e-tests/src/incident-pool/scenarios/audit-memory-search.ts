@@ -216,12 +216,19 @@ const IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/harness.ts",
 ];
 
+const A32_IMPLEMENTATION_FILES = [
+    ...IMPLEMENTATION_FILES,
+    "packages/plugin/src/features/magic-context/memory/storage-memory-claims.ts",
+];
+
 // ---------------------------------------------------------------------------
 // A5 — archived re-observation (accepted behavior, green)
 // ---------------------------------------------------------------------------
 
 export const ARCHIVED_REOBSERVATION_FIXTURE = {
     fact: "The ledger reconciliation queue must drain before publishing export snapshots.",
+    activeControl:
+        "The active reconciliation owner is the release captain for export snapshots.",
     category: "PROJECT_RULES",
     reobservation: "same-normalized-content-different-bytes",
     searchQuery: "reconciliation",
@@ -245,6 +252,7 @@ export type ArchivedReobservationObservation = {
     observerReadConsistent: boolean;
     searchAcknowledged: boolean;
     searchReturnsFact: boolean;
+    searchReturnsActiveControl: boolean;
 };
 
 const A5_FIELDS: Record<string, FieldKind> = {
@@ -264,6 +272,7 @@ const A5_FIELDS: Record<string, FieldKind> = {
     observerReadConsistent: "boolean",
     searchAcknowledged: "boolean",
     searchReturnsFact: "boolean",
+    searchReturnsActiveControl: "boolean",
 };
 
 export function normalizeArchivedReobservation(
@@ -314,7 +323,9 @@ export function verifyArchivedReobservation(
         ),
         check(
             "check-a5-no-agent-recall",
-            obs.searchAcknowledged && !obs.searchReturnsFact,
+            obs.searchAcknowledged &&
+                obs.searchReturnsActiveControl &&
+                !obs.searchReturnsFact,
         ),
     ];
 }
@@ -396,6 +407,16 @@ export async function driveArchivedReobservation(
             prompt: "the reconciliation rule came up again; record it",
         });
 
+        const activeControl = await runScriptedToolCall(h, sessionId, {
+            tool: "ctx_memory",
+            input: {
+                action: "write",
+                category: fixture.category,
+                content: fixture.activeControl,
+            },
+            prompt: "record the active reconciliation owner",
+        });
+
         const search = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_search",
             input: {
@@ -424,12 +445,14 @@ export async function driveArchivedReobservation(
             memoryToolPublished:
                 write.publishedToolName === "ctx_memory" &&
                 archive.publishedToolName === "ctx_memory" &&
-                reobserve.publishedToolName === "ctx_memory",
+                reobserve.publishedToolName === "ctx_memory" &&
+                activeControl.publishedToolName === "ctx_memory",
             searchToolPublished: search.publishedToolName === "ctx_search",
             argsValidated: argsValidated([
                 write.resultText,
                 archive.resultText,
                 reobserve.resultText,
+                activeControl.resultText,
                 search.resultText,
             ]),
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),
@@ -448,7 +471,10 @@ export async function driveArchivedReobservation(
             recurrenceCount: durable.seenCount,
             observerReadConsistent,
             searchAcknowledged: search.resultText.length > 0,
-            searchReturnsFact: search.resultText.includes("[memory]"),
+            searchReturnsFact: search.resultText.includes(fixture.fact),
+            searchReturnsActiveControl: search.resultText.includes(
+                fixture.activeControl,
+            ),
         };
     } finally {
         await h.dispose();
@@ -1228,17 +1254,22 @@ export const PENDING_NOTE_RECALL_FIXTURE = {
     surfaceCondition:
         "the vendor changelog announces the zanzibar export button",
     searchQuery: "zanzibar",
+    activeControl:
+        "Current project focus: keep the atlas export control ledger available.",
 } as const;
 
 export type PendingNoteRecallObservation = {
     kind: "a54-pending-note-recall";
     noteToolPublished: boolean;
+    memoryToolPublished: boolean;
     searchToolPublished: boolean;
     argsValidated: boolean;
     workspaceScoped: boolean;
     namespaceUnique: boolean;
     noteCreateAcknowledged: boolean;
+    controlWriteAcknowledged: boolean;
     noteDurablePending: boolean;
+    ordinaryTurnSurfacedControl: boolean;
     ordinaryTurnSurfacedNote: boolean;
     explicitSearchReturnedNote: boolean;
     explicitSearchLabeledPending: boolean;
@@ -1246,12 +1277,15 @@ export type PendingNoteRecallObservation = {
 
 const A54_FIELDS: Record<string, FieldKind> = {
     noteToolPublished: "boolean",
+    memoryToolPublished: "boolean",
     searchToolPublished: "boolean",
     argsValidated: "boolean",
     workspaceScoped: "boolean",
     namespaceUnique: "boolean",
     noteCreateAcknowledged: "boolean",
+    controlWriteAcknowledged: "boolean",
     noteDurablePending: "boolean",
+    ordinaryTurnSurfacedControl: "boolean",
     ordinaryTurnSurfacedNote: "boolean",
     explicitSearchReturnedNote: "boolean",
     explicitSearchLabeledPending: "boolean",
@@ -1273,11 +1307,17 @@ export function preconditionPendingNoteRecall(
     const obs = normalizePendingNoteRecall(observation as JsonValue);
     const provenanceOk =
         obs.noteToolPublished &&
+        obs.memoryToolPublished &&
         obs.searchToolPublished &&
         obs.argsValidated &&
         obs.workspaceScoped &&
         obs.namespaceUnique;
-    if (!provenanceOk || !obs.noteCreateAcknowledged || !obs.noteDurablePending)
+    if (
+        !provenanceOk ||
+        !obs.noteCreateAcknowledged ||
+        !obs.controlWriteAcknowledged ||
+        !obs.noteDurablePending
+    )
         return unmet();
     return { satisfied: true };
 }
@@ -1293,7 +1333,7 @@ export function verifyPendingNoteRecall(
         ),
         check(
             "check-a54-no-unprompted-surfacing",
-            !obs.ordinaryTurnSurfacedNote,
+            obs.ordinaryTurnSurfacedControl && !obs.ordinaryTurnSurfacedNote,
         ),
     ];
 }
@@ -1319,6 +1359,15 @@ export async function drivePendingNoteRecall(
             },
             prompt: "park a follow-up for the vendor export work",
         });
+        const activeControl = await runScriptedToolCall(h, writerSessionId, {
+            tool: "ctx_memory",
+            input: {
+                action: "write",
+                category: "PROJECT_RULES",
+                content: fixture.activeControl,
+            },
+            prompt: "record the current atlas export focus",
+        });
         const noteDurablePending = readContextDb(h, (db) => {
             const row = db
                 .prepare(
@@ -1338,6 +1387,9 @@ export async function drivePendingNoteRecall(
             "ordinary turn: summarize the current focus areas",
         );
         const ordinaryWire = JSON.stringify(lastMainBody(h));
+        const ordinaryTurnSurfacedControl = ordinaryWire.includes(
+            fixture.activeControl,
+        );
         const ordinaryTurnSurfacedNote = ordinaryWire.includes(
             fixture.searchQuery,
         );
@@ -1355,14 +1407,23 @@ export async function drivePendingNoteRecall(
         return {
             kind: "a54-pending-note-recall",
             noteToolPublished: note.publishedToolName === "ctx_note",
+            memoryToolPublished:
+                activeControl.publishedToolName === "ctx_memory",
             searchToolPublished: search.publishedToolName === "ctx_search",
-            argsValidated: argsValidated([note.resultText, search.resultText]),
+            argsValidated: argsValidated([
+                note.resultText,
+                activeControl.resultText,
+                search.resultText,
+            ]),
             workspaceScoped: caseHarnessIsWorkspaceScoped(h, context),
             namespaceUnique: caseNamespaceIsUnique(context),
             noteCreateAcknowledged: /Created smart note #\d+/.test(
                 note.resultText,
             ),
+            controlWriteAcknowledged:
+                activeControl.resultText.includes("Saved memory"),
             noteDurablePending,
+            ordinaryTurnSurfacedControl,
             ordinaryTurnSurfacedNote,
             explicitSearchReturnedNote:
                 search.resultText.includes("[note]") &&
@@ -1402,7 +1463,7 @@ export function auditMemorySearchIncidentCases(): RegisteredIncidentCase[] {
         },
         {
             variantId: "var-a32-stale-embedding-recall",
-            implementationFiles: IMPLEMENTATION_FILES,
+            implementationFiles: A32_IMPLEMENTATION_FILES,
             fixtures: { ...EMBEDDING_FRESHNESS_FIXTURE },
             driver: (context) => driveEmbeddingFreshness(context),
             normalizer: (raw) => normalizeEmbeddingFreshness(raw),

@@ -122,6 +122,11 @@ export function replayAdjudicationLedger(
                     `${label}: event ${event.supersedes} is already superseded`,
                 );
             }
+            if (target.kind === "baseline" && event.kind !== "baseline") {
+                throw new Error(
+                    `${label}: only a baseline event may supersede baseline ${event.supersedes}`,
+                );
+            }
         }
         if (event.kind === "baseline") {
             const required = history.latestBaseline?.event_id ?? null;
@@ -354,18 +359,17 @@ function requireOrderedRow<T extends { id: string }>(
     kind: string,
     visit: (accepted: T, candidate: T) => void,
 ): void {
-    const candidateIndex = new Map(
-        candidateRows.map((row, index) => [row.id, index] as const),
-    );
-    let lastIndex = -1;
-    for (const accepted of acceptedRows) {
-        const index = candidateIndex.get(accepted.id);
-        if (index === undefined)
+    for (const [index, accepted] of acceptedRows.entries()) {
+        const candidate = candidateRows[index];
+        if (!candidate || candidate.id !== accepted.id) {
+            if (candidateRows.some((row) => row.id === accepted.id)) {
+                throw new Error(
+                    `accepted ${kind} reordered or preceded by an insertion: ${accepted.id}`,
+                );
+            }
             throw new Error(`accepted ${kind} deleted: ${accepted.id}`);
-        if (index < lastIndex)
-            throw new Error(`accepted ${kind} reordered: ${accepted.id}`);
-        lastIndex = index;
-        visit(accepted, candidateRows[index]!);
+        }
+        visit(accepted, candidate);
     }
 }
 
@@ -450,6 +454,17 @@ export function compareWithAcceptedSnapshot(
         ) {
             throw new Error(
                 `adjudication ledger prefix rewrote logical identity at line ${index + 1}`,
+            );
+        }
+        const { rationale: beforeRationale, source_revision: beforeRevision, ...beforePinned } = before;
+        const { rationale: afterRationale, source_revision: afterRevision, ...afterPinned } = after;
+        void beforeRationale;
+        void beforeRevision;
+        void afterRationale;
+        void afterRevision;
+        if (canonicalJson(beforePinned) !== canonicalJson(afterPinned)) {
+            throw new Error(
+                `adjudication emergency redaction at line ${index + 1} may change only rationale and source_revision`,
             );
         }
         if (

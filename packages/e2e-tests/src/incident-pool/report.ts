@@ -15,6 +15,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { rowDigest } from "./history";
 import {
     ADJUDICATION_EVENT_ID_RE,
     BASELINE_VERDICTS,
@@ -63,6 +64,8 @@ export type BaselineComparison = (typeof BASELINE_COMPARISONS)[number];
 export const RESULT_REASON_CODES = [
     "deadline_exceeded",
     "exited_without_envelope",
+    "child_exit_failure",
+    "case_execution_failed",
     "invalid_envelope",
     "snapshot_mismatch",
     "duplicate_envelope",
@@ -186,6 +189,22 @@ export function newRunNonce(): string {
     return randomBytes(16).toString("hex");
 }
 
+export type SelectedSetDigestRow = readonly [
+    variantId: string,
+    semanticFingerprint: string,
+    implementationDigest: string,
+    baselineEventId: string,
+];
+
+export function computeSelectedSetDigest(
+    rows: readonly SelectedSetDigestRow[],
+): string {
+    const sorted = [...rows].sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0,
+    );
+    return rowDigest(["incident-selected-set/v1", sorted]);
+}
+
 export function asIdArray(value: unknown, re: RegExp, label: string): string[] {
     if (!Array.isArray(value)) fail(label, "must be an array");
     const ids = value.map((entry, i) => asId(entry, re, `${label}[${i}]`));
@@ -212,7 +231,11 @@ const UNHEALTHY_REASONS: Record<
     readonly ResultReasonCode[]
 > = {
     timeout: ["deadline_exceeded"],
-    crash: ["exited_without_envelope"],
+    crash: [
+        "exited_without_envelope",
+        "child_exit_failure",
+        "case_execution_failed",
+    ],
     unavailable: ["prerequisite_missing"],
     malformed: [
         "invalid_envelope",
@@ -609,6 +632,24 @@ export function parseIncidentReport(raw: unknown): IncidentPoolReport {
             "must equal the distinct family count of the results",
         );
     }
+    const selectedSetDigest = asHex64(
+        record.selected_set_digest,
+        "report.selected_set_digest",
+    );
+    const expectedSelectedSetDigest = computeSelectedSetDigest(
+        results.map((result) => [
+            result.variant_id,
+            result.semantic_fingerprint,
+            result.implementation_digest,
+            result.baseline_event_id,
+        ]),
+    );
+    if (selectedSetDigest !== expectedSelectedSetDigest) {
+        fail(
+            "report.selected_set_digest",
+            "does not match the parsed terminal result set",
+        );
+    }
     const evaluationComplete = results.every(isEvaluationComplete);
     if (record.evaluation_complete !== evaluationComplete) {
         fail(
@@ -624,10 +665,7 @@ export function parseIncidentReport(raw: unknown): IncidentPoolReport {
             record.ledger_fingerprint,
             "report.ledger_fingerprint",
         ),
-        selected_set_digest: asHex64(
-            record.selected_set_digest,
-            "report.selected_set_digest",
-        ),
+        selected_set_digest: selectedSetDigest,
         expected_count: expectedCount,
         family_count: familyCount,
         variant_count: results.length,
@@ -812,12 +850,16 @@ export function readScheduledIncidentReport(
 export function unexpectedIncompleteResults(
     report: IncidentPoolReport,
 ): IncidentCaseResult[] {
+    const resultIds = new Set(report.results.map((result) => result.variant_id));
     return report.results.filter(
         (result) =>
             !isEvaluationComplete(result) &&
             !(
                 result.reason_code === "blocked_by_dependency" &&
-                result.blocked_by.length > 0
+                result.blocked_by.length > 0 &&
+                result.blocked_by.every((dependency) =>
+                    resultIds.has(dependency),
+                )
             ),
     );
 }

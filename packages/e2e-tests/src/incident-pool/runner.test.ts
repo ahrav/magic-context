@@ -29,6 +29,7 @@ import {
 import {
     buildIncidentReport,
     buildScheduledIncidentReport,
+    computeSelectedSetDigest,
     incidentPoolExitCode,
     parseIncidentReport,
     parseScheduledIncidentReport,
@@ -51,6 +52,7 @@ import {
 } from "./runner";
 import {
     CASE_ENV_ALLOWLIST,
+    DiagnosticSink,
     assertLoopbackProviderEndpoints,
     buildCaseEnv,
     createCaseWorkspace,
@@ -654,6 +656,18 @@ describe("isolated case execution", () => {
         expect(result.reason_code).toBe("invalid_envelope");
     }, 20_000);
 
+    it("treats a valid envelope followed by nonzero exit as a crash", async () => {
+        const { result } = await runFakeChild(
+            snapshot,
+            red,
+            "sendEnvelope(); process.exit(7);",
+        );
+        expect(result.run_health).toBe("crash");
+        expect(result.behavioral_verdict).toBe("not_evaluated");
+        expect(result.baseline_comparison).toBe("unscored");
+        expect(result.reason_code).toBe("child_exit_failure");
+    }, 20_000);
+
     it("rejects duplicate envelopes on the result channel", async () => {
         const { result } = await runFakeChild(
             snapshot,
@@ -692,6 +706,26 @@ describe("isolated case execution", () => {
         );
         expect(unreviewed.result.reason_code).toBe("precondition_unmet");
         expect(unreviewed.result.blocked_by).toEqual([]);
+
+        const multiDependency = {
+            ...blocked,
+            blockedBy: ["var-red-one", "var-green-one"],
+        };
+        const subset = await runFakeChild(
+            snapshot,
+            multiDependency,
+            'sendEnvelope({ preconditions: "failed", precondition_reason: "blocked_by_dependency", blocked_by: ["var-red-one"], verdict: null });',
+        );
+        expect(subset.result.reason_code).toBe("precondition_unmet");
+        const exact = await runFakeChild(
+            snapshot,
+            multiDependency,
+            'sendEnvelope({ preconditions: "failed", precondition_reason: "blocked_by_dependency", blocked_by: ["var-green-one", "var-red-one"], verdict: null });',
+        );
+        expect(exact.result.reason_code).toBe("blocked_by_dependency");
+        expect(new Set(exact.result.blocked_by)).toEqual(
+            new Set(["var-red-one", "var-green-one"]),
+        );
     }, 20_000);
 });
 
@@ -797,6 +831,25 @@ sendEnvelope();`;
         expect(loopback.result.behavioral_verdict).toBe("pass");
     }, 20_000);
 
+    it("rejects extraEnv overrides for isolation, identity, credentials, and proxies", async () => {
+        for (const key of [
+            "HOME",
+            "XDG_DATA_HOME",
+            "MC_INCIDENT_VARIANT_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_PROFILE",
+            "OPENAI_API_KEY",
+            "SSH_AUTH_SOCK",
+            "HTTPS_PROXY",
+        ]) {
+            await expect(
+                runFakeChild(snapshot, green, "sendEnvelope();", {
+                    extraEnv: { [key]: "unsafe" },
+                }),
+            ).rejects.toThrow(new RegExp(`unsafe incident case extraEnv key ${key}`));
+        }
+    }, 20_000);
+
     it("keeps the result channel parent-only: a descendant cannot write it even with the nonce", async () => {
         const body = `
 import { spawnSync } from "node:child_process";
@@ -863,12 +916,49 @@ sendEnvelope();`;
             runNonce: snapshot.runNonce,
             harness: snapshot.harness,
             ledgerFingerprint: snapshot.ledgerFingerprint,
-            selectedSetDigest: snapshot.selectedSetDigest,
+            selectedSetDigest: computeSelectedSetDigest([
+                [
+                    result.variant_id,
+                    result.semantic_fingerprint,
+                    result.implementation_digest,
+                    result.baseline_event_id,
+                ],
+            ]),
             selectedVariantIds: ["var-green-one"],
             familyCount: 1,
             results: [result],
         });
         expect(JSON.stringify(report)).not.toContain("DIAGNOSTIC-NOISE");
+    }, 20_000);
+
+    it("contains diagnostic sink failures as a static unhealthy result", async () => {
+        const originalWrite = DiagnosticSink.prototype.write;
+        DiagnosticSink.prototype.write = () => {
+            throw new Error("private diagnostic failure");
+        };
+        try {
+            const report = await runIncidentPool(
+                snapshot,
+                async (selected) =>
+                    (
+                        await runFakeChild(
+                            snapshot,
+                            selected,
+                            'console.log("trigger sink"); sendEnvelope();',
+                        )
+                    ).result,
+            );
+            expect(report.results[0]?.run_health).toBe("crash");
+            expect(report.results[0]?.reason_code).toBe(
+                "case_execution_failed",
+            );
+            expect(JSON.stringify(report)).not.toContain(
+                "private diagnostic failure",
+            );
+            expect(report.completion_marker).toBe(true);
+        } finally {
+            DiagnosticSink.prototype.write = originalWrite;
+        }
     }, 20_000);
 });
 
@@ -877,7 +967,14 @@ function reportInput(snapshot: RunSnapshot, results: IncidentCaseResult[]) {
         runNonce: snapshot.runNonce,
         harness: snapshot.harness,
         ledgerFingerprint: snapshot.ledgerFingerprint,
-        selectedSetDigest: snapshot.selectedSetDigest,
+        selectedSetDigest: computeSelectedSetDigest(
+            results.map((result) => [
+                result.variant_id,
+                result.semantic_fingerprint,
+                result.implementation_digest,
+                result.baseline_event_id,
+            ]),
+        ),
         selectedVariantIds: results.map((result) => result.variant_id),
         familyCount: new Set(results.map((result) => result.family_id)).size,
         results,
@@ -943,7 +1040,7 @@ describe("catalog-bound report", () => {
         const published = readIncidentReport(target);
         expect(published.completion_marker).toBe(true);
         expect(published.evaluation_complete).toBe(true);
-        expect(published.selected_set_digest).toBe(snapshot.selectedSetDigest);
+        expect(published.selected_set_digest).toBe(report.selected_set_digest);
     }, 20_000);
 
     it("publishes one atomic scheduled report for the TS harness schedule", async () => {
@@ -992,6 +1089,14 @@ describe("catalog-bound report", () => {
         expect(() => parseIncidentReport({ ...raw, extra_field: 1 })).toThrow(
             /exactly/,
         );
+        const mutatedResults = structuredClone(raw) as {
+            selected_set_digest: string;
+            results: Array<{ implementation_digest: string }>;
+        };
+        mutatedResults.results[0]!.implementation_digest = HEX("9");
+        expect(() => parseIncidentReport(mutatedResults)).toThrow(
+            /selected_set_digest: does not match the parsed terminal result set/,
+        );
     }, 20_000);
 
     it("publishes structurally complete facts for unhealthy runs with evaluation completeness false", async () => {
@@ -1033,6 +1138,16 @@ describe("catalog-bound report", () => {
         expect(unexpectedIncompleteResults(blockedReport)).toEqual([]);
         expect(incidentPoolExitCode(blockedReport)).toBe(0);
 
+        const missingDependencyReport = buildIncidentReport(
+            reportInput(snapshot, [blockedResult.result]),
+        );
+        expect(
+            unexpectedIncompleteResults(missingDependencyReport).map(
+                (entry) => entry.variant_id,
+            ),
+        ).toEqual(["var-blocked-one"]);
+        expect(incidentPoolExitCode(missingDependencyReport)).toBe(1);
+
         const crashed = await runFakeChild(snapshot, green, "process.exit(3);");
         const crashReport = buildIncidentReport(
             reportInput(snapshot, [redResult.result, crashed.result]),
@@ -1044,6 +1159,25 @@ describe("catalog-bound report", () => {
         ).toEqual(["var-green-one"]);
         expect(incidentPoolExitCode(crashReport)).toBe(1);
     }, 20_000);
+
+    it("continues after one case callback throws and publishes a complete static report", async () => {
+        const report = await runIncidentPool(snapshot, async (selected) => {
+            if (selected.variantId === "var-green-one") {
+                throw new Error("private callback canary must not serialize");
+            }
+            return completedPass(snapshot, selected);
+        });
+        expect(report.results).toHaveLength(snapshot.selected.length);
+        const failed = report.results.find(
+            (result) => result.variant_id === "var-green-one",
+        );
+        expect(failed?.run_health).toBe("crash");
+        expect(failed?.behavioral_verdict).toBe("not_evaluated");
+        expect(failed?.baseline_comparison).toBe("unscored");
+        expect(failed?.reason_code).toBe("case_execution_failed");
+        expect(JSON.stringify(report)).not.toContain("private callback canary");
+        expect(report.completion_marker).toBe(true);
+    }, 30_000);
 
     it("runs the whole pool and keeps expected_red evaluation-complete (AE1 lane exit)", async () => {
         const scriptByVariant: Record<string, string> = {

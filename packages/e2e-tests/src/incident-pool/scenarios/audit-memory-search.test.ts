@@ -68,6 +68,7 @@ function a5Observation(
         observerReadConsistent: true,
         searchAcknowledged: true,
         searchReturnsFact: false,
+        searchReturnsActiveControl: true,
         ...overrides,
     };
 }
@@ -150,12 +151,15 @@ function a54Observation(
     return {
         kind: "a54-pending-note-recall",
         noteToolPublished: true,
+        memoryToolPublished: true,
         searchToolPublished: true,
         argsValidated: true,
         workspaceScoped: true,
         namespaceUnique: true,
         noteCreateAcknowledged: true,
+        controlWriteAcknowledged: true,
         noteDurablePending: true,
+        ordinaryTurnSurfacedControl: true,
         ordinaryTurnSurfacedNote: false,
         explicitSearchReturnedNote: true,
         explicitSearchLabeledPending: true,
@@ -220,6 +224,16 @@ describe("A5 archived re-observation verifier (invalid states)", () => {
             failedIds(
                 verifyArchivedReobservation(
                     a5Observation({ searchAcknowledged: false }),
+                ),
+            ),
+        ).toEqual(["check-a5-no-agent-recall"]);
+    });
+
+    it("rejects return-nothing search implementations using the active recall control", () => {
+        expect(
+            failedIds(
+                verifyArchivedReobservation(
+                    a5Observation({ searchReturnsActiveControl: false }),
                 ),
             ),
         ).toEqual(["check-a5-no-agent-recall"]);
@@ -456,6 +470,16 @@ describe("A54 pending note recall verifier", () => {
         ).toEqual(["check-a54-no-unprompted-surfacing"]);
     });
 
+    it("rejects an all-empty ordinary renderer using the active memory control", () => {
+        expect(
+            failedIds(
+                verifyPendingNoteRecall(
+                    a54Observation({ ordinaryTurnSurfacedControl: false }),
+                ),
+            ),
+        ).toEqual(["check-a54-no-unprompted-surfacing"]);
+    });
+
     it("fails when the explicit search result omits the pending status label", () => {
         expect(
             failedIds(
@@ -473,10 +497,15 @@ describe("A54 pending note recall verifier", () => {
         ).toEqual(["check-a54-explicit-search-pending-status"]);
     });
 
-    it("rejects a note that never persisted as pending", () => {
+    it("rejects a note or positive control that never persisted", () => {
         expect(
             preconditionPendingNoteRecall(
                 a54Observation({ noteDurablePending: false }),
+            ).satisfied,
+        ).toBe(false);
+        expect(
+            preconditionPendingNoteRecall(
+                a54Observation({ controlWriteAcknowledged: false }),
             ).satisfied,
         ).toBe(false);
     });
@@ -494,6 +523,18 @@ describe("catalog binding surface", () => {
             builtinIncidentCaseRegistry(),
             catalog,
         );
+    });
+
+    it("binds A32 to storage-memory-claims without overbinding sibling cases", () => {
+        const registry = builtinIncidentCaseRegistry();
+        const dependency =
+            "packages/plugin/src/features/magic-context/memory/storage-memory-claims.ts";
+        expect(
+            registry.get("var-a32-stale-embedding-recall")!.implementationFiles,
+        ).toContain(dependency);
+        expect(
+            registry.get("var-a5-archived-reobservation")!.implementationFiles,
+        ).not.toContain(dependency);
     });
 
     it("emits exactly the committed normative check ids per case", () => {
@@ -567,6 +608,31 @@ describe("deterministic embedding endpoint", () => {
             expect(captured[0]!.model).toBe("mock-embed");
             expect(captured[0]!.inputType).toBe("passage");
             expect(captured[0]!.inputs).toEqual(["aurora sample"]);
+        } finally {
+            await mock.stop();
+        }
+    });
+
+    it("returns 400 for malformed external embedding JSON without capturing it", async () => {
+        const mock = new MockProvider();
+        const { baseURL } = await mock.start();
+        try {
+            for (const body of [
+                null,
+                { model: "mock-embed", input: { text: "aurora" } },
+                { model: "mock-embed", input: ["aurora", 7] },
+                { model: 7, input: "aurora" },
+                { model: "mock-embed", input: [] },
+                { model: "mock-embed", input: "aurora", input_type: null },
+            ]) {
+                const response = await fetch(`${baseURL}/embeddings`, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify(body),
+                });
+                expect(response.status).toBe(400);
+            }
+            expect(mock.embeddingRequests()).toHaveLength(0);
         } finally {
             await mock.stop();
         }

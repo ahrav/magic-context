@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
     TODO_PARITY_MATRIX,
-    compareDeclaredParitySetup,
     normalizeTodoSyntheticInjection,
     preconditionTodoDeferReplay,
     preconditionTodoSyntheticInjection,
@@ -81,26 +80,6 @@ describe("Rust synthetic todo incident family", () => {
                 "captured-frozen-replayed-cleared",
             );
             expect(row.prerequisites.length).toBeGreaterThan(0);
-        }
-    });
-
-    it("compares only declared normalized setup fields", () => {
-        expect(compareDeclaredParitySetup(SETUP, SETUP)).toBe(true);
-        for (const field of [
-            "promptMatched",
-            "toolRegistryMatched",
-            "environmentMatched",
-            "clonedStateMatched",
-            "modeMatched",
-            "harnessMatched",
-            "prerequisitesMet",
-        ] as const) {
-            expect(
-                compareDeclaredParitySetup(SETUP, {
-                    ...SETUP,
-                    [field]: false,
-                }),
-            ).toBe(false);
         }
     });
 

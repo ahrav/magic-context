@@ -18,7 +18,10 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
             cwd: root,
             onlyFiles: true,
         }),
+        "scripts/check-rust-prerequisites.test.ts",
         "scripts/validate-incident-history.test.ts",
+        "scripts/validate-incident-verifiers.test.ts",
+        "scripts/validate-mode-manifest.test.ts",
     ].sort();
     if (files.length === 0) throw new Error("incident unit selection is empty");
     return files;

@@ -147,8 +147,53 @@ export function verifyFirstRenderPureDeferStability(
     ]);
 }
 
+function messageBlocks(message: unknown): Array<Record<string, unknown>> {
+    if (!message || typeof message !== "object") return [];
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) return [];
+    return content.filter(
+        (block): block is Record<string, unknown> =>
+            block !== null && typeof block === "object" && !Array.isArray(block),
+    );
+}
+
+/** Require the emitted ctx_reduce use/result pair, not its tool declaration. */
+export function hasCtxReducePair(
+    body: Record<string, unknown>,
+    callId: string,
+): boolean {
+    if (!Array.isArray(body.messages)) return false;
+    for (let index = 0; index < body.messages.length - 1; index += 1) {
+        const assistant = body.messages[index];
+        const user = body.messages[index + 1];
+        if (
+            !assistant ||
+            typeof assistant !== "object" ||
+            (assistant as { role?: unknown }).role !== "assistant" ||
+            !user ||
+            typeof user !== "object" ||
+            (user as { role?: unknown }).role !== "user"
+        ) {
+            continue;
+        }
+        const use = messageBlocks(assistant).some(
+            (block) =>
+                block.type === "tool_use" &&
+                block.id === callId &&
+                typeof block.name === "string" &&
+                /ctx_reduce/.test(block.name),
+        );
+        const result = messageBlocks(user).some(
+            (block) =>
+                block.type === "tool_result" && block.tool_use_id === callId,
+        );
+        if (use && result) return true;
+    }
+    return false;
+}
+
 /** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
-function emitCtxReduceOnce(h: TestHarness, drop: string): void {
+function emitCtxReduceOnce(h: TestHarness, drop: string, callId: string): void {
     let emitted = false;
     h.mock.addMatcher((body) => {
         if (emitted) return null;
@@ -170,7 +215,7 @@ function emitCtxReduceOnce(h: TestHarness, drop: string): void {
             content: [
                 {
                     type: "tool_use",
-                    id: `toolu_ci_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
+                    id: callId,
                     name,
                     input: { drop },
                 },
@@ -188,7 +233,7 @@ export async function driveAgedCtxReduceSurvival(
     h.mock.setDefault({ text: "A3 reply 1", usage: DEFER_USAGE });
     await h.sendPrompt(sessionId, "A3 turn 1: establish baseline content.");
 
-    emitCtxReduceOnce(h, "99999");
+    emitCtxReduceOnce(h, FIRST_RENDER_A3_FIXTURE.drop, FIRST_RENDER_A3_FIXTURE.callId);
     h.mock.setDefault({
         text: "A3 reply 2 (after ctx_reduce tool call)",
         usage: DEFER_USAGE,
@@ -206,18 +251,22 @@ export async function driveAgedCtxReduceSurvival(
             sessionId,
             `A3 turn ${i}: defer growth ages the ctx_reduce call.`,
         );
-        const body = JSON.stringify(h.mock.lastRequest()?.body ?? {});
-        if (body.includes("ctx_reduce")) sawReduceOnWire = true;
+        const body = h.mock.lastRequest()?.body;
+        if (body && hasCtxReducePair(body, FIRST_RENDER_A3_FIXTURE.callId)) {
+            sawReduceOnWire = true;
+        }
     }
 
     const requests = mainAgentRequests(h.mock.requests());
     const busts = findBusts(requests);
-    const finalBody = JSON.stringify(requests.at(-1)?.body ?? {});
+    const finalBody = requests.at(-1)?.body;
     return {
         sawReduceOnWire,
         bustCount: busts.length,
         bustReport: busts.length > 0 ? formatBustReport(busts) : "",
-        finalWireHasCtxReduce: finalBody.includes("ctx_reduce"),
+        finalWireHasCtxReduce:
+            finalBody !== undefined &&
+            hasCtxReducePair(finalBody, FIRST_RENDER_A3_FIXTURE.callId),
     };
 }
 
@@ -908,6 +957,8 @@ export const FIRST_RENDER_A3_FIXTURE = {
     scenario: "aged-ctx-reduce-defer-growth",
     turns: 8,
     drop: "99999",
+    callId: "toolu_incident_a3_ctx_reduce",
+    requiredWireEvidence: "matching ctx_reduce tool_use and tool_result blocks",
     modelContextLimit: 100_000,
     executeThresholdPercentage: 20,
 } as const;

@@ -298,11 +298,11 @@ describe("trusted accepted-base derivation", () => {
         ).toThrow(/not an ancestor/);
     });
 
-    it("uses an empty accepted snapshot when the trusted base predates the pool", () => {
-        const git: GitRunner = () => ({
-            status: 128,
+    it("uses an empty accepted snapshot only when ls-tree proves no incident paths", () => {
+        const git: GitRunner = (args) => ({
+            status: args[0] === "ls-tree" ? 0 : 128,
             stdout: "",
-            stderr: "path does not exist",
+            stderr: args[0] === "ls-tree" ? "" : "unexpected git show",
         });
         const snapshot = loadHistorySnapshotFromGit(
             "/fixture",
@@ -321,15 +321,48 @@ describe("trusted accepted-base derivation", () => {
         expect(snapshot.redactionLines).toEqual([]);
     });
 
-    it("fails closed when the trusted base has only part of incident history", () => {
+    it("fails closed when the trusted tree lists only part of incident history", () => {
         const git: GitRunner = (args) => ({
-            status: args.join(" ").includes("source-inventory.json") ? 0 : 128,
-            stdout: "{}",
-            stderr: "path does not exist",
+            status: 0,
+            stdout:
+                args[0] === "ls-tree"
+                    ? "packages/e2e-tests/incidents/source-inventory.json\n"
+                    : "{}",
+            stderr: "",
         });
         expect(() =>
             loadHistorySnapshotFromGit("/fixture", BASE_SHA, git),
         ).toThrow(/only part of incident history/);
+    });
+
+    it("fails closed on ls-tree errors and listed files that git show cannot read", () => {
+        const treeFailure: GitRunner = () => ({
+            status: 128,
+            stdout: "",
+            stderr: "object database unavailable",
+        });
+        expect(() =>
+            loadHistorySnapshotFromGit("/fixture", BASE_SHA, treeFailure),
+        ).toThrow(/could not inspect trusted incident baseline/);
+
+        const paths = [
+            "source-inventory.json",
+            "catalog.json",
+            "adjudications.jsonl",
+            "emergency-redactions.jsonl",
+        ].map((name) => `packages/e2e-tests/incidents/${name}`);
+        const showFailure: GitRunner = (args) => {
+            if (args[0] === "ls-tree") {
+                return { status: 0, stdout: `${paths.join("\n")}\n`, stderr: "" };
+            }
+            if (args.join(" ").includes("catalog.json")) {
+                return { status: 128, stdout: "", stderr: "misc git failure" };
+            }
+            return { status: 0, stdout: "{}", stderr: "" };
+        };
+        expect(() =>
+            loadHistorySnapshotFromGit("/fixture", BASE_SHA, showFailure),
+        ).toThrow(/could not read trusted incident file.*catalog.json/);
     });
 });
 

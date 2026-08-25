@@ -593,6 +593,7 @@ export type PiTodoAnchorObservation = TodoParitySetup & {
     rootTodoWriteExecuted: boolean;
     providerRequestCaptured: boolean;
     activeAnchorExisted: boolean;
+    postTerminalRootCapture: boolean;
     subagentTodoExecuted: boolean;
     subagentGated: boolean;
     terminalTodoExecuted: boolean;
@@ -606,6 +607,7 @@ const ANCHOR_FIELDS = [
     "rootTodoWriteExecuted",
     "providerRequestCaptured",
     "activeAnchorExisted",
+    "postTerminalRootCapture",
     "subagentTodoExecuted",
     "subagentGated",
     "terminalTodoExecuted",
@@ -642,7 +644,12 @@ export function verifyPiTodoAnchorLifecycle(
 ): VerifierCheck[] {
     const value = observation as PiTodoAnchorObservation;
     return [
-        check("check-pi-todo-subagent-gated", value.subagentGated),
+        check(
+            "check-pi-todo-subagent-gated",
+            value.activeAnchorExisted &&
+                value.postTerminalRootCapture &&
+                value.subagentGated,
+        ),
         check(
             "check-pi-todo-terminal-anchor-clear",
             value.activeAnchorExisted &&
@@ -676,6 +683,17 @@ export async function drivePiTodoAnchorLifecycle(
         );
         const terminalMeta = readPiTodoMeta(h, prepared.sessionId);
 
+        const rootControlSession = await newPiSessionId(h);
+        const rootControlProbe = await captureTodoState(
+            piAdapter(h),
+            STATE_X_TODOS,
+            "Pi post-terminal root capture control",
+        );
+        const rootControlMeta = readPiTodoMeta(h, rootControlSession);
+        const postTerminalRootCapture =
+            rootControlProbe.executed &&
+            rootControlMeta?.last_todo_state === normalizedTodoJson(STATE_X_TODOS);
+
         const subagentSession = await newPiSessionId(h);
         updatePiTodoMeta(
             h,
@@ -700,6 +718,7 @@ export async function drivePiTodoAnchorLifecycle(
             rootTodoWriteExecuted: prepared.toolExecuted,
             providerRequestCaptured: prepared.body !== null,
             activeAnchorExisted,
+            postTerminalRootCapture,
             subagentTodoExecuted: subagentProbe.executed,
             subagentGated,
             terminalTodoExecuted: terminalProbe.executed,
@@ -707,8 +726,7 @@ export async function drivePiTodoAnchorLifecycle(
                 terminalMeta?.last_todo_state ===
                 normalizedTodoJson(TERMINAL_TODOS),
             terminalPairAbsent:
-                terminalBody !== null &&
-                findSyntheticPair(terminalBody, prepared.callId) === null,
+                terminalBody !== null && findSyntheticPair(terminalBody) === null,
             terminalAnchorCleared:
                 (terminalMeta?.todo_synthetic_call_id ?? "") === "" &&
                 (terminalMeta?.todo_synthetic_anchor_message_id ?? "") === "" &&
@@ -778,7 +796,10 @@ export function parityPiTodoIncidentCases(): RegisteredIncidentCase[] {
             implementationFiles: PI_IMPLEMENTATION_FILES,
             fixtures: {
                 matrix: PI_MATRIX_FIXTURE,
-                assertions: ["subagent-gate", "terminal-clear"],
+                assertions: [
+                    "subagent-gate-with-fresh-post-terminal-root-control",
+                    "terminal-clear-with-any-pair-scan",
+                ],
                 pressure: TODO_PRESSURE_FIXTURE,
             },
             driver: drivePiTodoAnchorLifecycle,
