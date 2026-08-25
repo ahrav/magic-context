@@ -603,12 +603,14 @@ The fallback vocabulary is closed. Fallback always selects the offered `tcp` ent
 
 | `reason` | Meaning |
 | --- | --- |
-| `unavailable` | the host has no installed provider for any non-TCP offer |
+| `unavailable` | an installed, statically eligible non-TCP offer is dynamically unavailable: provider readiness (`Recovering`/`Quarantined`) or admission pressure. Permanent absence of a provider and statically ineligible offer parameters are NOT `unavailable`; they select TCP with no `reason` |
 | `negotiation_version_mismatch` | the host does not speak the requested `negotiation_version`; the request still parsed under version-1 grammar |
 | `capability_version_mismatch` | an offered transport is installed but no offered `capability_version` intersects the host's |
 | `connection_in_use` | the first negotiation arrived after the generation already committed to TCP |
 
 A valid TCP selection carrying one of these reasons, a direct TCP selection, or an exact legacy terminal `unsupported_operation` for `transport.negotiate` is the complete set of TCP-continuation evidence. Timeout, malformed content, an unoffered selection, token mismatch, provider attachment failure, activation or commit failure, channel failure, and base-wire or authentication failure are **not** fallback evidence and MUST fail closed without same-generation TCP fallback.
+
+Exact `unavailable` is the only selection that authorizes an automatic client re-upgrade probe: the client keeps the committed TCP generation primary and MAY retry a fresh shadow setup (discovery, authentication, negotiation, activation, commit) under one immutable bounded episode deadline, moving only new managed work after a successful commit. A reasonless TCP selection, every other fallback reason, the legacy terminal, and any post-grant failure MUST NOT start or extend that probe window.
 
 #### 7.7.4 Candidate activation and commit
 

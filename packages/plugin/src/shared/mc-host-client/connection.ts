@@ -192,6 +192,11 @@ export interface ConnectionGenerationOptions {
     onRetired?: (info: RetirementInfo) => void;
     /** Route Goodbye events; the generation owns no route cache (KTD6). */
     onRouteGoodbye?: (channel: number, epoch: number) => void;
+    /**
+     * onPendingZero signals an owner that outstanding work has drained.
+     * Retirement does not invoke onPendingZero.
+     */
+    onPendingZero?: () => void;
     /** Bounded read-only diagnostics hook (KTD12); see ConnectionDiagnosticEvent. */
     onDiagnostic?: (event: ConnectionDiagnosticEvent) => void;
 }
@@ -307,6 +312,7 @@ export class ConnectionGeneration {
     private readonly cleanupTicketMs: number;
     private readonly onRetired?: (info: RetirementInfo) => void;
     private readonly onRouteGoodbyeHook?: (channel: number, epoch: number) => void;
+    private readonly onPendingZeroHook?: () => void;
     private readonly onDiagnostic?: (event: ConnectionDiagnosticEvent) => void;
 
     private retiredInfo: RetirementInfo | null = null;
@@ -333,6 +339,7 @@ export class ConnectionGeneration {
         this.cleanupTicketMs = options.cleanupTicketMs ?? DEFAULT_CLEANUP_TICKET_MS;
         this.onRetired = options.onRetired;
         this.onRouteGoodbyeHook = options.onRouteGoodbye;
+        this.onPendingZeroHook = options.onPendingZero;
         this.onDiagnostic = options.onDiagnostic;
         this.nextCorr = options.firstCorrelation ?? 1n;
         if (this.nextCorr < 1n || this.nextCorr > MAX_CORRELATION) {
@@ -958,6 +965,13 @@ export class ConnectionGeneration {
         releaseReceiveBodies(entry.streamItems);
         entry.streamItems = [];
         this.resolveTicket(entry);
+        if (this.pending.size === 0 && this.retiredInfo === null) {
+            try {
+                this.onPendingZeroHook?.();
+            } catch {
+                // Observer exceptions must not affect protocol progress.
+            }
+        }
     }
 
     private clearEntryDeadline(entry: PendingEntry): void {
