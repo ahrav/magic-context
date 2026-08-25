@@ -35,7 +35,7 @@ describe("native mechanism gate", () => {
             `import { createRequire } from "node:module";\n` +
                 `const addon = createRequire(import.meta.url)(${JSON.stringify(addon)});\n` +
                 `addon.registerCleanupProbe(${JSON.stringify(marker)});\n` +
-                `addon.createTestPair();\n`,
+                `if (process.platform === "linux") addon.createTestPair();\n`,
         );
         const child = spawnSync(process.execPath, [script], { encoding: "utf8" });
         expect(child.status).toBe(0);

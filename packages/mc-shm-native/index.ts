@@ -37,6 +37,7 @@ interface NativeAddon {
     registerCleanupProbe(path: string): void;
     nativeLeakDiagnostics(): number;
     workerLimit(): number;
+    activeChannelCount(): number;
     attach(descriptor: NativeDescriptor): number;
     createTestPair(): {
         first: number;
@@ -83,7 +84,6 @@ function protect(segments: readonly Uint8Array[]): void {
 }
 
 export function probeCapabilities(): NativeCapabilities {
-    const native = addon();
     const base = {
         napiVersion: null,
         externalArrayBuffer: false,
@@ -95,6 +95,7 @@ export function probeCapabilities(): NativeCapabilities {
     if (process.platform !== "linux") {
         return { available: false, ...base, reason: "platform_unsupported" };
     }
+    const native = addon();
     if (!native) return { available: false, ...base, reason: "addon_unavailable" };
     try {
         const napiVersion = native.napiVersion();
@@ -360,4 +361,8 @@ export function registerCleanupProbe(path: string): boolean {
 
 export function nativeLeakDiagnostics(): number {
     return addon()?.nativeLeakDiagnostics() ?? 0;
+}
+
+export function activeNativeChannels(): number {
+    return addon()?.activeChannelCount() ?? 0;
 }

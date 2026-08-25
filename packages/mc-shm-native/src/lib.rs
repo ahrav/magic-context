@@ -219,6 +219,20 @@ pub fn worker_limit() -> u32 {
 }
 
 #[napi]
+pub fn active_channel_count() -> Result<u32> {
+    REGISTRY.with(|registry| {
+        u32::try_from(
+            registry
+                .try_borrow()
+                .map_err(|_| error("native channel registry is busy"))?
+                .channels
+                .len(),
+        )
+        .map_err(|_| error("native channel count overflow"))
+    })
+}
+
+#[napi]
 pub fn attach(env: &Env, descriptor: NativeDescriptor) -> Result<u32> {
     #[cfg(not(target_os = "linux"))]
     {

@@ -9,9 +9,13 @@
     ".": "./index.ts"
   },
   "scripts": {
-    "build": "cargo build -p mc-shm-native && cp -f ../../target/debug/libmc_shm_native.so ./mc_shm_native.node",
+    "build": "cargo build -p mc-shm-native && cp -f ../../target/debug/libmc_shm_native.$(test \"$(uname -s)\" = Darwin && echo dylib || echo so) ./mc_shm_native.node",
+    "build:source": "bun run build",
     "test": "bun test tests",
+    "test:bun": "bun test tests",
     "test:node": "node --experimental-transform-types tests/runtime.ts",
+    "test:capability:bun": "bun tests/capability.ts",
+    "test:capability:node": "node --experimental-transform-types tests/capability.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

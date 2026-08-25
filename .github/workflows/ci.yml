@@ -10,24 +10,97 @@ env:
 
 # Pipeline shape on every push to main and on every PR:
 #
-#   check-plugin, check-pi-plugin                          (unit tests + lint + typecheck, parallel)
+#   check-plugin, check-pi-plugin
+#   (unit tests + lint + typecheck, parallel)
 #                  ↓
-#   e2e-opencode, e2e-pi                                   (Docker install + smoke, parallel — gated by unit)
+#   e2e-opencode, e2e-pi
+#   (Docker install + smoke, parallel, gated by unit)
 #                  ↓
-#   e2e-host-opencode, e2e-host-pi                         (host behavior suite from packages/e2e-tests, parallel — gated by Docker)
+#   e2e-host-opencode, e2e-host-pi
+#   (host behavior suite, parallel, gated by Docker)
 #
 # Two e2e layers cover different concerns:
-#   - Docker e2e: fresh-install smoke (plugin loads, doctor clean, one mock turn writes DB rows
-#     under cortexkit path with right harness). Catches packaging / install-flow regressions.
-#   - Host e2e: behavior suite with byte-level wire assertions, multi-turn cache stability,
-#     historian publish behavior, tag-owner collision, synthetic todowrite, cross-harness memory,
-#     etc. Spawns real `opencode serve` / Pi subprocesses against an embedded mock provider.
-#     Catches cache-stability + correctness regressions that the smoke layer cannot see.
+#   - Docker e2e: fresh-install smoke. Plugin loads, doctor is clean, and
+#     one mock turn writes DB rows under the correct cortexkit harness path.
+#     This catches packaging and install-flow regressions.
+#   - Host e2e: behavior suite with byte-level wire assertions, multi-turn
+#     cache stability, historian publishing, tag-owner collision, synthetic
+#     todowrite, and cross-harness memory. It spawns real `opencode serve` and
+#     Pi subprocesses against an embedded mock provider. This catches behavior
+#     that the install smoke cannot see.
 #
-# Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here means
+# Docker e2e was previously in e2e-docker.yml. Folding it here means
 # every PR and main push exercises the full unit → Docker → host gauntlet.
 
 jobs:
+  shm-source-build:
+    name: Shared memory source build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Source-build transport, host, addon, and iceoryx
+        run: |
+          cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
+          cargo check -p mc-shm-transport --features iceoryx
+
+      - name: Rust contracts and lifecycle
+        run: >-
+          cargo nextest run
+          -p mc-shm-native -p mc-host -p mc-shm-transport
+
+      - name: Build package-relative addon from source
+        run: bun run --cwd packages/mc-shm-native build:source
+
+      - name: Native behavior (Bun)
+        run: bun run --cwd packages/mc-shm-native test:bun
+
+      - name: Native behavior (Node 24)
+        run: bun run --cwd packages/mc-shm-native test:node
+
+      - name: Capability activation or clean omission (Bun and Node 24)
+        run: |
+          bun run --cwd packages/mc-shm-native test:capability:bun
+          bun run --cwd packages/mc-shm-native test:capability:node
+
+      - name: Plugin shared-memory contracts (Bun)
+        run: bun test packages/plugin/src/shared/mc-host-client
+
+      - name: Plugin shared-memory lifetime (Node 24)
+        run: bun run --cwd packages/plugin test:mc-shm:node
+
+      - name: Plugin typecheck
+        run: bun run --cwd packages/plugin typecheck
+
+      - name: Reject prebuilt native modules
+        run: |
+          test -z "$(git ls-files '*.node')"
+          rm -f packages/mc-shm-native/mc_shm_native.node
+          test ! -e packages/mc-shm-native/mc_shm_native.node
+
   check-plugin:
     name: Check (plugin)
     runs-on: ubuntu-latest
@@ -69,9 +142,9 @@ jobs:
       - name: Smoke (node:sqlite backend)
         run: node packages/plugin/scripts/smoke-node-sqlite.ts
 
-      # The smart-note QuickJS sandbox loads a ~1MB WASM. `bun test` runs it from
-      # src (wasm resolves via node_modules), so it cannot catch a BUNDLING break
-      # where the wasm isn't embedded in dist. This bundles sandbox-runner exactly
+      # Smart-note QuickJS sandbox loads a ~1MB WASM. `bun test` runs it from
+      # src, where wasm resolves via node_modules, so it cannot catch a bundling
+      # break where wasm is not embedded. This bundles sandbox-runner exactly
       # like the package build and runs a real check against the bundle.
       - name: Smoke (smart-note wasm bundle)
         run: bun packages/plugin/scripts/smoke-smartnote-wasm.ts
@@ -211,14 +284,17 @@ jobs:
             bun packages/plugin/scripts/benchmark-retrieval.ts check \
               --profile ci \
               --out "benchmark-artifacts/retrieval-check-report-$run.json" \
-              --candidate-pool "benchmark-artifacts/retrieval-candidate-pool-$run.json"
+              --candidate-pool \
+              "benchmark-artifacts/retrieval-candidate-pool-$run.json"
           done
 
       - name: Gate quality against published ci baseline
         run: |
+          fixtures=packages/plugin/scripts/fixtures/retrieval-benchmark
+          baseline="$fixtures/baselines/v1"
           bun packages/plugin/scripts/benchmark-retrieval.ts regression \
-            --baseline packages/plugin/scripts/fixtures/retrieval-benchmark/baselines/v1/quality.json \
-            --policy packages/plugin/scripts/fixtures/retrieval-benchmark/baselines/v1/policy.json \
+            --baseline "$baseline/quality.json" \
+            --policy "$baseline/policy.json" \
             --candidate benchmark-artifacts/retrieval-check-report-1.json \
             --candidate benchmark-artifacts/retrieval-check-report-2.json \
             --candidate benchmark-artifacts/retrieval-check-report-3.json \
@@ -383,7 +459,7 @@ jobs:
       #
       # Per-test (and per-hook) timeout bumped to 300s: the first test file
       # Bun loads on a cold GitHub-hosted runner pays the dependency-resolution
-      # + opencode-binary cold-start cost in its `beforeAll(TestHarness.create)`,
+      # plus opencode cold-start cost in `beforeAll(TestHarness.create)`,
       # which can exceed Bun's 120s default. Subsequent files run in 5-10s.
       - name: Run host e2e suite (OpenCode tests only)
         env:
@@ -395,9 +471,11 @@ jobs:
           # CI because its private ../commons and ../subconscious path-deps are
           # not provisioned here; the local release gate runs that host group.
           cd packages/e2e-tests
-          files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness opencode | tr '\n' ' ')
-          echo "Running OpenCode host tests from mode manifest: $files"
-          bun test --timeout 600000 $files
+          mapfile -t files < <(
+            bun scripts/validate-mode-manifest.ts --mode ts --harness opencode
+          )
+          echo "Running OpenCode host tests from mode manifest: ${files[*]}"
+          bun test --timeout 600000 "${files[@]}"
           # This oracle is outside the manifest's tests/**/*.test.ts inventory.
           bun test --timeout 600000 src/cache-analysis.test.ts
 
@@ -450,6 +528,8 @@ jobs:
           MC_E2E_MODE: ts
         run: |
           cd packages/e2e-tests
-          files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness pi | tr '\n' ' ')
-          echo "Running Pi host tests from mode manifest: $files"
-          bun test --timeout 600000 $files
+          mapfile -t files < <(
+            bun scripts/validate-mode-manifest.ts --mode ts --harness pi
+          )
+          echo "Running Pi host tests from mode manifest: ${files[*]}"
+          bun test --timeout 600000 "${files[@]}"

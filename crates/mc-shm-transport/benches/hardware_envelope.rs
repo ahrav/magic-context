@@ -11,6 +11,7 @@ use mc_shm_transport::descriptor::{
     BackendId, HardwareProfileId, MemoryLayout, OwnershipMode, PlatformKind, RuntimeKind,
     SchedulingMode, TransportDescriptor, WorkloadClass,
 };
+use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::profile::{
     CompletionMode, ProducerTopology, ProfileConfig, TargetProfile, WorkerTopology,
 };
@@ -26,6 +27,7 @@ const ARMS: &[&str] = &[
     "unix_socket",
     "tcp",
     "h2_rust_napi_runtime_crossing",
+    "injected_avoidable_operations",
     "ring",
     "iceoryx_0_9_3",
 ];
@@ -43,6 +45,8 @@ struct Measurement {
     native_allocations: u64,
     syscalls: u64,
     park_wakes: u64,
+    generic_queue_hops: u64,
+    scheduler_handoffs: u64,
     checksum: u64,
     selectable: bool,
     qualified: bool,
@@ -114,8 +118,18 @@ fn main() {
         "period_unit": "fresh_arm_process",
         "paired_process_arms": ["h0_metadata_cacheline_ping_pong", "h1_raw_descriptor_ring_payload_touch", "copied_producer_copied_receiver", "copied_producer_leased_receiver", "direct_producer_copied_receiver", "direct_producer_leased_receiver", "unix_socket", "tcp", "ring"],
         "loopback_smoke_arms": ["iceoryx_0_9_3"],
+        "gate_control_arms": ["injected_avoidable_operations"],
         "order_blocks": ["ABBA", "BAAB"],
+        "counter_fields": ["body_copies", "native_allocations", "syscalls", "park_wakes", "generic_queue_hops", "scheduler_handoffs"],
         "verdict": "INCONCLUSIVE",
+        "selection": "NO_QUALIFYING_ARM",
+        "verdict_reasons": [
+            "designated_hosts_unset",
+            "paired_statistical_campaign_not_run",
+            "host_explicit_control_has_one_accounted_receive_copy",
+            "cold_native_wake_not_qualified",
+            "macos_not_run"
+        ],
         "attempts": attempts,
     });
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -135,28 +149,57 @@ fn measure(arm: &str, scheduling: SchedulingMode, iterations: u64, payload: usiz
         "direct_producer_copied_receiver" => run_ring(scheduling, iterations, payload, false, true),
         "unix_socket" => run_unix(iterations, payload),
         "tcp" => run_tcp(iterations, payload),
-        "h2_rust_napi_runtime_crossing" => Err("N-API runtime arm belongs to U6"),
+        "h2_rust_napi_runtime_crossing" => {
+            Err("runtime mechanism tests exist; paired H2 campaign has not run")
+        }
+        "injected_avoidable_operations" => run_ring(scheduling, iterations, payload, false, false),
         "iceoryx_0_9_3" => run_iceoryx(scheduling, iterations, payload),
         _ => Err("unknown arm"),
     };
     match result {
-        Ok((elapsed, copies, allocations, syscalls, wakes, checksum)) => Measurement {
-            schema: 1,
-            state: "complete".to_owned(),
-            arm: arm.to_owned(),
-            scheduling: scheduling_name(scheduling).to_owned(),
-            payload_bytes: payload,
-            iterations,
-            elapsed_ns: elapsed.as_nanos(),
-            body_copies: copies,
-            native_allocations: allocations,
-            syscalls,
-            park_wakes: wakes,
-            checksum,
-            selectable: matches!(arm, "ring" | "iceoryx_0_9_3"),
-            qualified: false,
-            reason: Some("smoke evidence is never designated-host qualification".to_owned()),
-        },
+        Ok((elapsed, copies, allocations, syscalls, wakes, checksum)) => {
+            let mut counters = OperationCounters {
+                body_copies: copies,
+                native_allocations: allocations,
+                syscalls,
+                park_wakes: wakes,
+                generic_queue_hops: 0,
+                scheduler_handoffs: 0,
+            };
+            if arm == "injected_avoidable_operations" {
+                counters.body_copies = 1;
+                counters.native_allocations = 1;
+                counters.syscalls = 1;
+                counters.park_wakes = 1;
+                counters.generic_queue_hops = 1;
+                counters.scheduler_handoffs = 1;
+            }
+            let disqualifications = counters.disqualifications(scheduling, false);
+            let reason = if disqualifications.is_empty() {
+                "smoke evidence is never designated-host qualification".to_owned()
+            } else {
+                format!("operation_counter_gate:{}", disqualifications.join(","))
+            };
+            Measurement {
+                schema: 1,
+                state: "complete".to_owned(),
+                arm: arm.to_owned(),
+                scheduling: scheduling_name(scheduling).to_owned(),
+                payload_bytes: payload,
+                iterations,
+                elapsed_ns: elapsed.as_nanos(),
+                body_copies: counters.body_copies,
+                native_allocations: counters.native_allocations,
+                syscalls: counters.syscalls,
+                park_wakes: counters.park_wakes,
+                generic_queue_hops: counters.generic_queue_hops,
+                scheduler_handoffs: counters.scheduler_handoffs,
+                checksum,
+                selectable: matches!(arm, "ring" | "iceoryx_0_9_3"),
+                qualified: false,
+                reason: Some(reason),
+            }
+        }
         Err(reason) => failed(
             arm,
             scheduling_name(scheduling),
@@ -186,6 +229,8 @@ fn failed(
         native_allocations: 0,
         syscalls: 0,
         park_wakes: 0,
+        generic_queue_hops: 0,
+        scheduler_handoffs: 0,
         checksum: 0,
         selectable: matches!(arm, "ring" | "iceoryx_0_9_3"),
         qualified: false,

@@ -11,6 +11,7 @@ BIN="$ROOT/target/release/examples"
 
 BUDGET_BENCH=""
 BUDGET_CHILD=""
+SHM_BENCH=""
 # Offered-rate points shared by the plan preview and execution paths. The
 # default string stays byte-identical to DEFAULT_RATES in
 # crates/mc-host/benches/ipc_budget.rs (parity-tested by
@@ -30,6 +31,53 @@ budget_build() {
     exit 1
   }
   BUDGET_BENCH="$ROOT/$BUDGET_BENCH"
+}
+
+shm_build() {
+  local out
+  out=$(cd "$ROOT" && cargo bench -p mc-shm-transport --bench hardware_envelope --no-run --locked 2>&1) || {
+    echo "$out"
+    echo "shared-memory evidence build failed" >&2
+    exit 1
+  }
+  SHM_BENCH=$(echo "$out" | grep -oE 'target/release/deps/hardware_envelope-[0-9a-f]+' | tail -1)
+  [[ -n "$SHM_BENCH" && -x "$ROOT/$SHM_BENCH" ]] || {
+    echo "could not locate hardware_envelope bench binary" >&2
+    exit 1
+  }
+  SHM_BENCH="$ROOT/$SHM_BENCH"
+}
+
+shm_run() {
+  local out="${1:?outdir}" mode="${2:?mode}" args=()
+  local manifest="$ROOT/crates/mc-shm-transport/benches/manifests/v1.json"
+  if [[ "$mode" == "shm-smoke" ]]; then
+    args+=(--smoke)
+  else
+    [[ "${MC_SHM_DESIGNATED_HOST:-}" == "1" ]] || {
+      echo "shm-evidence requires MC_SHM_DESIGNATED_HOST=1" >&2
+      exit 1
+    }
+    if grep -q 'UNSET' "$manifest"; then
+      echo "shm-evidence refused: designated-host manifest fields remain UNSET" >&2
+      exit 1
+    fi
+    args+=(--designated-host)
+  fi
+  mkdir -p "$out"
+  local evidence="$out/hardware-envelope-${mode#shm-}.json"
+  [[ ! -e "$evidence" ]] || {
+    echo "refusing existing evidence file $evidence" >&2
+    exit 1
+  }
+  shm_build
+  "$SHM_BENCH" "${args[@]}" >"$evidence"
+  grep -q '"verdict": "INCONCLUSIVE"' "$evidence" || {
+    echo "shared-memory harness did not retain structured INCONCLUSIVE output" >&2
+    exit 1
+  }
+  cat "$evidence"
+  echo "evidence: $evidence" >&2
 }
 
 budget_env() {
@@ -173,6 +221,10 @@ budget-preflight)
 esac
 
 case "${2:-}" in
+shm-smoke | shm-evidence)
+  shm_run "${1:?outdir}" "$2"
+  exit 0
+  ;;
 budget-smoke | budget-pilot | budget-final)
   BUDGET_OUT="${1:?outdir}"
   BUDGET_PAIR="${BUDGET_PAIR:-}"

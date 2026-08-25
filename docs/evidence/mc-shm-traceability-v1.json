@@ -1,0 +1,306 @@
+{
+  "schema_version": 1,
+  "plan": "docs/plans/2026-08-24-1500-feat-iceoryx2-shared-memory-transport-plan.md",
+  "current_verdict": "INCONCLUSIVE",
+  "selection": "NO_QUALIFYING_ARM",
+  "status_vocabulary": {
+    "PASS": "Executable local contract has passing coverage.",
+    "PARTIAL": "Some executable clauses pass; listed clauses remain unresolved.",
+    "BLOCKED": "Required platform, hostile-peer fixture, or designated host is unavailable.",
+    "INCONCLUSIVE": "Correctness evidence exists but selection requires an unrun paired campaign."
+  },
+  "requirements": [
+    {
+      "id": "R1",
+      "status": "PARTIAL",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#descriptor_rejects_every_untrusted_identity_and_span_failure",
+        "crates/mc-shm-transport/benches/manifests/v1.json"
+      ],
+      "note": "Descriptor identity and schema are executable; no backend/profile is retained."
+    },
+    {
+      "id": "R2",
+      "status": "PARTIAL",
+      "evidence": [
+        "packages/mc-shm-native/Cargo.toml",
+        "packages/mc-shm-native/tests/mechanism.ts",
+        "packages/mc-shm-native/tests/capability.ts"
+      ],
+      "note": "Linux Bun/Node mechanism checks pass locally; macOS source-build job is authored but has not run here."
+    },
+    {
+      "id": "R3",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-host/tests/shm_transport.rs#omitted_and_unqualified_profiles_fall_back_without_side_effects",
+        "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#omits_unsupported_and_non-qualified_profiles_without_registration",
+        "packages/mc-shm-native/tests/capability.ts"
+      ]
+    },
+    {
+      "id": "R4",
+      "status": "PARTIAL",
+      "evidence": [
+        "crates/mc-shm-transport/tests/ring.rs#sealed_object_prefault_repeated_setup_and_stress_conservation",
+        "crates/mc-host/tests/shm_transport.rs#shared_memory_errors_and_debug_output_are_redacted"
+      ],
+      "note": "Linux sealed-object path is covered; macOS attachment qualification is blocked."
+    },
+    {
+      "id": "R5",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#descriptor_rejects_every_untrusted_identity_and_span_failure",
+        "crates/mc-shm-transport/tests/ring.rs#two_process_zero_copy_exchange_uses_authenticated_grant"
+      ]
+    },
+    {
+      "id": "R6",
+      "status": "PARTIAL",
+      "evidence": [
+        "crates/mc-host/tests/shm_transport.rs#qualified_provider_grants_activates_correlates_and_closes",
+        "packages/mc-shm-native/tests/runtime.ts"
+      ],
+      "note": "Two ordered directions pass; U9 topology comparison has not run."
+    },
+    {
+      "id": "R7",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/ring.rs#boundary_round_trips_include_wrap_and_exact_maximum",
+        "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#callback_failure_underfill_and_overflow_publish_nothing"
+      ]
+    },
+    {
+      "id": "R8",
+      "status": "PASS",
+      "evidence": [
+        "packages/mc-shm-native/tests/runtime.ts",
+        "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#propagates_JSON_and_binary_leases_without_owned-adapter_copies",
+        "packages/plugin/scripts/check-mc-shm.ts"
+      ]
+    },
+    {
+      "id": "R9",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#descriptor_rejects_every_untrusted_identity_and_span_failure",
+        "crates/mc-shm-transport/tests/ring.rs#retained_oldest_lease_enforces_fifo_reclamation_and_release_validation"
+      ]
+    },
+    {
+      "id": "R10",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/ring.rs#sealed_object_prefault_repeated_setup_and_stress_conservation",
+        "crates/mc-host/tests/shm_transport.rs#admission_counts_active_plus_quarantined_commitments"
+      ]
+    },
+    {
+      "id": "R11",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/ring.rs#retained_oldest_lease_enforces_fifo_reclamation_and_release_validation",
+        "packages/mc-shm-native/tests/runtime.ts"
+      ]
+    },
+    {
+      "id": "R12",
+      "status": "INCONCLUSIVE",
+      "evidence": [
+        "crates/mc-shm-transport/benches/manifests/v1.json",
+        "docs/perf/mc-shm-hardware-envelope.md"
+      ],
+      "note": "No hot or cold profile has a designated-host winner."
+    },
+    {
+      "id": "R13",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#lifecycle_accepts_only_diagram_edges_and_quarantine_is_terminal",
+        "packages/mc-shm-native/tests/runtime.ts",
+        "packages/mc-shm-native/tests/mechanism.ts"
+      ]
+    },
+    {
+      "id": "R14",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-host/tests/shm_transport.rs#failure_after_prepare_closes_without_tcp_fallback_or_replay",
+        "crates/mc-host/tests/shm_transport.rs#omitted_and_unqualified_profiles_fall_back_without_side_effects"
+      ]
+    },
+    {
+      "id": "R15",
+      "status": "INCONCLUSIVE",
+      "evidence": [
+        "crates/mc-shm-transport/benches/manifests/v1.json",
+        "crates/mc-shm-transport/benches/hardware_envelope.rs",
+        "docs/perf/mc-shm-hardware-envelope.md"
+      ],
+      "note": "Manifest hosts are unset and no paired campaign has run."
+    },
+    {
+      "id": "R16",
+      "status": "BLOCKED",
+      "evidence": [
+        ".github/workflows/ci.yml#shm-source-build",
+        "packages/mc-shm-native/tests/capability.ts"
+      ],
+      "note": "Ubuntu/macOS matrix is defined; macOS cannot run on this Linux host."
+    },
+    {
+      "id": "R17",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#debug_and_errors_redact_every_sentinel",
+        "crates/mc-host/tests/shm_transport.rs#shared_memory_errors_and_debug_output_are_redacted"
+      ]
+    },
+    {
+      "id": "R18",
+      "status": "INCONCLUSIVE",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#purity_gate_rejects_injected_copy_allocation_queue_and_wake",
+        "crates/mc-shm-transport/benches/hardware_envelope.rs",
+        "docs/perf/mc-shm-hardware-envelope.md"
+      ],
+      "note": "Counter gate works; full production-shaped paired measurements are absent."
+    },
+    {
+      "id": "R19",
+      "status": "PARTIAL",
+      "evidence": [
+        "docs/mc-host-shm-transport.md#trusted-peer-boundary",
+        "docs/perf/mc-shm-hardware-envelope.md#evidence-boundary"
+      ],
+      "note": "Boundary is documented without an immutability claim; peer-mutation characterization fixture is not implemented."
+    }
+  ],
+  "acceptance_examples": [
+    {
+      "id": "AE1",
+      "status": "PARTIAL",
+      "evidence": [
+        "crates/mc-host/tests/shm_transport.rs#qualified_provider_grants_activates_correlates_and_closes"
+      ],
+      "note": "Linux explicit profile passes; macOS is clean omission only."
+    },
+    {
+      "id": "AE2",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-host/tests/shm_transport.rs#omitted_and_unqualified_profiles_fall_back_without_side_effects",
+        "packages/mc-shm-native/tests/capability.ts"
+      ]
+    },
+    {
+      "id": "AE3",
+      "status": "PARTIAL",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#descriptor_rejects_every_untrusted_identity_and_span_failure",
+        "crates/mc-host/tests/shm_transport.rs#shared_memory_errors_and_debug_output_are_redacted"
+      ],
+      "note": "Descriptor, offset, incarnation, and redaction failures pass; wrong-user and replaced-path campaigns remain unrun."
+    },
+    {
+      "id": "AE4",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/ring.rs#boundary_round_trips_include_wrap_and_exact_maximum"
+      ]
+    },
+    {
+      "id": "AE5",
+      "status": "PARTIAL",
+      "evidence": [
+        "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#propagates_JSON_and_binary_leases_without_owned-adapter_copies",
+        "crates/mc-shm-transport/benches/hardware_envelope.rs"
+      ],
+      "note": "Mechanism counters pass; paired H2 allocation evidence is absent."
+    },
+    {
+      "id": "AE6",
+      "status": "PASS",
+      "evidence": [
+        "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#callback_failure_underfill_and_overflow_publish_nothing",
+        "crates/mc-host/tests/shm_transport.rs#failure_after_prepare_closes_without_tcp_fallback_or_replay"
+      ]
+    },
+    {
+      "id": "AE7",
+      "status": "INCONCLUSIVE",
+      "evidence": [
+        "crates/mc-shm-transport/benches/hardware_envelope.rs",
+        "docs/perf/mc-shm-hardware-envelope.md"
+      ]
+    },
+    {
+      "id": "AE8",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/contract.rs#lifecycle_accepts_only_diagram_edges_and_quarantine_is_terminal",
+        "packages/mc-shm-native/tests/runtime.ts"
+      ]
+    },
+    {
+      "id": "AE9",
+      "status": "INCONCLUSIVE",
+      "evidence": [
+        "crates/mc-shm-transport/benches/manifests/v1.json",
+        "docs/perf/mc-shm-hardware-envelope.md"
+      ],
+      "note": "No qualifying arm; provider registries remain empty."
+    },
+    {
+      "id": "AE10",
+      "status": "PASS",
+      "evidence": [
+        "packages/mc-shm-native/tests/runtime.ts",
+        "packages/plugin/scripts/check-mc-shm.ts"
+      ]
+    },
+    {
+      "id": "AE11",
+      "status": "BLOCKED",
+      "evidence": [
+        "docs/mc-host-shm-transport.md#trusted-peer-boundary"
+      ],
+      "note": "No malicious-peer immutability claim is made; peer-mutation characterization fixture remains absent."
+    },
+    {
+      "id": "AE12",
+      "status": "PASS",
+      "evidence": [
+        "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#propagates_JSON_and_binary_leases_without_owned-adapter_copies",
+        "crates/mc-shm-transport/benches/hardware_envelope.rs"
+      ]
+    },
+    {
+      "id": "AE13",
+      "status": "PASS",
+      "evidence": [
+        "crates/mc-shm-transport/tests/ring.rs#boundary_round_trips_include_wrap_and_exact_maximum",
+        "packages/mc-shm-native/tests/runtime.ts"
+      ]
+    },
+    {
+      "id": "AE14",
+      "status": "PARTIAL",
+      "evidence": [
+        "crates/mc-shm-transport/tests/ring.rs#retained_oldest_lease_enforces_fifo_reclamation_and_release_validation",
+        "crates/mc-host/tests/shm_transport.rs#admission_counts_active_plus_quarantined_commitments"
+      ],
+      "note": "Stale releases and aggregate limits pass; sequence wrap and repeated quarantine campaign remain unrun."
+    },
+    {
+      "id": "AE15",
+      "status": "INCONCLUSIVE",
+      "evidence": [
+        "crates/mc-shm-transport/benches/manifests/v1.json",
+        "docs/perf/mc-shm-hardware-envelope.md"
+      ]
+    }
+  ]
+}

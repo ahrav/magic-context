@@ -101,6 +101,9 @@
       "unix_socket",
       "tcp"
     ],
+    "non_selectable_gate_controls": [
+      "injected_avoidable_operations"
+    ],
     "selectable": [
       "ring",
       "iceoryx_0_9_3"
@@ -141,6 +144,15 @@
     "h1_requires_analytic_validation": true,
     "copied_arms_selectable": false,
     "native_only_shortcut_selectable_for_runtime_profiles": false,
+    "required_counter_fields": [
+      "body_copies",
+      "native_allocations",
+      "syscalls",
+      "park_wakes",
+      "generic_queue_hops",
+      "scheduler_handoffs"
+    ],
+    "injected_gate_control_must_be_disqualified": true,
     "no_qualifying_arm_action": "ship_no_shared_memory_provider"
   }
 }

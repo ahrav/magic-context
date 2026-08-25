@@ -41,6 +41,7 @@
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
     "test:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts adversarial",
+    "test:mc-shm:node": "bun scripts/run-mc-shm-node.ts",
     "smoke:mc-host-client:bun": "bun scripts/smoke-mc-host-client.ts",
     "smoke:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts smoke",
     "smoke:mc-host-synapse:bun": "bun scripts/smoke-mc-host-synapse.ts",

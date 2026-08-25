@@ -10,6 +10,8 @@ pub mod arena;
 pub mod backend;
 /// Immutable grant and complete-frame metadata. commentlint: allow(JUDGE)
 pub mod descriptor;
+/// Operation-counter evidence gates. commentlint: allow(JUDGE)
+pub mod evidence;
 /// Scoped raw-span receive leases. commentlint: allow(JUDGE)
 pub mod lease;
 /// Checked close state machine. commentlint: allow(JUDGE)
