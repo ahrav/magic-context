@@ -770,6 +770,13 @@ const PI_IMPLEMENTATION_FILES = [
     "packages/pi-plugin/src/index.ts",
     "packages/pi-plugin/src/context-handler.ts",
     "packages/pi-plugin/src/pi-todo-inject.ts",
+    // Every Pi variant drives the real todowrite tool: the cases assert
+    // `toolName === "todowrite"`, which depends on the registration in
+    // tools/index.ts, and the capture case asserts missing-priority behavior,
+    // which is the optional `priority` in the todowrite schema. Without these
+    // the verdict could change while the digest stayed constant.
+    "packages/pi-plugin/src/tools/index.ts",
+    "packages/pi-plugin/src/tools/todowrite.ts",
 ];
 
 const PI_MATRIX_FIXTURE = TODO_PARITY_MATRIX.find(
