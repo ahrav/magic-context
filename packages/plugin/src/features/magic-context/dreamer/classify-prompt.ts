@@ -4,8 +4,8 @@
  * classify scores each memory's importance (1-100), scope, and shareability from
  * the memory TEXT alone (no code inspection). The reworked task is a PURE
  * transform: the host renders one prompt, the zero-tool dreamer-classifier agent
- * emits ONE XML manifest, and the host batch-applies the columns via
- * setMemoryClassification (cache-neutral). No per-memory tool calls.
+ * emits ONE XML manifest, and the host batch-applies revision-bound claim
+ * attributes under one operation receipt. No per-claim tool calls.
  *
  * Importance/scope/shareability GUIDANCE is the harness-validated text (DS4F:
  * 229 importances assigned, correct discrimination, 4/4 private controls held).
@@ -21,6 +21,8 @@ import {
 
 export interface ClassifyPromptMemory {
     publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
     category: string;
     content: string;
     importance: number;
@@ -63,8 +65,8 @@ Keep \`shareable="false"\` only for what is tied to the USER or their machine ra
 
 const OUTPUT_CONTRACT = `Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <classify>
-<memory claim="clm_..." importance="75" scope="project" shareable="true"/>
-<memory claim="clm_..." importance="20" scope="universe" shareable="false"/>
+<memory claim="mcm_..." importance="75" scope="project" shareable="true"/>
+<memory claim="mcm_..." importance="20" scope="universe" shareable="false"/>
 </classify>
 
 Rules:
@@ -81,7 +83,7 @@ function renderPool(memories: ClassifyPromptMemory[]): string {
     return memories
         .map(
             (m) =>
-                `[${m.publicClaimId}] ${m.category} (current: importance=${m.importance} scope=${m.scope} shareable=${Boolean(m.shareable)})\n${m.content}`,
+                `[${m.publicClaimId}] ${m.category} revision=${m.revisionLocator} digest=${m.contentDigest} (current: importance=${m.importance} scope=${m.scope} shareable=${Boolean(m.shareable)})\n${m.content}`,
         )
         .join("\n\n");
 }
@@ -89,10 +91,7 @@ function renderPool(memories: ClassifyPromptMemory[]): string {
 function renderAnchors(anchors: ClassifyAnchorMemory[]): string {
     if (anchors.length === 0) return "";
     const list = anchors
-        .map(
-            (a) =>
-                `[${a.publicClaimId}] ${a.category} importance=${a.importance}\n${a.content}`,
-        )
+        .map((a) => `[${a.publicClaimId}] ${a.category} importance=${a.importance}\n${a.content}`)
         .join("\n\n");
     return `### Already-classified reference memories (calibrate against these — do NOT re-score them, they are NOT in your output)
 ${list}

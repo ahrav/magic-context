@@ -42,7 +42,11 @@ import { readActiveDispositions } from "./storage-claim-policy.ts";
 import { ClaimGraphCorruptionError, resolveProjectId } from "./storage-claims.ts";
 import type { MemoryScope } from "./types.ts";
 
-export type ProjectMemorySurface = "auto_inject" | "explicit_search";
+export type ProjectMemorySurface =
+    | "auto_inject"
+    | "explicit_search"
+    | "maintenance_hygiene"
+    | "maintenance_verification";
 
 export interface ProjectMemoryWorkspaceAuthorization {
     /** Projects owned by the active workspace member. */
@@ -104,6 +108,10 @@ export interface ProjectMemoryClaimSnapshot {
      * for clean rows. Never set on the auto_inject surface. */
     explicitLabel: string | null;
     telemetry: { seenCount: number; retrievalCount: number };
+    verification: {
+        latestOutcome: "verified" | "update" | "archive" | "stale" | "flagged" | null;
+        verifiedAt: number;
+    };
     mutationToken: ClaimMutationToken;
     projectId: number;
 }
@@ -260,6 +268,18 @@ function hydrateClaim(db: Database, candidate: CandidateRow): ProjectMemoryClaim
                FROM claim_usage_stats WHERE claim_id = ?`,
         )
         .get(candidate.claimId) as { seenCount: number; retrievalCount: number } | undefined;
+    const verification = db
+        .prepare(
+            `SELECT
+                 (SELECT outcome FROM verification_events
+                   WHERE revision_id = ? ORDER BY id DESC LIMIT 1) AS latestOutcome,
+                 COALESCE(MAX(CASE WHEN outcome = 'verified' THEN created_at END), 0) AS verifiedAt
+               FROM verification_events WHERE revision_id = ?`,
+        )
+        .get(candidate.currentRevisionId, candidate.currentRevisionId) as {
+        latestOutcome: ProjectMemoryClaimSnapshot["verification"]["latestOutcome"];
+        verifiedAt: number;
+    };
     const locator = {
         publicClaimId: candidate.publicId,
         revision: revision.revision,
@@ -301,6 +321,7 @@ function hydrateClaim(db: Database, candidate: CandidateRow): ProjectMemoryClaim
             seenCount: telemetry?.seenCount ?? 0,
             retrievalCount: telemetry?.retrievalCount ?? 0,
         },
+        verification,
         mutationToken: computeProjectMemoryMutationToken(db, candidate.publicId),
         projectId: candidate.projectId,
     };
@@ -339,6 +360,13 @@ function surfaceDecision(
         return { eligible: false, label: null };
     }
     const softHidden = facts.stale || facts.disputed || facts.superseded;
+    if (surface === "maintenance_hygiene" || surface === "maintenance_verification") {
+        if (facts.superseded) return { eligible: false, label: null };
+        return {
+            eligible: surface === "maintenance_verification" || (!facts.stale && !facts.disputed),
+            label: null,
+        };
+    }
     if (surface === "auto_inject") {
         return { eligible: item.policy.autoEligible && !softHidden, label: null };
     }

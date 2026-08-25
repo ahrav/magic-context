@@ -1,8 +1,5 @@
-import { createHash } from "node:crypto";
-
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
-import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -16,105 +13,37 @@ import { hasShareabilitySensitiveText } from "../../../shared/redaction";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import {
-    getMemoriesByProject,
-    getUnclassifiedMemoryIds,
-    type Memory,
-    setMemoryClassification,
-} from "../memory";
-import {
-    exactMemoryContentDigests,
-    filterMemoriesForMaintenance,
-    maintenanceEligibleIdSet,
-} from "../memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "../memory/storage-claims";
+    type AutonomousManifestIdentity,
+    runAutonomousManifestInCurrentTransaction,
+} from "../memory/storage-claim-autonomous";
+import type { ProjectMemoryClaimSnapshot } from "../memory/storage-claim-current-state";
+import { stageReviseProjectMemoryClaimInCurrentTransaction } from "../memory/storage-claim-operations";
 import { recordChildInvocation } from "../subagent-token-capture";
+import {
+    claimManifestBinding,
+    dreamerInferenceProvenance,
+    dreamerManifestIdentity,
+    readDreamerProjectClaims,
+    recordDreamerManifestRejection,
+    refreshDreamerClaimBatch,
+} from "./claim-manifest";
 import {
     buildClassifyPrompt,
     CLASSIFY_SYSTEM_PROMPT,
     type ClassifyAnchorMemory,
     type ClassifyPromptMemory,
-    parseClassifyManifest,
     validateClassifyManifest,
 } from "./classify-prompt";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
-import { assertManifestCoversExactly } from "./manifest-parser";
-import { getModuleMemoryIdentities } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
 } from "./provider-output-failure";
 
-/**
- * classify-memories: a NON-agentic single-shot transform. Scores each project
- * memory's importance / scope / shareability from its TEXT (no code reads), then
- * the HOST batch-applies the columns via setMemoryClassification — cache-neutral.
- *
- * 3-stage anchoring (hardcoded 10/100 thresholds):
- *  - Stage 1 (< 10 memories): skip — too small a pool to score meaningfully.
- *  - Stage 2 (<= 100): classify the WHOLE pool every run (the model sees the full
- *    distribution, so it can discriminate). No anchors.
- *  - Stage 3 (> 100): classify only the NEW/CHANGED memories (classified_at NULL),
- *    plus a stratified sample of already-classified memories as scoring ANCHORS
- *    (calibration, not re-scored).
- *
- * The classified_at marker (stamped by setMemoryClassification, cleared on content
- * change) is the per-memory run-gate: a classified memory is not re-scored.
- */
-
-const MIN_POOL_TO_CLASSIFY = 10; // Stage 1 floor
-const FULL_POOL_CEILING = 100; // Stage 2 ceiling (<= → classify all)
-const STAGE3_ANCHOR_COUNT = 30; // calibration anchors shown in Stage 3
-// Even Stage 2/3 chunk so peak context stays bounded on a 128K window. 100
-// memories ≈ 8.6K tokens of pool text + guidance — comfortably one chunk; a
-// >100 to-classify Stage-3 backlog splits into chunks of this size.
+const MIN_POOL_TO_CLASSIFY = 10;
+const FULL_POOL_CEILING = 100;
+const STAGE3_ANCHOR_COUNT = 30;
 const CLASSIFY_CHUNK_SIZE = 100;
-
-// Module-side classify awaits a full broca producer run (CLASSIFY_AWAIT_TIMEOUT is
-// 600s in the module); the transport request must outlive it plus dispatch slack.
-// This is a ceiling, not the request timeout: each call is further capped by its
-// chunk's live slice remainder.
-const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
-
-// The module's payload budget is shortened by this margin relative to the
-// transport request budget: the transport's absolute deadline starts before
-// connection and lane admission, while the module starts its own clock only
-// after parsing the request — with equal budgets the transport times out
-// first and its cancel aborts the handler between the producer run and
-// `purge_session`, leaving the attempt's Broca subprocess (and its
-// memory-pool prompt) alive until the run timeout. The margin covers the
-// module's timeout path AFTER the payload deadline: the `session.delete`
-// unary request (30s producer request timeout), subprocess teardown
-// (SIGTERM plus its 5s termination grace), and dispatch slack — a stalled
-// delete response must not let the transport cancel mid-purge.
-const CLASSIFY_MODULE_PURGE_MARGIN_MS = 40_000;
-
-// A chunk slice below this floor cannot host a real module call: the purge
-// margin alone consumes 40s, and the model needs minutes-scale time on top.
-// Equal division of the remaining deadline across many chunks can drop every
-// slice under the margin; flooring the slice processes chunks head-first
-// with workable budgets and defers the tail to the next pass, instead of
-// letting later chunks inherit progressively larger slices while the head of
-// the stable pool ordering is skipped on every pass.
-const CLASSIFY_MIN_CHUNK_SLICE_MS = CLASSIFY_MODULE_PURGE_MARGIN_MS + 120_000;
-
-// Mirrors MAX_CLASSIFY_PROMPT_BYTES (crates/mc-module/src/classify.rs): the
-// module rejects any prompt_body over 256 KiB, and a rejected prompt is
-// rebuilt identically on every retry, so chunks must be sized by rendered
-// bytes as well as entry count. The pool and anchor budgets plus the
-// template and per-entry prefixes stay under the cap by construction.
-const MODULE_PROMPT_BYTE_CAP = 256 * 1024;
-// Per-entry prompt prefix (`[id] category (current: ...)`) plus separators;
-// 128 bytes dominates the rendered form for both pool and anchor entries.
-const PROMPT_ENTRY_OVERHEAD_BYTES = 128;
-// Anchors are calibration aids, not work: they get the smaller share.
-const ANCHOR_PROMPT_BYTE_BUDGET = 48 * 1024;
-// Memory pool share: cap minus the anchor budget, with headroom for the
-// task template and guidance.
-const CHUNK_PROMPT_BYTE_BUDGET = MODULE_PROMPT_BYTE_CAP - ANCHOR_PROMPT_BYTE_BUDGET - 16 * 1024;
-
-function promptEntryBytes(content: string): number {
-    return Buffer.byteLength(content, "utf8") + PROMPT_ENTRY_OVERHEAD_BYTES;
-}
 
 export interface ClassifyModuleCallArgs {
     sessionId: string;
@@ -129,22 +58,6 @@ export interface ClassifyModuleClient {
     call(args: ClassifyModuleCallArgs): Promise<unknown>;
 }
 
-/**
- * A module-backed classification failure must reach the task scheduler as a
- * transient error. The TypeScript child path is intentionally not a fallback:
- * when MODULE owns memories, writing through the child would violate the
- * authority boundary (or hide a module outage behind a misleading success).
- */
-export class ClassifyModuleFailureError extends Error {
-    readonly transient = true;
-
-    constructor(operation: string, cause: unknown) {
-        super(`Rust classify ${operation} failed: ${getErrorMessage(cause)}`);
-        this.name = "ClassifyModuleFailureError";
-        (this as Error & { cause?: unknown }).cause = cause;
-    }
-}
-
 export interface ClassifyArgs {
     db: Database;
     client: PluginContext["client"];
@@ -157,11 +70,6 @@ export interface ClassifyArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
-    /** Ordered classify model chain (task override → dreamer default → fallbacks)
-     *  the module route sends verbatim; the TypeScript provider path keeps using
-     *  model/fallbackModels instead. */
-    modelChain?: readonly string[];
-    /** Present only for rust-mode projects whose memories authority is MODULE. */
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
     moduleProjectRoot?: string;
@@ -180,126 +88,48 @@ export interface ClassifyResult {
     complete: boolean;
 }
 
-interface ClassifyCandidate {
-    /** The context.db row used for mirrored prompt content and local identity. */
-    contextMemory: Memory;
-    /** The id and hash understood by the module authority, or the TS row values. */
-    id: number;
-    normalizedHash: string;
-}
-
-function isModuleRoute(args: ClassifyArgs): boolean {
-    return (
-        args.moduleClient !== undefined &&
-        args.moduleSessionId !== undefined &&
-        args.moduleProjectRoot !== undefined &&
-        args.moduleContextStoreUuid !== undefined &&
-        args.moduleAuthorityGeneration !== undefined
-    );
-}
-
-/**
- * Build the classify pool in the authority's id space. The context rows are still the
- * prompt source, but module classification must use the mirrored module id and hash.
- * The live mirror hash is preferred over recomputing it in TypeScript because it is
- * the exact value checked by memory.set_classification.
- */
-function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
-    // Classification is hygiene maintenance with no healing authority over
-    // dispositions: candidates stay (they need classification to climb the
-    // ladder later), while soft-hidden and uniform-absence rows never reach
-    // the child-model prompt.
-    const active = filterMemoriesForMaintenance(
-        args.db,
-        getMemoriesByProject(args.db, args.projectIdentity),
-        "hygiene",
-    );
-    if (!isModuleRoute(args) || active.length === 0) {
-        return active.map((memory) => ({
-            contextMemory: memory,
-            id: memory.id,
-            normalizedHash: memory.normalizedHash,
-        }));
-    }
-
-    const mappedByContextId = getModuleMemoryIdentities(
-        args.db,
-        args.projectIdentity,
-        active.map((memory) => memory.id),
-    );
-    const candidates = active.flatMap((contextMemory) => {
-        const mapped = mappedByContextId.get(contextMemory.id);
-        return mapped
-            ? [{ contextMemory, id: mapped.moduleId, normalizedHash: mapped.normalizedHash }]
-            : [];
-    });
-    if (candidates.length !== active.length) {
-        const mappedContextIds = new Set(mappedByContextId.keys());
-        const withoutIdentity = active.filter((memory) => !mappedContextIds.has(memory.id)).length;
-        const withoutLiveHash = active.length - candidates.length - withoutIdentity;
-        log(
-            `[dreamer] classify: excluded ${active.length - candidates.length} module candidates for ${args.projectIdentity}` +
-                ` (${withoutIdentity} without mirror_identity, ${withoutLiveHash} without live module hash)`,
-        );
-    }
-    return candidates;
-}
-
-function toPromptMemory(candidate: ClassifyCandidate): ClassifyPromptMemory {
-    const m = candidate.contextMemory;
+function toPromptMemory(claim: ProjectMemoryClaimSnapshot): ClassifyPromptMemory {
     return {
-        id: candidate.id,
-        category: m.category,
-        content: m.content,
-        importance: m.importance ?? 50,
-        scope: m.scope ?? "project",
-        shareable: m.shareable ?? false,
+        publicClaimId: claim.publicClaimId,
+        revisionLocator: claim.revisionLocator,
+        contentDigest: claim.contentDigest,
+        category: claim.category,
+        content: claim.content,
+        importance: claim.importance,
+        scope: claim.memoryScope,
+        shareable: claim.sharing === "shareable",
     };
 }
 
-/** A calibration anchor plus the context row backing it: anchors carry memory
- *  content into every chunk's prompt, so the per-chunk policy recheck needs
- *  the context id (`anchor.id` is the authority's id space on the module
- *  route). */
-interface AnchorCandidate {
-    anchor: ClassifyAnchorMemory;
-    contextId: number;
-}
-
-function toAnchorCandidate(candidate: ClassifyCandidate): AnchorCandidate {
+function toAnchor(claim: ProjectMemoryClaimSnapshot): ClassifyAnchorMemory {
     return {
-        anchor: {
-            id: candidate.id,
-            category: candidate.contextMemory.category,
-            content: candidate.contextMemory.content,
-            importance: candidate.contextMemory.importance ?? 50,
-        },
-        contextId: candidate.contextMemory.id,
+        publicClaimId: claim.publicClaimId,
+        category: claim.category,
+        content: claim.content,
+        importance: claim.importance,
     };
 }
 
-/** Stratified sample of already-classified memories across importance bands, so
- *  Stage-3 anchors span the full distribution rather than clustering. */
-function stratifiedAnchors(classified: ClassifyCandidate[], count: number): AnchorCandidate[] {
-    if (classified.length <= count) {
-        return classified.map(toAnchorCandidate);
-    }
-    const sorted = [...classified].sort(
-        (a, b) => (a.contextMemory.importance ?? 50) - (b.contextMemory.importance ?? 50),
-    );
+function isClassified(claim: ProjectMemoryClaimSnapshot): boolean {
+    return claim.evidence.independenceKeys.some((key) => key.startsWith("classify-memories:"));
+}
+
+function stratifiedAnchors(
+    classified: ProjectMemoryClaimSnapshot[],
+    count: number,
+): ProjectMemoryClaimSnapshot[] {
+    if (classified.length <= count) return classified;
+    const sorted = [...classified].sort((left, right) => left.importance - right.importance);
     const step = sorted.length / count;
-    const out: AnchorCandidate[] = [];
-    for (let i = 0; i < count; i += 1) {
-        const candidate = sorted[Math.min(sorted.length - 1, Math.floor(i * step))];
-        out.push(toAnchorCandidate(candidate));
-    }
-    return out;
+    return Array.from({ length: count }, (_, index) => {
+        const claim = sorted[Math.min(sorted.length - 1, Math.floor(index * step))];
+        if (!claim) throw new Error("classify anchor selection failed");
+        return claim;
+    });
 }
 
 export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
-    const active = getClassifyCandidates(args);
-
-    // Stage 1: too small a pool to score meaningfully.
+    const active = readDreamerProjectClaims(args.db, args.projectIdentity, "hygiene");
     if (active.length < MIN_POOL_TO_CLASSIFY) {
         return {
             classified: 0,
@@ -311,30 +141,15 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         };
     }
 
-    let stage: 2 | 3;
-    let toClassify: ClassifyCandidate[];
-    let anchors: AnchorCandidate[] = [];
-    if (active.length <= FULL_POOL_CEILING) {
-        // Stage 2: classify the whole pool every run.
-        stage = 2;
-        toClassify = active;
-    } else {
-        // Stage 3: only the new/changed (unclassified) memories, with stratified
-        // already-classified anchors for distribution calibration.
-        stage = 3;
-        const unclassifiedIds = new Set(
-            getUnclassifiedMemoryIds(
-                args.db,
-                active.map((candidate) => candidate.contextMemory.id),
-            ),
-        );
-        toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
-        const classified = active.filter(
-            (candidate) => !unclassifiedIds.has(candidate.contextMemory.id),
-        );
-        anchors = stratifiedAnchors(classified, STAGE3_ANCHOR_COUNT);
-    }
-
+    const stage = active.length <= FULL_POOL_CEILING ? 2 : 3;
+    const toClassify = stage === 2 ? active : active.filter((claim) => !isClassified(claim));
+    const anchors =
+        stage === 2
+            ? []
+            : stratifiedAnchors(
+                  active.filter((claim) => isClassified(claim)),
+                  STAGE3_ANCHOR_COUNT,
+              );
     const result: ClassifyResult = {
         classified: 0,
         changed: 0,
@@ -343,36 +158,11 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         remaining: toClassify.length,
         complete: toClassify.length === 0,
     };
-    if (toClassify.length === 0) {
-        log(`[dreamer] classify: stage=${stage} nothing to classify`);
-        return result;
-    }
+    if (toClassify.length === 0) return result;
 
-    // Anchors ride every chunk's prompt, so they are bounded once by bytes.
-    // Both byte budgets exist only for the module route: the 256 KiB
-    // prompt_body cap they mirror is enforced by the Rust module, while the
-    // TypeScript child path accepts arbitrary content — capping it here
-    // would silently exclude memories a provider can classify.
-    const moduleRoute = isModuleRoute(args);
-    anchors = boundAnchorsByBytes(
-        anchors,
-        moduleRoute ? ANCHOR_PROMPT_BYTE_BUDGET : Number.POSITIVE_INFINITY,
-    );
-    // Chunk by entry count AND rendered prompt bytes: the module rejects a
-    // prompt_body over its byte cap, and content-heavy memories can exceed
-    // it well under the 100-entry count bound.
-    const { chunks, oversized } = chunkByCountAndBytes(
-        toClassify,
-        moduleRoute ? CHUNK_PROMPT_BYTE_BUDGET : Number.POSITIVE_INFINITY,
-    );
-    if (oversized > 0) {
-        // A memory whose content alone exceeds the pool budget can never
-        // classify at this cap; counting it as remaining would keep the
-        // pass permanently incomplete and hot-retry forever.
-        result.remaining -= oversized;
-        log(
-            `[dreamer] classify: ${oversized} memory(ies) exceed the prompt byte budget and cannot be classified`,
-        );
+    const chunks: ProjectMemoryClaimSnapshot[][] = [];
+    for (let index = 0; index < toClassify.length; index += CLASSIFY_CHUNK_SIZE) {
+        chunks.push(toClassify.slice(index, index + CLASSIFY_CHUNK_SIZE));
     }
 
     const abortController = new AbortController();
@@ -383,37 +173,17 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         () => abortController.abort(),
         args.leaseAcquisition,
     );
-
     try {
-        for (let i = 0; i < chunks.length; i += 1) {
+        for (let index = 0; index < chunks.length; index += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
             if (remainingMs <= 0) break;
-            const chunksRemaining = chunks.length - i;
-            // Floored so equal division across a long backlog cannot hand
-            // every chunk an unworkable slice; the tail defers to the next
-            // pass instead of the head starving on every pass.
-            const sliceMs = Math.min(
-                remainingMs,
-                Math.max(Math.floor(remainingMs / chunksRemaining), CLASSIFY_MIN_CHUNK_SLICE_MS),
-            );
-
             const counts = await classifyOneChunk(
                 args,
-                chunks[i],
+                chunks[index] ?? [],
                 anchors,
-                sliceMs,
+                Math.max(1, Math.floor(remainingMs / (chunks.length - index))),
                 abortController.signal,
             );
-            if (counts === null) {
-                // The slice could not reserve the purge margin: the overall
-                // deadline is effectively exhausted, and every later chunk
-                // would fare no better. Ending the pass keeps the stable
-                // pool ordering fair — the same chunks lead the next pass.
-                log(
-                    `[dreamer] classify: pass ended before chunk ${i + 1}/${chunks.length}; deadline cannot host another module call`,
-                );
-                break;
-            }
             result.classified += counts.classified;
             result.changed += counts.changed;
             result.remaining -= counts.classified;
@@ -430,140 +200,22 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     }
 }
 
-/** Splits the pool into chunks bounded by both entry count and rendered
- *  prompt bytes. A memory whose content alone exceeds the pool byte budget
- *  is excluded (`oversized`) — it cannot fit any chunk. An infinite budget
- *  degrades to count-only chunking (the TypeScript child path). */
-function chunkByCountAndBytes(
-    toClassify: ClassifyCandidate[],
-    byteBudget: number,
-): {
-    chunks: ClassifyCandidate[][];
-    oversized: number;
-} {
-    const chunks: ClassifyCandidate[][] = [];
-    let current: ClassifyCandidate[] = [];
-    let currentBytes = 0;
-    let oversized = 0;
-    for (const candidate of toClassify) {
-        const cost = promptEntryBytes(candidate.contextMemory.content);
-        if (cost > byteBudget) {
-            oversized += 1;
-            continue;
-        }
-        if (current.length >= CLASSIFY_CHUNK_SIZE || currentBytes + cost > byteBudget) {
-            chunks.push(current);
-            current = [];
-            currentBytes = 0;
-        }
-        current.push(candidate);
-        currentBytes += cost;
-    }
-    if (current.length > 0) chunks.push(current);
-    return { chunks, oversized };
-}
-
-/** Keeps stratified anchors while they fit the anchor byte budget, skipping
- *  individual anchors too large to fit so the remaining stratification is
- *  preserved. Anchors are calibration aids: dropping some degrades
- *  calibration, while keeping them all can push every chunk's prompt past
- *  the module's byte cap. An infinite budget keeps them all (the
- *  TypeScript child path). */
-function boundAnchorsByBytes(anchors: AnchorCandidate[], byteBudget: number): AnchorCandidate[] {
-    const out: AnchorCandidate[] = [];
-    let bytes = 0;
-    for (const candidate of anchors) {
-        const cost = promptEntryBytes(candidate.anchor.content);
-        if (bytes + cost > byteBudget) continue;
-        out.push(candidate);
-        bytes += cost;
-    }
-    if (out.length < anchors.length) {
-        log(
-            `[dreamer] classify: ${anchors.length - out.length} anchor(s) dropped to fit the prompt byte budget`,
-        );
-    }
-    return out;
-}
-
 async function classifyOneChunk(
     args: ClassifyArgs,
-    chunk: ClassifyCandidate[],
-    anchors: AnchorCandidate[],
+    selectedChunk: ProjectMemoryClaimSnapshot[],
+    selectedAnchors: ProjectMemoryClaimSnapshot[],
     sliceMs: number,
     signal: AbortSignal,
-): Promise<{ classified: number; changed: number } | null> {
-    // The candidate pool and the stage-3 anchor sample were frozen once at
-    // run start; later chunks wait behind provider calls, and child-session
-    // creation is itself an await. A memory quarantined, rejected, or
-    // superseded in the meantime must not reach the child-model prompt —
-    // anchors carry memory content into every prompt exactly like chunk
-    // members. `candidate.id`/`anchor.id` are the authority's id space (the
-    // module id on the module route); the policy recheck keys on the context
-    // row's id. Runs immediately before each route's provider call.
-    const recheckChunk = (): { chunk: ClassifyCandidate[]; anchors: ClassifyAnchorMemory[] } => {
-        const contextIds = [
-            ...chunk.map((candidate) => candidate.contextMemory.id),
-            ...anchors.map((candidate) => candidate.contextId),
-        ];
-        const stillEligible = maintenanceEligibleIdSet(args.db, contextIds, "hygiene");
-        // Eligibility keys on ids, but the frozen member/anchor bytes may
-        // predate a rewrite that left the successor eligible; the id-only
-        // check would then ship the superseded bytes. Exact-bind every row
-        // to the claim's current revision digest, as verify and
-        // compress-cues do.
-        const oracle = exactMemoryContentDigests(args.db, contextIds);
-        // Policy again AFTER the digest read (two autocommit snapshots): a
-        // hide committed between them leaves the digest unchanged.
-        const stillEligibleAfter = maintenanceEligibleIdSet(args.db, contextIds, "hygiene");
-        const eligibleChunk = chunk.filter(
-            (candidate) =>
-                stillEligible.has(candidate.contextMemory.id) &&
-                oracle.get(candidate.contextMemory.id) ===
-                    sha256Utf8Hex(candidate.contextMemory.content) &&
-                stillEligibleAfter.has(candidate.contextMemory.id),
-        );
-        const eligibleAnchors = anchors.filter(
-            (candidate) =>
-                stillEligible.has(candidate.contextId) &&
-                oracle.get(candidate.contextId) === sha256Utf8Hex(candidate.anchor.content) &&
-                stillEligibleAfter.has(candidate.contextId),
-        );
-        const dropped =
-            chunk.length - eligibleChunk.length + anchors.length - eligibleAnchors.length;
-        if (dropped > 0) {
-            log(
-                `[dreamer] classify chunk dropped ${dropped} member(s) hidden since pool selection`,
-            );
-        }
-        return {
-            chunk: eligibleChunk,
-            anchors: eligibleAnchors.map((candidate) => candidate.anchor),
-        };
-    };
+): Promise<{ classified: number; changed: number }> {
     let agentSessionId: string | null = null;
+    let rawManifest = "";
+    let identity: AutonomousManifestIdentity = dreamerManifestIdentity({
+        ...args,
+        task: "classify-memories",
+        publicClaimIds: selectedChunk.map((claim) => claim.publicClaimId),
+    });
     const startedAt = Date.now();
-    const moduleRoute = isModuleRoute(args);
     try {
-        if (moduleRoute) {
-            const live = recheckChunk();
-            if (live.chunk.length === 0) return { classified: 0, changed: 0 };
-            const run = await runClassifyThroughModule(
-                args,
-                live.chunk,
-                live.anchors,
-                startedAt + sliceMs,
-                signal,
-            );
-            // A null run means the slice expired before the module call could
-            // start: the chunk stays unbanked and is not a completed
-            // invocation. Propagated so the pass ends instead of skipping
-            // this chunk and classifying later ones out of order.
-            if (run === null) return null;
-            recordInvocation(args, startedAt, { status: "completed" });
-            return run;
-        }
-
         const createResponse = await createChildSessionWithFence({
             client: args.client,
             db: args.db,
@@ -574,22 +226,37 @@ async function classifyOneChunk(
         const created = shared.normalizeSDKResponse(
             createResponse,
             null as { id?: string } | null,
-            {
-                preferResponseOnMissingData: true,
-            },
+            { preferResponseOnMissingData: true },
         );
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create classify session.");
 
-        const live = recheckChunk();
-        if (live.chunk.length === 0) return { classified: 0, changed: 0 };
-        chunk = live.chunk;
+        const refreshed = refreshDreamerClaimBatch({
+            db: args.db,
+            projectIdentity: args.projectIdentity,
+            lane: "hygiene",
+            claims: [...selectedChunk, ...selectedAnchors],
+        });
+        const refreshedById = new Map(refreshed.map((claim) => [claim.publicClaimId, claim]));
+        const chunk = selectedChunk.flatMap((claim) => {
+            const current = refreshedById.get(claim.publicClaimId);
+            return current ? [current] : [];
+        });
+        const anchors = selectedAnchors.flatMap((claim) => {
+            const current = refreshedById.get(claim.publicClaimId);
+            return current ? [toAnchor(current)] : [];
+        });
+        if (chunk.length === 0) return { classified: 0, changed: 0 };
+        identity = dreamerManifestIdentity({
+            ...args,
+            task: "classify-memories",
+            publicClaimIds: chunk.map((claim) => claim.publicClaimId),
+        });
         const prompt = buildClassifyPrompt({
             projectPath: args.projectIdentity,
             memories: chunk.map(toPromptMemory),
-            anchors: live.anchors,
+            anchors,
         });
-
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,
             {
@@ -622,10 +289,11 @@ async function classifyOneChunk(
                     }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("classify returned no output");
+                    rawManifest = text;
                     try {
                         validateClassifyManifest(
                             text,
-                            new Set(chunk.map((candidate) => candidate.id)),
+                            new Set(chunk.map((claim) => claim.publicClaimId)),
                         );
                     } catch (error) {
                         const providerFailure = providerOutputFailureFromInvalidManifest(
@@ -639,284 +307,131 @@ async function classifyOneChunk(
                 },
             },
         );
-
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        return applyClassifications(
-            args,
-            chunk.map((candidate) => candidate.contextMemory),
-            run.validated,
-        );
+        return applyClassifications(args, chunk, run.validated);
     } catch (error) {
-        const failure = moduleRoute ? new ClassifyModuleFailureError("module", error) : error;
-        const desc = describeError(failure);
+        try {
+            recordDreamerManifestRejection({
+                ...args,
+                identity,
+                rawManifest,
+                reason: getErrorMessage(error),
+            });
+        } catch (recordError) {
+            log(`[dreamer] classify rejection receipt failed: ${getErrorMessage(recordError)}`);
+        }
+        const desc = describeError(error);
         log(
             `[dreamer] classify chunk failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: "failed", error: failure });
-        // A MODULE-authority failure is not safe to downgrade to the guarded
-        // TypeScript child path. Surface it so the scheduler records a
-        // transient failure and retries the same task instead.
-        if (moduleRoute || signal.aborted || failure instanceof DreamerProviderOutputFailureError)
-            throw failure;
+        recordInvocation(args, startedAt, { status: "failed", error });
+        if (signal.aborted || error instanceof DreamerProviderOutputFailureError) throw error;
         return { classified: 0, changed: 0 };
     } finally {
-        // Delete on success AND failure (the failed child still holds the
-        // memory-pool snapshot from the prompt). keep_subagents still honored —
-        // memory-pool text, not raw user transcripts.
         if (agentSessionId && !shouldKeepSubagents()) {
             await args.client.session
                 .delete({
                     path: { id: agentSessionId },
                     query: { directory: args.sessionDirectory },
                 })
-                .catch((e: unknown) => {
-                    log(`[dreamer] classify session cleanup failed: ${getErrorMessage(e)}`);
+                .catch((error: unknown) => {
+                    log(`[dreamer] classify session cleanup failed: ${getErrorMessage(error)}`);
                 });
         }
     }
 }
 
-/** Run the module classifier and apply its manifest in module id space. The
- *  mirror-back changefeed refreshes the context rows, including classified_at;
- *  this path must not write the context rows a second time. */
-async function runClassifyThroughModule(
-    args: ClassifyArgs,
-    chunk: ClassifyCandidate[],
-    anchors: ClassifyAnchorMemory[],
-    sliceDeadline: number,
-    signal: AbortSignal,
-): Promise<{ classified: number; changed: number } | null> {
-    const modelChain = args.modelChain ?? [];
-    if (modelChain.length === 0) {
-        // Module-backed classify cannot inherit the session's model the way
-        // the non-module path does: `session.send` requires an explicit
-        // canonical `provider/model`, and no canonical string for the
-        // session default exists on this side of the boundary. So this
-        // configuration is a hard, permanent failure rather than a silent
-        // fallback — the message names every key that can supply one, and
-        // the wording stays outside the transient-retry vocabulary so the
-        // task advances to its next cron slot instead of hot-retrying.
-        throw new Error(
-            "classify has no effective model chain: set dreamer.model, " +
-                "dreamer.tasks.classify-memories.model, or dreamer.fallback_models " +
-                "(all are unset or malformed, and module-backed classify has no session default to fall back on)",
-        );
-    }
-    const prompt = buildClassifyPrompt({
-        projectPath: args.projectIdentity,
-        memories: chunk.map(toPromptMemory),
-        anchors,
-    });
-    // Prompt construction consumes the slice budget. Both budgets below
-    // derive from this one capped remainder: capping only the transport
-    // would let a long slice hand the module a budget that outlives the
-    // transport and reopen the cancel-before-purge race. A remainder at or
-    // below the purge margin would give the module an unworkable budget and
-    // fail the task; leaving the chunk unbanked keeps it eligible next slice.
-    const budgetMs = Math.min(
-        CLASSIFY_MODULE_RUN_TIMEOUT_MS,
-        Math.min(sliceDeadline, args.deadline) - Date.now(),
-    );
-    if (budgetMs <= CLASSIFY_MODULE_PURGE_MARGIN_MS) {
-        log("[dreamer] classify: slice budget expired before the module call; chunk left unbanked");
-        return null;
-    }
-    const response = await args.moduleClient?.call({
-        sessionId: args.moduleSessionId as string,
-        projectRoot: args.moduleProjectRoot as string,
-        method: "dreamer.run_task",
-        body: {
-            method: "dreamer.run_task",
-            v: 1,
-            session_id: args.moduleSessionId,
-            task: "classify",
-            // Chunk membership must stay in the id for retry idempotency, but a large
-            // chunk's literal id list can exceed the module's 256-byte command-id cap,
-            // so the membership rides as a digest.
-            command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash("sha256")
-                .update(chunk.map((candidate) => candidate.id).join(","))
-                .digest("hex")
-                .slice(0, 24)}`,
-            authority_generation: args.moduleAuthorityGeneration,
-            payload: {
-                prompt_body: prompt,
-                model_chain: [...modelChain],
-                // Shorter than the transport budget below so the module's own
-                // deadline machinery — not a transport cancel that aborts the
-                // handler mid-cleanup — ends an over-budget run and purges its
-                // attempt session. The guard above keeps this positive.
-                timeout_ms: budgetMs - CLASSIFY_MODULE_PURGE_MARGIN_MS,
-                items: chunk.map((candidate) => ({
-                    memory_id: candidate.id,
-                    content_hash: candidate.normalizedHash,
-                })),
-            },
-        },
-        signal,
-        // The module drives a full producer run (model call included) before replying,
-        // so this request carries the classify slice budget, not the transport default.
-        timeoutMs: budgetMs,
-    });
-    const result = (response as { result?: unknown } | null)?.result ?? response;
-    if (!result || typeof result !== "object")
-        throw new Error("module returned invalid classify result");
-    const manifestText = (result as { manifest_text?: unknown }).manifest_text;
-    if (typeof manifestText !== "string") throw new Error("module returned no classify manifest");
-    if ((result as { truncated?: unknown }).truncated === true) {
-        throw new Error("classify returned length-capped output");
-    }
-    const parsed = validateClassifyManifest(
-        manifestText,
-        new Set(chunk.map((candidate) => candidate.id)),
-    );
-    const rows = parsed.map((entry) => {
-        const candidate = chunk.find((item) => item.id === entry.id);
-        if (!candidate) throw new Error(`classify returned unknown memory ${entry.id}`);
-        return {
-            memory_id: entry.id,
-            content_hash_at_prompt: candidate.normalizedHash,
-            // Exact prompted bytes: recheckChunk proved this content matches
-            // the claim's current revision, and the native handler compares
-            // it against the row's exact content inside its transaction —
-            // the normalized hash alone cannot reject a case/whitespace-only
-            // rewrite landing while the model ran.
-            content_sha256_at_prompt: sha256Utf8Hex(candidate.contextMemory.content),
-            importance: entry.importance,
-            scope: entry.scope,
-            // The host forces shareable to false whenever the memory text is sensitive,
-            // regardless of whether classification runs through the module or provider path.
-            shareable:
-                entry.shareable === true &&
-                hasShareabilitySensitiveText(candidate.contextMemory.content)
-                    ? false
-                    : entry.shareable,
-        };
-    });
-    let applied: unknown;
-    try {
-        applied = await args.moduleClient?.call({
-            sessionId: args.moduleSessionId as string,
-            projectRoot: args.moduleProjectRoot as string,
-            method: "memory.set_classification",
-            body: {
-                name: "memory.set_classification",
-                arguments: {
-                    memory_project: args.projectIdentity,
-                    context_store_uuid: args.moduleContextStoreUuid,
-                    authority_generation: args.moduleAuthorityGeneration,
-                    rows,
-                },
-            },
-            signal,
-        });
-    } catch (error) {
-        if (isRustAuthorityDrainingError(error)) {
-            throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
-        }
-        throw error;
-    }
-    if (isRustAuthorityDrainingError(applied)) {
-        throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
-    }
-    const applyResult = (applied as { result?: unknown } | null)?.result ?? applied;
-    if (!applyResult || typeof applyResult !== "object") {
-        throw new Error("module returned invalid classification apply result");
-    }
-    const accepted = (applyResult as { accepted?: unknown }).accepted;
-    if (!Array.isArray(accepted))
-        throw new Error("module returned no classification acceptance list");
-    const acceptedIds = accepted.map((id) => {
-        if (!Number.isInteger(id)) throw new Error("module returned an invalid accepted memory id");
-        return id as number;
-    });
-    const rejected = (applyResult as { rejected?: unknown }).rejected;
-    const rejectedRows = Array.isArray(rejected) ? rejected : [];
-    const rejectionCounts = new Map<string, number>();
-    for (const row of rejectedRows) {
-        const reason =
-            row &&
-            typeof row === "object" &&
-            typeof (row as { reason?: unknown }).reason === "string"
-                ? (row as { reason: string }).reason
-                : "unknown";
-        rejectionCounts.set(reason, (rejectionCounts.get(reason) ?? 0) + 1);
-    }
-    const nonStaleRejections = [...rejectionCounts].some(([reason]) => reason !== "stale");
-    if (nonStaleRejections) {
-        const knownReasons = ["not_found", "not_owned", "stale"];
-        const known = knownReasons.map((reason) => `${reason}=${rejectionCounts.get(reason) ?? 0}`);
-        const unknown = [...rejectionCounts]
-            .filter(([reason]) => !knownReasons.includes(reason))
-            .map(([reason, count]) => `${reason}=${count}`);
-        throw new Error(`module rejected classification (${[...known, ...unknown].join(", ")})`);
-    }
-
-    // Module ids are translated back only to identify the context rows whose
-    // mirror-back updates will satisfy the local classified_at run-gate. Do not
-    // call setMemoryClassification here: the authority feed owns that write.
-    const byModuleId = new Map(chunk.map((candidate) => [candidate.id, candidate]));
-    const acceptedContextIds = acceptedIds.map((moduleId) => {
-        const candidate = byModuleId.get(moduleId);
-        if (!candidate) throw new Error(`module accepted unknown memory ${moduleId}`);
-        return candidate.contextMemory.id;
-    });
-    return { classified: acceptedContextIds.length, changed: acceptedContextIds.length };
-}
-
 export function applyClassifications(
     args: ClassifyArgs,
-    chunk: Memory[],
+    chunk: ProjectMemoryClaimSnapshot[],
     manifestText: string,
 ): { classified: number; changed: number } {
-    const byId = new Map(chunk.map((m) => [m.id, m]));
-    const parsed = parseClassifyManifest(manifestText);
-    assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
-        new Set(byId.keys()),
-        "classify",
-    );
-    if (parsed.length === 0) return { classified: 0, changed: 0 };
-
-    let classified = 0;
-    let changed = 0;
-    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-        // The verdicts describe the PROMPTED bytes: a memory rewritten while
-        // the classifier ran must not have another revision's classification
-        // (a shareable=true verdict for benign content A would otherwise
-        // mark a sensitive successor B shareable), and a target the policy
-        // hid meanwhile must not be touched at all. Re-evaluate policy and
-        // exact content identity while holding the write lock.
-        const eligibleInTx = maintenanceEligibleIdSet(
-            args.db,
-            parsed.map((entry) => entry.id),
-            "hygiene",
-        );
-        const digestsInTx = exactMemoryContentDigests(
-            args.db,
-            parsed.map((entry) => entry.id),
-        );
-        for (const p of parsed) {
-            const memory = byId.get(p.id);
-            if (!memory) continue;
-            if (!eligibleInTx.has(p.id)) continue;
-            if (digestsInTx.get(p.id) !== sha256Utf8Hex(memory.content)) continue;
-            // Fail closed: secret/credential/personal-path text is forced private
-            // regardless of the model's verdict.
-            const shareable =
-                p.shareable === true && hasShareabilitySensitiveText(memory.content)
-                    ? false
-                    : p.shareable;
-            const didChange = setMemoryClassification(args.db, p.id, {
-                importance: p.importance,
-                scope: p.scope,
-                shareable,
-            });
-            classified += 1; // stamped classified_at (run-gate satisfied)
-            if (didChange) changed += 1; // an actual column value moved
-        }
+    const identity = dreamerManifestIdentity({
+        ...args,
+        task: "classify-memories",
+        publicClaimIds: chunk.map((claim) => claim.publicClaimId),
     });
-    return { classified, changed };
+    let parsed: ReturnType<typeof validateClassifyManifest>;
+    try {
+        parsed = validateClassifyManifest(
+            manifestText,
+            new Set(chunk.map((claim) => claim.publicClaimId)),
+        );
+    } catch (error) {
+        recordDreamerManifestRejection({
+            ...args,
+            identity,
+            rawManifest: manifestText,
+            reason: getErrorMessage(error),
+        });
+        throw error;
+    }
+    const byId = new Map(chunk.map((claim) => [claim.publicClaimId, claim]));
+    const changed = parsed.filter((entry) => {
+        const claim = byId.get(entry.publicClaimId);
+        return (
+            claim !== undefined &&
+            ((entry.importance !== undefined && entry.importance !== claim.importance) ||
+                (entry.scope !== undefined && entry.scope !== claim.memoryScope) ||
+                (entry.shareable !== undefined &&
+                    entry.shareable !== (claim.sharing === "shareable")))
+        );
+    }).length;
+    const applied = runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () =>
+        runAutonomousManifestInCurrentTransaction({
+            db: args.db,
+            identity,
+            items: parsed.map((entry) => {
+                const claim = byId.get(entry.publicClaimId);
+                if (!claim)
+                    throw new Error(`classify returned unknown claim ${entry.publicClaimId}`);
+                return { binding: claimManifestBinding(claim), value: entry };
+            }),
+            manifest: parsed.map((entry) => ({
+                importance: entry.importance ?? null,
+                publicClaimId: entry.publicClaimId,
+                scope: entry.scope ?? null,
+                shareable: entry.shareable ?? null,
+            })),
+            resultSummary: { changed },
+            stageItem: (db, item, nowMs) => {
+                const claim = byId.get(item.binding.publicClaimId);
+                if (!claim) throw new Error(`missing classify claim ${item.binding.publicClaimId}`);
+                const shareable =
+                    item.value.shareable === true && hasShareabilitySensitiveText(claim.content)
+                        ? false
+                        : item.value.shareable;
+                return stageReviseProjectMemoryClaimInCurrentTransaction(
+                    db,
+                    {
+                        token: item.binding.token,
+                        importance: item.value.importance,
+                        memoryScope: item.value.scope,
+                        sharing:
+                            shareable === undefined
+                                ? undefined
+                                : shareable
+                                  ? "shareable"
+                                  : "private",
+                        provenance: dreamerInferenceProvenance({
+                            identity,
+                            binding: item.binding,
+                            sourceContent: claim.content,
+                        }),
+                        actor: `dreamer:${identity.runId}`,
+                    },
+                    nowMs,
+                );
+            },
+        }),
+    );
+    if (applied.operation.outcome !== "applied") return { classified: 0, changed: 0 };
+    const summary = applied.summary as { changed?: unknown } | null;
+    return {
+        classified: applied.appliedItems,
+        changed: typeof summary?.changed === "number" ? summary.changed : 0,
+    };
 }
 
 function recordInvocation(

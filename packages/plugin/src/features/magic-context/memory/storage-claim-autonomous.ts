@@ -7,7 +7,8 @@
  * write, then stages every item under one outer operation receipt.
  */
 
-import { isInTransaction, type Database } from "../../../shared/sqlite";
+import { type Database, isInTransaction } from "../../../shared/sqlite";
+import type { ClaimMutationToken } from "./claim-operation-contract";
 import {
     type CanonicalJsonValue,
     canonicalClaimMutationToken,
@@ -15,6 +16,7 @@ import {
     formatRevisionLocator,
 } from "./claim-operation-contract";
 import {
+    type ClaimOperationEnvelope,
     type ClaimOperationRunResult,
     type ClaimOperationStageOutcome,
     computeProjectMemoryMutationToken,
@@ -23,7 +25,6 @@ import {
     runClaimOperationInCurrentTransaction,
 } from "./storage-claim-operations";
 import { sha256Utf8Hex } from "./storage-claims";
-import type { ClaimMutationToken } from "./claim-operation-contract";
 
 export interface AutonomousManifestIdentity {
     producer: string;
@@ -128,18 +129,22 @@ function validateBindings(
         // Full token comparison fences lifecycle, applicability, and policy
         // heads in addition to the revision checked above.
         const currentToken = computeProjectMemoryMutationToken(db, binding.publicClaimId);
-        if (canonicalClaimMutationToken(binding.token) !== canonicalClaimMutationToken(currentToken)) {
+        if (
+            canonicalClaimMutationToken(binding.token) !== canonicalClaimMutationToken(currentToken)
+        ) {
             return `manifest token is stale for ${binding.publicClaimId}`;
         }
     }
     return null;
 }
 
-function combineStageOutcomes(
+export function combineClaimOperationStageOutcomes(
     outcomes: readonly ClaimOperationStageOutcome[],
     summary: CanonicalJsonValue,
 ): ClaimOperationStageOutcome {
-    const effects = outcomes.flatMap((outcome) => (outcome.kind === "effects" ? outcome.effects : []));
+    const effects = outcomes.flatMap((outcome) =>
+        outcome.kind === "effects" ? outcome.effects : [],
+    );
     const stale = outcomes.find((outcome) => outcome.kind === "stale");
     if (stale?.kind === "stale") return stale;
     if (effects.length === 0) {
@@ -177,7 +182,11 @@ export function runAutonomousManifestInCurrentTransaction<T>(args: {
     items: readonly AutonomousManifestItem<T>[];
     manifest: CanonicalJsonValue;
     resultSummary?: CanonicalJsonValue;
-    stageItem: (db: Database, item: AutonomousManifestItem<T>, nowMs: number) => ClaimOperationStageOutcome;
+    stageItem: (
+        db: Database,
+        item: AutonomousManifestItem<T>,
+        nowMs: number,
+    ) => ClaimOperationStageOutcome;
     nowMs?: number;
 }): AutonomousManifestApplyResult {
     if (!isInTransaction(args.db)) {
@@ -210,16 +219,17 @@ export function runAutonomousManifestInCurrentTransaction<T>(args: {
                 args.items.map((item) => item.binding),
             );
             if (invalid) return { kind: "stale", reason: invalid };
-            return combineStageOutcomes(
+            return combineClaimOperationStageOutcomes(
                 args.items.map((item) => args.stageItem(args.db, item, nowMs)),
                 args.resultSummary ?? null,
             );
         },
         nowMs,
     );
-    const payload = operation.result.payload as
-        | { appliedItems?: unknown; summary?: CanonicalJsonValue }
-        | null;
+    const payload = operation.result.payload as {
+        appliedItems?: unknown;
+        summary?: CanonicalJsonValue;
+    } | null;
     return {
         operation,
         appliedItems:
@@ -228,6 +238,50 @@ export function runAutonomousManifestInCurrentTransaction<T>(args: {
                 : 0,
         summary: payload?.summary ?? null,
     };
+}
+
+function rejectionEnvelope(args: {
+    identity: AutonomousManifestIdentity;
+    rawManifest: string;
+}): ClaimOperationEnvelope {
+    return {
+        producer: args.identity.producer,
+        operationKey: operationKey(args.identity),
+        requestDigest: computeClaimOperationRequestDigest({
+            identity: {
+                batchId: args.identity.batchId,
+                leaseGeneration: String(args.identity.leaseGeneration),
+                leaseKey: args.identity.leaseKey,
+                runId: args.identity.runId,
+                task: args.identity.task,
+            },
+            manifestDigest: sha256Utf8Hex(args.rawManifest),
+            operation: "reject-autonomous-project-memory-manifest",
+        }),
+    };
+}
+
+/** Records a rejection result only within an active transaction. */
+export function recordAutonomousManifestRejectionInCurrentTransaction(args: {
+    db: Database;
+    identity: AutonomousManifestIdentity;
+    rawManifest: string;
+    reason: string;
+    nowMs?: number;
+}): ClaimOperationRunResult {
+    if (!isInTransaction(args.db)) {
+        throw new Error(
+            "recordAutonomousManifestRejectionInCurrentTransaction requires an active transaction",
+        );
+    }
+    assertIdentity(args.identity);
+    const nowMs = args.nowMs ?? Date.now();
+    return runClaimOperationInCurrentTransaction(
+        args.db,
+        rejectionEnvelope(args),
+        () => ({ kind: "stale", reason: args.reason }),
+        nowMs,
+    );
 }
 
 /** Persist a malformed/incomplete provider manifest as one replayable zero-effect result. */
@@ -242,21 +296,7 @@ export function recordAutonomousManifestRejection(args: {
     const nowMs = args.nowMs ?? Date.now();
     return runClaimOperation(
         args.db,
-        {
-            producer: args.identity.producer,
-            operationKey: operationKey(args.identity),
-            requestDigest: computeClaimOperationRequestDigest({
-                identity: {
-                    batchId: args.identity.batchId,
-                    leaseGeneration: String(args.identity.leaseGeneration),
-                    leaseKey: args.identity.leaseKey,
-                    runId: args.identity.runId,
-                    task: args.identity.task,
-                },
-                manifestDigest: sha256Utf8Hex(args.rawManifest),
-                operation: "reject-autonomous-project-memory-manifest",
-            }),
-        },
+        rejectionEnvelope(args),
         () => ({ kind: "stale", reason: args.reason }),
         nowMs,
     );
