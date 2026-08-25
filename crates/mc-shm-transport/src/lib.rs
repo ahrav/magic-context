@@ -12,6 +12,8 @@ pub mod backend;
 pub mod descriptor;
 /// Operation-counter evidence gates. commentlint: allow(JUDGE)
 pub mod evidence;
+/// Fuzz and corpus-replay decoder entry points. commentlint: allow(JUDGE)
+pub mod harness;
 /// Scoped raw-span receive leases. commentlint: allow(JUDGE)
 pub mod lease;
 /// Checked close state machine. commentlint: allow(JUDGE)

@@ -379,24 +379,45 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
     let ring = Ring::create(&profile(), 21).unwrap();
     let base = ring.grant().encode();
 
-    let mut cases = Vec::new();
+    // Geometry tampering fails closed inside the pure grant decoder.
     let mut version = base;
     version[0..2].copy_from_slice(&1u16.to_le_bytes());
-    cases.push(version);
-    let mut incarnation = base;
-    incarnation[2] ^= 1;
-    cases.push(incarnation);
-    let mut lane = base;
-    lane[18] ^= 1;
-    cases.push(lane);
+    let mut zero_depth = base;
+    zero_depth[22..30].copy_from_slice(&0u64.to_le_bytes());
+    let mut small_arena = base;
+    small_arena[30..38].copy_from_slice(&(MAX_FRAME_BYTES as u64 - 1).to_le_bytes());
+    let mut zero_leases = base;
+    zero_leases[38..46].copy_from_slice(&0u64.to_le_bytes());
+    let mut excess_leases = base;
+    excess_leases[38..46].copy_from_slice(&u64::MAX.to_le_bytes());
     let mut depth = base;
     depth[22..30].copy_from_slice(&31u64.to_le_bytes());
-    cases.push(depth);
     let mut arena = base;
     arena[30..38].copy_from_slice(&(MAX_FRAME_BYTES as u64 + 4096).to_le_bytes());
-    cases.push(arena);
+    let mut total = base;
+    total[46..54].copy_from_slice(&(ring.object_size() as u64 + 1).to_le_bytes());
+    let mut reserved = base;
+    reserved[54] = 1;
+    for bytes in [
+        version,
+        zero_depth,
+        small_arena,
+        zero_leases,
+        excess_leases,
+        depth,
+        arena,
+        total,
+        reserved,
+    ] {
+        assert_eq!(RingGrant::decode(bytes), Err(RingError::InvalidGrant));
+    }
 
-    for bytes in cases {
+    // Identity tampering passes `RingGrant::decode` but `Ring::attach` rejects it.
+    let mut incarnation = base;
+    incarnation[2] ^= 1;
+    let mut lane = base;
+    lane[18] ^= 1;
+    for bytes in [incarnation, lane] {
         let grant = RingGrant::decode(bytes).unwrap();
         assert!(matches!(
             Ring::attach(
@@ -407,10 +428,6 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
             Err(RingError::InvalidGrant)
         ));
     }
-
-    let mut reserved = base;
-    reserved[54] = 1;
-    assert_eq!(RingGrant::decode(reserved), Err(RingError::InvalidGrant));
 
     let name = c"mc-shm-unsealed-test";
     // SAFETY: static name and flags are valid for memfd_create.
@@ -433,6 +450,36 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
         Ring::attach(unsealed, ring.grant(), SchedulingMode::ColdParkWake),
         Err(RingError::ObjectValidationFailed)
     ));
+}
+
+#[test]
+fn grant_slice_rejects_every_truncation_point_and_one_byte_suffix() {
+    let encoded_len = RingGrant::encoded_len();
+    let valid = {
+        let ring = Ring::create(&profile(), 25).unwrap();
+        ring.grant().encode()
+    };
+    assert!(RingGrant::decode_slice(&valid).is_ok());
+
+    for cut in 0..encoded_len {
+        assert_eq!(
+            RingGrant::decode_slice(&valid[..cut]),
+            Err(RingError::InvalidGrant),
+            "truncation at byte {cut} must be rejected"
+        );
+    }
+    let mut suffixed = valid.to_vec();
+    suffixed.push(0);
+    assert_eq!(
+        RingGrant::decode_slice(&suffixed),
+        Err(RingError::InvalidGrant),
+        "one-byte suffix must be rejected"
+    );
+    assert_eq!(
+        RingGrant::decode_slice(&[]),
+        Err(RingError::InvalidGrant),
+        "empty grant must be rejected"
+    );
 }
 
 #[cfg(target_os = "linux")]

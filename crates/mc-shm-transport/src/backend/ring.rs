@@ -421,6 +421,11 @@ impl RingGrant {
     }
 
     /// Decodes grant received through authenticated bootstrap transport.
+    ///
+    /// Rejects reserved-byte tampering and any geometry that cannot map a
+    /// valid ring: wrong layout version, zero depth, an arena below one
+    /// legal maximum frame, lease bounds outside `1..=depth`, or a total
+    /// size that disagrees with the computed layout.
     pub fn decode(bytes: [u8; GRANT_BYTES]) -> Result<Self, RingError> {
         if bytes[54..58] != [0; 4] {
             return Err(RingError::InvalidGrant);
@@ -430,7 +435,7 @@ impl RingGrant {
                 .try_into()
                 .expect("grant ranges have fixed eight-byte width")
         };
-        Ok(Self {
+        let grant = Self {
             layout_version: u16::from_le_bytes([bytes[0], bytes[1]]),
             incarnation: Incarnation::from_bytes(
                 bytes[2..18]
@@ -446,7 +451,34 @@ impl RingGrant {
             arena_bytes: u64::from_le_bytes(array(30..38)),
             max_leases: u64::from_le_bytes(array(38..46)),
             total_bytes: u64::from_le_bytes(array(46..54)),
-        })
+        };
+        grant.checked_layout()?;
+        Ok(grant)
+    }
+
+    /// Decodes one exact-length grant slice. commentlint: allow(JUDGE)
+    pub fn decode_slice(bytes: &[u8]) -> Result<Self, RingError> {
+        let bytes: [u8; GRANT_BYTES] = bytes.try_into().map_err(|_| RingError::InvalidGrant)?;
+        Self::decode(bytes)
+    }
+
+    fn checked_layout(&self) -> Result<Layout, RingError> {
+        if self.layout_version != LAYOUT_VERSION
+            || self.descriptor_depth == 0
+            || self.arena_bytes < MAX_FRAME_BYTES as u64
+            || self.max_leases == 0
+            || self.max_leases > self.descriptor_depth
+        {
+            return Err(RingError::InvalidGrant);
+        }
+        let depth = usize::try_from(self.descriptor_depth).map_err(|_| RingError::InvalidGrant)?;
+        let arena = usize::try_from(self.arena_bytes).map_err(|_| RingError::InvalidGrant)?;
+        let total = usize::try_from(self.total_bytes).map_err(|_| RingError::InvalidGrant)?;
+        let layout = Layout::new(depth, arena)?;
+        if layout.total != total {
+            return Err(RingError::InvalidGrant);
+        }
+        Ok(layout)
     }
 
     /// Fixed encoded grant length.
@@ -563,21 +595,8 @@ impl Ring {
         grant: RingGrant,
         scheduling: SchedulingMode,
     ) -> Result<Self, RingError> {
-        if grant.layout_version != LAYOUT_VERSION
-            || grant.descriptor_depth == 0
-            || grant.arena_bytes < MAX_FRAME_BYTES as u64
-            || grant.max_leases == 0
-            || grant.max_leases > grant.descriptor_depth
-        {
-            return Err(RingError::InvalidGrant);
-        }
-        let depth = usize::try_from(grant.descriptor_depth).map_err(|_| RingError::InvalidGrant)?;
-        let arena = usize::try_from(grant.arena_bytes).map_err(|_| RingError::InvalidGrant)?;
+        let layout = grant.checked_layout()?;
         let total = usize::try_from(grant.total_bytes).map_err(|_| RingError::InvalidGrant)?;
-        let layout = Layout::new(depth, arena)?;
-        if layout.total != total {
-            return Err(RingError::InvalidGrant);
-        }
         let mapping = Mapping::attach(fd, total)?;
         validate_lifecycle(&mapping, layout, grant)?;
         prefault_read(&mapping);
