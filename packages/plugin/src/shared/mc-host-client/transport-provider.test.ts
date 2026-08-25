@@ -315,7 +315,12 @@ describe("sanitized provider channel", () => {
             dispatched.push(frame),
         );
         const segment = new Uint8Array(new ArrayBuffer(5));
-        const lease = new ReceiveLease([segment], () => {}, new CopyCounter(), () => "released");
+        const lease = new ReceiveLease(
+            [segment],
+            () => {},
+            new CopyCounter(),
+            () => "released",
+        );
         Object.defineProperty(lease, "segmentCount", { get: () => 2 ** 40 });
         handlers.onFrame({
             header: {
