@@ -19,7 +19,7 @@ use crate::wire::{
     PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::time::{timeout_at, Duration, Instant};
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::frame_channel::{
@@ -230,6 +230,7 @@ where
 /// Discards the declared bytes of an early-rejected oversize control body
 /// without allocating it, preserving stream alignment. Failure here closes the
 /// generation as usual; the already-queued terminal stays authoritative.
+/// Discards a declared body the caller refused to buffer, realigning the stream.
 async fn drain_declared_body<R>(
     reader: &mut R,
     declared: u32,
@@ -239,29 +240,12 @@ async fn drain_declared_body<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut scratch = [0u8; 8192];
-    let mut remaining = declared as usize;
-    while remaining > 0 {
-        let want = remaining.min(scratch.len());
-        let read = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(ReadClose::Cancelled),
-            result = timeout_at(deadline, reader.read(&mut scratch[..want])) => match result {
-                Ok(read) => read.map_err(ReadClose::Io)?,
-                Err(_) => return Err(ReadClose::Corrupt("drain deadline expired")),
-            },
-        };
-        if read == 0 {
-            return Err(ReadClose::Corrupt("EOF while draining oversize body"));
-        }
-        remaining -= read;
-    }
-    Ok(())
+    crate::frame_read::drain(reader, declared as usize, deadline, cancel)
+        .await
+        .map_err(drain_close)
 }
 
-/// Offset-tracked exact read under an absolute deadline. Cancellation-safe by
-/// construction: partial progress retires the generation, so a torn read never
-/// resumes on the same stream.
+/// Fills `buf`, classifying a short read as this layer sees it.
 async fn read_exact_deadline<R>(
     reader: &mut R,
     buf: &mut [u8],
@@ -271,27 +255,12 @@ async fn read_exact_deadline<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let read = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(ReadClose::Cancelled),
-            result = timeout_at(deadline, reader.read(&mut buf[filled..])) => match result {
-                Ok(read) => read.map_err(ReadClose::Io)?,
-                Err(_) => return Err(ReadClose::Corrupt("frame deadline expired")),
-            },
-        };
-        if read == 0 {
-            return Err(ReadClose::Corrupt("EOF inside frame"));
-        }
-        filled += read;
-    }
-    Ok(())
+    crate::frame_read::read_exact(reader, buf, deadline, cancel)
+        .await
+        .map_err(frame_close)
 }
 
-/// `read_buf` appends into `buf`'s spare capacity without zero-initializing
-/// it. `take` caps the read at the frame boundary even when the vector's
-/// allocated capacity exceeds `len`.
+/// Reads exactly `len` body bytes under the frame deadline.
 async fn read_body_deadline<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -302,21 +271,33 @@ async fn read_body_deadline<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut limited = reader.take(len as u64);
-    while buf.len() < len {
-        let read = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(ReadClose::Cancelled),
-            result = timeout_at(deadline, limited.read_buf(buf)) => match result {
-                Ok(read) => read.map_err(ReadClose::Io)?,
-                Err(_) => return Err(ReadClose::Corrupt("frame deadline expired")),
-            },
-        };
-        if read == 0 {
-            return Err(ReadClose::Corrupt("EOF inside frame"));
+    crate::frame_read::read_body(reader, buf, len, deadline, cancel)
+        .await
+        .map_err(frame_close)
+}
+
+/// A stop inside a frame: EOF and deadline both mean stream alignment is lost, so
+/// the generation closes without resynchronization (protocol section 6.3).
+fn frame_close(stop: crate::frame_read::ReadStop) -> ReadClose {
+    match stop {
+        crate::frame_read::ReadStop::Cancelled => ReadClose::Cancelled,
+        crate::frame_read::ReadStop::Eof => ReadClose::Corrupt("EOF inside frame"),
+        crate::frame_read::ReadStop::DeadlineExpired => {
+            ReadClose::Corrupt("frame deadline expired")
         }
+        crate::frame_read::ReadStop::Io(error) => ReadClose::Io(error),
     }
-    Ok(())
+}
+
+/// Same classes, named for the drain so a failure says which phase lost alignment.
+fn drain_close(stop: crate::frame_read::ReadStop) -> ReadClose {
+    match stop {
+        crate::frame_read::ReadStop::Eof => ReadClose::Corrupt("EOF while draining oversize body"),
+        crate::frame_read::ReadStop::DeadlineExpired => {
+            ReadClose::Corrupt("drain deadline expired")
+        }
+        other => frame_close(other),
+    }
 }
 
 /// The single serialized write task for one connection.

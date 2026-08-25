@@ -1829,32 +1829,21 @@ async fn read_active_frame<R: AsyncRead + Unpin>(
     }))
 }
 
+/// Fills `buf` under the frame deadline. Every stop is fatal to this generation:
+/// the client resynchronizes by reconnecting, never by guessing where the next
+/// header begins.
 async fn read_exact_until<R: AsyncRead + Unpin>(
     read: &mut R,
     buf: &mut [u8],
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Result<(), ()> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        let count = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(()),
-            result = timeout_at(deadline, read.read(&mut buf[offset..])) => result.map_err(|_| ())?.map_err(|_| ())?,
-        };
-        if count == 0 {
-            return Err(());
-        }
-        offset += count;
-    }
-    Ok(())
+    crate::frame_read::read_exact(read, buf, deadline, cancel)
+        .await
+        .map_err(|_| ())
 }
 
 /// Reads exactly `len` body bytes under one frame deadline.
-///
-/// `read_buf` appends into the vector's spare capacity without
-/// zero-initializing it, and `take` caps the read at the frame boundary even
-/// when the allocated capacity exceeds `len`.
 async fn read_body_until<R: AsyncRead + Unpin>(
     read: &mut R,
     len: usize,
@@ -1862,33 +1851,23 @@ async fn read_body_until<R: AsyncRead + Unpin>(
     cancel: &CancellationToken,
 ) -> Result<Vec<u8>, ()> {
     let mut body = Vec::with_capacity(len);
-    let mut limited = read.take(len as u64);
-    while body.len() < len {
-        let count = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(()),
-            result = timeout_at(deadline, limited.read_buf(&mut body)) => result.map_err(|_| ())?.map_err(|_| ())?,
-        };
-        if count == 0 {
-            return Err(());
-        }
-    }
+    crate::frame_read::read_body(read, &mut body, len, deadline, cancel)
+        .await
+        .map_err(|_| ())?;
     Ok(body)
 }
 
+/// Discards a body this client refused to retain, so the failure is reported
+/// against a stream still aligned on a header boundary.
 async fn drain_until<R: AsyncRead + Unpin>(
     read: &mut R,
-    mut remaining: usize,
+    remaining: usize,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Result<(), ()> {
-    let mut scratch = [0u8; 8192];
-    while remaining > 0 {
-        let take = remaining.min(scratch.len());
-        read_exact_until(read, &mut scratch[..take], deadline, cancel).await?;
-        remaining -= take;
-    }
-    Ok(())
+    crate::frame_read::drain(read, remaining, deadline, cancel)
+        .await
+        .map_err(|_| ())
 }
 
 /// Turns a caller-supplied timeout into an absolute deadline.

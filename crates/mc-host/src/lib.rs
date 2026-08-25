@@ -28,6 +28,7 @@ mod control;
 mod dispatch;
 #[doc(hidden)]
 pub mod frame_channel;
+mod frame_read;
 mod instance;
 mod panic_boundary;
 mod routing;
