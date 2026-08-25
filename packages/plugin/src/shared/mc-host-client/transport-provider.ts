@@ -10,11 +10,13 @@
 
 import { SubcCallError } from "./errors";
 import {
+    BoundedFrameProducer,
     type ByteBudget,
     CopyCounter,
     type FrameChannelCloseReason,
     type FrameChannelDiagnosticType,
     type FrameChannelHandlers,
+    type FrameChannelStats,
     type FrameMeta,
     type FrameSendHooks,
     type FrameSendTicket,
@@ -251,6 +253,19 @@ export function sanitizedCandidateFactory(
             for (const settle of [...flushWaiters]) settle();
             args.handlers.onClosed(reason, sanitizedProviderError(transport, phase));
         };
+        const boundedSendFailure = (
+            error: unknown,
+            outcome: "not_sent" | "outcome_unknown",
+        ): SubcCallError =>
+            new SubcCallError(
+                outcome,
+                `transport provider ${transport} failed during send`,
+                error instanceof SubcCallError &&
+                    error.code !== undefined &&
+                    BOUNDED_CHANNEL_CODES.has(error.code)
+                    ? error.code
+                    : undefined,
+            );
         const upstreamDiagnostic = args.handlers.onDiagnostic;
         const handlers: FrameChannelHandlers = {
             onFrame: (frame) => {
@@ -367,14 +382,16 @@ export function sanitizedCandidateFactory(
                     receiveLeases.add(safeLease);
                     snapshot = { header: safeHeader, body: safeLease };
                 } catch {
+                    let retained = false;
                     if (sourceLease && !sourceLease.isReleased()) {
                         try {
                             sourceLease.release();
                         } catch {
                             quarantinedBytes += charged;
+                            retained = true;
                         }
                     }
-                    if (charged > 0) args.budget.release(charged);
+                    if (charged > 0 && !retained) args.budget.release(charged);
                     closeUpstream("protocol_violation", "channel");
                     return;
                 }
@@ -495,14 +512,114 @@ export function sanitizedCandidateFactory(
                 };
             },
             reserve: (header, capacity, hooks) => {
+                let published = false;
+                const trackedHooks: FrameSendHooks = {
+                    onPublish: () => {
+                        published = true;
+                        hooks?.onPublish?.();
+                    },
+                    ...(hooks?.onComplete ? { onComplete: hooks.onComplete } : {}),
+                };
+                let inner: BoundedFrameProducer;
                 try {
-                    return channel.reserve(header, capacity, hooks);
-                } catch {
-                    throw new SubcCallError(
-                        "not_sent",
-                        `transport provider ${transport} failed during send`,
-                    );
+                    inner = channel.reserve(header, capacity, trackedHooks);
+                    if (!(inner instanceof BoundedFrameProducer)) {
+                        throw new TypeError("provider returned an invalid producer");
+                    }
+                } catch (error) {
+                    throw boundedSendFailure(error, "not_sent");
                 }
+                return new Proxy(inner, {
+                    get(target, property) {
+                        try {
+                            switch (property) {
+                                case "capacity":
+                                case "written":
+                                case "remaining":
+                                    return Reflect.get(target, property, target);
+                                case "view":
+                                    return () => {
+                                        try {
+                                            return target.view();
+                                        } catch (error) {
+                                            try {
+                                                target.abort();
+                                            } catch (abortError) {
+                                                void abortError;
+                                            }
+                                            throw boundedSendFailure(error, "not_sent");
+                                        }
+                                    };
+                                case "advance":
+                                    return (bytes: number) => {
+                                        try {
+                                            return target.advance(bytes);
+                                        } catch (error) {
+                                            try {
+                                                target.abort();
+                                            } catch (abortError) {
+                                                void abortError;
+                                            }
+                                            throw boundedSendFailure(error, "not_sent");
+                                        }
+                                    };
+                                case "write":
+                                    return (bytes: Uint8Array) => {
+                                        try {
+                                            return target.write(bytes);
+                                        } catch (error) {
+                                            try {
+                                                target.abort();
+                                            } catch (abortError) {
+                                                void abortError;
+                                            }
+                                            throw boundedSendFailure(error, "not_sent");
+                                        }
+                                    };
+                                case "commit":
+                                    return (exactLength: number) => {
+                                        try {
+                                            const ticket = target.commit(exactLength);
+                                            return {
+                                                cancel: () => {
+                                                    try {
+                                                        return (
+                                                            !published && ticket.cancel() === true
+                                                        );
+                                                    } catch {
+                                                        return false;
+                                                    }
+                                                },
+                                            };
+                                        } catch (error) {
+                                            try {
+                                                target.abort();
+                                            } catch (abortError) {
+                                                void abortError;
+                                            }
+                                            if (!published) {
+                                                throw boundedSendFailure(error, "not_sent");
+                                            }
+                                            closeUpstream("write_failed", "send");
+                                            throw boundedSendFailure(error, "outcome_unknown");
+                                        }
+                                    };
+                                case "abort":
+                                    return () => {
+                                        try {
+                                            target.abort();
+                                        } catch (abortError) {
+                                            void abortError;
+                                        }
+                                    };
+                                default:
+                                    return undefined;
+                            }
+                        } catch (error) {
+                            throw boundedSendFailure(error, "not_sent");
+                        }
+                    },
+                });
             },
             send: (frame, hooks) => {
                 // Publication is tracked HERE, not trusted from the error:
@@ -629,7 +746,39 @@ export function sanitizedCandidateFactory(
             },
             isClosed: () => channel.isClosed(),
             stats: () => {
-                const stats = channel.stats();
+                const zero: FrameChannelStats = {
+                    readerHeldBytes: 0,
+                    queueHeldBytes: 0,
+                    queuedDataFrames: 0,
+                    queuedControlFrames: 0,
+                    readPaused: false,
+                    activeTimers: 0,
+                    activeReceiveLeases: 0,
+                    quarantinedBytes: 0,
+                    ownedAdapterCopies: 0,
+                };
+                let stats = zero;
+                try {
+                    const reported = channel.stats();
+                    const counts = [
+                        reported.readerHeldBytes,
+                        reported.queueHeldBytes,
+                        reported.queuedDataFrames,
+                        reported.queuedControlFrames,
+                        reported.activeTimers,
+                        reported.activeReceiveLeases,
+                        reported.quarantinedBytes,
+                        reported.ownedAdapterCopies,
+                    ];
+                    if (
+                        counts.every((value) => Number.isSafeInteger(value) && value >= 0) &&
+                        typeof reported.readPaused === "boolean"
+                    ) {
+                        stats = reported;
+                    }
+                } catch {
+                    stats = zero;
+                }
                 return {
                     ...stats,
                     activeReceiveLeases: stats.activeReceiveLeases + receiveLeases.size,

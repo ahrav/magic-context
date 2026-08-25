@@ -272,17 +272,54 @@ fn quarantine_rejects_all_operations_and_reports_conservation() {
 }
 
 #[test]
-fn lease_limit_rejects_then_recovers_after_release() {
+fn lease_limit_reports_backpressure_then_recovers_after_release() {
     let ring = Ring::create(&lease_limited_profile(), 18).unwrap();
     publish(&ring, &[1]);
     publish(&ring, &[2]);
 
     let first = ring.try_receive().unwrap().unwrap();
-    assert!(matches!(ring.try_receive(), Err(RingError::LeaseLimit)));
+    assert!(
+        ring.try_receive().unwrap().is_none(),
+        "full lease set must read as no-frame backpressure, not an error"
+    );
     first.release().unwrap();
     let second = ring.try_receive().unwrap().unwrap();
     assert_eq!(second.segment(0).unwrap().read_byte(0), Some(2));
     second.release().unwrap();
+}
+
+#[test]
+fn one_span_profile_is_rejected_at_creation() {
+    let profile = TargetProfile::new(ProfileConfig {
+        descriptor: TransportDescriptor::new(
+            BackendId::Ring,
+            MemoryLayout::TwoSpanWrap,
+            OwnershipMode::DirectLeased,
+            SchedulingMode::ColdParkWake,
+            WorkloadClass::MixedDuplex,
+            if cfg!(target_os = "macos") {
+                PlatformKind::Macos
+            } else {
+                PlatformKind::Linux
+            },
+            RuntimeKind::Rust,
+            HardwareProfileId::new("ring-one-span").unwrap(),
+        ),
+        descriptor_depth: 2,
+        arena_bytes: MAX_FRAME_BYTES,
+        max_spans: 1,
+        max_leases: 1,
+        mappings: 2,
+        pinned_workers: 0,
+        producer_topology: ProducerTopology::CallerConfined,
+        worker_topology: WorkerTopology::CallerThread,
+        completion_mode: CompletionMode::SynchronousPull,
+    })
+    .unwrap();
+    assert!(matches!(
+        Ring::create(&profile, 20),
+        Err(RingError::ProfileMismatch)
+    ));
 }
 
 #[cfg(target_os = "linux")]

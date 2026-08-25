@@ -71,6 +71,14 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--designated-host") {
+        // The designated-host qualification campaign (manifest predicates,
+        // paired statistics, WINNER/HARDWARE_EQUIVALENT verdicts) is not
+        // implemented; refusing beats emitting unqualified-schedule
+        // evidence for a qualification request.
+        eprintln!("--designated-host refused: qualification campaign is not implemented");
+        std::process::exit(2);
+    }
     let smoke = args.iter().any(|arg| arg == "--smoke");
     let periods = if smoke { 1 } else { 20 };
     let iterations = if smoke { 64 } else { 100_000 };

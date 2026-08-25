@@ -61,6 +61,9 @@ struct ActiveProducer {
 struct Channel {
     producers: HashMap<u32, ActiveProducer>,
     active: HashMap<u32, ActiveLease>,
+    // Aliases whose detachment failed; retained so the channel entry (and its
+    // mapping) stays alive while a JS view may still be attached.
+    stranded: Vec<ExternalRef>,
     to_host: Box<Ring>,
     from_host: Ring,
     next_producer: u32,
@@ -111,11 +114,43 @@ fn attach_ring(pid: u32, fd: i32, grant: &str) -> Result<Ring> {
         .map_err(|_| error("shared-memory attachment failed"))
 }
 
-fn cleanup_created_refs(env: &Env, ring: &Ring, buffers: Vec<ExternalRef>) -> Result<()> {
-    let detached = napi_buffers::detach_all(env, &buffers);
-    let deleted = napi_buffers::delete_all(env, buffers);
-    if detached.is_err() || deleted.is_err() {
+fn cleanup_created_refs(
+    env: &Env,
+    ring: &Ring,
+    stranded: &mut Vec<ExternalRef>,
+    buffers: Vec<ExternalRef>,
+) -> Result<()> {
+    if napi_buffers::detach_all(env, &buffers).is_err() {
+        // A failed detach leaves JS views possibly attached to ring memory.
+        // The references move into `stranded` so their lifetime records (and
+        // the channel entry holding the mapping) survive until a later
+        // detachment succeeds.
         ring.enter_quarantine();
+        stranded.extend(buffers);
+        return Err(error(
+            "external alias state is unknown; storage quarantined",
+        ));
+    }
+    if napi_buffers::delete_all(env, buffers).is_err() {
+        ring.enter_quarantine();
+        return Err(error("external alias cleanup failed; storage quarantined"));
+    }
+    Ok(())
+}
+
+// Retries detachment of aliases stranded by an earlier failed cleanup. Entries
+// leave `stranded` only once detachment succeeds, so the channel stays
+// registered while any alias may still be attached.
+fn detach_stranded(env: &Env, channel: &mut Channel) -> Result<()> {
+    if channel.stranded.is_empty() {
+        return Ok(());
+    }
+    if napi_buffers::detach_all(env, &channel.stranded).is_err() {
+        return Err(error(
+            "external alias state is unknown; storage quarantined",
+        ));
+    }
+    if napi_buffers::delete_all(env, std::mem::take(&mut channel.stranded)).is_err() {
         return Err(error("external alias cleanup failed; storage quarantined"));
     }
     Ok(())
@@ -175,6 +210,7 @@ fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     for token in tokens {
         detach_active(env, channel, token, true)?;
     }
+    detach_stranded(env, channel)?;
     Ok(())
 }
 
@@ -190,6 +226,7 @@ fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     for token in tokens {
         detach_active(env, channel, token, false)?;
     }
+    detach_stranded(env, channel)?;
     Ok(())
 }
 
@@ -326,6 +363,7 @@ pub fn attach(env: &Env, descriptor: NativeDescriptor) -> Result<u32> {
                 Channel {
                     producers: HashMap::new(),
                     active: HashMap::new(),
+                    stranded: Vec::new(),
                     to_host: Box::new(to_host),
                     from_host,
                     next_producer: 0,
@@ -375,6 +413,7 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                 Channel {
                     producers: HashMap::new(),
                     active: HashMap::new(),
+                    stranded: Vec::new(),
                     to_host: Box::new(first_to_second),
                     from_host: first_from_second,
                     next_producer: 0,
@@ -387,6 +426,7 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                 Channel {
                     producers: HashMap::new(),
                     active: HashMap::new(),
+                    stranded: Vec::new(),
                     to_host: Box::new(second_to_first),
                     from_host: second_from_first,
                     next_producer: 0,
@@ -455,11 +495,11 @@ pub fn produce(
             Ok(())
         })();
         if let Err(build_error) = built {
-            cleanup_created_refs(env, &channel.to_host, refs)?;
+            cleanup_created_refs(env, &channel.to_host, &mut channel.stranded, refs)?;
             return Err(build_error);
         }
         let written = fill.call(views);
-        cleanup_created_refs(env, &channel.to_host, refs)?;
+        cleanup_created_refs(env, &channel.to_host, &mut channel.stranded, refs)?;
         let written = written? as usize;
         reservation
             .advance(written)
@@ -517,7 +557,7 @@ pub fn reserve(
             Ok(())
         })();
         if let Err(build_error) = built {
-            cleanup_created_refs(env, &channel.to_host, refs)?;
+            cleanup_created_refs(env, &channel.to_host, &mut channel.stranded, refs)?;
             return Err(build_error);
         }
         channel.next_producer = channel
@@ -549,10 +589,6 @@ pub fn commit_reservation(
     written: u32,
     before_publish: Function<(), ()>,
 ) -> Result<()> {
-    let header: [u8; WIRE_V2_HEADER_BYTES] = header
-        .as_ref()
-        .try_into()
-        .map_err(|_| error("wire header has invalid length"))?;
     REGISTRY.with(|registry| {
         let mut registry = registry
             .try_borrow_mut()
@@ -562,6 +598,10 @@ pub fn commit_reservation(
             .get_mut(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
         let mut reservation = detach_producer(env, channel, token)?;
+        let header: [u8; WIRE_V2_HEADER_BYTES] = header
+            .as_ref()
+            .try_into()
+            .map_err(|_| error("wire header has invalid length"))?;
         reservation
             .set_wire_header(header)
             .and_then(|()| reservation.advance(written as usize))
@@ -632,7 +672,7 @@ pub fn poll(
             Ok(())
         })();
         if let Err(build_error) = built {
-            cleanup_created_refs(env, &channel.from_host, refs)?;
+            cleanup_created_refs(env, &channel.from_host, &mut channel.stranded, refs)?;
             return Err(build_error);
         }
         std::mem::forget(lease);
@@ -650,7 +690,7 @@ pub fn poll(
     };
 
     if let Err(callback_error) = deliver.call(FnArgs::from((token, header, views))) {
-        REGISTRY.with(|registry| {
+        let cleanup = REGISTRY.with(|registry| {
             let mut registry = registry
                 .try_borrow_mut()
                 .map_err(|_| error("native channel is busy"))?;
@@ -662,7 +702,15 @@ pub fn poll(
                 detach_active(env, channel, token, true)?;
             }
             Ok::<(), Error>(())
-        })?;
+        });
+        // The callback error carries the actionable diagnosis; a cleanup
+        // failure is appended rather than replacing it.
+        if let Err(cleanup_error) = cleanup {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!("{callback_error}; receive cleanup also failed: {cleanup_error}"),
+            ));
+        }
         return Err(callback_error);
     }
     Ok(true)
@@ -692,9 +740,17 @@ pub fn close(env: &Env, channel_id: u32) -> Result<()> {
             .channels
             .get_mut(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
-        close_channel(env, channel)?;
-        registry.channels.remove(&channel_id);
-        Ok(())
+        let result = close_channel(env, channel);
+        // The entry is removed once no tracked alias remains, even if
+        // reference deletion or release reporting failed. A detach failure
+        // leaves its token or stranded alias behind, and the entry must then
+        // stay registered so the mapping outlives the still-attached JS
+        // views; a later close retries the detachment.
+        if channel.producers.is_empty() && channel.active.is_empty() && channel.stranded.is_empty()
+        {
+            registry.channels.remove(&channel_id);
+        }
+        result
     })
 }
 
@@ -708,8 +764,13 @@ pub fn force_close(env: &Env, channel_id: u32) -> Result<()> {
             .channels
             .get_mut(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
-        quarantine_channel(env, channel)?;
-        registry.channels.remove(&channel_id);
-        Ok(())
+        let result = quarantine_channel(env, channel);
+        // Same retention rule as close: only alias-free channels may drop
+        // their mapping.
+        if channel.producers.is_empty() && channel.active.is_empty() && channel.stranded.is_empty()
+        {
+            registry.channels.remove(&channel_id);
+        }
+        result
     })
 }

@@ -36,6 +36,17 @@ unsafe extern "C" fn finalize_owned(_env: sys::napi_env, _data: *mut c_void, hin
     drop(unsafe { Box::from_raw(hint.cast::<OwnedProbe>()) });
 }
 
+/// Severs a partially constructed external ArrayBuffer from its borrowed
+/// memory so no JS-visible alias survives a failed view creation. `released`
+/// is marked only when detachment succeeded; otherwise the finalizer still
+/// reports the alias through the leak diagnostics.
+fn abandon_arraybuffer(env: &Env, arraybuffer: sys::napi_value, released: &Arc<AtomicBool>) {
+    // SAFETY: arraybuffer is a live external ArrayBuffer in env.
+    if unsafe { sys::napi_detach_arraybuffer(env.raw(), arraybuffer) } == sys::Status::napi_ok {
+        released.store(true, Ordering::Release);
+    }
+}
+
 fn check(status: sys::napi_status, message: &'static str) -> Result<()> {
     if status == sys::Status::napi_ok {
         Ok(())
@@ -94,7 +105,7 @@ pub(crate) fn create_external_view<'env>(
     }
     let mut typedarray = std::ptr::null_mut();
     // SAFETY: arraybuffer is live and byte offset zero with exact length.
-    check(
+    if let Err(error) = check(
         unsafe {
             sys::napi_create_typedarray(
                 env.raw(),
@@ -106,13 +117,19 @@ pub(crate) fn create_external_view<'env>(
             )
         },
         "Uint8Array creation failed",
-    )?;
+    ) {
+        abandon_arraybuffer(env, arraybuffer, &released);
+        return Err(error);
+    }
     let mut reference = std::ptr::null_mut();
     // SAFETY: arraybuffer is a live N-API value in this environment.
-    check(
+    if let Err(error) = check(
         unsafe { sys::napi_create_reference(env.raw(), arraybuffer, 1, &mut reference) },
         "ArrayBuffer reference creation failed",
-    )?;
+    ) {
+        abandon_arraybuffer(env, arraybuffer, &released);
+        return Err(error);
+    }
     ACTIVE_EXTERNAL_REFS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: typedarray was created in env and remains in current callback scope.
     let view = unsafe { Unknown::from_raw_unchecked(env.raw(), typedarray) };

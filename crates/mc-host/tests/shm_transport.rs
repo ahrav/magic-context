@@ -276,6 +276,7 @@ fn admission_counts_active_plus_quarantined_commitments() {
     assert_eq!(snapshot.quarantined.arena_bytes, charge.arena_bytes);
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn failure_after_prepare_closes_without_tcp_fallback_or_replay() {
     let provider = Arc::new(ShmProvider::for_qualified_test_profile(

@@ -227,15 +227,23 @@ impl InjectedProvider for ShmProvider {
                 if initialized_tx.send(Ok(descriptor)).is_err() {
                     return;
                 }
-                let clean = runtime.block_on(run_endpoint(
-                    rings,
-                    queue,
-                    inbound_tx,
-                    ingress,
-                    frame_deadline,
-                    worker_root,
-                    worker_read_cancel,
-                ));
+                // An endpoint panic is an unclean close: catching it here
+                // keeps this thread alive to take the quarantine branch
+                // below instead of letting `Admission`'s drop return the
+                // charges as clean capacity while ring mappings may still
+                // exist.
+                let clean = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(run_endpoint(
+                        rings,
+                        queue,
+                        inbound_tx,
+                        ingress,
+                        frame_deadline,
+                        worker_root,
+                        worker_read_cancel,
+                    ))
+                }))
+                .unwrap_or(false);
                 if clean && !quarantine_next_close.swap(false, Ordering::AcqRel) {
                     admission.release();
                 } else {
@@ -341,9 +349,11 @@ async fn run_endpoint(
     let finish = queue.finish.clone();
     let mut finishing = false;
     loop {
+        let mut received = false;
         if !read_cancel.is_cancelled() {
             match receive_one(
-                &rings.second,
+                &rings,
+                &mut queue,
                 &inbound,
                 &ingress,
                 frame_deadline,
@@ -351,7 +361,7 @@ async fn run_endpoint(
             )
             .await
             {
-                Ok(true) => continue,
+                Ok(true) => received = true,
                 Ok(false) => {}
                 Err(close) => {
                     let _ = inbound.send(Err(close)).await;
@@ -362,7 +372,14 @@ async fn run_endpoint(
             }
         }
 
-        let queued = if finishing {
+        let queued = if received {
+            // Directions alternate under sustained inbound traffic: each
+            // received frame is followed by at most one queued outbound
+            // frame, taken without waiting, so a peer that refills the
+            // inbound ring as slots release cannot starve responses, Pings,
+            // and close frames while host-to-peer capacity is free.
+            queue.try_recv().ok()
+        } else if finishing {
             match queue.try_recv() {
                 Ok(frame) => Some(frame),
                 Err(_) => return true,
@@ -395,13 +412,15 @@ async fn run_endpoint(
 }
 
 async fn receive_one(
-    ring: &Ring,
+    rings: &DuplexRing,
+    queue: &mut SenderQueue,
     inbound: &mpsc::Sender<Result<InboundEvent, ReadClose>>,
     ingress: &ByteBudget,
     frame_deadline: Duration,
     read_cancel: &CancellationToken,
 ) -> Result<bool, ReadClose> {
-    let Some(lease) = ring
+    let Some(lease) = rings
+        .second
         .try_receive()
         .map_err(|_| ReadClose::Corrupt("shared-memory receive failed"))?
     else {
@@ -436,7 +455,17 @@ async fn receive_one(
                 "body budget wait exceeded frame deadline",
             ));
         }
-        std::thread::sleep(POLL_INTERVAL);
+        // The budget wait services queued outbound frames: a slow ingress
+        // drain holds only this receive, not the connection's sends, which
+        // would otherwise miss their deadlines behind it.
+        match queue.try_recv() {
+            Ok(queued) => {
+                if publish_one(&rings.first, queued, frame_deadline).is_err() {
+                    return Err(ReadClose::Corrupt("shared-memory publish failed"));
+                }
+            }
+            Err(_) => std::thread::sleep(POLL_INTERVAL),
+        }
     };
     let body = lease
         .to_vec()
@@ -672,7 +701,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
-        let ring = Ring::create(&qualified_test_profile(), 4).unwrap();
+        let rings = DuplexRing::create(&qualified_test_profile()).unwrap();
         let body = b"copy";
         let header = EnvelopeHeader {
             len: body.len() as u32,
@@ -683,13 +712,19 @@ mod tests {
             epoch: 0,
             corr: 1,
         };
-        let mut reservation = ring.try_reserve(body.len(), header.encode()).unwrap();
+        let mut reservation = rings
+            .second
+            .try_reserve(body.len(), header.encode())
+            .unwrap();
         reservation.write(body).unwrap();
         reservation.commit(body.len()).unwrap();
 
+        let (_sender, mut queue) =
+            frame_sender(1, CancellationToken::new(), Duration::from_secs(1));
         let (inbound, mut received) = mpsc::channel(1);
         assert!(receive_one(
-            &ring,
+            &rings,
+            &mut queue,
             &inbound,
             &ByteBudget::new(1024),
             Duration::from_secs(1),

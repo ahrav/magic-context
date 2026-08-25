@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::arena::{prefault, ArenaCounts, ArenaError, ArenaSpan, SpanPlan, MAX_FRAME_BYTES};
 use crate::descriptor::{
     BackendId, DescriptorCounts, DescriptorError, FrameDescriptor, Incarnation, MemoryLayout,
-    ReleaseIdentity, SchedulingMode, DESCRIPTOR_SCHEMA_VERSION, WIRE_V2_HEADER_BYTES,
+    ReleaseIdentity, SchedulingMode, DESCRIPTOR_SCHEMA_VERSION, MAX_SPANS, WIRE_V2_HEADER_BYTES,
 };
 use crate::lease::{LeaseError, LeaseSpan, ReceiveLease};
 use crate::profile::TargetProfile;
@@ -515,8 +515,11 @@ impl Ring {
         runtime: &RuntimeDir,
     ) -> Result<Self, RingError> {
         runtime.validate()?;
+        // Reservations crossing the arena end wrap into two spans, so a
+        // profile advertising fewer spans per frame cannot be honored.
         if profile.descriptor().backend() != BackendId::Ring
             || profile.descriptor().memory_layout() != MemoryLayout::TwoSpanWrap
+            || profile.max_spans() < MAX_SPANS
         {
             return Err(RingError::ProfileMismatch);
         }
@@ -735,6 +738,10 @@ impl Ring {
     }
 
     /// Acquires next complete frame after release/acquire publication.
+    ///
+    /// Returns `Ok(None)` when no frame is deliverable right now: the ring
+    /// is empty or every `max_leases` receive lease is outstanding. Errors
+    /// are reserved for faults that end the channel.
     pub fn try_receive(&self) -> Result<Option<ReceiveLease<'_>>, RingError> {
         if self.is_quarantined() {
             return Err(RingError::Quarantined);
@@ -744,7 +751,10 @@ impl Ring {
         // SAFETY: consumer page remains mapped.
         let active = unsafe { (*consumer).active_leases.load(Ordering::Relaxed) };
         if active >= self.grant.max_leases {
-            return Err(RingError::LeaseLimit);
+            // A full lease set is backpressure, not a fault: published
+            // frames stay queued until a lease is released and the caller
+            // polls again.
+            return Ok(None);
         }
         // SAFETY: consumer owns consumed cursor.
         let consumed = unsafe { (*consumer).consumed.load(Ordering::Relaxed) };
@@ -1492,8 +1502,6 @@ pub enum RingError {
     PrefaultFailed,
     /// Release sequence would wrap.
     SequenceExhausted,
-    /// Outstanding receive-lease limit reached.
-    LeaseLimit,
     /// Candidate is terminally quarantined.
     Quarantined,
     /// Descriptor validation failed.
@@ -1520,7 +1528,6 @@ impl fmt::Display for RingError {
             Self::InvalidSharedState => "shared ring state is invalid",
             Self::PrefaultFailed => "shared mapping prefault failed",
             Self::SequenceExhausted => "release sequence exhausted",
-            Self::LeaseLimit => "receive lease limit reached",
             Self::Quarantined => "transport storage is quarantined",
             Self::Descriptor(_) => "shared descriptor validation failed",
             Self::Lease(_) => "receive lease construction failed",
@@ -1649,10 +1656,18 @@ fn validate_object(fd: &OwnedFd, expected_len: usize) -> Result<(), RingError> {
     }
     // SAFETY: geteuid has no preconditions.
     let current_uid = unsafe { libc::geteuid() };
+    // Darwin populates st_mode for shm_open descriptors from the creation
+    // mode alone, without file-type bits, so the regular-file check applies
+    // only to Linux memfd objects.
+    let type_valid = if cfg!(target_os = "linux") {
+        stat.st_mode & libc::S_IFMT == libc::S_IFREG
+    } else {
+        true
+    };
     if stat.st_uid != current_uid
         || stat.st_size < 0
         || stat.st_size as usize != expected_len
-        || stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || !type_valid
         || stat.st_mode & 0o077 != 0
     {
         return Err(RingError::ObjectValidationFailed);

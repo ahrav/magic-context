@@ -470,7 +470,8 @@ impl InboundFrame {
         }
     }
 
-    #[cfg(test)]
+    /// The transport's copy counter, for adapters that flatten a wrapped
+    /// body into owned storage outside this module.
     pub(crate) fn copy_counter(&self) -> CopyCounter {
         self.copies.clone()
     }

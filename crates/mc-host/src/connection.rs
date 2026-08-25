@@ -605,18 +605,28 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
     }
 }
 
+/// Runs `decode` over the frame's body as one contiguous byte slice. TCP
+/// frames arrive contiguous; a ring backend delivers a body as two spans
+/// when it wraps the arena end, so that shape flattens through the explicit
+/// copying adapter first. Only decoded values leave the lease scope.
+fn decode_contiguous<T>(
+    frame: &crate::frame_channel::InboundFrame,
+    decode: impl FnOnce(&[u8]) -> T,
+) -> T {
+    let copies = frame.copy_counter();
+    frame.with_lease(|lease| match lease.contiguous_bytes() {
+        Some(body) => decode(body),
+        None => decode(&lease.to_owned(&copies)),
+    })
+}
+
 fn decode_control_frame(
     frame: crate::frame_channel::InboundFrame,
     targets: &crate::control::TargetIndex,
 ) -> (u64, ControlAction) {
     let corr = frame.header.corr;
     let binary = frame.header.flags.is_binary();
-    let action = frame.with_lease(|lease| {
-        let body = lease
-            .contiguous_bytes()
-            .expect("TCP compatibility frames are contiguous");
-        parse_control(body, binary, targets)
-    });
+    let action = decode_contiguous(&frame, |body| parse_control(body, binary, targets));
     (corr, action)
 }
 
@@ -1209,27 +1219,11 @@ async fn run_candidate_setup<H: McHostHandler>(
 fn decode_candidate_activate(
     frame: crate::frame_channel::InboundFrame,
 ) -> Result<crate::transport_negotiation::ActivateRequest, ()> {
-    frame
-        .with_lease(|lease| {
-            decode_activate_request(
-                lease
-                    .contiguous_bytes()
-                    .expect("TCP compatibility frames are contiguous"),
-            )
-        })
-        .map_err(|_| ())
+    decode_contiguous(&frame, decode_activate_request).map_err(|_| ())
 }
 
 fn decode_candidate_commit(frame: crate::frame_channel::InboundFrame) -> Result<(), ()> {
-    frame
-        .with_lease(|lease| {
-            decode_commit_request(
-                lease
-                    .contiguous_bytes()
-                    .expect("TCP compatibility frames are contiguous"),
-            )
-        })
-        .map_err(|_| ())
+    decode_contiguous(&frame, decode_commit_request).map_err(|_| ())
 }
 
 async fn expect_candidate_request(
