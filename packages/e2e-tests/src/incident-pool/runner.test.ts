@@ -460,6 +460,48 @@ describe("case registry", () => {
         ).toThrow(/binds caseDriver\/caseVerifier but carries/);
     });
 
+    it("rejects an executable callback that never reaches the bound symbol", () => {
+        const catalog = fixtureCatalog();
+        const registry: IncidentCaseRegistry = new Map();
+        function impostorVerifier(): VerifierCheck[] {
+            return [{ id: "check-red-holds", passed: true }];
+        }
+        // Correct `binding` metadata, but the pool executes `verifier` — so
+        // without the reachability check this swap publishes a false result.
+        for (const variant of catalog.families[0]!.variants) {
+            const entry = registeredCase(variant.id);
+            registerIncidentCase(
+                registry,
+                variant.id === "var-red-one"
+                    ? { ...entry, verifier: impostorVerifier }
+                    : entry,
+            );
+        }
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(
+            /executes callbacks that do not reach caseDriver\/caseVerifier/,
+        );
+    });
+
+    it("accepts an executable wrapper that delegates to the bound symbol", () => {
+        const catalog = fixtureCatalog();
+        const registry: IncidentCaseRegistry = new Map();
+        // The shape real cases use: an anonymous wrapper adapting the bound
+        // module function. It must stay legal, or reference identity would be
+        // the de-facto rule.
+        for (const variant of catalog.families[0]!.variants) {
+            const entry = registeredCase(variant.id);
+            registerIncidentCase(registry, {
+                ...entry,
+                verifier: () => caseVerifier(),
+            });
+        }
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).not.toThrow();
+    });
+
     it("registers the builtin cases 1:1 against the committed catalog", () => {
         const registry = builtinIncidentCaseRegistry();
         expect(registry.size).toBe(21);

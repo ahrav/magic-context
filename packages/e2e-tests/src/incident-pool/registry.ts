@@ -268,6 +268,21 @@ export function validateRegistryCatalogCorrespondence(
                 `registered case ${variantId} binds ${catalogDriver}/${catalogVerifier} but carries ${boundDriver || "<anonymous>"}/${boundVerifier || "<anonymous>"}`,
             );
         }
+        // The checks above validate `binding`, but `run-incident-case.ts`
+        // executes `driver`/`verifier`. Nothing coupled the two, so a
+        // registration could keep correct binding metadata while executing a
+        // different oracle. A case may legitimately WRAP the bound symbol to
+        // adapt its shape (harness setup, normalize-then-verify), so reference
+        // identity is too strict; require instead that the executed callback
+        // reaches the bound symbol.
+        if (
+            !invokesBoundSymbol(registered.driver, catalogDriver) ||
+            !invokesBoundSymbol(registered.verifier, catalogVerifier)
+        ) {
+            throw new Error(
+                `registered case ${variantId} executes callbacks that do not reach ${catalogDriver}/${catalogVerifier}`,
+            );
+        }
         const computed = semanticFingerprint(variant, registered.fixtures);
         if (computed !== variant.semantic_revision.fingerprint) {
             throw new Error(
@@ -281,6 +296,20 @@ export function validateRegistryCatalogCorrespondence(
 function bindingName(reference: unknown): string {
     if (typeof reference !== "function") return "";
     return reference.name;
+}
+
+/**
+ * Does the callback the pool actually executes reach `symbol`? Either it IS
+ * that function, or it is a wrapper whose own source delegates to it. Both
+ * arms rest on the same source-fidelity assumption as `bindingName`: these
+ * cases run unminified from source under Bun, so a function's `name` and body
+ * text are the ones written in the module.
+ */
+function invokesBoundSymbol(reference: unknown, symbol: string): boolean {
+    if (typeof reference !== "function") return false;
+    if (!/^[A-Za-z_$][\w$]*$/.test(symbol)) return false;
+    if (reference.name === symbol) return true;
+    return new RegExp(`\\b${symbol}\\b`).test(reference.toString());
 }
 
 /** The exported-symbol half of a catalog `path#symbol` binding string. */
