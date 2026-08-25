@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { parseIncidentCatalog } from "../src/incident-pool/contract";
 import {
     REPO_ROOT,
+    boundVerifierDigests,
     changedVerifiers,
     loadMutationEvidence,
 } from "../src/incident-pool/evidence";
@@ -46,6 +48,38 @@ export function assertBoundVerifierBytesUnchanged(
     }
 }
 
+/**
+ * The executable verifier modules the catalog binds must not drift either.
+ *
+ * Drift means different bytes for a module the accepted base also bound: that
+ * silently changes what scores the pool. A module bound only by the current
+ * catalog has no accepted bytes to drift from and is a new case, so it passes. A
+ * module bound only by the accepted catalog is rejected — dropping a binding is
+ * otherwise the way to exempt a scoring verifier from this gate.
+ */
+export function assertCatalogBoundVerifierBytesUnchanged(
+    acceptedDigests: Record<string, string>,
+    currentDigests: Record<string, string>,
+): void {
+    const changed: string[] = [];
+    const unbound: string[] = [];
+    for (const [path, accepted] of Object.entries(acceptedDigests)) {
+        const current = currentDigests[path];
+        if (current === undefined) unbound.push(path);
+        else if (current !== accepted) changed.push(path);
+    }
+    if (unbound.length > 0) {
+        throw new Error(
+            `catalog no longer binds accepted executable verifiers: ${unbound.sort().join(", ")}`,
+        );
+    }
+    if (changed.length > 0) {
+        throw new Error(
+            `catalog-bound executable verifiers changed without recorded replay support: ${changed.sort().join(", ")}`,
+        );
+    }
+}
+
 function trustedCiCommit(gitRunner: GitRunner): string {
     const eventName = process.env.GITHUB_EVENT_NAME;
     const eventPath = process.env.GITHUB_EVENT_PATH;
@@ -73,7 +107,37 @@ function trustedCiCommit(gitRunner: GitRunner): string {
     });
 }
 
-function loadTrustedEvidence(baseCommit: string) {
+interface TrustedVerifierState {
+    mutationDigests: Record<string, string>;
+    catalogBoundDigests: Record<string, string>;
+}
+
+/** Read both digest maps out of one detached worktree at `baseCommit`. */
+function readVerifierState(
+    worktree: string,
+    repoRoot: string,
+): TrustedVerifierState {
+    const e2eRoot = resolve(worktree, "packages/e2e-tests");
+    const catalogPath = resolve(e2eRoot, "incidents", "catalog.json");
+    // A tree that predates the catalog binds no executable verifiers, so it
+    // contributes no accepted bytes and every current binding reads as new.
+    // Deleting the catalog from the current tree is still caught, because the
+    // accepted bindings then have no counterpart.
+    const catalogBoundDigests = existsSync(catalogPath)
+        ? boundVerifierDigests(
+              parseIncidentCatalog(
+                  JSON.parse(readFileSync(catalogPath, "utf8")) as unknown,
+              ),
+              e2eRoot,
+          )
+        : {};
+    return {
+        mutationDigests: loadMutationEvidence(e2eRoot, repoRoot).verifierDigests,
+        catalogBoundDigests,
+    };
+}
+
+function loadTrustedEvidence(baseCommit: string): TrustedVerifierState {
     const parent = mkdtempSync(join(tmpdir(), "incident-verifier-base-"));
     const worktree = join(parent, "tree");
     const added = git(
@@ -86,12 +150,9 @@ function loadTrustedEvidence(baseCommit: string) {
             `could not create trusted verifier worktree: ${added.stderr.trim() || `git worktree add exited ${added.status}`}`,
         );
     }
-    let evidence: ReturnType<typeof loadMutationEvidence>;
+    let evidence: TrustedVerifierState;
     try {
-        evidence = loadMutationEvidence(
-            resolve(worktree, "packages/e2e-tests"),
-            worktree,
-        );
+        evidence = readVerifierState(worktree, worktree);
     } catch (error) {
         // Clean up, then surface the ORIGINAL evidence failure: a cleanup
         // error raised here would replace the diagnosis the caller needs.
@@ -122,12 +183,19 @@ function cleanupTrustedWorktree(
 
 export function validateIncidentVerifiers(baseCommit: string): number {
     const accepted = loadTrustedEvidence(baseCommit);
-    const current = loadMutationEvidence();
+    const current = readVerifierState(REPO_ROOT, REPO_ROOT);
     assertBoundVerifierBytesUnchanged(
-        accepted.verifierDigests,
-        current.verifierDigests,
+        accepted.mutationDigests,
+        current.mutationDigests,
     );
-    return Object.keys(accepted.verifierDigests).length;
+    assertCatalogBoundVerifierBytesUnchanged(
+        accepted.catalogBoundDigests,
+        current.catalogBoundDigests,
+    );
+    return (
+        Object.keys(accepted.mutationDigests).length +
+        Object.keys(accepted.catalogBoundDigests).length
+    );
 }
 
 function main(args: string[]): void {

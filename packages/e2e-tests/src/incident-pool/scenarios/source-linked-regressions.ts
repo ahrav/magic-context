@@ -29,6 +29,7 @@ import type {
     PreconditionOutcome,
     RegisteredIncidentCase,
 } from "../registry";
+import { adaptBoundSymbol } from "../registry";
 import { createCaseHarness } from "../support/tool-loop";
 
 export interface RegressionCheck {
@@ -1171,15 +1172,21 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             variantId: "var-parity-a1-pure-defer-stability",
             implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
             fixtures: { ...FIRST_RENDER_A1_FIXTURE },
-            driver: (context) =>
-                withCaseHarness(context, FIRST_RENDER_HARNESS_OPTIONS, (h) =>
-                    driveFirstRenderPureDeferStability(h),
-                ),
+            driver: adaptBoundSymbol(
+                driveFirstRenderPureDeferStability,
+                (inner) => (context) =>
+                    withCaseHarness(
+                        context,
+                        FIRST_RENDER_HARNESS_OPTIONS,
+                        (h) => inner(h),
+                    ),
+            ),
             normalizer: normalizeFirstRenderA1,
             precondition: satisfiedPrecondition,
-            verifier: (raw) =>
-                verifyFirstRenderPureDeferStability(normalizeFirstRenderA1(raw))
-                    .checks,
+            verifier: adaptBoundSymbol(
+                verifyFirstRenderPureDeferStability,
+                (inner) => (raw) => inner(normalizeFirstRenderA1(raw)).checks,
+            ),
             binding: {
                 driver: driveFirstRenderPureDeferStability,
                 verifier: verifyFirstRenderPureDeferStability,
@@ -1190,14 +1197,21 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             variantId: "var-parity-a3-ctx-reduce-survival",
             implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
             fixtures: { ...FIRST_RENDER_A3_FIXTURE },
-            driver: (context) =>
-                withCaseHarness(context, FIRST_RENDER_HARNESS_OPTIONS, (h) =>
-                    driveAgedCtxReduceSurvival(h),
-                ),
+            driver: adaptBoundSymbol(
+                driveAgedCtxReduceSurvival,
+                (inner) => (context) =>
+                    withCaseHarness(
+                        context,
+                        FIRST_RENDER_HARNESS_OPTIONS,
+                        (h) => inner(h),
+                    ),
+            ),
             normalizer: normalizeFirstRenderA3,
             precondition: satisfiedPrecondition,
-            verifier: (raw) =>
-                verifyAgedCtxReduceSurvival(normalizeFirstRenderA3(raw)).checks,
+            verifier: adaptBoundSymbol(
+                verifyAgedCtxReduceSurvival,
+                (inner) => (raw) => inner(normalizeFirstRenderA3(raw)).checks,
+            ),
             binding: {
                 driver: driveAgedCtxReduceSurvival,
                 verifier: verifyAgedCtxReduceSurvival,
@@ -1208,14 +1222,21 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             variantId: "var-thinking-nudge-anchor",
             implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
             fixtures: { ...THINKING_NUDGE_FIXTURE },
-            driver: (context) =>
-                withCaseHarness(context, THINKING_BLOCK_HARNESS_OPTIONS, (h) =>
-                    driveThinkingNudgeAnchor(h, { rustMode: false }),
-                ),
+            driver: adaptBoundSymbol(
+                driveThinkingNudgeAnchor,
+                (inner) => (context) =>
+                    withCaseHarness(
+                        context,
+                        THINKING_BLOCK_HARNESS_OPTIONS,
+                        (h) => inner(h, { rustMode: false }),
+                    ),
+            ),
             normalizer: normalizeThinkingNudge,
             precondition: satisfiedPrecondition,
-            verifier: (raw) =>
-                verifyThinkingNudgeAnchor(normalizeThinkingNudge(raw)).checks,
+            verifier: adaptBoundSymbol(
+                verifyThinkingNudgeAnchor,
+                (inner) => (raw) => inner(normalizeThinkingNudge(raw)).checks,
+            ),
             binding: {
                 driver: driveThinkingNudgeAnchor,
                 verifier: verifyThinkingNudgeAnchor,
@@ -1225,14 +1246,21 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             variantId: "var-thinking-dropped-shell",
             implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
             fixtures: { ...THINKING_DROPPED_SHELL_FIXTURE },
-            driver: (context) =>
-                withCaseHarness(context, THINKING_BLOCK_HARNESS_OPTIONS, (h) =>
-                    driveThinkingDroppedShell(h, { rustMode: false }),
-                ),
+            driver: adaptBoundSymbol(
+                driveThinkingDroppedShell,
+                (inner) => (context) =>
+                    withCaseHarness(
+                        context,
+                        THINKING_BLOCK_HARNESS_OPTIONS,
+                        (h) => inner(h, { rustMode: false }),
+                    ),
+            ),
             normalizer: normalizeThinkingShell,
             precondition: satisfiedPrecondition,
-            verifier: (raw) =>
-                verifyThinkingDroppedShell(normalizeThinkingShell(raw)).checks,
+            verifier: adaptBoundSymbol(
+                verifyThinkingDroppedShell,
+                (inner) => (raw) => inner(normalizeThinkingShell(raw)).checks,
+            ),
             binding: {
                 driver: driveThinkingDroppedShell,
                 verifier: verifyThinkingDroppedShell,
@@ -1242,14 +1270,21 @@ export function sourceLinkedRegressionIncidentCases(): RegisteredIncidentCase[] 
             variantId: "var-thinking-image-survival",
             implementationFiles: SOURCE_LINKED_IMPLEMENTATION_FILES,
             fixtures: { ...THINKING_IMAGE_FIXTURE },
-            driver: (context) =>
-                withCaseHarness(context, THINKING_BLOCK_HARNESS_OPTIONS, (h) =>
-                    driveThinkingImageSurvival(h, { rustMode: false }),
-                ),
+            driver: adaptBoundSymbol(
+                driveThinkingImageSurvival,
+                (inner) => (context) =>
+                    withCaseHarness(
+                        context,
+                        THINKING_BLOCK_HARNESS_OPTIONS,
+                        (h) => inner(h, { rustMode: false }),
+                    ),
+            ),
             normalizer: normalizeThinkingImage,
             precondition: satisfiedPrecondition,
-            verifier: (raw) =>
-                verifyThinkingImageSurvival(normalizeThinkingImage(raw)).checks,
+            verifier: adaptBoundSymbol(
+                verifyThinkingImageSurvival,
+                (inner) => (raw) => inner(normalizeThinkingImage(raw)).checks,
+            ),
             binding: {
                 driver: driveThinkingImageSurvival,
                 verifier: verifyThinkingImageSurvival,

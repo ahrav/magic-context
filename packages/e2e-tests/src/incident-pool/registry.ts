@@ -271,16 +271,22 @@ export function validateRegistryCatalogCorrespondence(
         // The checks above validate `binding`, but `run-incident-case.ts`
         // executes `driver`/`verifier`. Nothing coupled the two, so a
         // registration could keep correct binding metadata while executing a
-        // different oracle. A case may legitimately WRAP the bound symbol to
-        // adapt its shape (harness setup, normalize-then-verify), so reference
-        // identity is too strict; require instead that the executed callback
-        // reaches the bound symbol.
+        // different oracle. The coupling is proved structurally: the executed
+        // callback either IS the bound reference, or it was built by
+        // `adaptBoundSymbol`, which records the function object it adapted.
+        // Scanning the executed callback's source text cannot prove it, because
+        // a wrapper that merely mentions the expected name in a comment, a dead
+        // expression, or an unrelated identifier reads as bound while calling
+        // something else.
         if (
-            !invokesBoundSymbol(registered.driver, catalogDriver) ||
-            !invokesBoundSymbol(registered.verifier, catalogVerifier)
+            !executesBoundSymbol(registered.driver, registered.binding.driver) ||
+            !executesBoundSymbol(
+                registered.verifier,
+                registered.binding.verifier,
+            )
         ) {
             throw new Error(
-                `registered case ${variantId} executes callbacks that do not reach ${catalogDriver}/${catalogVerifier}`,
+                `registered case ${variantId} executes callbacks that are not bound to ${catalogDriver}/${catalogVerifier}`,
             );
         }
         const computed = semanticFingerprint(variant, registered.fixtures);
@@ -299,20 +305,50 @@ function bindingName(reference: unknown): string {
 }
 
 /**
- * Does the callback the pool actually executes reach `symbol`? Either it IS
- * that function, or it is a wrapper whose own source delegates to it. Both
- * arms rest on the same source-fidelity assumption as `bindingName`: these
- * cases run unminified from source under Bun, so a function's `name` and body
- * text are the ones written in the module.
+ * The function object an adapted callback was built from, when it carries one.
  */
-function invokesBoundSymbol(reference: unknown, symbol: string): boolean {
-    if (typeof reference !== "function") return false;
-    if (!/^[A-Za-z_$][\w$]*$/.test(symbol)) return false;
-    if (reference.name === symbol) return true;
-    return new RegExp(`\\b${symbol}\\b`).test(reference.toString());
+const ADAPTED_FROM = Symbol.for("mc.incident-pool.adaptedFrom");
+
+/**
+ * Build the callback the pool executes from the symbol the catalog binds.
+ *
+ * Some cases cannot register the bound symbol directly: the drivers take a
+ * prepared harness rather than a `CaseDriverContext`, and the verifiers take a
+ * normalized observation and return a richer record than `VerifierCheck[]`. The
+ * adaptation is passed the bound reference and nothing else, so the callback it
+ * returns is written against that function, and the reference is recorded on the
+ * result for validation.
+ *
+ * This proves which function the registration is built from, not that the body
+ * calls it — a `build` that ignores its argument and calls an imported impostor
+ * still type-checks. That residual gap is visible at the registration site,
+ * where the impostor has to be named; a source-text scan closed nothing at all,
+ * because any mention of the expected identifier satisfied it.
+ */
+export function adaptBoundSymbol<I, F extends (...args: never[]) => unknown>(
+    inner: I,
+    build: (inner: I) => F,
+): F {
+    const adapted = build(inner);
+    Object.defineProperty(adapted, ADAPTED_FROM, {
+        value: inner,
+        enumerable: false,
+    });
+    return adapted;
 }
 
-/** The exported-symbol half of a catalog `path#symbol` binding string. */
+/** Is `executed` the bound reference, or an adapter built from it? */
+function executesBoundSymbol(executed: unknown, bound: unknown): boolean {
+    if (typeof executed !== "function" || typeof bound !== "function")
+        return false;
+    if (executed === bound) return true;
+    return (executed as unknown as Record<symbol, unknown>)[ADAPTED_FROM] ===
+        bound;
+}
+
+/**
+ * The exported-symbol half of a catalog `path#symbol` binding string.
+ */
 function bindingSymbol(binding: string): string {
     const symbol = binding.split("#")[1] ?? "";
     return symbol.trim();

@@ -277,6 +277,14 @@ const MEMORY_SEARCH_PRODUCT_FILES = [
     "packages/plugin/src/features/magic-context/memory/storage-memory-projection.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-fts.ts",
     "packages/plugin/src/features/magic-context/memory/normalize-hash.ts",
+    // Recall is only observable through the injected compartment blocks: this
+    // module decides which memories reach m[0], renders the m[1] memory-update
+    // delta, and performs the hard fold. A5 and A54 read ordinary-turn m[0]
+    // recall through it, and A10's three checks (effective-context
+    // reconciliation, hard-fold convergence, no dual authority) are driven
+    // almost entirely by its output, so a change here flips those verdicts
+    // while the implementation and selected-set digests stay constant.
+    "packages/plugin/src/hooks/magic-context/inject-compartments.ts",
 ];
 
 const IMPLEMENTATION_FILES = [

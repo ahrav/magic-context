@@ -20,11 +20,14 @@ import {
     TODO_PRESSURE_FIXTURE,
     captureTodoState,
     findSyntheticPair,
+    findSyntheticPairs,
     isMagicContextRequest,
     normalizedTodoJson,
     primeNextTurnAsCacheBust,
     sendAndCaptureMainRequest,
     syntheticPairBytes,
+    type SyntheticPair,
+    type Todo,
     type TodoMeta,
     type TodoParitySetup,
     type TodoScriptAdapter,
@@ -223,6 +226,34 @@ function baseSetup(
     };
 }
 
+/**
+ * The id of the newest assistant message an injector may anchor to.
+ *
+ * The Pi injector appends the synthetic pair to the newest assistant message
+ * that did not abort or error, and persists THAT message's id, so it is the only
+ * legal anchor for a pair built from the same history. Deriving it here from
+ * Pi's own message fields keeps the expectation independent of the injector: a
+ * check that only requires a nonempty id accepts any string, and one that reused
+ * the injector's own id helper would agree with it however it were derived.
+ */
+function latestReplayableAssistantId(
+    messages: readonly Record<string, unknown>[],
+): string | null {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message || typeof message !== "object") continue;
+        if (message.role !== "assistant") continue;
+        if (message.stopReason === "aborted" || message.stopReason === "error")
+            continue;
+        const responseId = message.responseId;
+        if (typeof responseId === "string" && responseId.length > 0)
+            return responseId;
+        const timestamp = message.timestamp;
+        if (typeof timestamp === "number") return `pi-ts-${timestamp}`;
+    }
+    return null;
+}
+
 async function preparePiCacheBust(
     context: CaseDriverContext,
     h: PiTestHarness,
@@ -230,6 +261,7 @@ async function preparePiCacheBust(
     setup: TodoParitySetup;
     sessionId: string;
     callId: string;
+    expectedAnchorId: string | null;
     toolExecuted: boolean;
     pressureUsedRealBytes: boolean;
     body: Record<string, unknown> | null;
@@ -242,6 +274,9 @@ async function preparePiCacheBust(
     const callId = computeSyntheticCallId(stateJson);
     const probe = await captureTodoState(adapter, STATE_X_TODOS);
     const pressureUsedRealBytes = await primeNextTurnAsCacheBust(adapter);
+    // Snapshot before the bust turn: the request that injects the pair is built
+    // from this history, so the anchor must name a message already in it.
+    const expectedAnchorId = latestReplayableAssistantId(await h.getMessages());
     const body = await sendAndCaptureMainRequest(adapter, "Pi cache-bust turn");
     return {
         setup: {
@@ -250,6 +285,7 @@ async function preparePiCacheBust(
         },
         sessionId,
         callId,
+        expectedAnchorId,
         toolExecuted: probe.executed,
         pressureUsedRealBytes,
         body,
@@ -307,6 +343,38 @@ export function verifyPiTodoCapture(
     ];
 }
 
+/** The `todos` array carried by a synthetic pair's tool-use input. */
+function pairTodoInput(pair: SyntheticPair | null): unknown {
+    if (pair === null) return null;
+    const parsed = JSON.parse(pair.bytes) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    const toolUse = parsed[0] as { input?: { todos?: unknown } } | undefined;
+    return toolUse?.input?.todos ?? null;
+}
+
+/**
+ * Do the wire todos carry exactly the expected items with priorities already
+ * defaulted? Compared field by field on purpose: running the wire side through
+ * `normalizedTodoJson` would default a MISSING priority to `medium` and mask the
+ * very omission this asserts.
+ */
+function wireTodosCarryDefaultedPriorities(
+    wire: unknown,
+    expected: readonly Todo[],
+): boolean {
+    if (!Array.isArray(wire) || wire.length !== expected.length) return false;
+    return expected.every((todo, index) => {
+        const actual = wire[index];
+        if (!actual || typeof actual !== "object") return false;
+        const value = actual as Record<string, unknown>;
+        return (
+            value.content === todo.content &&
+            value.status === todo.status &&
+            value.priority === (todo.priority ?? "medium")
+        );
+    });
+}
+
 export async function drivePiTodoCapture(
     context: CaseDriverContext,
 ): Promise<PiTodoCaptureObservation> {
@@ -320,10 +388,28 @@ export async function drivePiTodoCapture(
             normalizedTodoJson(STATE_X_TODOS);
 
         const missingPrioritySession = await newPiSessionId(h);
+        const missingPriorityAdapter = piAdapter(h);
         const missingPriorityProbe = await captureTodoState(
-            piAdapter(h),
+            missingPriorityAdapter,
             MISSING_PRIORITY_TODOS,
         );
+        // Capture-side state is only half the behavior. Persisting `medium` and
+        // then omitting or mis-serializing it on the provider wire is the defect
+        // an agent would actually see, and no other variant covers it: the
+        // injection case drives STATE_X_TODOS, whose priorities are all
+        // explicit. Drive the defaulted state through a bust and read the pair.
+        const missingPriorityState = normalizedTodoJson(MISSING_PRIORITY_TODOS);
+        await primeNextTurnAsCacheBust(missingPriorityAdapter);
+        const missingPriorityBust = await sendAndCaptureMainRequest(
+            missingPriorityAdapter,
+            "Pi missing-priority cache-bust turn",
+        );
+        const missingPriorityPair = missingPriorityBust
+            ? findSyntheticPair(
+                  missingPriorityBust,
+                  computeSyntheticCallId(missingPriorityState),
+              )
+            : null;
         return {
             kind: "pi-todo-capture",
             ...baseSetup(context, h, initialMeta),
@@ -335,7 +421,11 @@ export async function drivePiTodoCapture(
             missingPriorityToolExecuted: missingPriorityProbe.executed,
             missingPriorityDefaulted:
                 readPiTodoMeta(h, missingPrioritySession)?.last_todo_state ===
-                normalizedTodoJson(MISSING_PRIORITY_TODOS),
+                    missingPriorityState &&
+                wireTodosCarryDefaultedPriorities(
+                    pairTodoInput(missingPriorityPair),
+                    MISSING_PRIORITY_TODOS,
+                ),
         };
     } finally {
         await h.dispose();
@@ -415,9 +505,17 @@ export async function drivePiTodoInjection(
             providerRequestCaptured: prepared.body !== null,
             syntheticPairPresent: pair !== null,
             deterministicCallIdMatched: pair?.callId === prepared.callId,
+            // A nonempty anchor id proves nothing: an implementation that
+            // persists the correct call id and state alongside an arbitrary
+            // message id satisfies the catalog's invalid "correct provider bytes
+            // linked to the wrong persisted anchor" shape, and the defer pass
+            // then re-anchors somewhere else or drops the pair. Require the id
+            // of the message the pair was actually appended to.
             persistedAnchorMatched:
                 prepared.meta?.todo_synthetic_call_id === prepared.callId &&
-                (prepared.meta.todo_synthetic_anchor_message_id ?? "") !== "" &&
+                prepared.expectedAnchorId !== null &&
+                prepared.meta.todo_synthetic_anchor_message_id ===
+                    prepared.expectedAnchorId &&
                 prepared.meta.todo_synthetic_state_json ===
                     normalizedTodoJson(STATE_X_TODOS),
         };
@@ -538,6 +636,14 @@ export async function drivePiTodoDeferReplay(
         const newerBytes = newerDefer
             ? syntheticPairBytes(newerDefer, newer.callId)
             : null;
+        // Deferral means the newer state is not on the wire AT ALL, not merely
+        // that the frozen pair survived beside it. Byte-comparing the old call
+        // id cannot see a second pair injected for the newer state, and the
+        // durable fields stay frozen in that case too, so without a count the
+        // case reads as deferred while already exposing the newer todos.
+        const newerDeferPairCount = newerDefer
+            ? findSyntheticPairs(newerDefer).length
+            : 0;
 
         const legacy = await preparePiCacheBust(context, h);
         const legacyAdapter = piAdapter(h);
@@ -595,6 +701,7 @@ export async function drivePiTodoDeferReplay(
             newerTodoDeferred:
                 newerBaselineBytes !== null &&
                 newerBytes === newerBaselineBytes &&
+                newerDeferPairCount === 1 &&
                 newerMeta?.last_todo_state ===
                     normalizedTodoJson(STATE_Y_TODOS) &&
                 newerMeta.todo_synthetic_call_id === newer.callId &&
@@ -777,6 +884,16 @@ const PI_IMPLEMENTATION_FILES = [
     // the verdict could change while the digest stayed constant.
     "packages/pi-plugin/src/tools/index.ts",
     "packages/pi-plugin/src/tools/todowrite.ts",
+    // The Pi injector is only the wire adapter. It imports the deterministic
+    // call id and the byte-exact synthetic pair (`computeSyntheticCallId`,
+    // `buildSyntheticTodoPart`, terminal-state handling) from the shared view
+    // module, and the durable anchor read/write/clear functions from the
+    // persisted metadata module — `storage-meta.ts` only re-exports those.
+    // Every Pi variant's verdict turns on that behavior, so without these two
+    // the call id, pair bytes, or anchor persistence could change while both
+    // the implementation and selected-set digests stayed constant.
+    "packages/plugin/src/hooks/magic-context/todo-view.ts",
+    "packages/plugin/src/features/magic-context/storage-meta-persisted.ts",
 ];
 
 const PI_MATRIX_FIXTURE = TODO_PARITY_MATRIX.find(

@@ -798,6 +798,71 @@ export function mutationRecordsBoundTo(
 }
 
 /**
+ * Repo-relative paths of the executable verifier modules the catalog binds.
+ *
+ * `loadMutationEvidence` derives its verifier paths from the run commands
+ * recorded in mutation artifacts, which name Rust degradation/roundtrip tests
+ * and standalone Bun test files. Those are the modules a crafted mutation was
+ * replayed against, NOT the modules that score the pool: the drivers and
+ * verifiers a variant actually executes are named by `verifier_binding`. The
+ * two sets are disjoint in this tree, so a gate built only from mutation
+ * evidence cannot see a change to a scoring verifier. Deriving the compared set
+ * from the validated bindings is what makes the gate cover them.
+ *
+ * Paths are the `path` half of a `path#symbol` binding, relative to
+ * `packages/e2e-tests`, and must stay confined under it.
+ */
+export function boundVerifierFiles(catalog: IncidentCatalog): string[] {
+    const paths = new Set<string>();
+    for (const family of catalog.families) {
+        for (const variant of family.variants) {
+            if (!EXECUTABLE_LANES.includes(variant.lane)) continue;
+            const binding = variant.verifier_binding;
+            if (!binding) continue;
+            for (const reference of [binding.driver, binding.verifier]) {
+                const path = reference.split("#")[0]?.trim() ?? "";
+                if (
+                    path.length === 0 ||
+                    path.startsWith("/") ||
+                    path.split(/[\\/]/).includes("..")
+                ) {
+                    throw new Error(
+                        `variant ${variant.id} verifier binding ${reference} is not a confined relative path`,
+                    );
+                }
+                paths.add(path);
+            }
+        }
+    }
+    return [...paths].sort();
+}
+
+/**
+ * Byte digests of the catalog's bound verifier modules, keyed by repo-relative
+ * path. A binding that names a module which does not exist is a validation
+ * failure here rather than a silently absent digest, which would compare equal
+ * against any other tree that also lacks it.
+ */
+export function boundVerifierDigests(
+    catalog: IncidentCatalog,
+    e2eRoot: string = E2E_ROOT,
+): Record<string, string> {
+    const digests: Record<string, string> = {};
+    for (const path of boundVerifierFiles(catalog)) {
+        const absolute = resolve(e2eRoot, path);
+        if (!existsSync(absolute)) {
+            throw new Error(
+                `catalog binds a missing verifier module packages/e2e-tests/${path}`,
+            );
+        }
+        digests[`packages/e2e-tests/${path}`] = sha256(
+            readFileSync(absolute, "utf8"),
+        );
+    }
+    return digests;
+}
+
+/**
  * Contributor gate: after replaying a changed verifier's bound mutations
  * serially, every bound record must have produced the expected red result.
  * `true` means the crafted invalid state was rejected (the mutated run failed

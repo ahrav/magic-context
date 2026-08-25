@@ -17,6 +17,7 @@ import {
 } from "./contract";
 import { replayAdjudicationLedger } from "./history";
 import {
+    adaptBoundSymbol,
     builtinIncidentCaseRegistry,
     implementationBundleDigest,
     ledgerFingerprint,
@@ -460,14 +461,14 @@ describe("case registry", () => {
         ).toThrow(/binds caseDriver\/caseVerifier but carries/);
     });
 
-    it("rejects an executable callback that never reaches the bound symbol", () => {
+    it("rejects an executable callback that is not bound to the catalog symbol", () => {
         const catalog = fixtureCatalog();
         const registry: IncidentCaseRegistry = new Map();
         function impostorVerifier(): VerifierCheck[] {
             return [{ id: "check-red-holds", passed: true }];
         }
         // Correct `binding` metadata, but the pool executes `verifier` — so
-        // without the reachability check this swap publishes a false result.
+        // without the structural check this swap publishes a false result.
         for (const variant of catalog.families[0]!.variants) {
             const entry = registeredCase(variant.id);
             registerIncidentCase(
@@ -480,21 +481,75 @@ describe("case registry", () => {
         expect(() =>
             validateRegistryCatalogCorrespondence(registry, catalog),
         ).toThrow(
-            /executes callbacks that do not reach caseDriver\/caseVerifier/,
+            /executes callbacks that are not bound to caseDriver\/caseVerifier/,
         );
     });
 
-    it("accepts an executable wrapper that delegates to the bound symbol", () => {
+    it("rejects a wrapper that names the bound symbol but calls another oracle", () => {
         const catalog = fixtureCatalog();
         const registry: IncidentCaseRegistry = new Map();
-        // The shape real cases use: an anonymous wrapper adapting the bound
-        // module function. It must stay legal, or reference identity would be
-        // the de-facto rule.
+        function impostorVerifier(): VerifierCheck[] {
+            return [{ id: "check-red-holds", passed: true }];
+        }
+        for (const variant of catalog.families[0]!.variants) {
+            const entry = registeredCase(variant.id);
+            registerIncidentCase(
+                registry,
+                variant.id === "var-red-one"
+                    ? {
+                          ...entry,
+                          // The bound symbol appears in the wrapper's source
+                          // without ever being called, which is why scanning
+                          // that source cannot prove the coupling.
+                          verifier: () => {
+                              const unused = caseVerifier;
+                              void unused;
+                              return impostorVerifier();
+                          },
+                      }
+                    : entry,
+            );
+        }
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(
+            /executes callbacks that are not bound to caseDriver\/caseVerifier/,
+        );
+    });
+
+    it("rejects an undeclared wrapper even when it does delegate", () => {
+        const catalog = fixtureCatalog();
+        const registry: IncidentCaseRegistry = new Map();
+        // Delegation alone is indistinguishable from the impostor above by any
+        // property the validator can read, so an adaptation must be declared
+        // through `adaptBoundSymbol` to be accepted.
         for (const variant of catalog.families[0]!.variants) {
             const entry = registeredCase(variant.id);
             registerIncidentCase(registry, {
                 ...entry,
                 verifier: () => caseVerifier(),
+            });
+        }
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(
+            /executes callbacks that are not bound to caseDriver\/caseVerifier/,
+        );
+    });
+
+    it("accepts an adapter declared against the bound symbol", () => {
+        const catalog = fixtureCatalog();
+        const registry: IncidentCaseRegistry = new Map();
+        // The shape the source-linked cases need: their verifiers take a
+        // normalized observation, so the registration adapts the bound symbol
+        // and records which function it was built from.
+        for (const variant of catalog.families[0]!.variants) {
+            const entry = registeredCase(variant.id);
+            registerIncidentCase(registry, {
+                ...entry,
+                verifier: adaptBoundSymbol(caseVerifier, (inner) => () =>
+                    inner(),
+                ),
             });
         }
         expect(() =>

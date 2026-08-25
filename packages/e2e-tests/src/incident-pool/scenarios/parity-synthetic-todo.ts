@@ -227,12 +227,20 @@ function findToolResultBlock(
     return null;
 }
 
-export function findSyntheticPair(
+/**
+ * Every synthetic pair on the wire, in message order.
+ *
+ * A check that only looks for one expected call id cannot see an ADDITIONAL
+ * pair beside it, which is how a premature newer state leaks onto a defer turn
+ * while the expected frozen bytes stay intact.
+ */
+export function findSyntheticPairs(
     body: RequestBody,
     expectedCallId?: string,
-): SyntheticPair | null {
+): SyntheticPair[] {
     const messages = body.messages;
-    if (!Array.isArray(messages)) return null;
+    if (!Array.isArray(messages)) return [];
+    const pairs: SyntheticPair[] = [];
     for (let index = 0; index < messages.length - 1; index += 1) {
         const assistant = messages[index] as WireMessage;
         const user = messages[index + 1] as WireMessage;
@@ -245,13 +253,20 @@ export function findSyntheticPair(
             const value = block as { type?: unknown; id?: unknown };
             return value.type === "tool_use" && value.id === callId;
         });
-        return {
+        pairs.push({
             index,
             callId,
             bytes: JSON.stringify([toolUse, toolResult]),
-        };
+        });
     }
-    return null;
+    return pairs;
+}
+
+export function findSyntheticPair(
+    body: RequestBody,
+    expectedCallId?: string,
+): SyntheticPair | null {
+    return findSyntheticPairs(body, expectedCallId)[0] ?? null;
 }
 
 export function syntheticPairBytes(
@@ -1402,6 +1417,13 @@ const RUST_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/rust-runner/hermetic-mc-host.ts",
     "packages/plugin/src/hooks/magic-context/hook-handlers.ts",
     "crates/mc-module/src/injection.rs",
+    // `injection.rs` supplies the pure producer (call id, pair bytes, capture
+    // and advance decisions); `transform.rs` is what calls it and performs the
+    // behavior the five Rust cases actually assert — provider-wire insertion,
+    // anchor persistence and reanchoring, and terminal clearing. Omitting it
+    // lets every Rust verdict change while the implementation and selected-set
+    // digests stay constant.
+    "crates/mc-module/src/transform.rs",
 ];
 
 const RUST_MATRIX_FIXTURE = TODO_PARITY_MATRIX.find(
