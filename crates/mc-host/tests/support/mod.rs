@@ -5,6 +5,7 @@
 
 pub mod broca;
 pub mod fake_transport;
+pub mod process_resources;
 pub mod raw_client;
 #[cfg(target_os = "linux")]
 pub mod shm_process;

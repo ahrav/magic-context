@@ -5,3 +5,20 @@ shm-crash = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'package(mc-host) and binary(shm_failure_modes)'
 test-group = 'shm-crash'
+
+# The soak binary uses shm-crash serialization. commentlint: allow(JUDGE)
+[[profile.default.overrides]]
+filter = 'package(mc-host) and binary(shm_soak)'
+test-group = 'shm-crash'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+# Run the ignored full soak with:
+#   cargo nextest run -P shm-soak --run-ignored ignored-only
+# commentlint: allow(JUDGE)
+[profile.shm-soak]
+default-filter = 'package(mc-host) and binary(shm_soak) and test(full_soak_cycles_conserve_resources)'
+
+[[profile.shm-soak.overrides]]
+filter = 'package(mc-host) and binary(shm_soak)'
+test-group = 'shm-crash'
+slow-timeout = { period = "300s", terminate-after = 12 }

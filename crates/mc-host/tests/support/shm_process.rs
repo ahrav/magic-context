@@ -64,8 +64,8 @@ use mc_host::transport_provider::{InjectedProvider, TransportProviders};
 use mc_shm_transport::profile::HostLimits as ShmHostLimits;
 use subc_protocol::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
 
-use super::raw_client::{self, RawClient};
-use super::{TestHost, LINKED_MODULE_ID};
+use super::raw_client::{self, Discovered, RawClient, FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
+use super::{connection_file, TestHost, LINKED_MODULE_ID};
 
 /// Prefix that marks a machine-readable harness record on a role's stdout.
 pub const RECORD_PREFIX: &str = "MC_SHM_REC";
@@ -242,6 +242,17 @@ impl RoleProcess {
         }
     }
 
+    /// The query discards records before the `soak` reply.
+    pub fn query_soak_stats(&mut self) -> DaemonSoakStats {
+        self.send_command("soak_stats");
+        loop {
+            let record = self.next_record();
+            if let Some(rest) = record.strip_prefix("soak ") {
+                return parse_soak_stats(rest).expect("soak stats record parses");
+            }
+        }
+    }
+
     /// Sends `SIGKILL` without reaping and without starting any timing.
     pub fn kill(&mut self) -> KillEvidence {
         assert!(self.status.is_none(), "role {} already reaped", self.name);
@@ -352,6 +363,52 @@ impl Drop for RoleProcess {
             let _ = self.child.wait();
         }
     }
+}
+
+/// Charge arrays are `[descriptors, arena_bytes, leases, mappings]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonSoakStats {
+    pub active: [u64; 4],
+    pub quarantined: [u64; 4],
+    pub preparations: u64,
+    pub readiness: String,
+}
+
+fn parse_soak_stats(rest: &str) -> Option<DaemonSoakStats> {
+    let mut active = None;
+    let mut quarantined = None;
+    let mut preparations = None;
+    let mut readiness = None;
+    for field in rest.split_whitespace() {
+        let (key, value) = field.split_once('=')?;
+        match key {
+            "active" => active = parse_charges(value),
+            "quarantined" => quarantined = parse_charges(value),
+            "preparations" => preparations = value.parse().ok(),
+            "readiness" => readiness = Some(value.to_owned()),
+            _ => return None,
+        }
+    }
+    Some(DaemonSoakStats {
+        active: active?,
+        quarantined: quarantined?,
+        preparations: preparations?,
+        readiness: readiness?,
+    })
+}
+
+fn parse_charges(value: &str) -> Option<[u64; 4]> {
+    let mut parts = value.split(',');
+    let charges = [
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ];
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(charges)
 }
 
 /// Transitive live descendants of `root`, from `/proc` parent links.
@@ -551,6 +608,32 @@ pub fn daemon_role() {
                     provider.release_admission();
                     emit_record("released");
                 }
+                "soak_stats" => {
+                    let accounting = provider.accounting().expect("accounting snapshot");
+                    emit_record(&format!(
+                        "soak active={},{},{},{} quarantined={},{},{},{} \
+                         preparations={} readiness={:?}",
+                        accounting.active.descriptors,
+                        accounting.active.arena_bytes,
+                        accounting.active.leases,
+                        accounting.active.mappings,
+                        accounting.quarantined.descriptors,
+                        accounting.quarantined.arena_bytes,
+                        accounting.quarantined.leases,
+                        accounting.quarantined.mappings,
+                        provider.preparation_count(),
+                        provider.readiness(),
+                    ));
+                }
+                "quarantine_next_close" => {
+                    provider.quarantine_next_close();
+                    emit_record("quarantine_armed");
+                }
+                "leak_fd" => {
+                    // A duplicated fd remains open. commentlint: allow(JUDGE)
+                    assert!(unsafe { libc::dup(0) } >= 0, "duplicated fd fixture");
+                    emit_record("leaked");
+                }
                 _ => {}
             }
         }
@@ -642,7 +725,7 @@ pub fn victim_role() {
             emit_record("barrier request_published");
             park();
         }
-        "roundtrip" => {
+        "roundtrip" | "roundtrip_park" => {
             let (channel, epoch) = shm_route_open(&peer, &session);
             let body = direct_fill_body(VICTIM_FILL_BYTES, VICTIM_FILL_VALUE);
             peer.send(request_header(channel, epoch, 4, body.len()), &body)
@@ -656,6 +739,11 @@ pub fn victim_role() {
             );
             emit_record("terminal ok");
             peer.send(goodbye_header(), &[]).expect("publish goodbye");
+            if scenario == "roundtrip_park" {
+                // Logical close precedes termination. commentlint: allow(JUDGE)
+                emit_record("closed");
+                park();
+            }
         }
         other => panic!("unknown victim scenario {other}"),
     }
@@ -666,4 +754,158 @@ fn park() -> ! {
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
+}
+
+pub fn start_daemon(data_root: &Path) -> RoleProcess {
+    start_daemon_with(data_root, 8)
+}
+
+pub fn start_daemon_with(data_root: &Path, candidates: u64) -> RoleProcess {
+    let mut daemon = spawn_role(
+        "daemon",
+        "shm_role_daemon",
+        &[
+            (ENV_DAEMON_DATA_ROOT, data_root.display().to_string()),
+            (ENV_DAEMON_CANDIDATES, candidates.to_string()),
+        ],
+    );
+    daemon.expect_record("daemon_ready");
+    daemon
+}
+
+pub fn daemon_info(data_root: &Path) -> Discovered {
+    raw_client::discover(&connection_file(data_root)).expect("daemon publication validates")
+}
+
+pub fn spawn_victim(
+    data_root: &Path,
+    scenario: &str,
+    session: &str,
+    stale_file: Option<&Path>,
+) -> RoleProcess {
+    let mut envs = vec![
+        (
+            ENV_VICTIM_CONNECTION,
+            connection_file(data_root).display().to_string(),
+        ),
+        (ENV_VICTIM_SCENARIO, scenario.to_owned()),
+        (ENV_VICTIM_SESSION, session.to_owned()),
+    ];
+    if let Some(path) = stale_file {
+        envs.push((ENV_VICTIM_STALE_FILE, path.display().to_string()));
+    }
+    spawn_role("victim", "shm_role_victim", &envs)
+}
+
+/// Independently authenticated observer route. commentlint: allow(JUDGE)
+pub struct Observer {
+    client: RawClient,
+    channel: u16,
+    epoch: u32,
+}
+
+impl Observer {
+    pub async fn connect(info: &Discovered, session: &str) -> Self {
+        let mut client = RawClient::connect(info)
+            .await
+            .expect("observer authenticates");
+        let (channel, epoch) = client
+            .route_open(LINKED_MODULE_ID, CRASH_ROOT, "shm-crash", session)
+            .await
+            .expect("observer route");
+        Self {
+            client,
+            channel,
+            epoch,
+        }
+    }
+
+    pub async fn roundtrip(&mut self, bytes: usize, value: u8, budget: Duration) {
+        let corr = self.client.next_corr();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "mode": "direct_fill",
+            "bytes": bytes,
+            "value": value
+        }))
+        .expect("observer body");
+        self.client
+            .send_frame(
+                TY_REQUEST,
+                FLAGS_INTERACTIVE,
+                self.channel,
+                self.epoch,
+                corr,
+                &body,
+            )
+            .await
+            .expect("observer send");
+        let (_, frame) = self
+            .client
+            .frames_until_corr(corr, budget)
+            .await
+            .expect("observer terminal");
+        assert_eq!(frame.ty, TY_RESPONSE, "observer terminal type");
+        assert_eq!(frame.body, vec![value; bytes], "observer response bytes");
+    }
+}
+
+pub async fn negotiate_grant(info: &Discovered) -> (RawClient, serde_json::Value) {
+    let mut bootstrap = RawClient::connect(info)
+        .await
+        .expect("bootstrap authenticates");
+    let corr = bootstrap.control(&shm_offers()).await.expect("negotiate");
+    let (_, frame) = bootstrap
+        .frames_until_corr(corr, ROLE_BUDGET)
+        .await
+        .expect("negotiation response");
+    (bootstrap, frame.json())
+}
+
+pub async fn commit_shm_peer(info: &Discovered) -> TestShmPeer {
+    let (mut bootstrap, grant) = negotiate_grant(info).await;
+    assert_eq!(grant["selected"]["transport"], SHM_TRANSPORT);
+    let token = grant["activation_token"]
+        .as_str()
+        .expect("activation token")
+        .to_owned();
+    let peer = tokio::task::block_in_place(|| {
+        TestShmPeer::attach(&grant["descriptor"]).expect("attach fresh candidate")
+    });
+    let activate = format!(
+        r#"{{"op":"transport.activate","negotiation_version":1,"activation_token":"{token}"}}"#
+    )
+    .into_bytes();
+    tokio::task::block_in_place(|| {
+        peer.send(request_header(0, 0, 1, activate.len()), &activate)
+            .expect("publish activate");
+        recv_response(&peer, 1, ROLE_BUDGET);
+        let commit = br#"{"op":"transport.commit","negotiation_version":1}"#;
+        peer.send(request_header(0, 0, 2, commit.len()), commit)
+            .expect("publish commit");
+        recv_response(&peer, 2, ROLE_BUDGET);
+    });
+    assert!(
+        bootstrap.closed_within(ROLE_BUDGET).await,
+        "bootstrap must retire at commit"
+    );
+    peer
+}
+
+pub fn shm_roundtrip(peer: &TestShmPeer, session: &str) {
+    let (channel, epoch) = shm_route_open(peer, session);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "mode": "direct_fill",
+        "bytes": VICTIM_FILL_BYTES,
+        "value": VICTIM_FILL_VALUE
+    }))
+    .expect("request body");
+    peer.send(request_header(channel, epoch, 4, body.len()), &body)
+        .expect("publish request");
+    let (header, response) = recv_response(peer, 4, ROLE_BUDGET);
+    assert_eq!(header.ty, FrameType::Response, "shm terminal");
+    assert_eq!(
+        response,
+        vec![VICTIM_FILL_VALUE; VICTIM_FILL_BYTES],
+        "shm response bytes"
+    );
 }

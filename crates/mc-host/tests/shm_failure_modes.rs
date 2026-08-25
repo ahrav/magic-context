@@ -6,23 +6,17 @@
 
 mod support;
 
-use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
 use mc_host::shm_provider::{TestShmPeer, SHM_TRANSPORT};
-use subc_protocol::FrameType;
-use support::raw_client::{
-    self, Discovered, RawClient, FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE,
-};
+use support::raw_client::{FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
 use support::shm_process::{
-    daemon_role, goodbye_header, live_descendants, recv_response, request_header,
-    serial_crash_lock, shm_offers, shm_route_open, spawn_role, victim_role, RoleProcess,
-    CRASH_ROOT, ENV_DAEMON_CANDIDATES, ENV_DAEMON_DATA_ROOT, ENV_VICTIM_CONNECTION,
-    ENV_VICTIM_SCENARIO, ENV_VICTIM_SESSION, ENV_VICTIM_STALE_FILE, OBSERVATION_TIMEOUT,
-    VICTIM_FILL_BYTES, VICTIM_FILL_VALUE,
+    commit_shm_peer, daemon_info, daemon_role, goodbye_header, live_descendants, negotiate_grant,
+    request_header, serial_crash_lock, shm_roundtrip, spawn_victim, start_daemon,
+    start_daemon_with, victim_role, Observer, RoleProcess, CRASH_ROOT, OBSERVATION_TIMEOUT,
 };
-use support::{connection_file, LINKED_MODULE_ID};
+use support::LINKED_MODULE_ID;
 
 const BUDGET: Duration = Duration::from_secs(10);
 
@@ -46,100 +40,6 @@ fn shm_role_victim() {
 // Parent-side helpers.
 // ---------------------------------------------------------------------------
 
-fn start_daemon(data_root: &Path) -> RoleProcess {
-    start_daemon_with(data_root, 8)
-}
-
-fn start_daemon_with(data_root: &Path, candidates: u64) -> RoleProcess {
-    let mut daemon = spawn_role(
-        "daemon",
-        "shm_role_daemon",
-        &[
-            (ENV_DAEMON_DATA_ROOT, data_root.display().to_string()),
-            (ENV_DAEMON_CANDIDATES, candidates.to_string()),
-        ],
-    );
-    daemon.expect_record("daemon_ready");
-    daemon
-}
-
-fn daemon_info(data_root: &Path) -> Discovered {
-    raw_client::discover(&connection_file(data_root)).expect("daemon publication validates")
-}
-
-fn spawn_victim(
-    data_root: &Path,
-    scenario: &str,
-    session: &str,
-    stale_file: Option<&Path>,
-) -> RoleProcess {
-    let mut envs = vec![
-        (
-            ENV_VICTIM_CONNECTION,
-            connection_file(data_root).display().to_string(),
-        ),
-        (ENV_VICTIM_SCENARIO, scenario.to_owned()),
-        (ENV_VICTIM_SESSION, session.to_owned()),
-    ];
-    if let Some(path) = stale_file {
-        envs.push((ENV_VICTIM_STALE_FILE, path.display().to_string()));
-    }
-    spawn_role("victim", "shm_role_victim", &envs)
-}
-
-/// Independently authenticated observer route; readiness changes and victim
-/// crashes must never reconnect or invalidate it. commentlint: allow(JUDGE)
-struct Observer {
-    client: RawClient,
-    channel: u16,
-    epoch: u32,
-}
-
-impl Observer {
-    async fn connect(info: &Discovered, session: &str) -> Self {
-        let mut client = RawClient::connect(info)
-            .await
-            .expect("observer authenticates");
-        let (channel, epoch) = client
-            .route_open(LINKED_MODULE_ID, CRASH_ROOT, "shm-crash", session)
-            .await
-            .expect("observer route");
-        Self {
-            client,
-            channel,
-            epoch,
-        }
-    }
-
-    async fn roundtrip(&mut self, bytes: usize, value: u8, budget: Duration) {
-        let corr = self.client.next_corr();
-        let body = serde_json::to_vec(&serde_json::json!({
-            "mode": "direct_fill",
-            "bytes": bytes,
-            "value": value
-        }))
-        .expect("observer body");
-        self.client
-            .send_frame(
-                TY_REQUEST,
-                FLAGS_INTERACTIVE,
-                self.channel,
-                self.epoch,
-                corr,
-                &body,
-            )
-            .await
-            .expect("observer send");
-        let (_, frame) = self
-            .client
-            .frames_until_corr(corr, budget)
-            .await
-            .expect("observer terminal");
-        assert_eq!(frame.ty, TY_RESPONSE, "observer terminal type");
-        assert_eq!(frame.body, vec![value; bytes], "observer response bytes");
-    }
-}
-
 /// Bounded poll until the daemon reports exactly `expected` dispatches;
 /// exceeding it at any sample fails immediately (replay detector).
 /// commentlint: allow(JUDGE)
@@ -160,68 +60,6 @@ fn wait_for_dispatches(daemon: &mut RoleProcess, expected: u64, budget: Duration
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-async fn negotiate_grant(info: &Discovered) -> (RawClient, serde_json::Value) {
-    let mut bootstrap = RawClient::connect(info)
-        .await
-        .expect("bootstrap authenticates");
-    let corr = bootstrap.control(&shm_offers()).await.expect("negotiate");
-    let (_, frame) = bootstrap
-        .frames_until_corr(corr, BUDGET)
-        .await
-        .expect("negotiation response");
-    (bootstrap, frame.json())
-}
-
-/// Full parent-side fresh setup: negotiate, attach, activate, commit.
-async fn commit_shm_peer(info: &Discovered) -> TestShmPeer {
-    let (mut bootstrap, grant) = negotiate_grant(info).await;
-    assert_eq!(grant["selected"]["transport"], SHM_TRANSPORT);
-    let token = grant["activation_token"]
-        .as_str()
-        .expect("activation token")
-        .to_owned();
-    let peer = tokio::task::block_in_place(|| {
-        TestShmPeer::attach(&grant["descriptor"]).expect("attach fresh candidate")
-    });
-    let activate = format!(
-        r#"{{"op":"transport.activate","negotiation_version":1,"activation_token":"{token}"}}"#
-    )
-    .into_bytes();
-    tokio::task::block_in_place(|| {
-        peer.send(request_header(0, 0, 1, activate.len()), &activate)
-            .expect("publish activate");
-        recv_response(&peer, 1, BUDGET);
-        let commit = br#"{"op":"transport.commit","negotiation_version":1}"#;
-        peer.send(request_header(0, 0, 2, commit.len()), commit)
-            .expect("publish commit");
-        recv_response(&peer, 2, BUDGET);
-    });
-    assert!(
-        bootstrap.closed_within(BUDGET).await,
-        "bootstrap must retire at commit"
-    );
-    peer
-}
-
-fn shm_roundtrip(peer: &TestShmPeer, session: &str) {
-    let (channel, epoch) = shm_route_open(peer, session);
-    let body = serde_json::to_vec(&serde_json::json!({
-        "mode": "direct_fill",
-        "bytes": VICTIM_FILL_BYTES,
-        "value": VICTIM_FILL_VALUE
-    }))
-    .expect("request body");
-    peer.send(request_header(channel, epoch, 4, body.len()), &body)
-        .expect("publish request");
-    let (header, response) = recv_response(peer, 4, BUDGET);
-    assert_eq!(header.ty, FrameType::Response, "shm terminal");
-    assert_eq!(
-        response,
-        vec![VICTIM_FILL_VALUE; VICTIM_FILL_BYTES],
-        "shm response bytes"
-    );
 }
 
 // ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ mc-shm-transport = { path = "../mc-shm-transport", default-features = false }
 
 [dev-dependencies]
 hmac = "0.12"
+libc = "0.2"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "signal"] }
 # `stdio` only serves the broca_subprocess fixture that replaces its own
