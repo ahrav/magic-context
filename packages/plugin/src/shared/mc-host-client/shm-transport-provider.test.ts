@@ -34,22 +34,16 @@ function channelArgs(): CandidateChannelArgs {
 }
 
 describe("grant geometry and duplex-pair binding", () => {
-    // Pinned by golden_grant_fixture_matches_the_frozen_ring_profile_encoding in crates/mc-shm-transport/tests/ring.rs; keep both hex literals identical. commentlint: allow(JUDGE)
-    const GOLDEN_GRANT_HEX =
-        "0200d489c07ee46333a5fe7901df356f6f4600000000200000000000000000000004000000002000" +
-        "000000000000004000040000000000000000";
-
-    test("the pinned golden grant fixture is accepted as a lane-0 grant", () => {
-        const descriptor = { ...validGrant(), host_to_peer_grant: GOLDEN_GRANT_HEX };
-        const decoded = decodeShmGrant(descriptor, OPTIONS);
-        expect(decoded.hostToPeerGrant).toBe(GOLDEN_GRANT_HEX);
+    test("the qualified host profile geometry is accepted", () => {
+        const decoded = decodeShmGrant(validGrant(), OPTIONS);
+        expect(decoded.hostToPeerGrant).toBe(grantHex({ lane: 0, incarnation: 0xab }));
     });
 
     test("an internally consistent over-profile grant is rejected", () => {
         const overArena = 1n << 40n;
         const grant = {
             ...validGrant(),
-            host_to_peer_grant: grantHex({ lane: 0, arena: overArena, total: overArena + 12_288n }),
+            host_to_peer_grant: grantHex({ lane: 0, arena: overArena, total: overArena + 8_192n }),
         };
         expectCode(() => decodeShmGrant(grant, OPTIONS), "geometry_mismatch");
         const overDepth = {

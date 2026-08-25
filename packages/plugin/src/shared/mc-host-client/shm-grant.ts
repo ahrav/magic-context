@@ -63,10 +63,10 @@ const GRANT_HEX_LEN = 116;
 
 /** `LAYOUT_VERSION` in `backend/ring.rs`. */
 const LAYOUT_VERSION = 2;
-/** Exact frozen `mc-host-test-ring-v1` geometry (`profile.rs::ring_profile`). */
-const DESCRIPTOR_DEPTH = 32n;
+/** Exact `mc-host-test-ring-v1` geometry (`shm_provider::qualified_test_profile`). */
+const DESCRIPTOR_DEPTH = 8n;
 const ARENA_BYTES = 67_108_864n;
-const MAX_LEASES = 32n;
+const MAX_LEASES = 8n;
 /**
  * Absolute cap on the mapping size a grant may request: the exact arena
  * plus a generous 1 MiB metadata allowance. The native side re-derives the

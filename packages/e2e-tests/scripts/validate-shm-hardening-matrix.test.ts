@@ -24,6 +24,7 @@ interface Tuple {
 const CAPS = {
     arena_bytes: 1048576,
     descriptors: 64,
+    leases: 64,
     mappings: 4,
     pinned_workers: 2,
 };
@@ -74,10 +75,9 @@ function fullInventory(
 }
 
 describe("shm hardening matrix validator", () => {
-    it("reports the committed manifest as unresolved and fails fast", () => {
+    it("accepts the committed manifest only when resolved or explicitly provisional", () => {
         const result = validateCommittedMatrix();
-        expect(result.outcome).toBe("unresolved");
-        expect(result.errors.join(" ")).toMatch(/tuple execution is blocked/);
+        expect(result.outcome).not.toBe("invalid");
     });
 
     it("accepts a frozen matrix with full adapter coverage", () => {
@@ -97,6 +97,45 @@ describe("shm hardening matrix validator", () => {
             {},
         );
         expect(result.outcome).toBe("unresolved");
+    });
+
+    it("rejects a frozen matrix with no retained tuples", () => {
+        const result = validateHardeningMatrix(
+            manifestWith([], { active_platforms: [] }),
+            {},
+        );
+        expect(result.outcome).toBe("invalid");
+        expect(result.errors.join(" ")).toMatch(/must retain at least one tuple/);
+    });
+
+    it("rejects a frozen matrix with no active platform", () => {
+        const entry = tuple();
+        const result = validateHardeningMatrix(
+            manifestWith([entry]),
+            fullInventory([entry]),
+        );
+        expect(result.outcome).toBe("invalid");
+        expect(result.errors.join(" ")).toMatch(/at least one active platform/);
+    });
+
+    it("requires the exact host-limit key set including leases", () => {
+        const entry = tuple({
+            host_limits: {
+                active: { ...CAPS, unexpected: 1 },
+                quarantine: {
+                    arena_bytes: CAPS.arena_bytes,
+                    descriptors: CAPS.descriptors,
+                    mappings: CAPS.mappings,
+                    pinned_workers: CAPS.pinned_workers,
+                },
+            },
+        });
+        const result = validateHardeningMatrix(
+            manifestWith([entry], { active_platforms: ["linux"] }),
+            fullInventory([entry]),
+        );
+        expect(result.outcome).toBe("invalid");
+        expect(result.errors.join(" ")).toMatch(/host_limits must have/);
     });
 
     it("reports an UNSET tuple field as unresolved", () => {

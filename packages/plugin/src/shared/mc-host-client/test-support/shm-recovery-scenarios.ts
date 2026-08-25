@@ -14,7 +14,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { SubcClient, type SubcClientOptions, type SubcDiagnosticsEvent } from "../client";
+import {
+    DEFAULT_RECOVERY_DEADLINE_MS,
+    SubcClient,
+    type SubcClientOptions,
+    type SubcDiagnosticsEvent,
+} from "../client";
 import type { BindIdentity, RouteTarget } from "../types";
 import {
     encodePeerFrame,
@@ -430,7 +435,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 sleep,
             });
             // The escalating pacer sums to the 30s window in bounded steps.
-            await waitUntil(() => now >= 30_000, 15_000);
+            await waitUntil(() => now >= DEFAULT_RECOVERY_DEADLINE_MS, 15_000);
             await client.closeAsync();
             await settle();
             const settledCount = peer.connections.length;

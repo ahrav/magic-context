@@ -849,9 +849,24 @@ mod tests {
         assert_eq!(accounting.quarantined, ResourceCharges::ZERO);
     }
 
+    #[test]
+    fn qualified_test_profile_pins_client_grant_geometry() {
+        let profile = qualified_test_profile();
+        assert_eq!(profile.descriptor_depth(), 8);
+        assert_eq!(profile.max_leases(), 8);
+        assert_eq!(profile.arena_bytes(), mc_shm_transport::MIN_ARENA_BYTES);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
         let rings = DuplexRing::create(&qualified_test_profile()).unwrap();
+        let encoded = rings.first.grant().encode();
+        assert_eq!(u64::from_le_bytes(encoded[22..30].try_into().unwrap()), 8);
+        assert_eq!(u64::from_le_bytes(encoded[38..46].try_into().unwrap()), 8);
+        assert_eq!(
+            u64::from_le_bytes(encoded[46..54].try_into().unwrap()),
+            (mc_shm_transport::MIN_ARENA_BYTES + 8_192) as u64
+        );
         let body = b"copy";
         let header = EnvelopeHeader {
             len: body.len() as u32,

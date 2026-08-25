@@ -173,12 +173,14 @@
         "active": {
           "arena_bytes": "active arena-byte cap (non-negative integer)",
           "descriptors": "active descriptor cap (non-negative integer)",
+          "leases": "active receive-lease cap (non-negative integer)",
           "mappings": "active mapping cap (non-negative integer)",
           "pinned_workers": "active pinned-worker cap (non-negative integer)"
         },
         "quarantine": {
           "arena_bytes": "quarantined arena-byte cap (non-negative integer)",
           "descriptors": "quarantined descriptor cap (non-negative integer)",
+          "leases": "quarantined receive-lease cap (non-negative integer)",
           "mappings": "quarantined mapping cap (non-negative integer)",
           "pinned_workers": "quarantined pinned-worker cap (non-negative integer)"
         }

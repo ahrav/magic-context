@@ -81,7 +81,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_ROUTE_OPEN_DEADLINE_MS = 30_000;
 /** Separate bounded shutdown deadline for route and connection Goodbye. */
 const DEFAULT_SHUTDOWN_DEADLINE_MS = 5_000;
-const DEFAULT_RECOVERY_DEADLINE_MS = 30_000;
+export const DEFAULT_RECOVERY_DEADLINE_MS = 30_000;
 /** Channel-0 control bodies are capped below the frame limit (wire doc 7.1). */
 const MAX_CONTROL_BODY_LEN = 65_536;
 /**

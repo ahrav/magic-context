@@ -23,11 +23,11 @@ export function grantHex(
     view.setUint16(0, overrides.layoutVersion ?? 2, true);
     bytes[2] = overrides.incarnation ?? 0xab;
     view.setUint32(18, overrides.lane ?? 0, true);
-    view.setBigUint64(22, overrides.depth ?? 32n, true);
+    view.setBigUint64(22, overrides.depth ?? 8n, true);
     const arena = overrides.arena ?? 67_108_864n;
     view.setBigUint64(30, arena, true);
-    view.setBigUint64(38, overrides.maxLeases ?? 32n, true);
-    view.setBigUint64(46, overrides.total ?? arena + 12_288n, true);
+    view.setBigUint64(38, overrides.maxLeases ?? 8n, true);
+    view.setBigUint64(46, overrides.total ?? arena + 8_192n, true);
     view.setUint32(54, overrides.reserved ?? 0, true);
     return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }

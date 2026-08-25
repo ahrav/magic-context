@@ -12,6 +12,9 @@ on:
         required: false
         default: "60"
 
+permissions:
+  contents: read
+
 jobs:
   full-soak:
     name: Full resource soak (Linux, provisional ring tuple)
@@ -19,6 +22,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -38,6 +43,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -52,8 +59,10 @@ jobs:
 
       - name: Bounded fuzz per target
         working-directory: crates/mc-shm-transport
+        env:
+          FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
         run: |
           for target in frame_descriptor provider_grant provider_sample; do
             cargo +nightly fuzz run "$target" -- \
-              -max_total_time=${{ inputs.fuzz_seconds }}
+              -max_total_time="$FUZZ_SECONDS"
           done

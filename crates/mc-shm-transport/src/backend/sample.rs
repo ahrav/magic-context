@@ -120,7 +120,6 @@ impl SamplePrefix {
             return Err(DescriptorError::InvalidAllocation);
         }
         Ok(ValidatedSample {
-            wire_header: self.wire_header,
             identity: self.identity,
             body_len,
         })
@@ -136,17 +135,11 @@ impl std::fmt::Debug for SamplePrefix {
 /// Validated sample metadata with the exact declared body range.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedSample {
-    wire_header: [u8; WIRE_V2_HEADER_BYTES],
     identity: ReleaseIdentity,
     body_len: usize,
 }
 
 impl ValidatedSample {
-    /// Frozen wire-v2 header.
-    pub const fn wire_header(&self) -> [u8; WIRE_V2_HEADER_BYTES] {
-        self.wire_header
-    }
-
     /// Qualified release identity.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity

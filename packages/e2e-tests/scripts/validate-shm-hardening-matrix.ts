@@ -24,6 +24,7 @@ export const GEOMETRY_FIELDS = [
 export const HOST_LIMIT_FIELDS = [
     "arena_bytes",
     "descriptors",
+    "leases",
     "mappings",
     "pinned_workers",
 ] as const;
@@ -113,6 +114,7 @@ function validateTupleShape(
     const limits = tuple.host_limits;
     const validCaps = (caps: unknown): boolean =>
         isRecord(caps) &&
+        Object.keys(caps).length === HOST_LIMIT_FIELDS.length &&
         HOST_LIMIT_FIELDS.every((field) => isCount(caps[field]));
     if (
         !isRecord(limits) ||
@@ -189,6 +191,14 @@ export function validateHardeningMatrix(
             ],
         };
     }
+    if (section.retained_tuples.length === 0) {
+        return {
+            outcome: "invalid",
+            errors: [
+                "a frozen failure_hardening matrix must retain at least one tuple",
+            ],
+        };
+    }
 
     const errors: string[] = [];
     const selectable = new Set(
@@ -200,6 +210,12 @@ export function validateHardeningMatrix(
         ? section.active_platforms
         : [];
     const identities = new Set<string>();
+
+    if (activePlatforms.length === 0) {
+        errors.push(
+            "a frozen failure_hardening matrix must declare at least one active platform",
+        );
+    }
 
     for (const [index, tuple] of section.retained_tuples.entries()) {
         validateTupleShape(tuple, index, selectable, errors);
