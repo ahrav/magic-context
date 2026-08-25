@@ -589,7 +589,12 @@ jobs:
       - name: Run supported TS incident schedule
         env:
           NODE_ENV: ""
-        run: bun run --cwd packages/e2e-tests test:incidents --mode ts
+        # Same 600s per-case budget the host suites use: a cold runner pays Bun
+        # bootstrap plus a fresh harness and `opencode serve` startup inside the
+        # first case, which the 120s default deadline cannot cover.
+        run: >-
+          bun run --cwd packages/e2e-tests test:incidents --mode ts
+          --timeout 600000
 
       - name: Archive explicit incident report
         if: always()

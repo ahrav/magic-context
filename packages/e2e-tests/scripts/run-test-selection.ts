@@ -29,17 +29,32 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
 }
 
 /**
- * Unit tests that live outside `tests/` and outside the incident-pool tree, so
- * neither the mode manifest nor the incident-unit selection can see them. The
- * mode selection carries them because it replaced a bare `bun test` as the
- * package's default suite; without this they run nowhere.
+ * Hermetic unit tests that live outside `tests/` and outside the incident-pool
+ * tree, so neither the mode manifest nor the incident-unit selection can see
+ * them. The mode selection carries them because it replaced a bare `bun test`
+ * as the package's default suite; without this they run nowhere. These need
+ * nothing beyond Bun, so every mode can run them.
  */
 export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         "src/cache-analysis.test.ts",
         "src/pi-runner/rpc-client.test.ts",
-        "src/rust-runner/hermetic-mc-host.test.ts",
     ];
+    return assertPresent(files, root);
+}
+
+/**
+ * Standalone tests that build the direct-host Cargo fixture. They belong to the
+ * Rust selection alone: a public TypeScript checkout has no `../commons` path
+ * dependencies, so building the fixture there fails, and these tests carry no
+ * skip guard of their own. The Rust selection gates on the prerequisite probe
+ * before it reaches them.
+ */
+export function rustStandaloneFiles(root: string = E2E_ROOT): string[] {
+    return assertPresent(["src/rust-runner/hermetic-mc-host.test.ts"], root);
+}
+
+function assertPresent(files: string[], root: string): string[] {
     for (const file of files) {
         if (!existsSync(resolve(root, file))) {
             throw new Error(`standalone unit selection names a missing ${file}`);
@@ -139,8 +154,14 @@ async function main(): Promise<number> {
     }
     const wrapper = "tests/incident-pool-green.test.ts";
     // The wrapper drives the whole pool in-process, so it runs alone in a
-    // second phase. Standalone units are hermetic and ride the first phase.
-    const standalone = args.incidentUnit ? [] : standaloneUnitFiles();
+    // second phase. Hermetic standalone units ride the first phase; the
+    // Cargo-fixture ones join only when Rust prerequisites were proven above.
+    const standalone = args.incidentUnit
+        ? []
+        : [
+              ...standaloneUnitFiles(),
+              ...(args.mode === "rust" ? rustStandaloneFiles() : []),
+          ];
     const selected = [...files, ...standalone];
     const groups = selected.includes(wrapper)
         ? [selected.filter((file) => file !== wrapper), [wrapper]]

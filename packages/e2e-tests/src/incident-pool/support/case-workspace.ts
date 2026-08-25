@@ -63,6 +63,12 @@ export function destroyCaseWorkspace(workspace: CaseWorkspace): void {
  * The ONLY parent variables a child may inherit. Everything else — AWS/API
  * credentials, tokens, proxy configuration, ambient HOME/TMPDIR/XDG paths —
  * is stripped because it is never copied.
+ *
+ * The toolchain entries carry no secrets and are required for a Rust case to
+ * resolve its own toolchain: a rustup-backed `cargo` shim locates the installed
+ * toolchain through `RUSTUP_HOME`, which the relocated `HOME` no longer implies,
+ * and `MC_E2E_DIRECT_HOST_FIXTURE_BIN` names an already-built fixture so the
+ * child does not build one at all.
  */
 export const CASE_ENV_ALLOWLIST = [
     "PATH",
@@ -74,6 +80,9 @@ export const CASE_ENV_ALLOWLIST = [
     "USER",
     "LOGNAME",
     "SHELL",
+    "RUSTUP_HOME",
+    "CARGO_HOME",
+    "MC_E2E_DIRECT_HOST_FIXTURE_BIN",
 ] as const;
 
 /** Allowlisted env with home/temp/XDG roots relocated into the workspace. */
