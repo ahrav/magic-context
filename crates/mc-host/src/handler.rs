@@ -426,14 +426,23 @@ impl RequestCtx {
         self.stream.reserve_direct(exact_len, serializer).await
     }
 
-    pub(crate) fn try_reserve_resident(&self, bytes: usize) -> Option<crate::wire::ByteCharge> {
+    /// Reserves resident bytes for request-derived state the handler is about to
+    /// allocate — parse scratch, an owned tree decoded from `body`, anything whose
+    /// lifetime is the request rather than the response.
+    ///
+    /// `None` means the pool cannot cover it right now. Charge BEFORE allocating:
+    /// a reservation taken afterwards has already let the allocation escape the
+    /// envelope, and concurrent requests each escape by their own full amount.
+    /// The returned charge releases on drop, so hold it for as long as the bytes
+    /// are live.
+    pub fn try_reserve_resident(&self, bytes: usize) -> Option<crate::wire::ByteCharge> {
         self.scratch.try_charge(bytes)
     }
 
     /// The resident ceiling `try_reserve_resident` is measured against. A
     /// reservation above this can never be acquired, so callers report it
     /// as a permanent rejection instead of retryable backpressure.
-    pub(crate) fn resident_capacity(&self) -> usize {
+    pub fn resident_capacity(&self) -> usize {
         self.scratch.capacity()
     }
 

@@ -12465,6 +12465,30 @@ impl CompositeComponent for McHandler {
         if let Err(outcome) = enforce_request_byte_cap(ctx.body.as_slice()) {
             return settle_prepared(&ctx, outcome).await;
         }
+        // Charge the tree BEFORE materializing it. `from_slice::<Value>` turns a
+        // body into a node per value plus an owned `String` per string, which for
+        // scalar-dense JSON is many times the wire bytes — and the body's own
+        // ingress charge does not cover any of it. Reserved afterwards, every
+        // concurrent request would already have escaped the resident envelope by
+        // its own full expansion.
+        //
+        // The bound is counted from the body rather than assumed as a multiple of
+        // it, mirroring what the response path does with `measure`: a realistic
+        // string-heavy transform body reserves close to its true footprint, while
+        // a scalar-dense body that genuinely cannot be served inside the envelope
+        // is refused instead of silently exceeding it.
+        let Some(footprint) = value_footprint_bound(ctx.body.as_slice()) else {
+            return settle_prepared(&ctx, request_too_large_error()).await;
+        };
+        let _parse_charge = match ctx.try_reserve_resident(footprint) {
+            Some(charge) => charge,
+            None if footprint > ctx.resident_capacity() => {
+                // Above the ceiling itself: no amount of draining admits it, so
+                // this is permanent rather than backpressure.
+                return settle_prepared(&ctx, request_too_large_error()).await;
+            }
+            None => return settle_prepared(&ctx, resident_capacity_error()).await,
+        };
         let request = serde_json::from_slice::<Value>(ctx.body.as_slice()).unwrap_or(Value::Null);
         let inbound_bytes = ctx.body.len();
         let outcome = self
@@ -14747,6 +14771,70 @@ impl RequestMethodProbe {
 /// legitimately carry a session's full message array (multi-MiB on large
 /// sessions), so they get the wider cap. Method sniffing on raw bytes avoids
 /// parsing multi-MiB JSON just to reject it.
+/// Slack on the counted node storage, covering `Vec` and map growth: both double
+/// as they fill, so the live allocation can reach twice the storage the final
+/// element count needs.
+const VALUE_NODE_SLACK: usize = 2;
+
+/// Fixed headroom for the root value, the deserializer's own scratch, and the
+/// small allocations that do not scale with the body.
+const VALUE_ENVELOPE_BYTES: usize = 4096;
+
+/// Upper bound on the heap a `serde_json::Value` tree decoded from `body` can
+/// occupy. `None` on arithmetic overflow, which callers treat as unsatisfiable.
+///
+/// Counted, not assumed: one pass classifies every byte as inside or outside a
+/// string, because only outside-string `,` and `:` separate values. A document
+/// holds at most one root value, plus one per outside-string comma (array
+/// elements and object members), plus one per outside-string colon (member
+/// values) — which bounds the node count without building anything. String bytes
+/// are added separately, since each string becomes an owned `String`.
+fn value_footprint_bound(body: &[u8]) -> Option<usize> {
+    let mut nodes: usize = 1;
+    let mut string_bytes: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in body {
+        if in_string {
+            string_bytes += 1;
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b',' | b':' => nodes += 1,
+            _ => {}
+        }
+    }
+    nodes
+        .checked_mul(std::mem::size_of::<Value>())?
+        .checked_mul(VALUE_NODE_SLACK)?
+        .checked_add(string_bytes)?
+        .checked_add(VALUE_ENVELOPE_BYTES)
+}
+
+/// Permanent: the tree cannot fit this host's resident ceiling at any load.
+fn request_too_large_error() -> PreparedOutcome {
+    PreparedOutcome::Error {
+        code: "invalid_params".to_string(),
+        message: "request body needs more resident bytes than this host can hold".to_string(),
+    }
+}
+
+/// Retryable: the ceiling could hold it, but concurrent requests hold it now.
+fn resident_capacity_error() -> PreparedOutcome {
+    PreparedOutcome::Error {
+        code: "queue_full".to_string(),
+        message: "resident capacity for request parsing is exhausted".to_string(),
+    }
+}
+
 fn enforce_request_byte_cap(body: &[u8]) -> Result<(), PreparedOutcome> {
     if body.len() <= MAX_FACADE_FRAME_BYTES {
         return Ok(());
@@ -18095,6 +18183,60 @@ mod tests {
         // The transform cap itself is still a hard ceiling.
         assert!(
             enforce_request_byte_cap(&pad("transform", "kind", MAX_TRANSFORM_FRAME_BYTES)).is_err()
+        );
+    }
+
+    #[test]
+    fn value_footprint_counts_nodes_outside_strings_only() {
+        // The string-awareness is the load-bearing part. Punctuation inside a
+        // string separates no values, so counting it would inflate the bound
+        // until ordinary string-heavy transform bodies were refused.
+        let quoted = br#"{"a":"x,y,z:w,,,::"}"#;
+        let bare = br#"{"a":1,"b":2,"c":3}"#;
+        assert!(
+            value_footprint_bound(quoted).unwrap() < value_footprint_bound(bare).unwrap(),
+            "commas and colons inside a string must not count as value separators"
+        );
+
+        // An escaped quote does not end the string, so the rest stays inside it.
+        let escaped = br#"{"a":"he said \"x,y,z\" ok"}"#;
+        let node_cost = std::mem::size_of::<Value>() * VALUE_NODE_SLACK;
+        assert!(
+            value_footprint_bound(escaped).unwrap()
+                < VALUE_ENVELOPE_BYTES + escaped.len() + 4 * node_cost,
+            "an escaped quote must not drop the scan out of the string"
+        );
+    }
+
+    #[test]
+    fn scalar_dense_bodies_bound_far_above_their_wire_size() {
+        // This is the case the charge exists for: every two wire bytes become a
+        // whole `Value` node, so the tree dwarfs the body that the ingress
+        // charge covered.
+        let dense: Vec<u8> = {
+            let mut body = Vec::from(b"[1".as_slice());
+            for _ in 0..10_000 {
+                body.extend_from_slice(b",1");
+            }
+            body.push(b']');
+            body
+        };
+        let bound = value_footprint_bound(&dense).expect("bound fits usize");
+        assert!(
+            bound > dense.len() * 8,
+            "a scalar-dense body must bound far above its wire size, got {bound} for {} bytes",
+            dense.len()
+        );
+
+        // A string-heavy body of the same length bounds near its wire size, so
+        // realistic transform traffic is not refused by this gate.
+        let mut stringy = Vec::from(b"[\"".as_slice());
+        stringy.extend(std::iter::repeat_n(b'x', dense.len()));
+        stringy.extend_from_slice(b"\"]");
+        let stringy_bound = value_footprint_bound(&stringy).expect("bound fits usize");
+        assert!(
+            stringy_bound < stringy.len() * 2,
+            "string bytes must not be charged as nodes, got {stringy_bound}"
         );
     }
 
