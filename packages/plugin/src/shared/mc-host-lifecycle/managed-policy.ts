@@ -2,8 +2,20 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import payloadIndex from "../../../../../release/mc-host-payload-index.json";
-import { BROCA_CREDENTIAL_NAMES, McHostClient } from "../mc-host-client";
+import {
+    type AuthenticatedPeer,
+    BROCA_CREDENTIAL_NAMES,
+    type CatalogEntry,
+    type HostStatusSnapshot,
+    McHostClient,
+} from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
+import {
+    evaluateCompatibility,
+    evaluateDaemonCompatibility,
+    evaluateModuleCompatibility,
+    observedEpochsFromMagicContextMetrics,
+} from "./compatibility";
 import type { NativeStartupEnvelope } from "./native-launcher";
 import {
     type PayloadTrustIndex,
@@ -12,6 +24,7 @@ import {
 } from "./owner";
 import { connectionFilePath, resolveLifecycleDataRoot } from "./paths";
 import {
+    type CompatibilitySnapshot,
     type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
     type ObservationalHealth,
@@ -84,7 +97,110 @@ async function probeManagedStorage(
     }
 }
 
-async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
+export interface ManagedCompatibilityClient {
+    readonly authenticated: AuthenticatedPeer | null;
+    catalogList(): Promise<CatalogEntry[]>;
+    hostStatus(options?: { timeoutMs?: number }): Promise<HostStatusSnapshot>;
+}
+
+function samePeer(left: AuthenticatedPeer | null, right: AuthenticatedPeer): boolean {
+    if (
+        left === null ||
+        left.daemonVer !== right.daemonVer ||
+        left.proof !== right.proof ||
+        left.daemonId === null ||
+        right.daemonId === null ||
+        left.daemonId.length !== right.daemonId.length
+    ) {
+        return false;
+    }
+    return left.daemonId.every((byte, index) => byte === right.daemonId?.[index]);
+}
+
+interface CompatibilityProbeResult {
+    snapshot: CompatibilitySnapshot;
+    status: HostStatusSnapshot | null;
+}
+
+async function readCompatibilityProbe(
+    client: ManagedCompatibilityClient,
+    deadline: number,
+    signal?: AbortSignal,
+): Promise<CompatibilityProbeResult> {
+    const authenticated = client.authenticated;
+    if (authenticated === null || authenticated.daemonId === null) {
+        throw new Error("authenticated peer disappeared");
+    }
+    const daemon = evaluateDaemonCompatibility(authenticated.daemonVer);
+    if (!daemon.ok) {
+        return {
+            snapshot: {
+                authenticatedDaemonVersion: authenticated.daemonVer,
+                authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
+                catalog: [],
+                epochs: {},
+                evaluatedThrough: "daemon",
+            },
+            status: null,
+        };
+    }
+    const catalog = await client.catalogList();
+    if (!samePeer(client.authenticated, authenticated)) {
+        throw new Error("authenticated peer changed during compatibility probe");
+    }
+    if (signal?.aborted) throw signal.reason ?? new Error("compatibility probe aborted");
+    const modules = evaluateModuleCompatibility(catalog);
+    if (!modules.ok) {
+        return {
+            snapshot: {
+                authenticatedDaemonVersion: authenticated.daemonVer,
+                authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
+                catalog,
+                epochs: {},
+                evaluatedThrough: "modules",
+            },
+            status: null,
+        };
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error("compatibility probe deadline expired");
+    const status = await client.hostStatus({
+        timeoutMs: remainingMs,
+    });
+    if (!samePeer(client.authenticated, authenticated)) {
+        throw new Error("authenticated peer changed during compatibility probe");
+    }
+    if (signal?.aborted) throw signal.reason ?? new Error("compatibility probe aborted");
+    const components = asRecord(status.metrics.components);
+    const magicContextMetrics = asRecord(asRecord(components?.["magic-context"])?.metrics);
+    const snapshot = {
+        authenticatedDaemonVersion: authenticated.daemonVer,
+        authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
+        catalog,
+        epochs: observedEpochsFromMagicContextMetrics(magicContextMetrics),
+        evaluatedThrough: "epochs" as const,
+    };
+    evaluateCompatibility({
+        authenticatedDaemonVer: snapshot.authenticatedDaemonVersion,
+        catalog: snapshot.catalog,
+        epochs: snapshot.epochs,
+    });
+    return { snapshot, status };
+}
+
+export async function readCompatibilitySnapshot(
+    client: ManagedCompatibilityClient,
+    deadline: number,
+    signal?: AbortSignal,
+): Promise<CompatibilitySnapshot> {
+    return (await readCompatibilityProbe(client, deadline, signal)).snapshot;
+}
+
+async function probeManagedCompatibility(
+    root: string,
+    budgetMs: number,
+    signal?: AbortSignal,
+): Promise<CompatibilitySnapshot> {
     const deadline = Date.now() + budgetMs;
     const client = await McHostClient.connect({
         connectionFile: connectionFilePath(root),
@@ -92,11 +208,36 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
         requestTimeoutMs: Math.max(1, budgetMs),
     });
     try {
-        const authenticated = client.authenticated;
-        if (authenticated === null) throw new Error("authenticated peer disappeared");
-        const status = await client.hostStatus({
-            timeoutMs: Math.max(1, deadline - Date.now()),
-        });
+        return await readCompatibilitySnapshot(client, deadline, signal);
+    } finally {
+        await client.closeAsync().catch(() => {});
+    }
+}
+
+async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
+    const deadline = Date.now() + budgetMs;
+    const client = await McHostClient.connect({
+        connectionFile: connectionFilePath(root),
+        handshakeTimeoutMs: Math.max(1, budgetMs),
+        requestTimeoutMs: Math.max(1, budgetMs),
+        identity: {
+            project_root: root,
+            harness: "mc-host-lifecycle",
+            session: "compatibility",
+        },
+    });
+    try {
+        const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
+        if (status === null) {
+            return {
+                ...compatibility,
+                readiness: {
+                    transport: { state: "ready", reason: "healthy" },
+                    storage: { state: "unavailable", reason: "storage_unavailable" },
+                    synapse: { state: "degraded", reason: "synapse_degraded" },
+                },
+            };
+        }
         const components = asRecord(status.metrics.components);
         const storage = storageState(status.metrics);
         const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
@@ -113,7 +254,7 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
                     ? { state: "starting" as const, reason: "synapse_starting" as const }
                     : { state: "degraded" as const, reason: "synapse_degraded" as const };
         return {
-            authenticatedDaemonVersion: authenticated.daemonVer,
+            ...compatibility,
             readiness: {
                 transport: { state: "ready", reason: "healthy" },
                 storage: {
@@ -209,6 +350,9 @@ export function createManagedLifecyclePolicy(
             defaultStartupEnvelope: buildManagedCredentialEnvelope(env),
             storageProbe:
                 options.storageProbe ?? ((budgetMs) => probeManagedStorage(root.root, budgetMs)),
+            compatibilityProbe:
+                options.compatibilityProbe ??
+                ((budgetMs, signal) => probeManagedCompatibility(root.root, budgetMs, signal)),
             readinessProbe:
                 options.readinessProbe ??
                 ((budgetMs) => probeManagedReadiness(root.root, budgetMs)),

@@ -351,6 +351,7 @@ describe("McHostModuleTransport", () => {
                     ok: true,
                     reason: "already_running",
                     storage: "ready",
+                    authenticatedDaemonId: Uint8Array.from(peer.daemonId),
                 }),
             }),
         );
@@ -410,6 +411,39 @@ describe("McHostModuleTransport", () => {
             if (oldCredential === undefined) delete process.env.ANTHROPIC_API_KEY;
             else process.env.ANTHROPIC_API_KEY = oldCredential;
         }
+    });
+
+    it("rejects a rotated daemon before route open or application body", async () => {
+        const peer = await startPeer();
+        const connectionFile = await writeConnFile(peer);
+        const wrongDaemonId = Uint8Array.from(peer.daemonId);
+        wrongDaemonId[0] = (wrongDaemonId[0] ?? 0) ^ 1;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                connectionFile,
+                connectionOrigin: "managed-default",
+                requestTimeoutMs: 100,
+                demandStart: async () => ({
+                    ok: true,
+                    reason: "already_running",
+                    storage: "ready",
+                    authenticatedDaemonId: wrongDaemonId,
+                }),
+            }),
+        );
+
+        const error = await rejection(
+            transport.call({
+                sessionId: "rotated-daemon",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        );
+        expect(__moduleTransportTest.isConnectionFailure(error)).toBe(true);
+        expect(peer.connections.flatMap((connection) => connection.frames).some(isRouteOpen)).toBe(
+            false,
+        );
     });
 
     it("surfaces a missing managed lifecycle owner before connection work", async () => {

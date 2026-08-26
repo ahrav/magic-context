@@ -319,6 +319,7 @@ interface RequestParams {
     deadline: Deadline;
     options: RequestOptions;
     responseMode?: "json" | "binary";
+    mode?: "unary" | "stream";
     binary?: boolean;
     /**
      * Retain the raw wire Error terminal on the thrown failure. Only the
@@ -532,9 +533,13 @@ export class McHostClient {
      * attempt under one bounded deadline; retry policy belongs to owners
      * above (managed `call()` owns its own allowlisted retry loop).
      */
-    async routeOpen(target: RouteTarget, identity: BindIdentity): Promise<RouteHandle> {
+    async routeOpen(
+        target: RouteTarget,
+        identity: BindIdentity,
+        options: Pick<RequestOptions, "expectedDaemonId"> = {},
+    ): Promise<RouteHandle> {
         const deadline = Deadline.start(this.routeOpenDeadlineMs, this.clock);
-        const active = await this.ensureConnection(deadline);
+        const active = await this.ensureConnection(deadline, options.expectedDaemonId);
         return this.controlRouteOpen(
             active,
             target,
@@ -554,6 +559,7 @@ export class McHostClient {
         options: RequestOptions = {},
     ): Promise<unknown> {
         const active = this.requireLiveHandle(handle);
+        this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const terminal = await this.awaitRequest(active.generation, {
             channel: handle.channel,
@@ -572,6 +578,7 @@ export class McHostClient {
         options: RequestOptions = {},
     ): Promise<ReceiveLease> {
         const active = this.requireLiveHandle(handle);
+        this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const terminal = await this.awaitRequest(active.generation, {
             channel: handle.channel,
@@ -590,6 +597,43 @@ export class McHostClient {
             );
         }
         return terminal.body;
+    }
+
+    /** Collect one bounded JSON stream through StreamEnd, preserving item order. */
+    async requestStream(
+        handle: RouteHandle,
+        body: unknown,
+        options: RequestOptions = {},
+    ): Promise<unknown[]> {
+        const active = this.requireLiveHandle(handle);
+        this.assertExpectedDaemon(active, options.expectedDaemonId);
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const terminal = await this.awaitRequest(active.generation, {
+            channel: handle.channel,
+            epoch: handle.epoch,
+            body: encodeBody(body),
+            deadline,
+            options,
+            mode: "stream",
+        });
+        if (terminal.kind !== "stream_end") {
+            throw new McHostCallError(
+                "terminal",
+                "stream request did not receive StreamEnd",
+                "expected_stream_response",
+            );
+        }
+        return terminal.stream.map((item) => {
+            const json = requireJsonReceiveBody(item);
+            if (!json.valid) {
+                throw new McHostCallError(
+                    "terminal",
+                    "stream item body was not valid JSON",
+                    "invalid_response_body",
+                );
+            }
+            return json.value;
+        });
     }
 
     /**
@@ -613,6 +657,7 @@ export class McHostClient {
             const handle = await this.managedRouteHandle(moduleId, options, deadline);
             try {
                 const active = this.requireLiveHandle(handle);
+                this.assertExpectedDaemon(active, options.expectedDaemonId);
                 const terminal = await this.awaitRequest(active.generation, {
                     channel: handle.channel,
                     epoch: handle.epoch,
@@ -724,7 +769,10 @@ export class McHostClient {
     // Connection ownership: single-flight connect and retirement reaction.
     // ------------------------------------------------------------------
 
-    private async ensureConnection(deadline: Deadline): Promise<ActiveConnection> {
+    private async ensureConnection(
+        deadline: Deadline,
+        expectedDaemonId?: Uint8Array,
+    ): Promise<ActiveConnection> {
         // R1: one immutable handshake stage per caller, derived once from its
         // own operation deadline and kept through every join and replacement.
         const stage = deadline.stage(this.handshakeTimeoutMs);
@@ -732,7 +780,10 @@ export class McHostClient {
         for (;;) {
             if (this.closeStarted) throw new McHostClientError("client closed", "client_closed");
             const active = this.active;
-            if (active && !active.generation.isRetired()) return active;
+            if (active && !active.generation.isRetired()) {
+                this.assertExpectedDaemon(active, expectedDaemonId);
+                return active;
+            }
             let flight = this.connecting;
             let owner = false;
             if (!flight) {
@@ -764,7 +815,10 @@ export class McHostClient {
             }
             // KTD4: adopt only a still-current, non-retired generation; a
             // stale success re-enters recovery under the unchanged stage.
-            if (this.active === conn && !conn.generation.isRetired()) return conn;
+            if (this.active === conn && !conn.generation.isRetired()) {
+                this.assertExpectedDaemon(conn, expectedDaemonId);
+                return conn;
+            }
             if (stage.isExpired()) throw connectionStageError();
             // Pace the replacement dial unless a live candidate is already
             // installed (the loop head adopts it without new I/O).
@@ -1171,6 +1225,25 @@ export class McHostClient {
         return conn;
     }
 
+    private assertExpectedDaemon(
+        connection: ActiveConnection,
+        expectedDaemonId?: Uint8Array,
+    ): void {
+        if (expectedDaemonId === undefined) return;
+        const actual = connection.generation.authenticatedDaemonId;
+        if (
+            actual === null ||
+            actual.length !== expectedDaemonId.length ||
+            !actual.every((byte, index) => byte === expectedDaemonId[index])
+        ) {
+            throw new McHostCallError(
+                "not_sent",
+                "authenticated daemon changed after lifecycle compatibility validation",
+                "daemon_generation_changed",
+            );
+        }
+    }
+
     private evictHandle(handle: RouteHandle): void {
         const conn = this.connectionFor(handle);
         if (conn !== null) conn.liveRoutes.delete(handle.channel);
@@ -1457,7 +1530,7 @@ export class McHostClient {
             epoch: params.epoch,
             body: params.body,
             deadline: params.deadline,
-            mode: "unary",
+            mode: params.mode ?? "unary",
             responseMode: params.responseMode,
             binary: params.binary,
             priority: params.options.priority,
@@ -1652,7 +1725,13 @@ export class McHostClient {
             { kind: ManagedRouteKind }
         >;
         const consumerIdentity = this.envConsumerIdentity();
-        const key = routeCacheKey(target, identity, consumerIdentity);
+        const expectedDaemonKey =
+            options.expectedDaemonId === undefined
+                ? ""
+                : Array.from(options.expectedDaemonId, (byte) =>
+                      byte.toString(16).padStart(2, "0"),
+                  ).join("");
+        const key = `${routeCacheKey(target, identity, consumerIdentity)}\0${expectedDaemonKey}`;
         // R1: one immutable route-open stage per caller, derived once and
         // kept through every join and replacement decision.
         const stage = deadline.stage(this.routeOpenDeadlineMs);
@@ -1694,7 +1773,7 @@ export class McHostClient {
                 owner = true;
                 const slot = cached;
                 flight = makeSetupFlight(
-                    (f) => this.openCachedRoute(slot, stage, f),
+                    (f) => this.openCachedRoute(slot, stage, f, options.expectedDaemonId),
                     (f) => {
                         if (slot.opening === f) slot.opening = null;
                     },
@@ -1744,6 +1823,7 @@ export class McHostClient {
         cached: CachedManagedRoute,
         deadline: Deadline,
         flight: SetupFlight<RouteHandle>,
+        expectedDaemonId?: Uint8Array,
     ): Promise<RouteHandle> {
         let delayMs = SETUP_RETRY_BASE_MS;
         const backoff = async (): Promise<boolean> => {
@@ -1766,7 +1846,7 @@ export class McHostClient {
             }
             let active: ActiveConnection;
             try {
-                active = await this.ensureConnection(deadline);
+                active = await this.ensureConnection(deadline, expectedDaemonId);
             } catch (error) {
                 if (error instanceof McHostCallError) throw error;
                 // KTD3: a snapshot that outlives its stage names the clamped

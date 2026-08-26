@@ -58,6 +58,7 @@ export interface ManagedDemandResult {
     ok: boolean;
     reason: string;
     storage: StorageReadiness | null;
+    authenticatedDaemonId?: Uint8Array;
 }
 
 export type ManagedDemandStart = (request: {
@@ -92,6 +93,15 @@ function managedCredentialSourceVersion(env: Record<string, string | undefined>)
         hash.update(`${Buffer.byteLength(value)}:${value}`);
     }
     return hash.digest("hex");
+}
+
+function sameDaemonId(left: Uint8Array | null | undefined, right: Uint8Array): boolean {
+    return (
+        left !== null &&
+        left !== undefined &&
+        left.length === right.length &&
+        left.every((byte, index) => byte === right[index])
+    );
 }
 
 interface GeneratedHarnessClosure {
@@ -222,6 +232,9 @@ export function createLazyManagedDemandStart(
             ok: outcome.result.ok,
             reason: outcome.result.reason,
             storage: outcome.storage,
+            ...(outcome.authenticatedDaemonId === undefined
+                ? {}
+                : { authenticatedDaemonId: outcome.authenticatedDaemonId }),
         };
     };
 }
@@ -289,6 +302,7 @@ function isConnectionFailure(error: unknown): boolean {
                 "request_deadline",
                 "deadline_exceeded_no_drop_observed",
                 "connection_dropped",
+                "daemon_generation_changed",
                 "MC_HOST_CONNECTION_BACKOFF",
             ].includes(code) ||
             /\bclient closed\b|\bconnection closed\b|\bclosed the connection\b/i.test(message)
@@ -411,6 +425,7 @@ export class McHostModuleTransport {
     private authorityBindRoot = "";
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
+    private compatibleDaemonId: Uint8Array | null = null;
     private stateSyncCapabilityCache: {
         generation: number;
         capabilities: { state_sync_deltas?: boolean };
@@ -743,6 +758,9 @@ export class McHostModuleTransport {
                             admissionClass: AdmissionClass.Normal,
                             timeoutMs: Math.max(1, deadline.remainingMs()),
                             signal: args.signal,
+                            ...(this.compatibleDaemonId === null
+                                ? {}
+                                : { expectedDaemonId: this.compatibleDaemonId }),
                         }),
                         deadline,
                         "waiting for the module response",
@@ -1066,7 +1084,11 @@ export class McHostModuleTransport {
                 session: `${this.routeSessionPrefix}${sessionId}`,
             };
             const route = await this.beforeDeadline(
-                client.routeOpen(target, identity),
+                client.routeOpen(target, identity, {
+                    ...(this.compatibleDaemonId === null
+                        ? {}
+                        : { expectedDaemonId: this.compatibleDaemonId }),
+                }),
                 deadline,
                 "opening the module route",
             );
@@ -1142,8 +1164,11 @@ export class McHostModuleTransport {
         });
     }
 
-    private async demandManagedReadiness(deadline?: Deadline, signal?: AbortSignal): Promise<void> {
-        if (this.connectionOrigin !== "managed-default") return;
+    private async demandManagedReadiness(
+        deadline?: Deadline,
+        signal?: AbortSignal,
+    ): Promise<Uint8Array | undefined> {
+        if (this.connectionOrigin !== "managed-default") return undefined;
         if (!this.demandStart) {
             const error = new Error("managed mc-host lifecycle owner is unavailable") as Error & {
                 code?: string;
@@ -1173,18 +1198,47 @@ export class McHostModuleTransport {
             error.code = code;
             throw error;
         }
+        if (outcome.authenticatedDaemonId === undefined) {
+            throw Object.assign(
+                new Error("managed lifecycle compatibility returned no daemon identity"),
+                { code: "incompatible_daemon" },
+            );
+        }
+        return outcome.authenticatedDaemonId;
     }
 
     private async ensureConnected(
         deadline?: Deadline,
         signal?: AbortSignal,
     ): Promise<McHostClient> {
-        if (this.client) return this.client;
-        await this.demandManagedReadiness(deadline, signal);
+        if (
+            this.client &&
+            (this.connectionOrigin !== "managed-default" ||
+                (this.compatibleDaemonId !== null &&
+                    sameDaemonId(this.client.authenticated?.daemonId, this.compatibleDaemonId)))
+        ) {
+            return this.client;
+        }
+        if (this.client) this.invalidateConnection(this.client);
+        const expectedDaemonId = await this.demandManagedReadiness(deadline, signal);
+        this.compatibleDaemonId =
+            expectedDaemonId === undefined ? null : Uint8Array.from(expectedDaemonId);
         if (signal?.aborted) {
             throw signal.reason ?? new Error("module transport call aborted");
         }
-        if (this.connectionPromise) return await this.connectionPromise;
+        if (this.connectionPromise) {
+            const candidate = await this.connectionPromise;
+            if (
+                expectedDaemonId !== undefined &&
+                !sameDaemonId(candidate.authenticated?.daemonId, expectedDaemonId)
+            ) {
+                this.invalidateConnection(candidate);
+                throw this.connectionChangedError(
+                    "daemon changed after lifecycle compatibility validation",
+                );
+            }
+            return candidate;
+        }
         const now = Date.now();
         if (now < this.nextProbeMs) {
             const error = new Error(
@@ -1201,6 +1255,15 @@ export class McHostModuleTransport {
             let candidate: McHostClient | null = null;
             try {
                 candidate = await this.connectClient(deadline);
+                if (
+                    expectedDaemonId !== undefined &&
+                    !sameDaemonId(candidate.authenticated?.daemonId, expectedDaemonId)
+                ) {
+                    candidate.close();
+                    throw this.connectionChangedError(
+                        "daemon changed after lifecycle compatibility validation",
+                    );
+                }
                 if (generation !== this.connectionGeneration) {
                     candidate.close();
                     throw this.connectionChangedError("subc connection attempt was superseded");
@@ -1229,6 +1292,7 @@ export class McHostModuleTransport {
     private invalidateConnection(client: McHostClient | null = this.client): void {
         if (client && this.client !== client) return;
         this.connectionGeneration += 1;
+        this.compatibleDaemonId = null;
         this.invalidateStateSyncCapabilities();
         this.client = null;
         this.routes.clear();

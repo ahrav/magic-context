@@ -319,10 +319,11 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         fail("restart requires effects");
     }
     if (
-        effects?.start_committed === true &&
-        (!record.ok || state !== "running" || reason !== "started")
+        command === "restart" &&
+        record.ok &&
+        (effects?.start_committed !== true || state !== "running" || reason !== "started")
     ) {
-        fail("start_committed contradicts the restart outcome");
+        fail("successful restart contradicts its start effect");
     }
     let readiness: DaemonReadiness | null = null;
     if (record.readiness !== null) {
