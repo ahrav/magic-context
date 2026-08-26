@@ -20,7 +20,17 @@ export interface SelectionEntry {
 
 export interface ClaimDraft {
   publicClaimId: string;
+  /**
+   * Locator and token of the revision this draft was started against, pinned at
+   * the first keystroke and never refreshed.
+   *
+   * A save must fence against the base the user actually edited. Submitting the
+   * refreshed token would make the adapter accept a write whose text predates a
+   * concurrent revision, silently discarding it; submitting the original lets
+   * the token fence report `stale`, which is the outcome the fence exists for.
+   */
   revisionLocator: string;
+  mutationToken: ClaimMemory["mutationToken"];
   text: string;
   revisionAdvanced: boolean;
 }

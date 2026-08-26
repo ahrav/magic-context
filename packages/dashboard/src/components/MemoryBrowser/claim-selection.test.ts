@@ -158,6 +158,7 @@ describe("claim selection", () => {
     const previous = {
       publicClaimId: A,
       revisionLocator: claim(A).revisionLocator,
+      mutationToken: claim(A).mutationToken,
       text: "unsaved draft",
       revisionAdvanced: false,
     };
@@ -167,5 +168,30 @@ describe("claim selection", () => {
       revisionAdvanced: true,
     });
     expect(reconcileDraft(previous, undefined)).toEqual(previous);
+  });
+
+  it("keeps the draft pinned to the revision it was started against", () => {
+    // A concurrent writer advancing the claim must not silently become the base
+    // of an open draft: saving with the refreshed token would pass the adapter's
+    // fence and overwrite the other revision with older text. The pinned token
+    // makes that save report `stale` instead.
+    const base = claim(A);
+    const previous = {
+      publicClaimId: A,
+      revisionLocator: base.revisionLocator,
+      mutationToken: base.mutationToken,
+      text: "unsaved draft",
+      revisionAdvanced: false,
+    };
+
+    const advanced = claim(A, 2);
+    const reconciled = reconcileDraft(previous, advanced);
+
+    expect(reconciled?.revisionAdvanced).toBe(true);
+    expect(reconciled?.mutationToken).toEqual(base.mutationToken);
+    expect(reconciled?.mutationToken.revision).toBe(1);
+    expect(reconciled?.revisionLocator).toBe(base.revisionLocator);
+    // Not the refreshed token, which is what would overwrite silently.
+    expect(reconciled?.mutationToken).not.toEqual(advanced.mutationToken);
   });
 });

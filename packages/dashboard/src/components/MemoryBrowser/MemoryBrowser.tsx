@@ -130,6 +130,7 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
       next.set(claim.publicClaimId, {
         publicClaimId: claim.publicClaimId,
         revisionLocator: claim.revisionLocator,
+        mutationToken: claim.mutationToken,
         text: claim.content,
         revisionAdvanced: false,
       });
@@ -169,8 +170,16 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
     );
 
   const handleContentChange = async (claim: ClaimMemory, content: string) => {
+    // Fence against the revision the draft was started on, not the refreshed
+    // one. A concurrent writer advances `claim` underneath an open editor while
+    // `reconcileDraft` keeps the user's text, so saving with the refreshed token
+    // would pass the fence and overwrite the other revision with text that
+    // predates it. The pinned token makes the adapter report `stale` instead,
+    // and `revisionAdvanced` is already surfaced in the editor.
+    const draft = drafts().get(claim.publicClaimId);
+    const target = claimMutationTarget(draft ?? claim);
     const saved = await handleMutation(
-      () => reviseMemoryContent(claimMutationTarget(claim), operationKey("content"), content),
+      () => reviseMemoryContent(target, operationKey("content"), content),
       "Failed to update content",
     );
     if (saved) {
@@ -426,6 +435,7 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
                 next.set(claim().publicClaimId, {
                   publicClaimId: claim().publicClaimId,
                   revisionLocator: current?.revisionLocator ?? claim().revisionLocator,
+                  mutationToken: current?.mutationToken ?? claim().mutationToken,
                   text,
                   revisionAdvanced: current?.revisionAdvanced ?? false,
                 });
@@ -435,9 +445,12 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
             onDiscardDraft={() =>
               setDrafts((previous) => {
                 const next = new Map(previous);
+                // Discard rebases onto the current revision, so the pin moves
+                // with it: the user is explicitly abandoning the older base.
                 next.set(claim().publicClaimId, {
                   publicClaimId: claim().publicClaimId,
                   revisionLocator: claim().revisionLocator,
+                  mutationToken: claim().mutationToken,
                   text: claim().content,
                   revisionAdvanced: false,
                 });

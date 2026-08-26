@@ -19,6 +19,12 @@ interface Props {
 export default function MemoryDetail(props: Props) {
   const [editing, setEditing] = createSignal(false);
 
+  // Retirement is terminal in the adapter: `validate_target` refuses every
+  // mutation of a retired claim. Rendering the controls anyway offers the user
+  // actions that deterministically fail, and the Retired and all-lifecycle views
+  // both return such claims.
+  const retired = () => props.memory.lifecycleState === "retired";
+
   // The parent renders this panel through a non-keyed `Show`, whose child
   // callback re-runs only on falsy<->truthy transitions of its condition. This
   // instance therefore survives a change of focused claim, so the editor has to
@@ -84,28 +90,32 @@ export default function MemoryDetail(props: Props) {
             <tr>
               <td>Category</td>
               <td>
-                <FilterSelect
-                  compact
-                  value={props.memory.category}
-                  onChange={(category) => void props.onCategoryChange(props.memory, category)}
-                  options={SHARE_CATEGORY_OPTIONS}
-                />
+                <Show when={!retired()} fallback={<span>{props.memory.category}</span>}>
+                  <FilterSelect
+                    compact
+                    value={props.memory.category}
+                    onChange={(category) => void props.onCategoryChange(props.memory, category)}
+                    options={SHARE_CATEGORY_OPTIONS}
+                  />
+                </Show>
               </td>
             </tr>
             <tr>
               <td>Lifecycle</td>
               <td>
-                <FilterSelect
-                  compact
-                  value={props.memory.lifecycleState}
-                  onChange={(state) =>
-                    void props.onLifecycleChange(props.memory, state as "active" | "archived")
-                  }
-                  options={[
-                    { value: "active", label: "active" },
-                    { value: "archived", label: "archived" },
-                  ]}
-                />
+                <Show when={!retired()} fallback={<span>retired</span>}>
+                  <FilterSelect
+                    compact
+                    value={props.memory.lifecycleState}
+                    onChange={(state) =>
+                      void props.onLifecycleChange(props.memory, state as "active" | "archived")
+                    }
+                    options={[
+                      { value: "active", label: "active" },
+                      { value: "archived", label: "archived" },
+                    ]}
+                  />
+                </Show>
               </td>
             </tr>
             <tr>
@@ -159,14 +169,16 @@ export default function MemoryDetail(props: Props) {
                 >
                   {props.memory.content}
                 </div>
-                <button
-                  type="button"
-                  class="btn sm"
-                  style={{ "margin-top": "8px" }}
-                  onClick={() => setEditing(true)}
-                >
-                  Edit Content
-                </button>
+                <Show when={!retired()}>
+                  <button
+                    type="button"
+                    class="btn sm"
+                    style={{ "margin-top": "8px" }}
+                    onClick={() => setEditing(true)}
+                  >
+                    Edit Content
+                  </button>
+                </Show>
               </div>
             }
           >
@@ -231,7 +243,7 @@ export default function MemoryDetail(props: Props) {
             "border-top": "1px solid var(--border)",
           }}
         >
-          <Show when={props.memory.lifecycleState !== "archived"}>
+          <Show when={props.memory.lifecycleState === "active"}>
             <button
               type="button"
               class="btn sm"
