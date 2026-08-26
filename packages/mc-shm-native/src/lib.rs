@@ -5,12 +5,13 @@ mod napi_buffers;
 mod scheduling;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -63,6 +64,51 @@ struct Channel {
     next_producer: u32,
     next_lease: u32,
     closed: bool,
+    // Held for its Drop: releasing the process-wide claim exactly when the
+    // channel entry is removed keeps quarantined and alias-holding entries
+    // reserved for as long as their mapping lives.
+    _reservation: Option<GrantReservation>,
+}
+
+/// Process-wide claim on the encoded grants backing live channels.
+///
+/// Attachment exclusivity must span worker threads: each thread consults its
+/// own `REGISTRY`, but every thread maps the same shared memory, so a grant
+/// active on any thread is a concurrently duplicated descriptor on all of
+/// them.
+static ACTIVE_GRANTS: Mutex<BTreeSet<Vec<u8>>> = Mutex::new(BTreeSet::new());
+
+struct GrantReservation {
+    grants: [Vec<u8>; 2],
+}
+
+impl GrantReservation {
+    /// Atomically claims both lane grants; either grant already active
+    /// anywhere in the process is a replayed or duplicated descriptor.
+    #[cfg(target_os = "linux")]
+    fn claim(first: Vec<u8>, second: Vec<u8>) -> Result<Self> {
+        let mut active = ACTIVE_GRANTS
+            .lock()
+            .map_err(|_| error("native grant registry is poisoned"))?;
+        if active.contains(&first) || active.contains(&second) {
+            return Err(error("shared-memory descriptor is already attached"));
+        }
+        active.insert(first.clone());
+        active.insert(second.clone());
+        Ok(Self {
+            grants: [first, second],
+        })
+    }
+}
+
+impl Drop for GrantReservation {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_GRANTS.lock() {
+            for grant in &self.grants {
+                active.remove(grant);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -471,20 +517,13 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
             return Err(descriptor_error());
         }
         // Exclusive active attachment: a grant already backing a live
-        // channel is a replayed or concurrently duplicated descriptor.
-        REGISTRY.with(|registry| {
-            let registry = registry
-                .try_borrow()
-                .map_err(|_| error("native channel is busy"))?;
-            for channel in registry.channels.values() {
-                for grant in [channel.to_host.grant(), channel.from_host.grant()] {
-                    if grant == host_to_peer_grant || grant == peer_to_host_grant {
-                        return Err(error("shared-memory descriptor is already attached"));
-                    }
-                }
-            }
-            Ok(())
-        })?;
+        // channel anywhere in this process is a replayed or concurrently
+        // duplicated descriptor. The claim is process-wide because worker
+        // threads each hold their own `REGISTRY` yet map the same memory.
+        let reservation = GrantReservation::claim(
+            host_to_peer_grant.encode().to_vec(),
+            peer_to_host_grant.encode().to_vec(),
+        )?;
         let from_host = attach_ring(pid, host_to_peer_fd, host_to_peer_grant)?;
         let to_host = attach_ring(pid, peer_to_host_fd, peer_to_host_grant)?;
         REGISTRY.with(|registry| {
@@ -503,6 +542,7 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    _reservation: Some(reservation),
                 },
             )
         })
@@ -553,6 +593,9 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    // Test pairs attach freshly created local rings, never a
+                    // host descriptor, so no process-wide grant is claimed.
+                    _reservation: None,
                 },
             )?;
             let second = insert_channel(
@@ -566,6 +609,7 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    _reservation: None,
                 },
             )?;
             Ok(NativeTestPair {

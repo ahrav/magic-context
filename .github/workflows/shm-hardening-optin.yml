@@ -68,6 +68,13 @@ jobs:
               exit 1
               ;;
           esac
+          # libFuzzer's -max_total_time bounds the run only when positive;
+          # zero would run the first target until the workflow timeout and
+          # starve the remaining targets.
+          if [ "$FUZZ_SECONDS" -eq 0 ]; then
+            echo "fuzz_seconds must be a positive number of seconds" >&2
+            exit 1
+          fi
           for target in frame_descriptor provider_grant provider_sample; do
             cargo +nightly fuzz run "$target" -- \
               -max_total_time="$FUZZ_SECONDS"
