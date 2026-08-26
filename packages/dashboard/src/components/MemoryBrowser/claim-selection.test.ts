@@ -6,9 +6,9 @@ import {
   reconcileDraft,
   selectionState,
   selectionTargets,
+  snapshotErrorFor,
   toggleClaimSelection,
   toggleClaimsSelection,
-  snapshotErrorFor,
 } from "./claim-selection";
 
 function claim(publicClaimId: string, revision = 1): ClaimMemory {
