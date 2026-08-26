@@ -428,6 +428,12 @@ export interface FrameChannelHandlers {
     onFrame: (frame: InboundFrame) => void;
     onClosed: (reason: FrameChannelCloseReason, error: unknown) => void;
     onDiagnostic?: (type: FrameChannelDiagnosticType, meta: FrameMeta) => void;
+    /**
+     * Fires after any ReceiveLease minted by this channel is released,
+     * including force-releases during close. Owners draining a connection
+     * use it to re-evaluate retirement once callers hand storage back.
+     */
+    onLeaseReleased?: () => void;
 }
 
 export interface FrameChannelStats {

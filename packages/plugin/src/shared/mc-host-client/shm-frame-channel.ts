@@ -313,6 +313,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
                         (outcome) => {
                             this.receiveLeases.delete(lease);
                             if (outcome === "quarantined") this.quarantinedBytes += header.len;
+                            this.options.handlers.onLeaseReleased?.();
                         },
                         this.copies,
                         () => {

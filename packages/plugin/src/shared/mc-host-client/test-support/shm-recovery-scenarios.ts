@@ -385,6 +385,82 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
+        // Seeded-defect detector for the terminal-lease/retirement race: a
+        // binary response settles its terminal and empties the
+        // predecessor's pending set BEFORE the awaiting requestBinary
+        // continuation receives the ReceiveLease, and retirement
+        // force-releases every channel lease, so a pending-zero retirement
+        // with no live routes would hand the caller an already-released
+        // lease. The drain must stay open until the caller releases it.
+        name: "a binary response resolving during predecessor drain keeps its lease usable",
+        async run(ctx) {
+            const provider = recoveryProvider();
+            const peer = await ctx.startPeer();
+            let allowGrant = false;
+            scriptNegotiations(peer, (index) => {
+                if (index === 0) return tcpSelectionBody("unavailable");
+                return allowGrant ? grantSelectionBody() : tcpSelectionBody("unavailable");
+            });
+            const events: McHostDiagnosticsEvent[] = [];
+            const client = await ctx.connect(peer, {
+                transportProviders: [provider],
+                diagnostics: (event) => events.push(event),
+            });
+            const conn1 = peer.connections[0] as FakePeerConnection;
+
+            // Open the raw route while conn1 is primary, then withhold the
+            // binary response so the request is pending across promotion.
+            const stopServing = serveTcpRoutes(conn1, 7);
+            const rawHandle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+            stopServing();
+            const pendingBinary = client.requestBinary(rawHandle, new Uint8Array([1, 2, 3]));
+            await conn1.waitFor(() =>
+                conn1.frames.some(
+                    (frame) => frame.ty === PeerFrameType.Request && frame.channel === 7,
+                ),
+            );
+
+            allowGrant = true;
+            await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
+
+            // Close the last raw route while the request is still pending:
+            // the pending entry alone now holds the drain open.
+            await client.closeRoute(rawHandle);
+            assert.equal(conn1.socket.destroyed, false);
+
+            // The binary terminal lands on the draining predecessor: its
+            // arrival reaches pending-zero before the requestBinary
+            // continuation resumes, which must not retire the generation
+            // out from under the lease it just handed to the caller.
+            const requestFrame = conn1.frames.find(
+                (frame) => frame.ty === PeerFrameType.Request && frame.channel === 7,
+            ) as PeerFrame;
+            conn1.socket.write(
+                encodePeerFrame({
+                    ty: PeerFrameType.Response,
+                    flags: 1, // FLAG_BINARY
+                    channel: 7,
+                    epoch: 1,
+                    corr: requestFrame.corr,
+                    body: Buffer.from([0xaa, 0xbb, 0xcc]),
+                }),
+            );
+            const lease = await pendingBinary;
+            await settle();
+
+            assert.equal(conn1.socket.destroyed, false, "predecessor retired early");
+            assert.equal(lease.isReleased(), false, "lease force-released during drain");
+            const owned = lease.takeOwned();
+            assert.deepEqual([...owned], [0xaa, 0xbb, 0xcc]);
+
+            // The lease release was the last drain obligation.
+            await waitUntil(
+                () => conn1.frames.some((f) => f.ty === PeerFrameType.Goodbye && f.channel === 0),
+                10_000,
+            );
+        },
+    },
+    {
         // AE9/AE15: daemon restart retires old pending work with its
         // existing outcome classification, reconnects over exact
         // `unavailable`, and a fresh commit serves only later managed calls.

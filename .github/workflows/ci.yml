@@ -88,10 +88,13 @@ jobs:
 
       # Serialized shm-crash nextest group; the ignored full soak
       # stays opt-in via shm-hardening-optin.yml; no artifact upload.
-      # commentlint: allow(JUDGE)
+      # The --lib pass runs the provider_recovery controller unit
+      # suite (stale retries, deadline isolation, wedged cleanup,
+      # late-result fencing, inbox bounds, custody accounting), which
+      # no integration binary exercises. commentlint: allow(JUDGE)
       - name: Crash, recovery, and soak-smoke suites
         run: |
-          cargo nextest run -p mc-host \
+          cargo nextest run -p mc-host --lib \
             --test shm_failure_modes --test shm_soak
 
   shm-source-build:

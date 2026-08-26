@@ -197,6 +197,13 @@ export interface ConnectionGenerationOptions {
      * Retirement does not invoke onPendingZero.
      */
     onPendingZero?: () => void;
+    /**
+     * Fires after any ReceiveLease minted by this generation's channel is
+     * released. A caller-held binary or stream lease keeps a draining
+     * generation's storage aliased after its pending set empties, so an
+     * owner deferring retirement on `activeReceiveLeases` re-checks here.
+     */
+    onLeaseReleased?: () => void;
     /** Bounded read-only diagnostics hook (KTD12); see ConnectionDiagnosticEvent. */
     onDiagnostic?: (event: ConnectionDiagnosticEvent) => void;
 }
@@ -211,6 +218,8 @@ export interface ConnectionStats {
     queuedDataFrames: number;
     queuedControlFrames: number;
     pendingRequests: number;
+    /** Live ReceiveLeases minted by the channel and not yet released. */
+    activeReceiveLeases: number;
     droppedFrames: number;
     activeTimers: number;
     readPaused: boolean;
@@ -313,6 +322,7 @@ export class ConnectionGeneration {
     private readonly onRetired?: (info: RetirementInfo) => void;
     private readonly onRouteGoodbyeHook?: (channel: number, epoch: number) => void;
     private readonly onPendingZeroHook?: () => void;
+    private readonly onLeaseReleasedHook?: () => void;
     private readonly onDiagnostic?: (event: ConnectionDiagnosticEvent) => void;
 
     private retiredInfo: RetirementInfo | null = null;
@@ -340,6 +350,7 @@ export class ConnectionGeneration {
         this.onRetired = options.onRetired;
         this.onRouteGoodbyeHook = options.onRouteGoodbye;
         this.onPendingZeroHook = options.onPendingZero;
+        this.onLeaseReleasedHook = options.onLeaseReleased;
         this.onDiagnostic = options.onDiagnostic;
         this.nextCorr = options.firstCorrelation ?? 1n;
         if (this.nextCorr < 1n || this.nextCorr > MAX_CORRELATION) {
@@ -353,6 +364,13 @@ export class ConnectionGeneration {
             onClosed: (reason: FrameChannelCloseReason, error) =>
                 this.retire(reason === "truncated_frame" ? "eof" : reason, error),
             onDiagnostic: (type, meta) => this.emitDiagnostic(type, meta),
+            onLeaseReleased: () => {
+                try {
+                    this.onLeaseReleasedHook?.();
+                } catch {
+                    // Observer exceptions must not affect lease accounting.
+                }
+            },
         };
         this.channel = options.channelFactory
             ? options.channelFactory({ budget: this.budget, maxBodyLen, handlers })
@@ -417,6 +435,7 @@ export class ConnectionGeneration {
             queuedDataFrames: channel.queuedDataFrames,
             queuedControlFrames: channel.queuedControlFrames,
             pendingRequests: this.pending.size,
+            activeReceiveLeases: channel.activeReceiveLeases,
             droppedFrames: this.droppedFrameCount,
             activeTimers: this.timers.size + channel.activeTimers,
             readPaused: channel.readPaused,

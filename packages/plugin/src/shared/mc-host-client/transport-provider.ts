@@ -430,6 +430,7 @@ export function sanitizedCandidateFactory(
                                 closeUpstream("protocol_violation", "channel");
                             }
                             charged = 0;
+                            args.handlers.onLeaseReleased?.();
                         },
                         copyCounter,
                         () => (providerLease.release() ? "released" : "quarantined"),

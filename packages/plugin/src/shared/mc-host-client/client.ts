@@ -752,6 +752,9 @@ export class McHostClient {
             onPendingZero: () => {
                 if (conn) this.onPendingDrained(conn);
             },
+            onLeaseReleased: () => {
+                if (conn) this.onPendingDrained(conn);
+            },
             // Skip per-frame event allocation entirely when no observer is
             // configured; the generation's hook check short-circuits on
             // undefined.
@@ -964,6 +967,9 @@ export class McHostClient {
                     if (conn) this.onRouteGoodbye(conn, channel, epoch);
                 },
                 onPendingZero: () => {
+                    if (conn) this.onPendingDrained(conn);
+                },
+                onLeaseReleased: () => {
                     if (conn) this.onPendingDrained(conn);
                 },
                 onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
@@ -1343,11 +1349,17 @@ export class McHostClient {
             this.predecessor = null;
             return;
         }
-        if (pred.generation.stats().pendingRequests > 0) return;
+        const stats = pred.generation.stats();
+        if (stats.pendingRequests > 0) return;
         // A route.open whose terminal already settled but whose awaiting
         // continuation has not yet recorded the handle keeps the drain
         // open; the continuation's completion re-invokes this check.
         if ((this.routeOpenCounts.get(pred) ?? 0) > 0) return;
+        // A settled binary or stream terminal hands its ReceiveLease to the
+        // caller, whose storage aliases the channel until an explicit
+        // release; retirement force-releases every lease, so a drain with
+        // live leases stays open and each release re-invokes this check.
+        if (stats.activeReceiveLeases > 0) return;
         for (const [channel, handle] of [...pred.liveRoutes]) {
             if (!this.managedHandles.has(handle)) continue;
             pred.liveRoutes.delete(channel);
