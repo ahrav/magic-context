@@ -339,6 +339,42 @@ describe("createCtxSearchTools", () => {
         }
     });
 
+    it("does not resolve locators when the source restriction excludes memory", async () => {
+        // The short-circuit runs before sources reach unifiedSearch, so it has
+        // to honour the restriction itself: `[]` is documented as searching no
+        // sources, and a non-memory restriction must not return claim content.
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:repo-project",
+            content: "Locator content behind a source restriction.",
+            category: "ARCHITECTURE",
+        });
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "git:repo-project",
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        for (const sources of [[], ["message"]]) {
+            const result = await tools.ctx_search.execute(
+                { query: claim.revisionLocator, sources },
+                toolContext(),
+            );
+            expect(result).not.toContain("Locator content behind a source restriction.");
+            expect(result).not.toContain(`id=${claim.publicClaimId}`);
+        }
+
+        // Explicitly naming memory still resolves, and so does omitting sources.
+        for (const args of [
+            { query: claim.revisionLocator, sources: ["memory"] },
+            { query: claim.revisionLocator },
+        ]) {
+            const result = await tools.ctx_search.execute(args, toolContext());
+            expect(result).toContain("Locator content behind a source restriction.");
+        }
+    });
+
     it("falls through to unifiedSearch when the bare-id query has no matching memory", async () => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
             async () =>

@@ -174,8 +174,17 @@ export async function executeCtxSearch(
     // null for ordinary text so it still searches the corpus. If no
     // locator resolves (foreign hidden, missing) the call falls through
     // to the normal lanes.
+    //
+    // Source restriction binds here too. This path runs BEFORE
+    // `normalizeSources` reaches `unifiedSearch`, so without the check a
+    // locator-shaped query would return claim content under `sources: []`
+    // — documented as searching no sources — or under a restriction naming
+    // only non-memory sources.
+    const requestedSources = normalizeSources(args.sources);
+    const memorySourceAllowed =
+        requestedSources === undefined || requestedSources.includes("memory");
     const locatorShape = parseLocatorShapedQuery(query);
-    if (locatorShape && memoryEnabled) {
+    if (locatorShape && memoryEnabled && memorySourceAllowed) {
         const locatorResults = resolveClaimsByLocatorsForSearch({
             db: deps.db,
             projectPath,
@@ -200,7 +209,7 @@ export async function executeCtxSearch(
         readMessages: deps.readMessages,
         maxMessageOrdinal: messageOrdinalCutoff,
         gitCommitsEnabled,
-        sources: normalizeSources(args.sources),
+        sources: requestedSources,
         // Explicit agent search → enable literal-probe multi-query
         // recall for symbol/command/path lookups. Auto-search hints
         // (the hot path) leave this off to protect their latency.

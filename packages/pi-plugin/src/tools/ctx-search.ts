@@ -184,8 +184,16 @@ export function createCtxSearchTool(
 			// bypass the lexical+semantic lanes and resolve them through the
 			// current-state provider. If nothing resolves we fall through to
 			// the normal lanes so ordinary text still searches the corpus.
+			//
+			// Source restriction binds here too: this path runs before
+			// `params.sources` reaches `unifiedSearch`, so without the check a
+			// locator-shaped query would return claim content under a
+			// restriction that names only non-memory sources, or under an
+			// explicit empty list.
+			const memorySourceAllowed =
+				params.sources === undefined || params.sources.includes("memory");
 			const locatorShape = parseLocatorShapedQuery(query);
-			if (locatorShape && memoryEnabled) {
+			if (locatorShape && memoryEnabled && memorySourceAllowed) {
 				const locatorResults = resolveClaimsByLocatorsForSearch({
 					db: deps.db,
 					projectPath: projectIdentity,
