@@ -38,6 +38,44 @@ const custodyEvidence = {
 };
 
 describe("cohort close", () => {
+    it("rejects in-memory deletion evidence whose stores or instants are invalid", () => {
+        // A disposition built by hand rather than read from the store carries only
+        // TypeScript's word for its shape, and every timestamp test in the close is a
+        // Date.parse comparison an unparseable instant passes as NaN.
+        const base = staticPrivacyRejection(
+            `intake-${"e".repeat(32)}`,
+            sanitizedIntakeFixture().submittedAt,
+            sanitizedIntakeFixture().deletionEvidence,
+        );
+        const closeInput = {
+            epochId: "epoch-test-release",
+            freezeManifestFingerprint: H1,
+            closedAt: "2026-09-08T00:00:00Z",
+            late: [],
+            subjectiveMapCommitment: H2,
+            custodyEvidence,
+            approvalActors: { cohortCustodian: "custodian-one", admissionReviewer: "reviewer-two" },
+        };
+        const bogusStores = {
+            ...base,
+            deletionEvidence: base.deletionEvidence.map((entry, index) => ({
+                ...entry,
+                store: `bogus-${index}` as typeof entry.store,
+            })),
+        };
+        expect(() => buildCohortClose({ ...closeInput, decisions: [bogusStores] }))
+            .toThrow(/store/);
+        const bogusInstant = {
+            ...base,
+            deletionEvidence: base.deletionEvidence.map((entry) => ({
+                ...entry,
+                completedAt: "not-an-instant" as typeof entry.completedAt,
+            })),
+        };
+        expect(() => buildCohortClose({ ...closeInput, decisions: [bogusInstant] }))
+            .toThrow(/completedAt/);
+    });
+
     it("takes close snapshot atomically before later submissions become late", () => {
         const root = mkdtempSync(join(tmpdir(), "cohort-store-"));
         try {

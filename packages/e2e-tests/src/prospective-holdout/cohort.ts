@@ -277,8 +277,24 @@ export function buildCohortClose(input: {
     const late = [...input.late].sort((left, right) => left.intakeId.localeCompare(right.intakeId));
     const closedAtMs = Date.parse(input.closedAt);
     const deletionEvidence = input.decisions.map((entry) => {
-        const evidence = "intake" in entry ? entry.intake.deletionEvidence : entry.deletionEvidence;
-        const submittedAt = "intake" in entry ? entry.intake.submittedAt : entry.submittedAt;
+        // A disposition reaching here in memory has only TypeScript's word for its shape:
+        // the store-read path parses, but a caller can hand `buildCohortClose` a
+        // hand-constructed one. Nothing below would catch it, because five distinct bogus
+        // store names satisfy the count and uniqueness test, and every timestamp test is a
+        // `Date.parse` comparison that an unparseable instant passes as NaN, since NaN
+        // compares false in both directions. The malformed evidence would then be covered
+        // by `retentionEvidenceFingerprint` while the close drops the evidence itself,
+        // leaving repository validation no way to discover deletion was never validly
+        // attested. Parsing first rejects the store name and the instant by their own
+        // contracts rather than by comparison.
+        const evidence = parseDeletionEvidence(
+            "intake" in entry ? entry.intake.deletionEvidence : entry.deletionEvidence,
+            "cohort.deletionEvidence",
+        );
+        const submittedAt = instant(
+            "intake" in entry ? entry.intake.submittedAt : entry.submittedAt,
+            "cohort.deletionEvidence.submittedAt",
+        );
         if (
             evidence.length !== DELETION_STORES.length ||
             new Set(evidence.map((item) => item.store)).size !== DELETION_STORES.length ||
