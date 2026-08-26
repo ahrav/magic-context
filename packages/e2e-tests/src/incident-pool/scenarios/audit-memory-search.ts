@@ -459,6 +459,10 @@ function observerProcessFactState(
     const script = [
         'const { Database } = require("bun:sqlite");',
         `const db = new Database(${JSON.stringify(dbPath)}, { readonly: true });`,
+        // The child cannot import `openTestDb`, so it sets the same pragma
+        // inline: without it this read races the writer and fails as
+        // SQLITE_BUSY instead of waiting for the lock.
+        'db.exec("PRAGMA busy_timeout=5000");',
         `const rows = db.prepare(${JSON.stringify(factRowStateSql())}).all(${JSON.stringify(normalizedHash)});`,
         "console.log(JSON.stringify(rows));",
     ].join("\n");

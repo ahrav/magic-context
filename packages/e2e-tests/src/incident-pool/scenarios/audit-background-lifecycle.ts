@@ -5,6 +5,7 @@ import type { PluginContext } from "../../../../plugin/src/plugin/types";
 import { initializeDatabase } from "../../../../plugin/src/features/magic-context/storage-db";
 import { runMigrations } from "../../../../plugin/src/features/magic-context/migrations";
 import { runValidatedHistorianPass } from "../../../../plugin/src/hooks/magic-context/compartment-runner-historian";
+import { openTestDb } from "../../test-db";
 import { createDreamTaskExecutor } from "../../../../plugin/src/features/magic-context/dreamer/task-executor";
 import {
     acquireLeaseWithAcquisition,
@@ -201,7 +202,7 @@ export async function driveHistorianFailureDump(
     const shellCanary = `$(touch ${sideEffectPath}) ; A28_SHELL_CANARY`;
     const invalidOutput = `<output><broken>${contentCanary}${terminalCanary}${shellCanary}</broken>`;
     const dumpPaths: string[] = [];
-    const db = new Database(join(context.storeDir, "a28-context.db"));
+    const db = openTestDb(join(context.storeDir, "a28-context.db"));
     initializeDatabase(db);
     runMigrations(db);
 
@@ -585,8 +586,13 @@ export async function driveLeaseLossResidualWrite(
         if (!seed) throw new Error("A47 seed memory was not persisted");
 
         const dbPath = contextDbPath(context, h.opencode.env.dataDir);
-        executorDb = new Database(dbPath);
-        replacementDb = new Database(dbPath);
+        // Two writers plus the observer below all hold this one file open while
+        // the plugin writes it too. With the default `busy_timeout = 0` any
+        // overlap fails instantly as SQLITE_BUSY in whichever handle collides,
+        // which reads as a flaky "database is locked" rather than a real defect —
+        // `openTestDb` exists so the timeout can never be forgotten.
+        executorDb = openTestDb(dbPath);
+        replacementDb = openTestDb(dbPath);
         leaseKey = leaseKeyFor("curate", seed.project_path);
         const acquisition = acquireLeaseWithAcquisition(
             executorDb,
@@ -674,7 +680,7 @@ export async function driveLeaseLossResidualWrite(
                     await promptBarrier.signal();
                 },
                 afterPrompt: (declareLeaseLost) => {
-                    const observer = new Database(dbPath, { readonly: true });
+                    const observer = openTestDb(dbPath, { readonly: true });
                     try {
                         const memory = observer
                             .prepare("SELECT status FROM memories WHERE id = ?")

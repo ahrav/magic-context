@@ -582,6 +582,29 @@ function parseBinding(
     return { path: match[1]!, symbol: match[2]! };
 }
 
+/**
+ * Parse a scenario module once per path.
+ *
+ * Five modules back all 26 catalog variants and every variant checks two
+ * bindings, so an unmemoized read-plus-parse repeats the same work up to ten
+ * times per validation. The cache is keyed by resolved path and lives for the
+ * process, which is correct here because validation reads a fixed committed tree.
+ */
+const parsedModules = new Map<string, ts.SourceFile>();
+
+function parsedModule(absolute: string): ts.SourceFile {
+    const cached = parsedModules.get(absolute);
+    if (cached) return cached;
+    const source = ts.createSourceFile(
+        absolute,
+        readFileSync(absolute, "utf8"),
+        ts.ScriptTarget.Latest,
+        true,
+    );
+    parsedModules.set(absolute, source);
+    return source;
+}
+
 function checkBindingLiveness(
     e2eRoot: string,
     variantId: string,
@@ -603,13 +626,7 @@ function checkBindingLiveness(
             `variant ${variantId}: live binding names a missing module ${path}`,
         );
     }
-    const moduleText = readFileSync(absolute, "utf8");
-    const source = ts.createSourceFile(
-        absolute,
-        moduleText,
-        ts.ScriptTarget.Latest,
-        true,
-    );
+    const source = parsedModule(absolute);
     const exported = (node: ts.Node): boolean =>
         ts.canHaveModifiers(node) &&
         ts

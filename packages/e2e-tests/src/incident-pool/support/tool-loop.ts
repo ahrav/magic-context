@@ -17,6 +17,7 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "../../../../plugin/src/shared/sqlite";
 import { TestHarness, type TestHarnessOptions } from "../../harness";
+import { openTestDb } from "../../test-db";
 import type { MockUsage } from "../../mock-provider/server";
 import type { CaseDriverContext } from "../registry";
 
@@ -353,15 +354,18 @@ export function installHistorianMatcher(h: TestHarness): void {
     });
 }
 
-/** Open the case harness's context.db read-only and run `fn` over it. */
+/**
+ * Open the case harness's context.db read-only and run `fn` over it.
+ *
+ * Through `openTestDb`, never a bare `new Database`: the plugin under test writes
+ * to this same file while a case reads it, and a handle with the default
+ * `busy_timeout = 0` fails instantly with SQLITE_BUSY the moment the writer holds
+ * the lock. That surfaces as "database is locked" in whichever driver happens to
+ * collide, not as a real regression. The path comes from the harness for the same
+ * reason it is not rebuilt by hand — one definition, no drift.
+ */
 export function readContextDb<T>(h: TestHarness, fn: (db: Database) => T): T {
-    const dbPath = join(
-        h.opencode.env.dataDir,
-        "cortexkit",
-        "magic-context",
-        "context.db",
-    );
-    const db = new Database(dbPath, { readonly: true });
+    const db = openTestDb(h.contextDbPath(), { readonly: true });
     try {
         return fn(db);
     } finally {
@@ -376,13 +380,7 @@ export function readContextDb<T>(h: TestHarness, fn: (db: Database) => T): T {
  * out-of-band setup a case reproduces.
  */
 export function writeContextDb<T>(h: TestHarness, fn: (db: Database) => T): T {
-    const dbPath = join(
-        h.opencode.env.dataDir,
-        "cortexkit",
-        "magic-context",
-        "context.db",
-    );
-    const db = new Database(dbPath);
+    const db = openTestDb(h.contextDbPath());
     try {
         return fn(db);
     } finally {

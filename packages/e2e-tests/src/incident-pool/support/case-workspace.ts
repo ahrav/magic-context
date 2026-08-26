@@ -43,6 +43,10 @@ export function createCaseWorkspace(
     const sub = (name: string): string => {
         const path = join(root, name);
         mkdirSync(path, { mode: 0o700 });
+        // Same umask correction as `root` above. These hold the relocated HOME,
+        // TMPDIR, the case-owned store, and diagnostics, so they are exactly the
+        // directories the isolation guarantee is about.
+        chmodSync(path, 0o700);
         return path;
     };
     return {
