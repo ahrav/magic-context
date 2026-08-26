@@ -196,6 +196,45 @@ describe("doctor reset-db U11 scenarios", () => {
         expect(readFileSync(corruptPath)).toEqual(corruptBytes);
     });
 
+    it("classifies a current family whose rollback journal is still hot", () => {
+        // A process that dies mid-transaction leaves a HOT journal: the main
+        // image is unrecovered until SQLite rolls it back. Classifying without
+        // the journal reads a pre-rollback image, and reading it with the
+        // journal but read-only fails the open outright — either way a
+        // recoverable family can be reported as corrupt and offered for
+        // quarantine.
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "hot-journal.db");
+        const created = createDirectTestDatabase({ path: dbPath });
+        const incarnation = created.marker.databaseIncarnationId;
+        created.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        created.db.exec("PRAGMA journal_mode=DELETE");
+        // A tiny page cache forces the open transaction to spill dirty pages
+        // into the main file, which is what makes the journal hot rather than
+        // merely present.
+        created.db.exec("PRAGMA cache_size=2");
+        created.db.exec("BEGIN IMMEDIATE");
+        // Created INSIDE the transaction, so rollback removes it. That makes
+        // this test discriminate: classifying the pre-rollback image sees an
+        // unregistered schema object and reports `unsupported`, while a probe
+        // that actually recovers sees the clean current family.
+        created.db.exec("CREATE TABLE hot_journal_probe(a, b)");
+        const insert = created.db.prepare("INSERT INTO hot_journal_probe VALUES (?, ?)");
+        for (let index = 0; index < 20_000; index += 1) insert.run(index, "x".repeat(200));
+        // Abandon the connection without commit or close, leaving the journal
+        // on disk exactly as a killed process would.
+        expect(existsSync(`${dbPath}-journal`)).toBe(true);
+
+        const before = readFileSync(dbPath);
+        expect(inspectDirectDatabaseFamilyState(dbPath)).toEqual({
+            state: "current",
+            databaseIncarnationId: incarnation,
+        });
+        // The probe recovers on its private copy, never the real family.
+        expect(readFileSync(dbPath)).toEqual(before);
+        expect(existsSync(`${dbPath}-journal`)).toBe(true);
+    });
+
     it("scenario 2: dry-run reports exact family, identities, incarnation, path, and abandonment", async () => {
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "context.db");

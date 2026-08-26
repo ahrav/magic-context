@@ -135,6 +135,25 @@ describe("claim selection", () => {
     expect(selectionState(selected, visible)).toBe("none");
   });
 
+  it("does not let a drifted claim block the batch once it leaves the view", () => {
+    // Drift then a filter change: the entry renders no checkbox to refresh, so
+    // refusing on its behalf blocks every visible selection with no way out.
+    let selected = toggleClaimSelection(new Map(), claim(A));
+    selected = toggleClaimSelection(selected, claim(B));
+    selected = reconcileClaimSelection(selected, [claim(A, 2), claim(B)]);
+    expect(selected.get(A)).toMatchObject({ stale: true, offScope: false });
+    expect(() => selectionTargets(selected)).toThrow("Refresh stale selections");
+
+    selected = reconcileClaimSelection(selected, [claim(B)]);
+    expect(selected.get(A)).toMatchObject({ stale: true, offScope: true });
+    expect(selectionTargets(selected).map((t) => t.mutationToken.publicClaimId)).toEqual([B]);
+
+    // The flag is kept, not cleared, so it blocks again on return.
+    selected = reconcileClaimSelection(selected, [claim(A, 2), claim(B)]);
+    expect(selected.get(A)).toMatchObject({ stale: true, offScope: false });
+    expect(() => selectionTargets(selected)).toThrow("Refresh stale selections");
+  });
+
   it("preserves draft text and reports a revision advance", () => {
     const previous = {
       publicClaimId: A,

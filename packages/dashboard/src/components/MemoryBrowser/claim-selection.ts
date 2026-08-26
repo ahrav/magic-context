@@ -102,13 +102,19 @@ export function toggleClaimsSelection(
  *
  * Off-scope entries are dropped rather than refused: they are outside the view
  * the user is acting on, and every mutation is token-guarded anyway, so
- * including them could only produce rejections. Token drift still refuses the
- * whole batch — a partial apply against a revision the user never saw is the
- * outcome worth blocking.
+ * including them could only produce rejections. Token drift on a VISIBLE entry
+ * still refuses the whole batch — a partial apply against a revision the user
+ * never saw is the outcome worth blocking.
+ *
+ * Off-scope wins over stale for the gate, and only for the gate. A claim can go
+ * stale and then leave the view, and refusing on its behalf would block every
+ * visible selection over an entry that renders no checkbox to refresh — the
+ * dead end this function exists to remove. The flag stays on the entry, so the
+ * same claim blocks again the moment it returns to view still drifted.
  */
 export function selectionTargets(selected: SelectionState): ClaimMutationTarget[] {
   const stale = [...selected.entries()]
-    .filter(([, entry]) => entry.stale)
+    .filter(([, entry]) => entry.stale && !entry.offScope)
     .map(([publicClaimId]) => publicClaimId)
     .sort();
   if (stale.length > 0) {

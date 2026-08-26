@@ -211,9 +211,14 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
   };
 
   const selectedCount = () => selected().size;
-  const staleSelectedCount = () => [...selected().values()].filter((entry) => entry.stale).length;
+  // "Stale" counts only what actually blocks a bulk action — a drifted claim
+  // still in view. A drifted claim that has left the view is reported as out of
+  // view, matching `selectionTargets`, so the bar never shows a blocker the user
+  // cannot see a checkbox for.
+  const staleSelectedCount = () =>
+    [...selected().values()].filter((entry) => entry.stale && !entry.offScope).length;
   const offScopeSelectedCount = () =>
-    [...selected().values()].filter((entry) => entry.offScope && !entry.stale).length;
+    [...selected().values()].filter((entry) => entry.offScope).length;
   const allVisibleState = () => selectionState(selected(), visibleClaims());
   const draftForFocused = () => {
     const claim = focusedClaim();
