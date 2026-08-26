@@ -22,6 +22,7 @@ const INPUT_LOCK_PATH = "release/mc-host-production-inputs.lock.json";
 const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const QUALIFICATION_WORKFLOW_PATH = ".github/workflows/mc-host-release-qualification.yml";
 
 interface RegistryPackageEvidence {
     name: string;
@@ -57,6 +58,93 @@ interface ProofArtifactRef {
     subject: string;
     path: string;
     sha256: string;
+}
+
+export interface WorkflowSource {
+    runUrl: string;
+    repository: string;
+    headSha: string;
+    workflow: string;
+}
+
+export function workflowRunApiPath(source: WorkflowSource): string | null {
+    const runId = source.runUrl.match(/\/actions\/runs\/(\d+)$/)?.[1];
+    return runId === undefined ? null : `repos/${source.repository}/actions/runs/${runId}`;
+}
+
+function attestationCertificateMatches(
+    value: unknown,
+    source: WorkflowSource,
+    artifactSha256: string,
+): boolean {
+    if (!Array.isArray(value) || value.length === 0) return false;
+    const claimedRunId = source.runUrl.match(/\/actions\/runs\/(\d+)$/)?.[1];
+    if (claimedRunId === undefined) return false;
+    return value.some((entry) => {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+        const verificationResult = (entry as Record<string, unknown>).verificationResult;
+        if (
+            verificationResult === null ||
+            typeof verificationResult !== "object" ||
+            Array.isArray(verificationResult)
+        ) {
+            return false;
+        }
+        const signature = (verificationResult as Record<string, unknown>).signature;
+        if (signature === null || typeof signature !== "object" || Array.isArray(signature)) {
+            return false;
+        }
+        const certificate = (signature as Record<string, unknown>).certificate;
+        if (
+            certificate === null ||
+            typeof certificate !== "object" ||
+            Array.isArray(certificate)
+        ) {
+            return false;
+        }
+        const fields = certificate as Record<string, unknown>;
+        const statement = (verificationResult as Record<string, unknown>).statement;
+        if (statement === null || typeof statement !== "object" || Array.isArray(statement)) {
+            return false;
+        }
+        const subjects = (statement as Record<string, unknown>).subject;
+        const artifactMatches =
+            Array.isArray(subjects) &&
+            subjects.some((subject) => {
+                if (subject === null || typeof subject !== "object" || Array.isArray(subject)) {
+                    return false;
+                }
+                const digest = (subject as Record<string, unknown>).digest;
+                return (
+                    digest !== null &&
+                    typeof digest === "object" &&
+                    !Array.isArray(digest) &&
+                    (digest as Record<string, unknown>).sha256 === artifactSha256
+                );
+            });
+        const runInvocationUri = fields.runInvocationURI;
+        const attestedRunId =
+            typeof runInvocationUri === "string"
+                ? runInvocationUri.match(/\/actions\/runs\/(\d+)(?:\/attempts\/\d+)?$/)?.[1]
+                : undefined;
+        return (
+            fields.sourceRepositoryURI === `https://github.com/${source.repository}` &&
+            fields.sourceRepositoryDigest === source.headSha &&
+            typeof fields.buildConfigURI === "string" &&
+            fields.buildConfigURI.split("@", 1)[0] ===
+                `https://github.com/${source.repository}/${source.workflow}` &&
+            artifactMatches &&
+            attestedRunId === claimedRunId
+        );
+    });
+}
+
+export function attestationMatchesWorkflowSource(
+    value: unknown,
+    source: WorkflowSource,
+    artifactSha256: string,
+): boolean {
+    return attestationCertificateMatches(value, source, artifactSha256);
 }
 
 export interface InstalledReleaseEvidence {
@@ -157,6 +245,14 @@ function sha256File(rootDir: string, relative: string): string {
     return createHash("sha256")
         .update(readFileSync(join(rootDir, relative)))
         .digest("hex");
+}
+
+function isSafeRelativePath(path: string): boolean {
+    return (
+        !path.startsWith("/") &&
+        !path.includes("\\") &&
+        !path.split("/").some((part) => part.length === 0 || part === "." || part === "..")
+    );
 }
 
 function exactIdentitySet(
@@ -394,11 +490,7 @@ export function validateInstalledReleaseEvidence(
             fail(`proof_artifacts[${index}].kind is outside the closed union`);
         }
         const path = stringField(entry, "path", `proof_artifacts[${index}]`);
-        if (
-            path.startsWith("/") ||
-            path.includes("\\") ||
-            path.split("/").some((part) => part.length === 0 || part === "." || part === "..")
-        ) {
+        if (!isSafeRelativePath(path) || !path.startsWith("tmp/mc-host-release-proofs/")) {
             fail(`proof_artifacts[${index}].path must be a safe relative path`);
         }
         const sha256 = stringField(entry, "sha256", `proof_artifacts[${index}]`);
@@ -462,11 +554,37 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
     value: unknown,
     requireQualified: boolean,
     options: {
-        verifyAttestation?: (path: string, proof: ProofArtifactRef) => boolean;
+        verifyAttestation?: (
+            path: string,
+            proof: ProofArtifactRef,
+            source: WorkflowSource,
+        ) => unknown;
+        verifyWorkflowRun?: (
+            source: WorkflowSource,
+            proof: ProofArtifactRef,
+        ) => boolean;
+        verifyInstalledEvidenceAttestation?: (
+            path: string,
+            source: WorkflowSource,
+            sha256: string,
+        ) => unknown;
+        expectedHeadSha?: string;
     } = {},
 ): InstalledReleaseEvidence {
     const evidence = validateInstalledReleaseEvidence(value);
     const contract = buildContract();
+    const expectedHeadSha =
+        options.expectedHeadSha ??
+        (() => {
+            const result = spawnSync("git", ["rev-parse", "HEAD"], {
+                cwd: rootDir,
+                encoding: "utf8",
+            });
+            return result.status === 0 ? result.stdout.trim() : "";
+        })();
+    if (requireQualified && !/^[0-9a-f]{40}$/.test(expectedHeadSha)) {
+        fail("cannot bind qualified evidence to the current release commit");
+    }
     const expected = {
         production_inputs_sha256: sha256File(rootDir, INPUT_LOCK_PATH),
         qualification_sha256: sha256File(rootDir, QUALIFICATION_PATH),
@@ -478,6 +596,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             fail(`${field} does not match the current artifact`);
         }
     }
+    let qualifiedSource: WorkflowSource | null = null;
     for (const proof of evidence.proof_artifacts) {
         const bytes = readFileSync(join(rootDir, proof.path));
         const digest = createHash("sha256").update(bytes).digest("hex");
@@ -513,9 +632,22 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             fail(`proof artifact ${proof.kind}:${proof.subject} does not match its claim`);
         }
         const source = record(report.source, `proof ${proof.path}.source`);
-        exactKeys(source, ["run_url"], `proof ${proof.path}.source`);
+        exactKeys(
+            source,
+            ["run_url", "repository", "head_sha", "workflow"],
+            `proof ${proof.path}.source`,
+        );
         const runUrl = stringField(source, "run_url", `proof ${proof.path}.source`);
-        if (!/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/\d+/.test(runUrl)) {
+        const repository = stringField(source, "repository", `proof ${proof.path}.source`);
+        const headSha = stringField(source, "head_sha", `proof ${proof.path}.source`);
+        const workflow = stringField(source, "workflow", `proof ${proof.path}.source`);
+        if (
+            !/^https:\/\/github\.com\/ahrav\/magic-context\/actions\/runs\/\d+$/.test(runUrl) ||
+            repository !== "ahrav/magic-context" ||
+            !/^[0-9a-f]{40}$/.test(headSha) ||
+            headSha !== expectedHeadSha ||
+            workflow !== QUALIFICATION_WORKFLOW_PATH
+        ) {
             fail(`proof artifact ${proof.kind}:${proof.subject} has no immutable workflow run`);
         }
         const observations = record(
@@ -566,9 +698,18 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                             : "linux",
                         self_fd_verified: target.self_fd_verified,
                         target: target.target,
+                        test_report_path:
+                            typeof observations.test_report_path === "string" &&
+                            isSafeRelativePath(observations.test_report_path)
+                                ? observations.test_report_path
+                                : null,
                         test_report_sha256:
+                            typeof observations.test_report_path === "string" &&
+                            isSafeRelativePath(observations.test_report_path) &&
                             typeof observations.test_report_sha256 === "string" &&
-                            SHA256_RE.test(observations.test_report_sha256)
+                            SHA256_RE.test(observations.test_report_sha256) &&
+                            sha256File(rootDir, observations.test_report_path) ===
+                                observations.test_report_sha256
                                 ? observations.test_report_sha256
                                 : null,
                     }
@@ -601,22 +742,139 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         }
         if (requireQualified) {
             const proofPath = join(rootDir, proof.path);
-            const verified =
-                options.verifyAttestation?.(proofPath, proof) ??
-                spawnSync(
+            const workflowSource = {
+                runUrl,
+                repository,
+                headSha,
+                workflow,
+            };
+            if (
+                qualifiedSource !== null &&
+                canonicalJson(qualifiedSource) !== canonicalJson(workflowSource)
+            ) {
+                fail("qualified proof artifacts must share one workflow source");
+            }
+            qualifiedSource = workflowSource;
+            const workflowVerified =
+                options.verifyWorkflowRun?.(workflowSource, proof) ??
+                (() => {
+                    const apiPath = workflowRunApiPath(workflowSource);
+                    if (apiPath === null) return false;
+                    const result = spawnSync(
+                        "gh",
+                        ["api", apiPath],
+                        { cwd: rootDir, encoding: "utf8" },
+                    );
+                    if (result.status !== 0) return false;
+                    try {
+                        const observed = record(
+                            JSON.parse(result.stdout),
+                            "workflow run verification",
+                        );
+                        return (
+                            observed.conclusion === "success" &&
+                            observed.head_sha === headSha &&
+                            observed.html_url === runUrl &&
+                            observed.path === workflow
+                        );
+                    } catch {
+                        return false;
+                    }
+                })();
+            if (!workflowVerified) {
+                fail(`proof artifact ${proof.kind}:${proof.subject} workflow run is unverified`);
+            }
+            const attestationResult =
+                options.verifyAttestation?.(proofPath, proof, workflowSource) ??
+                (() => {
+                    const result = spawnSync(
+                        "gh",
+                        [
+                            "attestation",
+                            "verify",
+                            proofPath,
+                            "--repo",
+                            repository,
+                            "--source-digest",
+                            headSha,
+                            "--signer-workflow",
+                            `${repository}/${workflow}`,
+                            "--format",
+                            "json",
+                        ],
+                        { cwd: rootDir, encoding: "utf8" },
+                    );
+                    if (result.status !== 0) return null;
+                    try {
+                        return JSON.parse(result.stdout) as unknown;
+                    } catch {
+                        return null;
+                    }
+                })();
+            const verified = attestationCertificateMatches(
+                attestationResult,
+                workflowSource,
+                proof.sha256,
+            );
+            if (!verified) {
+                fail(`proof artifact ${proof.kind}:${proof.subject} lacks a valid attestation`);
+            }
+        }
+    }
+    if (requireQualified) {
+        if (qualifiedSource === null) {
+            fail("qualified evidence has no attested workflow source");
+        }
+        const installedEvidencePath = join(rootDir, EVIDENCE_PATH);
+        const installedEvidenceBytes = readFileSync(installedEvidencePath);
+        if (
+            canonicalJson(JSON.parse(installedEvidenceBytes.toString("utf8"))) !==
+            canonicalJson(evidence)
+        ) {
+            fail("installed release evidence bytes differ from the validated value");
+        }
+        const installedEvidenceSha256 = createHash("sha256")
+            .update(installedEvidenceBytes)
+            .digest("hex");
+        const attestationResult =
+            options.verifyInstalledEvidenceAttestation?.(
+                installedEvidencePath,
+                qualifiedSource,
+                installedEvidenceSha256,
+            ) ??
+            (() => {
+                const result = spawnSync(
                     "gh",
                     [
                         "attestation",
                         "verify",
-                        proofPath,
+                        installedEvidencePath,
                         "--repo",
-                        "ahrav/magic-context",
+                        qualifiedSource.repository,
+                        "--source-digest",
+                        qualifiedSource.headSha,
+                        "--signer-workflow",
+                        `${qualifiedSource.repository}/${qualifiedSource.workflow}`,
+                        "--format",
+                        "json",
                     ],
-                    { cwd: rootDir, stdio: "ignore" },
-                ).status === 0;
-            if (!verified) {
-                fail(`proof artifact ${proof.kind}:${proof.subject} lacks a valid attestation`);
-            }
+                    { cwd: rootDir, encoding: "utf8" },
+                );
+                if (result.status !== 0) return null;
+                try {
+                    return JSON.parse(result.stdout) as unknown;
+                } catch {
+                    return null;
+                }
+            })();
+        if (
+            !attestationCertificateMatches(
+                attestationResult,
+                qualifiedSource,
+                installedEvidenceSha256,
+            )
+        ) {
+            fail("installed release evidence lacks a valid attestation");
         }
     }
     if (requireQualified && !evidence.qualified) {
@@ -699,7 +957,9 @@ function main(): void {
         return;
     }
     if (flag !== "--check" && flag !== "--check-schema") {
-        console.error("usage: verify-mc-host-release-evidence.ts [--check|--check-schema|--write-template]");
+        console.error(
+            "usage: verify-mc-host-release-evidence.ts [--check|--check-schema|--write-template]",
+        );
         process.exit(2);
     }
     const evidence = readJson(rootDir, EVIDENCE_PATH);

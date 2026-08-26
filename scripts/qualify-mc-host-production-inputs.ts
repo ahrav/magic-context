@@ -2605,8 +2605,11 @@ export function generate(
         const path = join(rootDir, relative);
         const expected = outputs[key];
         if (options.check) {
+            if (key === "evidence") {
+                continue;
+            }
             if (!existsSync(path)) {
-                if (key !== "evidence") drift.push(`${relative}: missing`);
+                drift.push(`${relative}: missing`);
             } else if (readFileSync(path, "utf8") !== expected) {
                 drift.push(
                     `${relative}: content drift (regenerate with bun scripts/qualify-mc-host-production-inputs.ts)`,

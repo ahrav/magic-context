@@ -149,7 +149,7 @@ function markRegistryGatePassing(root: string): void {
 }
 
 function context() {
-    return loadReleaseContext(repoRoot);
+    return loadReleaseContext(freshRoot());
 }
 
 describe("release context qualification evidence", () => {
@@ -242,7 +242,8 @@ function devManifest(): PayloadManifest {
 
 describe("payload package metadata", () => {
     test("committed release check fails closed on the live registry contradiction", () => {
-        expect(() => runCheck(repoRoot, { write: false })).toThrow(
+        const root = freshRoot();
+        expect(() => runCheck(root, { write: false })).toThrow(
             /synchronized version 0\.38\.0 is not unpublished/,
         );
     });
@@ -1057,14 +1058,15 @@ describe("dev payload build", () => {
     test("dev payload manifest recomputes to the same digest from disk", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);
+        const releaseRoot = freshRoot();
         const fakeBinary = join(root, "ck-mc-host-src");
         writeFileSync(fakeBinary, "\x7fELF fake dev binary bytes\n");
-        const result = buildDevPayload(repoRoot, {
+        const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
             target: targetFor("darwin-x64"),
         });
-        const ctx = context();
+        const ctx = loadReleaseContext(releaseRoot);
         const reloaded = JSON.parse(readFileSync(result.manifestPath, "utf8"));
         validatePayloadManifest(reloaded, ctx);
         expect(payloadManifestDigest(reloaded)).toBe(result.digest);
@@ -1077,9 +1079,10 @@ describe("dev payload build", () => {
     test("staged dev bytes are mutation-detected", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);
+        const releaseRoot = freshRoot();
         const fakeBinary = join(root, "ck-mc-host-src");
         writeFileSync(fakeBinary, "dev binary");
-        const result = buildDevPayload(repoRoot, {
+        const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
             target: targetFor("darwin-arm64"),
