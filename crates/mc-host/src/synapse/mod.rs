@@ -479,6 +479,30 @@ struct SynapseInner {
     closing: CancellationToken,
 }
 
+impl SynapseInner {
+    fn new(config: Option<SynapseConfig>, limits: SynapseLimits, state: LaneState) -> Self {
+        let cpu = Arc::new(tokio::sync::Semaphore::new(1));
+        let query_admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let jobs = Arc::new(JobTable::new(limits.clone()));
+        let metrics = Arc::new(SynapseMetrics::new(
+            Arc::clone(&cpu),
+            Arc::clone(&query_admission),
+            Arc::clone(&jobs),
+        ));
+        Self {
+            config,
+            limits,
+            state: Mutex::new(state),
+            jobs,
+            cpu,
+            query_admission,
+            metrics,
+            tracker: TaskTracker::new(),
+            closing: CancellationToken::new(),
+        }
+    }
+}
+
 pub struct SynapseComponent {
     inner: Arc<SynapseInner>,
 }
@@ -489,28 +513,14 @@ impl SynapseComponent {
             .as_ref()
             .map(|config| config.limits.clone())
             .unwrap_or_default();
-        let cpu = Arc::new(tokio::sync::Semaphore::new(1));
-        let query_admission = Arc::new(tokio::sync::Semaphore::new(1));
-        let jobs = Arc::new(JobTable::new(limits.clone()));
-        let metrics = Arc::new(SynapseMetrics::new(
-            Arc::clone(&cpu),
-            Arc::clone(&query_admission),
-            Arc::clone(&jobs),
-        ));
         Self {
-            inner: Arc::new(SynapseInner {
+            inner: Arc::new(SynapseInner::new(
                 config,
-                jobs,
                 limits,
-                state: Mutex::new(LaneState::Disabled {
+                LaneState::Disabled {
                     reason: "not initialized".to_owned(),
-                }),
-                cpu,
-                query_admission,
-                metrics,
-                tracker: TaskTracker::new(),
-                closing: CancellationToken::new(),
-            }),
+                },
+            )),
         }
     }
 
@@ -522,29 +532,15 @@ impl SynapseComponent {
         limits: SynapseLimits,
     ) -> Self {
         lane.max_text_bytes = limits.max_text_bytes;
-        let cpu = Arc::new(tokio::sync::Semaphore::new(1));
-        let query_admission = Arc::new(tokio::sync::Semaphore::new(1));
-        let jobs = Arc::new(JobTable::new(limits.clone()));
-        let metrics = Arc::new(SynapseMetrics::new(
-            Arc::clone(&cpu),
-            Arc::clone(&query_admission),
-            Arc::clone(&jobs),
-        ));
         Self {
-            inner: Arc::new(SynapseInner {
-                config: None,
-                jobs,
+            inner: Arc::new(SynapseInner::new(
+                None,
                 limits,
-                state: Mutex::new(LaneState::Ready(Arc::new(ReadyLane {
+                LaneState::Ready(Arc::new(ReadyLane {
                     backend: engine,
                     lane,
-                }))),
-                cpu,
-                query_admission,
-                metrics,
-                tracker: TaskTracker::new(),
-                closing: CancellationToken::new(),
-            }),
+                })),
+            )),
         }
     }
 
@@ -1319,22 +1315,15 @@ impl CompositeComponent for SynapseComponent {
         // Probe serialization allocates by design; request paths read the
         // fixed-cardinality snapshot directly and remain allocation-free.
         let metrics = Some(serde_json::to_value(self.metrics()).expect("metrics serialize"));
-        match self.status() {
-            SynapseStatus::Ready(_) => HealthReport {
-                status: HealthStatus::Ok,
-                detail: None,
-                metrics,
-            },
-            SynapseStatus::Disabled { reason } => HealthReport {
-                status: HealthStatus::Degraded,
-                detail: Some(reason),
-                metrics,
-            },
-            SynapseStatus::Failing { reason } => HealthReport {
-                status: HealthStatus::Failing,
-                detail: Some(reason),
-                metrics,
-            },
+        let (status, detail) = match self.status() {
+            SynapseStatus::Ready(_) => (HealthStatus::Ok, None),
+            SynapseStatus::Disabled { reason } => (HealthStatus::Degraded, Some(reason)),
+            SynapseStatus::Failing { reason } => (HealthStatus::Failing, Some(reason)),
+        };
+        HealthReport {
+            status,
+            detail,
+            metrics,
         }
     }
 

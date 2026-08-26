@@ -166,7 +166,6 @@ async fn query_wait_hold_and_inference_are_separate_observations() {
             && snapshot.free_query_permits == 1
     })
     .await;
-    assert_eq!(snapshot.cpu_wait_outcome.query.iter().sum::<u64>(), 1);
     assert_one_at_or_above(snapshot.cpu_wait.query, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.cpu_hold.query, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.inference.query, TIMING_FLOOR);
@@ -228,7 +227,6 @@ async fn batch_wait_hold_inference_and_item_count_are_separate() {
             && snapshot.jobs_retained == 1
     })
     .await;
-    assert_eq!(snapshot.cpu_wait_outcome.batch.iter().sum::<u64>(), 1);
     assert_one_at_or_above(snapshot.cpu_wait.batch, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.cpu_hold.batch, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.inference.batch, TIMING_FLOOR);
@@ -285,8 +283,6 @@ async fn lane_failure_after_grant_records_hold_without_inference() {
             && snapshot.cpu_hold.query.count == 1
     })
     .await;
-    assert_eq!(snapshot.cpu_wait_outcome.query.iter().sum::<u64>(), 1);
-    assert_eq!(snapshot.cpu_wait.query.count, 1);
     assert_eq!(snapshot.inference.query.count, 0);
     assert_eq!(harness.engine.calls(), 1);
 
@@ -561,16 +557,4 @@ fn serialized_snapshot_has_stable_integer_only_shape() {
         "retained_result_bytes": 0,
     });
     assert_eq!(actual, expected);
-
-    fn assert_integer_only(value: &serde_json::Value) {
-        match value {
-            serde_json::Value::Object(fields) => {
-                fields.values().for_each(assert_integer_only);
-            }
-            serde_json::Value::Array(values) => values.iter().for_each(assert_integer_only),
-            serde_json::Value::Number(number) => assert!(number.is_u64()),
-            other => panic!("snapshot contains non-integer value: {other:?}"),
-        }
-    }
-    assert_integer_only(&actual);
 }

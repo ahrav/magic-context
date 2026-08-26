@@ -28,13 +28,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 const ROOT: &str = "/workspace/synapse-perf";
 const DRAIN_BUDGET: Duration = Duration::from_secs(10);
-const MAX_RESPONSE_BYTES: u32 = 1 << 20;
-
-#[derive(Clone, Copy)]
-struct Opts {
-    rate: u64,
-    seconds: u64,
-}
 
 #[derive(Clone, Copy)]
 struct Plan {
@@ -46,11 +39,10 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(opts: Opts) -> Result<Self, String> {
-        let interval_ns = perf_measurement::open_loop_interval_ns(opts.rate)?;
-        let offered = opts
-            .rate
-            .checked_mul(opts.seconds)
+    fn new(rate: u64, seconds: u64) -> Result<Self, String> {
+        let interval_ns = perf_measurement::open_loop_interval_ns(rate)?;
+        let offered = rate
+            .checked_mul(seconds)
             .filter(|count| *count > 0)
             .ok_or_else(|| "offered request count is zero or overflows".to_owned())?;
         offered
@@ -59,8 +51,8 @@ impl Plan {
         let offered_capacity = usize::try_from(offered)
             .map_err(|_| "offered request count exceeds addressable capacity".to_owned())?;
         Ok(Self {
-            rate: opts.rate,
-            seconds: opts.seconds,
+            rate,
+            seconds,
             interval_ns,
             offered,
             offered_capacity,
@@ -106,27 +98,38 @@ impl Schedule {
 }
 
 fn parse_opts() -> Result<Plan, String> {
-    let mut opts = Opts {
-        rate: 100,
-        seconds: 5,
-    };
+    let mut rate = 100;
+    let mut seconds = 5;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
-            "--rate" => opts.rate = value.parse().map_err(|_| "invalid rate".to_owned())?,
-            "--seconds" => {
-                opts.seconds = value.parse().map_err(|_| "invalid seconds".to_owned())?
-            }
+            "--rate" => rate = value.parse().map_err(|_| "invalid rate".to_owned())?,
+            "--seconds" => seconds = value.parse().map_err(|_| "invalid seconds".to_owned())?,
             _ => return Err(format!("unknown option {flag}")),
         }
     }
-    if opts.seconds == 0 {
+    if seconds == 0 {
         return Err("seconds must be nonzero".to_owned());
     }
-    Plan::new(opts)
+    Plan::new(rate, seconds)
+}
+
+fn request_body(text: &str) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&serde_json::json!({
+        "method": "embed.query",
+        "params": {
+            "model": "synapse-perf-zero-delay",
+            "required_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "required_epoch": 1,
+            "allow_equivalent": false,
+            "accept_declared": false,
+            "text": text
+        }
+    }))
+    .map_err(|error| format!("serialize request: {error}"))
 }
 
 struct ZeroDelayEngine;
@@ -252,7 +255,7 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<raw_client::
         .await
         .map_err(|error| format!("frame header: {error}"))?;
     let mut frame = raw_client::decode_header(&header);
-    if frame.len > MAX_RESPONSE_BYTES {
+    if frame.len > perf_measurement::MAX_BODY_LEN {
         return Err(format!("response body {} exceeds cap", frame.len));
     }
     frame.body.resize(frame.len as usize, 0);
@@ -317,18 +320,7 @@ async fn run(plan: Plan) -> Result<serde_json::Value, String> {
             "run",
         )
         .await?;
-    let warmup_body = serde_json::to_vec(&serde_json::json!({
-        "method": "embed.query",
-        "params": {
-            "model": "synapse-perf-zero-delay",
-            "required_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "required_epoch": 1,
-            "allow_equivalent": false,
-            "accept_declared": false,
-            "text": "warmup"
-        }
-    }))
-    .map_err(|error| format!("serialize warmup request: {error}"))?;
+    let warmup_body = request_body("warmup")?;
     let warmup_corr = client.next_corr();
     client
         .send_frame(
@@ -359,18 +351,7 @@ async fn run(plan: Plan) -> Result<serde_json::Value, String> {
         pending.insert(1_000_000 + slot, schedule.scheduled(slot)?);
     }
 
-    let request = serde_json::to_vec(&serde_json::json!({
-        "method": "embed.query",
-        "params": {
-            "model": "synapse-perf-zero-delay",
-            "required_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "required_epoch": 1,
-            "allow_equivalent": false,
-            "accept_declared": false,
-            "text": "model-free benchmark query"
-        }
-    }))
-    .map_err(|error| format!("serialize request: {error}"))?;
+    let request = request_body("model-free benchmark query")?;
     let sender = tokio::spawn(async move {
         for slot in 0..plan.offered {
             let scheduled = schedule.scheduled(slot)?;
