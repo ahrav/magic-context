@@ -40,7 +40,6 @@ pub const HISTOGRAM_EDGES_MS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1
 pub const HISTOGRAM_BUCKETS: usize = HISTOGRAM_EDGES_MS.len() + 1;
 /// Terminal outcomes for a query waiting on the CPU permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(usize)]
 pub enum QueryWaitOutcome {
     Granted,
     Timeout,
@@ -48,18 +47,37 @@ pub enum QueryWaitOutcome {
     CancelledOrClosed,
 }
 
+impl QueryWaitOutcome {
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::Granted => 0,
+            Self::Timeout => 1,
+            Self::WaiterGone => 2,
+            Self::CancelledOrClosed => 3,
+        }
+    }
+}
+
 /// Terminal outcomes for a batch waiting on the CPU permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(usize)]
 pub enum BatchWaitOutcome {
     Granted,
     Cancelled,
     Closed,
 }
 
+impl BatchWaitOutcome {
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::Granted => 0,
+            Self::Cancelled => 1,
+            Self::Closed => 2,
+        }
+    }
+}
+
 /// Fixed reasons why Synapse rejects work as `queue_full`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(usize)]
 pub enum QueueFullReason {
     ParseReservationUnsatisfiable,
     ParseResidentExhausted,
@@ -69,9 +87,21 @@ pub enum QueueFullReason {
     ResultPageResident,
 }
 
-/// Wire-visible outcomes of one result poll.
+impl QueueFullReason {
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::ParseReservationUnsatisfiable => 0,
+            Self::ParseResidentExhausted => 1,
+            Self::CoverageShort => 2,
+            Self::QueryAdmission => 3,
+            Self::JobAdmission => 4,
+            Self::ResultPageResident => 5,
+        }
+    }
+}
+
+/// Outcome of one handler poll attempt before its response is produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(usize)]
 pub enum PollMetricOutcome {
     Restarted,
     KeyMismatch,
@@ -82,10 +112,24 @@ pub enum PollMetricOutcome {
     Page,
 }
 
-pub const QUERY_WAIT_OUTCOMES: usize = QueryWaitOutcome::CancelledOrClosed as usize + 1;
-pub const BATCH_WAIT_OUTCOMES: usize = BatchWaitOutcome::Closed as usize + 1;
-pub const QUEUE_FULL_REASONS: usize = QueueFullReason::ResultPageResident as usize + 1;
-pub const POLL_OUTCOMES: usize = PollMetricOutcome::Page as usize + 1;
+impl PollMetricOutcome {
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::Restarted => 0,
+            Self::KeyMismatch => 1,
+            Self::BadCursor => 2,
+            Self::Failed => 3,
+            Self::PendingQueued => 4,
+            Self::PendingRunning => 5,
+            Self::Page => 6,
+        }
+    }
+}
+
+pub const QUERY_WAIT_OUTCOMES: usize = 4;
+pub const BATCH_WAIT_OUTCOMES: usize = 3;
+pub const QUEUE_FULL_REASONS: usize = 6;
+pub const POLL_OUTCOMES: usize = 7;
 
 /// Plain snapshot of one fixed-edge duration histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -129,14 +173,14 @@ pub struct SynapseMetricsSnapshot {
 
 /// Fixed-edge duration histogram with monotonic relaxed atomic counters.
 #[derive(Default)]
-pub struct Histogram {
+struct Histogram {
     buckets: [AtomicU64; HISTOGRAM_BUCKETS],
     count: AtomicU64,
     sum_us: AtomicU64,
 }
 
 impl Histogram {
-    pub fn record(&self, duration: Duration) {
+    fn record(&self, duration: Duration) {
         let elapsed_ms = duration.as_millis();
         let bucket = HISTOGRAM_EDGES_MS
             .iter()
@@ -150,7 +194,7 @@ impl Histogram {
         );
     }
 
-    pub fn snapshot(&self) -> HistogramSnapshot {
+    fn snapshot(&self) -> HistogramSnapshot {
         HistogramSnapshot {
             buckets: load_counters(&self.buckets),
             count: self.count.load(Ordering::Relaxed),
@@ -201,47 +245,47 @@ impl SynapseMetrics {
         }
     }
 
-    pub fn record_cpu_wait_query(&self, duration: Duration) {
+    pub(crate) fn record_cpu_wait_query(&self, duration: Duration) {
         self.cpu_wait_query.record(duration);
     }
 
-    pub fn record_cpu_wait_batch(&self, duration: Duration) {
+    pub(crate) fn record_cpu_wait_batch(&self, duration: Duration) {
         self.cpu_wait_batch.record(duration);
     }
 
-    pub fn record_cpu_hold_query(&self, duration: Duration) {
+    pub(crate) fn record_cpu_hold_query(&self, duration: Duration) {
         self.cpu_hold_query.record(duration);
     }
 
-    pub fn record_cpu_hold_batch(&self, duration: Duration) {
+    pub(crate) fn record_cpu_hold_batch(&self, duration: Duration) {
         self.cpu_hold_batch.record(duration);
     }
 
-    pub fn record_inference_query(&self, duration: Duration) {
+    pub(crate) fn record_inference_query(&self, duration: Duration) {
         self.inference_query.record(duration);
     }
 
-    pub fn record_inference_batch(&self, duration: Duration) {
+    pub(crate) fn record_inference_batch(&self, duration: Duration) {
         self.inference_batch.record(duration);
     }
 
-    pub fn increment_query_wait_outcome(&self, outcome: QueryWaitOutcome) {
-        self.query_wait_outcome[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn increment_query_wait_outcome(&self, outcome: QueryWaitOutcome) {
+        self.query_wait_outcome[outcome.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn increment_batch_wait_outcome(&self, outcome: BatchWaitOutcome) {
-        self.batch_wait_outcome[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn increment_batch_wait_outcome(&self, outcome: BatchWaitOutcome) {
+        self.batch_wait_outcome[outcome.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn increment_queue_full(&self, reason: QueueFullReason) {
-        self.queue_full[reason as usize].fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn increment_queue_full(&self, reason: QueueFullReason) {
+        self.queue_full[reason.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn increment_poll_outcome(&self, outcome: PollMetricOutcome) {
-        self.poll_outcome[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn increment_poll_outcome(&self, outcome: PollMetricOutcome) {
+        self.poll_outcome[outcome.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn add_batch_items_embedded(&self, count: usize) {
+    pub(crate) fn add_batch_items_embedded(&self, count: usize) {
         saturating_add(
             &self.batch_items_embedded,
             u64::try_from(count).unwrap_or(u64::MAX),
@@ -1522,6 +1566,46 @@ mod tests {
     }
 
     #[test]
+    fn poll_metric_outcome_maps_every_job_table_outcome() {
+        let cases = [
+            (PollOutcome::Restarted, PollMetricOutcome::Restarted),
+            (PollOutcome::KeyMismatch, PollMetricOutcome::KeyMismatch),
+            (PollOutcome::BadCursor, PollMetricOutcome::BadCursor),
+            (
+                PollOutcome::Failed {
+                    code: "artifact_invalid".to_owned(),
+                    message: "model lane failed".to_owned(),
+                },
+                PollMetricOutcome::Failed,
+            ),
+            (
+                PollOutcome::Pending { status: "queued" },
+                PollMetricOutcome::PendingQueued,
+            ),
+            (
+                PollOutcome::Pending { status: "running" },
+                PollMetricOutcome::PendingRunning,
+            ),
+            (
+                PollOutcome::Page(jobs::ResultPage {
+                    vectors: vec![(
+                        "item-0".to_owned(),
+                        "0".repeat(jobs::CONTENT_SHA256_BYTES),
+                        Arc::<[f32]>::from(vec![1.0]),
+                    )],
+                    done: true,
+                    next_cursor: None,
+                }),
+                PollMetricOutcome::Page,
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            assert_eq!(poll_metric_outcome(&outcome), expected);
+        }
+    }
+
+    #[test]
     fn metrics_histogram_sum_saturates() {
         let histogram = Histogram::default();
         histogram.sum_us.store(u64::MAX - 1, Ordering::Relaxed);
@@ -1553,16 +1637,16 @@ mod tests {
             1
         );
         assert_eq!(
-            after.cpu_wait_outcome.query[QueryWaitOutcome::Granted as usize],
+            after.cpu_wait_outcome.query[QueryWaitOutcome::Granted.slot()],
             1
         );
         assert_eq!(
-            after.cpu_wait_outcome.batch[BatchWaitOutcome::Cancelled as usize],
+            after.cpu_wait_outcome.batch[BatchWaitOutcome::Cancelled.slot()],
             1
         );
-        assert_eq!(after.queue_full[QueueFullReason::CoverageShort as usize], 1);
+        assert_eq!(after.queue_full[QueueFullReason::CoverageShort.slot()], 1);
         assert_eq!(
-            after.poll_outcome[PollMetricOutcome::PendingRunning as usize],
+            after.poll_outcome[PollMetricOutcome::PendingRunning.slot()],
             1
         );
         assert_eq!(after.batch_items_embedded - before.batch_items_embedded, 3);

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use mc_host::synapse::inference::InferenceError;
 use mc_host::synapse::{
-    HistogramSnapshot, PollMetricOutcome, QueryWaitOutcome, QueueFullReason, SynapseLimits,
-    SynapseMetrics, SynapseMetricsSnapshot, HISTOGRAM_EDGES_MS,
+    BatchWaitOutcome, HistogramSnapshot, PollMetricOutcome, QueryWaitOutcome, QueueFullReason,
+    SynapseLimits, SynapseMetrics, SynapseMetricsSnapshot, HISTOGRAM_EDGES_MS,
 };
 use support::raw_client::{RawClient, RawFrame};
 use support::synapse::{
@@ -157,13 +157,16 @@ async fn query_wait_hold_and_inference_are_separate_observations() {
     );
 
     let snapshot = snapshot_when(&harness.metrics, |snapshot| {
-        snapshot.cpu_wait_outcome.query[QueryWaitOutcome::Granted as usize] == 1
+        snapshot.cpu_wait_outcome.query[QueryWaitOutcome::Granted.slot()] == 1
+            && snapshot.cpu_wait_outcome.query.iter().sum::<u64>() == 1
+            && snapshot.cpu_wait.query.count == 1
             && snapshot.cpu_hold.query.count == 1
             && snapshot.inference.query.count == 1
             && snapshot.free_cpu_permits == 1
             && snapshot.free_query_permits == 1
     })
     .await;
+    assert_eq!(snapshot.cpu_wait_outcome.query.iter().sum::<u64>(), 1);
     assert_one_at_or_above(snapshot.cpu_wait.query, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.cpu_hold.query, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.inference.query, TIMING_FLOOR);
@@ -216,13 +219,16 @@ async fn batch_wait_hold_inference_and_item_count_are_separate() {
     harness.gate.release();
 
     let snapshot = snapshot_when(&harness.metrics, |snapshot| {
-        snapshot.cpu_wait_outcome.batch[0] == 1
+        snapshot.cpu_wait_outcome.batch[BatchWaitOutcome::Granted.slot()] == 1
+            && snapshot.cpu_wait_outcome.batch.iter().sum::<u64>() == 1
+            && snapshot.cpu_wait.batch.count == 1
             && snapshot.cpu_hold.batch.count == 1
             && snapshot.inference.batch.count == 1
             && snapshot.batch_items_embedded == 3
             && snapshot.jobs_retained == 1
     })
     .await;
+    assert_eq!(snapshot.cpu_wait_outcome.batch.iter().sum::<u64>(), 1);
     assert_one_at_or_above(snapshot.cpu_wait.batch, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.cpu_hold.batch, TIMING_FLOOR);
     assert_one_at_or_above(snapshot.inference.batch, TIMING_FLOOR);
@@ -273,10 +279,13 @@ async fn lane_failure_after_grant_records_hold_without_inference() {
     );
 
     let snapshot = snapshot_when(&harness.metrics, |snapshot| {
-        snapshot.cpu_wait_outcome.query[QueryWaitOutcome::Granted as usize] == 1
+        snapshot.cpu_wait_outcome.query[QueryWaitOutcome::Granted.slot()] == 1
+            && snapshot.cpu_wait_outcome.query.iter().sum::<u64>() == 1
+            && snapshot.cpu_wait.query.count == 1
             && snapshot.cpu_hold.query.count == 1
     })
     .await;
+    assert_eq!(snapshot.cpu_wait_outcome.query.iter().sum::<u64>(), 1);
     assert_eq!(snapshot.cpu_wait.query.count, 1);
     assert_eq!(snapshot.inference.query.count, 0);
     assert_eq!(harness.engine.calls(), 1);
@@ -318,11 +327,12 @@ async fn deadline_while_queued_records_one_terminal_and_no_wait_histogram() {
     assert_eq!(query.await.expect("query task").error_code(), "timeout");
 
     let snapshot = snapshot_when(&harness.metrics, |snapshot| {
-        snapshot.cpu_wait_outcome.query[QueryWaitOutcome::Timeout as usize]
-            + snapshot.cpu_wait_outcome.query[QueryWaitOutcome::WaiterGone as usize]
+        snapshot.cpu_wait_outcome.query[QueryWaitOutcome::Timeout.slot()]
+            + snapshot.cpu_wait_outcome.query[QueryWaitOutcome::WaiterGone.slot()]
             == 1
     })
     .await;
+    assert_eq!(snapshot.cpu_wait_outcome.query.iter().sum::<u64>(), 1);
     assert_eq!(snapshot.cpu_wait.query.count, 0);
     assert_eq!(snapshot.cpu_hold.query.count, 0);
 
@@ -361,10 +371,7 @@ async fn saturated_job_table_attributes_one_job_admission_rejection() {
     .await;
     assert_eq!(frame.error_code(), "queue_full");
     let snapshot = harness.metrics.snapshot();
-    assert_eq!(
-        snapshot.queue_full[QueueFullReason::JobAdmission as usize],
-        1
-    );
+    assert_eq!(snapshot.queue_full[QueueFullReason::JobAdmission.slot()], 1);
     assert_eq!(snapshot.queue_full.iter().sum::<u64>(), 1);
     assert_eq!(snapshot.jobs_active, 1);
 
@@ -493,29 +500,37 @@ async fn poll_outcomes_count_once_per_wire_request() {
     let requests = 6;
     let snapshot = snapshot_when(&harness.metrics, |snapshot| {
         snapshot.poll_outcome.iter().sum::<u64>()
-            + snapshot.queue_full[QueueFullReason::ResultPageResident as usize]
+            + snapshot.queue_full[QueueFullReason::ResultPageResident.slot()]
             == requests
     })
     .await;
     assert_eq!(
-        snapshot.poll_outcome[PollMetricOutcome::PendingQueued as usize],
+        snapshot.poll_outcome[PollMetricOutcome::PendingQueued.slot()],
         1
     );
     assert_eq!(
-        snapshot.poll_outcome[PollMetricOutcome::PendingRunning as usize],
+        snapshot.poll_outcome[PollMetricOutcome::PendingRunning.slot()],
         1
     );
-    assert_eq!(snapshot.poll_outcome[PollMetricOutcome::Page as usize], 3);
+    assert_eq!(snapshot.poll_outcome[PollMetricOutcome::Page.slot()], 3);
     assert_eq!(
-        snapshot.poll_outcome[PollMetricOutcome::Restarted as usize],
+        snapshot.poll_outcome[PollMetricOutcome::Restarted.slot()],
         1
     );
     assert_eq!(
-        snapshot.queue_full[QueueFullReason::ResultPageResident as usize],
+        snapshot.queue_full[QueueFullReason::ResultPageResident.slot()],
         0
     );
 
     harness.host.shutdown().await.expect("graceful shutdown");
+}
+
+#[test]
+fn histogram_edges_match_the_published_contract() {
+    assert_eq!(
+        HISTOGRAM_EDGES_MS,
+        [1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000]
+    );
 }
 
 #[test]

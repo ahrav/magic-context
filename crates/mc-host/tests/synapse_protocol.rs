@@ -133,7 +133,7 @@ async fn query_overload_preserves_tool_provider_capacity() {
     assert_eq!(overloaded.error_code(), "queue_full");
     let snapshot = metrics.snapshot();
     assert_eq!(
-        snapshot.queue_full[QueueFullReason::QueryAdmission as usize],
+        snapshot.queue_full[QueueFullReason::QueryAdmission.slot()],
         1
     );
     assert_eq!(snapshot.queue_full.iter().sum::<u64>(), 1);

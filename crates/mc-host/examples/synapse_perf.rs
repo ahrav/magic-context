@@ -1,7 +1,9 @@
 //! Model-free, open-loop `embed.query` benchmark.
 //!
 //! Every request keeps its absolute scheduled time through completion, so
-//! scheduler lag and overload remain in the reported latency distribution.
+//! scheduler lag and overload remain in the reported successful-response
+//! latency distribution. Throughput and latency include admitted successes
+//! only; rejected outcomes are reported separately.
 
 #[path = "../tests/support/perf_measurement.rs"]
 mod perf_measurement;
@@ -34,7 +36,76 @@ struct Opts {
     seconds: u64,
 }
 
-fn parse_opts() -> Result<Opts, String> {
+#[derive(Clone, Copy)]
+struct Plan {
+    rate: u64,
+    seconds: u64,
+    interval_ns: u64,
+    offered: u64,
+    offered_capacity: usize,
+}
+
+impl Plan {
+    fn new(opts: Opts) -> Result<Self, String> {
+        let interval_ns = perf_measurement::open_loop_interval_ns(opts.rate)?;
+        let offered = opts
+            .rate
+            .checked_mul(opts.seconds)
+            .filter(|count| *count > 0)
+            .ok_or_else(|| "offered request count is zero or overflows".to_owned())?;
+        offered
+            .checked_add(1_000_000)
+            .ok_or_else(|| "correlation range overflows".to_owned())?;
+        let offered_capacity = usize::try_from(offered)
+            .map_err(|_| "offered request count exceeds addressable capacity".to_owned())?;
+        Ok(Self {
+            rate: opts.rate,
+            seconds: opts.seconds,
+            interval_ns,
+            offered,
+            offered_capacity,
+        })
+    }
+
+    fn schedule(self) -> Result<Schedule, String> {
+        let start = Instant::now()
+            .checked_add(Duration::from_millis(25))
+            .ok_or_else(|| "benchmark start instant overflows".to_owned())?;
+        let send_end = start
+            .checked_add(Duration::from_secs(self.seconds))
+            .ok_or_else(|| "benchmark send deadline overflows".to_owned())?;
+        let drain_deadline = send_end
+            .checked_add(DRAIN_BUDGET)
+            .ok_or_else(|| "benchmark drain deadline overflows".to_owned())?;
+        let schedule = Schedule {
+            start,
+            drain_deadline,
+            interval_ns: self.interval_ns,
+        };
+        schedule.scheduled(self.offered - 1)?;
+        Ok(schedule)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Schedule {
+    start: Instant,
+    drain_deadline: Instant,
+    interval_ns: u64,
+}
+
+impl Schedule {
+    fn scheduled(self, slot: u64) -> Result<Instant, String> {
+        let offset_ns = slot
+            .checked_mul(self.interval_ns)
+            .ok_or_else(|| "scheduled offset overflows".to_owned())?;
+        self.start
+            .checked_add(Duration::from_nanos(offset_ns))
+            .ok_or_else(|| "scheduled instant overflows".to_owned())
+    }
+}
+
+fn parse_opts() -> Result<Plan, String> {
     let mut opts = Opts {
         rate: 100,
         seconds: 5,
@@ -55,12 +126,7 @@ fn parse_opts() -> Result<Opts, String> {
     if opts.seconds == 0 {
         return Err("seconds must be nonzero".to_owned());
     }
-    perf_measurement::open_loop_interval_ns(opts.rate)?;
-    opts.rate
-        .checked_mul(opts.seconds)
-        .filter(|count| *count > 0)
-        .ok_or_else(|| "offered request count is zero or overflows".to_owned())?;
-    Ok(opts)
+    Plan::new(opts)
 }
 
 struct ZeroDelayEngine;
@@ -216,7 +282,7 @@ async fn wait_for_publication(
     }
 }
 
-async fn run(opts: Opts) -> Result<serde_json::Value, String> {
+async fn run(plan: Plan) -> Result<serde_json::Value, String> {
     let data_root = tempfile::tempdir().map_err(|error| format!("temporary data root: {error}"))?;
     let synapse = SynapseComponent::ready_with_engine(
         lane(),
@@ -287,18 +353,10 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         .map_err(|error| format!("set TCP_NODELAY: {error}"))?;
     let (mut reader, mut writer) = stream.into_split();
 
-    let interval_ns = perf_measurement::open_loop_interval_ns(opts.rate)?;
-    let offered = opts
-        .rate
-        .checked_mul(opts.seconds)
-        .ok_or_else(|| "offered request count overflows".to_owned())?;
-    let start = Instant::now() + Duration::from_millis(25);
-    let mut pending = HashMap::with_capacity(offered as usize);
-    for slot in 0..offered {
-        pending.insert(
-            1_000_000 + slot,
-            start + Duration::from_nanos(slot * interval_ns),
-        );
+    let schedule = plan.schedule()?;
+    let mut pending = HashMap::with_capacity(plan.offered_capacity);
+    for slot in 0..plan.offered {
+        pending.insert(1_000_000 + slot, schedule.scheduled(slot)?);
     }
 
     let request = serde_json::to_vec(&serde_json::json!({
@@ -314,8 +372,8 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     }))
     .map_err(|error| format!("serialize request: {error}"))?;
     let sender = tokio::spawn(async move {
-        for slot in 0..offered {
-            let scheduled = start + Duration::from_nanos(slot * interval_ns);
+        for slot in 0..plan.offered {
+            let scheduled = schedule.scheduled(slot)?;
             tokio::time::sleep_until(scheduled.into()).await;
             let corr = 1_000_000 + slot;
             let mut frame = raw_client::header(
@@ -335,23 +393,20 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         Ok::<_, String>(writer)
     });
 
-    let drain_deadline = start + Duration::from_secs(opts.seconds) + DRAIN_BUDGET;
     let mut completed = 0u64;
     let mut rejected = 0u64;
     let mut timed_out = 0u64;
-    let mut latencies_ns = Vec::with_capacity(offered as usize);
+    let mut latencies_ns = Vec::with_capacity(plan.offered_capacity);
     while !pending.is_empty() {
-        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        let remaining = schedule
+            .drain_deadline
+            .saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            timed_out += pending.len() as u64;
-            pending.clear();
             break;
         }
         let frame = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
             Ok(frame) => frame?,
             Err(_) => {
-                timed_out += pending.len() as u64;
-                pending.clear();
                 break;
             }
         };
@@ -400,10 +455,18 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         .map_err(|error| format!("sender task: {error}"))??;
 
     let in_flight = pending.len() as u64;
-    if offered != completed + rejected + timed_out + in_flight || in_flight != 0 {
+    if in_flight != 0 {
         return Err(format!(
-            "accounting mismatch: offered={offered} completed={completed} rejected={rejected} \
-             timed_out={timed_out} in_flight={in_flight}"
+            "accounting incomplete after drain: offered={} completed={completed} \
+             rejected={rejected} timed_out={timed_out} in_flight={in_flight}",
+            plan.offered
+        ));
+    }
+    if plan.offered != completed + rejected + timed_out {
+        return Err(format!(
+            "accounting mismatch: offered={} completed={completed} rejected={rejected} \
+             timed_out={timed_out}",
+            plan.offered
         ));
     }
     if completed == 0 {
@@ -429,14 +492,14 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         "kind": "synapse_perf_result",
         "loop": "open",
         "engine": "inline_zero_delay",
-        "rate_per_sec": opts.rate,
-        "seconds": opts.seconds,
-        "offered": offered,
+        "rate_per_sec": plan.rate,
+        "seconds": plan.seconds,
+        "offered": plan.offered,
         "completed": completed,
         "rejected": rejected,
         "timed_out": timed_out,
         "in_flight": in_flight,
-        "throughput_per_sec": completed as f64 / opts.seconds as f64,
+        "throughput_per_sec": completed as f64 / plan.seconds as f64,
         "p50_ns": p50_ns,
         "p95_ns": p95_ns,
         "p99_ns": p99_ns

@@ -81,6 +81,11 @@ observation increments one bucket and `count`. `sum_us` is the sum of observed
 durations in microseconds and saturates at `u64::MAX`; the host does not
 compute percentiles.
 
+These request-path instruments cover the `embed.query`, `embed.batch`, and
+`embed.result` handlers only. The public `SynapseComponent::embed_blocking`
+entry point does not record them and must not be included in a reconciliation
+against these counters.
+
 `cpu_wait` starts before the worker task is spawned, includes task-scheduling
 delay, and records only waits that acquire a CPU permit. `cpu_hold` starts at
 permit acquisition. Query hold ends after inference settlement and the worker's
@@ -181,7 +186,9 @@ successful-response throughput was
 `[1696156, 1664541, 1704532]` ns. Post medians were 934.0 requests/s and
 1,696,156 ns; both are inside the corresponding baseline envelope. Rejected
 responses were `[344, 228, 330]`. Both p99 arrays contain successful responses
-only.
+only, and throughput is successful responses per send-window second. The
+differing rejection counts mean the arms observed different successful
+populations, which limits any latency or throughput comparison between them.
 
 Verdict: no detectable regression.
 
