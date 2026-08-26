@@ -58,7 +58,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	applySqliteTuningPragmas,
-	getMigrationOnOpenRefusal,
+	getFormatRefusal,
 	getSchemaFenceRejection,
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
@@ -788,33 +788,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			);
 			return;
 		}
-		const migration = getMigrationOnOpenRefusal();
-		const blockingProcesses =
-			migration?.blockingProcesses ??
-			migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
-			[];
+		const formatRefusal = getFormatRefusal();
 		const fence = getSchemaFenceRejection();
-		const reason: FailClosedReason =
-			migration && blockingProcesses.length > 0
+		const reason: FailClosedReason = formatRefusal
+			? {
+					kind: "format_refusal",
+					family: formatRefusal.family,
+					reasons: formatRefusal.reasons,
+				}
+			: fence
 				? {
-						kind: "migration_guard",
-						persistedVersion: migration.persistedVersion,
-						supportedVersion: migration.supportedVersion,
-						blockingProcesses,
+						kind: "schema_fence",
+						persistedVersion: fence.persistedVersion,
+						supportedVersion: fence.supportedVersion,
 					}
-				: fence
-					? {
-							kind: "schema_fence",
-							persistedVersion: fence.persistedVersion,
-							supportedVersion: fence.supportedVersion,
-						}
-					: {
-							kind: "storage_failure",
-							cause: migration?.unreadableFile
-								? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-								: (openFailureCause ??
-									`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`),
-						};
+				: {
+						kind: "storage_failure",
+						cause:
+							openFailureCause ??
+							`storage unavailable at ${dbPath} (unsupported database format, or open failed)`,
+					};
 		if (
 			early.config.fail_closed_blocking === false ||
 			!isCompactionEnabled(early.config)

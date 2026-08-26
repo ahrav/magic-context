@@ -62,7 +62,7 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import {
-    getMigrationOnOpenRefusal,
+    getFormatRefusal,
     getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
@@ -255,40 +255,26 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 reason,
             );
             notifyMagicContextDisabled(deps.client, reason);
-            const migration = getMigrationOnOpenRefusal();
-            const blockingProcesses =
-                migration?.blockingProcesses ??
-                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
-                [];
+            const formatRefusal = getFormatRefusal();
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",
-                reason:
-                    migration && (blockingProcesses.length > 0 || migration.unreadableFile)
-                        ? {
-                              kind: "migration_guard",
-                              persistedVersion: migration.persistedVersion,
-                              supportedVersion: migration.supportedVersion,
-                              blockingProcesses,
-                              ...(migration.unreadableFile
-                                  ? { unreadableFile: migration.unreadableFile }
-                                  : {}),
-                              ...(migration.unreadableArm
-                                  ? { unreadableArm: migration.unreadableArm }
-                                  : {}),
-                          }
-                        : fence
-                          ? {
-                                kind: "schema_fence",
-                                persistedVersion: fence.persistedVersion,
-                                supportedVersion: fence.supportedVersion,
-                            }
-                          : {
-                                kind: "storage_failure",
-                                cause: migration?.unreadableFile
-                                    ? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-                                    : reason,
-                            },
+                reason: formatRefusal
+                    ? {
+                          kind: "format_refusal",
+                          family: formatRefusal.family,
+                          reasons: formatRefusal.reasons,
+                      }
+                    : fence
+                      ? {
+                            kind: "schema_fence",
+                            persistedVersion: fence.persistedVersion,
+                            supportedVersion: fence.supportedVersion,
+                        }
+                      : {
+                            kind: "storage_failure",
+                            cause: reason,
+                        },
             });
             return null;
         }

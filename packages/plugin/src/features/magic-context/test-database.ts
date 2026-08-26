@@ -15,18 +15,16 @@ import {
     CURRENT_SCHEMA_COMPONENTS,
     composeRegisteredSchema,
     computeSchemaManifestDigest,
-    listSchemaObjectNames,
     type RegisteredSchemaComponent,
 } from "./storage-current-schema.ts";
 import {
     buildDirectFormatMarker,
     createDirectFormatMarkerSchema,
-    DIRECT_FORMAT_EPOCH,
     type DirectFormatMarker,
-    type ExpectedDirectFormat,
-    MC_APPLICATION_ID,
     stampDirectFormatMarker,
 } from "./storage-format-epoch.ts";
+
+export { computeExpectedDirectFormat } from "./storage-current-schema.ts";
 
 export interface DirectTestDatabaseOptions {
     /** Defaults to ":memory:". */
@@ -40,31 +38,6 @@ export interface DirectTestDatabaseOptions {
 export interface DirectTestDatabase {
     readonly db: Database;
     readonly marker: DirectFormatMarker;
-}
-
-/**
- * Compute the expected direct format (registered inventory plus marker
- * objects) by composing the components into a scratch in-memory database, so
- * the expectation can never drift from what composition actually creates.
- */
-export function computeExpectedDirectFormat(
-    components: readonly RegisteredSchemaComponent[] = CURRENT_SCHEMA_COMPONENTS,
-): ExpectedDirectFormat {
-    const manifest = buildSchemaComponentManifest(components);
-    const scratch = new Database(":memory:");
-    try {
-        scratch.exec("PRAGMA foreign_keys=ON");
-        composeRegisteredSchema(scratch, components);
-        createDirectFormatMarkerSchema(scratch);
-        return {
-            applicationId: MC_APPLICATION_ID,
-            formatEpoch: DIRECT_FORMAT_EPOCH,
-            componentManifestDigest: computeSchemaManifestDigest(manifest),
-            schemaObjectNames: listSchemaObjectNames(scratch),
-        };
-    } finally {
-        scratch.close();
-    }
 }
 
 export function createDirectTestDatabase(

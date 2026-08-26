@@ -598,9 +598,7 @@ async function runHealthChecks(options: {
                 // Stable storage-version probe: live DB schema vs this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 add(results, "info", formatStorageVersions(storageVersions));
-                const fenceCheck = checkStorageVersionFence(storageVersions, {
-                    blockingProcesses: getLiveMigrationBlockingProcesses(storageDir),
-                });
+                const fenceCheck = checkStorageVersionFence(storageVersions);
                 add(results, fenceCheck.alarm ? "fail" : "info", fenceCheck.message);
 
                 const integrity = db.prepare("PRAGMA integrity_check").get() as {

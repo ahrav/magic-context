@@ -39,7 +39,6 @@ export {
     clearIndexedMessages,
     deleteIndexedMessage,
 } from "./message-index";
-export { runMigrations } from "./migrations";
 export {
     computeProjectDocsHash,
     readProjectDocsCanonical,
@@ -63,12 +62,11 @@ export {
     applySqliteTuningPragmas,
     type ContextDatabase,
     closeDatabase,
-    enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
     getDatabasePath,
     getDatabasePersistenceError,
+    getFormatRefusal,
     getPersistedSchemaVersion,
-    initializeDatabase,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     type OpenDatabaseOptions,

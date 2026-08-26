@@ -18,7 +18,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { Database } from "../../shared/sqlite";
+import { Database } from "../../shared/sqlite.ts";
 import {
     addObservationSourceTrustClassColumn,
     CLAIM_APPLICABILITY_TABLES,
@@ -33,6 +33,12 @@ import {
     CLAIMS_AND_EVIDENCE_TABLES,
     createClaimsAndEvidenceSchema,
 } from "./storage-claims-schema.ts";
+import {
+    createDirectFormatMarkerSchema,
+    DIRECT_FORMAT_EPOCH,
+    type ExpectedDirectFormat,
+    MC_APPLICATION_ID,
+} from "./storage-format-epoch.ts";
 import {
     createSessionRuntimeSchema,
     SESSION_RUNTIME_TABLES,
@@ -275,5 +281,30 @@ export function composeRegisteredSchema(
     );
     if (missing.length > 0) {
         throw new Error(`declared objects were not created: ${missing.join(", ")}`);
+    }
+}
+
+/**
+ * Compute the expected direct format (registered inventory plus marker
+ * objects) by composing the components into a scratch in-memory database so
+ * the expectation can never drift from what composition actually creates.
+ */
+export function computeExpectedDirectFormat(
+    components: readonly RegisteredSchemaComponent[] = CURRENT_SCHEMA_COMPONENTS,
+): ExpectedDirectFormat {
+    const manifest = buildSchemaComponentManifest(components);
+    const scratch = new Database(":memory:");
+    try {
+        scratch.exec("PRAGMA foreign_keys=ON");
+        composeRegisteredSchema(scratch, components);
+        createDirectFormatMarkerSchema(scratch);
+        return {
+            applicationId: MC_APPLICATION_ID,
+            formatEpoch: DIRECT_FORMAT_EPOCH,
+            componentManifestDigest: computeSchemaManifestDigest(manifest),
+            schemaObjectNames: listSchemaObjectNames(scratch),
+        };
+    } finally {
+        scratch.close();
     }
 }

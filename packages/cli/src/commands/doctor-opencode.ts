@@ -1259,11 +1259,7 @@ export async function runDoctor(
                 // Stable storage-version probe: live DB schema vs this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 log.info(formatStorageVersions(storageVersions));
-                const fenceCheck = checkStorageVersionFence(storageVersions, {
-                    blockingProcesses: getLiveMigrationBlockingProcesses(
-                        getMagicContextStorageDir(),
-                    ),
-                });
+                const fenceCheck = checkStorageVersionFence(storageVersions);
                 if (fenceCheck.alarm) fail(fenceCheck.message);
                 else log.info(fenceCheck.message);
                 try {
@@ -1288,8 +1284,8 @@ export async function runDoctor(
                     for (const table of [
                         "tags",
                         "compartments",
-                        "memories",
                         "notes",
+                        "claims",
                         "dream_runs",
                     ]) {
                         try {
