@@ -4,6 +4,7 @@ import {
     hasClaimMemoryFragment,
     resolveProjectIdsForIdentities,
 } from "../memory/storage-claim-current-state";
+import { uniformlyAbsentClaimSql } from "../memory/storage-claim-visibility";
 import { MURAL_CUE_RENDERER_EPOCH } from "../mural/storage-mural-cues";
 import { getProjectEmbeddingSnapshot } from "../project-embedding-registry";
 import {
@@ -62,12 +63,18 @@ export function countActiveMemories(db: Database, projectPath: string): number {
     });
 }
 
+// Lifecycle-active is not the same as runnable. `surfaceDecision` drops
+// hard-hidden, contradicted, quarantined, rejected, and expired claims on every
+// surface — maintenance lanes included — so counting only the lifecycle head
+// reported work the runners cannot see: curate would open a child session over an
+// empty pool and the backlog telemetry would never drain.
 const ACTIVE_CLAIM_BASE_SQL = `
     FROM claim_public_ids cpi
     JOIN claims ON claims.id = cpi.claim_id
     JOIN claim_memory_lifecycle_heads heads
       ON heads.claim_id = claims.id AND heads.state = 'active'
-   WHERE claims.project_id = ?`;
+   WHERE claims.project_id = ?
+     AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`;
 
 /** Latest baseline assertion with `paths_state = 'known'` and at least one
  * path selector. */

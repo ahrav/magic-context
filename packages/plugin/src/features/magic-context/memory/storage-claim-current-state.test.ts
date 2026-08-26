@@ -6,6 +6,7 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import type { SourceTrustClass } from "../storage-claim-applicability-schema";
 import { createDirectTestDatabase } from "../test-database";
 import { computeWorkspaceEpochFingerprint } from "../workspaces";
+import { readAuthorizedClaimMemorySnapshot } from "./claim-memory-render";
 import { CLAIM_POLICY_VERSION } from "./claim-visibility-policy";
 import { readProjectMemoryCurrentState } from "./storage-claim-current-state";
 import {
@@ -192,6 +193,59 @@ describe("current-state provider: workspace revalidation", () => {
                 workspaceIdentities: identities,
             });
             expect(stale.status).toBe("stale");
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+});
+
+describe("auto-injection lane: workspace revalidation", () => {
+    test("a revoked workspace makes the automatic lane refuse to publish", () => {
+        // Automatic injection has the least recourse of any surface: nothing
+        // downstream re-checks authorization. A workspace mutation bumps
+        // project_memory_epoch, not the claim generation in the vector, so the
+        // recomputed fingerprint is the only signal that sharing changed.
+        const ctx = setup();
+        try {
+            createClaimOp(ctx, "op-auto", "Auto-injected claim.");
+            ctx.db.exec(`
+                CREATE TABLE IF NOT EXISTS project_state (
+                    project_path TEXT PRIMARY KEY,
+                    project_memory_epoch INTEGER NOT NULL DEFAULT 0
+                );
+            `);
+            ctx.db
+                .prepare(
+                    "INSERT OR REPLACE INTO project_state (project_path, project_memory_epoch) VALUES (?, 1)",
+                )
+                .run("git:u2-current");
+            const identities = ["git:u2-current"];
+            const epoch = computeWorkspaceEpochFingerprint(ctx.db, identities);
+
+            const served = readAuthorizedClaimMemorySnapshot(ctx.db, {
+                authorizedIdentities: identities,
+                ownIdentities: identities,
+                sharedCategories: [],
+                workspaceEpoch: epoch,
+                workspaceIdentities: identities,
+            });
+            expect(served?.items.length ?? 0).toBeGreaterThan(0);
+
+            // Sharing revoked after the caller authorized.
+            ctx.db
+                .prepare(
+                    "UPDATE project_state SET project_memory_epoch = project_memory_epoch + 1 WHERE project_path = ?",
+                )
+                .run("git:u2-current");
+
+            const refused = readAuthorizedClaimMemorySnapshot(ctx.db, {
+                authorizedIdentities: identities,
+                ownIdentities: identities,
+                sharedCategories: [],
+                workspaceEpoch: epoch,
+                workspaceIdentities: identities,
+            });
+            expect(refused).toBeNull();
         } finally {
             closeQuietly(ctx.db);
         }

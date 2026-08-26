@@ -597,7 +597,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                 });
-                recordRun("completed", null);
+                // Project promotions are claim-native, so the legacy `memories`
+                // diff sees nothing and the run row would record no claim IDs
+                // while the line below reports project_promoted > 0.
+                recordRun("completed", null, {
+                    memoryChanges: claimEffectMemoryChanges(result.effects),
+                });
                 log(
                     `[dreamer] review-user-memories: promoted=${result.promoted} project_promoted=${result.projectPromoted} merged=${result.merged} dismissed=${result.dismissed}`,
                 );

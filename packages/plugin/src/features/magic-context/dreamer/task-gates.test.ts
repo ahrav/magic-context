@@ -238,6 +238,42 @@ describe("dream task backlog probes", () => {
     });
 });
 
+describe("uniformly absent claims are not runnable work", () => {
+    test("a quarantined claim leaves the backlog empty", () => {
+        // Lifecycle-active is not runnable: surfaceDecision drops quarantined
+        // claims on every surface, so counting the lifecycle head alone had
+        // curate opening a child session over a pool its runner sees as empty,
+        // and the backlog never drained.
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-hidden-pool";
+        const claim = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "quarantined claim bytes",
+            category: "PROJECT_RULES",
+        });
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "curate").total).toBe(1);
+
+        database
+            .prepare(
+                `INSERT INTO claim_disposition_events
+                    (revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
+                 SELECT claims.current_revision_id, claims.project_id, 'quarantined', 'assert',
+                        'user:test', 1, ?
+                   FROM claims
+                   JOIN claim_public_ids cpi ON cpi.claim_id = claims.id
+                  WHERE cpi.public_id = ?`,
+            )
+            .run(Date.now(), claim.publicClaimId);
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "curate")).toEqual({
+            pending: 0,
+            total: 0,
+        });
+    });
+});
+
 describe("evaluateTaskGate", () => {
     test("classify-memories runs when active claims exist", () => {
         const database = createClaimReaderTestDatabase();

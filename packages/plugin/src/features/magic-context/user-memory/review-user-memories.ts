@@ -16,6 +16,7 @@ import {
     startLeaseHeartbeat,
 } from "../dreamer/lease";
 import { REVIEW_USER_MEMORIES_SYSTEM_PROMPT } from "../dreamer/task-prompts";
+import type { ClaimOperationResultEffect } from "../memory/claim-operation-contract";
 import { canonicalJsonEncode } from "../memory/claim-operation-contract";
 import {
     type AutonomousManifestIdentity,
@@ -66,6 +67,13 @@ export interface ReviewResult {
     merged: number;
     dismissed: number;
     candidatesConsumed: number;
+    /**
+     * Effects of the claim-native project promotions. Reducing the outcome to
+     * counts left the dream-run audit with no claim IDs at all while the log
+     * reported `project_promoted > 0`; the curate and retrospective paths feed
+     * these through `claimEffectMemoryChanges` for the same reason.
+     */
+    effects: readonly ClaimOperationResultEffect[];
 }
 
 interface ReviewCandidateSnapshot extends UserMemoryCandidate {
@@ -542,6 +550,7 @@ export function applyUserMemoryReviewManifest(args: {
                         merged: 0,
                         dismissed: 0,
                         candidatesConsumed: 0,
+                        effects: [],
                     },
                     replayed: operation.operation.replayed,
                     staleReason:
@@ -581,6 +590,7 @@ export function applyUserMemoryReviewManifest(args: {
                     merged: args.manifest.updates.length,
                     dismissed: args.manifest.dismissals.length,
                     candidatesConsumed: args.manifest.consumeCandidateIds.length,
+                    effects: operation.operation.result.effects,
                 },
                 replayed: operation.operation.replayed,
                 staleReason: null,
@@ -597,6 +607,7 @@ export async function reviewUserMemories(args: ReviewUserMemoriesArgs): Promise<
         merged: 0,
         dismissed: 0,
         candidatesConsumed: 0,
+        effects: [],
     };
     const leaseKey = args.leaseKey ?? DREAMING_LEASE_KEY;
     const snapshotNow = Date.now();

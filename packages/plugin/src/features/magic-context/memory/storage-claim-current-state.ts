@@ -41,6 +41,7 @@ import {
     computeProjectMemoryMutationToken,
 } from "./storage-claim-operations.ts";
 import { readActiveDispositions } from "./storage-claim-policy.ts";
+import { uniformlyAbsentClaimSql } from "./storage-claim-visibility.ts";
 import { ClaimGraphCorruptionError, resolveProjectId } from "./storage-claims.ts";
 import type { MemoryScope } from "./types.ts";
 
@@ -605,7 +606,8 @@ export function countProjectMemoryClaims(
                JOIN claims ON claims.id = claim_public_ids.claim_id
                JOIN claim_memory_lifecycle_heads heads ON heads.claim_id = claims.id
               WHERE claims.project_id IN (${request.projectIds.map(() => "?").join(", ")})
-                AND heads.state IN (${lifecycleStates.map(() => "?").join(", ")})`,
+                AND heads.state IN (${lifecycleStates.map(() => "?").join(", ")})
+                AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`,
         )
         .get(...request.projectIds, ...lifecycleStates) as { cnt: number } | undefined;
     return row?.cnt ?? 0;

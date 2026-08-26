@@ -4,6 +4,7 @@ import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import { Database } from "../../../shared/sqlite";
 import { dreamerManifestIdentity, readDreamerProjectClaims } from "../dreamer/claim-manifest";
 import { acquireLeaseWithAcquisition, releaseLease } from "../dreamer/lease";
+import { claimEffectMemoryChanges } from "../dreamer/storage-dream-runs";
 import { runMigrations } from "../migrations";
 import { createClaimMemorySchema } from "../storage-claim-memory-schema";
 import { initializeDatabase } from "../storage-db";
@@ -167,7 +168,7 @@ describe("reviewUserMemories", () => {
         ).version;
         const second = apply();
 
-        expect(first).toEqual({
+        expect(first).toMatchObject({
             result: {
                 promoted: 1,
                 projectPromoted: 1,
@@ -178,6 +179,10 @@ describe("reviewUserMemories", () => {
             replayed: false,
             staleReason: null,
         });
+        // A project promotion commits a claim, so the outcome has to carry the
+        // effects the dream-run audit records; counts alone lose the claim IDs.
+        expect(first.result.effects.length).toBeGreaterThan(0);
+        expect(claimEffectMemoryChanges(first.result.effects)).not.toBeNull();
         expect(second).toEqual({ ...first, replayed: true });
         expect(getUserMemoryCandidates(db)).toHaveLength(0);
         expect(getActiveUserMemories(db).map((memory) => memory.content)).toEqual([

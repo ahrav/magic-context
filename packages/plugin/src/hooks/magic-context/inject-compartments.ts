@@ -1025,6 +1025,11 @@ export function readClaimLaneSnapshot(args: {
             : [args.projectPath],
         sharedCategories: args.workspace.shareCategories ?? [],
         workspaceEpoch,
+        // Only when the epoch is a real fingerprint: the disabled sentinel has
+        // no identities to recompute from.
+        ...(args.workspace.identities.length === 0
+            ? {}
+            : { workspaceIdentities: args.workspace.identities }),
         ...(args.nowMs === undefined ? {} : { nowMs: args.nowMs }),
     });
     if (snapshot === null) return null;

@@ -339,6 +339,54 @@ fn read_generations(
     Ok(generations)
 }
 
+/// Which projects a snapshot vector must account for.
+///
+/// A project-scoped read compares a known id set. A global read cannot: a
+/// project absent from the candidate rows — because nothing matched the filter,
+/// or because it holds no claims at all yet — would never enter a fixed list, so
+/// its first matching claim appearing mid-hydration would leave both vectors
+/// equal and publish a settled result that omits it. Global reads therefore
+/// compare every generation row that exists at each read, which makes a newly
+/// created project's row a difference.
+enum SnapshotScope<'a> {
+    Global,
+    Projects(&'a [i64]),
+}
+
+fn read_all_generations(conn: &Connection) -> AdapterResult<BTreeMap<String, i64>> {
+    let mut statement =
+        sql(conn.prepare("SELECT project_id, generation FROM claim_project_generations"))?;
+    let rows: Vec<(i64, i64)> = sql(statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|rows| rows.collect()))?;
+    Ok(rows
+        .into_iter()
+        .map(|(project_id, generation)| (project_id.to_string(), generation))
+        .collect())
+}
+
+fn read_snapshot_vector_for(
+    conn: &Connection,
+    scope: &SnapshotScope<'_>,
+) -> AdapterResult<SnapshotVector> {
+    let generations = match scope {
+        SnapshotScope::Global => read_all_generations(conn)?,
+        SnapshotScope::Projects(project_ids) => {
+            let mut ids = project_ids.to_vec();
+            ids.sort_unstable();
+            ids.dedup();
+            read_generations(conn, &ids)?
+        }
+    };
+    Ok(SnapshotVector {
+        vector_version: 1,
+        database_incarnation_id: marker_incarnation(conn)?,
+        workspace_epoch: String::new(),
+        project_generations: generations.clone(),
+        policy_generations: generations,
+    })
+}
+
 fn read_snapshot_vector(conn: &Connection, project_ids: &[i64]) -> AdapterResult<SnapshotVector> {
     let mut ids = project_ids.to_vec();
     ids.sort_unstable();
@@ -580,6 +628,23 @@ fn read_policy(conn: &Connection, revision_id: i64) -> AdapterResult<ClaimPolicy
         .optional())?;
     let active = dispositions(conn, revision_id)?;
     let (maturity, taint, auto, explicit, hidden, version, generation, missing) = match row {
+        // A projection written with a newer policy version records decisions
+        // under semantics this build cannot interpret, so its stored maturity,
+        // taint, and eligibility bits are not a trustworthy answer. Treat it
+        // exactly as a missing row — the adapter's existing "no trustworthy
+        // stored decision" case, which fails closed — rather than showing or
+        // hiding content on unknown semantics and omitting `policy:unknown`.
+        // Authoritative dispositions are read separately and still apply.
+        Some((_, _, _, _, _, version, generation)) if version > POLICY_VERSION => (
+            "CANDIDATE".to_string(),
+            "unknown".to_string(),
+            false,
+            false,
+            true,
+            version,
+            generation,
+            true,
+        ),
         Some((maturity, taint, auto, explicit, hidden, version, generation)) => (
             maturity,
             taint,
@@ -1025,7 +1090,11 @@ pub fn read_claim_memories(
                 }
             }
         }
-        let vector = read_snapshot_vector(conn, &project_ids)?;
+        let scope = match project {
+            Some(_) => SnapshotScope::Projects(&project_ids),
+            None => SnapshotScope::Global,
+        };
+        let vector = read_snapshot_vector_for(conn, &scope)?;
         Ok((claims, project_ids, vector))
     })();
     let (claims, project_ids, vector) = match hydrated {
@@ -1038,7 +1107,13 @@ pub fn read_claim_memories(
             return Err(error);
         }
     };
-    let fresh = read_snapshot_vector(conn, &project_ids)?;
+    let fresh = read_snapshot_vector_for(
+        conn,
+        &match project {
+            Some(_) => SnapshotScope::Projects(&project_ids),
+            None => SnapshotScope::Global,
+        },
+    )?;
     if fresh != vector {
         return Ok(ClaimMemoryReadResult {
             outcome: "stale".to_string(),

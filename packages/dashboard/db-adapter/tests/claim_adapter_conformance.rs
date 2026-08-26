@@ -957,6 +957,66 @@ fn tauri_content_edits_keep_explicit_user_eligibility() {
 }
 
 #[test]
+fn a_future_policy_version_is_treated_as_unprojected() {
+    // The adapter declared POLICY_VERSION but never compared the stored value,
+    // so an older dashboard trusted a newer writer's eligibility bits, maturity,
+    // and taint — hiding or showing content on semantics it cannot interpret and
+    // omitting the policy:unknown label.
+    let conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+    let revision_id: i64 = conn
+        .query_row(
+            "SELECT current_revision_id FROM claims WHERE id = (SELECT claim_id FROM claim_public_ids WHERE public_id = ?1)",
+            [CLAIM_A],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE claim_effective_policy SET policy_version = 99, auto_eligible = 1, explicit_eligible = 1,          effective_maturity = 'ENFORCED', origin_taint = 'EXPLICIT_USER' WHERE revision_id = ?1",
+        [revision_id],
+    )
+    .unwrap();
+
+    // The read path must not disclose it on unknown semantics.
+    let stats = claim_adapter::read_claim_memory_stats(&conn, None).unwrap();
+    assert_eq!(
+        stats.total, 0,
+        "a future-version projection must not be disclosed"
+    );
+
+    // And the picker must agree with the read path.
+    let projects = claim_adapter::enumerate_claim_projects(&conn).unwrap();
+    assert!(projects.is_empty(), "{projects:?}");
+}
+
+#[test]
+fn a_global_read_tracks_projects_absent_from_its_candidates() {
+    // An all-project read built its vector from candidate rows only, so a
+    // project matching nothing — or holding no claims yet — was untracked and
+    // its first matching claim appearing mid-hydration left both vectors equal.
+    let conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+    conn.execute(
+        "INSERT INTO projects (id, canonical_identity, created_at) VALUES (7, 'git:quiet', 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO claim_project_generations (project_id, generation, updated_at) VALUES (7, 3, 1)",
+        [],
+    )
+    .unwrap();
+
+    let listed = claim_adapter::read_claim_memories(&conn, None, None, None, None, 50, 0).unwrap();
+    let vector = listed.snapshot_vector.expect("a global read carries a vector");
+    assert!(
+        vector.project_generations.contains_key("7"),
+        "a global read must track every generation row, not only candidate projects: {:?}",
+        vector.project_generations
+    );
+}
+
+#[test]
 fn an_empty_project_scoped_read_still_tracks_the_requested_project() {
     // With no matching candidates the id list was empty, so neither snapshot
     // vector carried the project's generation and the comparison could not

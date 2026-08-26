@@ -189,7 +189,11 @@ export async function executeCtxSearch(
             db: deps.db,
             projectPath,
             locators: locatorShape,
-            limit: Math.max(normalizeSearchResultLimit(args.limit), locatorShape.length),
+            // The requested limit applies here exactly as it does to every other
+            // search path. Raising the cap to the locator count let `limit: 1`
+            // with two ids return both, and a long enough locator list slip past
+            // the shared hard ceiling.
+            limit: normalizeSearchResultLimit(args.limit),
             visibleRevisionLocators,
         });
         if (locatorResults !== null) {
