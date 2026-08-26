@@ -78,21 +78,26 @@ function coordinatePair(
     };
 }
 
-function candidateFor(context: ReturnType<typeof fixtures>, pair: PairedCaseFact): GraduationCandidate {
+function candidateFor(
+    context: ReturnType<typeof fixtures>,
+    pairs: readonly PairedCaseFact[],
+): GraduationCandidate {
     const trustedCloseFingerprint = canonicalFingerprint(context.close);
     const incidentBytes = { scenario: "synthetic-current-state", expected: "pass" };
     return buildGraduationCandidate({
         close: context.close,
         trustedCloseFingerprint,
         report: context.report,
-        pair,
+        pairs,
         incidentBytes,
         semanticRevisionId: "rev-first",
         secondPrivacyApproval: {
             approver: "privacy-reviewer",
+            // Names the admitted case directly so an empty or cross-case pair set still reaches
+            // the constructor's own rejections rather than failing while building the subject.
             subjectFingerprint: canonicalFingerprint({
                 epochId: context.close.body.epochId,
-                caseId: pair.caseId,
+                caseId: context.close.body.cases[0]!.caseId,
                 closeManifestFingerprint: trustedCloseFingerprint,
                 incidentBytesFingerprint: canonicalFingerprint(incidentBytes),
             }),
@@ -116,7 +121,7 @@ describe("prospective incident graduation", () => {
             close,
             trustedCloseFingerprint,
             report,
-            pair,
+            pairs: [pair],
             incidentBytes,
             semanticRevisionId: "rev-first",
             secondPrivacyApproval: { approver: "privacy-reviewer", subjectFingerprint },
@@ -175,7 +180,7 @@ describe("prospective incident graduation", () => {
             close,
             trustedCloseFingerprint,
             report,
-            pair,
+            pairs: [pair],
             incidentBytes,
             semanticRevisionId: "rev-first",
             secondPrivacyApproval: {
@@ -195,7 +200,7 @@ describe("prospective incident graduation", () => {
 
     it("rejects an accepted-behavior disposition when a later coordinate regresses", () => {
         const context = fixtures();
-        const candidate = candidateFor(context, context.pair);
+        const candidate = candidateFor(context, [context.pair]);
         expect(candidate.disposition).toBe("executable-accepted-behavior");
         const failing = coordinatePair(context.pair, 11, {
             productOutcome: "fail",
@@ -216,7 +221,7 @@ describe("prospective incident graduation", () => {
 
     it("accepts an accepted-behavior disposition when every coordinate passes", () => {
         const context = fixtures();
-        const candidate = candidateFor(context, context.pair);
+        const candidate = candidateFor(context, [context.pair]);
         expect(() => validateGraduationPairBindings(
             [candidate],
             [context.pair, coordinatePair(context.pair, 11)],
@@ -225,11 +230,52 @@ describe("prospective incident graduation", () => {
 
     it("rejects a coordinate whose implementation fingerprint drifts from the candidate", () => {
         const context = fixtures();
-        const candidate = candidateFor(context, context.pair);
+        const candidate = candidateFor(context, [context.pair]);
         const drifted: PairedCaseFact = { ...coordinatePair(context.pair, 11), implementationFingerprint: H3 };
         expect(candidate.implementationFingerprint).not.toBe(drifted.implementationFingerprint);
         expect(() => validateGraduationPairBindings([candidate], [context.pair, drifted])).toThrow(
             /pair-binding-mismatch/,
+        );
+    });
+
+    it("builds a regression disposition from a mixed coordinate set that then validates", () => {
+        const context = fixtures();
+        const regressed = coordinatePair(context.pair, 11, {
+            productOutcome: "fail",
+            failedChecks: ["check-current"],
+        });
+        const candidate = candidateFor(context, [context.pair, regressed]);
+        expect(candidate.disposition).toBe("executable-regression");
+        expect(() => validateGraduationPairBindings([candidate], [context.pair, regressed])).not.toThrow();
+    });
+
+    it("builds an accepted-behavior disposition from an all-passing coordinate set that then validates", () => {
+        const context = fixtures();
+        const alsoPassing = coordinatePair(context.pair, 11);
+        const candidate = candidateFor(context, [context.pair, alsoPassing]);
+        expect(candidate.disposition).toBe("executable-accepted-behavior");
+        expect(() => validateGraduationPairBindings([candidate], [context.pair, alsoPassing])).not.toThrow();
+    });
+
+    it("rejects a pair set that is empty or spans two case ids", () => {
+        const context = fixtures();
+        expect(() => candidateFor(context, [])).toThrow(/pair-set-empty/);
+        const otherCase: PairedCaseFact = { ...context.pair, caseId: `case-${"e".repeat(32)}` };
+        expect(() => candidateFor(context, [context.pair, otherCase])).toThrow(/pair-set-multi-case/);
+    });
+
+    it("rejects a pair set that disagrees on implementation or family identity", () => {
+        const context = fixtures();
+        const driftedImplementation: PairedCaseFact = {
+            ...coordinatePair(context.pair, 11),
+            implementationFingerprint: H3,
+        };
+        expect(() => candidateFor(context, [context.pair, driftedImplementation])).toThrow(
+            /pair-set-implementation-drift/,
+        );
+        const driftedFamily: PairedCaseFact = { ...coordinatePair(context.pair, 11), familyId: "fam-other" };
+        expect(() => candidateFor(context, [context.pair, driftedFamily])).toThrow(
+            /report-or-pair-binding-mismatch/,
         );
     });
 
@@ -240,7 +286,7 @@ describe("prospective incident graduation", () => {
             close,
             trustedCloseFingerprint: canonicalFingerprint(close),
             report,
-            pair,
+            pairs: [pair],
             incidentBytes: { scenario: "/home/private/customer" },
             semanticRevisionId: "rev-first",
             secondPrivacyApproval: { approver: "privacy-reviewer", subjectFingerprint: H1 },

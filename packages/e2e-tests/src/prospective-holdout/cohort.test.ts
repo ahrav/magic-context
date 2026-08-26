@@ -1,9 +1,21 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+    chmodSync,
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    rmSync,
+    symlinkSync,
+    utimesSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildCohortClose, ProspectiveIntakeStore } from "./cohort";
+import { HoldoutContractError } from "./contract";
 import { reviewSanitizedIntake, staticPrivacyRejection } from "./intake";
+import { withRecoverableLock } from "./lock";
 import { deadPid, H1, H2, H3, sanitizedIntakeFixture } from "./test-fixtures";
 
 const key = new TextEncoder().encode("c".repeat(32));
@@ -128,6 +140,35 @@ function seedLock(root: string, owner: { pid: number; nonce: string; acquiredAt:
     return lock;
 }
 
+function pause(ms: number): void {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Arranges for `lock` to be removed a moment from now by a separate process, and
+ * returns once that process is running. A waiter blocks its own thread between
+ * acquisition attempts, so nothing in this process could release the lock while
+ * it waits: only another process can produce a release the waiter observes.
+ *
+ * The removal is sequenced behind a marker the caller's return writes, and the
+ * caller waits for the poller to start, so the release lands after the waiter's
+ * first attempt has already failed and well inside the acquire timeout.
+ */
+function releaseFromCompetingProcess(root: string, lock: string): void {
+    const polling = join(root, "holder-polling");
+    const release = join(root, "holder-release");
+    // Paths arrive as positional arguments, so no path text is spliced into the script.
+    const script = ': > "$2"; while [ ! -e "$3" ]; do sleep 0.01; done; sleep 0.15; rm -rf "$1"';
+    const holder = spawn("/bin/sh", ["-c", script, "sh", lock, polling, release], { stdio: "ignore" });
+    holder.unref();
+    const startupDeadline = Date.now() + 10_000;
+    while (!existsSync(polling)) {
+        if (Date.now() >= startupDeadline) throw new Error("competing lock holder never started");
+        pause(5);
+    }
+    writeFileSync(release, "");
+}
+
 describe("cohort store lock", () => {
     it("reclaims a lock whose recorded holder is dead and whose lease expired", () => {
         const pid = deadPid();
@@ -168,4 +209,84 @@ describe("cohort store lock", () => {
             rmSync(root, { recursive: true, force: true });
         }
     }, 20_000);
+
+    it("takes the lock a live holder releases while a waiter is waiting", () => {
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            // A live holder inside its lease is never reclaimable, so the read can only
+            // succeed by retrying across the release the competing process performs.
+            const lock = seedLock(root, { pid: process.pid, nonce: "live-holder", acquiredAt: Date.now() });
+            releaseFromCompetingProcess(root, lock);
+            const store = new ProspectiveIntakeStore(root);
+            const started = Date.now();
+            expect(store.readDecisions()).toEqual({ decisions: [], late: [] });
+            // An uncontended acquisition returns in about a millisecond, so the elapsed
+            // wait is what distinguishes a read that waited out the holder from one that
+            // found the lock already free and never entered the retry loop.
+            expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+            expect(existsSync(lock)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    it("keeps waiting when a failed claim leaves nothing at the lock path", () => {
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            // A symlink to a missing target holds still, for a whole acquisition, the
+            // state a release produces for an instant: `mkdirSync` refuses the path as
+            // taken while every existence check on it reports nothing there. Reading
+            // that absence as a failure is what would report busy for a free lock, so
+            // acquisition must instead retry until its deadline.
+            symlinkSync(join(root, "no-such-holder"), join(root, ".lock"));
+            const store = new ProspectiveIntakeStore(root);
+            const started = Date.now();
+            expect(() => store.readDecisions()).toThrow(/cohort-store: busy/);
+            expect(Date.now() - started).toBeGreaterThanOrEqual(1_000);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    it("surfaces the filesystem error when the lock path cannot be created", () => {
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            let refused: unknown;
+            try {
+                withRecoverableLock(join(root, "absent", ".lock"), { busyCode: "cohort-store: busy" }, () => {});
+            } catch (error) {
+                refused = error;
+            }
+            // A missing parent directory is not a busy peer, and reporting it as one
+            // would hide the one fact that explains the failure.
+            expect((refused as { code?: string }).code).toBe("ENOENT");
+            expect(refused).not.toBeInstanceOf(HoldoutContractError);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("surfaces a refused permission on the store root rather than busy", () => {
+        // A process running as root creates the lock regardless of the mode, so the
+        // permission this asserts on does not exist there.
+        if (process.getuid?.() === 0) return;
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            // The store creates its own root, and a recursive create leaves an existing
+            // directory's mode alone, so a read-only root reaches the lock as EACCES.
+            chmodSync(root, 0o500);
+            const store = new ProspectiveIntakeStore(root);
+            let refused: unknown;
+            try {
+                store.readDecisions();
+            } catch (error) {
+                refused = error;
+            }
+            expect((refused as { code?: string }).code).toBe("EACCES");
+            expect(refused).not.toBeInstanceOf(HoldoutContractError);
+        } finally {
+            chmodSync(root, 0o700);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
 });

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HoldoutContractError } from "./contract";
 
@@ -84,24 +84,43 @@ function lockAbandoned(lock: string): boolean {
     }
 }
 
-function claimLock(lock: string): boolean {
+/**
+ * Outcome of one acquisition attempt. `contended` is every failure another
+ * process can clear by releasing or by finishing a reclaim, so a later attempt
+ * can still win the lock. `structural` is a path no attempt can turn into a lock
+ * directory, and carries the filesystem error so a caller reports that cause
+ * rather than presenting a broken path as a busy peer.
+ */
+type LockClaim =
+    | { status: "acquired" }
+    | { status: "contended" }
+    | { status: "structural"; error: unknown };
+
+function claimLock(lock: string): LockClaim {
     try {
         mkdirSync(lock);
-    } catch {
-        return false;
+    } catch (error) {
+        // EEXIST is the only `mkdirSync` failure a releasing holder clears: the path is
+        // already a lock directory. Every other errno describes the path itself, a
+        // missing parent or a refused permission, and waiting does not change it.
+        if (errorCode(error) === "EEXIST") return { status: "contended" };
+        return { status: "structural", error };
     }
     const owner: LockOwner = { pid: process.pid, nonce: LOCK_NONCE, acquiredAt: Date.now() };
     try {
         writeFileSync(join(lock, LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`, { flag: "wx", mode: 0o600 });
     } catch {
-        return false;
+        // `mkdirSync` created this directory empty a moment ago, so the record write
+        // fails only once a reclaimer has removed the directory or installed its own
+        // record in it. That lock belongs to the reclaimer, which is contention.
+        return { status: "contended" };
     }
     // A racing reclaimer can remove this directory between `mkdirSync` and the
     // record write and install its own lock in the same place. Reading the record
     // back is what proves the surviving lock is this process's rather than the
     // racer's; a mismatch is a lost race, so leave the winner's lock alone and let
     // the caller retry.
-    return readLockOwner(lock)?.nonce === LOCK_NONCE;
+    return readLockOwner(lock)?.nonce === LOCK_NONCE ? { status: "acquired" } : { status: "contended" };
 }
 
 function releaseLock(lock: string): void {
@@ -127,6 +146,11 @@ export interface RecoverableLockOptions {
  * reclaim, a process killed between `mkdirSync` and release would leave a
  * directory no later run can remove, and every later operation on the guarded
  * resource would report `options.busyCode` forever.
+ *
+ * `options.busyCode` describes exactly one situation: a lock still held when the
+ * acquire deadline passes. A lock path that cannot be created at all raises the
+ * underlying filesystem error instead, so a missing parent or a refused
+ * permission is not reported as a busy peer.
  */
 export function withRecoverableLock<T>(
     lockPath: string,
@@ -138,15 +162,25 @@ export function withRecoverableLock<T>(
     // satisfy the lease test again before the acquire timeout expires, so every
     // later iteration goes through the deadline check.
     let reclaimed = false;
-    while (!claimLock(lockPath)) {
+    for (;;) {
+        const claim = claimLock(lockPath);
+        if (claim.status === "acquired") break;
+        // Waiting out the acquire timeout on a path that can never hold a directory
+        // ends in `options.busyCode`, which names contention that was never there.
+        // The filesystem error is the honest diagnostic, and rethrowing it is what
+        // keeps the errno: the callers name their busy codes in different areas, so
+        // no single contract code could carry a cause that belongs to the path.
+        if (claim.status === "structural") throw claim.error;
         if (!reclaimed && lockAbandoned(lockPath)) {
             reclaimed = true;
             rmSync(lockPath, { recursive: true, force: true });
             continue;
         }
-        if (!existsSync(lockPath) || Date.now() >= deadline) {
-            throw new HoldoutContractError([options.busyCode]);
-        }
+        // Contention is all that remains, and a holder that releases mid-wait leaves
+        // an absent directory behind, which the next attempt turns into an acquired
+        // lock. So the deadline alone ends the wait: reading absence as a failure here
+        // would report busy for a lock that is already free.
+        if (Date.now() >= deadline) throw new HoldoutContractError([options.busyCode]);
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
     }
     try {

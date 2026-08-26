@@ -35,11 +35,29 @@ export interface GraduationCandidate {
     implementationFingerprint: string;
 }
 
+/**
+ * A case yields one pair per execution coordinate, so the disposition is a property of the whole
+ * coordinate set rather than of any single cell: one passing model, seed, or platform says nothing
+ * about the others. Accepted behavior therefore requires every coordinate to have completed with
+ * both arms passing, and any incomplete or failing coordinate makes the case a regression.
+ * `buildGraduationCandidate` and `validateGraduationPairBindings` read the disposition through this
+ * one predicate so a stamped disposition cannot disagree with the validated one. Callers reject an
+ * empty set first, because `every` over no coordinates is vacuously true.
+ */
+function dispositionFor(casePairs: readonly PairedCaseFact[]): GraduationCandidate["disposition"] {
+    const allPass = casePairs.every((pair) =>
+        pair.status === "complete" &&
+        pair.releaseN.productOutcome === "pass" &&
+        pair.releaseNMinus1.productOutcome === "pass"
+    );
+    return allPass ? "executable-accepted-behavior" : "executable-regression";
+}
+
 export function buildGraduationCandidate(input: {
     close: CohortCloseManifest;
     trustedCloseFingerprint: string;
     report: ProspectiveReport;
-    pair: PairedCaseFact;
+    pairs: readonly PairedCaseFact[];
     incidentBytes: unknown;
     semanticRevisionId: string;
     secondPrivacyApproval: { approver: string; subjectFingerprint: string };
@@ -56,12 +74,25 @@ export function buildGraduationCandidate(input: {
             violations.map((entry) => `graduation.privacy.${entry.category}:${entry.path}`),
         );
     }
-    const closed = input.close.body.cases.find((entry) => entry.caseId === input.pair.caseId);
+    const [first] = input.pairs;
+    if (!first) throw new HoldoutContractError(["graduation: pair-set-empty"]);
+    // The set has to be exactly one case's coordinates, because the case identity it carries
+    // selects the admitted case and every field the candidate copies out of it.
+    if (input.pairs.some((pair) => pair.caseId !== first.caseId)) {
+        throw new HoldoutContractError(["graduation: pair-set-multi-case"]);
+    }
+    // The candidate carries one implementation fingerprint for the whole set, so the coordinates
+    // have to agree on it rather than the first one speaking for the rest.
+    const implementationFingerprint = first.implementationFingerprint;
+    if (input.pairs.some((pair) => pair.implementationFingerprint !== implementationFingerprint)) {
+        throw new HoldoutContractError(["graduation: pair-set-implementation-drift"]);
+    }
+    const closed = input.close.body.cases.find((entry) => entry.caseId === first.caseId);
     if (!closed) throw new HoldoutContractError(["graduation: case-not-admitted"]);
     if (
         input.report.body.epochId !== input.close.body.epochId ||
         input.report.body.closeManifestFingerprint !== input.trustedCloseFingerprint ||
-        input.pair.familyId !== closed.familyId
+        input.pairs.some((pair) => pair.familyId !== closed.familyId)
     ) {
         throw new HoldoutContractError(["graduation: report-or-pair-binding-mismatch"]);
     }
@@ -94,20 +125,17 @@ export function buildGraduationCandidate(input: {
     const sourceItemId = `src-prospective-${suffix}`;
     const sourceClaimId = `claim-prospective-${suffix}`;
     const variantId = `var-prospective-${suffix}`;
-    const bothPass = input.pair.status === "complete" &&
-        input.pair.releaseN.productOutcome === "pass" &&
-        input.pair.releaseNMinus1.productOutcome === "pass";
     const candidate: GraduationCandidate = {
         schema: "prospective-graduation-candidate/v1",
         sourceItemId,
         sourceClaimId,
         familyId: closed.familyId,
         variantId,
-        disposition: bothPass ? "executable-accepted-behavior" : "executable-regression",
+        disposition: dispositionFor(input.pairs),
         source,
         sourceFingerprint: rowDigest(source),
         incidentBytes: input.incidentBytes,
-        implementationFingerprint: input.pair.implementationFingerprint,
+        implementationFingerprint,
     };
     const metadataViolations = scanForSensitiveContent(candidate, input);
     if (metadataViolations.length > 0) {
@@ -173,21 +201,13 @@ export function validateGraduationPairBindings(
         // regression in any other coordinate pass, so every pair for the case has to agree
         // with the candidate, and its disposition is derived from all of them together.
         const casePairs = pairs.filter((entry) => entry.caseId === candidate.source.case_id);
-        const allPass = casePairs.every((pair) =>
-            pair.status === "complete" &&
-            pair.releaseN.productOutcome === "pass" &&
-            pair.releaseNMinus1.productOutcome === "pass"
-        );
-        const expectedDisposition = allPass
-            ? "executable-accepted-behavior"
-            : "executable-regression";
         if (
             casePairs.length === 0 ||
             casePairs.some((pair) =>
                 pair.familyId !== candidate.familyId ||
                 pair.implementationFingerprint !== candidate.implementationFingerprint
             ) ||
-            candidate.disposition !== expectedDisposition
+            candidate.disposition !== dispositionFor(casePairs)
         ) {
             throw new HoldoutContractError(["graduation: pair-binding-mismatch"]);
         }
