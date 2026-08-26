@@ -453,6 +453,49 @@ describe("doctor reset-db U11 scenarios", () => {
         );
     });
 
+    it("refuses when the family becomes current during the confirmation prompt", async () => {
+        // The prompt is an open-ended window. Another process can upgrade the
+        // family in place and exit while it is displayed, after which the holder
+        // check sees nobody. Publishing from the pre-prompt reading would bind a
+        // marker to a family that no longer matches it, and marker verification
+        // compares device and inode while ignoring content — so an in-place
+        // replacement reusing the inode passes and a current family is
+        // quarantined.
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "context.db");
+        seedUnsupportedDirect(dbPath);
+        let reads = 0;
+
+        const code = await runResetDb({
+            dbPath,
+            storageDir,
+            prompts: new MockPrompts(),
+            yes: true,
+            deps: {
+                inspectFamilyState: (path: string) => {
+                    reads += 1;
+                    // Reads 1 and 2 are the initial classification and the
+                    // pre-prompt exclusivity re-check; the upgrade lands while
+                    // the confirmation is open, so the post-confirmation read
+                    // must see it.
+                    if (reads >= 3) {
+                        return {
+                            state: "current",
+                            databaseIncarnationId: "upgraded-incarnation",
+                        } as ReturnType<typeof inspectDirectDatabaseFamilyState>;
+                    }
+                    return inspectDirectDatabaseFamilyState(path);
+                },
+            },
+        });
+
+        expect(code).toBe(RESET_DB_EXIT.refused);
+        expect(existsSync(databaseResetMarkerPath(dbPath))).toBe(false);
+        expect(readdirSync(storageDir).some((name) => name.includes(".mc-quarantine-"))).toBe(
+            false,
+        );
+    });
+
     it("scenario 8: quarantine uses sidecar-first order and private permissions", async () => {
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "context.db");

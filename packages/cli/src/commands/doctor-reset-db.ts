@@ -611,12 +611,27 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
         return RESET_DB_EXIT.declined;
     }
 
+    // The confirmation prompt is an open-ended window: another process can
+    // upgrade or replace the family in place and exit while it is displayed, and
+    // the holder check afterwards would see nobody. Publishing from the
+    // pre-prompt reading would then bind a marker to a family that no longer
+    // matches it, and because marker verification compares device and inode
+    // while deliberately ignoring size and content, an in-place replacement that
+    // reuses the inode can still pass — quarantining a now-current family. So
+    // reclassify and recapture immediately before publishing and act on that
+    // reading, not the one the user was shown.
+    const postConfirmRecheck = recheckUnderExclusivity(prompts, deps, dbPath, confirmedState);
+    if (postConfirmRecheck.outcome === "stop") return postConfirmRecheck.code;
+    const publishState = postConfirmRecheck.state;
+    const publishPlan = captureResetPlan(prompts, deps, dbPath);
+    if (publishPlan === null) return RESET_DB_EXIT.failed;
+
     const marker = buildDatabaseResetMarker({
         dbPath,
         createdAtMs: deps.now().getTime(),
-        databaseIncarnationId: familyIncarnation(confirmedState),
-        quarantineDirPath: plan.quarantineDirPath,
-        fileIdentities: plan.identities,
+        databaseIncarnationId: familyIncarnation(publishState),
+        quarantineDirPath: publishPlan.quarantineDirPath,
+        fileIdentities: publishPlan.identities,
     });
     try {
         writeDatabaseResetMarker(marker);
