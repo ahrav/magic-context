@@ -2877,13 +2877,6 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         }
     }
 
-    // Legacy rows can contain the marker without the new persisted image. Omitting
-    // an image part already changes provider-visible multipart bytes, so also remove
-    // the now-false textual reference rather than claiming an image follows.
-    if (!options.state.cachedM0MuralDataUrl) {
-        m0Text = stripMemoryMuralBlock(m0Text);
-    }
-
     const publishedVector = options.state.snapshotMarkers.claimSnapshotVector;
     const currentWorkspace = resolveWorkspaceRenderContext({
         db: options.db,
@@ -2902,11 +2895,31 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         ).length > 0;
     if (claimLaneMoved) {
         m0Text = stripProjectMemoryBlock(m0Text);
+        // The mural is a picture of the same claim lane: it renders public claim
+        // ids, categories, and cue text drawn from the snapshot this fence just
+        // declared stale. Withholding only the text would leave those cues legible
+        // in the image, so drop the cached wire payload and its hash too. Safe to
+        // clear rather than merely skip: the payload is frozen alongside
+        // claimSnapshotVector in one persistCachedM0 row, so a moved vector means
+        // this image can never be published again. The next pass folds on the same
+        // vector change and re-derives it from the project-level mural render,
+        // which reuses the stored PNG whenever the cue text is unchanged.
+        options.state.cachedM0MuralDataUrl = null;
+        options.state.cachedM0MuralHash = null;
         options.db
             .prepare(
                 "UPDATE session_meta SET memory_block_count = 0, memory_block_ids = '[]', memory_block_hashes = '[]' WHERE session_id = ?",
             )
             .run(options.sessionId);
+    }
+
+    // Runs after the staleness fence so one predicate covers both cases: a legacy
+    // row carrying the marker without a persisted image, and a stale snapshot whose
+    // image was just dropped above. Omitting an image part already changes
+    // provider-visible multipart bytes, so also remove the now-false textual
+    // reference rather than claiming an image follows.
+    if (!options.state.cachedM0MuralDataUrl) {
+        m0Text = stripMemoryMuralBlock(m0Text);
     }
 
     let prependedMessageCount = 0;

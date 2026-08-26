@@ -2357,13 +2357,6 @@ export function injectM0M1Pi(
 	const skippedVisibleMessages = boundaryId
 		? trimPiMessagesToBoundary(piMessages, entryIds, boundaryId)
 		: 0;
-	const muralWire = m0.includes("<memory-mural>")
-		? muralForWire(state.sessionId)
-		: undefined;
-	// A legacy row with no paired payload cannot replay its old image part. Since
-	// that omission already changes provider-visible bytes, remove the false text
-	// claiming an image follows and keep the fallback internally consistent.
-	if (!muralWire) m0 = stripMemoryMuralBlock(m0);
 	const publishWorkspace = resolveWorkspaceRenderContextPi(state, db);
 	const publishedVector = markers.claimSnapshotVector;
 	const publishWorkspaceEpoch =
@@ -2382,10 +2375,29 @@ export function injectM0M1Pi(
 		).length > 0;
 	if (claimLaneMoved) {
 		m0 = stripProjectMemoryBlock(m0);
+		// The mural is a picture of the same claim lane: it renders public claim
+		// ids, categories, and cue text drawn from the snapshot this fence just
+		// declared stale. Withholding only the text would leave those cues legible
+		// in the image, so drop the cached wire payload and its hash too. Safe to
+		// clear rather than merely skip: the payload is frozen alongside
+		// claimSnapshotVector in one cached m[0] row, so a moved vector means this
+		// image can never be published again. The next pass folds on the same
+		// vector change and re-derives it from the project-level mural render,
+		// which reuses the stored PNG whenever the cue text is unchanged.
+		rememberPiMuralPayload(state.sessionId, null, null);
 		db.prepare(
 			"UPDATE session_meta SET memory_block_count = 0, memory_block_ids = '[]', memory_block_hashes = '[]' WHERE session_id = ?",
 		).run(state.sessionId);
 	}
+	const muralWire = m0.includes("<memory-mural>")
+		? muralForWire(state.sessionId)
+		: undefined;
+	// Runs after the staleness fence so one predicate covers both cases: a legacy
+	// row with no paired payload that cannot replay its old image part, and a stale
+	// snapshot whose payload was just dropped above. Since that omission already
+	// changes provider-visible bytes, remove the false text claiming an image
+	// follows and keep the fallback internally consistent.
+	if (!muralWire) m0 = stripMemoryMuralBlock(m0);
 	prependM0M1Messages(piMessages, m0, m1, muralWire);
 	logSession(
 		state.sessionId,

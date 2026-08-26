@@ -9895,14 +9895,23 @@ impl McHandler {
         let Some(items) = payload.get("items").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires items");
         };
-        // The requested IDs are the accept predicate's oracle: an attempt is
-        // successful only if its manifest covers exactly these.
-        let mut expected_ids: BTreeSet<i64> = BTreeSet::new();
+        // The requested claims are the accept predicate's oracle: an attempt
+        // is successful only if its manifest covers exactly these. Identity is
+        // the claim's opaque public ID, which is also what
+        // `CLASSIFY_SYSTEM_PROMPT` asks the model to echo back — a request
+        // parser and a manifest validator that disagreed on the identity type
+        // would reject every attempt the prompt can produce.
+        let mut expected_ids: BTreeSet<String> = BTreeSet::new();
         for item in items {
-            let Some(memory_id) = item.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("classify items require an integer memory_id");
+            let Some(public_claim_id) = item.get("public_claim_id").and_then(Value::as_str) else {
+                return invalid_params_error("classify items require a public_claim_id string");
             };
-            expected_ids.insert(memory_id);
+            if !mc_core::claim_operation::is_valid_public_claim_id(public_claim_id) {
+                return invalid_params_error(
+                    "classify items require a well-formed public_claim_id",
+                );
+            }
+            expected_ids.insert(public_claim_id.to_owned());
         }
         let Some(models) = payload.get("model_chain").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires model_chain");
@@ -9931,20 +9940,28 @@ impl McHandler {
             model_chain.push(model.to_string());
         }
         // The deadline prevents new producer runs after the caller's supplied
-        // budget expires.
-        let deadline = match payload.get("timeout_ms") {
-            None => None,
-            Some(value) => {
-                let Some(ms) = value.as_u64().filter(|ms| *ms > 0) else {
-                    return invalid_params_error("classify timeout_ms must be a positive integer");
-                };
-                // `Instant + Duration` panics on overflow, so an absurd
-                // budget is a parameter error, not a crashed handler task.
-                let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
-                    return invalid_params_error("classify timeout_ms is out of range");
-                };
-                Some(deadline)
-            }
+        // budget expires, and it is the ONLY bound relating this handler's
+        // work to the caller's transport budget. Without it a single model can
+        // burn CLASSIFY_AWAIT_TIMEOUT on the start, CLASSIFY_AWAIT_TIMEOUT on
+        // the await, and CLASSIFY_RECOVERY_TIMEOUT on the re-drain — 21
+        // minutes — and a full MAX_CLASSIFY_MODEL_CHAIN chain multiplies that
+        // by eight, so the caller's cancel would always land mid-chain,
+        // between a producer run and its purge. Required, not optional: a
+        // payload that omits it is asking for an unbounded billable chain.
+        let deadline = {
+            let Some(ms) = payload
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+            else {
+                return invalid_params_error("classify payload requires a positive timeout_ms");
+            };
+            // `Instant + Duration` panics on overflow, so an absurd
+            // budget is a parameter error, not a crashed handler task.
+            let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
+                return invalid_params_error("classify timeout_ms is out of range");
+            };
+            deadline
         };
 
         // Exactly one execution per (ledger_session, command_id): a
@@ -9998,7 +10015,7 @@ impl McHandler {
         let mut last_error = String::new();
         let mut output = None;
         for (attempt, model) in model_chain.iter().enumerate() {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 last_error =
                     "classify time budget exhausted before starting a producer run".to_string();
                 break;
@@ -10026,7 +10043,7 @@ impl McHandler {
             // Connection and route setup can consume the remaining budget;
             // a send after the promised deadline would start a billable run
             // only to time out its zero-length await immediately.
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 last_error = "classify time budget exhausted during producer startup".to_string();
                 break;
             }
@@ -13603,11 +13620,8 @@ fn need_full_sync_response(request: &TransformRequest) -> PreparedOutcome {
     )
 }
 
-fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Duration {
-    match deadline {
-        None => ceiling,
-        Some(deadline) => ceiling.min(deadline.saturating_duration_since(Instant::now())),
-    }
+fn classify_attempt_timeout(ceiling: Duration, deadline: Instant) -> Duration {
+    ceiling.min(deadline.saturating_duration_since(Instant::now()))
 }
 
 /// The accept predicate for one classify attempt: usable output, then a
@@ -13618,7 +13632,7 @@ fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Dur
 /// every retry.
 fn length_capped_or_invalid(
     result: &historian_producer::ProducerOutput,
-    expected_ids: &BTreeSet<i64>,
+    expected_ids: &BTreeSet<String>,
 ) -> Result<(), String> {
     if result.length_capped {
         return Err("a length-capped generation".to_owned());
@@ -27372,6 +27386,7 @@ mod tests {
                     "authority_generation": generation,
                     "payload": {
                         "prompt_body": "classify",
+                        "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                         "items": [],
                         "model_chain": ["test/bad-model", "test/good-model"],
                     },
@@ -27445,6 +27460,7 @@ mod tests {
                         "authority_generation": generation,
                         "payload": {
                             "prompt_body": "classify",
+                            "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                             "items": [],
                             "model_chain": ["test/model"],
                         },
@@ -27459,6 +27475,11 @@ mod tests {
         let _ = task.await;
         assert!(!handler.dreamer_run_registered(&child_session));
     }
+
+    /// A classify budget large enough that no test's own setup can exhaust it,
+    /// so a payload's shape is what the test proves. Deadline behaviour has its
+    /// own tests with deliberately small budgets.
+    const TEST_CLASSIFY_TIMEOUT_MS: u64 = 600_000;
 
     async fn dreamer_classify_outcome(
         producer: &Arc<ProducerState>,
@@ -27520,6 +27541,7 @@ mod tests {
             &producer,
             json!({
                 "prompt_body": "classify",
+                "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                 "items": [],
                 "model_chain": ["test/capped-model", "test/whole-model"],
             }),
@@ -27552,18 +27574,19 @@ mod tests {
         // any run starts.
         let oversized_chain = json!({
             "prompt_body": "classify",
+            "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
             "items": [],
             "model_chain": (0..=MAX_CLASSIFY_MODEL_CHAIN)
                 .map(|i| format!("prov/m{i}"))
                 .collect::<Vec<_>>(),
         });
         for payload in [
-            json!({ "prompt_body": "classify", "items": [] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": [] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": ["flat-model"] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": ["/model"] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": ["prov/"] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": [7] }),
+            json!({ "prompt_body": "classify", "items": [], "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS }),
+            json!({ "prompt_body": "classify", "items": [], "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS, "model_chain": [] }),
+            json!({ "prompt_body": "classify", "items": [], "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS, "model_chain": ["flat-model"] }),
+            json!({ "prompt_body": "classify", "items": [], "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS, "model_chain": ["/model"] }),
+            json!({ "prompt_body": "classify", "items": [], "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS, "model_chain": ["prov/"] }),
+            json!({ "prompt_body": "classify", "items": [], "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS, "model_chain": [7] }),
             oversized_chain,
         ] {
             let producer = Arc::new(ProducerState::default());
@@ -27595,6 +27618,7 @@ mod tests {
             &producer,
             json!({
                 "prompt_body": "classify",
+                "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                 "items": [],
                 "model_chain": ["test/payload-model"],
             }),
@@ -27651,6 +27675,7 @@ mod tests {
             &producer,
             json!({
                 "prompt_body": "classify",
+                "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                 "items": [],
                 "model_chain": models,
             }),
@@ -27702,6 +27727,7 @@ mod tests {
             &producer,
             json!({
                 "prompt_body": "classify",
+                "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                 "items": [],
                 "model_chain": ["test/model"],
             }),
@@ -27751,6 +27777,7 @@ mod tests {
             &producer,
             json!({
                 "prompt_body": "classify",
+                "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                 "items": [],
                 "model_chain": ["test/model"],
             }),
@@ -27797,6 +27824,7 @@ mod tests {
             "authority_generation": generation,
             "payload": {
                 "prompt_body": "classify",
+                "timeout_ms": TEST_CLASSIFY_TIMEOUT_MS,
                 "items": [],
                 "model_chain": ["test/model-a", "test/model-b"],
             },
@@ -27836,8 +27864,18 @@ mod tests {
         assert_eq!(response["ok"], json!(true));
     }
 
+    /// An exhausted budget must start no new LLM run.
+    ///
+    /// The first attempt is made to outlive the window the handler ACTUALLY
+    /// granted it — read back from `await_timeouts` — rather than racing a
+    /// fixed sleep against a fixed budget. A wall-clock guess makes the
+    /// proof depend on how long ledger reads, registry locks, and
+    /// `producer_factory.connect` took: overrun the budget during that setup
+    /// and the handler breaks at the startup check with zero starts, which is
+    /// a different behavior than the one under test.
     #[tokio::test(flavor = "current_thread")]
     async fn dreamer_run_task_exhausted_budget_starts_no_new_run() {
+        const BUDGET_MS: u64 = 250;
         let producer = Arc::new(ProducerState::default());
         producer
             .await_results
@@ -27847,10 +27885,23 @@ mod tests {
                 text: "no envelope".to_string(),
                 length_capped: false,
             }));
-        // The first attempt outlives the 10ms budget, so the second configured
-        // model must never start.
-        *producer.on_await_output.lock().unwrap() = Some(Box::new(|| {
-            std::thread::sleep(Duration::from_millis(30));
+        // `await_output_with_timeout` records the granted window before
+        // delegating to the hook, so sleeping past it exhausts the budget by
+        // construction. `Weak` keeps the hook from pinning the state it lives in.
+        let observer = Arc::downgrade(&producer);
+        *producer.on_await_output.lock().unwrap() = Some(Box::new(move || {
+            let granted = observer
+                .upgrade()
+                .and_then(|state| {
+                    state
+                        .await_timeouts
+                        .lock()
+                        .expect("await timeouts mutex")
+                        .last()
+                        .copied()
+                })
+                .expect("the attempt's granted await window");
+            std::thread::sleep(granted + Duration::from_millis(50));
         }));
         let (producer, outcome) = dreamer_classify_outcome(
             &producer,
@@ -27858,7 +27909,7 @@ mod tests {
                 "prompt_body": "classify",
                 "items": [],
                 "model_chain": ["test/slow", "test/never-started"],
-                "timeout_ms": 10,
+                "timeout_ms": BUDGET_MS,
             }),
             "budget-exhausted",
         )
@@ -27879,9 +27930,187 @@ mod tests {
         let await_timeouts = producer.await_timeouts.lock().unwrap().clone();
         assert_eq!(await_timeouts.len(), 1);
         assert!(
-            await_timeouts[0] <= Duration::from_millis(10),
+            await_timeouts[0] <= Duration::from_millis(BUDGET_MS),
             "the await window must be bounded by the remaining budget, not the 600s ceiling: {await_timeouts:?}"
         );
+    }
+
+    /// A well-formed public claim ID, distinct per `seed`.
+    fn test_claim_id(seed: u8) -> String {
+        format!("mcm_{}", format!("{seed:02x}").repeat(16))
+    }
+
+    /// The exact payload `runClassifyThroughModule` sends for a claim-native
+    /// chunk, and the manifest shape `CLASSIFY_SYSTEM_PROMPT` asks for.
+    fn claim_native_payload(claims: &[String], timeout_ms: u64) -> Value {
+        json!({
+            "prompt_body": "classify",
+            "model_chain": ["test/model"],
+            "timeout_ms": timeout_ms,
+            "items": claims.iter().map(|claim| json!({
+                "public_claim_id": claim,
+                "revision_locator": format!("{claim}/r1/{}", "b".repeat(64)),
+                "content_digest": "b".repeat(64),
+                "mutation_token": { "publicClaimId": claim },
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn claim_manifest(claims: &[String]) -> String {
+        let entries: String = claims
+            .iter()
+            .map(|claim| {
+                format!(
+                    "<memory claim=\"{claim}\" importance=\"80\" scope=\"project\" shareable=\"true\"/>"
+                )
+            })
+            .collect();
+        format!("<classify>{entries}</classify>")
+    }
+
+    /// The request parser, the expected-id set, and the manifest validator
+    /// must all speak the claim's public ID. While the parser demanded an
+    /// integer `memory_id`, this payload died at `invalid_params` with zero
+    /// producer starts; while the validator demanded a numeric `id`, the
+    /// manifest the prompt asks for was rejected too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_accepts_claim_native_items_and_manifest() {
+        let claims = [test_claim_id(1), test_claim_id(2)];
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(ProducerOutput {
+                text: claim_manifest(&claims),
+                length_capped: false,
+            }));
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            claim_native_payload(&claims, TEST_CLASSIFY_TIMEOUT_MS),
+            "claim-native",
+        )
+        .await;
+        let response = match outcome {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("a claim-native classify must be accepted: {other:?}"),
+        };
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["manifest_text"], json!(claim_manifest(&claims)));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_rejects_items_that_are_not_claim_identities() {
+        let claim = test_claim_id(1);
+        for items in [
+            // The retired integer identity.
+            json!([{ "memory_id": 7 }]),
+            json!([{ "public_claim_id": 7 }]),
+            json!([{ "public_claim_id": "" }]),
+            json!([{ "public_claim_id": "mcm_short" }]),
+            json!([{ "public_claim_id": &claim[4..] }]),
+        ] {
+            let producer = Arc::new(ProducerState::default());
+            let mut payload = claim_native_payload(&[], TEST_CLASSIFY_TIMEOUT_MS);
+            payload["items"] = items.clone();
+            let (producer, outcome) =
+                dreamer_classify_outcome(&producer, payload, "claim-items-shape").await;
+            match outcome {
+                PreparedOutcome::Error { code, .. } => {
+                    assert_eq!(code, "invalid_params", "items {items}")
+                }
+                other => panic!("expected invalid_params for {items}, got {other:?}"),
+            }
+            assert_eq!(
+                producer.starts.load(Ordering::SeqCst),
+                0,
+                "a rejected identity must never start a run: {items}"
+            );
+        }
+    }
+
+    /// A manifest naming a claim the request never asked about must advance
+    /// the chain, not end it and be ledgered as this command's response.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_rejects_a_manifest_naming_an_unexpected_claim() {
+        let requested = test_claim_id(1);
+        let unexpected = test_claim_id(9);
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            // Covers the requested claim AND one nobody asked about.
+            Ok(ProducerOutput {
+                text: claim_manifest(&[requested.clone(), unexpected]),
+                length_capped: false,
+            }),
+            Ok(ProducerOutput {
+                text: claim_manifest(std::slice::from_ref(&requested)),
+                length_capped: false,
+            }),
+        ]);
+        let mut payload =
+            claim_native_payload(std::slice::from_ref(&requested), TEST_CLASSIFY_TIMEOUT_MS);
+        payload["model_chain"] = json!(["test/unexpected-claim", "test/exact"]);
+        let (producer, outcome) =
+            dreamer_classify_outcome(&producer, payload, "unexpected-claim").await;
+        let response = match outcome {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the chain must recover from an unexpected claim: {other:?}"),
+        };
+        assert_eq!(
+            response["diagnostics"]["model"],
+            json!("test/exact"),
+            "the over-covering manifest must not be the accepted one"
+        );
+        assert_eq!(
+            response["manifest_text"],
+            json!(claim_manifest(&[requested]))
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            producer.purges.lock().unwrap().len(),
+            2,
+            "the rejected attempt's session must be purged before advancing"
+        );
+    }
+
+    /// The payload deadline is the only bound relating this handler's work to
+    /// the caller's transport budget, so a payload without one is refused
+    /// before any billable run rather than granted the 21-minute per-model
+    /// ceiling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_requires_a_positive_timeout_ms() {
+        let claims = [test_claim_id(1)];
+        for timeout in [None, Some(json!(0)), Some(json!(-1)), Some(json!("600000"))] {
+            let producer = Arc::new(ProducerState::default());
+            let mut payload = claim_native_payload(&claims, TEST_CLASSIFY_TIMEOUT_MS);
+            match &timeout {
+                None => {
+                    payload
+                        .as_object_mut()
+                        .expect("payload object")
+                        .remove("timeout_ms");
+                }
+                Some(value) => payload["timeout_ms"] = value.clone(),
+            }
+            let (producer, outcome) =
+                dreamer_classify_outcome(&producer, payload, "deadline-required").await;
+            match outcome {
+                PreparedOutcome::Error { code, message } => {
+                    assert_eq!(code, "invalid_params", "timeout {timeout:?}");
+                    assert!(
+                        message.contains("timeout_ms"),
+                        "the failure must name the missing deadline: {message}"
+                    );
+                }
+                other => panic!("expected invalid_params for {timeout:?}, got {other:?}"),
+            }
+            assert_eq!(
+                producer.starts.load(Ordering::SeqCst),
+                0,
+                "a deadline-less payload must never start a run: {timeout:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
