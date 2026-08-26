@@ -127,6 +127,31 @@ describe("immutable adjudication", () => {
         })).toThrow(/cardinality-mismatch/);
     });
 
+    it("rejects a close stamped before the cohort close and admits the same instant", () => {
+        const packet = packetFixture();
+        const cohortClose = subjectiveClose("1".repeat(64));
+        const judgments = appendJudgment({
+            prior: [],
+            packet,
+            sealedPackets: [packet],
+            adjudicator: "judge-one",
+            verdict: "build-a",
+            authenticationKey: authKey,
+        });
+        const base = {
+            close: cohortClose,
+            trustedCloseFingerprint: canonicalFingerprint(cohortClose),
+            judgments,
+            sealedPackets: [packet],
+            authenticationKey: authKey,
+            approver: "reviewer-three",
+        };
+        expect(() => closeAdjudication({ ...base, closedAt: "2026-09-07T23:59:59Z" }))
+            .toThrow(/adjudication-close\.closedAt: before-cohort-close/);
+        expect(closeAdjudication({ ...base, closedAt: cohortClose.body.closedAt }).closedAt)
+            .toBe(cohortClose.body.closedAt);
+    });
+
     it("rejects replacement, replay, forged authentication, and overwrite", () => {
         const packet = packetFixture();
         const judgments = appendJudgment({

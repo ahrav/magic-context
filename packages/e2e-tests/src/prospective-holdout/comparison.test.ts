@@ -61,4 +61,50 @@ describe("paired prospective comparison", () => {
         const control = cell("release-n-minus-1");
         expect(() => assertAaSymmetry(control, structuredClone(control))).not.toThrow();
     });
+
+    it("rejects a retry committed after both arms of the previous attempt completed", () => {
+        expect(() => buildPairedFacts(closeManifest(), [
+            { attempt: 0, cell: cell("release-n") },
+            { attempt: 0, cell: cell("release-n-minus-1") },
+            { attempt: 1, cell: cell("release-n", { productOutcome: "fail", failedChecks: ["check-current"] }) },
+            { attempt: 1, cell: cell("release-n-minus-1") },
+        ], aa(), 1, freezeManifest())).toThrow(/retry-after-completion/);
+    });
+
+    it("selects the retry when it reruns an attempt that did not complete", () => {
+        const facts = buildPairedFacts(closeManifest(), [
+            {
+                attempt: 0,
+                cell: cell("release-n", {
+                    runHealth: "timeout",
+                    productOutcome: "not-evaluated",
+                    reasonCode: "deadline-exceeded",
+                }),
+            },
+            { attempt: 0, cell: cell("release-n-minus-1") },
+            { attempt: 1, cell: cell("release-n", { productOutcome: "fail", failedChecks: ["check-current"] }) },
+            { attempt: 1, cell: cell("release-n-minus-1") },
+        ], aa(), 1, freezeManifest());
+        expect(facts).toHaveLength(1);
+        expect(facts[0]!.status).toBe("complete");
+        expect(facts[0]!.releaseN.runHealth).toBe("completed");
+        expect(facts[0]!.releaseN.productOutcome).toBe("fail");
+    });
+
+    it("rejects an attempt sequence with a hole and a coordinate with no committed pair", () => {
+        expect(() => buildPairedFacts(closeManifest(), [
+            {
+                attempt: 0,
+                cell: cell("release-n", {
+                    runHealth: "timeout",
+                    productOutcome: "not-evaluated",
+                    reasonCode: "deadline-exceeded",
+                }),
+            },
+            { attempt: 0, cell: cell("release-n-minus-1") },
+            { attempt: 2, cell: cell("release-n") },
+            { attempt: 2, cell: cell("release-n-minus-1") },
+        ], aa(), 2, freezeManifest())).toThrow(/attempt-invalid/);
+        expect(() => buildPairedFacts(closeManifest(), [], aa(), 1, freezeManifest())).toThrow(/missing-pair/);
+    });
 });

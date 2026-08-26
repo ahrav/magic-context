@@ -225,6 +225,12 @@ export function validateHoldoutRepository(
                 ) {
                     throw new HoldoutContractError(["adjudication-close: cohort-binding-invalid"]);
                 }
+                // The cohort manifest fixes the case set the judgments cover, so a close
+                // stamped before it claims verdicts over cases intake could still admit.
+                // The same instant is legal: the cohort is fixed at that point.
+                if (Date.parse(adjudicationClose.closedAt) < Date.parse(close.manifest.body.closedAt)) {
+                    throw new HoldoutContractError(["adjudication-close.closedAt: before-cohort-close"]);
+                }
             }
         }
         const graduatedEvent = requiredEvent(events, "graduated");

@@ -34,6 +34,18 @@ function identity(cell: ProspectiveCellResult): string {
     return `${coordinate(cell)}:${cell.releaseRole}`;
 }
 
+type PairedArms = readonly [ProspectiveCellResult, ProspectiveCellResult];
+
+function pairAt(cells: Map<string, ProspectiveCellResult> | undefined, key: string): PairedArms | undefined {
+    const releaseN = cells?.get(`${key}:release-n`);
+    const releaseNMinus1 = cells?.get(`${key}:release-n-minus-1`);
+    return releaseN && releaseNMinus1 ? [releaseN, releaseNMinus1] : undefined;
+}
+
+function isCompletePair(pair: PairedArms): boolean {
+    return pair[0].runHealth === "completed" && pair[1].runHealth === "completed";
+}
+
 function expectedCoordinates(close: CohortCloseManifest, freeze: ReleaseFreezeManifest): string[] {
     return close.body.cases.flatMap((entry) =>
         freeze.body.executionMatrix.models.flatMap((model) =>
@@ -121,19 +133,34 @@ export function buildPairedFacts(
     for (const key of coordinates) {
         const [caseId] = key.split(":", 1);
         const closed = admitted.get(caseId)!;
-        let chosen: Map<string, ProspectiveCellResult> | undefined;
+        const committedAttempts: number[] = [];
+        const committed: PairedArms[] = [];
         for (let attempt = 0; attempt <= pairedRetryLimit; attempt += 1) {
-            const candidate = byAttempt.get(attempt);
-            if (candidate?.has(`${key}:release-n`) && candidate.has(`${key}:release-n-minus-1`)) {
-                chosen = candidate;
-                const n = candidate.get(`${key}:release-n`)!;
-                const previous = candidate.get(`${key}:release-n-minus-1`)!;
-                if (n.runHealth === "completed" && previous.runHealth === "completed") break;
+            const pair = pairAt(byAttempt.get(attempt), key);
+            if (pair) {
+                committedAttempts.push(attempt);
+                committed.push(pair);
             }
         }
-        if (!chosen) throw new HoldoutContractError(["comparison: missing-pair"]);
-        const releaseN = chosen.get(`${key}:release-n`)!;
-        const releaseNMinus1 = chosen.get(`${key}:release-n-minus-1`)!;
+        if (committed.length === 0) throw new HoldoutContractError(["comparison: missing-pair"]);
+        // Attempts run in order from 0, so a coordinate's committed attempts form a contiguous
+        // run. A hole leaves a committed attempt index that names a run with no predecessor in
+        // the store, which is the same defect class as an index outside the retry bound.
+        if (committedAttempts.some((attempt, index) => attempt !== index)) {
+            throw new HoldoutContractError(["comparison: attempt-invalid"]);
+        }
+        // A retry exists to rerun a pair that did not complete, so every attempt before the last
+        // must leave at least one arm short of "completed". Once both arms complete, the
+        // coordinate's outcome is settled; admitting a later attempt would let a second run
+        // replace that outcome, so a completed pass at attempt N could hide a completed failure
+        // at attempt N+1.
+        if (committed.slice(0, -1).some(isCompletePair)) {
+            throw new HoldoutContractError(["comparison: retry-after-completion"]);
+        }
+        // The last attempt is the only one the rules above permit to be complete, so it carries
+        // the coordinate's outcome.
+        const chosen = committed[committed.length - 1]!;
+        const [releaseN, releaseNMinus1] = chosen;
         if (
             releaseN.familyId !== closed.familyId ||
             releaseNMinus1.familyId !== closed.familyId ||
@@ -151,9 +178,7 @@ export function buildPairedFacts(
             platform: releaseN.platform,
             releaseN,
             releaseNMinus1,
-            status: releaseN.runHealth === "completed" && releaseNMinus1.runHealth === "completed"
-                ? "complete"
-                : "incomplete",
+            status: isCompletePair(chosen) ? "complete" : "incomplete",
         });
     }
     return facts.sort((left, right) =>

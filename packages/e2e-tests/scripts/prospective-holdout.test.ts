@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint, canonicalJson } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { appendLifecycleEvent } from "../src/prospective-holdout/lifecycle";
+import { appendLifecycleEvent, parseLifecycleLedger } from "../src/prospective-holdout/lifecycle";
+import { LOCK_LEASE_MS, LOCK_OWNER_FILE } from "../src/prospective-holdout/lock";
 import { buildProspectiveReport, type ReportRecomputers } from "../src/prospective-holdout/report";
 import { publishClose, publishFreeze } from "../src/prospective-holdout/freeze";
 import { cellResultFixture, closeManifest, freezeManifest, H1, H2, readyPolicies } from "../src/prospective-holdout/test-fixtures";
@@ -325,3 +327,94 @@ function existsSyncSafe(path: string): boolean {
         return false;
     }
 }
+
+/**
+ * Yields a pid that is not running: a child is spawned and reaped so the kernel
+ * releases its pid, then each candidate is confirmed dead so a recycled pid cannot
+ * make an abandoned-lock fixture look live. Returns null when nothing can be
+ * proven dead. The cohort store's lock suite keeps an identical probe; the two
+ * suites live in different directories with no fixture module in common.
+ */
+function deadPid(): number | null {
+    const reaped = spawnSync(process.execPath, ["--version"], { stdio: "ignore" }).pid;
+    for (const candidate of [reaped, 4_194_301, 4_194_302, 4_194_303]) {
+        if (typeof candidate !== "number" || !Number.isInteger(candidate) || candidate <= 1) continue;
+        try {
+            process.kill(candidate, 0);
+        } catch (error) {
+            if ((error as { code?: string }).code === "ESRCH") return candidate;
+        }
+    }
+    return null;
+}
+
+/** Installs the lock a lifecycle append acquires, in the shape a killed holder leaves behind. */
+function seedLifecycleLock(ledgerPath: string, owner: { pid: number; nonce: string; acquiredAt: number }): string {
+    const lock = `${ledgerPath}.lock`;
+    mkdirSync(lock, { recursive: true });
+    writeFileSync(join(lock, LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`);
+    return lock;
+}
+
+function frozenEventFile(root: string): string {
+    const event = join(root, "event.json");
+    writeJson(event, {
+        schema: "prospective-lifecycle-event/v1",
+        epochId: "epoch-test-release",
+        seq: 1,
+        state: "frozen",
+        occurredAt: "2026-09-01T00:00:00Z",
+        previousEventFingerprint: null,
+        artifactFingerprint: H1,
+        reasonCode: null,
+        approvers: ["reviewer-one"],
+    });
+    return event;
+}
+
+describe("prospective holdout lifecycle lock", () => {
+    it("appends after reclaiming a lifecycle lock whose recorded holder is dead", async () => {
+        const pid = deadPid();
+        if (pid === null) return;
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-lock-abandoned-"));
+        try {
+            const ledger = join(root, "lifecycle.jsonl");
+            const lock = seedLifecycleLock(ledger, {
+                pid,
+                nonce: "abandoned-worker",
+                acquiredAt: Date.now() - LOCK_LEASE_MS - 60_000,
+            });
+            const messages: string[] = [];
+            expect(await runProspectiveHoldoutCli(["freeze", ledger, frozenEventFile(root)], {
+                out: (message) => messages.push(message),
+                err: (message) => messages.push(message),
+            })).toBe(0);
+            expect(parseLifecycleLedger(readFileSync(ledger, "utf8")).map((event) => event.state)).toEqual(["frozen"]);
+            expect(existsSync(lock)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reports append-busy while the lifecycle lock holder is live inside its lease", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-lock-live-"));
+        try {
+            const ledger = join(root, "lifecycle.jsonl");
+            const lock = seedLifecycleLock(ledger, {
+                pid: process.pid,
+                nonce: "live-holder",
+                acquiredAt: Date.now(),
+            });
+            const messages: string[] = [];
+            expect(await runProspectiveHoldoutCli(["freeze", ledger, frozenEventFile(root)], {
+                out: (message) => messages.push(message),
+                err: (message) => messages.push(message),
+            })).toBe(1);
+            expect(messages.join(" ")).toContain("lifecycle: append-busy");
+            expect(existsSyncSafe(ledger)).toBe(false);
+            expect(existsSync(lock)).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+});

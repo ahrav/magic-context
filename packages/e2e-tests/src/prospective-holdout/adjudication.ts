@@ -182,6 +182,12 @@ export function closeAdjudication(input: {
     if (input.close.approvals.some((approval) => approval.approver === input.approver)) {
         fail("adjudication-close.approval: independence-required");
     }
+    // The cohort manifest fixes the case set these judgments cover, so a close stamped
+    // before it claims verdicts over cases intake could still admit. The same instant is
+    // legal: the cohort is fixed at that point.
+    if (Date.parse(input.closedAt) < Date.parse(input.close.body.closedAt)) {
+        fail("adjudication-close.closedAt: before-cohort-close");
+    }
     const judgments = validateCohortJudgments(
         input.close,
         input.judgments,
