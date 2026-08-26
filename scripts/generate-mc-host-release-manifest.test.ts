@@ -422,10 +422,35 @@ describe("platform floors", () => {
                 os: "darwin",
                 arch,
                 osVersion: "13.5",
+                devFdExec: true,
             });
             expect(mac.supported).toBe(true);
             expect(mac.synapse).toBe("unsupported");
             expect(mac.synapseReason).toBe("synapse_unsupported");
+        }
+    });
+
+    test("a macOS host without descriptor execution is unsupported_platform", () => {
+        // The Darwin counterpart of the Linux procfs_self_fd_exec gate: the
+        // contract requires dev_fd_exec, so a version-passing host that cannot
+        // execute through a descriptor must be refused here rather than at exec
+        // time. An omitted probe field is not evidence of the capability.
+        for (const arch of ["arm64", "x64"] as const) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "darwin",
+                    arch,
+                    osVersion: "13.5",
+                    devFdExec: false,
+                }),
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+            expect(
+                evaluatePlatform(contract, {
+                    os: "darwin",
+                    arch,
+                    osVersion: "13.5",
+                }),
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
         }
     });
 
@@ -625,6 +650,8 @@ describe("stop-provenance schema", () => {
             ["predecessor_manifest", "not-an-object"],
             ["predecessor_manifest", []],
             ["predecessor_release_version", "0.37"],
+            ["predecessor_release_version", "0.38.0"],
+            ["predecessor_release_version", "0.99.0"],
             ["predecessor_daemon_version", "0.0.9"],
             ["target", "linux-arm64-musl"],
             ["target", true],

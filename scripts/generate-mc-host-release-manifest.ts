@@ -1192,6 +1192,7 @@ export interface PlatformProbe {
     glibc?: string;
     osVersion?: string;
     procfsSelfFdExec?: boolean;
+    devFdExec?: boolean;
 }
 
 /**
@@ -1274,6 +1275,20 @@ export function evaluatePlatform(
         if (
             probe.osVersion === undefined ||
             !(compareDotted(probe.osVersion, mac.os_min) >= 0)
+        ) {
+            return unsupported;
+        }
+        // Each macOS row requires `capabilities.dev_fd_exec`, the Darwin
+        // counterpart of the Linux `procfs_self_fd_exec` gate: the retained
+        // native payload is executed through a descriptor, so a host that
+        // cannot do that must read as unsupported here rather than failing at
+        // exec time. Absent evidence is not proof of the capability, so an
+        // omitted probe field is unsupported, exactly as on Linux.
+        if (
+            "capabilities" in mac &&
+            "dev_fd_exec" in mac.capabilities &&
+            mac.capabilities.dev_fd_exec === true &&
+            probe.devFdExec !== true
         ) {
             return unsupported;
         }
@@ -1408,6 +1423,17 @@ export function validateStopProvenance(
     const predecessorRelease = nonEmptyString("predecessor_release_version");
     if (predecessorRelease === null || !SEMVER_RE.test(predecessorRelease)) {
         return invalid("predecessor_release_version must be exact semver");
+    }
+    // `proof.legacy_stop_only.adjacent_release_only` limits legacy stop
+    // authority to the release immediately preceding this one, but the contract
+    // states no predecessor version, so exact adjacency is not derivable here.
+    // Enforce the half that is: a predecessor must be strictly older than the
+    // release claiming authority, which rejects a record naming this release or
+    // a newer one as its own predecessor.
+    if (compareSemver(predecessorRelease, contract.release.version) >= 0) {
+        return invalid(
+            "predecessor_release_version must be older than the current release",
+        );
     }
     const predecessorDaemon = nonEmptyString("predecessor_daemon_version");
     if (
