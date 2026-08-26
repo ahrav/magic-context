@@ -287,17 +287,24 @@ fn test_db() -> Connection {
             policy_version INTEGER,
             recorded_at INTEGER
         );
+        -- These three carried only the columns the adapter counted, which is
+        -- how a policy divergence hid here: the effective rung depends on
+        -- WHICH approval action is latest and whether an artifact passed and
+        -- survived revocation, so the stubs mirror those columns.
         CREATE TABLE claim_approval_actions (
             id INTEGER PRIMARY KEY,
-            revision_id INTEGER NOT NULL
+            revision_id INTEGER NOT NULL,
+            action TEXT NOT NULL DEFAULT 'approve'
         );
         CREATE TABLE claim_enforcement_artifacts (
             id INTEGER PRIMARY KEY,
-            revision_id INTEGER NOT NULL
+            revision_id INTEGER NOT NULL,
+            evaluator_result TEXT NOT NULL DEFAULT 'pass'
         );
         CREATE TABLE claim_enforcement_artifact_events (
             id INTEGER PRIMARY KEY,
-            artifact_id INTEGER NOT NULL
+            artifact_id INTEGER NOT NULL,
+            action TEXT NOT NULL DEFAULT 'revoked'
         );
         CREATE TABLE claim_effective_policy (
             revision_id INTEGER PRIMARY KEY REFERENCES claim_revisions(id),
@@ -947,6 +954,121 @@ fn tauri_content_edits_keep_explicit_user_eligibility() {
     assert_eq!(inferred.revision, 2);
     assert_eq!(inferred.policy.effective_maturity, "CANDIDATE");
     assert!(!inferred.policy.auto_eligible);
+}
+
+#[test]
+fn a_revoked_approval_does_not_come_back_through_a_later_policy_pass() {
+    // The maturity stream is append-only, so a historical APPROVED stays at its
+    // head forever. Reading the head as the effective rung let any later policy
+    // pass restore `auto_eligible` for a claim whose approval the user had
+    // revoked. The head must cap the rung, not supply it.
+    let mut conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+
+    // Rewrite through the bearer-HTTP channel first, so the revision under test
+    // is model-inferred: no explicit-user evidence and one independence group,
+    // which makes the approval its ONLY route above CANDIDATE. Otherwise
+    // explicit-user origin would justify VERIFIED on its own and the assertion
+    // would not isolate the approval.
+    let before_rewrite = read_claim(&conn, CLAIM_A);
+    claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::BearerHttp,
+        claim_adapter::ReviseClaimInput {
+            target: target(&before_rewrite),
+            operation_key: "model-rewrite".to_string(),
+            content: Some("alpha rewritten by a model".to_string()),
+            category: None,
+        },
+    )
+    .unwrap();
+    let revision_id: i64 = conn
+        .query_row(
+            "SELECT current_revision_id FROM claims WHERE id = (SELECT claim_id FROM claim_public_ids WHERE public_id = ?1)",
+            [CLAIM_A],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // History reached APPROVED, then the user revoked it.
+    conn.execute(
+        "INSERT INTO claim_maturity_assertions (stream_id, seq, predecessor_id, maturity, actor, evidence_json, approval_action_id, artifact_id, policy_version, recorded_at) \
+         SELECT id, 99, NULL, 'APPROVED', 'seed', NULL, NULL, NULL, 1, 9 FROM claim_maturity_streams WHERE revision_id = ?1",
+        [revision_id],
+    )
+    .unwrap();
+    for action in ["approve", "revoke"] {
+        conn.execute(
+            "INSERT INTO claim_approval_actions (revision_id, action) VALUES (?1, ?2)",
+            rusqlite::params![revision_id, action],
+        )
+        .unwrap();
+    }
+
+    // Any later policy pass — here an evidence attachment on the unchanged
+    // claim — must not read APPROVED back off the head.
+    let before_attach = read_claim(&conn, CLAIM_A);
+    claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::BearerHttp,
+        claim_adapter::ReviseClaimInput {
+            target: target(&before_attach),
+            operation_key: "post-revoke-attach".to_string(),
+            // Same bytes: the adapter takes its attach-evidence branch and
+            // re-runs policy without appending a revision.
+            content: Some(before_attach.content.clone()),
+            category: None,
+        },
+    )
+    .unwrap();
+
+    let after = read_claim(&conn, CLAIM_A);
+    assert_ne!(after.policy.effective_maturity, "APPROVED");
+    assert!(
+        !after.policy.auto_eligible,
+        "a revoked approval must not be restored by a later policy pass (maturity {})",
+        after.policy.effective_maturity
+    );
+}
+
+#[test]
+fn a_category_only_revision_keeps_the_evidence_attesting_the_same_bytes() {
+    // Recategorizing replaces no bytes, so the observations supporting the old
+    // revision still attest to this exact content. Binding only the fresh
+    // model-inference observation stranded that support on the previous
+    // revision and dropped an explicit-user claim to CANDIDATE just for being
+    // filed under a different category.
+    let mut conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+    let before = read_claim(&conn, CLAIM_A);
+    assert!(
+        before.policy.auto_eligible,
+        "fixture must start eligible (maturity {})",
+        before.policy.effective_maturity
+    );
+
+    claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::BearerHttp,
+        claim_adapter::ReviseClaimInput {
+            target: target(&before),
+            operation_key: "recategorize".to_string(),
+            content: None,
+            category: Some("PREFERENCE".to_string()),
+        },
+    )
+    .unwrap();
+
+    let after = read_claim(&conn, CLAIM_A);
+    assert_eq!(
+        after.policy.effective_maturity, before.policy.effective_maturity,
+        "a category-only revision must not lower the rung"
+    );
+    assert!(
+        after.policy.auto_eligible,
+        "recategorizing must not strip standing (maturity {})",
+        after.policy.effective_maturity
+    );
 }
 
 #[test]

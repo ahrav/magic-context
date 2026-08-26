@@ -1,4 +1,5 @@
 import { type Database, isInTransaction } from "../../../shared/sqlite";
+import type { ClaimOperationResultEffect } from "../memory/claim-operation-contract";
 import {
     type AutonomousManifestIdentity,
     runAutonomousCreationManifestInCurrentTransaction,
@@ -29,6 +30,12 @@ export interface RetrospectiveApplyResult {
     observationsInserted: number;
     observationsDropped: number;
     rejected: Array<{ content: string; reason: string }>;
+    /**
+     * Effects of the claim-native creation manifest. Route-`memory` learnings
+     * write only the claim tables, so a caller diffing the legacy `memories`
+     * table sees no change; run telemetry has to come from these instead.
+     */
+    effects: readonly ClaimOperationResultEffect[];
 }
 
 const LEARNINGS_BLOCK_REGEX = /<learnings\b[^>]*>(.*?)<\/learnings>/is;
@@ -246,6 +253,7 @@ export function applyRetrospectiveLearnings(args: {
         observationsInserted: observations.length,
         observationsDropped,
         rejected,
+        effects: operation.operation.result.effects,
     };
 }
 

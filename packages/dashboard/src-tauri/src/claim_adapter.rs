@@ -1341,6 +1341,74 @@ fn maturity_rank(value: &str) -> i64 {
     }
 }
 
+fn maturity_for_rank(rank: i64) -> &'static str {
+    match rank {
+        1 => "CORROBORATED",
+        2 => "VERIFIED",
+        3 => "APPROVED",
+        4 => "ENFORCED",
+        _ => "CANDIDATE",
+    }
+}
+
+/// The rung the revision's CURRENT support justifies, mirroring
+/// `supportedMaturity` in `claim-visibility-policy.ts`.
+///
+/// Every input is a present-tense fact, never history: an approval that was
+/// later revoked does not count, and neither does a revoked enforcement
+/// artifact.
+fn supported_maturity(
+    approved: bool,
+    enforced_artifact: bool,
+    verified: bool,
+    explicit_user: bool,
+    independent_groups: i64,
+) -> &'static str {
+    if approved && enforced_artifact {
+        return "ENFORCED";
+    }
+    if approved {
+        return "APPROVED";
+    }
+    if verified || explicit_user {
+        return "VERIFIED";
+    }
+    if independent_groups >= 2 {
+        return "CORROBORATED";
+    }
+    "CANDIDATE"
+}
+
+/// Latest approval action for the revision, counted only while it is an
+/// `approve`. Mirrors `currentApprovalActionId`: the table is append-only, so a
+/// later `revoke` supersedes an earlier `approve` rather than deleting it.
+fn currently_approved(conn: &Connection, revision_id: i64) -> AdapterResult<bool> {
+    let action: Option<String> = sql(conn
+        .query_row(
+            "SELECT action FROM claim_approval_actions \
+             WHERE revision_id = ?1 ORDER BY id DESC LIMIT 1",
+            [revision_id],
+            |row| row.get(0),
+        )
+        .optional())?;
+    Ok(action.as_deref() == Some("approve"))
+}
+
+/// Whether a passing, unrevoked enforcement artifact currently exists.
+/// Mirrors `currentValidArtifactId`.
+fn currently_enforced(conn: &Connection, revision_id: i64) -> AdapterResult<bool> {
+    let exists = sql(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM claim_enforcement_artifacts artifact \
+         WHERE artifact.revision_id = ?1 AND artifact.evaluator_result = 'pass' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM claim_enforcement_artifact_events event \
+               WHERE event.artifact_id = artifact.id AND event.action = 'revoked'))",
+        [revision_id],
+        |row| row.get::<_, i64>(0),
+    ))? != 0;
+    Ok(exists)
+}
+
 fn append_maturity(
     conn: &Connection,
     revision_id: i64,
@@ -1464,13 +1532,34 @@ fn finalize_policy(
     if explicit_user || verified {
         append_maturity(conn, revision_id, project_id, "VERIFIED", now_ms)?;
     }
-    let maturity: String = sql(conn.query_row(
+    // The maturity stream is APPEND-ONLY, so its head is the highest rung ever
+    // asserted and never falls. Reading it as the effective rung makes a
+    // historical `APPROVED` permanent: after the user revokes that approval, any
+    // later policy pass — attaching evidence to an unchanged claim, say — would
+    // still see `APPROVED` at the head and restore `auto_eligible`, putting a
+    // claim the user explicitly downgraded back into automatic injection.
+    //
+    // So the head is a CAP, not the value, exactly as `effectiveMaturity` in
+    // `claim-visibility-policy.ts` defines it: take the rung the CURRENT support
+    // justifies and clamp it to history, which keeps the append-only stream's
+    // guarantee (a rung is never claimed that history never reached) without
+    // resurrecting support that has since been withdrawn.
+    let historical: String = sql(conn.query_row(
         "SELECT assertion.maturity FROM claim_maturity_streams stream \
          JOIN claim_maturity_assertions assertion ON assertion.stream_id = stream.id \
          WHERE stream.revision_id = ?1 ORDER BY assertion.seq DESC LIMIT 1",
         [revision_id],
         |row| row.get(0),
     ))?;
+    let supported = supported_maturity(
+        currently_approved(conn, revision_id)?,
+        currently_enforced(conn, revision_id)?,
+        verified,
+        explicit_user,
+        independent_groups,
+    );
+    let maturity =
+        maturity_for_rank(maturity_rank(&historical).min(maturity_rank(supported))).to_string();
     let active = dispositions(conn, revision_id)?;
     let hard_hidden = active.contradicted || active.quarantined;
     let soft_hidden = active.stale || active.disputed || active.superseded;
@@ -1887,6 +1976,27 @@ fn revise_stage(
          VALUES (?1, ?2, 'supports', ?3)",
         params![revision_id, observation_id, now_ms],
     ))?;
+    // A category-only revision replaces no bytes, so every observation that
+    // supported the previous revision still attests to exactly this content.
+    // Binding only the fresh observation would strand that support on the old
+    // revision and silently drop the claim to CANDIDATE — an explicit-user
+    // memory would lose its standing merely by being recategorized.
+    //
+    // Only `supports` is named forward, never copied wholesale, so a future
+    // non-supporting relation (a refutation, say) is not re-asserted as
+    // support. This cannot manufacture trust on its own: explicit-user standing
+    // additionally requires the revision to still hold the claim's
+    // first-revision bytes, which a content edit breaks by construction.
+    if next_content == claim.content {
+        sql(conn.execute(
+            "INSERT OR IGNORE INTO claim_evidence (revision_id, observation_id, relation, created_at) \
+             SELECT ?1, prior.observation_id, 'supports', ?2 FROM claim_evidence prior \
+             WHERE prior.revision_id = ?3 AND prior.relation = 'supports' \
+               AND prior.observation_id <> ?4 \
+             ORDER BY prior.observation_id",
+            params![revision_id, now_ms, claim.current_revision_id, observation_id],
+        ))?;
+    }
     ensure_baseline_applicability(conn, revision_id, claim.project_id, &content_digest, now_ms)?;
     sql(conn.execute(
         "INSERT INTO claim_memory_revision_attributes \

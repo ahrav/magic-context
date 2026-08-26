@@ -15,6 +15,7 @@ import {
     parseRetrospectiveLearnings,
     validateRetrospectiveLearningText,
 } from "./retrospective-learnings";
+import { claimEffectMemoryChanges } from "./storage-dream-runs";
 
 let db: Database | null = null;
 afterEach(() => {
@@ -126,6 +127,28 @@ describe("applyRetrospectiveLearnings", () => {
         expect(claims(db)).toHaveLength(1);
         expect(claims(db)[0]?.policy.originTaint).toBe("DREAMER_INFERENCE");
         expect(getUserMemoryCandidates(db)).toHaveLength(1);
+    });
+
+    test("returns the claim effects a run needs for its memory-change telemetry", () => {
+        // Route-`memory` learnings are claim-native, so a caller diffing the
+        // legacy `memories` table sees nothing and records NULL changes for a
+        // run that did create claims. The effects have to come back here.
+        db = createClaimReaderTestDatabase();
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="memory" category="CONSTRAINTS">Bulk provider calls are rate limited.</learning>
+        </learnings>`);
+        const result = apply(db, {
+            projectIdentity: PROJECT,
+            sourceSessionId: "ses-effects",
+            learnings,
+            userMemoryCollectionEnabled: false,
+        });
+
+        expect(result.memoryWritten).toBe(1);
+        expect(result.effects.length).toBeGreaterThan(0);
+        const changes = claimEffectMemoryChanges(result.effects);
+        expect(changes).not.toBeNull();
+        expect(changes?.claimUpsertedIds ?? []).toHaveLength(1);
     });
 
     test("replays one window without duplicate claims, observations, or generations", () => {
