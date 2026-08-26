@@ -59,6 +59,137 @@ decisions on `crates/mc-host` only.
   kernel/syscall time invisible — syscall cost inferred from strace counts +
   latency deltas, not cycles).
 
+## Synapse instrument semantics
+
+`SynapseComponent::metrics()` returns a component-incarnation snapshot with these
+top-level fields:
+
+- `cpu_wait`, `cpu_hold`, and `inference`. Each contains `query` and `batch`.
+  Each lane contains `buckets`, `count`, and `sum_us`.
+- `cpu_wait_outcome`, which contains `query` and `batch` counter arrays.
+- `queue_full`, `poll_outcome`, and `batch_items_embedded`.
+- `free_cpu_permits`, `free_query_permits`, `jobs_active`, `jobs_retained`,
+  `queued_text_bytes`, and `retained_result_bytes`.
+
+The six duration histograms are `cpu_wait.query`, `cpu_wait.batch`,
+`cpu_hold.query`, `cpu_hold.batch`, `inference.query`, and `inference.batch`.
+Their fixed millisecond edges are
+`[1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]`, followed by an
+overflow bucket. Bucket 0 is `[0, 1)` ms, each middle bucket is
+`[previous_edge, edge)` ms, and the overflow bucket is `[5000, +∞)` ms. Each
+observation increments one bucket and `count`. `sum_us` is the sum of observed
+durations in microseconds and saturates at `u64::MAX`; the host does not
+compute percentiles.
+
+`cpu_wait` starts before the worker task is spawned, includes task-scheduling
+delay, and records only waits that acquire a CPU permit. `cpu_hold` starts at
+permit acquisition. Query hold ends after inference settlement and the worker's
+result send. Batch hold ends after settlement and `publish_ready` or
+`publish_failed`, so it includes publication copies and the job-table lock.
+Thus hold includes inference plus settlement and publication work. The
+per-lane accounting invariants are
+`cpu_wait.count == cpu_wait_outcome.granted`,
+`cpu_hold.count == cpu_wait_outcome.granted`, and
+`inference.count <= cpu_wait_outcome.granted`. Lane-failure and shutdown
+short-circuits after permit acquisition still record a hold but do not record
+inference.
+
+Counter arrays use these fixed slot orders:
+
+- `cpu_wait_outcome.query`: `[granted, timeout, waiter_gone,
+  cancelled_or_closed]`.
+- `cpu_wait_outcome.batch`: `[granted, cancelled, closed]`.
+- `queue_full`: `[parse_reservation_unsatisfiable,
+  parse_resident_exhausted, coverage_short, query_admission, job_admission,
+  result_page_resident]`.
+- `poll_outcome`: `[restarted, key_mismatch, bad_cursor, failed,
+  pending_queued, pending_running, page]`.
+
+Query `timeout` and `waiter_gone` race at the same deadline. `timeout` means
+the worker's timer won. `waiter_gone` means the response receiver disappeared,
+including when the handler deadline won first. For a controlled run without
+route loss or other receiver cancellation, consumers combine `timeout +
+waiter_gone` when measuring deadline expiry while waiting for a CPU permit
+rather than interpret either slot alone. General traffic cannot isolate that
+expiry from these counters because `waiter_gone` also includes route loss. A
+handler deadline reached after permit grant remains classified as `granted`.
+
+Poll counters describe handler attempts, not jobs. Every `embed.result` request
+that enters `handle_result` either increments `result_page_resident` before the
+poll or increments exactly one `poll_outcome` slot after `JobTable::poll`.
+`pending_queued` and `pending_running` split the internal pending result, and
+`page` means the job table produced one page, so a multi-page job can increment
+`page` several times. Later response reservation or encoding can still fail.
+Requests rejected during decode or validation never enter this accounting. The
+handler identity is therefore `requests entering handle_result ==
+sum(poll_outcome) + queue_full[result_page_resident]`.
+
+`batch_items_embedded` adds the number of texts once immediately before a batch
+backend call. Together with `inference.batch.count`, it gives aggregate items
+per completed backend call when the backend does not panic. A panicked call
+adds its items but no inference observation. The counter does not provide
+latency for any item.
+
+The six depth fields are gauges computed when the snapshot is read rather than
+stored metric counters. `free_cpu_permits` and `free_query_permits` read the
+two semaphores; the query value is binary because that semaphore has one
+permit. `jobs_active` counts stored jobs that are not complete,
+`jobs_retained` counts completed jobs held for pickup, `queued_text_bytes`
+counts the UTF-8 text bytes in admitted queued or running batches, and
+`retained_result_bytes` counts vector bytes plus retained item ID and content
+hash bytes. These are logical accounting bytes, not allocator residency.
+Reading job depth takes the table lock but deliberately does not sweep expired
+jobs. Gauges can therefore include expired jobs until another job-table
+operation sweeps them.
+
+Metric counters use relaxed atomics, and a snapshot reads counters and gauges
+one at a time without a global consistency barrier. A snapshot taken during
+updates can mix nearby instants and temporarily violate cross-field identities.
+At quiescence, histogram and counter snapshots merge additively; gauges do not.
+Compute counter and histogram deltas between quiescent snapshots for an
+interval, assuming component-incarnation counters have neither wrapped nor
+saturated.
+
+Cardinality and content are fixed: the snapshot has 117 scalar values, uses no
+string labels, and contains no job ID, request key, content hash, text, or
+per-item state. It does not provide a total request-rate denominator, a count
+of idempotent batch replays, or per-item latency. Those require separate
+request accounting or tracing and must not be inferred from these counters.
+
+### Synapse metrics overhead gate
+
+Both arms used this command from their recorded environment files:
+
+```text
+cargo run -q -p mc-host --release --example synapse_perf -- --rate 1000 --seconds 5
+```
+
+The baseline artifacts are in
+`docs/perf/runs/synapse-metrics-baseline-3dec75b9/` at commit
+`3dec75b9ad5566833b5281680098266cceb9dde1`. Across n=3 runs,
+successful-response throughput was
+`[939.8, 938.8, 932.8]` requests/s and p99 was
+`[1493141, 2041107, 1253284]` ns. The baseline min–max envelopes are
+932.8–939.8 requests/s and 1,253,284–2,041,107 ns. Rejected responses were
+`[301, 306, 336]`.
+
+The post-instrument artifacts are in
+`docs/perf/runs/synapse-metrics-after-6b491392/` at commit
+`6b4913922b6cfe486c80d2d5507a1b34bd5bd1ba`. Across n=3 runs,
+successful-response throughput was
+`[931.2, 954.4, 934.0]` requests/s and p99 was
+`[1696156, 1664541, 1704532]` ns. Post medians were 934.0 requests/s and
+1,696,156 ns; both are inside the corresponding baseline envelope. Rejected
+responses were `[344, 228, 330]`. Both p99 arrays contain successful responses
+only.
+
+Verdict: no detectable regression.
+
+This is low-resolution evidence from three five-second runs per arm. Recorded
+pre-run load also differed: 2.40/1.66/0.99 for the
+baseline and 2.34/4.26/4.07 after instrumentation. Do not use this result to
+claim a smaller effect than the run spread can resolve.
+
 ## Environment record (fill per collection)
 
 host, kernel, CPUs, load before run, rustc, commit.
