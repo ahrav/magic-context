@@ -259,8 +259,7 @@ describe("immutable input fail-closed rules", () => {
         ][] = [
             [
                 (m) => {
-                    m.inputs.model_onnx.license.redistribution_approved =
-                        false;
+                    m.inputs.model_onnx.license.redistribution_approved = false;
                 },
                 /redistribution approval is required/,
             ],
@@ -587,9 +586,7 @@ describe("credential-row fingerprint canonicalization", () => {
             ["OPENAI_ORG_ID", "org-two"],
         ];
         const same = canonicalCredentialRowEncoding("pi", "openai", rowA);
-        expect(canonicalCredentialRowEncoding("pi", "openai", rowA)).toBe(
-            same,
-        );
+        expect(canonicalCredentialRowEncoding("pi", "openai", rowA)).toBe(same);
         const reordered = canonicalCredentialRowEncoding("pi", "openai", [
             rowA[1],
             rowA[0],
@@ -624,9 +621,7 @@ describe("credential-row fingerprint canonicalization", () => {
         }
         const credentials = JSON.parse(result.outputs.credentials);
         expect(credentials.fingerprint.emitted).toBe(false);
-        expect(credentials.fingerprint.domain).toBe(
-            "subc-broca-credential-v1",
-        );
+        expect(credentials.fingerprint.domain).toBe("subc-broca-credential-v1");
     });
 });
 

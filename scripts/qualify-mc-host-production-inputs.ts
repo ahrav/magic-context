@@ -488,11 +488,7 @@ const CREDENTIALS_DOC = {
         ],
         node: {
             fields: ["path", "sha256"],
-            path_rules: [
-                "relative",
-                "no_parent_segments",
-                "no_symlink_escape",
-            ],
+            path_rules: ["relative", "no_parent_segments", "no_symlink_escape"],
         },
         extensions_ordered: true,
         rules: {
@@ -646,9 +642,7 @@ export function validateCredentialsDoc(
                 !(alias.canonical in harness.providers) ||
                 alias.alias_mechanism_supported !== false ||
                 alias.fallback !== "canonical_row" ||
-                !doc.unsupported_auth_mechanisms.includes(
-                    alias.alias_mechanism,
-                )
+                !doc.unsupported_auth_mechanisms.includes(alias.alias_mechanism)
             ) {
                 fail(
                     `${harnessName}: alias ${aliasName} must fall back to a qualified canonical row with an unsupported alias mechanism`,
@@ -997,7 +991,9 @@ function tinyFixtureHashBlacklist(rootDir: string): Set<string> {
     try {
         collect(JSON.parse(readFileSync(path, "utf8")));
     } catch {
-        fail(`unreadable tiny-fixture manifest at ${TINY_FIXTURE_MANIFEST_PATH}`);
+        fail(
+            `unreadable tiny-fixture manifest at ${TINY_FIXTURE_MANIFEST_PATH}`,
+        );
     }
     return blacklist;
 }
@@ -1041,7 +1037,10 @@ function validateQualifiedArtifact(
     ) {
         fail(`inputs.${key}: size_bytes must be a positive integer`);
     }
-    if (typeof artifact.sha256 !== "string" || !SHA256_RE.test(artifact.sha256)) {
+    if (
+        typeof artifact.sha256 !== "string" ||
+        !SHA256_RE.test(artifact.sha256)
+    ) {
         fail(`inputs.${key}: sha256 must be 64 lowercase hex`);
     }
     if (isPlaceholderSha256(artifact.sha256)) {
@@ -1226,16 +1225,11 @@ export function validateSourceManifest(
     } as const;
     for (const name of ["opencode", "pi"] as const) {
         const harness = m.harnesses[name];
-        assertExactKeys(
-            harness,
-            ["package", "version"],
-            `harnesses.${name}`,
-            ["unqualified_reason"],
-        );
+        assertExactKeys(harness, ["package", "version"], `harnesses.${name}`, [
+            "unqualified_reason",
+        ]);
         if (harness.package !== expectPackage[name]) {
-            fail(
-                `harnesses.${name}: package must be ${expectPackage[name]}`,
-            );
+            fail(`harnesses.${name}: package must be ${expectPackage[name]}`);
         }
         if (harness.version === null) {
             if (
@@ -1264,7 +1258,9 @@ function verifyArtifactBytes(
         ? artifact.verify_local_path
         : join(rootDir, artifact.verify_local_path);
     if (!existsSync(path)) {
-        fail(`inputs.${key}: verify bytes missing at ${artifact.verify_local_path}`);
+        fail(
+            `inputs.${key}: verify bytes missing at ${artifact.verify_local_path}`,
+        );
     }
     const bytes = readFileSync(path);
     if (bytes.length !== artifact.size_bytes) {
@@ -1290,9 +1286,7 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
         }
         const bunLock = readFileSync(bunLockPath, "utf8");
         if (
-            !bunLock.includes(
-                `"${manifest.harnesses.pi.package}@${piVersion}"`,
-            )
+            !bunLock.includes(`"${manifest.harnesses.pi.package}@${piVersion}"`)
         ) {
             fail(
                 `harnesses.pi: version ${piVersion} does not match the resolved bun.lock pin`,
@@ -1302,7 +1296,9 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
     const cargoPath = join(rootDir, MC_HOST_CARGO_TOML_PATH);
     if (manifest.mode === "production") {
         if (!existsSync(cargoPath)) {
-            fail("crates/mc-host/Cargo.toml is required to qualify the ORT crate pins");
+            fail(
+                "crates/mc-host/Cargo.toml is required to qualify the ORT crate pins",
+            );
         }
         const cargo = readFileSync(cargoPath, "utf8");
         if (

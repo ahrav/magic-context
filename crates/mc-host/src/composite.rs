@@ -73,6 +73,11 @@ pub trait CompositeComponent: Send + Sync + 'static {
 
 pub trait PrimaryComponent: CompositeComponent {
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
+
+    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged. commentlint: allow(JUDGE)
+    fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// An expected artifact fault (missing or invalid bundle) must resolve to
@@ -81,6 +86,11 @@ pub trait PrimaryComponent: CompositeComponent {
 /// `Err` is reserved for host-fatal invariant failures.
 pub trait SecondaryComponent: CompositeComponent {
     fn initialize(&self) -> impl Future<Output = Result<(), InitError>> + Send;
+
+    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged. commentlint: allow(JUDGE)
+    fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +215,18 @@ impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHa
             self.primary.initialize(init),
             self.secondary.initialize(),
             self.tertiary.initialize()
+        )?;
+        Ok(())
+    }
+
+    async fn activate(&self) -> Result<(), InitError> {
+        // Children activate concurrently; fixed polling order preserves
+        // deterministic error precedence.
+        tokio::try_join!(
+            biased;
+            self.primary.activate(),
+            self.secondary.activate(),
+            self.tertiary.activate()
         )?;
         Ok(())
     }

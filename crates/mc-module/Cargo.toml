@@ -15,6 +15,12 @@ name = "direct_host_fixture"
 path = "examples/direct_host_fixture.rs"
 required-features = ["direct-host-fixture"]
 
+# `ck-mc-host` is the production lifecycle/serve executable; it depends on
+# mc-module + mc-host, never the reverse. commentlint: allow(JUDGE)
+[[bin]]
+name = "ck-mc-host"
+path = "src/bin/ck-mc-host.rs"
+
 [dependencies]
 mc-core = { workspace = true }
 mc-store = { workspace = true }
@@ -29,9 +35,14 @@ serde_json = { workspace = true }
 # Provider context-overflow error patterns (scheduler unit). Plain regex (no
 # lookarounds in those patterns); fancy-regex stays confined to mc-tokenizer.
 regex = "1"
-tokio = { workspace = true }
+# `signal` enables the `ck-mc-host serve` SIGTERM handler.
+tokio = { workspace = true, features = ["signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { workspace = true }
+hmac = "0.12"
+# Only the detached-exec module in `src/bin/ck-mc-host.rs` uses libc
+# (fork/setsid/fexecve); library code never does. commentlint: allow(JUDGE)
+libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [features]

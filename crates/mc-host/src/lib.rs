@@ -13,6 +13,7 @@ pub mod client;
 pub mod composite;
 pub mod config;
 pub mod connection_file;
+pub mod generation;
 pub mod handler;
 pub mod lifecycle;
 #[doc(hidden)]

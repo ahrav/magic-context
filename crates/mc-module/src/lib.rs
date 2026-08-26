@@ -3023,6 +3023,8 @@ impl ProjectionCache {
 pub struct McHandler {
     store: Arc<Mutex<Option<Arc<McStore>>>>,
     store_open: Arc<StoreOpenCoordinator>,
+    /// Storage descriptor decoded by `initialize` and consumed by `activate`, so storage opening begins only after transport publication while a malformed descriptor still fails startup before anything publishes. commentlint: allow(JUDGE)
+    pending_storage: Mutex<Option<StorageDescriptor>>,
     /// Serializes "is the module still accepting tasks?" against shutdown.
     ///
     /// Holds no state: `cancel` is the single source of truth for whether
@@ -3557,6 +3559,7 @@ impl McHandler {
         McHandler {
             store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
+            pending_storage: Mutex::new(None),
             spawn_gate: Mutex::new(()),
             cancel,
             tasks: TaskTracker::new(),
@@ -3865,6 +3868,7 @@ impl McHandler {
         McHandler {
             store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
+            pending_storage: Mutex::new(None),
             spawn_gate: Mutex::new(()),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -12612,7 +12616,23 @@ impl PrimaryComponent for McHandler {
                 .map_err(|_| InitError("invalid Magic Context storage descriptor".to_owned()))?,
             None => dev_descriptor(),
         };
-        self.begin_store_open(descriptor)
+        if self.cancel.is_cancelled() {
+            return Err(InitError("module task admission is closed".to_owned()));
+        }
+        *self.pending_storage.lock().expect("pending storage mutex") = Some(descriptor);
+        Ok(())
+    }
+
+    async fn activate(&self) -> Result<(), InitError> {
+        let descriptor = self
+            .pending_storage
+            .lock()
+            .expect("pending storage mutex")
+            .take();
+        match descriptor {
+            Some(descriptor) => self.begin_store_open(descriptor),
+            None => Ok(()),
+        }
     }
 }
 

@@ -1377,6 +1377,8 @@ dependencies = [
  "cortexkit-store",
  "cortexkit-store-types",
  "filetime",
+ "hmac",
+ "libc",
  "mc-core",
  "mc-host",
  "mc-store",

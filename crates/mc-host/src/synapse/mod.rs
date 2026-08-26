@@ -151,11 +151,19 @@ struct ReadyLane {
 #[derive(Debug, Clone)]
 pub enum SynapseStatus {
     Ready(LaneInfo),
-    Disabled { reason: String },
-    Failing { reason: String },
+    /// Post-publication activation has not settled the lane yet: bundle
+    /// verification, ORT load, or model construction is still running.
+    Starting,
+    Disabled {
+        reason: String,
+    },
+    Failing {
+        reason: String,
+    },
 }
 
 enum LaneState {
+    Starting,
     Disabled { reason: String },
     Ready(Arc<ReadyLane>),
     Failing { reason: String },
@@ -232,6 +240,7 @@ impl SynapseComponent {
     pub fn status(&self) -> SynapseStatus {
         match &*self.inner.state.lock().expect("synapse state lock") {
             LaneState::Ready(lane) => SynapseStatus::Ready(lane.lane.clone()),
+            LaneState::Starting => SynapseStatus::Starting,
             LaneState::Disabled { reason } => SynapseStatus::Disabled {
                 reason: reason.clone(),
             },
@@ -255,6 +264,7 @@ impl SynapseComponent {
         let Some(lane) = self.ready_lane() else {
             let reason = match self.status() {
                 SynapseStatus::Disabled { reason } | SynapseStatus::Failing { reason } => reason,
+                SynapseStatus::Starting => STARTING_REASON.to_owned(),
                 SynapseStatus::Ready(_) => unreachable!("ready lanes embed"),
             };
             return Err(InferenceError::Artifact(reason));
@@ -278,9 +288,13 @@ fn mark_failing(inner: &SynapseInner, reason: String) {
 fn lane_failure_reason(inner: &SynapseInner) -> Option<String> {
     match &*inner.state.lock().expect("synapse state lock") {
         LaneState::Ready(_) => None,
+        LaneState::Starting => Some(STARTING_REASON.to_owned()),
         LaneState::Disabled { reason } | LaneState::Failing { reason } => Some(reason.clone()),
     }
 }
+
+/// Bounded static reason reported while activation has not settled the lane.
+const STARTING_REASON: &str = "the synapse lane is still starting";
 
 fn embed_via(
     inner: &SynapseInner,
@@ -801,6 +815,13 @@ impl CompositeComponent for SynapseComponent {
     async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
         match self.status() {
             SynapseStatus::Ready(_) => BindOutcome::Accept,
+            // Retryable: the client's route-open backoff retries
+            // `module_reloading`, so a demand that races activation settles
+            // once the lane loads instead of failing terminally.
+            SynapseStatus::Starting => BindOutcome::Reject {
+                code: "module_reloading".to_owned(),
+                message: STARTING_REASON.to_owned(),
+            },
             SynapseStatus::Disabled { .. } | SynapseStatus::Failing { .. } => BindOutcome::Reject {
                 code: "artifact_invalid".to_owned(),
                 message: "the synapse model bundle is unavailable".to_owned(),
@@ -900,6 +921,11 @@ impl CompositeComponent for SynapseComponent {
     async fn health(&self) -> HealthReport {
         match self.status() {
             SynapseStatus::Ready(_) => HealthReport::ok(),
+            SynapseStatus::Starting => HealthReport {
+                status: HealthStatus::Degraded,
+                detail: Some(STARTING_REASON.to_owned()),
+                metrics: None,
+            },
             SynapseStatus::Disabled { reason } => HealthReport {
                 status: HealthStatus::Degraded,
                 detail: Some(reason),
@@ -929,24 +955,37 @@ impl CompositeComponent for SynapseComponent {
 
 impl SecondaryComponent for SynapseComponent {
     async fn initialize(&self) -> Result<(), InitError> {
-        let Some(config) = self.inner.config.clone() else {
-            let mut state = self.inner.state.lock().expect("synapse state lock");
-            // A pre-readied lane (the test seam) has no configuration to
-            // load and stays ready.
-            if !matches!(&*state, LaneState::Ready(_)) {
-                *state = LaneState::Disabled {
-                    reason: "no bundle configured".to_owned(),
-                };
+        let mut state = self.inner.state.lock().expect("synapse state lock");
+        // A pre-readied lane (the test seam) has no configuration to load
+        // and stays ready.
+        if matches!(&*state, LaneState::Ready(_)) {
+            return Ok(());
+        }
+        *state = if self.inner.config.is_some() {
+            // Bundle verification, ORT load, and model construction are
+            // post-publication activation work: transport must not wait
+            // behind them, so pre-publication bootstrap only records that
+            // the lane is still starting.
+            LaneState::Starting
+        } else {
+            LaneState::Disabled {
+                reason: "no bundle configured".to_owned(),
             }
+        };
+        Ok(())
+    }
+
+    async fn activate(&self) -> Result<(), InitError> {
+        let Some(config) = self.inner.config.clone() else {
             return Ok(());
         };
         // Blocking work (file reads, hashing, native model construction,
         // probe inference) leaves the async lifecycle thread. Blocking tasks
         // detach on drop and cannot be stopped once running, so completion is
         // routed through the incarnation tracker: if this future is dropped
-        // at the await (initialization abort), the tracked wrapper still owns
-        // the closure's completion, and `shutdown`'s tracker drain holds
-        // until the native load actually stops.
+        // at the await (activation abandoned at shutdown), the tracked
+        // wrapper still owns the closure's completion, and `shutdown`'s
+        // tracker drain holds until the native load actually stops.
         let blocking = tokio::task::spawn_blocking(move || {
             let bundle = bundle::load_bundle(&config.bundle_dir, &config.limits)?;
             let ort = OrtIdentity {
@@ -967,7 +1006,7 @@ impl SecondaryComponent for SynapseComponent {
         let loaded = match self.inner.tracker.spawn(blocking).await {
             Ok(joined) => joined,
             // The wrapper never panics and is never aborted, so a lost
-            // wrapper is the same initialization failure as a lost closure.
+            // wrapper is the same activation failure as a lost closure.
             Err(join_error) => Err(join_error),
         };
         let mut state = self.inner.state.lock().expect("synapse state lock");
@@ -977,7 +1016,7 @@ impl SecondaryComponent for SynapseComponent {
                 Ok(())
             }
             // An expected artifact fault is isolated degradation, never a
-            // host-fatal initialization error.
+            // host-fatal activation error.
             Ok(Err(error)) => {
                 *state = LaneState::Disabled {
                     reason: error.to_string(),
@@ -985,7 +1024,7 @@ impl SecondaryComponent for SynapseComponent {
                 Ok(())
             }
             Err(join_error) => Err(InitError(format!(
-                "synapse initialization task failed: {join_error}"
+                "synapse activation task failed: {join_error}"
             ))),
         }
     }
