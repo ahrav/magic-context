@@ -321,13 +321,14 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         }
     }))
     .map_err(|error| format!("serialize request: {error}"))?;
+    let request_len = u32::try_from(request.len()).map_err(|_| "request too large".to_owned())?;
     let mut sender = tokio::spawn(async move {
         for slot in 0..offered {
             let scheduled = start + Duration::from_nanos(slot * interval_ns);
             tokio::time::sleep_until(scheduled.into()).await;
             let corr = 1_000_000 + slot;
             let mut frame = raw_client::header(
-                u32::try_from(request.len()).map_err(|_| "request too large".to_owned())?,
+                request_len,
                 raw_client::TY_REQUEST,
                 raw_client::FLAGS_INTERACTIVE,
                 channel,
