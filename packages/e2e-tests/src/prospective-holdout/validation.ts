@@ -100,20 +100,20 @@ function requiredEvent(events: readonly LifecycleEvent[], state: LifecycleEvent[
 }
 
 /**
- * Rejects anything under a staging entry that a publish could not have created, and
+ * Rejects anything under a runtime entry that its writer could not have created, and
  * scans the bytes of one that it could have.
  *
- * A publish only ever creates a directory of regular files here, so a symlink, or an
- * entry that is neither, is not staging state this exemption owns. Scanning the files is
- * what keeps the exemption from becoming a privacy hole: every committed artifact's
- * bytes are scanned, and an entry removed from the artifact-set check would otherwise
- * reach neither that scan nor this one.
+ * A publish or a lock acquisition only ever creates a directory of regular files here,
+ * so a symlink, or an entry that is neither, is not runtime state an exemption owns.
+ * Scanning the files is what keeps the exemption from becoming a privacy hole: every
+ * committed artifact's bytes are scanned, and an entry removed from the artifact-set
+ * check would otherwise reach neither that scan nor this one.
  *
- * A concurrent publish can rename its staging directory away or finish writing a file
- * mid-walk, so a vanished entry is skipped rather than reported: it is no longer in the
- * tree this run is validating.
+ * A concurrent publish or lock release can rename its directory away or finish writing a
+ * file mid-walk, so a vanished entry is skipped rather than reported: it is no longer in
+ * the tree this run is validating.
  */
-function scanStagingDirectory(directory: string): void {
+function scanRuntimeDirectory(directory: string): void {
     let entries: string[];
     try {
         entries = readdirSync(directory);
@@ -125,11 +125,11 @@ function scanStagingDirectory(directory: string): void {
         const stat = lstatSync(path, { throwIfNoEntry: false });
         if (!stat) continue;
         if (stat.isDirectory()) {
-            scanStagingDirectory(path);
+            scanRuntimeDirectory(path);
             continue;
         }
         if (stat.isSymbolicLink() || !stat.isFile()) {
-            throw new HoldoutContractError(["epoch: staging-entry-not-regular"]);
+            throw new HoldoutContractError(["epoch: runtime-entry-not-regular"]);
         }
         let raw: string;
         try {
@@ -138,34 +138,41 @@ function scanStagingDirectory(directory: string): void {
             continue;
         }
         if (scanForSensitiveContent(raw).length > 0) {
-            throw new HoldoutContractError(["epoch: staging-privacy-rejected"]);
+            throw new HoldoutContractError(["epoch: runtime-privacy-rejected"]);
         }
     }
 }
 
+/** Names the lifecycle append lock and the directory a reclaim renames aside. */
+const LIFECYCLE_LOCK_ENTRY_RE = /^lifecycle\.jsonl\.lock(?:\.reclaimed-[0-9a-f]+)?$/;
+
 /**
- * Decides whether `entry` is transient staging state the artifact-set check exempts.
+ * Decides whether `entry` is transient runtime state the artifact-set check exempts.
  *
- * A publisher killed between `mkdtempSync` and `renameSync` leaves its staging directory
- * beside the artifacts, and reading that as a committed artifact rejects the epoch and
- * strands the identical retry documented as the recovery. Matching the name alone is not
- * enough evidence to exempt it: a file, a symlink, or a committed directory under the
- * same name leaves the check without its type or its bytes ever being inspected, so it
- * can carry arbitrary untrusted or sensitive content in the public epoch tree while this
- * validation and its privacy scans stay green. The type and the contents are what
- * distinguish staging state from bytes wearing its name.
+ * Two writers leave state beside the artifacts. A publisher killed between `mkdtempSync`
+ * and `renameSync` leaves its staging directory, and a lifecycle append holds a lock
+ * directory that a reclaim may rename aside. Reading either as a committed artifact
+ * rejects the epoch, which fails a validation run concurrent with a transition and
+ * strands the identical retry documented as the publish recovery.
+ *
+ * Matching the name alone is not enough evidence to exempt either: a file, a symlink, or
+ * a committed directory under one of these names leaves the check without its type or
+ * its bytes ever being inspected, so it can carry arbitrary untrusted or sensitive
+ * content in the public epoch tree while this validation and its privacy scans stay
+ * green. Both writers create a directory of regular files, so the type and the contents
+ * are what distinguish runtime state from bytes wearing its name.
  */
-function exemptStagingEntry(epochRoot: string, entry: string): boolean {
-    if (!STAGING_ENTRY_RE.test(entry)) return false;
+function exemptRuntimeEntry(epochRoot: string, entry: string): boolean {
+    if (!STAGING_ENTRY_RE.test(entry) && !LIFECYCLE_LOCK_ENTRY_RE.test(entry)) return false;
     const path = join(epochRoot, entry);
     const stat = lstatSync(path, { throwIfNoEntry: false });
-    // A publish that renamed its staging directory away between the read of the epoch
-    // directory and this check left no entry for the artifact set to account for.
+    // A publish or lock release that renamed the directory away between the read of the
+    // epoch directory and this check left no entry for the artifact set to account for.
     if (!stat) return true;
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw new HoldoutContractError(["epoch: staging-entry-not-directory"]);
+        throw new HoldoutContractError(["epoch: runtime-entry-not-directory"]);
     }
-    scanStagingDirectory(path);
+    scanRuntimeDirectory(path);
     return true;
 }
 
@@ -465,13 +472,10 @@ export function validateHoldoutRepository(
         // validation run concurrent with a transition or a publish, or one after a worker
         // was killed mid-reclaim or mid-publish, would otherwise read them as unexpected
         // committed artifacts. They are runtime state under names no artifact uses, and
-        // the staging exemption proves that from the entry's type and bytes rather than
-        // from its name alone.
+        // the exemption proves that from each entry's type and bytes rather than from its
+        // name alone, for the lock and the staging directory alike.
         const actualEntries = readdirSync(epochRoot)
-            .filter((entry) =>
-                !/^lifecycle\.jsonl\.lock(?:\.reclaimed-[0-9a-f]+)?$/.test(entry) &&
-                !exemptStagingEntry(epochRoot, entry),
-            )
+            .filter((entry) => !exemptRuntimeEntry(epochRoot, entry))
             .sort();
         if (
             actualEntries.length !== expectedEntries.size ||

@@ -805,7 +805,7 @@ describe("prospective holdout CLI", () => {
         }
     });
 
-    it("exempts a staging directory only on its type and scanned bytes", async () => {
+    it("exempts runtime entries only on their type and scanned bytes", async () => {
         const root = mkdtempSync(join(tmpdir(), "holdout-cli-epoch-staging-"));
         try {
             const recomputers = completeRepository(root, { lifecycleState: "cohort-closed" });
@@ -826,7 +826,7 @@ describe("prospective holdout CLI", () => {
             writeFileSync(join(staging, "manifest.json"), '{"path":"/Users/realperson/secrets"}\n');
             expect(await validateRepository(root, recomputers)).toEqual({
                 code: 1,
-                messages: ["epoch: staging-privacy-rejected"],
+                messages: ["epoch: runtime-privacy-rejected"],
             });
             rmSync(staging, { recursive: true, force: true });
             // A publish only ever creates a directory here, so a regular file under the
@@ -834,7 +834,24 @@ describe("prospective holdout CLI", () => {
             writeFileSync(join(epoch, ".staging-abc123"), "committed bytes\n");
             expect(await validateRepository(root, recomputers)).toEqual({
                 code: 1,
-                messages: ["epoch: staging-entry-not-directory"],
+                messages: ["epoch: runtime-entry-not-directory"],
+            });
+            rmSync(join(epoch, ".staging-abc123"), { force: true });
+            // The lifecycle lock is exempted by the same rule, so a regular file wearing its
+            // name is rejected rather than skipped on the name alone.
+            writeFileSync(join(epoch, "lifecycle.jsonl.lock"), "committed bytes\n");
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["epoch: runtime-entry-not-directory"],
+            });
+            rmSync(join(epoch, "lifecycle.jsonl.lock"), { force: true });
+            // A real lock directory holding sensitive bytes reaches the same scan every
+            // committed artifact gets.
+            mkdirSync(join(epoch, "lifecycle.jsonl.lock"), { recursive: true });
+            writeFileSync(join(epoch, "lifecycle.jsonl.lock", "owner.json"), '{"path":"/Users/realperson/x"}\n');
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["epoch: runtime-privacy-rejected"],
             });
         } finally {
             rmSync(root, { recursive: true, force: true });
