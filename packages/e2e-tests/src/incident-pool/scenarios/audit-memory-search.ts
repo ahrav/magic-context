@@ -311,6 +311,14 @@ const A32_IMPLEMENTATION_FILES = [
     ...IMPLEMENTATION_FILES,
     "packages/plugin/src/features/magic-context/memory/storage-memory-claims.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-embeddings.ts",
+    // `search.ts` delegates the behavior A32 measures — missing/stale selection,
+    // re-embedding, and guarded persistence — to the backfill path, which in turn
+    // runs the provider and derives the persisted model identity. Without these,
+    // a change that flips stale-vector replacement or semantic recall leaves both
+    // digests unchanged.
+    "packages/plugin/src/features/magic-context/memory/embedding-backfill.ts",
+    "packages/plugin/src/features/magic-context/memory/embedding.ts",
+    "packages/plugin/src/features/magic-context/memory/embedding-identity.ts",
 ];
 
 // A54 drives the note path, which the shared memory/search bundle does not

@@ -1472,6 +1472,9 @@ async function driveDependent(
             const deferBytes = defer
                 ? syntheticPairBytes(defer, root.callId)
                 : null;
+            const bustPair = bust
+                ? findSyntheticPair(bust, root.callId)
+                : null;
             return {
                 ...base,
                 ownActionExecuted:
@@ -1480,9 +1483,20 @@ async function driveDependent(
                     pressureUsedRealBytes,
                 // The rebuilt pair must carry the deterministic call id for the
                 // retained state, and the following defer pass must replay it
-                // byte-for-byte rather than rebuild it again.
+                // byte-for-byte rather than rebuild it again. Byte-identity
+                // between the two passes says nothing about WHAT was rebuilt:
+                // healing reconstructs the pair after synthetic_todo is deleted,
+                // so incorrect input or result bytes replayed consistently would
+                // pass. Todo 1's payload check covers the original injection,
+                // not this rebuild.
                 providerTransitionCorrect:
-                    bustBytes !== null && deferBytes === bustBytes,
+                    bustBytes !== null &&
+                    deferBytes === bustBytes &&
+                    wireTodosMatch(pairTodoInput(bustPair), STATE_X_TODOS) &&
+                    wireTodosMatch(
+                        pairToolResultTodos(bustPair),
+                        STATE_X_TODOS,
+                    ),
                 durableTransitionCorrect:
                     after?.syntheticCallId === root.callId &&
                     after?.lastTodoState ===

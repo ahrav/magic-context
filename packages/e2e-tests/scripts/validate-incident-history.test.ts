@@ -56,7 +56,19 @@ function fixtureFiles(): FixtureFiles {
                         id: "var-red-one",
                         lane: "known-red",
                         source_claims: ["claim-red-one"],
-                        applicability: { harness: "opencode", omitted: [] },
+                        applicability: {
+                            harness: "opencode",
+                            omitted: [
+                                {
+                                    harness: "pi",
+                                    reason: "fixture: not applicable",
+                                },
+                                {
+                                    harness: "rust",
+                                    reason: "fixture: not applicable",
+                                },
+                            ],
+                        },
                         semantic_revision: {
                             id: "rev-red-one",
                             fingerprint: HEX("c"),

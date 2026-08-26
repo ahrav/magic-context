@@ -15,6 +15,7 @@ import {
     parseIncidentCatalog,
     parseSourceInventory,
     EXECUTABLE_LANES,
+    HARNESSES,
     type AdjudicationEvent,
     type EmergencyRedactionEvent,
     type IncidentCatalog,
@@ -291,6 +292,29 @@ export function validateIncidentHistory(
     for (const variant of variantById.values()) {
         const history = ledger.byIdentity.get(variant.id);
         if (EXECUTABLE_LANES.includes(variant.lane)) {
+            // Every noncanonical harness needs a reviewed reason, not just some
+            // of them. A partial `omitted` list is structurally valid, so the
+            // parser accepts it and the remaining harness ends up with neither
+            // applicability nor a rationale — which `buildRunSnapshot` then
+            // papers over with its generic "canonical harness is ..." fallback.
+            // Enforced here rather than in the parser because this is a policy
+            // over the committed catalog, not a shape rule for every caller.
+            const applicability = variant.applicability;
+            if (applicability !== null) {
+                const documented = new Set(
+                    applicability.omitted.map((entry) => entry.harness),
+                );
+                const undocumented = HARNESSES.filter(
+                    (candidate) =>
+                        candidate !== applicability.harness &&
+                        !documented.has(candidate),
+                );
+                if (undocumented.length > 0) {
+                    throw new Error(
+                        `variant ${variant.id} omits no reason for noncanonical harness ${undocumented.join(", ")}`,
+                    );
+                }
+            }
             const baseline = history?.latestBaseline ?? null;
             if (baseline === null) {
                 throw new Error(

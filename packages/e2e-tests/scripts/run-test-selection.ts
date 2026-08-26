@@ -19,10 +19,14 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
             cwd: root,
             onlyFiles: true,
         }),
-        "scripts/check-rust-prerequisites.test.ts",
-        "scripts/validate-incident-history.test.ts",
-        "scripts/validate-incident-verifiers.test.ts",
-        "scripts/validate-mode-manifest.test.ts",
+        // Globbed, not listed: `assertSrcTestsClassified` only scans `src/`, so a
+        // hand-maintained list here would silently drop a newly added
+        // `scripts/*.test.ts` from the default, host, and incident-unit
+        // selections without tripping any guard.
+        ...new Glob("scripts/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
     ].sort();
     if (files.length === 0) throw new Error("incident unit selection is empty");
     return files;

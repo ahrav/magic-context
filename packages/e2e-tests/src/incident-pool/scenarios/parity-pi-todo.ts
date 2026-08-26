@@ -21,6 +21,7 @@ import {
     captureTodoState,
     findSyntheticPair,
     injectedTodoPairs,
+    pairToolResultTodos,
     pairTodoInput,
     isMagicContextRequest,
     normalizedTodoJson,
@@ -471,8 +472,23 @@ export async function drivePiTodoInjection(
             todoWriteExecuted: prepared.toolExecuted,
             pressureUsedRealBytes: prepared.pressureUsedRealBytes,
             providerRequestCaptured: prepared.body !== null,
-            syntheticPairPresent: pair !== null,
-            deterministicCallIdMatched: pair?.callId === prepared.callId,
+            // A correct pair beside a second injected one satisfies a bare
+            // existence check, and neither the id nor the anchor assertion can
+            // see the extra pair, so duplicate or conflicting todos could reach
+            // the agent unnoticed.
+            syntheticPairPresent:
+                pair !== null &&
+                prepared.body !== null &&
+                injectedTodoPairs(prepared.body).length === 1,
+            // The call id is a hash of the normalized state, so matching it
+            // proves the id was DERIVED from the right state, not that the pair
+            // carries it. Both halves are compared: the agent reads the tool
+            // result, so a correct input beside a fabricated result is still a
+            // contradictory pair.
+            deterministicCallIdMatched:
+                pair?.callId === prepared.callId &&
+                wireTodosMatch(pairTodoInput(pair), STATE_X_TODOS) &&
+                wireTodosMatch(pairToolResultTodos(pair), STATE_X_TODOS),
             // A nonempty anchor id proves nothing: an implementation that
             // persists the correct call id and state alongside an arbitrary
             // message id satisfies the catalog's invalid "correct provider bytes
