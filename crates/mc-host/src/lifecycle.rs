@@ -497,6 +497,17 @@ impl InstanceGuard {
 /// (`NamespaceAnchor`, crate-private); the lock alone serializes mutators,
 /// it does not
 /// prove the names still resolve to the tree the holder opened.
+///
+/// Like the lifetime fence, the exclusion holds only among coordination-aware
+/// releases. A release that predates this token serializes transactions on the
+/// `${dataDir}/cortexkit/lifecycle` directory inode instead; that inode and
+/// this file are unrelated, so the two never contend and a pre-coordination
+/// launcher's transaction can overlap one taken here. Mixed-release lifecycle
+/// mutation therefore requires stopping the daemon across the transition
+/// rather than relying on this lock; restoring exclusion against a
+/// pre-coordination peer would mean also acquiring the legacy directory lock in
+/// a fixed order, which no supported deployment needs while adjacent-release
+/// interop stays stop-only.
 pub struct LifecycleTransactionLock {
     _file: OwnedFd,
     path: PathBuf,

@@ -481,6 +481,16 @@ export function sha256Hex(text: string): string {
 // ---------------------------------------------------------------------------
 
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+/**
+ * An inert R50 name reservation: exact semver carrying a prerelease identifier.
+ * The prerelease is what makes it inert — semver range resolution excludes
+ * prerelease versions unless the range itself carries a prerelease on the same
+ * version triple, so a dependent's `^`/`~` range can never select it. A bare
+ * label ("reserved") or an ordinary GA version is not evidence of a reservation
+ * and must not satisfy the gate.
+ */
+const RESERVATION_VERSION_RE =
+    /^\d+\.\d+\.\d+-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/;
 const DOTTED_FLOOR_RE = /^\d+\.\d+$/;
 
 function fail(message: string): never {
@@ -1151,9 +1161,15 @@ export function validateRegistryGate(
             ) {
                 gateFail(`missing inert reservation version for ${pkg.name}`);
             }
-            if (pkg.reservation_version === contract.release.version) {
+            // Presence alone is not evidence of inertness. A GA version is
+            // selectable by an ordinary dependent range, and a bare label is
+            // not a version at all; either would report R50 satisfied while
+            // leaving the name takeover-exposed. `release.version` is exact GA
+            // semver, so a prerelease can never collide with it and no separate
+            // inequality check is reachable.
+            if (!RESERVATION_VERSION_RE.test(pkg.reservation_version)) {
                 gateFail(
-                    `reservation version for ${pkg.name} must differ from the coordinated release version`,
+                    `reservation version ${pkg.reservation_version} for ${pkg.name} must be an inert prerelease (MAJOR.MINOR.PATCH-<prerelease>)`,
                 );
             }
         }
@@ -1354,6 +1370,14 @@ export function validateStopProvenance(
         return invalid(
             "predecessor record must carry exactly its required fields",
         );
+    }
+    // `release_version` binds the record to the release that is claiming stop
+    // authority, exactly as it does for genesis; the predecessor's own identity
+    // travels in `predecessor_release_version`. Without this check a record
+    // minted under a different release grants legacy stop authority under this
+    // contract.
+    if (rec.release_version !== contract.release.version) {
+        return invalid("predecessor must bind the current release identity");
     }
     return { valid: true, legacyStopAuthority: true };
 }

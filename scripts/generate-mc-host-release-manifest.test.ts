@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import {
     cpSync,
-    mkdirSync,
     mkdtempSync,
     readFileSync,
     rmSync,
@@ -328,7 +327,21 @@ describe("registry gate", () => {
                 (g) => {
                     g.packages[3].reservation_version = g.release_version;
                 },
-                /must differ from the coordinated release version/,
+                /must be an inert prerelease/,
+            ],
+            [
+                "reservation that is a bare label rather than a version",
+                (g) => {
+                    g.packages[3].reservation_version = "reserved";
+                },
+                /must be an inert prerelease/,
+            ],
+            [
+                "reservation that is an installable GA version",
+                (g) => {
+                    g.packages[3].reservation_version = "0.37.0";
+                },
+                /must be an inert prerelease/,
             ],
             [
                 "version already published for one name",
@@ -595,6 +608,14 @@ describe("stop-provenance schema", () => {
             validateStopProvenance(contract, { ...complete, extra: true })
                 .valid,
         ).toBe(false);
+        // `release_version` binds the claiming release, not the predecessor's;
+        // a record minted under another release carries no authority here.
+        const foreign = validateStopProvenance(contract, {
+            ...complete,
+            release_version: "0.99.0",
+        });
+        expect(foreign.valid).toBe(false);
+        expect(foreign.legacyStopAuthority).toBe(false);
     });
 
     test("untagged and unknown-tag records are rejected", () => {
@@ -618,12 +639,9 @@ describe("dependency boundary", () => {
 
 describe("generated typescript location", () => {
     test("the shared lifecycle directory holds the generated contract", () => {
-        mkdirSync(
-            join(repoRoot, "packages/plugin/src/shared/mc-host-lifecycle"),
-            {
-                recursive: true,
-            },
-        );
+        // Reads the committed artifact in place: the assertion is that the
+        // contract path is populated in the repository, so creating the
+        // directory here would only mask the failure it exists to catch.
         const content = readFileSync(
             join(repoRoot, OUTPUT_PATHS.typescript),
             "utf8",

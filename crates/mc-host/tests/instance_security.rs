@@ -438,8 +438,14 @@ async fn startup_refuses_to_overwrite_an_unknown_lifecycle_schema() {
     })
     .await;
     assert!(
-        matches!(refused, Err(mc_host::HostError::Instance(_))),
-        "startup over an unknown schema must fail closed"
+        matches!(
+            refused,
+            Err(mc_host::HostError::Instance(
+                mc_host::InstanceError::UnsupportedStateSchema { .. }
+            ))
+        ),
+        "startup over an unknown schema must fail closed on the quarantine gate, \
+         not on some unrelated instance error"
     );
     assert_eq!(
         std::fs::read(&record).expect("reread"),
