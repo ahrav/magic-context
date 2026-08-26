@@ -141,6 +141,14 @@ struct Jobs {
     closed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobDepth {
+    pub(crate) jobs_active: usize,
+    pub(crate) jobs_retained: usize,
+    pub(crate) queued_text_bytes: u64,
+    pub(crate) retained_result_bytes: u64,
+}
+
 pub struct JobTable {
     limits: SynapseLimits,
     incarnation: String,
@@ -323,6 +331,22 @@ impl JobTable {
         let mut jobs = self.lock_jobs();
         self.sweep_expired(&mut jobs, &mut released);
         jobs.by_key.contains_key(key)
+    }
+
+    /// Returns the stored table depth without sweeping expired jobs.
+    pub(crate) fn depth(&self) -> JobDepth {
+        let jobs = self.lock_jobs();
+        let jobs_retained = jobs
+            .by_seq
+            .values()
+            .filter(|job| job.is_completed())
+            .count();
+        JobDepth {
+            jobs_active: jobs.by_seq.len() - jobs_retained,
+            jobs_retained,
+            queued_text_bytes: jobs.queued_text_bytes,
+            retained_result_bytes: jobs.retained_result_bytes,
+        }
     }
 
     /// Admission with **no resident charge** — the job owns its key, queued
@@ -857,6 +881,46 @@ mod tests {
 
         jobs.clear();
         assert_eq!(budget.available(), POOL);
+    }
+
+    #[test]
+    fn depth_reports_active_retained_and_byte_accounting_without_sweeping() {
+        let limits = SynapseLimits {
+            retention: std::time::Duration::ZERO,
+            ..SynapseLimits::default()
+        };
+        let jobs = JobTable::new(limits);
+        let retained_items = vec![charged_item("a", "alpha")];
+        let active_items = vec![charged_item("b", "beta")];
+        let retained_result_bytes =
+            admitted_result_bytes(&retained_items, 2).expect("result bytes");
+
+        let AdmitOutcome::Admitted { .. } =
+            jobs.admit_uncharged_for_tests("active".to_owned(), active_items, 2)
+        else {
+            panic!("active job is admitted");
+        };
+        let AdmitOutcome::Admitted {
+            seq: retained_seq, ..
+        } = jobs.admit_uncharged_for_tests("retained".to_owned(), retained_items, 2)
+        else {
+            panic!("retained job is admitted");
+        };
+        jobs.start(retained_seq).expect("retained job starts");
+        jobs.publish_ready(retained_seq, vec![vec![0.0; 2]]);
+
+        assert_eq!(
+            jobs.depth(),
+            JobDepth {
+                jobs_active: 1,
+                jobs_retained: 1,
+                queued_text_bytes: 4,
+                retained_result_bytes,
+            },
+            "depth includes expired-but-unswept retained jobs"
+        );
+        jobs.sweep();
+        assert_eq!(jobs.depth().jobs_retained, 0);
     }
 
     #[test]

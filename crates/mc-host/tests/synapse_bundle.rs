@@ -152,10 +152,9 @@ async fn unconfigured_component_is_disabled_not_fatal() {
         mc_host::BindOutcome::Reject { code, .. } => assert_eq!(code, "artifact_invalid"),
         mc_host::BindOutcome::Accept => panic!("a disabled lane must not accept binds"),
     }
-    assert_eq!(
-        component.health().await.status,
-        mc_host::HealthStatus::Degraded
-    );
+    let health = component.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded);
+    assert!(health.metrics.is_some(), "disabled health includes metrics");
 }
 
 fn identity() -> mc_host::RouteIdentity {

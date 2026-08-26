@@ -174,10 +174,15 @@ pub struct SynapseMetrics {
     batch_items_embedded: AtomicU64,
     cpu: Arc<tokio::sync::Semaphore>,
     query_admission: Arc<tokio::sync::Semaphore>,
+    jobs: Arc<JobTable>,
 }
 
 impl SynapseMetrics {
-    fn new(cpu: Arc<tokio::sync::Semaphore>, query_admission: Arc<tokio::sync::Semaphore>) -> Self {
+    fn new(
+        cpu: Arc<tokio::sync::Semaphore>,
+        query_admission: Arc<tokio::sync::Semaphore>,
+        jobs: Arc<JobTable>,
+    ) -> Self {
         Self {
             cpu_wait_query: Histogram::default(),
             cpu_wait_batch: Histogram::default(),
@@ -192,6 +197,7 @@ impl SynapseMetrics {
             batch_items_embedded: AtomicU64::new(0),
             cpu,
             query_admission,
+            jobs,
         }
     }
 
@@ -243,6 +249,7 @@ impl SynapseMetrics {
     }
 
     pub fn snapshot(&self) -> SynapseMetricsSnapshot {
+        let depth = self.jobs.depth();
         SynapseMetricsSnapshot {
             cpu_wait: LaneHistogramsSnapshot {
                 query: self.cpu_wait_query.snapshot(),
@@ -265,10 +272,10 @@ impl SynapseMetrics {
             batch_items_embedded: self.batch_items_embedded.load(Ordering::Relaxed),
             free_cpu_permits: self.cpu.available_permits(),
             free_query_permits: self.query_admission.available_permits(),
-            jobs_active: 0,
-            jobs_retained: 0,
-            queued_text_bytes: 0,
-            retained_result_bytes: 0,
+            jobs_active: depth.jobs_active,
+            jobs_retained: depth.jobs_retained,
+            queued_text_bytes: depth.queued_text_bytes,
+            retained_result_bytes: depth.retained_result_bytes,
         }
     }
 }
@@ -414,7 +421,7 @@ struct SynapseInner {
     config: Option<SynapseConfig>,
     limits: SynapseLimits,
     state: Mutex<LaneState>,
-    jobs: JobTable,
+    jobs: Arc<JobTable>,
     /// One permit: at most one native inference call runs at a time, and
     /// waiters are served FIFO.
     cpu: Arc<tokio::sync::Semaphore>,
@@ -440,14 +447,16 @@ impl SynapseComponent {
             .unwrap_or_default();
         let cpu = Arc::new(tokio::sync::Semaphore::new(1));
         let query_admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let jobs = Arc::new(JobTable::new(limits.clone()));
         let metrics = Arc::new(SynapseMetrics::new(
             Arc::clone(&cpu),
             Arc::clone(&query_admission),
+            Arc::clone(&jobs),
         ));
         Self {
             inner: Arc::new(SynapseInner {
                 config,
-                jobs: JobTable::new(limits.clone()),
+                jobs,
                 limits,
                 state: Mutex::new(LaneState::Disabled {
                     reason: "not initialized".to_owned(),
@@ -471,14 +480,16 @@ impl SynapseComponent {
         lane.max_text_bytes = limits.max_text_bytes;
         let cpu = Arc::new(tokio::sync::Semaphore::new(1));
         let query_admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let jobs = Arc::new(JobTable::new(limits.clone()));
         let metrics = Arc::new(SynapseMetrics::new(
             Arc::clone(&cpu),
             Arc::clone(&query_admission),
+            Arc::clone(&jobs),
         ));
         Self {
             inner: Arc::new(SynapseInner {
                 config: None,
-                jobs: JobTable::new(limits.clone()),
+                jobs,
                 limits,
                 state: Mutex::new(LaneState::Ready(Arc::new(ReadyLane {
                     backend: engine,
@@ -1261,17 +1272,24 @@ impl CompositeComponent for SynapseComponent {
     async fn route_gone(&self, _route: RouteHandle) {}
 
     async fn health(&self) -> HealthReport {
+        // Probe serialization allocates by design; request paths read the
+        // fixed-cardinality snapshot directly and remain allocation-free.
+        let metrics = Some(serde_json::to_value(self.metrics()).expect("metrics serialize"));
         match self.status() {
-            SynapseStatus::Ready(_) => HealthReport::ok(),
+            SynapseStatus::Ready(_) => HealthReport {
+                status: HealthStatus::Ok,
+                detail: None,
+                metrics,
+            },
             SynapseStatus::Disabled { reason } => HealthReport {
                 status: HealthStatus::Degraded,
                 detail: Some(reason),
-                metrics: None,
+                metrics,
             },
             SynapseStatus::Failing { reason } => HealthReport {
                 status: HealthStatus::Failing,
                 detail: Some(reason),
-                metrics: None,
+                metrics,
             },
         }
     }
@@ -1357,6 +1375,7 @@ impl SecondaryComponent for SynapseComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -1406,6 +1425,74 @@ mod tests {
         assert_eq!(snapshot.jobs_retained, 0);
         assert_eq!(snapshot.queued_text_bytes, 0);
         assert_eq!(snapshot.retained_result_bytes, 0);
+    }
+
+    fn metric_key_paths(value: &serde_json::Value) -> BTreeSet<String> {
+        fn visit(value: &serde_json::Value, prefix: &str, paths: &mut BTreeSet<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, value) in map {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        visit(value, &path, paths);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    assert!(values.iter().all(serde_json::Value::is_u64));
+                    paths.insert(prefix.to_owned());
+                }
+                serde_json::Value::Number(_) => {
+                    paths.insert(prefix.to_owned());
+                }
+                other => panic!("metrics contain a non-numeric value: {other}"),
+            }
+        }
+
+        let mut paths = BTreeSet::new();
+        visit(value, "", &mut paths);
+        paths
+    }
+
+    fn assert_health_metrics(report: &HealthReport) {
+        let metrics = report.metrics.as_ref().expect("health metrics");
+        let expected: BTreeSet<String> = [
+            "batch_items_embedded",
+            "cpu_hold.batch.buckets",
+            "cpu_hold.batch.count",
+            "cpu_hold.batch.sum_us",
+            "cpu_hold.query.buckets",
+            "cpu_hold.query.count",
+            "cpu_hold.query.sum_us",
+            "cpu_wait.batch.buckets",
+            "cpu_wait.batch.count",
+            "cpu_wait.batch.sum_us",
+            "cpu_wait.query.buckets",
+            "cpu_wait.query.count",
+            "cpu_wait.query.sum_us",
+            "cpu_wait_outcome.batch",
+            "cpu_wait_outcome.query",
+            "free_cpu_permits",
+            "free_query_permits",
+            "inference.batch.buckets",
+            "inference.batch.count",
+            "inference.batch.sum_us",
+            "inference.query.buckets",
+            "inference.query.count",
+            "inference.query.sum_us",
+            "jobs_active",
+            "jobs_retained",
+            "poll_outcome",
+            "queue_full",
+            "queued_text_bytes",
+            "retained_result_bytes",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(metric_key_paths(metrics), expected);
     }
 
     #[test]
@@ -1492,5 +1579,27 @@ mod tests {
             )
             .metrics(),
         );
+    }
+
+    #[tokio::test]
+    async fn health_attaches_stable_numeric_metrics_on_every_lane_state() {
+        let disabled = SynapseComponent::new(None);
+        let report = disabled.health().await;
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_health_metrics(&report);
+
+        let ready = SynapseComponent::ready_with_engine(
+            test_lane(),
+            Arc::new(TestEngine),
+            SynapseLimits::default(),
+        );
+        let report = ready.health().await;
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_health_metrics(&report);
+
+        mark_failing(&ready.inner, "test failure".to_owned());
+        let report = ready.health().await;
+        assert_eq!(report.status, HealthStatus::Failing);
+        assert_health_metrics(&report);
     }
 }
