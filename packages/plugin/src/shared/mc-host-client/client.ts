@@ -1238,7 +1238,7 @@ export class McHostClient {
             // classification (KTD6).
             if (
                 error instanceof ConnectionFileError &&
-                (error.code === "open_failed" ||
+                (error.code === "not_found" ||
                     error.code === "replaced_during_read" ||
                     error.code === "deadline_expired")
             ) {

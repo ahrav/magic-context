@@ -124,6 +124,33 @@ function validateTupleShape(
         errors.push(
             `${id} host_limits must have active and quarantine caps for ${HOST_LIMIT_FIELDS.join(", ")}`,
         );
+    } else if (
+        isRecord(geometry) &&
+        GEOMETRY_FIELDS.every((field) => isCount(geometry[field]))
+    ) {
+        // One admitted duplex candidate charges both directions
+        // (mc-shm-transport ResourceCharges): descriptors and arena bytes
+        // double the per-direction geometry, a fused pair maps one region
+        // per direction, and frame delivery needs at least one receive
+        // lease per direction. Active caps below that floor declare a
+        // tuple no host could admit, so the matrix must not report it as
+        // executable coverage. pinned_workers has no floor: cold-park
+        // profiles pin zero workers.
+        const active = limits.active as Record<string, number>;
+        const shape = geometry as Record<string, number>;
+        const floors: readonly (readonly [string, number])[] = [
+            ["descriptors", 2 * shape.slot_count * shape.lane_count],
+            ["arena_bytes", 2 * shape.arena_bytes],
+            ["leases", 2],
+            ["mappings", 2],
+        ];
+        for (const [field, floor] of floors) {
+            if ((active[field] as number) < floor) {
+                errors.push(
+                    `${id} active ${field} cap ${active[field]} cannot admit one candidate of the declared geometry (needs at least ${floor})`,
+                );
+            }
+        }
     }
     if (!EXPECTATION_VALUES.includes(tuple.expectation as never)) {
         errors.push(

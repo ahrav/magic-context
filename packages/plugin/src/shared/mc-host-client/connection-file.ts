@@ -36,6 +36,7 @@ export const WIRE_VERSION = 2;
 export type ConnectionFileErrorCode =
     | "unsupported_platform"
     | "deadline_expired"
+    | "not_found"
     | "open_failed"
     | "stat_failed"
     | "not_regular_file"
@@ -141,6 +142,16 @@ async function openNoFollow(filePath: string): Promise<FileHandle> {
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
     } catch (error) {
+        // Only absence (ENOENT) is retryable republication churn; EACCES,
+        // ELOOP, descriptor exhaustion, and every other open fault is
+        // permanent evidence that must stop a recovery episode.
+        if (statErrno(error) === "ENOENT") {
+            throw new ConnectionFileError(
+                `connection file ${filePath} does not exist`,
+                "not_found",
+                error,
+            );
+        }
         throw new ConnectionFileError(
             `failed to open connection file ${filePath}`,
             "open_failed",
@@ -207,15 +218,15 @@ async function snapshotDirect(
 ): Promise<Uint8Array> {
     checkDeadline(deadline);
     // Stat failures split by errno: an absent path (ENOENT) during daemon
-    // republication is the same retryable `open_failed` churn class as a
-    // failed open, while EACCES, ENOTDIR, ELOOP, and every other stat
-    // fault is permanent configuration evidence (`stat_failed`) that must
-    // stop a recovery episode instead of retrying to its deadline.
+    // republication is retryable `not_found` churn, while EACCES, ENOTDIR,
+    // ELOOP, and every other stat fault is permanent configuration
+    // evidence (`stat_failed`) that must stop a recovery episode instead
+    // of retrying to its deadline.
     const before = await lstat(filePath).catch((error: unknown) => {
         if (statErrno(error) === "ENOENT") {
             throw new ConnectionFileError(
                 `connection file ${filePath} does not exist`,
-                "open_failed",
+                "not_found",
                 error,
             );
         }

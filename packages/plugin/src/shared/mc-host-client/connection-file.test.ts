@@ -181,11 +181,11 @@ describe("direct-file snapshot", () => {
         await expectFailure(filePath, "replaced_during_read", { afterOpen });
     });
 
-    test("classifies a missing file as open_failed discovery churn", async () => {
+    test("classifies a missing file as not_found discovery churn", async () => {
         // A raw ENOENT here would escape the ConnectionFileError retry
         // allowlist and permanently stop a recovery episode whose daemon
         // was mid-republication (unlink before the fresh file lands).
-        await expectFailure(freshPath("absent.json"), "open_failed");
+        await expectFailure(freshPath("absent.json"), "not_found");
     });
 
     test("classifies a permanent stat failure as stat_failed, not churn", async () => {
@@ -197,6 +197,17 @@ describe("direct-file snapshot", () => {
         await expectFailure(path.join(filePath, "child.json"), "stat_failed");
     });
 
+    test("classifies a permanent open failure as open_failed, not churn", async () => {
+        // Root opens an unreadable file anyway; the errno split under test
+        // is unreachable there.
+        if (process.getuid?.() === 0) return;
+        const filePath = freshPath("unreadable.json");
+        await writeFile(filePath, JSON.stringify(validJson()), { mode: 0o000 });
+        // The pre-open lstat succeeds; open(2) fails with EACCES, which is
+        // permanent evidence outside the retryable churn classes.
+        await expectFailure(filePath, "open_failed");
+    });
+
     test("classifies an unlink during the snapshot as discovery churn", async () => {
         const filePath = freshPath("unlinked-mid-read.json");
         await writePrivateFile(filePath, JSON.stringify(validJson()));
@@ -206,8 +217,8 @@ describe("direct-file snapshot", () => {
         // First attempt: the post-read stat reports the removal as
         // `replaced_during_read`; the one-restart rule retries, and the
         // restart's initial stat reports the still-absent file as
-        // `open_failed`. Both are retryable churn codes for callers.
-        await expectFailure(filePath, "open_failed", { afterOpen });
+        // `not_found`. Both are retryable churn codes for callers.
+        await expectFailure(filePath, "not_found", { afterOpen });
     });
 
     test("fails closed on win32 before any filesystem work", async () => {

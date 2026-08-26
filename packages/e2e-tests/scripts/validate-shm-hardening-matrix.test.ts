@@ -22,7 +22,9 @@ interface Tuple {
 }
 
 const CAPS = {
-    arena_bytes: 1048576,
+    // Covers one duplex candidate of the default geometry below: both
+    // directions double the per-direction arena bytes and descriptors.
+    arena_bytes: 2097152,
     descriptors: 64,
     leases: 64,
     mappings: 4,
@@ -136,6 +138,63 @@ describe("shm hardening matrix validator", () => {
         );
         expect(result.outcome).toBe("invalid");
         expect(result.errors.join(" ")).toMatch(/host_limits must have/);
+    });
+
+    it("rejects active caps that cannot admit one candidate of the geometry", () => {
+        const entry = tuple({
+            host_limits: {
+                active: {
+                    // One duplex candidate of the default geometry needs
+                    // 2 x 1048576 arena bytes, 2 x 32 descriptors, and at
+                    // least one lease and one mapping per direction.
+                    arena_bytes: 1048576,
+                    descriptors: 63,
+                    leases: 1,
+                    mappings: 1,
+                    pinned_workers: 0,
+                },
+                quarantine: { ...CAPS },
+            },
+        });
+        const result = validateHardeningMatrix(
+            manifestWith([entry], { active_platforms: ["linux"] }),
+            fullInventory([entry]),
+        );
+        expect(result.outcome).toBe("invalid");
+        const text = result.errors.join(" ");
+        expect(text).toMatch(/active arena_bytes cap 1048576 cannot admit/);
+        expect(text).toMatch(/active descriptors cap 63 cannot admit/);
+        expect(text).toMatch(/active leases cap 1 cannot admit/);
+        expect(text).toMatch(/active mappings cap 1 cannot admit/);
+    });
+
+    it("accepts exact one-candidate active caps with zero pinned workers", () => {
+        const entry = tuple({
+            host_limits: {
+                active: {
+                    arena_bytes: 2097152,
+                    descriptors: 64,
+                    leases: 2,
+                    mappings: 2,
+                    // Cold-park profiles pin zero workers; no floor applies.
+                    pinned_workers: 0,
+                },
+                // Quarantine caps have no admission floor: zero declares
+                // quarantine retention disabled.
+                quarantine: {
+                    arena_bytes: 0,
+                    descriptors: 0,
+                    leases: 0,
+                    mappings: 0,
+                    pinned_workers: 0,
+                },
+            },
+        });
+        const result = validateHardeningMatrix(
+            manifestWith([entry], { active_platforms: ["linux"] }),
+            fullInventory([entry]),
+        );
+        expect(result.outcome).toBe("valid");
     });
 
     it("reports an UNSET tuple field as unresolved", () => {
