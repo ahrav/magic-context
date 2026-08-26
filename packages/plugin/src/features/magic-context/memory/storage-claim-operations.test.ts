@@ -1330,6 +1330,54 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
         }
     });
 
+    test("a merge that keeps the target content keeps the target's own evidence", () => {
+        // Built from source observations only, the merged revision dropped the
+        // target's attestation of bytes it still holds — invisible in evidence
+        // summaries, and gone from the chain once this claim is merged again.
+        const ctx = setup();
+        try {
+            const target = createClaimOp(ctx, "op-target", "Target claim content.");
+            const source = createClaimOp(ctx, "op-source", "Source claim content.");
+            const targetObservations = ctx.db
+                .prepare(
+                    `SELECT observation_id AS observationId FROM claim_evidence
+                      WHERE revision_id = (SELECT current_revision_id FROM claims
+                                            WHERE id = (SELECT claim_id FROM claim_public_ids
+                                                         WHERE public_id = ?))
+                        AND relation = 'supports'`,
+                )
+                .all(publicIdOf(target)) as Array<{ observationId: number }>;
+            expect(targetObservations.length).toBeGreaterThan(0);
+
+            // mergedContent omitted, so the target keeps its bytes.
+            const merged = mergeProjectMemoryClaims(
+                ctx.db,
+                { producer: "test", operationKey: "op-merge" },
+                {
+                    targetToken: computeProjectMemoryMutationToken(ctx.db, publicIdOf(target)),
+                    sourceTokens: [computeProjectMemoryMutationToken(ctx.db, publicIdOf(source))],
+                    actor: "user:test",
+                },
+            );
+            expect(merged.outcome).toBe("applied");
+
+            const carried = ctx.db
+                .prepare(
+                    `SELECT observation_id AS observationId FROM claim_evidence
+                      WHERE revision_id = (SELECT current_revision_id FROM claims
+                                            WHERE id = (SELECT claim_id FROM claim_public_ids
+                                                         WHERE public_id = ?))`,
+                )
+                .all(publicIdOf(target)) as Array<{ observationId: number }>;
+            const carriedIds = new Set(carried.map((row) => row.observationId));
+            for (const row of targetObservations) {
+                expect(carriedIds.has(row.observationId)).toBe(true);
+            }
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("a cross-category merge is refused before any claim is retired", () => {
         // A merge keeps the target's category and terminally retires every
         // source, so merging across categories destroys the source category's

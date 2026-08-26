@@ -1146,6 +1146,20 @@ describe("sqlite runtime gate", () => {
         expect(result.reasons).toEqual(["Bun 1.3.13 is below the supported floor 1.3.14"]);
     });
 
+    it("blocks a production open, not just the off-path probe", () => {
+        // The gate reported an unsafe runtime but nothing consulted it: both
+        // production openDatabase paths went straight to a connection, enabled
+        // WAL, and wrote migrations — exactly the corruption mode it exists to
+        // prevent. Assert it is consulted before any connection is constructed.
+        const source = readFileSync(new URL("./storage-db.ts", import.meta.url), "utf8");
+        const gate = source.indexOf("const runtimeGate = probeSqliteRuntimeGate();");
+        expect(gate).toBeGreaterThan(-1);
+        const guardBody = source.slice(gate, gate + 200);
+        expect(guardBody).toContain("return null");
+        // ...and before the connection exists.
+        expect(gate).toBeLessThan(source.indexOf("const db = new Database(dbPath);"));
+    });
+
     it("passes the live off-path probe on this supported runtime", () => {
         const report = probeSqliteRuntimeGate();
         expect(report.ok).toBe(true);

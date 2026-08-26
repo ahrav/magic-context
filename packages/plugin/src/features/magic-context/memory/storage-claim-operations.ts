@@ -1636,13 +1636,38 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
             "merge sources carry no supporting evidence; direct-SQL corruption",
         );
     }
+    // A merge that keeps the target's bytes — the default when `mergedContent`
+    // is omitted — leaves the target's own observations still attesting to
+    // exactly this content. Building the revision from source observations alone
+    // dropped that provenance from the live chain: current-state evidence
+    // summaries lost it, and merging this claim again propagated only its source
+    // lineage, so the original attestation was gone for good. Carried as
+    // `supports` because these observations attest the content, while source
+    // observations arrive as `merged_from` lineage. A merge that REPLACES the
+    // bytes carries nothing, for the same reason the source rule gives: those
+    // observations attest to content this revision replaced.
+    const evidence = new Map<number, "supports" | "merged_from">();
+    if (mergedContent === target.content) {
+        for (const row of db
+            .prepare(
+                `SELECT observation_id AS observationId FROM claim_evidence
+                  WHERE revision_id = ? AND relation = 'supports'
+                  ORDER BY observation_id`,
+            )
+            .all(target.currentRevisionId) as Array<{ observationId: number }>) {
+            evidence.set(row.observationId, "supports");
+        }
+    }
+    for (const observationId of sourceObservations) {
+        if (!evidence.has(observationId)) evidence.set(observationId, "merged_from");
+    }
     const appended = appendClaimRevisionInCurrentTransaction(db, {
         claimId: target.claimId,
         expectedCurrentRevisionId: target.currentRevisionId,
         content: mergedContent,
-        evidence: [...new Set(sourceObservations)].map((observationId) => ({
+        evidence: [...evidence].map(([observationId, relation]) => ({
             observationId,
-            relation: "merged_from" as const,
+            relation,
         })),
     });
     if (appended.status !== "applied") {
