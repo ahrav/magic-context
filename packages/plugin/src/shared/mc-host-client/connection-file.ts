@@ -197,7 +197,17 @@ async function snapshotDirect(
     afterOpen?: () => void | Promise<void>,
 ): Promise<Uint8Array> {
     checkDeadline(deadline);
-    const before = await lstat(filePath);
+    // A failed stat is discovery evidence, not a raw I/O fault: an absent
+    // path during daemon republication must reach callers as the same
+    // `open_failed` churn class as a failed open, or retry classification
+    // falls through to a permanent stop on the unwrapped ENOENT.
+    const before = await lstat(filePath).catch((error: unknown) => {
+        throw new ConnectionFileError(
+            `failed to stat connection file ${filePath}`,
+            "open_failed",
+            error,
+        );
+    });
     if (before.isSymbolicLink()) {
         throw new ConnectionFileError(
             `connection file ${filePath} is a symlink; client discovery must reject symbolic links`,
@@ -225,7 +235,16 @@ async function snapshotDirect(
         checkDeadline(deadline);
         const bytes = await readBounded(handle, deadline);
         checkDeadline(deadline);
-        const after = await lstat(filePath);
+        // An unlink after the read is a replacement event: classify it as
+        // `replaced_during_read` so the one-restart rule (KTD3) and churn
+        // retry classification apply instead of a raw ENOENT escaping.
+        const after = await lstat(filePath).catch((error: unknown) => {
+            throw new ConnectionFileError(
+                `connection file ${filePath} was removed during the snapshot`,
+                "replaced_during_read",
+                error,
+            );
+        });
         if (!after.isFile() || !sameIdentity(during, after)) {
             throw new ConnectionFileError(
                 `connection file ${filePath} was replaced during the snapshot`,
