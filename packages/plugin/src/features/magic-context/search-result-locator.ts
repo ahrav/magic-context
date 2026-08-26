@@ -50,7 +50,7 @@ export interface PhysicalResultLocator {
 export function encodePhysicalResultLocator(result: UnifiedSearchResult): string {
     switch (result.source) {
         case "memory":
-            return `${SOURCE_LOCATOR_KIND.memory}:${result.memoryId}`;
+            return `${SOURCE_LOCATOR_KIND.memory}:${result.publicClaimId}`;
         case "message":
             return `${SOURCE_LOCATOR_KIND.message}:${result.messageId}`;
         case "compartment":

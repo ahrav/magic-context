@@ -1,5 +1,6 @@
 import type { ContextEvent } from "@earendil-works/pi-coding-agent";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import { createClaimMemorySchema } from "@magic-context/core/features/magic-context/storage-claim-memory-schema";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { Database } from "@magic-context/core/shared/sqlite";
@@ -11,6 +12,7 @@ export function createTestDb(path = ":memory:"): Database {
 	const db = new Database(path);
 	initializeDatabase(db);
 	runMigrations(db);
+	db.transaction(() => createClaimMemorySchema(db)).immediate();
 	return db;
 }
 

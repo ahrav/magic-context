@@ -12,6 +12,7 @@
  *   doctor migrate-session  Re-home an OpenCode session to another directory/project.
  *   doctor merge-identity   Merge all project-scoped rows between identities.
  *   doctor repair-db        Back up and salvage a corrupted shared database.
+ *   doctor reset-db         Abandon an unsupported database family into quarantine.
  *
  * Common flags:
  *   --harness opencode|pi|omp   Target one harness (default: auto-detect / prompt)
@@ -78,6 +79,7 @@ function printUsage(): void {
         "    doctor merge-identity   Merge project rows (--from ID --to ID [--dry-run] [--yes])",
     );
     console.log("    doctor repair-db   Back up and salvage a corrupted shared database");
+    console.log("    doctor reset-db    Abandon an unsupported database family (--dry-run/--yes)");
     console.log("");
     console.log("  Harness selection:");
     console.log("    --harness opencode    Target OpenCode only");
@@ -142,6 +144,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
             if (rest[0] === "repair-db") {
                 const { runRepairDbCli } = await import("./commands/doctor-repair-db");
                 return runRepairDbCli(rest.slice(1));
+            }
+            if (rest[0] === "reset-db") {
+                const { runResetDbCli } = await import("./commands/doctor-reset-db");
+                return runResetDbCli(rest.slice(1));
             }
             if (rest[0] === "migrate") {
                 const { runMigrateCli } = await import("./commands/migrate");

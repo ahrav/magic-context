@@ -40,9 +40,10 @@ function memoryResult(
 		source: "memory",
 		content,
 		score,
-		memoryId,
+		publicClaimId: `mcm_${memoryId}`,
+		revisionLocator: `mcm_${memoryId}/r1/${"0".repeat(64)}`,
 		category: "WORKFLOW_RULES",
-		matchType: "fts",
+		matchType: "exact",
 		...(contentDigest === undefined ? {} : { contentDigest }),
 	};
 }
@@ -132,42 +133,40 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
-	it("suppresses a persisted hint whose contributing memory is no longer eligible", async () => {
+	it("suppresses a persisted legacy hint whose contributing memory is no longer eligible", async () => {
 		const db = createTestDb();
 		const seeded = seedEligibleMemory(db);
+		// A pre-cutover persisted decision that bound fragments keeps its
+		// replay gate; fresh decisions record no claim fragments.
+		const persisted = appendAutoSearchHintDecision(db, "ses-auto", {
+			// The default test entry-id shape for message index 0, timestamp 1.
+			messageId: "test-entry-0:1",
+			decision: "hint",
+			text: "\n\n<ctx-search-hint>historian cache wiring details</ctx-search-hint>",
+			memoryFragments: [{ id: seeded.id, hash: seeded.digest }],
+		});
+		expect(persisted.ok).toBeTrue();
+		runInMemoryClaimsWriteTransaction(db, () =>
+			updateMemoryContentWithClaimsInCurrentTransaction(
+				db,
+				{
+					producer: "auto-search-pi-test",
+					operationKey: `rewrite:${seeded.id}`,
+					requestDigest: sha256Utf8Hex(`rewrite:${seeded.id}`),
+				},
+				{
+					memoryId: seeded.id,
+					content: "rewritten after the hint was persisted",
+					normalizedHash: "hash:rewritten",
+				},
+			),
+		);
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => [seeded.result],
+			async () => {
+				throw new Error("replay must not re-search");
+			},
 		);
 		try {
-			const firstMessages = [
-				userMessage("explain the historian cache wiring", 1),
-			];
-			await runAutoSearchHintForPi({
-				sessionId: "ses-auto",
-				db,
-				messages: firstMessages,
-				options: baseOptions,
-			});
-			expect(textOf(firstMessages[0])).toContain("<ctx-search-hint>");
-
-			// An in-place rewrite changes the exact content digest, so the
-			// replay pass must suppress the persisted hint instead of
-			// re-serving a fragment bound to bytes that no longer exist.
-			runInMemoryClaimsWriteTransaction(db, () =>
-				updateMemoryContentWithClaimsInCurrentTransaction(
-					db,
-					{
-						producer: "auto-search-pi-test",
-						operationKey: `rewrite:${seeded.id}`,
-						requestDigest: sha256Utf8Hex(`rewrite:${seeded.id}`),
-					},
-					{
-						memoryId: seeded.id,
-						content: "rewritten after the hint was persisted",
-						normalizedHash: "hash:rewritten",
-					},
-				),
-			);
 			const replayMessages = [
 				userMessage("explain the historian cache wiring", 1),
 			];
@@ -177,7 +176,7 @@ describe("runAutoSearchHintForPi", () => {
 				messages: replayMessages,
 				options: baseOptions,
 			});
-			expect(spy).toHaveBeenCalledTimes(1);
+			expect(spy).toHaveBeenCalledTimes(0);
 			expect(textOf(replayMessages[0])).not.toContain("<ctx-search-hint>");
 		} finally {
 			spy.mockRestore();

@@ -33,21 +33,7 @@ pub fn resolve_db_path() -> Option<PathBuf> {
         .join("cortexkit")
         .join("magic-context")
         .join("context.db");
-    if shared_path.exists() {
-        return Some(shared_path);
-    }
-
-    let legacy_path = data_dir
-        .join("opencode")
-        .join("storage")
-        .join("plugin")
-        .join("magic-context")
-        .join("context.db");
-    if legacy_path.exists() {
-        Some(legacy_path)
-    } else {
-        None
-    }
+    shared_path.exists().then_some(shared_path)
 }
 
 pub fn resolve_opencode_db_path() -> Option<PathBuf> {
@@ -68,79 +54,78 @@ pub fn resolve_opencode_db_path() -> Option<PathBuf> {
     }
 }
 
-/// Opens a read-only connection to the database in WAL mode.
+fn refusal(message: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(message),
+    )
+}
+
+fn verify_context_database(conn: &Connection, path: &Path) -> Result<(), rusqlite::Error> {
+    let runtime = crate::sqlite_runtime::read_sqlite_engine_identity(conn)?;
+    let runtime_reasons = crate::sqlite_runtime::evaluate_sqlite_runtime_gate(&runtime);
+    if !runtime_reasons.is_empty() {
+        return Err(refusal(format!(
+            "unsafe SQLite runtime: {}",
+            runtime_reasons.join("; ")
+        )));
+    }
+    let format_reasons =
+        crate::sqlite_runtime::verify_direct_format(conn, path).map_err(refusal)?;
+    if !format_reasons.is_empty() {
+        return Err(refusal(format!(
+            "unsupported Magic Context database format: {}",
+            format_reasons.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+fn open_external_readonly(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    Ok(conn)
+}
+
+/// Opens an exact direct-format database for reads.
 pub fn open_readonly(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    // WAL mode is inherited from the plugin's read-write connection — no need to set it here.
-    // busy_timeout is connection-local and safe on read-only connections.
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    verify_context_database(&conn, path)?;
+    let violations = crate::sqlite_runtime::verify_sqlite_connection_contract(&conn, true, 5000)?;
+    if !violations.is_empty() {
+        return Err(refusal(format!(
+            "unsafe SQLite connection contract: {}",
+            violations.join("; ")
+        )));
+    }
     Ok(conn)
 }
 
-fn ensure_context_store_uuid(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let has_table: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_store_meta'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if has_table.is_none() {
-        return Ok(());
-    }
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT value FROM context_store_meta WHERE key = 'store_uuid'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if existing.is_some() {
-        return Ok(());
-    }
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|error| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            error.to_string(),
-        )))
-    })?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let uuid = format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-    );
-    conn.execute(
-        "INSERT INTO context_store_meta(key, value) VALUES ('store_uuid', ?1) ON CONFLICT(key) DO NOTHING",
-        [&uuid],
-    )?;
-    Ok(())
-}
-
-/// Opens a read-write connection for write operations (memory edits, queue entries).
+/// Opens an exact direct-format database for writes without creating it.
 pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
-    // READ_WRITE WITHOUT CREATE: if the DB file vanished after startup,
-    // Connection::open would CREATE an empty SQLite file — violating the
-    // "dashboard never owns the schema" boundary. The plugin owns DB lifecycle;
-    // a missing file should error, not silently spawn a blank DB.
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    // busy_timeout MUST come before journal_mode=WAL: setting WAL can itself need
-    // the file lock, and with the timeout installed last a cold-open under
-    // contention fails immediately with SQLITE_BUSY instead of waiting.
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    verify_context_database(&conn, path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    // This opener has no module client, so a marker-less store cannot be classified as
-    // regressed here. The later module handshake performs the authoritative reconciliation.
-    ensure_context_store_uuid(&conn)?;
+    let violations = crate::sqlite_runtime::verify_sqlite_connection_contract(&conn, true, 5000)?;
+    if !violations.is_empty() {
+        return Err(refusal(format!(
+            "unsafe SQLite connection contract: {}",
+            violations.join("; ")
+        )));
+    }
     Ok(conn)
 }
 
@@ -936,7 +921,7 @@ pub fn load_raw_db_cache_events(
         return Ok(Vec::new());
     };
 
-    let conn = open_readonly(&opencode_db_path)?;
+    let conn = open_external_readonly(&opencode_db_path)?;
 
     // Per-session windowing: each session gets up to `limit` recent events
     // (so a session-filtered timeline always has full bar coverage), capped
@@ -1408,7 +1393,7 @@ fn build_db_cache_events_with_attribution(
         .collect();
     if !oc_session_ids.is_empty() {
         if let Some(opencode_db_path) = resolve_opencode_db_path() {
-            if let Ok(conn) = open_readonly(&opencode_db_path) {
+            if let Ok(conn) = open_external_readonly(&opencode_db_path) {
                 if let Ok(mut stmt) = conn.prepare(FIRST_OPENCODE_CACHE_EVENT_SQL) {
                     for sid in oc_session_ids {
                         let db_earliest = stmt
@@ -1908,7 +1893,7 @@ fn load_recent_opencode_cache_sessions(
     let Some(path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok(conn) = open_readonly(&path) else {
+    let Ok(conn) = open_external_readonly(&path) else {
         return Vec::new();
     };
     if let Ok(mut cache) = opencode_cache_presence().write() {
@@ -2079,7 +2064,7 @@ fn load_managed_cache_sessions_from_path(
     path: &Path,
     keys: &HashSet<(Harness, String)>,
 ) -> HashSet<(Harness, String)> {
-    let Ok(conn) = open_readonly(&path.to_path_buf()) else {
+    let Ok(conn) = open_external_readonly(path) else {
         return HashSet::new();
     };
     load_managed_cache_sessions_from_conn(&conn, keys)
@@ -2149,7 +2134,7 @@ pub fn load_cache_session_titles(
         .collect();
     if !opencode_ids.is_empty() {
         if let Some(path) = resolve_opencode_db_path() {
-            if let Ok(conn) = open_readonly(&path) {
+            if let Ok(conn) = open_external_readonly(&path) {
                 let placeholders = vec!["?"; opencode_ids.len()].join(",");
                 let sql = format!(
                     "SELECT id, COALESCE(title, '') FROM session WHERE id IN ({placeholders})"
@@ -2436,7 +2421,7 @@ fn get_opencode_session_cache_events(
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok(conn) = open_readonly(&opencode_db_path) else {
+    let Ok(conn) = open_external_readonly(&opencode_db_path) else {
         return Vec::new();
     };
 
@@ -2651,11 +2636,7 @@ pub fn get_projects(conn: &Connection) -> Result<Vec<ProjectInfo>, rusqlite::Err
     let workspace_identities =
         crate::workspaces::extra_workspace_member_identities(conn).unwrap_or_default();
 
-    // UNION only the project-path sources that exist. The dashboard opens the
-    // DB read-only and never migrates, so a DB older than the Dreamer V2 schema
-    // lacks task_schedule_state / dream_runs; an unconditional UNION would throw
-    // "no such table" and break the Projects page instead of degrading.
-    let mut sources = vec!["SELECT project_path FROM memories".to_string()];
+    let mut sources = vec!["SELECT canonical_identity AS project_path FROM projects".to_string()];
     if table_exists(conn, "task_schedule_state") {
         sources.push("SELECT project_path FROM task_schedule_state".to_string());
     }
@@ -2783,7 +2764,7 @@ fn mapped_session_directories(identities: &SessionIdentityMap) -> Vec<(String, S
     let mut dirs = Vec::new();
 
     if let Some(oc) = resolve_opencode_db_path() {
-        if let Ok(conn) = open_readonly(&oc) {
+        if let Ok(conn) = open_external_readonly(&oc) {
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT id, COALESCE(directory, '')
                  FROM session
@@ -2884,7 +2865,7 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
     let identity_by_dir = session_identity_by_directory(&session_identities);
 
     if let Some(opencode_db_path) = resolve_opencode_db_path() {
-        if let Ok(conn) = open_readonly(&opencode_db_path) {
+        if let Ok(conn) = open_external_readonly(&opencode_db_path) {
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT p.name, p.worktree, COUNT(s.id)
                  FROM project p LEFT JOIN session s ON s.project_id = p.id
@@ -4625,7 +4606,7 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok(conn) = open_readonly(&opencode_db_path) else {
+    let Ok(conn) = open_external_readonly(&opencode_db_path) else {
         return Vec::new();
     };
     // No message-table join: the session list does not show a message count, and
@@ -4852,7 +4833,7 @@ pub fn get_session_messages(
             let Some(opencode_db_path) = resolve_opencode_db_path() else {
                 return Ok(Vec::new());
             };
-            let conn = open_readonly(&opencode_db_path)?;
+            let conn = open_external_readonly(&opencode_db_path)?;
             load_opencode_messages(&conn, session_id)
         }
         Harness::Pi => {
@@ -4885,7 +4866,7 @@ pub fn get_opencode_session_detail(
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Ok(None);
     };
-    let oc_conn = open_readonly(&opencode_db_path)?;
+    let oc_conn = open_external_readonly(&opencode_db_path)?;
     let row = oc_conn.query_row(
         "SELECT s.id, COALESCE(s.title, ''), COALESCE(p.name, ''), COALESCE(p.worktree, ''),
                 COALESCE(s.directory, ''),
@@ -5189,7 +5170,7 @@ fn resolve_session_info(
         return result;
     };
 
-    let conn = match open_readonly(&opencode_db) {
+    let conn = match open_external_readonly(&opencode_db) {
         Ok(c) => c,
         Err(_) => return result,
     };
@@ -5258,7 +5239,7 @@ pub fn get_compartments(
 
     // Resolve message timestamps from OpenCode DB
     if let Some(opencode_db_path) = resolve_opencode_db_path() {
-        if let Ok(oc_conn) = open_readonly(&opencode_db_path) {
+        if let Ok(oc_conn) = open_external_readonly(&opencode_db_path) {
             for comp in compartments.iter_mut() {
                 if let Some(ref start_id) = comp.start_message_id {
                     if let Ok(ts) = oc_conn.query_row(

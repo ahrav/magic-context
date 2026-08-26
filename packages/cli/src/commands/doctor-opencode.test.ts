@@ -480,7 +480,7 @@ describe("doctor claims backfill commands", () => {
         const messages: string[] = [];
         const versionBefore = database
             .prepare("SELECT MAX(version) AS version FROM schema_migrations")
-            .get();
+            .get() as { version: number };
 
         const result = await runClaimsBackfillCommands(makeHarness(database, messages), {
             retryClaimsBackfill: true,
@@ -491,7 +491,7 @@ describe("doctor claims backfill commands", () => {
         expect(output).toContain("before: phase=complete; linked=0/0");
         expect(output).toContain("after:  phase=complete; linked=0/0");
         expect(output).toContain("claims backfill complete");
-        expect(output).toContain("schema: v89 → v89");
+        expect(output).toContain(`schema: v${versionBefore.version} → v${versionBefore.version}`);
         expect(output).toContain("restart it before creating new sessions");
         expect(
             database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),

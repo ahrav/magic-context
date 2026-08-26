@@ -16,7 +16,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
-import { Database } from "../../shared/sqlite";
+import { Database, evaluateSqliteRuntimeGate } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     __resetStoragePrivatePermissionEnforcementForTests,
@@ -28,6 +28,7 @@ import {
     __resetStoragePermissionFsForTests,
     __setRpcDiscoveryFsForTests,
     __setStoragePermissionFsForTests,
+    assertSqliteConnectionContract,
     closeDatabase,
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
@@ -40,6 +41,7 @@ import {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
+    probeSqliteRuntimeGate,
     resolveDatabasePath,
 } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
@@ -209,6 +211,30 @@ describe("upstream migration version lane", () => {
 
 describe("storage-db", () => {
     describe("#given openDatabase", () => {
+        it("#when a reset marker is pending #then refuses without opening or changing the family", () => {
+            const dir = makeTempDir("storage-db-reset-pending-");
+            const dbPath = join(dir, "context.db");
+            writeFileSync(dbPath, "database bytes");
+            writeFileSync(`${dbPath}.mc-reset`, "pending marker");
+            const beforeMain = readFileSync(dbPath);
+            const beforeMarker = readFileSync(`${dbPath}.mc-reset`);
+
+            expect(() => openDatabase(dbPath)).toThrow(/reset marker .* is pending/);
+            expect(readFileSync(dbPath)).toEqual(beforeMain);
+            expect(readFileSync(`${dbPath}.mc-reset`)).toEqual(beforeMarker);
+        });
+
+        it("#when only an orphan sidecar exists #then refuses pristine bootstrap", () => {
+            const dir = makeTempDir("storage-db-orphan-sidecar-");
+            const dbPath = join(dir, "context.db");
+            writeFileSync(`${dbPath}-wal`, "orphan wal");
+            const before = readFileSync(`${dbPath}-wal`);
+
+            expect(() => openDatabase(dbPath)).toThrow(/orphan family artifacts: wal/);
+            expect(existsSync(dbPath)).toBe(false);
+            expect(readFileSync(`${dbPath}-wal`)).toEqual(before);
+        });
+
         it("#when called first time #then creates DB with WAL mode and busy_timeout", () => {
             const dataHome = useTempDataHome("storage-db-wal-");
 
@@ -1068,5 +1094,144 @@ describe("storage-db", () => {
                 expect(body.includes("test-preload.ts")).toBe(true);
             }
         });
+    });
+});
+
+describe("sqlite runtime gate", () => {
+    const safeInput = {
+        runtime: "Node.js" as const,
+        runtimeVersion: "24.18.0",
+        sqliteVersion: "3.53.1",
+        sqliteSourceId:
+            "2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9",
+    };
+
+    it("passes an approved WAL-reset-safe source", () => {
+        expect(evaluateSqliteRuntimeGate(safeInput)).toEqual({ ok: true, reasons: [] });
+    });
+
+    it("fails Node 24.14.1 even with a safe SQLite source", () => {
+        const result = evaluateSqliteRuntimeGate({ ...safeInput, runtimeVersion: "24.14.1" });
+        expect(result.ok).toBe(false);
+        expect(result.reasons).toEqual(["Node.js 24.14.1 is below the supported floor 24.15.0"]);
+    });
+
+    it("fails an unsafe bundled SQLite source that predates the WAL-reset fix", () => {
+        const result = evaluateSqliteRuntimeGate({
+            ...safeInput,
+            sqliteVersion: "3.46.0",
+            sqliteSourceId:
+                "2024-05-23 13:25:27 96c92aba00c8375bc32fafcdf12429c58bd8aabfcadab6683e35bbb9cdebf19e",
+        });
+        expect(result.ok).toBe(false);
+        expect(result.reasons).toEqual(["SQLite 3.46.0 predates the WAL-reset fix in 3.47.1"]);
+    });
+
+    it("fails an unknown SQLite source identity", () => {
+        const result = evaluateSqliteRuntimeGate({
+            ...safeInput,
+            sqliteSourceId: "vendor-custom-build",
+        });
+        expect(result.ok).toBe(false);
+        expect(result.reasons[0]).toContain("not a recognized SQLite source identity");
+    });
+
+    it("fails a Bun runtime below the supported floor", () => {
+        const result = evaluateSqliteRuntimeGate({
+            ...safeInput,
+            runtime: "Bun",
+            runtimeVersion: "1.3.13",
+        });
+        expect(result.ok).toBe(false);
+        expect(result.reasons).toEqual(["Bun 1.3.13 is below the supported floor 1.3.14"]);
+    });
+
+    it("blocks a production open, not just the off-path probe", () => {
+        // The gate reported an unsafe runtime but nothing consulted it: both
+        // production openDatabase paths went straight to a connection, enabled
+        // WAL, and wrote migrations — exactly the corruption mode it exists to
+        // prevent. Assert it is consulted before any connection is constructed.
+        const source = readFileSync(new URL("./storage-db.ts", import.meta.url), "utf8");
+        const gate = source.indexOf("const runtimeGate = probeSqliteRuntimeGate();");
+        expect(gate).toBeGreaterThan(-1);
+        const guardBody = source.slice(gate, gate + 200);
+        expect(guardBody).toContain("return null");
+        // ...and before the connection exists.
+        expect(gate).toBeLessThan(source.indexOf("const db = new Database(dbPath);"));
+    });
+
+    it("passes the live off-path probe on this supported runtime", () => {
+        const report = probeSqliteRuntimeGate();
+        expect(report.ok).toBe(true);
+        expect(report.input.sqliteVersion.length).toBeGreaterThan(0);
+    });
+});
+
+describe("sqlite connection contract", () => {
+    it("accepts a file-backed connection with the production PRAGMAs", () => {
+        const dir = makeTempDir("storage-db-contract-");
+        const db = new Database(join(dir, "contract.db"));
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            db.exec("PRAGMA foreign_keys=ON");
+            db.exec("PRAGMA journal_mode=WAL");
+            expect(() =>
+                assertSqliteConnectionContract(db, { expectWal: true, minBusyTimeoutMs: 5000 }),
+            ).not.toThrow();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks when foreign keys are disabled", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: false })).toThrow(
+                /foreign_keys is disabled/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks when WAL activation did not stick", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            db.exec("PRAGMA foreign_keys=ON");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: true })).toThrow(
+                /journal_mode is 'memory', expected 'wal'/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks when the busy timeout is missing", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA foreign_keys=ON");
+            db.exec("PRAGMA busy_timeout=0");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: false })).toThrow(
+                /busy_timeout 0ms is below the required 1ms/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks a synchronous mode outside the declared set", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            db.exec("PRAGMA foreign_keys=ON");
+            db.exec("PRAGMA synchronous=OFF");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: false })).toThrow(
+                /synchronous mode 0 is not in the declared set/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
     });
 });

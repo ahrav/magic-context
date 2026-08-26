@@ -1,8 +1,14 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { FORK_MIGRATION_VERSION_FLOOR, LATEST_MIGRATION_VERSION, MIGRATIONS } from "./migrations";
+import {
+    DIRECT_FORMAT_SUPERSEDED_MIGRATION_HEAD,
+    FORK_MIGRATION_VERSION_FLOOR,
+    LATEST_MIGRATION_VERSION,
+    MIGRATIONS,
+} from "./migrations";
 import { formatSchemaFenceBootLog, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import { DIRECT_FORMAT_EPOCH, MC_APPLICATION_ID } from "./storage-format-epoch";
 
 // Guards the #1 bug class the project already hit during v2 work: adding a
 // migration but forgetting to bump LATEST_SUPPORTED_VERSION (the schema-fence
@@ -25,5 +31,21 @@ describe("schema version fence", () => {
         expect(formatSchemaFenceBootLog(71, 72)).toBe(
             "[magic-context] upstream migration lane at boot: database=v71, supported_fence=v72",
         );
+    });
+});
+
+describe("direct-format fence primitives", () => {
+    it("pins the superseded migration head to the current migration head", () => {
+        expect(DIRECT_FORMAT_SUPERSEDED_MIGRATION_HEAD).toBe(LATEST_MIGRATION_VERSION);
+        expect(DIRECT_FORMAT_SUPERSEDED_MIGRATION_HEAD).toBe(LATEST_SUPPORTED_VERSION);
+        expect(DIRECT_FORMAT_SUPERSEDED_MIGRATION_HEAD).toBeLessThan(FORK_MIGRATION_VERSION_FLOOR);
+    });
+
+    it("keeps the direct-format vocabulary disjoint from the migration lane", () => {
+        expect(DIRECT_FORMAT_EPOCH).toBeGreaterThanOrEqual(1);
+        expect(MC_APPLICATION_ID).toBe(0x4d435458);
+        for (const migration of MIGRATIONS) {
+            expect(migration.version).toBeLessThanOrEqual(DIRECT_FORMAT_SUPERSEDED_MIGRATION_HEAD);
+        }
     });
 });

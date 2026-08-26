@@ -11,7 +11,10 @@ function result(partial: Record<string, unknown>): UnifiedSearchResult {
 
 describe("encodePhysicalResultLocator", () => {
     const cases: Array<[UnifiedSearchResult, string]> = [
-        [result({ source: "memory", memoryId: 42 }), "memory:42"],
+        [
+            result({ source: "memory", publicClaimId: `mcm_${"a".repeat(32)}` }),
+            `memory:mcm_${"a".repeat(32)}`,
+        ],
         [result({ source: "message", messageId: "msg_abc123" }), "message:msg_abc123"],
         [result({ source: "compartment", compartmentId: 7 }), "chunk:7"],
         [

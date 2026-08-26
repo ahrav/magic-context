@@ -4,17 +4,23 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createDreamTimerModuleClient } from "../../../plugin/dream-timer-module-client";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { applyMirrorPage, ensureContextStoreUuid } from "../context-authority";
+import { ensureContextStoreUuid } from "../context-authority";
+import { insertMemory } from "../memory";
 import {
-    getMemoriesByProject,
-    getUnclassifiedMemoryIds,
-    insertMemory,
-    recordMemoryVerifications,
-} from "../memory";
+    applyProjectMemoryMapping,
+    computeProjectMemoryMutationToken,
+} from "../memory/storage-claim-operations";
 import { runMigrations } from "../migrations";
+import { getClaimMuralCueStates } from "../mural/storage-mural-cues";
+import { createClaimMemorySchema } from "../storage-claim-memory-schema";
 import { initializeDatabase } from "../storage-db";
-import { ensureProjectState, getProjectState } from "../storage-project-state";
-import { getUserMemoryCandidates, insertUserMemory } from "../user-memory/storage-user-memory";
+import { type SeededProjectMemoryClaim, seedProjectMemoryClaim } from "../test-claim-database";
+import {
+    getUserMemoryCandidates,
+    insertUserMemory,
+    insertUserMemoryCandidates,
+} from "../user-memory/storage-user-memory";
+import { readDreamerProjectClaims } from "./claim-manifest";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
 import { getDreamRuns } from "./storage-dream-runs";
@@ -38,7 +44,21 @@ function freshDb(): Database {
     const database = new Database(":memory:");
     initializeDatabase(database);
     runMigrations(database);
+    database.transaction(() => createClaimMemorySchema(database)).immediate();
     return database;
+}
+
+function mapClaim(database: Database, claim: SeededProjectMemoryClaim, paths: string[]): void {
+    const result = applyProjectMemoryMapping(
+        database,
+        { producer: "task-executor-test", operationKey: `map-${claim.publicClaimId}` },
+        {
+            token: computeProjectMemoryMutationToken(database, claim.publicClaimId),
+            revisionLocator: claim.revisionLocator,
+            paths: { state: "known", exact: paths },
+        },
+    );
+    expect(result.outcome).toBe("applied");
 }
 
 function assistantMessages(text: string) {
@@ -75,19 +95,19 @@ describe("createDreamTaskExecutor — curate", () => {
     test("runs whole-pool curation without verification gate or watermark patch", async () => {
         db = freshDb();
         const project = "dir:/repo/project";
-        const first = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const firstContent = "First memory uses src/first.ts because it is load-bearing.";
+        const secondContent = "Second memory is a project workflow rule.";
+        const first = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "ARCHITECTURE",
-            content: "First memory uses src/first.ts because it is load-bearing.",
+            content: firstContent,
         });
-        const second = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const second = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "PROJECT_RULES",
-            content: "Second memory is a project workflow rule.",
+            content: secondContent,
         });
-        recordMemoryVerifications(db, first.id, ["src/first.ts"], Date.now());
+        mapClaim(db, first, ["src/first.ts"]);
         insertUserMemory(db, "Prefer concise answers globally.", []);
 
         let capturedPrompt = "";
@@ -99,7 +119,11 @@ describe("createDreamTaskExecutor — curate", () => {
                     capturedPrompt = args.body?.parts?.[0]?.text ?? "";
                     return {};
                 }),
-                messages: mock(async () => ({ data: assistantMessages("curation complete") })),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        `<curate><keep claim="${first.publicClaimId}"/><keep claim="${second.publicClaimId}"/></curate>`,
+                    ),
+                })),
                 delete: mock(async () => ({})),
             },
         };
@@ -123,8 +147,10 @@ describe("createDreamTaskExecutor — curate", () => {
 
         expect(result).toEqual({ status: "completed", schedulePatch: undefined });
         expect(capturedPrompt).toContain("## Task: Curate Project Memory Pool (hygiene)");
-        expect(capturedPrompt).toContain(first.content);
-        expect(capturedPrompt).toContain(second.content);
+        expect(capturedPrompt).toContain(firstContent);
+        expect(capturedPrompt).toContain(secondContent);
+        expect(capturedPrompt).toContain(first.revisionLocator);
+        expect(capturedPrompt).toContain(first.contentDigest);
         expect(capturedPrompt).toContain("Mapped files: src/first.ts");
         expect(capturedPrompt).toContain("### Global user profile (for the redundancy check)");
         expect(capturedPrompt).toContain("Prefer concise answers globally.");
@@ -135,9 +161,8 @@ describe("createDreamTaskExecutor — curate", () => {
     test("rejects a textual pseudo-tool-call and retries with the fallback model", async () => {
         db = freshDb();
         const project = "dir:/repo/curate-pseudo-tool-call";
-        insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "PROJECT_RULES",
             content: "Use the shared release checklist before publishing.",
         });
@@ -153,7 +178,9 @@ describe("createDreamTaskExecutor — curate", () => {
                 }),
                 messages: mock(async () => ({
                     data: assistantMessages(
-                        promptCalls === 1 ? CURATE_PSEUDO_TOOL_CALL : "curation complete",
+                        promptCalls === 1
+                            ? CURATE_PSEUDO_TOOL_CALL
+                            : `<curate><keep claim="${claim.publicClaimId}"/></curate>`,
                     ),
                 })),
                 delete: mock(async () => ({})),
@@ -187,9 +214,8 @@ describe("createDreamTaskExecutor — curate", () => {
     test("adds the content language directive to curated prose tasks", async () => {
         db = freshDb();
         const project = "dir:/repo/language-project";
-        insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "ARCHITECTURE",
             content: "The project stores prompts in src/prompts.ts.",
         });
@@ -203,7 +229,11 @@ describe("createDreamTaskExecutor — curate", () => {
                     capturedSystem = args.body?.system ?? "";
                     return {};
                 }),
-                messages: mock(async () => ({ data: assistantMessages("curation complete") })),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        `<curate><keep claim="${claim.publicClaimId}"/></curate>`,
+                    ),
+                })),
                 delete: mock(async () => ({})),
             },
         };
@@ -236,16 +266,13 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         db = freshDb();
         const project = "dir:/repo/verify-broad-result";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
-        const memories = [];
         for (let i = 0; i < 51; i += 1) {
-            const memory = insertMemory(db, {
-                sourceType: "user",
-                projectPath: project,
+            const claim = seedProjectMemoryClaim(db, {
+                projectIdentity: project,
                 category: "ARCHITECTURE",
                 content: `Mapped broad fact ${i}.`,
             });
-            recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
-            memories.push(memory.id);
+            mapClaim(db, claim, ["package.json"]);
         }
 
         let promptCalls = 0;
@@ -262,14 +289,14 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
                     }) => {
                         promptCalls += 1;
                         const prompt = args.body?.parts?.[0]?.text ?? "";
-                        const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
-                            Number(match[1]),
+                        const ids = [...prompt.matchAll(/^\[(mcm_[^\]]+)\]/gm)].map(
+                            (match) => match[1] ?? "",
                         );
                         manifests.set(
                             args.path?.id ?? "",
                             promptCalls > 1
                                 ? "<verify>"
-                                : `<verify>${ids.map((id) => `<verified id="${id}"/>`).join("")}</verify>`,
+                                : `<verify>${ids.map((id) => `<verified claim="${id}" files="package.json"/>`).join("")}</verify>`,
                         );
                         return {};
                     },
@@ -284,7 +311,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         };
         const executor = createDreamTaskExecutor({
             client: client as never,
-            sessionDirectory: project,
+            sessionDirectory: process.cwd(),
             openOpenCodeDb: () => null,
         });
         const leaseKey = leaseKeyFor("verify-broad", project);
@@ -321,13 +348,12 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         db = freshDb();
         const project = "dir:/repo/verify-broad-provider-outage";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
-        const memory = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "ARCHITECTURE",
             content: "Mapped fact blocked by a provider outage.",
         });
-        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+        mapClaim(db, claim, ["src/fact.ts"]);
         const client = {
             session: {
                 list: mock(async () => ({ data: [] })),
@@ -374,13 +400,12 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         db = freshDb();
         const project = "dir:/repo/verify-broad-zero";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
-        const memory = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "ARCHITECTURE",
             content: "Mapped fact that cannot be verified yet.",
         });
-        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+        mapClaim(db, claim, ["src/fact.ts"]);
         const client = {
             session: {
                 list: mock(async () => ({ data: [] })),
@@ -413,6 +438,80 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
             0,
         );
         expect(getDreamRuns(db, project)[0]?.tasks_failed).toBe(1);
+    });
+});
+
+describe("createDreamTaskExecutor — review-user-memories", () => {
+    test("forwards project identity and commits project promotion through claim operation", async () => {
+        db = freshDb();
+        const project = "git:user-review-executor";
+        db.prepare(
+            `INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+             VALUES ('user-review-source', 'opencode', ?, ?)`,
+        ).run(project, Date.now());
+        insertUserMemoryCandidates(db, [
+            {
+                content: "This project requires focused tests before commit",
+                sessionId: "user-review-source",
+            },
+        ]);
+        const [candidate] = getUserMemoryCandidates(db);
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "user-review-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        JSON.stringify({
+                            promote_project: [
+                                {
+                                    content: "Run focused tests before commit.",
+                                    category: "PROJECT_RULES",
+                                    candidate_ids: [candidate.id],
+                                },
+                            ],
+                            consume_candidate_ids: [candidate.id],
+                        }),
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: "/repo/user-review-executor",
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor("review-user-memories", project);
+
+        const result = await executor(
+            {
+                task: "review-user-memories",
+                schedule: "0 3 * * *",
+                timeoutMinutes: 20,
+                promotionThreshold: 1,
+            },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-user-review",
+                leaseKey,
+            },
+        );
+
+        expect(result).toEqual({ status: "completed" });
+        expect(
+            readDreamerProjectClaims(db, project, "hygiene").map((claim) => claim.content),
+        ).toEqual(["Run focused tests before commit."]);
+        expect(getUserMemoryCandidates(db)).toHaveLength(0);
+        expect(
+            (
+                db.prepare("SELECT COUNT(*) AS count FROM claim_operation_effects").get() as {
+                    count: number;
+                }
+            ).count,
+        ).toBe(1);
     });
 });
 
@@ -537,25 +636,21 @@ describe("createDreamTaskExecutor — classify-memories", () => {
     test("runs the non-agentic XML transform and applies the manifest host-side", async () => {
         db = freshDb();
         const project = "dir:/repo/project";
-        // Stage 2 needs >= 10 memories in the pool to classify at all.
-        const ids: number[] = [];
-        for (let i = 0; i < 12; i += 1) {
-            const m = insertMemory(db, {
-                sourceType: "user",
-                projectPath: project,
+        const claims = Array.from({ length: 12 }, (_, index) =>
+            seedProjectMemoryClaim(db as Database, {
+                projectIdentity: project,
                 category: "ARCHITECTURE",
-                content: `Memory ${i}: the transform lives in src/file${i}.ts.`,
-            });
-            if (m) ids.push(m.id);
-        }
+                content: `Memory ${index}: the transform lives in src/file${index}.ts.`,
+            }),
+        );
 
         let capturedPrompt = "";
         let capturedAgent = "";
         // The classifier emits ONE <classify> manifest; the host parses + applies.
-        const manifest = `<classify>\n${ids
+        const manifest = `<classify>\n${claims
             .map(
-                (id) =>
-                    `<memory id="${id}" importance="${40 + (id % 30)}" scope="project" shareable="true"/>`,
+                (claim, index) =>
+                    `<memory claim="${claim.publicClaimId}" importance="${40 + (index % 30)}" scope="project" shareable="true"/>`,
             )
             .join("\n")}\n</classify>`;
         const client = {
@@ -603,25 +698,25 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         expect(capturedPrompt).toContain("Emit one <classify> manifest");
         expect(capturedPrompt).not.toContain('ctx_memory(action="classify"');
 
-        // Host applied the manifest: every memory is now classified (classified_at
-        // stamped → no longer unclassified) and importance moved off the default.
-        const stillUnclassified = getUnclassifiedMemoryIds(db, ids);
-        expect(stillUnclassified).toEqual([]);
+        const classified = readDreamerProjectClaims(db, project, "hygiene");
+        expect(classified).toHaveLength(12);
+        expect(
+            classified.every((claim) =>
+                claim.evidence.independenceKeys.some((key) => key.startsWith("classify-memories:")),
+            ),
+        ).toBe(true);
+        expect(classified.every((claim) => claim.revision === 2)).toBe(true);
     });
 
     test("provider-outage chunk aborts the run without advancing lastRunAt", async () => {
         db = freshDb();
         const project = "dir:/repo/classify-provider-outage";
-        const ids: number[] = [];
         for (let index = 0; index < 201; index += 1) {
-            ids.push(
-                insertMemory(db, {
-                    sourceType: "user",
-                    projectPath: project,
-                    category: "ARCHITECTURE",
-                    content: `Provider outage classification fixture ${index}.`,
-                }).id,
-            );
+            seedProjectMemoryClaim(db, {
+                projectIdentity: project,
+                category: "ARCHITECTURE",
+                content: `Provider outage classification fixture ${index}.`,
+            });
         }
         let promptCalls = 0;
         const client = {
@@ -670,7 +765,14 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         });
 
         expect(promptCalls).toBe(3);
-        expect(getUnclassifiedMemoryIds(db, ids)).toHaveLength(201);
+        expect(
+            readDreamerProjectClaims(db, project, "hygiene").every(
+                (claim) =>
+                    !claim.evidence.independenceKeys.some((key) =>
+                        key.startsWith("classify-memories:"),
+                    ),
+            ),
+        ).toBe(true);
         expect(getTaskScheduleState(db, project, task.task)).toMatchObject({
             lastRunAt: 1_234,
             lastStatus: "failed",
@@ -682,30 +784,20 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         db = freshDb();
         const project = "dir:/repo/rust-classify";
         ensureContextStoreUuid(db);
-        const sensitive = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const sensitive = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "PROJECT_RULES",
             content: "Use token sk-test-secret only on my localhost machine.",
         });
-        const contextMemories = [sensitive];
+        const claims = [sensitive];
         for (let i = 0; i < 11; i += 1) {
-            contextMemories.push(
-                insertMemory(db, {
-                    sourceType: "user",
-                    projectPath: project,
+            claims.push(
+                seedProjectMemoryClaim(db, {
+                    projectIdentity: project,
                     category: "ARCHITECTURE",
                     content: `The cache-neutral classification path is module-owned (${i}).`,
                 }),
             );
-        }
-        for (const [index, memory] of contextMemories.entries()) {
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(project, 10000 + index, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
-            ).run(project, 10000 + index, memory.category, memory.normalizedHash);
         }
         const moduleCalls: Array<{ method: string; body: unknown }> = [];
         let authorityStatusCalls = 0;
@@ -732,22 +824,27 @@ describe("createDreamTaskExecutor — classify-memories", () => {
                 if (this.instanceState !== "timer-transport")
                     throw new Error("lost transport this");
                 moduleCalls.push(args);
-                if (args.method === "dreamer.run_task") {
-                    const body = args.body as { payload: { items: Array<{ memory_id: number }> } };
-                    return {
-                        ok: true,
-                        manifest_text: `<classify>${body.payload.items
-                            .map(
-                                (item) =>
-                                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
-                            )
-                            .join("")}</classify>`,
-                        truncated: false,
+                if (args.method !== "dreamer.run_task") throw new Error("unexpected module call");
+                const body = args.body as {
+                    payload: {
+                        items: Array<{
+                            public_claim_id: string;
+                            revision_locator: string;
+                            content_digest: string;
+                            mutation_token: { publicClaimId: string };
+                        }>;
                     };
-                }
-                const rows = (args.body as { arguments: { rows: Array<{ memory_id: number }> } })
-                    .arguments.rows;
-                return { accepted: rows.map((row) => row.memory_id), rejected: [] };
+                };
+                return {
+                    ok: true,
+                    manifest_text: `<classify>${body.payload.items
+                        .map(
+                            (item) =>
+                                `<memory claim="${item.public_claim_id}" importance="80" scope="project" shareable="true"/>`,
+                        )
+                        .join("")}</classify>`,
+                    truncated: false,
+                };
             }
         }
         const moduleClient = createDreamTimerModuleClient(new StatefulTimerModuleClient() as never);
@@ -771,34 +868,42 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         expect(result.status).toBe("completed");
         expect(authorityStatusCalls).toBe(1);
         expect(client.session.create).not.toHaveBeenCalled();
-        expect(moduleCalls.map((call) => call.method)).toEqual([
-            "dreamer.run_task",
-            "memory.set_classification",
-        ]);
-        const applyBody = moduleCalls[1].body as {
-            arguments: { rows: Array<{ memory_id: number; shareable: boolean }> };
+        expect(moduleCalls.map((call) => call.method)).toEqual(["dreamer.run_task"]);
+        const producerBody = moduleCalls[0]?.body as {
+            payload: {
+                items: Array<{
+                    public_claim_id: string;
+                    revision_locator: string;
+                    content_digest: string;
+                    mutation_token: { publicClaimId: string };
+                }>;
+            };
         };
-        expect(applyBody.arguments.rows.find((row) => row.memory_id === 10000)?.shareable).toBe(
-            false,
-        );
+        expect(producerBody.payload.items).toHaveLength(12);
+        expect(
+            producerBody.payload.items.every(
+                (item) =>
+                    item.revision_locator.length > 0 &&
+                    item.content_digest.length > 0 &&
+                    item.mutation_token.publicClaimId === item.public_claim_id,
+            ),
+        ).toBe(true);
+        expect(
+            readDreamerProjectClaims(db, project, "hygiene").find(
+                (claim) => claim.publicClaimId === sensitive.publicClaimId,
+            )?.sharing,
+        ).toBe("private");
     });
     test("module failures are transient and never fall back to a TypeScript child", async () => {
         db = freshDb();
         const project = "dir:/repo/rust-classify-failure";
         ensureContextStoreUuid(db);
         for (let i = 0; i < 12; i += 1) {
-            const memory = insertMemory(db, {
-                sourceType: "user",
-                projectPath: project,
+            seedProjectMemoryClaim(db, {
+                projectIdentity: project,
                 category: "ARCHITECTURE",
                 content: `Module classification failure fixture ${i}.`,
             });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(project, 11000 + i, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
-            ).run(project, 11000 + i, memory.category, memory.normalizedHash);
         }
 
         const client = {
@@ -852,39 +957,31 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 
         expect(result.status).toBe("failed");
         expect(result.transient).toBe(true);
-        expect(result.error).toContain("Rust classify module failed");
+        expect(result.error).toContain("Rust dreamer classify module failed");
         expect(client.session.create).not.toHaveBeenCalled();
         expect(moduleCalls).toEqual(["dreamer.run_task"]);
     });
 });
 
 describe("createDreamTaskExecutor — compress-cues", () => {
-    test("rust-authority fixture routes cues through memory.set_mural_cue and leaves no parked facade path", async () => {
+    test("rust-authority fixture writes claim cues locally without a module facade call", async () => {
         db = freshDb();
         const project = "dir:/repo/module-cues";
-        const contextStoreUuid = ensureContextStoreUuid(db);
-        const memory = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        ensureContextStoreUuid(db);
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
+            content: "A cue candidate compressed under module authority.",
             category: "ARCHITECTURE",
-            content: "A cue candidate routed through the module facade.",
         });
-        db.prepare(
-            `INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id)
-             VALUES ('memories', ?, 101, ?)`,
-        ).run(project, memory.id);
-        db.prepare(
-            `INSERT INTO mirror_live_memory_rows(
-                 module_project, module_row_id, category, normalized_hash, full_row_snapshot
-             ) VALUES (?, 101, ?, ?, '{}')`,
-        ).run(project, memory.category, "module-hash");
         const client = {
             session: {
                 list: mock(async () => ({ data: [] })),
                 create: mock(async () => ({ data: { id: "cue-child" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({
-                    data: assistantMessages(`<cues><cue id="${memory.id}">module cue</cue></cues>`),
+                    data: assistantMessages(
+                        `<cues><cue id="${claim.publicClaimId}">module cue</cue></cues>`,
+                    ),
                 })),
                 delete: mock(async () => ({})),
             },
@@ -892,50 +989,8 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         const authorityStatus = mock(async () => ({
             authority: { state: "MODULE", generation: 12 },
         }));
-        const moduleCall = mock(async (args: { method: string; body?: unknown }) => {
-            expect(args.method).toBe("memory.set_mural_cue");
-            const body = args.body as {
-                arguments?: { command_id?: unknown; rows?: Array<Record<string, unknown>> };
-            };
-            expect(typeof body.arguments?.command_id).toBe("string");
-            expect(body.arguments?.rows).toEqual([
-                {
-                    memory_id: 101,
-                    content_hash_at_prompt: expect.any(String),
-                    cue: "module cue",
-                    rejection_count: 0,
-                },
-            ]);
-            const update = body.arguments?.rows?.[0];
-            applyMirrorPage({
-                db,
-                page: {
-                    domain: "memories",
-                    cursor: 0,
-                    next_cursor: 1,
-                    has_more: false,
-                    rows: [
-                        {
-                            feed_seq: 1,
-                            domain: "memories",
-                            op: "update",
-                            module_row_id: 101,
-                            content_hash: String(update?.content_hash_at_prompt),
-                            full_row_snapshot: {
-                                id: 101,
-                                project_path: project,
-                                context_store_uuid: contextStoreUuid,
-                                context_row_id: memory.id,
-                                mural_cue: update?.cue,
-                                mural_cue_hash: update?.content_hash_at_prompt,
-                                mural_cue_at: 123,
-                                mural_cue_rejection_count: update?.rejection_count,
-                            },
-                        },
-                    ],
-                },
-            });
-            return { result: { accepted: [101], rejected: [] } };
+        const moduleCall = mock(async () => {
+            throw new Error("claim cues are context-owned; no facade call may run");
         });
         const executor = createDreamTaskExecutor({
             client: client as never,
@@ -953,18 +1008,12 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         );
 
         expect(result).toEqual({ status: "completed" });
-        expect(authorityStatus).toHaveBeenCalledTimes(1);
         expect(client.session.create).toHaveBeenCalledTimes(1);
         expect(client.session.prompt).toHaveBeenCalledTimes(1);
-        expect(moduleCall).toHaveBeenCalledTimes(1);
-        expect(
-            db
-                .prepare("SELECT mural_cue, mural_cue_hash FROM memories WHERE id = ?")
-                .get(memory.id),
-        ).toEqual({
-            mural_cue: "module cue",
-            mural_cue_hash: expect.any(String),
-        });
+        expect(moduleCall).not.toHaveBeenCalled();
+        const state = getClaimMuralCueStates(db, [claim.publicClaimId]).get(claim.publicClaimId);
+        expect(state?.cue).toBe("module cue");
+        expect(state?.revisionLocator).toBe(claim.revisionLocator);
     });
 
     test("defers cue mutation while Rust authority is draining", async () => {
@@ -1019,11 +1068,10 @@ describe("createDreamTaskExecutor — compress-cues", () => {
     test("reports a structural membership failure as transient", async () => {
         db = freshDb();
         const project = "dir:/repo/malformed-cues";
-        insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
-            category: "ARCHITECTURE",
+        seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             content: "A cue candidate omitted by the manifest.",
+            category: "ARCHITECTURE",
         });
         const client = {
             session: {
@@ -1057,11 +1105,10 @@ describe("createDreamTaskExecutor — compress-cues", () => {
     test("reports a fully drained cue set as completed", async () => {
         db = freshDb();
         const project = "dir:/repo/complete-cues";
-        const memory = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
-            category: "ARCHITECTURE",
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             content: "A cue candidate completed by the manifest.",
+            category: "ARCHITECTURE",
         });
         const client = {
             session: {
@@ -1070,7 +1117,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({
                     data: assistantMessages(
-                        `<cues><cue id="${memory.id}">completed anchor</cue></cues>`,
+                        `<cues><cue id="${claim.publicClaimId}">completed anchor</cue></cues>`,
                     ),
                 })),
                 delete: mock(async () => ({})),
@@ -1095,30 +1142,37 @@ describe("createDreamTaskExecutor — compress-cues", () => {
 });
 
 describe("createDreamTaskExecutor — retrospective", () => {
-    test("retrospective memory insert leaves project memory epoch unchanged", () => {
+    test("retrospective memory insert writes direct claim state atomically", () => {
         db = freshDb();
         const project = "dir:/repo/project";
-        ensureProjectState(db, project, 1);
-        const epochBefore = getProjectState(db, project)?.projectMemoryEpoch;
+        const content =
+            "Verify provider-executed tool availability before describing it as supported.";
 
-        const applied = applyRetrospectiveLearnings({
-            db,
-            projectIdentity: project,
-            sourceSessionId: "s1",
-            learnings: [
-                {
-                    route: "memory",
-                    category: "PROJECT_RULES",
-                    content:
-                        "Verify provider-executed tool availability before describing it as supported.",
-                },
-            ],
-            userMemoryCollectionEnabled: false,
-            sourceUserTexts: [],
-        });
+        const applied = db
+            .transaction(() =>
+                applyRetrospectiveLearnings({
+                    db: db as Database,
+                    projectIdentity: project,
+                    sourceSessionId: "s1",
+                    learnings: [{ route: "memory", category: "PROJECT_RULES", content }],
+                    identity: {
+                        producer: "dreamer-retrospective",
+                        task: "retrospective",
+                        runId: "retro-direct-run",
+                        leaseKey: leaseKeyFor("retrospective", project),
+                        leaseGeneration: 1,
+                        batchId: "retro-direct-window",
+                    },
+                    userMemoryCollectionEnabled: false,
+                    sourceUserTexts: [],
+                }),
+            )
+            .immediate();
 
         expect(applied.memoryWritten).toBe(1);
-        expect(getProjectState(db, project)?.projectMemoryEpoch).toBe(epochBefore);
+        expect(
+            readDreamerProjectClaims(db, project, "hygiene").map((claim) => claim.content),
+        ).toEqual([content]);
     });
 
     test("gate returns 'n' → one gate turn, child created+deleted, watermark advances, no deepen", async () => {
@@ -1180,7 +1234,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
         expect(client.session.create).toHaveBeenCalled();
         expect(prompts).toBe(1); // gate only — no deepen turn
         expect(client.session.delete).toHaveBeenCalled(); // child always cleaned up
-        expect(getMemoriesByProject(db, project)).toHaveLength(0);
+        expect(readDreamerProjectClaims(db, project, "hygiene")).toHaveLength(0);
     });
 
     test("signal deepens, parses XML, host-applies memory and gated observation", async () => {
@@ -1288,11 +1342,13 @@ describe("createDreamTaskExecutor — retrospective", () => {
         expect(captured[1]?.system).toContain("retrospective learning agent");
         expect(captured[1]?.prompt).toContain("### Friction window");
         expect(captured[1]?.prompt).not.toContain("ctx_memory");
-        const memories = getMemoriesByProject(db, project);
-        expect(memories.map((memory) => memory.content)).toEqual([
+        const claims = readDreamerProjectClaims(db, project, "hygiene");
+        expect(claims.map((claim) => claim.content)).toEqual([
             "Verify provider-executed tool availability on wire before describing it as supported.",
         ]);
-        expect(memories[0]?.sourceType).toBe("dreamer");
+        expect(
+            claims[0]?.evidence.independenceKeys.some((key) => key.startsWith("retrospective:")),
+        ).toBe(true);
         expect(getUserMemoryCandidates(db).map((candidate) => candidate.content)).toEqual([
             "Prefers concise root-cause summaries before implementation details.",
         ]);

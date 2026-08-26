@@ -13,6 +13,7 @@ import {
     createPolicySubjectInCurrentTransaction,
     currentApprovalActionId,
     currentValidArtifactId,
+    EXPLICIT_USER_REVISION_PRODUCER,
     hasExplicitUserEvidence,
     readActiveDispositions,
     readMaturityHead,
@@ -52,7 +53,14 @@ let uniq = 0;
 
 function addObservation(
     fx: Fixture,
-    args: Partial<{ independenceKey: string; runId: string; content: string; trust: string }> = {},
+    args: Partial<{
+        independenceKey: string;
+        runId: string;
+        content: string;
+        trust: string;
+        extractor: string;
+        contentSha256: string;
+    }> = {},
 ): number {
     uniq += 1;
     const key = args.independenceKey ?? `key-${uniq}`;
@@ -71,12 +79,13 @@ function addObservation(
         .prepare(
             `INSERT INTO observations (source_span_id, extracted_text, content_sha256, extractor,
                 extractor_version, extractor_run_id, independence_key, source_trust_class, created_at)
-             VALUES (?, ?, ?, 'extractor', '1', ?, ?, ?, 1)`,
+             VALUES (?, ?, ?, ?, '1', ?, ?, ?, 1)`,
         )
         .run(
             spanId,
             content,
-            content.padEnd(64, "0").slice(0, 64),
+            args.contentSha256 ?? content.padEnd(64, "0").slice(0, 64),
+            args.extractor ?? "extractor",
             runId,
             key,
             args.trust ?? "model_inference",
@@ -518,6 +527,104 @@ describe("claim policy storage kernel", () => {
             // the observation nor the retained metadata.
             expect(hasExplicitUserEvidence(fx.db, rewrite)).toBeFalse();
             expect(hasExplicitUserEvidence(fx.db, first)).toBeTrue();
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
+    test("a dashboard explicit-user edit keeps trust while a copied stamp on the same bytes does not", () => {
+        // The dashboard is the one writer that authors NEW user-content
+        // revisions, so its stamp must survive a digest change. The producer is
+        // the witness: a pre-v86 rewrite copying the trust class onto the same
+        // replacement bytes is otherwise indistinguishable.
+        const fx = fixture();
+        try {
+            const first = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
+            const claimId = Number(
+                (
+                    fx.db
+                        .prepare("SELECT claim_id AS id FROM claim_revisions WHERE id = ?")
+                        .get(first) as { id: number }
+                ).id,
+            );
+            const editedSha = "d".repeat(64);
+            fx.db
+                .prepare(
+                    `INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at)
+                     VALUES (?, 2, 'user rewrote this in the dashboard', ?, 2)`,
+                )
+                .run(claimId, editedSha);
+            const edited = Number(
+                (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
+                    .id,
+            );
+
+            // A copied legacy stamp on the exact same bytes: right digest,
+            // wrong producer.
+            const copied = addObservation(fx, {
+                trust: "explicit_user",
+                extractor: "historian",
+                contentSha256: editedSha,
+            });
+            fx.db
+                .prepare(
+                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
+                )
+                .run(edited, copied);
+            expect(hasExplicitUserEvidence(fx.db, edited)).toBeFalse();
+
+            // The dashboard's own observation for those bytes qualifies.
+            const dashboard = addObservation(fx, {
+                trust: "explicit_user",
+                extractor: EXPLICIT_USER_REVISION_PRODUCER,
+                contentSha256: editedSha,
+            });
+            fx.db
+                .prepare(
+                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
+                )
+                .run(edited, dashboard);
+            expect(hasExplicitUserEvidence(fx.db, edited)).toBeTrue();
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
+    test("a dashboard stamp cannot credit bytes it did not observe", () => {
+        const fx = fixture();
+        try {
+            const first = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
+            const claimId = Number(
+                (
+                    fx.db
+                        .prepare("SELECT claim_id AS id FROM claim_revisions WHERE id = ?")
+                        .get(first) as { id: number }
+                ).id,
+            );
+            fx.db
+                .prepare(
+                    `INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at)
+                     VALUES (?, 2, 'model rewrite', ?, 2)`,
+                )
+                .run(claimId, "e".repeat(64));
+            const rewrite = Number(
+                (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
+                    .id,
+            );
+            // Correct producer, but the observation describes different bytes.
+            fx.db
+                .prepare(
+                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
+                )
+                .run(
+                    rewrite,
+                    addObservation(fx, {
+                        trust: "explicit_user",
+                        extractor: EXPLICIT_USER_REVISION_PRODUCER,
+                        contentSha256: "f".repeat(64),
+                    }),
+                );
+            expect(hasExplicitUserEvidence(fx.db, rewrite)).toBeFalse();
         } finally {
             closeQuietly(fx.db);
         }

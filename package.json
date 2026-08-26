@@ -26,7 +26,7 @@
     "dev:dashboard": "bun run --cwd packages/dashboard dev",
     "build:rust": "cargo build --workspace",
     "test:rust": "sh scripts/test-rust.sh",
-    "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --manifest-path packages/dashboard/db-adapter/Cargo.toml --all --check && cargo clippy --manifest-path packages/dashboard/db-adapter/Cargo.toml --all-targets -- -D warnings",
     "fmt:rust": "cargo fmt",
     "check:all": "bun run test && bun run test:rust && cargo clippy --workspace --all-targets -- -D warnings",
     "build:dists": "bun run --cwd packages/plugin build && bun run --cwd packages/pi-plugin build"

@@ -6,7 +6,9 @@ import {
 import { getTaskScheduleState } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import { createClaimMemorySchema } from "@magic-context/core/features/magic-context/storage-claim-memory-schema";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
@@ -38,6 +40,7 @@ function createDb(): Database {
 	const database = new Database(":memory:");
 	initializeDatabase(database);
 	runMigrations(database);
+	database.transaction(() => createClaimMemorySchema(database)).immediate();
 	return database;
 }
 
@@ -169,8 +172,8 @@ describe("Pi dreamer wiring", () => {
 					}),
 				}) as never,
 		);
-		insertMemory(db, {
-			projectPath: "git:pi-manual-language",
+		seedProjectMemoryClaim(db, {
+			projectIdentity: "git:pi-manual-language",
 			category: "ARCHITECTURE",
 			content: "The Pi harness runs dreamer prompts through a subprocess.",
 		});

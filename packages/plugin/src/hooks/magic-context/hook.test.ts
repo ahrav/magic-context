@@ -37,7 +37,9 @@ import {
     setPendingCompactionMarkerState,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
 import { Database } from "../../shared/sqlite";
 import { autoEmbedAttemptedBySession, clearEmbedSessionState } from "./embed-session-state";
 import { createMagicContextHook, type MagicContextDeps } from "./hook";
@@ -954,34 +956,14 @@ describe("magic-context hook", () => {
                 retryCount: 0,
             });
 
-            runInMemoryClaimsWriteTransaction(db, () =>
-                db
-                    .prepare(
-                        "INSERT INTO memories (project_path, category, content, normalized_hash, source_session_id, source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at, verification_status, verified_at, superseded_by_memory_id, merged_from, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .run(
-                        projectPath,
-                        "ARCHITECTURE_DECISIONS",
-                        "Dream me",
-                        "dream-me",
-                        "ses-seed",
-                        "historian",
-                        1,
-                        0,
-                        now,
-                        now,
-                        now,
-                        now,
-                        null,
-                        "active",
-                        null,
-                        "unverified",
-                        null,
-                        null,
-                        null,
-                        null,
-                    ),
-            );
+            // The curate gate counts claims: overlay the claim-memory
+            // fragment and seed one claim so the due task actually runs.
+            db.transaction(() => createClaimMemorySchema(db)).immediate();
+            seedProjectMemoryClaim(db, {
+                projectIdentity: projectPath,
+                content: "Dream me",
+                category: "ARCHITECTURE",
+            });
 
             await hook.event!({
                 event: {

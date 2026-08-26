@@ -1,4 +1,15 @@
-import { existsSync, writeFileSync } from "node:fs";
+import {
+    closeSync,
+    copyFileSync,
+    existsSync,
+    mkdtempSync,
+    openSync,
+    readSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
     ensureContextStoreUuid,
@@ -8,6 +19,17 @@ import {
     getPersistedSchemaVersion as getCorePersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
+import {
+    classifyDatabaseFormatFamily,
+    type DatabaseFormatFamily,
+    type DatabaseResetMarker,
+    type ExpectedDirectFormat,
+    inspectDatabaseForClassification,
+    listDatabaseFamilyArtifacts,
+    MC_APPLICATION_ID,
+    readDatabaseResetMarker,
+} from "@magic-context/core/features/magic-context/storage-format-epoch";
+import { computeExpectedDirectFormat } from "@magic-context/core/features/magic-context/test-database";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
 
@@ -86,8 +108,9 @@ export function openExistingDatabase(
     // database file") but honors { create: false }, while node:sqlite has no
     // create option and needs the URI's mode=rw.
     if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
-        // create/readwrite are bun:sqlite-only options, absent from the shared
-        // better-sqlite3-shaped Options type the wrapper exports.
+        // SAFETY: create/readwrite are bun:sqlite-only options, absent from the
+        // shared better-sqlite3-shaped Options type the wrapper exports; the Bun
+        // branch above guarantees the bun:sqlite constructor receives them.
         const db = new Database(path, { create: false, readwrite: true } as unknown as {
             readonly: boolean;
         });
@@ -175,4 +198,158 @@ export async function backupDatabaseSnapshot(db: DatabaseType, destination: stri
         throw new Error("The active SQLite runtime does not provide a snapshot backup API");
     }
     await sqlite.backup(db, destination);
+}
+
+// ---------------------------------------------------------------------------
+// U11 direct-format family state (KTD11, R15): read-only CLI access that
+// distinguishes current, pristine, unsupported, reset-pending, and corrupt
+// direct-format state without initializing schema or mutating the family.
+// ---------------------------------------------------------------------------
+
+export type DirectDatabaseFamilyState =
+    | { readonly state: "pristine" }
+    | { readonly state: "current"; readonly databaseIncarnationId: string }
+    | {
+          readonly state: "reset-pending";
+          /** Present marker, or the malformed-read reason recovery must refuse on. */
+          readonly marker:
+              | { readonly status: "present"; readonly marker: DatabaseResetMarker }
+              | { readonly status: "malformed"; readonly reason: string };
+      }
+    | {
+          readonly state: "unsupported";
+          readonly family: DatabaseFormatFamily;
+          readonly reasons: readonly string[];
+          /** Incarnation when the family carries a readable direct-format marker. */
+          readonly databaseIncarnationId: string | null;
+      }
+    | {
+          readonly state: "corrupt";
+          readonly format: "direct" | "unknown";
+          readonly directFormatSignals: readonly string[];
+          readonly detail: string;
+      };
+
+let cachedExpectedDirectFormat: ExpectedDirectFormat | null = null;
+
+function getExpectedDirectFormat(): ExpectedDirectFormat {
+    cachedExpectedDirectFormat ??= computeExpectedDirectFormat();
+    return cachedExpectedDirectFormat;
+}
+
+function readDirectFormatHeaderSignals(dbPath: string): string[] {
+    const header = Buffer.alloc(100);
+    let fd: number | null = null;
+    try {
+        fd = openSync(dbPath, "r");
+        if (readSync(fd, header, 0, header.length, 0) < header.length) return [];
+    } catch {
+        return [];
+    } finally {
+        if (fd !== null) closeSync(fd);
+    }
+    if (header.toString("ascii", 0, 16) !== "SQLite format 3\0") return [];
+    const signals: string[] = [];
+    const userVersion = header.readUInt32BE(60);
+    const applicationId = header.readUInt32BE(68);
+    if (applicationId === MC_APPLICATION_ID) {
+        signals.push('application_id is the direct-format "MCTX" value');
+    }
+    if (userVersion !== 0)
+        signals.push(`user_version ${userVersion} is direct-format epoch vocabulary`);
+    return signals;
+}
+
+/**
+ * Open a throwaway family copy read-write so SQLite can roll back a hot journal
+ * before classification reads the image. Never used on a real family.
+ */
+function openProbeCopyForRecovery(probePath: string): DatabaseType {
+    if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
+        // SAFETY: create/readwrite are bun:sqlite-only options, absent from the
+        // shared better-sqlite3-shaped Options type the wrapper exports; the Bun
+        // branch above guarantees the bun:sqlite constructor receives them.
+        return new Database(probePath, { create: false, readwrite: true } as unknown as {
+            readonly: boolean;
+        });
+    }
+    // The better-sqlite3-shaped constructor opens read-write by default and
+    // throws rather than creating when the file is absent.
+    return new Database(probePath);
+}
+
+/**
+ * Classify the on-disk database family for CLI diagnostics and reset. Never
+ * initializes schema.
+ *
+ * Content is read from a private temp copy of the whole family — main, WAL,
+ * SHM, and rollback journal — because even a read-only SQLite open rewrites an
+ * existing SHM file; artifact presence is still checked at the real path.
+ *
+ * The copy is opened read-write, and both halves of that matter. A rollback
+ * journal left by a process that died mid-transaction is HOT: the main image is
+ * unrecovered until SQLite rolls it back, so classifying without the journal
+ * reads a pre-rollback image, and copying the journal while opening read-only
+ * makes it worse — SQLite sees the pending rollback, cannot perform it, and
+ * fails the open, so a recoverable family would classify as corrupt and
+ * `doctor reset-db` would offer to quarantine it. Read-write on a throwaway copy
+ * lets recovery run where it cannot harm the real family. `create: false` keeps
+ * a missing copy from opening as a fresh empty database, which would classify as
+ * pristine.
+ */
+export function inspectDirectDatabaseFamilyState(dbPath: string): DirectDatabaseFamilyState {
+    const markerRead = readDatabaseResetMarker(dbPath);
+    if (markerRead.status !== "absent") return { state: "reset-pending", marker: markerRead };
+    if (!existsSync(dbPath)) {
+        const artifacts = listDatabaseFamilyArtifacts(dbPath);
+        if (artifacts.length === 0) return { state: "pristine" };
+        return {
+            state: "unsupported",
+            family: "orphan-artifacts",
+            reasons: artifacts.map(
+                (artifact) => `orphan ${artifact} artifact without a current main database`,
+            ),
+            databaseIncarnationId: null,
+        };
+    }
+    let probeDir: string | null = null;
+    let db: DatabaseType | null = null;
+    try {
+        probeDir = mkdtempSync(join(tmpdir(), "mc-family-probe-"));
+        const probePath = join(probeDir, basename(dbPath));
+        for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+            const source = `${dbPath}${suffix}`;
+            if (existsSync(source)) copyFileSync(source, `${probePath}${suffix}`);
+        }
+        db = openProbeCopyForRecovery(probePath);
+        // Content comes from the probe connection; existence and artifact
+        // checks inside inspectDatabaseForClassification use the real path.
+        const inspection = inspectDatabaseForClassification(db, dbPath);
+        const classification = classifyDatabaseFormatFamily(inspection, getExpectedDirectFormat());
+        const databaseIncarnationId =
+            inspection.marker.status === "present"
+                ? inspection.marker.marker.databaseIncarnationId
+                : null;
+        if (classification.family === "current" && databaseIncarnationId !== null) {
+            return { state: "current", databaseIncarnationId };
+        }
+        if (classification.family === "pristine") return { state: "pristine" };
+        return {
+            state: "unsupported",
+            family: classification.family,
+            reasons: classification.reasons,
+            databaseIncarnationId,
+        };
+    } catch (error) {
+        const directFormatSignals = readDirectFormatHeaderSignals(dbPath);
+        return {
+            state: "corrupt",
+            format: directFormatSignals.length > 0 ? "direct" : "unknown",
+            directFormatSignals,
+            detail: error instanceof Error ? error.message : String(error),
+        };
+    } finally {
+        db?.close();
+        if (probeDir !== null) rmSync(probeDir, { recursive: true, force: true });
+    }
 }
