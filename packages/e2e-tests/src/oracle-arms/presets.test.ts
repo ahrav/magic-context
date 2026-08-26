@@ -140,8 +140,10 @@ describe("oracle arm presets", () => {
             spawnOpencode({ mockProviderURL: baseURL, ...recipe, hostname: "0.0.0.0" }),
         ).rejects.toThrow(/ANTHROPIC_API_KEY/);
 
-        // Nothing was allocated: the guard runs before any port, directory, or
-        // config, so a refused spawn leaves no process to clean up.
+        // Nothing was allocated: the guard runs at the top of the spawn path,
+        // ahead of Rust-mode provisioning as well as the port, directory, and
+        // config work, so a refused spawn leaves no process to clean up. The
+        // mock recorded no request, which a spawned child would have produced.
         expect(mock.requests()).toHaveLength(0);
     }, 30_000);
 

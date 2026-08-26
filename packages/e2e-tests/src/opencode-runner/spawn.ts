@@ -455,7 +455,9 @@ function isInheritableEnvKey(key: string): boolean {
  * pin silently. The serve API has no authentication, so the failure publishes a
  * live credential to anything that can reach the port for the process lifetime.
  *
- * Fail closed on the name, before any port, directory, or config is allocated.
+ * Fail closed on the name, and at the top of the spawn path: Rust mode builds a
+ * Cargo fixture and starts a hermetic host subprocess before the ordinary spawn
+ * work begins, so a later check would pay for both before refusing.
  * Names are matched rather than values because a fake test credential is shaped
  * like a real one, so a value check would guess per vendor and would pull the
  * secret into the diagnostic. A spawn that genuinely wants a secret-shaped
@@ -484,6 +486,14 @@ async function spawnOpencodeWithProvision(
     opts: SpawnOptions,
     provision: () => Promise<RustSpawnResources>,
 ): Promise<SpawnedOpencode> {
+    // Ahead of provisioning: Rust mode builds a Cargo fixture and starts a real
+    // hermetic host subprocess, so checking later would do that work before
+    // refusing. `resolvedOpts` below only overrides the env, connection file, and
+    // project config, leaving `hostname`, `extraEnv`, and the waiver identical to
+    // `opts`, so the earlier check decides the same way.
+    const hostname = opts.hostname ?? "0.0.0.0";
+    assertSecretsBoundToLoopback(opts, hostname);
+
     // MC_E2E_MODE is intentionally read only at this shared spawn seam. Rust
     // suites that already supplied a host connection keep their existing
     // stack; ordinary suites get one provisioned here for the rust invocation.
@@ -526,8 +536,6 @@ async function spawnOpencodeWithProvision(
                   },
               }
             : opts;
-        const hostname = resolvedOpts.hostname ?? "0.0.0.0";
-        assertSecretsBoundToLoopback(resolvedOpts, hostname);
 
         // Reuse a caller-provided env for the Rust-mode harness (connection file
         // pre-placed, data dir shared across a serve restart); otherwise allocate.
