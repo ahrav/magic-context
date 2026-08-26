@@ -396,18 +396,64 @@ async function provisionRustMode(releaseRoot?: VerifiedReleaseRoot): Promise<Rus
 }
 
 /**
- * Refuse to publish an unauthenticated serve API on a non-loopback interface
- * while the child env carries a secret-shaped variable.
+ * Whether a parent-environment variable is handed to the serve child.
  *
- * The pairing was previously a convention: `liveModelSpawnOptions()` returns the
- * credential and `hostname: "127.0.0.1"` together, and a comment asked callers
- * to keep them together. Nothing held it. The recipe is a `Pick<SpawnOptions>`,
- * so any partial merge that forwards `extraEnv` without `hostname` falls back to
- * the all-interfaces default — and neither `TestHarnessOptions` nor
- * `RustTestHarnessOptions` carries `hostname`, so routing a real key through a
- * harness instead of raw `spawnOpencode` drops the pin silently. The serve API
- * has no authentication, so the failure publishes a live credential to anything
- * that can reach the port for the process lifetime.
+ * The child otherwise inherits the runner's environment wholesale, and it is an
+ * unauthenticated server that binds all interfaces by default, so this list is
+ * what stands between the runner's environment and anything that can reach the
+ * port.
+ */
+function isInheritableEnvKey(key: string): boolean {
+    // Our tests run unsecured on a random localhost port, and inherited auth
+    // would force every SDK request to carry Basic auth headers we don't set.
+    if (key === "OPENCODE_SERVER_PASSWORD" || key === "OPENCODE_SERVER_USERNAME") return false;
+    // Bun's test runner sets NODE_ENV=test automatically and the plugin's logger
+    // (src/shared/logger.ts) silences all output when it is set. The subprocess
+    // should behave like a real install so the log file populates for diagnostics.
+    if (key === "NODE_ENV") return false;
+    // Strip any inherited supervised-launch identity. These are still the live
+    // variable names (`mc_host::wire::SUBC_MODULE_ID_ENV` /
+    // `SUBC_LAUNCH_NONCE_ENV`), and `historian_producer` reads them into
+    // `consumer_module_id`/`consumer_launch_nonce` on every route identity. When
+    // the test process is itself launched under a supervisor that sets them, the
+    // plugin would present THAT identity to our hermetic host, which rejects it
+    // as not matching a supervised launch nonce. A real install is never launched
+    // under a supervised identity, so clearing them matches production. Harmless
+    // for TS-mode suites, which never reach the Rust client.
+    if (key === "SUBC_MODULE_ID" || key === "SUBC_LAUNCH_NONCE") return false;
+    // Ambient secrets are never forwarded. A CI job's GITHUB_TOKEN or NPM_TOKEN,
+    // or an exported cloud or provider credential, would otherwise be served by
+    // the unauthenticated API to anything that can reach the port. None of it is
+    // needed: the child talks to the mock provider, and a spawn that genuinely
+    // needs a credential passes it through `extraEnv`, where
+    // `assertSecretsBoundToLoopback` governs it. Dropping them here is what
+    // makes that guard total, by leaving `extraEnv` as the only channel a caller
+    // secret can arrive on.
+    if (isSecretEnvKey(key)) return false;
+    return true;
+}
+
+/**
+ * Refuse to publish an unauthenticated serve API on a non-loopback interface
+ * while a caller-supplied secret reaches the child.
+ *
+ * Scope is exactly `extraEnv`, and that is the whole effective surface rather
+ * than a narrower slice of it: the inherited `process.env` copy below drops
+ * secret-shaped names outright, so ambient runner credentials never reach the
+ * child on any interface, and the fake `ANTHROPIC_API_KEY` default it sets is a
+ * fixture value. `extraEnv` is therefore the only channel a real credential can
+ * arrive on. Checking the assembled child env instead would refuse every default
+ * spawn, since that fake default is always present and is shaped like a secret.
+ *
+ * The pairing this enforces was previously a convention: `liveModelSpawnOptions()`
+ * returns the credential and `hostname: "127.0.0.1"` together, and a comment
+ * asked callers to keep them together. Nothing held it. The recipe is a
+ * `Pick<SpawnOptions>`, so any partial merge that forwards `extraEnv` without
+ * `hostname` falls back to the all-interfaces default — and neither
+ * `TestHarnessOptions` nor `RustTestHarnessOptions` carries `hostname`, so
+ * routing a real key through a harness instead of raw `spawnOpencode` drops the
+ * pin silently. The serve API has no authentication, so the failure publishes a
+ * live credential to anything that can reach the port for the process lifetime.
  *
  * Fail closed on the name, before any port, directory, or config is allocated.
  * Names are matched rather than values because a fake test credential is shaped
@@ -494,31 +540,10 @@ async function spawnOpencodeWithProvision(
         if (compaction?.auto !== true) initializeIsolatedContextDb(env.dataDir, resolvedOpts.releaseRoot);
         writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
 
-        // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
-        // our tests run unsecured on a random localhost port, and inherited auth would
-        // force every SDK request to carry Basic auth headers we don't set.
-        // Also strip NODE_ENV=test: Bun's test runner sets it automatically and the
-        // plugin's logger (src/shared/logger.ts) silences all output when NODE_ENV=test.
-        // We want the subprocess to behave like a real install, so the log file gets
-        // populated normally for diagnostics.
         const childEnv: Record<string, string> = {};
         for (const [key, value] of Object.entries(process.env)) {
             if (value === undefined) continue;
-            if (key === "OPENCODE_SERVER_PASSWORD") continue;
-            if (key === "OPENCODE_SERVER_USERNAME") continue;
-            if (key === "NODE_ENV") continue;
-            // Strip any inherited supervised-launch identity. These are still the
-            // live variable names (`mc_host::wire::SUBC_MODULE_ID_ENV` /
-            // `SUBC_LAUNCH_NONCE_ENV`), and `historian_producer` reads them into
-            // `consumer_module_id`/`consumer_launch_nonce` on every route identity.
-            // When the test process is itself launched under a supervisor that sets
-            // them, the plugin would present THAT identity to our hermetic host,
-            // which rejects it as not matching a supervised launch nonce. A real
-            // install is never launched under a supervised identity, so clearing
-            // them matches production. Harmless for TS-mode suites, which never
-            // reach the Rust client.
-            if (key === "SUBC_MODULE_ID") continue;
-            if (key === "SUBC_LAUNCH_NONCE") continue;
+            if (!isInheritableEnvKey(key)) continue;
             childEnv[key] = value;
         }
         childEnv.OPENCODE_CONFIG_DIR = env.configDir;
@@ -607,6 +632,8 @@ export function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
 }
 
 export const __spawnOpencodeTest = {
+    assertSecretsBoundToLoopback,
+    isInheritableEnvKey,
     initializeIsolatedContextDb,
     rejectOnSpawnError,
     stopChild,

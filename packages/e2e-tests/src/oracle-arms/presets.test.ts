@@ -6,9 +6,15 @@ import { dirname, join } from "node:path";
 import { extractMessageText, mainAgentRequests } from "../cache-analysis";
 import { TestHarness } from "../harness";
 import { MockProvider } from "../mock-provider/server";
-import { spawnOpencode, type SpawnedOpencode } from "../opencode-runner/spawn";
+import {
+    __spawnOpencodeTest,
+    spawnOpencode,
+    type SpawnedOpencode,
+} from "../opencode-runner/spawn";
 import { goldEvidencePrompt } from "./gold-evidence";
 import { liveModelSpawnOptions, mcOffOptions, naiveCompactionOptions } from "./presets";
+
+const { isInheritableEnvKey } = __spawnOpencodeTest;
 
 const harnesses: TestHarness[] = [];
 const spawned: SpawnedOpencode[] = [];
@@ -115,8 +121,7 @@ describe("oracle arm presets", () => {
         expect(mock.requests()).toHaveLength(0);
     }, 120_000);
 
-    it("refuses a secret-shaped extraEnv key off loopback without an explicit waiver", async () => {
-        const mock = new MockProvider();
+    it("refuses a secret-shaped extraEnv key off loopback without an explicit waiver", async () => {        const mock = new MockProvider();
         mocks.push(mock);
         const { baseURL } = await mock.start();
         const recipe = liveModelSpawnOptions({
@@ -139,6 +144,42 @@ describe("oracle arm presets", () => {
         // config, so a refused spawn leaves no process to clean up.
         expect(mock.requests()).toHaveLength(0);
     }, 30_000);
+
+    it("never forwards an ambient secret from the runner environment to the child", () => {
+        // The child inherits the runner's environment wholesale and binds all
+        // interfaces by default, so the loopback guard would be a half measure
+        // if it only policed the explicit channel: a CI job's own credentials
+        // would ride along on every spawn and be served by an unauthenticated
+        // API. These must be dropped regardless of hostname.
+        for (const key of [
+            "GITHUB_TOKEN",
+            "NPM_TOKEN",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GH_COOKIE",
+            "SSH_AUTH_SOCK",
+        ]) {
+            expect(isInheritableEnvKey(key)).toBe(false);
+        }
+
+        // Ordinary variables the child genuinely needs still pass through, so
+        // the filter is not vacuously rejecting everything.
+        for (const key of ["PATH", "HOME", "LANG", "MAGIC_CONTEXT_LOG_PATH", "MC_E2E_MODE"]) {
+            expect(isInheritableEnvKey(key)).toBe(true);
+        }
+
+        // The pre-existing strips stay in force alongside the secret rule.
+        for (const key of [
+            "OPENCODE_SERVER_PASSWORD",
+            "OPENCODE_SERVER_USERNAME",
+            "NODE_ENV",
+            "SUBC_MODULE_ID",
+            "SUBC_LAUNCH_NONCE",
+        ]) {
+            expect(isInheritableEnvKey(key)).toBe(false);
+        }
+    });
 
     it("passes gold evidence verbatim in the main-agent request", async () => {
         const harness = await createHarness();
