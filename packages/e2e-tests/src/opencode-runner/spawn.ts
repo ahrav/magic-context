@@ -11,9 +11,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
-import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
-import { Database } from "../../../plugin/src/shared/sqlite";
+import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { waitForChildExit } from "../process-exit";
 import {
     buildDirectHostFixture,
@@ -38,13 +36,7 @@ function initializeIsolatedContextDb(dataDir: string): void {
     const path = join(dataDir, "cortexkit", "magic-context", "context.db");
     if (existsSync(path)) return;
     mkdirSync(dirname(path), { recursive: true });
-    const db = new Database(path);
-    try {
-        initializeDatabase(db);
-        runMigrations(db);
-    } finally {
-        db.close();
-    }
+    createDirectTestDatabase({ path }).db.close();
 }
 
 export interface IsolatedEnv {

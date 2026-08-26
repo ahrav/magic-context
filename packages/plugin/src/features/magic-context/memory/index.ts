@@ -9,6 +9,5 @@ export * from "./storage-claim-autonomous";
 export * from "./storage-claim-current-state";
 export * from "./storage-claim-operations";
 export * from "./storage-claims";
-export * from "./storage-memory";
 export * from "./types";
 export * from "./verification-paths";

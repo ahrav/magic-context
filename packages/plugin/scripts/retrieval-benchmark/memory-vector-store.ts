@@ -1,4 +1,60 @@
+import { computeNormalizedHash } from "../../src/features/magic-context/memory/normalize-hash";
 import type { Database, Statement as PreparedStatement } from "../../src/shared/sqlite";
+
+export function createBenchmarkMemoryFixtureTables(db: Database): void {
+    db.exec(`
+    CREATE TABLE IF NOT EXISTS memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_path TEXT NOT NULL,
+      category TEXT NOT NULL,
+      content TEXT NOT NULL,
+      normalized_hash TEXT NOT NULL,
+      source_type TEXT DEFAULT 'historian',
+      first_seen_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      status TEXT DEFAULT 'active',
+      UNIQUE(project_path, category, normalized_hash)
+    );
+    CREATE TABLE IF NOT EXISTS memory_embeddings (
+      memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+      embedding BLOB NOT NULL,
+      model_id TEXT NOT NULL,
+      PRIMARY KEY(memory_id, model_id)
+    );
+    `);
+}
+
+export interface BenchmarkMemoryInput {
+    projectPath: string;
+    category: string;
+    content: string;
+    nowMs: number;
+    sourceType: string;
+}
+
+export function insertBenchmarkMemory(db: Database, input: BenchmarkMemoryInput): { id: number } {
+    const result = db
+        .prepare(
+            `INSERT INTO memories
+                (project_path, category, content, normalized_hash, source_type,
+                 first_seen_at, created_at, updated_at, last_seen_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+        )
+        .run(
+            input.projectPath,
+            input.category,
+            input.content,
+            computeNormalizedHash(input.content),
+            input.sourceType,
+            input.nowMs,
+            input.nowMs,
+            input.nowMs,
+            input.nowMs,
+        );
+    return { id: Number(result.lastInsertRowid) };
+}
 
 export interface StoredMemoryEmbedding {
     embedding: Float32Array;

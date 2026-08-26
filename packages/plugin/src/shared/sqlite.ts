@@ -201,7 +201,7 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
             const stmt = super.prepare(sql);
             for (const method of ["run", "get", "all"] as const) {
                 const original = stmt[method].bind(stmt);
-                stmt[method] = (...args: unknown[]): unknown =>
+                stmt[method] = (...args: unknown[]): ReturnType<typeof original> =>
                     args.length === 1 && Array.isArray(args[0])
                         ? original(...args[0])
                         : original(...args);
@@ -304,28 +304,6 @@ export type Database = BetterSqlite3.Database;
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
-const claimCompatStateTableCache = new WeakMap<Database, true>();
-
-// Module mirror transactions must hold BOTH the module-authority privilege
-// and the v84 claims-write capability (KTD6): the two guards live in separate
-// tables so TypeScript claim writers never gain module authority, but a
-// privileged mirror write on a migrated-v84 database would otherwise trip the
-// semantic memory guards. A negative table probe is never cached because a
-// sibling process can migrate the shared file after this handle opened.
-// Exported as the single v84 schema probe: `hasMemoryClaimsCompatSchema`
-// delegates here so both callers share one positive-only cache.
-export function hasClaimCompatibilityWriteState(db: Database): boolean {
-    if (claimCompatStateTableCache.get(db)) return true;
-    const present = Boolean(
-        db
-            .prepare(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_compatibility_write_state'",
-            )
-            .get(),
-    );
-    if (present) claimCompatStateTableCache.set(db, true);
-    return present;
-}
 
 /**
  * True while the connection holds an open transaction. bun:sqlite and
@@ -362,20 +340,9 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
         db.prepare(
             "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
         ).run();
-        const claimsCapable = hasClaimCompatibilityWriteState(db);
-        if (claimsCapable) {
-            db.prepare(
-                "INSERT INTO claim_compatibility_write_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
-            ).run();
-        }
         const result = operation();
         if (previousDepth === 0) {
             db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
-            if (claimsCapable) {
-                db.prepare(
-                    "UPDATE claim_compatibility_write_state SET enabled = 0 WHERE id = 1",
-                ).run();
-            }
         }
         if (nested) {
             db.exec(`RELEASE ${savepoint}`);

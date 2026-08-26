@@ -4,7 +4,7 @@
  *
  * Every writer here assumes the caller already holds the outer write
  * transaction (`runInMemoryClaimsWriteTransaction` / the operation envelope),
- * matching the `storage-memory-claims.ts` kernel pattern. Policy decisions,
+ * matching the claim-operation kernel pattern. Policy decisions,
  * projection rows, outbox effects, and generations therefore commit together
  * (R27); the append-only v86 triggers enforce the ledger invariants at the
  * database boundary.

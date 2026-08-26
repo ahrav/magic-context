@@ -18,7 +18,7 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getCompartmentEvents } from "../compartment-events";
-import { getMemoryCountsByStatus } from "../memory";
+import { censusProjectMemoryClaims } from "../memory/storage-claim-current-state";
 import type { CanonicalJsonValue } from "../memory/claim-operation-contract";
 import {
     type AutonomousManifestIdentity,
@@ -513,14 +513,16 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         };
 
         function computeMemoryDelta(
-            before: ReturnType<typeof getMemoryCountsByStatus>,
+            before: ReturnType<typeof censusProjectMemoryClaims>,
         ): DreamRunMemoryChanges | null {
-            const after = getMemoryCountsByStatus(db, projectIdentity);
+            const after = censusProjectMemoryClaims(db, projectIdentity);
             // Capture the exact changed ids (#221) — count === array length.
+            // Claims are append-only, so deletedIds stays empty outside a reset;
+            // "merged" reports newly retired claims (merge retires its sources).
             const writtenIds = newIds(before.ids, after.ids);
             const deletedIds = newIds(after.ids, before.ids);
             const archivedIds = newIds(before.archivedIds, after.archivedIds);
-            const mergedIds = newIds(before.mergedIds, after.mergedIds);
+            const mergedIds = newIds(before.retiredIds, after.retiredIds);
             const changes: DreamRunMemoryChanges = {
                 written: writtenIds.length,
                 deleted: deletedIds.length,
@@ -626,7 +628,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             }
 
             if (config.task === "verify" || config.task === "verify-broad") {
-                const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
+                const memoryBefore = censusProjectMemoryClaims(db, projectIdentity);
                 const result = await runVerify({
                     db,
                     client: deps.client,
@@ -804,7 +806,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             }
 
             if (config.task === "retrospective") {
-                const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
+                const memoryBefore = censusProjectMemoryClaims(db, projectIdentity);
                 const retro = await runRetrospectiveTask(config, ctx, {
                     deps,
                     deadline,
@@ -1241,7 +1243,7 @@ async function runAgenticTask(
             },
         ) => void;
         computeMemoryDelta: (
-            before: ReturnType<typeof getMemoryCountsByStatus>,
+            before: ReturnType<typeof censusProjectMemoryClaims>,
         ) => { written: number; deleted: number; archived: number; merged: number } | null;
     },
 ): Promise<TaskExecOutcome> {

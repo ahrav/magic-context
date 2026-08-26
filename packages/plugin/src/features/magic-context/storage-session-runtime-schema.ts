@@ -10,9 +10,7 @@
  * migration chain and no v87+ data migration. Schema changes bump the
  * component manifest digest, which changes the direct-format identity.
  *
- * The retired memory-era objects (memories, memories_fts, memory_embeddings,
- * memory_stats, memory_verifications, memory_mutation_log, the
- * legacy_memory_claims crosswalk, and the v84 claim compatibility tables) are
+ * The retired memory-era objects and compatibility crosswalks are
  * deliberately absent: project memory lives in the registered claim
  * components (R18).
  *

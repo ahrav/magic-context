@@ -2,8 +2,7 @@
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
-import { initializeDatabase } from "../../plugin/src/features/magic-context/storage-db";
+import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
@@ -41,13 +40,7 @@ function initializeIsolatedContextDb(dataDir: string): void {
   const path = join(dataDir, "cortexkit", "magic-context", "context.db");
   if (existsSync(path)) return;
   mkdirSync(dirname(path), { recursive: true });
-  const db = new Database(path);
-  try {
-    initializeDatabase(db);
-    runMigrations(db);
-  } finally {
-    db.close();
-  }
+  createDirectTestDatabase({ path }).db.close();
 }
 
 export class PiTestHarness {
@@ -170,6 +163,7 @@ export class PiTestHarness {
     if (last) return `http://${last.headers.host}`;
     // MockProvider doesn't expose baseURL after start; derive it from the Bun server by
     // reaching through the stable private field shape in tests.
+    // SAFETY: A running MockProvider exposes its Bun server port through private `server.port`.
     const server = (mock as unknown as { server?: { port?: number } }).server;
     const port = server?.port;
     if (!port) throw new Error("mock provider is not running");
