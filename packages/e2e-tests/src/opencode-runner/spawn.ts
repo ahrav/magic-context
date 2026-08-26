@@ -40,6 +40,18 @@ export interface IsolatedEnv {
     workdir: string;
 }
 
+/**
+ * Listen addresses the fixed loopback client URL can reach.
+ *
+ * The set is closed on purpose. Readiness polling and the returned handle both
+ * target `http://127.0.0.1:${port}`, so an address that URL cannot reach — an
+ * IPv6-only `::1`, or a single non-loopback interface — would bind a socket no
+ * client ever connects to and burn the whole readiness timeout instead of
+ * failing with the reason. Admitting another value means deriving the client
+ * URL from it in the same change, including IPv6 bracket form.
+ */
+export type ServeHostname = "0.0.0.0" | "127.0.0.1";
+
 export interface SpawnedOpencode {
     url: string;
     port: number;
@@ -81,7 +93,7 @@ export interface SpawnOptions {
      * spawn that places a real credential in the child env must pass
      * "127.0.0.1" to keep the API off non-loopback interfaces.
      */
-    hostname?: string;
+    hostname?: ServeHostname;
     /** Verified immutable release root. Omitted keeps active-checkout behavior. */
     releaseRoot?: VerifiedReleaseRoot;
 }

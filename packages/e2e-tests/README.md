@@ -124,9 +124,9 @@ scenario to retrieval, formation, or representation. The helpers operate on a
   fails its database precondition.
 - `liveModelSpawnOptions({ apiKey, providerBlock })` returns the `extraEnv`,
   `openCodeConfigExtra`, and `hostname` portion of raw `SpawnOptions`. It sets
-  `ANTHROPIC_API_KEY`, installs the supplied provider map, and pins the serve
-  listen address to `127.0.0.1`; it does not send a request or validate
-  provider contents. The loopback pin matters: the serve HTTP API is
+  `ANTHROPIC_API_KEY`, installs the supplied provider map, and pins the
+  `opencode serve` listen address to `127.0.0.1`; it does not send a request or
+  validate provider contents. The loopback pin matters: the serve HTTP API is
   unauthenticated, and this is the only spawn path carrying a real credential.
 
 The demonstration uses this capability matrix:
@@ -179,8 +179,10 @@ the live provider if later prompts still use the mock. Also,
 `RustTestHarness.restart()` drops `openCodeConfigExtra`; rebuild or reapply the
 recipe after a restart. Keep the recipe's `hostname: "127.0.0.1"` when spawning
 with a real key — other spawns bind all interfaces with no authentication,
-which would expose the live credential to anyone who can reach the port. The
-shipped test only checks the generated config and never calls a live model.
+which would expose the live credential to anyone who can reach the port.
+`hostname` accepts only `"0.0.0.0"` and `"127.0.0.1"`, the two addresses the
+fixed `http://127.0.0.1:${port}` client URL can reach. The shipped test only
+checks the generated config and never calls a live model.
 
 Callers own scoring and aggregation. Given scores R0 through R3, compute regret
 as retrieval = R1 - R0, formation = R2 - R1, and representation = R3 - R2.
