@@ -309,6 +309,8 @@ function validateManifestReferences(args: {
     manifest: UserMemoryReviewManifest;
     snapshot: UserMemoryReviewSnapshot;
     projectIdentity: string;
+    /** Minimum corroborating candidates a project promotion must carry. */
+    promotionThreshold: number;
 }): void {
     const candidateById = new Map(
         args.snapshot.candidates.map((candidate) => [candidate.id, candidate]),
@@ -335,6 +337,26 @@ function validateManifestReferences(args: {
     }
     for (const [index, promotion] of args.manifest.projectPromotions.entries()) {
         useCandidates(promotion.candidateIds, `promote_project[${index}]`);
+        // The threshold gates whether the review runs at all and is otherwise
+        // stated only in the prompt, so a model that returns a single candidate
+        // out of a qualifying snapshot would turn one uncorroborated observation
+        // into a durable project claim. A project promotion has to carry its own
+        // corroboration.
+        //
+        // Reject an unusable threshold rather than comparing against it: test
+        // files are excluded from typecheck, so a caller that omits the field
+        // would otherwise compare against `undefined` — always false — and lose
+        // this guard silently, which is the failure mode it exists to prevent.
+        if (!Number.isInteger(args.promotionThreshold) || args.promotionThreshold < 1) {
+            throw new Error(
+                `promote_project[${index}] cannot be validated: promotionThreshold is ${args.promotionThreshold}`,
+            );
+        }
+        if (promotion.candidateIds.length < args.promotionThreshold) {
+            throw new Error(
+                `promote_project[${index}] carries ${promotion.candidateIds.length} candidate(s); ${args.promotionThreshold} are required for a project claim`,
+            );
+        }
         for (const id of promotion.candidateIds) {
             const projects = candidateById.get(id)?.projectIdentities ?? [];
             if (projects.length !== 1 || projects[0] !== args.projectIdentity) {
@@ -405,6 +427,8 @@ export function applyUserMemoryReviewManifest(args: {
     identity: AutonomousManifestIdentity;
     snapshot: UserMemoryReviewSnapshot;
     manifest: UserMemoryReviewManifest;
+    /** Minimum corroborating candidates a project promotion must carry. */
+    promotionThreshold: number;
     nowMs?: number;
 }): ReviewApplyResult {
     validateManifestReferences(args);
@@ -788,6 +812,7 @@ If no promotions are warranted, return empty arrays. Consume reviewed candidates
                         manifest,
                         snapshot,
                         projectIdentity: args.projectIdentity,
+                        promotionThreshold: args.promotionThreshold,
                     });
                     return manifest;
                 },
@@ -803,6 +828,7 @@ If no promotions are warranted, return empty arrays. Consume reviewed candidates
             identity,
             snapshot,
             manifest: reviewRun.validated,
+            promotionThreshold: args.promotionThreshold,
         });
         manifestFinalized = true;
         if (applied.staleReason) throw new StaleUserMemoryReviewError(applied.staleReason);

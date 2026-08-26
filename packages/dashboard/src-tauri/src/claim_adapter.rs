@@ -1330,6 +1330,16 @@ fn insert_policy_subject(
     Ok(())
 }
 
+/// The direct memory taxonomy. Mirrors the tool schema's five categories and
+/// the set the pre-cutover dashboard path validated against.
+const MEMORY_CATEGORIES: [&str; 5] = [
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+];
+
 fn maturity_rank(value: &str) -> i64 {
     match value {
         "CANDIDATE" => 0,
@@ -1879,6 +1889,20 @@ fn revise_stage(
         .is_some_and(|category| category.trim().is_empty())
     {
         return Err("claim category must not be empty".to_string());
+    }
+    // Neither `claim_memory_revision_attributes` nor the current-head projection
+    // constrains the category, so a nonempty-only check persists an
+    // out-of-taxonomy value permanently, where category filters and prompts no
+    // longer recognize it. The five-category contract is enforced by the tool
+    // schema and was enforced by the previous dashboard path
+    // (`update_memory_category`); the adapter has to keep enforcing it.
+    if let Some(category) = input.category.as_deref() {
+        if !MEMORY_CATEGORIES.contains(&category) {
+            return Err(format!(
+                "invalid claim category: {category}. Must be one of {}.",
+                MEMORY_CATEGORIES.join(", ")
+            ));
+        }
     }
     let (current_category, importance, memory_scope, sharing, expires_at): (
         String,

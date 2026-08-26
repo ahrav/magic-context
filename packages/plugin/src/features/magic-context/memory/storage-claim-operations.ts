@@ -1579,6 +1579,33 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         );
     }
     const normalizedHash = computeNormalizedHash(mergedContent);
+    // A merge keeps the target's category and terminally retires every source,
+    // so merging across categories destroys the source category's live fact.
+    // Categories partition distinct facts: two similar claims filed under
+    // different categories are not duplicates, one is miscategorized. Rejecting
+    // here — before any staging — is what the pre-cutover `merge_memories`
+    // guaranteed ("cross-category merges are rejected before any store mutation
+    // so a miscategorization cannot silently destroy a distinct fact"), and what
+    // the curator prompt still promises the model. The check belongs to the
+    // operation rather than one caller so every entry point inherits it.
+    const sourceCategories = new Set<string>();
+    for (const source of sources) {
+        const attributes = readRevisionAttributes(db, source.currentRevisionId);
+        if (!attributes) {
+            throw new ClaimGraphCorruptionError(
+                `claim revision ${source.currentRevisionId} has no attributes row; direct-SQL corruption`,
+            );
+        }
+        if (attributes.category !== targetAttributes.category) {
+            sourceCategories.add(attributes.category);
+        }
+    }
+    if (sourceCategories.size > 0) {
+        const found = [targetAttributes.category, ...[...sourceCategories].sort()].join(", ");
+        throw new ClaimOperationInputError(
+            `cross-category merge is refused (${found}); a category boundary separates distinct facts, so archive the redundant claim instead`,
+        );
+    }
     assertNoLiveDuplicate(db, {
         projectId: target.projectId,
         category: targetAttributes.category,

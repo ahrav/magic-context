@@ -5,6 +5,7 @@ import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import type { SourceTrustClass } from "../storage-claim-applicability-schema";
 import { createDirectTestDatabase } from "../test-database";
+import { CLAIM_POLICY_VERSION } from "./claim-visibility-policy";
 import { readProjectMemoryCurrentState } from "./storage-claim-current-state";
 import {
     type ClaimEvidenceProvenance,
@@ -136,6 +137,48 @@ describe("current-state provider: hydration", () => {
             expect(second.snapshotVector.projectGenerations[String(ctx.projectId)]).toBe(
                 (first.snapshotVector.projectGenerations[String(ctx.projectId)] as number) + 1,
             );
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+});
+
+describe("current-state provider: unsupported policy version", () => {
+    test("a future policy version fails closed on auto-inject and is labeled unknown in search", () => {
+        // An older process still attached to the database must not trust a
+        // projection a newer writer produced: its stored bits were decided under
+        // policy semantics this binary cannot interpret. The shared evaluator and
+        // the legacy adapter both fail closed here.
+        const ctx = setup();
+        try {
+            const claim = createClaimOp(ctx, "op-future", "Future-policy claim.");
+            const claimRef = getProjectMemoryClaimByPublicId(ctx.db, publicIdOf(claim));
+            if (!claimRef) throw new Error("unreachable");
+            ctx.db
+                .prepare(
+                    "UPDATE claim_effective_policy SET policy_version = ?, auto_eligible = 1, explicit_eligible = 1 WHERE revision_id = ?",
+                )
+                .run(CLAIM_POLICY_VERSION + 1, claimRef.currentRevisionId);
+
+            const auto = readProjectMemoryCurrentState(ctx.db, {
+                projectIds: [ctx.projectId],
+                surface: "auto_inject",
+                limit: 10,
+            });
+            expect(auto.status).toBe("ok");
+            if (auto.status !== "ok") throw new Error("unreachable");
+            expect(auto.items.map((item) => item.publicClaimId)).not.toContain(publicIdOf(claim));
+
+            // Explicit search may still serve it, but only as a labeled unknown.
+            const explicit = readProjectMemoryCurrentState(ctx.db, {
+                projectIds: [ctx.projectId],
+                surface: "explicit_search",
+                limit: 10,
+            });
+            expect(explicit.status).toBe("ok");
+            if (explicit.status !== "ok") throw new Error("unreachable");
+            const served = explicit.items.find((item) => item.publicClaimId === publicIdOf(claim));
+            expect(served?.explicitLabel ?? "").toContain("policy:unknown");
         } finally {
             closeQuietly(ctx.db);
         }

@@ -573,13 +573,13 @@ fn content_and_category_revisions_append_without_mutating_history() {
             target: target(&content.refreshed_claims[0]),
             operation_key: "revise-category".to_string(),
             content: None,
-            category: Some("RULE".to_string()),
+            category: Some("PROJECT_RULES".to_string()),
         },
     )
     .unwrap();
     assert_eq!(category.outcome, "applied");
     assert_eq!(category.refreshed_claims[0].revision, 3);
-    assert_eq!(category.refreshed_claims[0].category, "RULE");
+    assert_eq!(category.refreshed_claims[0].category, "PROJECT_RULES");
     assert_eq!(category.refreshed_claims[0].content, "new content");
 
     let mut statement = conn
@@ -617,7 +617,7 @@ fn content_and_category_revisions_append_without_mutating_history() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(categories, vec!["FACT", "FACT", "RULE"]);
+    assert_eq!(categories, vec!["FACT", "FACT", "PROJECT_RULES"]);
 }
 
 #[test]
@@ -745,7 +745,7 @@ fn stale_revision_token_commits_zero_effects() {
             target: target(&stale),
             operation_key: "stale-revision".to_string(),
             content: None,
-            category: Some("RULE".to_string()),
+            category: Some("PROJECT_RULES".to_string()),
         },
     )
     .unwrap();
@@ -957,6 +957,54 @@ fn tauri_content_edits_keep_explicit_user_eligibility() {
 }
 
 #[test]
+fn a_revision_outside_the_direct_taxonomy_is_refused() {
+    // Neither the revision attributes nor the current-head projection constrains
+    // the category, so accepting any nonempty string persists an out-of-taxonomy
+    // claim permanently — invisible to category filters and prompts. The tool
+    // schema and the pre-cutover dashboard path both enforce the five categories.
+    let mut conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+    let claim = read_claim(&conn, CLAIM_A);
+
+    let refused = claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::BearerHttp,
+        claim_adapter::ReviseClaimInput {
+            target: target(&claim),
+            operation_key: "bad-category".to_string(),
+            content: None,
+            category: Some("arbitrary".to_string()),
+        },
+    );
+    assert!(refused.is_err(), "an out-of-taxonomy category must be refused");
+
+    // Every one of the five remains accepted.
+    for (index, category) in [
+        "PROJECT_RULES",
+        "ARCHITECTURE",
+        "CONSTRAINTS",
+        "CONFIG_VALUES",
+        "NAMING",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let current = read_claim(&conn, CLAIM_A);
+        claim_adapter::revise_claim(
+            &mut conn,
+            claim_adapter::MutationChannel::BearerHttp,
+            claim_adapter::ReviseClaimInput {
+                target: target(&current),
+                operation_key: format!("ok-category-{index}"),
+                content: None,
+                category: Some((*category).to_string()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("{category} must be accepted: {error}"));
+    }
+}
+
+#[test]
 fn a_revoked_approval_does_not_come_back_through_a_later_policy_pass() {
     // The maturity stream is append-only, so a historical APPROVED stays at its
     // head forever. Reading the head as the effective rung let any later policy
@@ -1054,7 +1102,7 @@ fn a_category_only_revision_keeps_the_evidence_attesting_the_same_bytes() {
             target: target(&before),
             operation_key: "recategorize".to_string(),
             content: None,
-            category: Some("PREFERENCE".to_string()),
+            category: Some("CONSTRAINTS".to_string()),
         },
     )
     .unwrap();
@@ -1279,7 +1327,7 @@ fn hidden_claims_are_omitted_from_stale_mutation_responses() {
             target: target(&stale),
             operation_key: "stale-hidden".to_string(),
             content: None,
-            category: Some("RULE".to_string()),
+            category: Some("PROJECT_RULES".to_string()),
         },
     )
     .unwrap();

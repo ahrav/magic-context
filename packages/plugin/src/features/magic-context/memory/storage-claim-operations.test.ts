@@ -1330,6 +1330,38 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
         }
     });
 
+    test("a cross-category merge is refused before any claim is retired", () => {
+        // A merge keeps the target's category and terminally retires every
+        // source, so merging across categories destroys the source category's
+        // live fact. The pre-cutover `merge_memories` rejected this before any
+        // store mutation and the curator prompt still promises it.
+        const ctx = setup();
+        try {
+            const target = createClaimOp(ctx, "op-target", "Target claim content.");
+            const source = createClaimOp(ctx, "op-source", "Source claim content.", {
+                category: "CONSTRAINTS",
+            });
+            const before = snapshotCounts(ctx.db);
+            expect(() =>
+                mergeProjectMemoryClaims(
+                    ctx.db,
+                    { producer: "test", operationKey: "op-merge" },
+                    {
+                        targetToken: computeProjectMemoryMutationToken(ctx.db, publicIdOf(target)),
+                        sourceTokens: [
+                            computeProjectMemoryMutationToken(ctx.db, publicIdOf(source)),
+                        ],
+                        actor: "user:test",
+                    },
+                ),
+            ).toThrow(/cross-category merge is refused/);
+            // Nothing staged, so the source's distinct fact is still live.
+            expect(snapshotCounts(ctx.db)).toEqual(before);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("merged content may keep a source's exact wording", () => {
         // The sources are still `active` when the duplicate-content guard runs
         // and only retire later in the same transaction, so a merge that keeps

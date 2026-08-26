@@ -28,6 +28,7 @@ import {
 } from "./claim-operation-contract.ts";
 import {
     type ActiveDispositions,
+    CLAIM_POLICY_VERSION,
     explicitSearchLabelFromFields,
 } from "./claim-visibility-policy.ts";
 import {
@@ -367,10 +368,22 @@ function surfaceDecision(
             label: null,
         };
     }
+    // A projection written by a newer writer records decisions under policy
+    // semantics this binary cannot interpret, so its stored bits are not a
+    // trustworthy answer. Both the shared evaluator (`policy_version_unsupported`)
+    // and the legacy adapter (`unprojected`) already fail closed here; the direct
+    // provider has to agree, or an older process still attached to the database
+    // keeps auto-injecting content it cannot reason about.
+    const versionUnsupported = item.policy.policyVersion > CLAIM_POLICY_VERSION;
     if (surface === "auto_inject") {
-        return { eligible: item.policy.autoEligible && !softHidden, label: null };
+        return {
+            eligible: !versionUnsupported && item.policy.autoEligible && !softHidden,
+            label: null,
+        };
     }
-    if (!item.policy.explicitEligible) return { eligible: false, label: null };
+    if (!versionUnsupported && !item.policy.explicitEligible) {
+        return { eligible: false, label: null };
+    }
     const dispositions: string[] = [];
     if (facts.stale) dispositions.push("stale");
     if (facts.disputed) dispositions.push("disputed");
@@ -378,11 +391,15 @@ function surfaceDecision(
     return {
         eligible: true,
         label: explicitSearchLabelFromFields({
-            effectiveMaturity: item.policy.effectiveMaturity,
-            originTaint: item.policy.originTaint,
+            // An unsupported revision's stored maturity and taint were written
+            // under a scheme this build does not understand, so the label keeps
+            // the sanitized `policy:unknown` shape rather than echoing raw
+            // future-version strings to the agent.
+            effectiveMaturity: versionUnsupported ? "CANDIDATE" : item.policy.effectiveMaturity,
+            originTaint: versionUnsupported ? "unknown" : item.policy.originTaint,
             dispositions,
-            policyMissing: false,
-            autoEligible: item.policy.autoEligible && !softHidden,
+            policyMissing: versionUnsupported,
+            autoEligible: !versionUnsupported && item.policy.autoEligible && !softHidden,
         }),
     };
 }

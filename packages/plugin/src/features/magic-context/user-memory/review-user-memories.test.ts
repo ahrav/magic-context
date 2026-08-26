@@ -152,6 +152,8 @@ describe("reviewUserMemories", () => {
                 identity,
                 snapshot,
                 manifest,
+                // These cases exercise apply/replay atomicity, not corroboration.
+                promotionThreshold: 1,
                 nowMs: 50_000,
             });
 
@@ -222,6 +224,54 @@ describe("reviewUserMemories", () => {
         db.close();
     });
 
+    test("an under-corroborated project promotion is refused", () => {
+        // The threshold only decides whether the review runs; a qualifying
+        // snapshot of three unrelated candidates can still yield a manifest that
+        // promotes one of them, turning a single observation into a durable
+        // project claim the prompt said required recurrence.
+        const db = freshDb();
+        const holderId = "holder-threshold";
+        const acquisition = acquire(db, holderId);
+        const [a, b, c] = seedCandidates(db, [
+            "This project pins the toolchain",
+            "User prefers short explanations",
+            "This project runs focused tests",
+        ]);
+        const snapshot = captureUserMemoryReviewSnapshot(db, PROJECT);
+        const manifest = parseUserMemoryReviewManifest({
+            promote_project: [
+                {
+                    content: "Pin the toolchain.",
+                    category: "PROJECT_RULES",
+                    candidate_ids: [a],
+                },
+            ],
+            consume_candidate_ids: [a, b, c],
+        });
+        const identity = dreamerManifestIdentity({
+            db,
+            holderId,
+            leaseKey: LEASE,
+            task: "review-user-memories",
+            publicClaimIds: [`snapshot:${snapshot.digest}`],
+        });
+
+        expect(() =>
+            applyUserMemoryReviewManifest({
+                db,
+                projectIdentity: PROJECT,
+                holderId,
+                leaseKey: LEASE,
+                expectedLeaseGeneration: acquisition.generation,
+                identity,
+                snapshot,
+                manifest,
+                promotionThreshold: 3,
+            }),
+        ).toThrow(/carries 1 candidate\(s\); 3 are required/);
+        expect(readDreamerProjectClaims(db, PROJECT, "hygiene")).toHaveLength(0);
+    });
+
     test("rolls claim receipt, effect, generation, and profile changes back together", () => {
         const db = freshDb();
         const holderId = "holder-rollback";
@@ -271,6 +321,7 @@ describe("reviewUserMemories", () => {
                 identity,
                 snapshot,
                 manifest,
+                promotionThreshold: 1,
             }),
         ).toThrow("profile update failed");
         expect(readDreamerProjectClaims(db, PROJECT, "hygiene")).toHaveLength(0);
