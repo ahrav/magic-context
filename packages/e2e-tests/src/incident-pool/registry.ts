@@ -24,6 +24,10 @@ import {
     type IncidentVariant,
 } from "./contract";
 import { rowDigest } from "./history";
+import {
+    isVerifiedProspectiveSource,
+    type VerifiedProspectiveIncidentSource,
+} from "./evidence";
 import { auditBackgroundLifecycleIncidentCases } from "./scenarios/audit-background-lifecycle";
 import { auditMemorySearchIncidentCases } from "./scenarios/audit-memory-search";
 import { parityPiTodoIncidentCases } from "./scenarios/parity-pi-todo";
@@ -118,6 +122,20 @@ function validateImplementationFiles(files: string[], variantId: string): void {
             );
         seen.add(file);
     }
+}
+
+export function registerProspectiveIncidentCase(
+    registry: IncidentCaseRegistry,
+    source: VerifiedProspectiveIncidentSource,
+    entry: RegisteredIncidentCase,
+): void {
+    if (!isVerifiedProspectiveSource(source)) {
+        throw new Error("prospective incident registration requires verified source evidence");
+    }
+    if (entry.fixtures.prospectiveSourceFingerprint !== rowDigest(source)) {
+        throw new Error("prospective incident registration does not bind its source contract");
+    }
+    registerIncidentCase(registry, entry);
 }
 
 export function registerIncidentCase(
@@ -342,6 +360,7 @@ function executesBoundSymbol(executed: unknown, bound: unknown): boolean {
     if (typeof executed !== "function" || typeof bound !== "function")
         return false;
     if (executed === bound) return true;
+    // SAFETY: function objects support symbol-keyed properties set by adaptBoundSymbol. commentlint: allow(JUDGE)
     return (executed as unknown as Record<symbol, unknown>)[ADAPTED_FROM] ===
         bound;
 }

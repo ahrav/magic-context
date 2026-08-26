@@ -29,9 +29,12 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as ts from "typescript";
+import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import type { CohortCloseManifest } from "../prospective-holdout/contract";
 import type {
     IncidentCatalog,
     IncidentVariant,
+    ProspectiveIncidentSource,
     SourceInventory,
 } from "./contract";
 import { EXECUTABLE_LANES } from "./contract";
@@ -905,6 +908,55 @@ export function assertMutationReplayResults(
             `changed verifier ${verifierPath} failed mutation replay: ${failures.join(", ")} did not produce the expected red result`,
         );
     }
+}
+
+declare const verifiedProspectiveSourceBrand: unique symbol;
+export type VerifiedProspectiveIncidentSource = ProspectiveIncidentSource & {
+    readonly [verifiedProspectiveSourceBrand]: true;
+};
+const verifiedProspectiveSourceFingerprints = new WeakMap<object, string>();
+
+export function isVerifiedProspectiveSource(
+    source: ProspectiveIncidentSource,
+): source is VerifiedProspectiveIncidentSource {
+    return verifiedProspectiveSourceFingerprints.get(source) === canonicalFingerprint(source);
+}
+
+export function verifyProspectiveSourceEvidence(
+    source: ProspectiveIncidentSource,
+    close: CohortCloseManifest,
+    trustedCloseFingerprint: string,
+    incidentBytes: unknown,
+): VerifiedProspectiveIncidentSource {
+    if (
+        source.epoch_id !== close.body.epochId ||
+        source.close_manifest_fingerprint !== trustedCloseFingerprint ||
+        canonicalFingerprint(close) !== trustedCloseFingerprint
+    ) {
+        throw new Error("prospective source does not bind the trusted cohort close");
+    }
+    const admitted = close.body.cases.find((entry) => entry.caseId === source.case_id);
+    if (
+        !admitted ||
+        admitted.familyId !== source.family_id ||
+        admitted.caseCommitment !== source.case_commitment
+    ) {
+        throw new Error("prospective source does not bind an admitted cohort case");
+    }
+    if (canonicalFingerprint(incidentBytes) !== source.incident_bytes_fingerprint) {
+        throw new Error("prospective source incident bytes fingerprint mismatch");
+    }
+    const approvalSubject = canonicalFingerprint({
+        epochId: source.epoch_id,
+        caseId: source.case_id,
+        closeManifestFingerprint: source.close_manifest_fingerprint,
+        incidentBytesFingerprint: source.incident_bytes_fingerprint,
+    });
+    if (source.second_privacy_approval.subject_fingerprint !== approvalSubject) {
+        throw new Error("prospective source second privacy approval is stale");
+    }
+    verifiedProspectiveSourceFingerprints.set(source, canonicalFingerprint(source));
+    return source as VerifiedProspectiveIncidentSource;
 }
 
 // ---------------------------------------------------------------------------

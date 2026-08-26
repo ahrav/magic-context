@@ -3,6 +3,7 @@ import {
     parseAdjudicationEvent,
     parseEmergencyRedaction,
     parseIncidentCatalog,
+    parseProspectiveIncidentSource,
     parseSourceInventory,
     ADJUDICATION_EVENT_SCHEMA,
     EMERGENCY_REDACTION_SCHEMA,
@@ -641,5 +642,28 @@ describe("emergency redaction contract", () => {
                 "r",
             ),
         ).toThrow(/prohibited_data_class: must be one of/);
+    });
+});
+
+describe("prospective incident source contract", () => {
+    it("accepts exact trusted cohort provenance and rejects unknown fields", () => {
+        const source = {
+            schema: "incident-prospective-source/v1",
+            epoch_id: "epoch-test-release",
+            case_id: `case-${"a".repeat(32)}`,
+            family_id: "fam-context-loss",
+            close_manifest_fingerprint: HEX("1"),
+            case_commitment: HEX("2"),
+            semantic_revision_id: "rev-first",
+            incident_bytes_fingerprint: HEX("3"),
+            second_privacy_approval: {
+                approver: "privacy-reviewer",
+                subject_fingerprint: HEX("4"),
+            },
+        };
+        expect(parseProspectiveIncidentSource(source).case_id).toBe(source.case_id);
+        expect(() => parseProspectiveIncidentSource({ ...source, raw_report: "forbidden" })).toThrow(
+            /must contain exactly/,
+        );
     });
 });
