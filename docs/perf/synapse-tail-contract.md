@@ -141,9 +141,16 @@ The following fields are intentionally unresolved until pilot blocks estimate
 process variance and queue accumulation. They must be filled, reviewed, and
 frozen in this file and the run manifest before any treatment collection:
 
-- `INDEPENDENT_BLOCK_COUNT = <freeze after U7 pilot>`
-- `BLOCK_HOLD_DURATION = <freeze after U7 pilot>`
-- `CANDIDATE_A_K_LEVELS = <derive and freeze after U7 pilot>`
+- `INDEPENDENT_BLOCK_COUNT = 2`
+- `BLOCK_HOLD_DURATION = 1 second`
+- `CANDIDATE_A_K_LEVELS = {1, 2}`
+
+These values were frozen from the U7 pilot on 2026-08-26. Two blocks are fixed
+descriptive replication, not a powered design. No owner policy, minimum
+detectable effect, or treatment-effect threshold exists. The one-second hold
+keeps the complete matrix bounded while preserving raw request observations.
+Candidate A uses every feasible positive K: startup scratch validation accepts
+K=1 and K=2 and rejects K=3. K=0 remains the baseline admission behavior.
 
 Cell order is randomized as complete blocks. One independent block contains
 one repetition of each scheduled cell under one environment and artifact.
@@ -198,23 +205,24 @@ resource shifts, correctness gates, and all nine acceptance criteria do.
 
 An independently restarted, randomized complete block is the analysis unit.
 Requests and attempts within a block are observations, not independent
-replicates. Per-cell estimates first reduce each block to its declared summary;
-uncertainty then resamples paired blocks. Reports use paired 95% bootstrap
-intervals and retain the bootstrap seed and resampling count.
+replicates. Per-cell estimates first reduce each block to its declared summary.
+With two fixed descriptive blocks, reports show both block values, their range,
+and paired point contrasts. They do not report confidence intervals, p-values,
+power, or a treatment verdict. A future inferential run requires an owner-set
+effect boundary and a separately frozen design.
 
 Before treatment collection, run two byte-identical hygiene-only labels through
-the complete pilot schedule as the A/A control. Report their absolute values,
-paired ratios, and intervals for every primary outcome. Any accounting mismatch,
+the complete pilot schedule as the A/A control. Report their absolute values and
+paired ratios for every primary outcome. Any accounting mismatch,
 label-dependent code path, or material offset that remains after rerun and
 instrumentation review invalidates the harness. A/A is a measurement-system
 check, not evidence for a treatment.
 
-Multiplicity is controlled within each loop-discipline × injected-delay ×
-batch-shape slice. Apply Holm's correction at family α = 0.05 to the primary
-candidate-versus-hygiene-only contrasts across variants and the four primary
-outcomes. Required descriptive outcomes retain unadjusted 95% intervals and are
-labeled exploratory. No corrected or uncorrected interval creates a repository
-performance policy.
+No inferential multiplicity procedure is applied to this fixed descriptive run.
+Every loop-discipline × injected-delay × batch-shape slice reports all candidate-
+versus-hygiene-only contrasts and all four primary outcomes without selecting on
+the largest movement. Required descriptive outcomes are labeled exploratory.
+No observed range creates a repository performance policy.
 
 Pilot collection stops only after it can freeze independent block count, hold
 duration, and K levels. Treatment collection then uses that fixed schedule with

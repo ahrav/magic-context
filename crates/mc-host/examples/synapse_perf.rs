@@ -1194,6 +1194,7 @@ struct Summary {
     permit_wait: Option<SignedSummary>,
     poll_distribution: Option<CountSummary>,
     service_time: Option<LatencySummary>,
+    service_time_mean_ns: Option<f64>,
     service_time_cv: Option<f64>,
     send_lag_max_ns: u64,
     missed_slots: u64,
@@ -1257,7 +1258,9 @@ impl SignedSummary {
     }
 }
 
-async fn run(opts: Opts) -> Result<(Vec<LogicalRecord>, Vec<AttemptRecord>, Summary), String> {
+async fn run(
+    opts: Opts,
+) -> Result<(Vec<LogicalRecord>, Vec<AttemptRecord>, Vec<u64>, Summary), String> {
     let data_root = tempfile::tempdir().map_err(|error| format!("temporary data root: {error}"))?;
     let service_ns = Arc::new(StdMutex::new(Vec::new()));
     let engine = Arc::new(DelayEngine {
@@ -1329,8 +1332,9 @@ async fn run(opts: Opts) -> Result<(Vec<LogicalRecord>, Vec<AttemptRecord>, Summ
         CountSummary::from_unsorted(logical.iter().map(|request| request.polls).collect());
     let service_samples = service_ns.lock().expect("service samples").clone();
     let service_time = LatencySummary::from_unsorted(service_samples.clone());
+    let service_time_mean_ns = mean(&service_samples);
     let service_time_cv = coefficient_of_variation(&service_samples);
-    let censored = ledger.offered.saturating_sub(ledger.completed);
+    let censored = censored_count(&ledger);
     let censored_per_mille = if ledger.offered == 0 {
         0.0
     } else {
@@ -1352,6 +1356,7 @@ async fn run(opts: Opts) -> Result<(Vec<LogicalRecord>, Vec<AttemptRecord>, Summ
         permit_wait,
         poll_distribution,
         service_time,
+        service_time_mean_ns,
         service_time_cv,
         send_lag_max_ns,
         missed_slots,
@@ -1361,14 +1366,18 @@ async fn run(opts: Opts) -> Result<(Vec<LogicalRecord>, Vec<AttemptRecord>, Summ
     };
     drop(ctx);
     host.shutdown()?;
-    Ok((logical, attempts, summary))
+    Ok((logical, attempts, service_samples, summary))
 }
 
-fn coefficient_of_variation(samples: &[u64]) -> Option<f64> {
+fn mean(samples: &[u64]) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
-    let mean = samples.iter().map(|value| *value as f64).sum::<f64>() / samples.len() as f64;
+    Some(samples.iter().map(|value| *value as f64).sum::<f64>() / samples.len() as f64)
+}
+
+fn coefficient_of_variation(samples: &[u64]) -> Option<f64> {
+    let mean = mean(samples)?;
     if mean == 0.0 {
         return Some(0.0);
     }
@@ -1380,9 +1389,14 @@ fn coefficient_of_variation(samples: &[u64]) -> Option<f64> {
     Some(variance.sqrt() / mean)
 }
 
+fn censored_count(ledger: &perf_measurement::SynapseLedgerSummary) -> u64 {
+    ledger.timed_out.saturating_add(ledger.in_flight)
+}
+
 fn emit(
     logical: &[LogicalRecord],
     attempts: &[AttemptRecord],
+    service_samples: &[u64],
     summary: &Summary,
 ) -> Result<(), String> {
     for record in logical {
@@ -1409,6 +1423,21 @@ fn emit(
                 "load": summary.load,
                 "seed": summary.seed,
                 "record": record
+            }))
+            .map_err(|error| error.to_string())?
+        );
+    }
+    for (index, service_ns) in service_samples.iter().enumerate() {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "kind": "synapse_perf_service",
+                "variant": summary.variant,
+                "arm": summary.arm,
+                "load": summary.load,
+                "seed": summary.seed,
+                "index": index,
+                "service_ns": service_ns
             }))
             .map_err(|error| error.to_string())?
         );
@@ -1441,15 +1470,12 @@ fn main() {
     };
     let result = runtime.block_on(run(opts));
     match result {
-        Ok((logical, attempts, summary)) => {
-            if let Err(error) = emit(&logical, &attempts, &summary) {
+        Ok((logical, attempts, service_samples, summary)) => {
+            if let Err(error) = emit(&logical, &attempts, &service_samples, &summary) {
                 eprintln!("synapse_perf failed: emit: {error}");
                 std::process::exit(1);
             }
-            let censored = summary
-                .ledger
-                .offered
-                .saturating_sub(summary.ledger.completed);
+            let censored = censored_count(&summary.ledger);
             let censoring_invalid = u128::from(censored) * 1_000
                 > u128::from(summary.ledger.offered) * MAX_CENSORED_PER_MILLE;
             if !summary.ledger.valid
@@ -1480,6 +1506,41 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn logical(disposition: LogicalDisposition) -> LogicalRecord {
+        terminal_record(1, None, 0, 1, disposition, None, 0, 0)
+    }
+
+    #[test]
+    fn terminal_rejection_is_not_censoring() {
+        let ledger = perf_measurement::validate_synapse_ledgers(
+            &[logical(LogicalDisposition::Rejected)],
+            &[],
+        );
+
+        assert!(ledger.valid);
+        assert_eq!(censored_count(&ledger), 0);
+    }
+
+    #[test]
+    fn timeout_and_in_flight_are_censoring() {
+        let ledger = perf_measurement::validate_synapse_ledgers(
+            &[
+                logical(LogicalDisposition::TimedOut),
+                logical(LogicalDisposition::InFlight),
+            ],
+            &[],
+        );
+
+        assert!(ledger.valid);
+        assert_eq!(censored_count(&ledger), 2);
+    }
+
+    #[test]
+    fn service_time_mean_retains_raw_sample_mean() {
+        assert_eq!(mean(&[10, 20, 30]), Some(20.0));
+        assert_eq!(mean(&[]), None);
     }
 
     #[test]
