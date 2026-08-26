@@ -383,18 +383,48 @@ fn u10_scenario_7_delete_and_reseed_require_drained_u5_intents() {
         .replace_claim_mirror_snapshot(&original_snapshot, 1)
         .unwrap();
 
+    let route_root = "/repo/claim-mirror-test";
+    let store_uuid = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
+    let authority_project = "git:claim-mirror-test";
+    // Staging resolves memories authority through the bound route, so drive the
+    // route to MODULE before staging.
+    store
+        .bind_authority_route(store_uuid, authority_project, route_root)
+        .unwrap();
+    let preparing = store
+        .authority_begin_prepare(store_uuid, authority_project, "memories")
+        .unwrap();
+    let authority_generation = store
+        .authority_finish_prepare(
+            store_uuid,
+            authority_project,
+            "memories",
+            preparing.generation,
+            "same",
+            "same",
+            true,
+        )
+        .unwrap()
+        .generation;
+
     let binding = ClaimIntentBinding {
         database_incarnation_id: INCARNATION.to_string(),
         format_epoch: 1,
-        authority_project: "git:claim-mirror-test".to_string(),
-        authority_generation: 1,
+        authority_project: authority_project.to_string(),
+        authority_generation,
     };
     let command = ClaimCommandIdentity {
         producer: "mc-module".to_string(),
         operation_key: "pending-reset".to_string(),
     };
     let staged = store
-        .stage_claim_intent(&binding, &command, &json!({"operation": "update"}), 2)
+        .stage_claim_intent(
+            route_root,
+            &binding,
+            &command,
+            &json!({"operation": "update"}),
+            2,
+        )
         .unwrap();
 
     assert!(matches!(

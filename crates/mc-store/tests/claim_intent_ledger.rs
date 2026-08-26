@@ -8,6 +8,12 @@ use serde_json::{json, Value};
 
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 const PROJECT: &str = "git:claim-intent-test";
+/// Deliberately not `INCARNATION`. Production mints the context store UUID
+/// (`randomUUID()`) separately from the format marker's 32-hex database
+/// incarnation, so a fixture that reuses one value for both cannot observe a
+/// fence that keys `mc_authority` by the wrong identifier.
+const STORE_UUID: &str = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
+const ROUTE_ROOT: &str = "/repo/claim-intent-test";
 
 fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
     StorageDescriptor {
@@ -40,6 +46,30 @@ fn request(value: i64) -> Value {
     json!({"operation":"create","value":value})
 }
 
+/// Bind this route and drive memories authority to MODULE, returning the live
+/// generation. Staging resolves authority through the bound route, so a test that
+/// stages without this setup is correctly refused.
+fn module_authority(store: &McStore) -> u64 {
+    store
+        .bind_authority_route(STORE_UUID, PROJECT, ROUTE_ROOT)
+        .unwrap();
+    let preparing = store
+        .authority_begin_prepare(STORE_UUID, PROJECT, "memories")
+        .unwrap();
+    store
+        .authority_finish_prepare(
+            STORE_UUID,
+            PROJECT,
+            "memories",
+            preparing.generation,
+            "same",
+            "same",
+            true,
+        )
+        .unwrap()
+        .generation
+}
+
 fn result(outcome: &str) -> String {
     canonical_json_encode(&json!({
         "resultEncodingVersion": 1,
@@ -56,13 +86,14 @@ fn result(outcome: &str) -> String {
 fn acknowledged_intent_survives_more_than_512_later_commands() {
     let dir = tempfile::tempdir().unwrap();
     let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let generation = module_authority(&store);
     let first = command("first");
     let staged = store
-        .stage_claim_intent(&binding(1), &first, &request(0), 1)
+        .stage_claim_intent(ROUTE_ROOT, &binding(generation), &first, &request(0), 1)
         .unwrap();
     let committed = store
         .acknowledge_claim_intent(
-            &binding(1),
+            &binding(generation),
             &first,
             &staged.record.request_digest,
             ClaimIntentAckKind::ContextCommitted,
@@ -72,7 +103,7 @@ fn acknowledged_intent_survives_more_than_512_later_commands() {
         .unwrap();
     store
         .acknowledge_claim_intent(
-            &binding(1),
+            &binding(generation),
             &first,
             &committed.record.request_digest,
             ClaimIntentAckKind::Acknowledged,
@@ -84,7 +115,8 @@ fn acknowledged_intent_survives_more_than_512_later_commands() {
     for index in 0..600 {
         store
             .stage_claim_intent(
-                &binding(1),
+                ROUTE_ROOT,
+                &binding(generation),
                 &command(format!("later-{index:03}")),
                 &request(index),
                 index + 10,
@@ -102,13 +134,15 @@ fn staged_intent_reopens_and_rejects_binding_or_digest_reuse() {
     let dir = tempfile::tempdir().unwrap();
     let descriptor = descriptor(dir.path());
     let identity = command("restart");
-    let original_digest = {
+    let (original_digest, generation) = {
         let store = McStore::open(&descriptor).unwrap();
-        store
-            .stage_claim_intent(&binding(7), &identity, &request(1), 10)
+        let generation = module_authority(&store);
+        let digest = store
+            .stage_claim_intent(ROUTE_ROOT, &binding(generation), &identity, &request(1), 10)
             .unwrap()
             .record
-            .request_digest
+            .request_digest;
+        (digest, generation)
     };
 
     let store = McStore::open(&descriptor).unwrap();
@@ -116,17 +150,17 @@ fn staged_intent_reopens_and_rejects_binding_or_digest_reuse() {
     assert_eq!(reopened.request_digest, original_digest);
     assert_eq!(reopened.state, ClaimIntentState::Staged);
 
-    let mut other_incarnation = binding(7);
+    let mut other_incarnation = binding(generation);
     other_incarnation.database_incarnation_id = "abcdef0123456789abcdef0123456789".to_string();
     assert!(matches!(
-        store.stage_claim_intent(&other_incarnation, &identity, &request(1), 11),
+        store.stage_claim_intent(ROUTE_ROOT, &other_incarnation, &identity, &request(1), 11),
         Err(McStoreError::ClaimIntentBindingMismatch {
             field: "database incarnation",
             ..
         })
     ));
     assert!(matches!(
-        store.stage_claim_intent(&binding(7), &identity, &request(2), 12),
+        store.stage_claim_intent(ROUTE_ROOT, &binding(generation), &identity, &request(2), 12),
         Err(McStoreError::ClaimIntentIdentityConflict { .. })
     ));
 }
@@ -135,16 +169,21 @@ fn staged_intent_reopens_and_rejects_binding_or_digest_reuse() {
 fn stale_zero_effect_result_can_settle_after_authority_drain_starts() {
     let dir = tempfile::tempdir().unwrap();
     let store = McStore::open(&descriptor(dir.path())).unwrap();
-    let preparing = store
-        .authority_begin_prepare(INCARNATION, PROJECT, "memories")
+    store
+        .bind_authority_route(STORE_UUID, PROJECT, ROUTE_ROOT)
         .unwrap();
+    let preparing = store
+        .authority_begin_prepare(STORE_UUID, PROJECT, "memories")
+        .unwrap();
+    // PREPARING is not MODULE, so the route-resolved fence refuses the stage on the
+    // authority row itself rather than relying on the transition-control row.
     assert!(matches!(
-        store.stage_claim_intent(&binding(preparing.generation), &command("preparing"), &request(0), 0),
-        Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "resetting"
+        store.stage_claim_intent(ROUTE_ROOT, &binding(preparing.generation), &command("preparing"), &request(0), 0),
+        Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "PREPARING"
     ));
     let active = store
         .authority_finish_prepare(
-            INCARNATION,
+            STORE_UUID,
             PROJECT,
             "memories",
             preparing.generation,
@@ -156,21 +195,22 @@ fn stale_zero_effect_result_can_settle_after_authority_drain_starts() {
     let active_binding = binding(active.generation);
     let identity = command("stale");
     let staged = store
-        .stage_claim_intent(&active_binding, &identity, &request(1), 1)
+        .stage_claim_intent(ROUTE_ROOT, &active_binding, &identity, &request(1), 1)
         .unwrap();
 
     let draining = store
-        .authority_begin_drain(INCARNATION, PROJECT, "memories", "lease", 100, 2)
+        .authority_begin_drain(STORE_UUID, PROJECT, "memories", "lease", 100, 2)
         .unwrap();
     assert!(draining.generation > active.generation);
     assert!(matches!(
         store.stage_claim_intent(
+            ROUTE_ROOT,
             &binding(draining.generation),
             &command("new"),
             &request(2),
             3,
         ),
-        Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "draining"
+        Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "DRAINING"
     ));
 
     let settled = store
@@ -188,21 +228,80 @@ fn stale_zero_effect_result_can_settle_after_authority_drain_starts() {
 }
 
 #[test]
+fn staging_fails_closed_without_route_resolved_module_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+    // No route binding and no authority row. The binding alone must never be
+    // sufficient: keying the authority lookup by the caller-supplied marker
+    // incarnation previously matched no row and fell through to the insert.
+    assert!(matches!(
+        store.stage_claim_intent(ROUTE_ROOT, &binding(1), &command("unowned"), &request(0), 1),
+        Err(McStoreError::ClaimIntentRouteNotManaged)
+    ));
+    assert_eq!(store.unresolved_claim_intent_count().unwrap(), 0);
+
+    let generation = module_authority(&store);
+
+    // The route owns the project vocabulary, so a binding naming another project
+    // cannot borrow this route's authority.
+    let mut foreign = binding(generation);
+    foreign.authority_project = "git:someone-else".to_string();
+    assert!(matches!(
+        store.stage_claim_intent(ROUTE_ROOT, &foreign, &command("foreign"), &request(1), 2),
+        Err(McStoreError::ClaimIntentBindingMismatch {
+            field: "authority project",
+            ..
+        })
+    ));
+
+    // A generation that does not match the live authority row is refused.
+    assert!(matches!(
+        store.stage_claim_intent(
+            ROUTE_ROOT,
+            &binding(generation + 1),
+            &command("stale-generation"),
+            &request(2),
+            3,
+        ),
+        Err(McStoreError::ClaimIntentBindingMismatch {
+            field: "authority generation",
+            ..
+        })
+    ));
+
+    // An unbound route cannot stage even when authority exists for the project.
+    assert!(matches!(
+        store.stage_claim_intent(
+            "/repo/some-other-route",
+            &binding(generation),
+            &command("unbound-route"),
+            &request(3),
+            4,
+        ),
+        Err(McStoreError::ClaimIntentRouteNotManaged)
+    ));
+
+    assert_eq!(store.unresolved_claim_intent_count().unwrap(), 0);
+}
+
+#[test]
 fn store_rebuild_is_refused_until_intents_drain_then_freezes_new_stages() {
     let dir = tempfile::tempdir().unwrap();
     let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let generation = module_authority(&store);
     let identity = command("pending");
     let staged = store
-        .stage_claim_intent(&binding(1), &identity, &request(1), 1)
+        .stage_claim_intent(ROUTE_ROOT, &binding(generation), &identity, &request(1), 1)
         .unwrap();
 
     assert!(matches!(
-        store.begin_claim_store_rebuild(INCARNATION, 1, 2),
+        store.begin_claim_store_rebuild(INCARNATION, generation, 2),
         Err(McStoreError::ClaimIntentResetBlocked { unresolved: 1 })
     ));
     store
         .acknowledge_claim_intent(
-            &binding(1),
+            &binding(generation),
             &identity,
             &staged.record.request_digest,
             ClaimIntentAckKind::TerminalRejected,
@@ -210,15 +309,17 @@ fn store_rebuild_is_refused_until_intents_drain_then_freezes_new_stages() {
             3,
         )
         .unwrap();
-    store.begin_claim_store_rebuild(INCARNATION, 1, 4).unwrap();
+    store
+        .begin_claim_store_rebuild(INCARNATION, generation, 4)
+        .unwrap();
     assert!(matches!(
-        store.stage_claim_intent(&binding(1), &command("too-late"), &request(2), 5),
+        store.stage_claim_intent(ROUTE_ROOT, &binding(generation), &command("too-late"), &request(2), 5),
         Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "resetting"
     ));
-    let mut replacement = binding(1);
+    let mut replacement = binding(generation);
     replacement.database_incarnation_id = "abcdef0123456789abcdef0123456789".to_string();
     assert!(matches!(
-        store.stage_claim_intent(&replacement, &command("replacement"), &request(3), 6),
+        store.stage_claim_intent(ROUTE_ROOT, &replacement, &command("replacement"), &request(3), 6),
         Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "resetting"
     ));
 

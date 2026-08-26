@@ -148,6 +148,7 @@ fn intent_wire_record(record: ClaimIntentRecord) -> ClaimIntentWireRecord {
 
 pub fn stage_claim_intent(
     store: &McStore,
+    route_project_root: &str,
     request: &ClaimIntentStageRequest,
     now_ms: i64,
 ) -> Result<ClaimIntentStageResponse, MemoryToolError> {
@@ -158,8 +159,13 @@ pub fn stage_claim_intent(
             request.request_encoding_version
         )));
     }
-    let outcome =
-        store.stage_claim_intent(&request.binding, &request.command, &request.request, now_ms)?;
+    let outcome = store.stage_claim_intent(
+        route_project_root,
+        &request.binding,
+        &request.command,
+        &request.request,
+        now_ms,
+    )?;
     Ok(ClaimIntentStageResponse {
         protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
         replayed: outcome.replayed,
@@ -1050,11 +1056,32 @@ mod tests {
     fn claim_intent_protocol_is_strict_versioned_and_replayable() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
+        let route_root = "/repo/claim-intent-protocol";
+        let store_uuid = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
+        // Staging resolves memories authority through the bound route.
+        store
+            .bind_authority_route(store_uuid, "git:project", route_root)
+            .unwrap();
+        let preparing = store
+            .authority_begin_prepare(store_uuid, "git:project", "memories")
+            .unwrap();
+        let authority_generation = store
+            .authority_finish_prepare(
+                store_uuid,
+                "git:project",
+                "memories",
+                preparing.generation,
+                "same",
+                "same",
+                true,
+            )
+            .unwrap()
+            .generation;
         let binding = ClaimIntentBinding {
             database_incarnation_id: "0123456789abcdef0123456789abcdef".to_string(),
             format_epoch: 1,
             authority_project: "git:project".to_string(),
-            authority_generation: 3,
+            authority_generation,
         };
         let command = ClaimCommandIdentity {
             producer: "mc-module".to_string(),
@@ -1067,10 +1094,14 @@ mod tests {
             command: command.clone(),
             request: serde_json::json!({"operation":"create","value":"fact"}),
         };
-        let staged = stage_claim_intent(&store, &request, 1).unwrap();
+        let staged = stage_claim_intent(&store, route_root, &request, 1).unwrap();
         assert_eq!(staged.intent.state, ClaimIntentState::Staged);
         assert!(!staged.replayed);
-        assert!(stage_claim_intent(&store, &request, 2).unwrap().replayed);
+        assert!(
+            stage_claim_intent(&store, route_root, &request, 2)
+                .unwrap()
+                .replayed
+        );
 
         let inspected = inspect_claim_intents(
             &store,

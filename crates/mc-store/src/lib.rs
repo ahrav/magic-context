@@ -5318,6 +5318,8 @@ pub enum McStoreError {
     ClaimIntentAuthorityFrozen {
         state: String,
     },
+    /// The bound daemon route resolves to no memories authority row.
+    ClaimIntentRouteNotManaged,
     ClaimIntentNotFound {
         producer: String,
         operation_key: String,
@@ -5409,6 +5411,10 @@ impl std::fmt::Display for McStoreError {
             McStoreError::ClaimIntentAuthorityFrozen { state } => {
                 write!(f, "claim intent writes are frozen during authority state {state}")
             }
+            McStoreError::ClaimIntentRouteNotManaged => write!(
+                f,
+                "claim intent route has no memories authority; refusing to stage"
+            ),
             McStoreError::ClaimIntentNotFound {
                 producer,
                 operation_key,
@@ -5574,6 +5580,10 @@ enum ClaimIntentTxnOutcome {
         found: String,
     },
     Frozen(String),
+    /// No `mc_authority` row is reachable from the bound daemon route, so this route
+    /// has no proven memories ownership. Distinct from `Frozen` so callers can tell
+    /// "never managed here" from "managed but transitioning".
+    RouteNotManaged,
     NotFound,
     Transition {
         expected: String,
@@ -5814,6 +5824,7 @@ fn claim_intent_mutation_result(
         ClaimIntentTxnOutcome::Frozen(state) => {
             Err(McStoreError::ClaimIntentAuthorityFrozen { state })
         }
+        ClaimIntentTxnOutcome::RouteNotManaged => Err(McStoreError::ClaimIntentRouteNotManaged),
         ClaimIntentTxnOutcome::NotFound => Err(McStoreError::ClaimIntentNotFound {
             producer: command.producer.clone(),
             operation_key: command.operation_key.clone(),
@@ -5931,6 +5942,49 @@ fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
             "unknown authority domain {domain}"
         )))
     }
+}
+
+/// Resolve the memories/notes authority bound to a daemon route, inside an open
+/// transaction.
+///
+/// This is the transaction-scoped twin of `authority_project_state_for_route`.
+/// Callers that hold caller-supplied identity fields must not key `mc_authority`
+/// by those fields: the authority row is keyed by `context_store_uuid`, which the
+/// host mints separately from the format marker's `database_incarnation_id`, so
+/// keying by the marker identity matches no row and silently fails open. Route
+/// bindings are installed server-side by `bind_authority_route`, which makes the
+/// bound route the only trustworthy authority identity on a facade request.
+///
+/// Both legs are index seeks: `mc_authority_route_bindings.route_project_root` is
+/// the primary key, and `mc_authority` is keyed by
+/// `(context_store_uuid, project, domain)`.
+///
+/// Unlike the non-transactional helpers, this does not filter on state; the caller
+/// decides which states it accepts so it can distinguish "not managed" from
+/// "managed but draining".
+fn authority_for_route_tx(
+    tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
+    domain: &str,
+) -> rusqlite::Result<Option<(String, String, u64)>> {
+    tx.query_row(
+        "SELECT authority.project, authority.state, authority.generation
+           FROM mc_authority_route_bindings binding
+           JOIN mc_authority authority
+             ON authority.context_store_uuid = binding.context_store_uuid
+            AND authority.project = binding.project
+          WHERE binding.route_project_root = ?1
+            AND authority.domain = ?2",
+        params![route_project_root, domain],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        },
+    )
+    .optional()
 }
 
 fn set_claim_intent_transition_tx(
@@ -14959,8 +15013,14 @@ impl McStore {
 }
 
 impl McStore {
+    /// Durably stage one claim command before the host mutates `context.db`.
+    ///
+    /// `route_project_root` is the daemon-bound route this request arrived on. The
+    /// memories authority is resolved from that route, not from `binding`, because
+    /// the binding's identity fields are caller-supplied.
     pub fn stage_claim_intent(
         &self,
+        route_project_root: &str,
         binding: &ClaimIntentBinding,
         command: &ClaimCommandIdentity,
         request: &Value,
@@ -15015,25 +15075,32 @@ impl McStore {
             if let Some(state) = transition.filter(|state| state != "accepting") {
                 return Ok(ClaimIntentTxnOutcome::Frozen(state));
             }
-            let authority: Option<(String, i64)> = tx
-                .query_row(
-                    "SELECT state, generation FROM mc_authority
-                      WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
-                    params![binding.database_incarnation_id, binding.authority_project],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((state, generation)) = authority {
-                if state != "MODULE" {
-                    return Ok(ClaimIntentTxnOutcome::Frozen(state));
-                }
-                if generation != authority_generation {
-                    return Ok(ClaimIntentTxnOutcome::BindingMismatch {
-                        field: "authority generation",
-                        expected: generation.to_string(),
-                        found: authority_generation.to_string(),
-                    });
-                }
+            // Resolve the authority from the bound route, never from the caller-supplied
+            // binding. `mc_authority` is keyed by `context_store_uuid`, which the host mints
+            // independently of the format marker's `database_incarnation_id`, so keying this
+            // lookup by the binding identity matches no row and fails open.
+            let authority = authority_for_route_tx(tx, route_project_root, "memories")?;
+            let Some((authority_project, state, generation)) = authority else {
+                return Ok(ClaimIntentTxnOutcome::RouteNotManaged);
+            };
+            if state != "MODULE" {
+                return Ok(ClaimIntentTxnOutcome::Frozen(state));
+            }
+            // The route owns the project vocabulary; a binding naming another project must
+            // not be able to stage against this route's authority.
+            if authority_project != binding.authority_project {
+                return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                    field: "authority project",
+                    expected: authority_project,
+                    found: binding.authority_project.clone(),
+                });
+            }
+            if generation != binding.authority_generation {
+                return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                    field: "authority generation",
+                    expected: generation.to_string(),
+                    found: binding.authority_generation.to_string(),
+                });
             }
             tx.execute(
                 "INSERT INTO mc_claim_intents(

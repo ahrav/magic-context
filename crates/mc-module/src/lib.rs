@@ -10720,10 +10720,10 @@ impl McHandler {
             }
             "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
-            "claim.intent.stage" => self.handle_claim_intent_stage(&request),
-            "claim.intent.inspect" => self.handle_claim_intent_inspect(&request),
-            "claim.intent.ack" => self.handle_claim_intent_ack(&request),
-            "claim.effects.apply" => self.handle_claim_effects_apply(&request),
+            "claim.intent.stage" => self.handle_claim_intent_stage(channel, &request),
+            "claim.intent.inspect" => self.handle_claim_intent_inspect(channel, &request),
+            "claim.intent.ack" => self.handle_claim_intent_ack(channel, &request),
+            "claim.effects.apply" => self.handle_claim_effects_apply(channel, &request),
             "claim.mirror.replace" => self.handle_claim_mirror_replace(channel, &request),
             "claim.mirror.apply" => self.handle_claim_mirror_apply(channel, &request),
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
@@ -10734,7 +10734,31 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_intent_stage(&self, request: &Value) -> PreparedOutcome {
+    /// Resolve the daemon-bound route root for a claim facade request.
+    ///
+    /// Every claim handler must go through this. The claim wire carries
+    /// caller-supplied identity (`binding.authorityProject`,
+    /// `binding.databaseIncarnationId`), so the bound route is the only
+    /// trustworthy authority identity on the request.
+    fn claim_route_root(
+        &self,
+        channel: RouteHandle,
+        request_name: &str,
+    ) -> Result<String, PreparedOutcome> {
+        match self.facade_binding(channel) {
+            Ok(binding) => Ok(binding.project_root.to_string_lossy().into_owned()),
+            Err(_) => Err(PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: format!("{request_name} requires a bound facade route"),
+            }),
+        }
+    }
+
+    fn handle_claim_intent_stage(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        let route_root = match self.claim_route_root(channel, "claim.intent.stage") {
+            Ok(route_root) => route_root,
+            Err(outcome) => return outcome,
+        };
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.stage requires arguments");
         };
@@ -10748,7 +10772,7 @@ impl McHandler {
         let Some(store) = self.store() else {
             return store_unavailable_error();
         };
-        match memory_tool::stage_claim_intent(&store, &parsed, now_ms()) {
+        match memory_tool::stage_claim_intent(&store, &route_root, &parsed, now_ms()) {
             Ok(response) => match serde_json::to_value(response) {
                 Ok(value) => respond(value),
                 Err(error) => PreparedOutcome::Error {
@@ -10763,7 +10787,14 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_intent_inspect(&self, request: &Value) -> PreparedOutcome {
+    fn handle_claim_intent_inspect(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.inspect") {
+            return outcome;
+        }
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.inspect requires arguments");
         };
@@ -10794,7 +10825,10 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_intent_ack(&self, request: &Value) -> PreparedOutcome {
+    fn handle_claim_intent_ack(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.ack") {
+            return outcome;
+        }
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.ack requires arguments");
         };
@@ -10822,7 +10856,10 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_effects_apply(&self, request: &Value) -> PreparedOutcome {
+    fn handle_claim_effects_apply(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.effects.apply") {
+            return outcome;
+        }
         let Some(arguments) = request.get("arguments").and_then(Value::as_object) else {
             return invalid_params_error("claim.effects.apply requires arguments");
         };
