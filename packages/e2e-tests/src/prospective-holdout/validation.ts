@@ -7,6 +7,7 @@ import {
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
 import { HoldoutContractError, exact, record } from "./contract";
 import {
+    STAGING_ENTRY_RE,
     loadClose,
     loadFreeze,
     loadPolicyDocuments,
@@ -343,12 +344,16 @@ export function validateHoldoutRepository(
                 throw new HoldoutContractError(["lifecycle: graduation-artifact-mismatch"]);
             }
         }
-        // The lifecycle append lock and the directory a reclaim renames aside both live
-        // beside the ledger, so a validation run concurrent with a transition, or one after
-        // a worker was killed mid-reclaim, would otherwise read them as unexpected committed
-        // artifacts. They are runtime state under a name no artifact uses.
+        // The lifecycle append lock, the directory a reclaim renames aside, and a staging
+        // directory a killed publisher left behind all live beside the artifacts, so a
+        // validation run concurrent with a transition or a publish, or one after a worker
+        // was killed mid-reclaim or mid-publish, would otherwise read them as unexpected
+        // committed artifacts. They are runtime state under names no artifact uses.
         const actualEntries = readdirSync(epochRoot)
-            .filter((entry) => !/^lifecycle\.jsonl\.lock(?:\.reclaimed-[0-9a-f]+)?$/.test(entry))
+            .filter((entry) =>
+                !/^lifecycle\.jsonl\.lock(?:\.reclaimed-[0-9a-f]+)?$/.test(entry) &&
+                !STAGING_ENTRY_RE.test(entry),
+            )
             .sort();
         if (
             actualEntries.length !== expectedEntries.size ||

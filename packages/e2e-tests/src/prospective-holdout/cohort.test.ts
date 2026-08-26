@@ -24,6 +24,7 @@ const reviewOptions = {
     commitmentKey: key,
     expectedRubricFingerprint: H3,
     freezePublishedAt: "2026-09-01T00:00:00Z",
+    intakeOpensAt: "2026-09-01T00:00:00Z",
     intakeClosesAt: "2026-09-08T00:00:00Z",
 };
 const custodyEvidence = {

@@ -118,8 +118,69 @@ export function validateFreezePolicies(freeze: ReleaseFreezeManifest, policies: 
     }
 }
 
+/**
+ * Name `mkdtempSync` gives a staging directory: the fixed prefix this module passes as
+ * the template plus the six random characters `XXXXXX` becomes. No artifact name begins
+ * with a dot, and the fixed length refuses a longer name that merely starts the same
+ * way, so the pattern cannot match an artifact. Readers of an artifact parent recognise
+ * staging directories by this pattern, so it lives with the code that produces them.
+ */
+export const STAGING_ENTRY_RE = /^\.staging-[A-Za-z0-9]{6}$/;
+
+/**
+ * How long a staging directory must sit untouched before a publish treats it as
+ * orphaned rather than as another publisher's work in progress.
+ *
+ * `mkdtempSync` picks the name at random and nothing records who created it, so there
+ * is no owner to interrogate the way a lock's record names its holder, and no lease is
+ * published either. Age is the only evidence available. A publisher holds a staging
+ * directory across one write, one canonical re-read and one rename, with no wait in
+ * between, so a live one was touched a few filesystem operations ago; a minute is
+ * orders of magnitude beyond that window.
+ */
+const STAGING_ORPHAN_AGE_MS = 60_000;
+
+/**
+ * Removes staging directories in `parent` that no publisher can still be holding.
+ *
+ * A publisher killed between `mkdtempSync` and `renameSync` leaves its staging
+ * directory beside the artifacts. An identical retry publishes through the
+ * accept-existing path without touching that leftover, while the epoch artifact-set
+ * check reads it as an entry no artifact owns, so the retry documented as the recovery
+ * cannot finish it. Sweeping on the way into every publish, including that retry, is
+ * what completes the recovery without an operator deleting files by hand.
+ *
+ * With only age as evidence, the threshold is what protects a live publisher. Removing
+ * a live directory costs that publisher its `renameSync` and nothing else: the rename
+ * is the only step that installs a destination, and it moves a directory whose manifest
+ * has already been written and re-read, so a removal cannot leave partial bytes behind
+ * at the destination.
+ */
+function reclaimOrphanedStaging(parent: string): void {
+    let entries: string[];
+    try {
+        entries = readdirSync(parent);
+    } catch {
+        // An unreadable parent holds no orphan this publish can act on, and the publish
+        // below reports whatever is actually wrong with the path.
+        return;
+    }
+    for (const entry of entries) {
+        if (!STAGING_ENTRY_RE.test(entry)) continue;
+        const path = join(parent, entry);
+        const stat = lstatSync(path, { throwIfNoEntry: false });
+        // A publish only ever creates a directory under this name. Anything else is not
+        // a staging directory this reclaim owns, and a symlink would move the removal
+        // outside the parent.
+        if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) continue;
+        if (Date.now() - stat.mtimeMs <= STAGING_ORPHAN_AGE_MS) continue;
+        rmSync(path, { recursive: true, force: true });
+    }
+}
+
 function writeArtifactAtomically(value: unknown, destination: string): void {
     const bytes = `${JSON.stringify(value, null, 2)}\n`;
+    const parent = dirname(destination);
     const acceptExisting = (): boolean => {
         if (!existsSync(destination)) return false;
         assertArtifactDirectory(destination);
@@ -128,8 +189,11 @@ function writeArtifactAtomically(value: unknown, destination: string): void {
         }
         return true;
     };
+    // The sweep runs ahead of the accept-existing return because a killed publisher's
+    // destination may already hold the artifact, and the identical retry is then the
+    // only run that reaches this parent again.
+    reclaimOrphanedStaging(parent);
     if (acceptExisting()) return;
-    const parent = dirname(destination);
     mkdirSync(parent, { recursive: true });
     const staging = mkdtempSync(join(parent, ".staging-"));
     try {

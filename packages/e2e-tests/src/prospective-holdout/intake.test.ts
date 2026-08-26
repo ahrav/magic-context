@@ -7,6 +7,7 @@ const reviewOptions = {
     commitmentKey: key,
     expectedRubricFingerprint: H3,
     freezePublishedAt: "2026-09-01T00:00:00Z",
+    intakeOpensAt: "2026-09-01T00:00:00Z",
     intakeClosesAt: "2026-09-08T00:00:00Z",
 };
 
@@ -50,5 +51,34 @@ describe("privacy-first prospective intake", () => {
             `intake-${"e".repeat(32)}`,
             sanitizedIntakeFixture().deletionEvidence,
         ).reasonCode).toBe("privacy-rejected");
+    });
+
+    it("rejects a submission before the frozen window opens and admits one at the opening", () => {
+        // A freeze published before its window opens leaves a span in which a report is
+        // prospective relative to publication and still outside the declared window, so
+        // the lower bound the freeze published is what rejects it.
+        expect(() => reviewSanitizedIntake(sanitizedIntakeFixture(), {
+            ...reviewOptions,
+            intakeOpensAt: "2026-09-03T00:00:00Z",
+        })).toThrow(/before-frozen-opening/);
+        // The opening instant is inside the window, and the fixture is still strictly
+        // after publication, so both lower bounds admit this submission.
+        expect(reviewSanitizedIntake(sanitizedIntakeFixture(), {
+            ...reviewOptions,
+            intakeOpensAt: sanitizedIntakeFixture().submittedAt,
+        }).status).toBe("admitted");
+    });
+
+    it("rejects deletion evidence completed before the submission it belongs to", () => {
+        const early = sanitizedIntakeFixture();
+        // Every store stays inside its own deadline, so the deadline test admits this
+        // evidence and the submission bound is the only rule that rejects it.
+        for (const evidence of early.deletionEvidence) evidence.completedAt = "2026-09-01T00:00:00Z";
+        expect(() => reviewSanitizedIntake(early, reviewOptions)).toThrow(/before-submission/);
+        const atSubmission = sanitizedIntakeFixture();
+        for (const evidence of atSubmission.deletionEvidence) {
+            evidence.completedAt = atSubmission.submittedAt;
+        }
+        expect(reviewSanitizedIntake(atSubmission, reviewOptions).status).toBe("admitted");
     });
 });

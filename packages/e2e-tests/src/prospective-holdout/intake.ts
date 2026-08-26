@@ -141,6 +141,9 @@ export function parseSanitizedIntake(raw: unknown): SanitizedIntake {
     for (const key of Object.keys(custody)) {
         if (custody[key] !== false) fail(`intake.custody.${key}: access-forbidden`);
     }
+    // The evidence covers the copies this report itself created, so the instant the
+    // report exists bounds every completion below.
+    const submittedAt = instant(value.submittedAt, "intake.submittedAt");
     const deletionEvidence = parseDeletionEvidence(value.deletionEvidence, "intake.deletionEvidence");
     if (
         deletionEvidence.length !== DELETION_STORES.length ||
@@ -148,15 +151,24 @@ export function parseSanitizedIntake(raw: unknown): SanitizedIntake {
     ) {
         fail("intake.deletionEvidence: exact-stores-required");
     }
+    const submittedAtMs = Date.parse(submittedAt);
     for (const evidence of deletionEvidence) {
         if (Date.parse(evidence.completedAt) > Date.parse(evidence.deadline)) {
             fail("intake.deletionEvidence: overdue");
+        }
+        // A store cannot have been cleared of this report's data before the report
+        // reached the store, so a completion earlier than `submittedAt` attests some
+        // earlier retention run and leaves this report's own copies unaccounted for.
+        // Completion at `submittedAt` is the legal boundary: nothing is retained past
+        // the instant intake records.
+        if (Date.parse(evidence.completedAt) < submittedAtMs) {
+            fail("intake.deletionEvidence: before-submission");
         }
     }
     const parsed: SanitizedIntake = {
         schema: SANITIZED_INTAKE_SCHEMA,
         intakeId: staticId(value.intakeId, "intake.intakeId", INTAKE_ID_RE),
-        submittedAt: instant(value.submittedAt, "intake.submittedAt"),
+        submittedAt,
         provenance: enumeration(value.provenance, INTAKE_PROVENANCE, "intake.provenance"),
         familyId: staticId(value.familyId, "intake.familyId", FAMILY_ID_RE),
         scenario: {
@@ -206,6 +218,7 @@ export function reviewSanitizedIntake(
         commitmentKey: Uint8Array;
         expectedRubricFingerprint: string;
         freezePublishedAt: string;
+        intakeOpensAt: string;
         intakeClosesAt: string;
         forbiddenTokens?: readonly string[];
         forbiddenIdentifiers?: readonly string[];
@@ -219,6 +232,16 @@ export function reviewSanitizedIntake(
     }
     if (Date.parse(intake.submittedAt) <= Date.parse(input.freezePublishedAt)) {
         fail("intake.submittedAt: not-prospective");
+    }
+    // Publication and the declared opening are separate instants, and a freeze may be
+    // published before its window opens, so being after publication does not place a
+    // report inside the window. Both bounds hold together: a case is admitted only when
+    // it is prospective relative to the freeze and inside the window the freeze
+    // committed to. The opening instant itself is inside the window, so equality passes.
+    // The close artifact drops `submittedAt`, so an out-of-window case admitted here is
+    // no longer detectable from the repository.
+    if (Date.parse(intake.submittedAt) < Date.parse(input.intakeOpensAt)) {
+        fail("intake.submittedAt: before-frozen-opening");
     }
     if (Date.parse(intake.submittedAt) > Date.parse(input.intakeClosesAt)) {
         fail("intake.submittedAt: after-frozen-cutoff");
