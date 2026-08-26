@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Harness } from "../src/incident-pool/contract";
+import { detectRustPrerequisites } from "../scripts/check-rust-prerequisites";
 import { validateIncidentHistory } from "../src/incident-pool/history";
 import {
     builtinIncidentCaseRegistry,
@@ -47,6 +48,19 @@ const RUST_GREEN_VARIANT_IDS = [
 
 const mode = process.env.MC_E2E_MODE === "rust" ? "rust" : "ts";
 const harness: Harness = mode === "rust" ? "rust" : "opencode";
+
+// Resolve the direct-host fixture in THIS process, which still has real Cargo
+// state, and publish the path for the environment allowlist to carry into each
+// case child. A child left to `buildDirectHostFixture()` would build against the
+// empty per-case CARGO_HOME the workspace relocation creates and fail offline.
+// The incident-pool CLI does the same for its own schedule; a fixture built by an
+// earlier test phase cannot reach this separate wrapper process any other way.
+if (mode === "rust" && !process.env.MC_E2E_DIRECT_HOST_FIXTURE_BIN) {
+    const prereqs = detectRustPrerequisites({ allowBuild: true });
+    if (prereqs.fixtureBin) {
+        process.env.MC_E2E_DIRECT_HOST_FIXTURE_BIN = prereqs.fixtureBin;
+    }
+}
 const variantIds =
     mode === "rust" ? RUST_GREEN_VARIANT_IDS : OPENCODE_GREEN_VARIANT_IDS;
 const historyFiles = loadHistorySnapshot(INCIDENTS_DIR, "working");

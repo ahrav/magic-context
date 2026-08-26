@@ -1384,7 +1384,18 @@ async function driveDependent(
             return {
                 ...base,
                 ownActionExecuted: true,
-                providerTransitionCorrect: bytes0 !== null && bytes1 === bytes0,
+                providerTransitionCorrect:
+                    bytes0 !== null &&
+                    bytes1 === bytes0 &&
+                    // Each defer wire must carry exactly one injected pair. The
+                    // byte comparison resolves `root.callId`, so a second pair
+                    // beside the frozen one is invisible to it, and Todo 1's
+                    // single-pair check covers only the initial bust.
+                    [t0, t1].every(
+                        (body) =>
+                            body !== null &&
+                            injectedTodoPairs(body).length === 1,
+                    ),
                 durableTransitionCorrect:
                     state0?.syntheticCallId === root.callId &&
                     // Both reads being null satisfies plain equality, so an

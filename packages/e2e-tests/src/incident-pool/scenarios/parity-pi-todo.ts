@@ -400,7 +400,11 @@ export async function drivePiTodoCapture(
                 wireTodosMatch(
                     pairToolResultTodos(missingPriorityPair),
                     MISSING_PRIORITY_TODOS,
-                ),
+                ) &&
+                // Looking the expected pair up by id cannot see another beside
+                // it, and the durable read is identical either way.
+                missingPriorityBust !== null &&
+                injectedTodoPairs(missingPriorityBust).length === 1,
         };
     } finally {
         await h.dispose();
@@ -602,6 +606,9 @@ export async function drivePiTodoDeferReplay(
         );
         const metaT1 = readPiTodoMeta(h, replay.sessionId);
         const pair0 = t0 ? findSyntheticPair(t0, replay.callId) : null;
+        const replayPairCounts = [t0, t1].map((body) =>
+            body ? injectedTodoPairs(body).length : 0,
+        );
         const bytes0 = pair0?.bytes ?? null;
         const bytes1 = t1 ? syntheticPairBytes(t1, replay.callId) : null;
 
@@ -694,7 +701,12 @@ export async function drivePiTodoDeferReplay(
                 bytes0 !== null &&
                 bytes1 === bytes0 &&
                 wireTodosMatch(pairTodoInput(pair0), STATE_X_TODOS) &&
-                wireTodosMatch(pairToolResultTodos(pair0), STATE_X_TODOS),
+                wireTodosMatch(pairToolResultTodos(pair0), STATE_X_TODOS) &&
+                // Both passes must carry exactly one injected pair: the byte and
+                // payload checks resolve the expected call id, so a conflicting
+                // second pair on either wire is invisible to them, and the
+                // durable identity fields cannot see a provider-only duplicate.
+                replayPairCounts.every((count) => count === 1),
             // Comparing the two reads only to each other is satisfied by two
             // nulls, so an implementation that replays the deterministic pair
             // while persisting no anchor at all reads as stable — the catalog's
