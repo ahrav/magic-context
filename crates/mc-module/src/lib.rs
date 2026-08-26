@@ -10826,7 +10826,11 @@ impl McHandler {
         let Some(arguments) = request.get("arguments").and_then(Value::as_object) else {
             return invalid_params_error("claim.effects.apply requires arguments");
         };
-        if arguments.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+        if arguments.get("protocolVersion").and_then(Value::as_u64)
+            != Some(u64::from(
+                mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
+            ))
+        {
             return invalid_params_error("claim.effects.apply protocolVersion is unsupported");
         }
         if arguments
@@ -10883,7 +10887,7 @@ impl McHandler {
             previous = id;
         }
         respond(json!({
-            "protocolVersion": 1,
+            "protocolVersion": mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
             "ackedEffectId": previous,
         }))
     }
@@ -10903,7 +10907,12 @@ impl McHandler {
             return invalid_params_error("claim.mirror.replace requires arguments");
         };
         let parsed = match serde_json::from_value::<ClaimMirrorSnapshotRequest>(arguments) {
-            Ok(parsed) if parsed.protocol_version == 1 => parsed,
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
             Ok(_) => {
                 return invalid_params_error("claim.mirror.replace protocolVersion is unsupported")
             }
@@ -10916,7 +10925,7 @@ impl McHandler {
         };
         match store.replace_claim_mirror_snapshot(&parsed.snapshot, now_ms()) {
             Ok(()) => respond(json!({
-                "protocolVersion": 1,
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
                 "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
                 "databaseIncarnationId": parsed.snapshot.vector.database_incarnation_id,
                 "projectCheckpoints": parsed.snapshot.project_checkpoints,
@@ -10936,7 +10945,12 @@ impl McHandler {
             return invalid_params_error("claim.mirror.apply requires arguments");
         };
         let parsed = match serde_json::from_value::<ClaimMirrorReceiptRequest>(arguments) {
-            Ok(parsed) if parsed.protocol_version == 1 => parsed,
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
             Ok(_) => {
                 return invalid_params_error("claim.mirror.apply protocolVersion is unsupported")
             }
@@ -10949,7 +10963,7 @@ impl McHandler {
         };
         match store.apply_claim_mirror_receipt(&parsed.receipt, now_ms()) {
             Ok(result) => respond(json!({
-                "protocolVersion": 1,
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
                 "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
                 "receiptId": parsed.receipt.receipt_id,
                 "replayed": result.replayed,

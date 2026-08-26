@@ -100,7 +100,11 @@ import {
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { dropSlot } from "./lkg-slot";
-import { drainClaimEffectPrefix, proveClaimOperationDurable } from "./module-state-sync";
+import {
+    drainClaimEffectPrefix,
+    MODULE_CLAIM_EFFECTS_CONSUMER,
+    proveClaimOperationDurable,
+} from "./module-state-sync";
 import { McHostModuleTransport } from "./module-transport";
 import { CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION } from "./module-wire";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
@@ -973,7 +977,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               });
                               await drainClaimEffectPrefix({
                                   db,
-                                  consumer: "rust-module-claims-v1",
+                                  consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
                                   throughReceiptId: proof.receiptId,
                                   deliver: (receipt) =>
                                       claimEffectsApply({
@@ -981,7 +985,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                           projectRoot,
                                           request: {
                                               protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
-                                              consumer: "rust-module-claims-v1",
+                                              consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
                                               receipt,
                                           },
                                       }),

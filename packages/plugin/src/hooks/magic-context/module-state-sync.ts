@@ -2111,6 +2111,10 @@ export async function buildModuleStateSyncPayload(args: {
 }
 
 export const MODULE_CLAIM_MIRROR_CONSUMER = "rust-module-claim-mirror-v1";
+// Outbox consumer identity for the claim-effect lane. Checkpoint bookkeeping and
+// the delivered request body must name the same consumer, or checkpoints advance
+// under one identity while the module is told about another.
+export const MODULE_CLAIM_EFFECTS_CONSUMER = "rust-module-claims-v1";
 const CLAIM_MIRROR_MAX_GROUPS_PER_SYNC = 1_000;
 const CLAIM_MIRROR_CHANGE_KINDS: readonly ClaimMirrorChangeKind[] = [
     "upsert",

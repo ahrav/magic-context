@@ -215,7 +215,10 @@ pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     while !claim.content.is_char_boundary(end) {
         end -= 1;
     }
-    let content = escape_xml_content(&claim.content[..end]);
+    // Indent continuation lines exactly as `render_memory_line` does. Both feed the
+    // same `<project-memory>` block, so an unindented continuation breaks the block's
+    // line structure that m0 byte accounting and the prompt cache depend on.
+    let content = escape_xml_content(&claim.content[..end]).replace('\n', "\n  ");
     format!("{}{source}: {content}", claim.public_claim_id)
 }
 

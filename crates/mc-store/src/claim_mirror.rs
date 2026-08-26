@@ -21,6 +21,11 @@ use crate::McStore;
 pub const CLAIM_MIRROR_VERSION: u32 = 1;
 /// Version of generation vectors accepted by this mirror.
 pub const CLAIM_MIRROR_VECTOR_VERSION: u32 = 1;
+/// Version of the `claim.mirror.*` facade transport. Independent from
+/// `CLAIM_MIRROR_VERSION` so transport evolution cannot silently reinterpret
+/// snapshot or receipt payloads. Mirrors `CLAIM_MIRROR_PROTOCOL_VERSION` on the
+/// host wire; the host decoder compares it for exact equality.
+pub const CLAIM_MIRROR_PROTOCOL_VERSION: u32 = 1;
 
 /// Authoritative lifecycle stored with a committed claim revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
