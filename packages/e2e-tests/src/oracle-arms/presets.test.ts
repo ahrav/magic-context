@@ -121,7 +121,8 @@ describe("oracle arm presets", () => {
         expect(mock.requests()).toHaveLength(0);
     }, 120_000);
 
-    it("refuses a secret-shaped extraEnv key off loopback without an explicit waiver", async () => {        const mock = new MockProvider();
+    it("refuses a secret-shaped extraEnv key off loopback without an explicit waiver", async () => {
+        const mock = new MockProvider();
         mocks.push(mock);
         const { baseURL } = await mock.start();
         const recipe = liveModelSpawnOptions({
@@ -168,6 +169,14 @@ describe("oracle arm presets", () => {
             "GCP_SA_KEY",
             "SSH_KEY",
             "ANTHROPIC_BASE_URL",
+            // Connection strings carry their credentials in the value's
+            // userinfo, so the name alone reads as innocuous.
+            "DATABASE_URL",
+            "POSTGRES_URL",
+            "REDIS_URL",
+            "MONGODB_URI",
+            "SENTRY_DSN",
+            "STORAGE_CONNECTION_STRING",
         ]) {
             expect(isInheritableEnvKey(key)).toBe(false);
         }
