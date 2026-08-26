@@ -170,7 +170,20 @@ export async function runProspectiveCase(input: {
         if (raced === "timeout") {
             controller.abort();
             const cleanupSucceeded = await cleanup();
-            await execution;
+            // A driver that ignores the abort signal, and that cleanup cannot terminate, would
+            // otherwise make this await outlive timeoutMs entirely and hang the suite until the
+            // CI job timeout. Draining is best effort and bounded by a second timeoutMs.
+            let drainTimer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await Promise.race([
+                    execution,
+                    new Promise<"abandoned">((resolve) => {
+                        drainTimer = setTimeout(() => resolve("abandoned"), input.timeoutMs);
+                    }),
+                ]);
+            } finally {
+                if (drainTimer) clearTimeout(drainTimer);
+            }
             return terminal(input.scenario, input.releaseRole, root, expected, coordinate, cleanupSucceeded ? {
                 runHealth: "timeout",
                 productOutcome: "not-evaluated",

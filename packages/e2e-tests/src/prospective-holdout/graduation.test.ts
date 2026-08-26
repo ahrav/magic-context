@@ -15,6 +15,7 @@ import {
     buildGraduationCandidate,
     validateGraduationCompleteness,
     validateGraduationPairBindings,
+    type GraduationCandidate,
 } from "./graduation";
 import { buildProspectiveReport } from "./report";
 import type { ProspectiveCellResult } from "./runner";
@@ -55,6 +56,48 @@ function fixtures() {
         invalidated: false,
     });
     return { close, pair, report };
+}
+
+function coordinatePair(
+    base: PairedCaseFact,
+    seed: number,
+    releaseNOverrides: Partial<ProspectiveCellResult> = {},
+): PairedCaseFact {
+    const releaseN = cellResultFixture("release-n", { seed, ...releaseNOverrides });
+    const releaseNMinus1 = cellResultFixture("release-n-minus-1", { seed });
+    return {
+        ...base,
+        seed,
+        releaseN,
+        releaseNMinus1,
+        // Mirrors the derivation in buildPairedFacts: a coordinate is complete only when both
+        // arms reach `completed`.
+        status: releaseN.runHealth === "completed" && releaseNMinus1.runHealth === "completed"
+            ? "complete"
+            : "incomplete",
+    };
+}
+
+function candidateFor(context: ReturnType<typeof fixtures>, pair: PairedCaseFact): GraduationCandidate {
+    const trustedCloseFingerprint = canonicalFingerprint(context.close);
+    const incidentBytes = { scenario: "synthetic-current-state", expected: "pass" };
+    return buildGraduationCandidate({
+        close: context.close,
+        trustedCloseFingerprint,
+        report: context.report,
+        pair,
+        incidentBytes,
+        semanticRevisionId: "rev-first",
+        secondPrivacyApproval: {
+            approver: "privacy-reviewer",
+            subjectFingerprint: canonicalFingerprint({
+                epochId: context.close.body.epochId,
+                caseId: pair.caseId,
+                closeManifestFingerprint: trustedCloseFingerprint,
+                incidentBytesFingerprint: canonicalFingerprint(incidentBytes),
+            }),
+        },
+    });
 }
 
 describe("prospective incident graduation", () => {
@@ -148,6 +191,46 @@ describe("prospective incident graduation", () => {
         expect(() => validateGraduationPairBindings([
             { ...candidate, disposition: "executable-regression" },
         ], [pair])).toThrow(/pair-binding-mismatch/);
+    });
+
+    it("rejects an accepted-behavior disposition when a later coordinate regresses", () => {
+        const context = fixtures();
+        const candidate = candidateFor(context, context.pair);
+        expect(candidate.disposition).toBe("executable-accepted-behavior");
+        const failing = coordinatePair(context.pair, 11, {
+            productOutcome: "fail",
+            failedChecks: ["check-current"],
+        });
+        expect(() => validateGraduationPairBindings([candidate], [context.pair, failing])).toThrow(
+            /pair-binding-mismatch/,
+        );
+        const timedOut = coordinatePair(context.pair, 13, {
+            runHealth: "timeout",
+            productOutcome: "not-evaluated",
+            reasonCode: "deadline-exceeded",
+        });
+        expect(() => validateGraduationPairBindings([candidate], [context.pair, timedOut])).toThrow(
+            /pair-binding-mismatch/,
+        );
+    });
+
+    it("accepts an accepted-behavior disposition when every coordinate passes", () => {
+        const context = fixtures();
+        const candidate = candidateFor(context, context.pair);
+        expect(() => validateGraduationPairBindings(
+            [candidate],
+            [context.pair, coordinatePair(context.pair, 11)],
+        )).not.toThrow();
+    });
+
+    it("rejects a coordinate whose implementation fingerprint drifts from the candidate", () => {
+        const context = fixtures();
+        const candidate = candidateFor(context, context.pair);
+        const drifted: PairedCaseFact = { ...coordinatePair(context.pair, 11), implementationFingerprint: H3 };
+        expect(candidate.implementationFingerprint).not.toBe(drifted.implementationFingerprint);
+        expect(() => validateGraduationPairBindings([candidate], [context.pair, drifted])).toThrow(
+            /pair-binding-mismatch/,
+        );
     });
 
     it("blocks untrusted, incomplete, or privacy-unsafe graduation", () => {

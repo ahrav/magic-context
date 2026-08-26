@@ -279,6 +279,9 @@ jobs:
   prospective-release-holdout:
     name: Prospective release holdout contracts
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
         with:

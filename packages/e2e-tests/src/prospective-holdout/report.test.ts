@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import type { PairedCaseFact } from "./comparison";
+import type { PairedCaseFact, PairStatus } from "./comparison";
 import {
     buildProspectiveReport,
     parseProspectiveReport,
@@ -33,13 +33,41 @@ function pair(): PairedCaseFact {
     };
 }
 
-function adapters(input: { sufficient?: boolean; failures?: string[]; evidence?: boolean; allowed?: boolean } = {}) {
+function coordinatePair(seed: number, status: PairStatus): PairedCaseFact {
+    // A timed-out release-n arm is what makes a coordinate incomplete. Both arms stay clear of
+    // `fail` so the family contributes no miss and only the counts differ across coordinates.
+    const releaseN = status === "incomplete"
+        ? cellResultFixture("release-n", {
+            seed,
+            runHealth: "timeout",
+            productOutcome: "not-evaluated",
+            reasonCode: "deadline-exceeded",
+        })
+        : cellResultFixture("release-n", { seed });
+    return {
+        ...pair(),
+        seed,
+        releaseN,
+        releaseNMinus1: cellResultFixture("release-n-minus-1", { seed }),
+        status,
+    };
+}
+
+function adapters(
+    input: {
+        sufficient?: boolean;
+        failures?: string[];
+        evidence?: boolean;
+        allowed?: boolean;
+        completeFamilyCount?: number;
+    } = {},
+) {
     const estimator: FamilyEstimatorAdapter = {
         owner: "magic-context-x4l.14",
         analyze: () => ({
             direction: "regression",
             evidenceSufficient: input.sufficient ?? true,
-            completeFamilyCount: 1,
+            completeFamilyCount: input.completeFamilyCount ?? 1,
             resultFingerprint: H1,
         }),
     };
@@ -55,14 +83,18 @@ function adapters(input: { sufficient?: boolean; failures?: string[]; evidence?:
     return { estimator, scorecard };
 }
 
-function report(overrides: Parameters<typeof adapters>[0] = {}, invalidated = false) {
+function report(
+    overrides: Parameters<typeof adapters>[0] = {},
+    invalidated = false,
+    pairs: readonly PairedCaseFact[] = [pair()],
+) {
     return buildProspectiveReport({
         epochId: "epoch-test-release",
         freezeManifestFingerprint: H1,
         closeManifestFingerprint: H2,
         analysisPolicyFingerprint: H3,
         scorecardPolicyFingerprint: H3,
-        pairs: [pair()],
+        pairs,
         ...adapters(overrides),
         invalidated,
     });
@@ -101,5 +133,32 @@ describe("prospective report", () => {
         expect(promotable.body.decision).toBe("promote");
         expect(releasePromotionAllowed(promotable, false)).toBe(false);
         expect(releasePromotionAllowed(promotable, true)).toBe(true);
+    });
+
+    it("names one incomplete case once while counting every coordinate", () => {
+        const pairs = [
+            coordinatePair(7, "complete"),
+            coordinatePair(11, "incomplete"),
+            coordinatePair(13, "incomplete"),
+        ];
+        const caseId = pairs[0]!.caseId;
+        const built = report({ completeFamilyCount: 0 }, false, pairs);
+        expect(built.body.incompleteCaseIds).toEqual([caseId]);
+        expect(built.body.prospective.pairCount).toBe(pairs.length);
+        expect(built.body.prospective.completePairCount).toBe(1);
+        expect(parseProspectiveReport(structuredClone(built))).toEqual(built);
+    });
+
+    it("rejects a cleared incomplete case list while a coordinate stays incomplete", () => {
+        const built = report({ completeFamilyCount: 0 }, false, [
+            coordinatePair(7, "complete"),
+            coordinatePair(11, "incomplete"),
+        ]);
+        const cleared = structuredClone(built);
+        cleared.body.incompleteCaseIds = [];
+        cleared.reportFingerprint = canonicalFingerprint(cleared.body);
+        expect(() => parseProspectiveReport(cleared)).toThrow(
+            /report\.body\.prospective: incomplete-count-mismatch/,
+        );
     });
 });

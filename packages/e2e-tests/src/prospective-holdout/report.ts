@@ -75,7 +75,11 @@ function summarizePairs(pairs: readonly PairedCaseFact[]): {
             `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
         )
     );
-    const incompleteCaseIds = sortedPairs.filter((pair) => pair.status === "incomplete").map((pair) => pair.caseId);
+    // A pair is per execution coordinate, so one case contributes several. Case ids are
+    // deduplicated because the report parser rejects a repeated id, while the pair counts
+    // stay per coordinate.
+    const incompletePairs = sortedPairs.filter((pair) => pair.status === "incomplete");
+    const incompleteCaseIds = [...new Set(incompletePairs.map((pair) => pair.caseId))];
     const families = [...new Set(sortedPairs.map((pair) => pair.familyId))];
     return {
         pairedFactsFingerprint: canonicalFingerprint(sortedPairs),
@@ -87,7 +91,7 @@ function summarizePairs(pairs: readonly PairedCaseFact[]): {
             .filter((pair) => pair.releaseN.productOutcome === "fail" || pair.releaseNMinus1.productOutcome === "fail")
             .map((pair) => pair.familyId))].sort(),
         pairCount: sortedPairs.length,
-        completePairCount: sortedPairs.length - incompleteCaseIds.length,
+        completePairCount: sortedPairs.length - incompletePairs.length,
     };
 }
 
@@ -244,7 +248,10 @@ export function parseProspectiveReport(raw: unknown): ProspectiveReport {
     if (body.scorecardPromotionAllowed && (!body.mandatoryEvidenceComplete || body.hardGateFailures.length > 0)) {
         fail("report.body.scorecardPromotionAllowed: cross-field-invalid");
     }
-    if (body.prospective.completePairCount !== body.prospective.pairCount - body.incompleteCaseIds.length) {
+    // Case ids are deduplicated while the counts are per coordinate, so the two cannot be
+    // related by subtraction. What must hold is that some case is named incomplete exactly
+    // when some coordinate is incomplete.
+    if ((body.incompleteCaseIds.length > 0) !== (body.prospective.completePairCount < body.prospective.pairCount)) {
         fail("report.body.prospective: incomplete-count-mismatch");
     }
     const expectedLimitations = [

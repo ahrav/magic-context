@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import {
     CASE_ID_RE,
@@ -218,9 +218,15 @@ function intakeId(disposition: CohortDisposition): string {
     return disposition.status === "admitted" ? disposition.intake.intakeId : disposition.intakeId;
 }
 
-function publishFileOnce(path: string, bytes: string): void {
+function publishFileOnce(storeRoot: string, path: string, bytes: string): void {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const staging = `${path}.staging-${randomBytes(8).toString("hex")}`;
+    // Staging lives in a store-root directory the readers never scan. A hard kill between
+    // the write and the cleanup leaves the staging file behind, and the readers reject any
+    // name that is not a decision record, so a leftover inside `decisions` or `late` would
+    // wedge every later read and close until an operator removed it by hand.
+    const stagingDirectory = join(storeRoot, ".staging");
+    mkdirSync(stagingDirectory, { recursive: true, mode: 0o700 });
+    const staging = join(stagingDirectory, `${basename(path)}.${randomBytes(8).toString("hex")}`);
     try {
         writeFileSync(staging, bytes, { flag: "wx", mode: 0o600 });
         linkSync(staging, path);
@@ -284,7 +290,7 @@ export class ProspectiveIntakeStore {
             const decisionPath = join(this.root, "decisions", `${id}.json`);
             if (existsSync(decisionPath)) {
                 try {
-                    publishFileOnce(decisionPath, dispositionBytes);
+                    publishFileOnce(this.root, decisionPath, dispositionBytes);
                 } catch {
                     throw new HoldoutContractError(["cohort-store: disposition-conflict"]);
                 }
@@ -297,7 +303,7 @@ export class ProspectiveIntakeStore {
                 ? { intakeId: id, dispositionFingerprint: canonicalFingerprint(disposition) }
                 : disposition;
             try {
-                publishFileOnce(path, `${JSON.stringify(value, null, 2)}\n`);
+                publishFileOnce(this.root, path, `${JSON.stringify(value, null, 2)}\n`);
             } catch {
                 throw new HoldoutContractError(["cohort-store: disposition-conflict"]);
             }
@@ -310,7 +316,7 @@ export class ProspectiveIntakeStore {
             const marker = join(this.root, "closed.json");
             const bytes = `${JSON.stringify({ epochId, closedAt }, null, 2)}\n`;
             try {
-                publishFileOnce(marker, bytes);
+                publishFileOnce(this.root, marker, bytes);
             } catch {
                 throw new HoldoutContractError(["cohort-store: already-closed"]);
             }

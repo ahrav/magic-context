@@ -169,17 +169,24 @@ export function validateGraduationPairBindings(
     pairs: readonly PairedCaseFact[],
 ): void {
     for (const candidate of candidates) {
-        const pair = pairs.find((entry) => entry.caseId === candidate.source.case_id);
-        const bothPass = pair?.status === "complete" &&
+        // A case yields one pair per execution coordinate. Selecting a single pair would let a
+        // regression in any other coordinate pass, so every pair for the case has to agree
+        // with the candidate, and its disposition is derived from all of them together.
+        const casePairs = pairs.filter((entry) => entry.caseId === candidate.source.case_id);
+        const allPass = casePairs.every((pair) =>
+            pair.status === "complete" &&
             pair.releaseN.productOutcome === "pass" &&
-            pair.releaseNMinus1.productOutcome === "pass";
-        const expectedDisposition = bothPass
+            pair.releaseNMinus1.productOutcome === "pass"
+        );
+        const expectedDisposition = allPass
             ? "executable-accepted-behavior"
             : "executable-regression";
         if (
-            !pair ||
-            pair.familyId !== candidate.familyId ||
-            pair.implementationFingerprint !== candidate.implementationFingerprint ||
+            casePairs.length === 0 ||
+            casePairs.some((pair) =>
+                pair.familyId !== candidate.familyId ||
+                pair.implementationFingerprint !== candidate.implementationFingerprint
+            ) ||
             candidate.disposition !== expectedDisposition
         ) {
             throw new HoldoutContractError(["graduation: pair-binding-mismatch"]);
