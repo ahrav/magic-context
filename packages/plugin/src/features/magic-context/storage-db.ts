@@ -39,6 +39,7 @@ import {
     createDirectFormatMarkerSchema,
     type FormatFamilyClassification,
     inspectDatabaseForClassification,
+    listDatabaseFamilyArtifacts,
     stampDirectFormatMarker,
 } from "./storage-format-epoch";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
@@ -661,8 +662,15 @@ function bootstrapUnderWriteLock(
     expected: ReturnType<typeof computeExpectedDirectFormat>,
 ): FormatFamilyClassification {
     db.transaction(() => {
+        // The lock holder's own rollback journal is not a family artifact:
+        // BEGIN IMMEDIATE creates `-journal` on this very connection, and
+        // counting it would misread a pristine family as orphaned.
+        const inspection = inspectDatabaseForClassification(db, dbPath);
         const recheck = classifyDatabaseFormatFamily(
-            inspectDatabaseForClassification(db, dbPath),
+            {
+                ...inspection,
+                artifacts: inspection.artifacts.filter((artifact) => artifact !== "journal"),
+            },
             expected,
         );
         if (recheck.family !== "pristine") return;
@@ -713,6 +721,27 @@ function recordFormatRefusal(
  * verdict. There is no migration lane: old databases are refused, never
  * migrated.
  */
+// Inspect family artifacts before opening SQLite: open-time recovery can
+// consume an orphan WAL for an empty main file.
+function refusePreOpenFamily(dbPath: string): DatabaseFormatRefusal | null {
+    const artifacts = listDatabaseFamilyArtifacts(dbPath);
+    if (artifacts.includes("reset-marker")) {
+        return {
+            family: "reset-pending",
+            reasons: [`a reset marker ${dbPath}.mc-reset is pending for this database family`],
+        };
+    }
+    if (existsSync(dbPath) && statSync(dbPath).size > 0) return null;
+    const orphans = artifacts.filter((artifact) => artifact !== "journal");
+    if (orphans.length === 0) return null;
+    return {
+        family: "orphan-artifacts",
+        reasons: orphans.map(
+            (artifact) => `orphan ${artifact} artifact without a current main database`,
+        ),
+    };
+}
+
 function openDirectDatabase(
     dbPath: string,
     dbDir: string,
@@ -720,6 +749,14 @@ function openDirectDatabase(
     latestSupportedVersion: number,
 ): Database | null {
     ensureSafeSqliteRuntime();
+    const preOpenRefusal = refusePreOpenFamily(dbPath);
+    if (preOpenRefusal) {
+        lastFormatRefusal = preOpenRefusal;
+        log(
+            `[magic-context] storage fatal: refusing to open ${dbPath}; the database family is not usable (${preOpenRefusal.family}): ${preOpenRefusal.reasons.join("; ")}. No data was changed. To abandon this database family and start fresh, run 'npx @cortexkit/magic-context@latest doctor reset-db'.`,
+        );
+        return null;
+    }
     ensureSecureStorageDir(dbDir);
 
     const db = new Database(dbPath);

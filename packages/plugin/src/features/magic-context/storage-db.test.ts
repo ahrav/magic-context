@@ -1,56 +1,55 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import type { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
     type chmodSync,
     existsSync,
     mkdirSync,
-    mkdtempSync,
     readFileSync,
     rmSync,
     statSync,
-    utimesSync,
     writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
 import { Database, evaluateSqliteRuntimeGate } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     __resetStoragePrivatePermissionEnforcementForTests,
     setStoragePrivatePermissionEnforcement,
 } from "../../shared/storage-permissions";
+import { DIRECT_FORMAT_FENCE_MIGRATION_VERSION, FORK_MIGRATION_VERSION_FLOOR } from "./migrations";
 import {
-    __resetRpcDiscoveryFsForTests,
     __resetSchemaFenceStateForTests,
     __resetStoragePermissionFsForTests,
-    __setRpcDiscoveryFsForTests,
     __setStoragePermissionFsForTests,
     assertSqliteConnectionContract,
     closeDatabase,
-    enforceSchemaFence,
-    FORK_MIGRATION_VERSION_FLOOR,
-    formatInconclusiveOpenCodeMigrationWarning,
-    getLiveMigrationBlockingProcesses,
-    getMigrationOnOpenRefusal,
+    getFormatRefusal,
     getPersistedSchemaVersion,
     getSchemaFenceRejection,
-    inspectRpcServerDiscovery,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
     probeSqliteRuntimeGate,
     resolveDatabasePath,
 } from "./storage-db";
+import {
+    buildDirectFormatMarker,
+    computeMarkerDigest,
+    MC_APPLICATION_ID,
+    readDirectFormatMarker,
+} from "./storage-format-epoch";
 import { clearSession } from "./storage-meta-session";
+import { createDirectTestDatabase } from "./test-database";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = join(tmpdir(), `${prefix}${Math.random().toString(36).slice(2)}`);
+    mkdirSync(dir, { recursive: true });
     tempDirs.push(dir);
     return dir;
 }
@@ -62,18 +61,7 @@ function useTempDataHome(prefix: string): string {
 }
 
 function resolveDbPath(dataHome: string): string {
-    // Plugin v0.16+ — shared cortexkit/magic-context path. See data-path.ts.
     return join(dataHome, "cortexkit", "magic-context", "context.db");
-}
-
-function seedPendingMigration(dataHome: string): string {
-    openDatabase();
-    closeDatabase();
-    const dbPath = resolveDbPath(dataHome);
-    const db = new Database(dbPath);
-    db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_SUPPORTED_VERSION);
-    closeQuietly(db);
-    return dbPath;
 }
 
 function readPersistedVersion(dbPath: string): number {
@@ -85,26 +73,23 @@ function readPersistedVersion(dbPath: string): number {
     }
 }
 
-function setLinuxIdentityProbe(processStartTicks = 10_000): void {
-    __setRpcIdentityTestHooks({
-        platform: "linux",
-        nowMs: () => 2_000_000,
-        readFileSync: ((path: string | URL) => {
-            if (String(path) === `/proc/${process.pid}/stat`) {
-                return `${process.pid} (opencode) S ${Array.from({ length: 18 }, () => "0").join(" ")} ${processStartTicks}`;
-            }
-            if (String(path) === "/proc/uptime") return "1000.0 0.0";
-            throw new Error(`unexpected identity read: ${String(path)}`);
-        }) as typeof readFileSync,
-    });
+function fileDigest(path: string): string {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function seedDirectDatabase(dir: string): string {
+    const dbPath = join(dir, "context.db");
+    const { db } = createDirectTestDatabase({ path: dbPath });
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.exec("PRAGMA journal_mode=DELETE");
+    db.close();
+    return dbPath;
 }
 
 afterEach(() => {
     closeDatabase();
-    __resetRpcDiscoveryFsForTests();
     __resetSchemaFenceStateForTests();
     __resetStoragePermissionFsForTests();
-    __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
     process.env.XDG_DATA_HOME = originalXdgDataHome;
 
@@ -131,108 +116,53 @@ describe("upstream migration version lane", () => {
     it("reports zero for an empty migrations table", () => {
         const db = new Database(":memory:");
         try {
-            db.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
+            db.exec(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+            );
             expect(getPersistedSchemaVersion(db)).toBe(0);
         } finally {
             closeQuietly(db);
         }
     });
 
-    it("is equivalent to the historical MAX for stock-only rows", () => {
+    it("counts the direct-format fence row but ignores the reserved downstream floor and above", () => {
         const db = new Database(":memory:");
         try {
-            db.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
-            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(1);
-            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(50);
-            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
-                LATEST_SUPPORTED_VERSION,
+            db.exec(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL)",
             );
-
-            const historicalMax = (
-                db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as {
-                    version: number;
-                }
-            ).version;
-            expect(getPersistedSchemaVersion(db)).toBe(historicalMax);
+            const insert = db.prepare(
+                "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, 0)",
+            );
+            insert.run(DIRECT_FORMAT_FENCE_MIGRATION_VERSION, "fence");
+            insert.run(FORK_MIGRATION_VERSION_FLOOR, "fork floor");
+            insert.run(FORK_MIGRATION_VERSION_FLOOR + 5, "fork later");
+            expect(getPersistedSchemaVersion(db)).toBe(DIRECT_FORMAT_FENCE_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
-        }
-    });
-
-    it("counts 9999 but ignores the reserved downstream floor and above", () => {
-        const db = new Database(":memory:");
-        try {
-            db.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
-            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
-                FORK_MIGRATION_VERSION_FLOOR - 1,
-            );
-            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
-                FORK_MIGRATION_VERSION_FLOOR,
-            );
-            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
-                FORK_MIGRATION_VERSION_FLOOR + 1,
-            );
-
-            expect(getPersistedSchemaVersion(db)).toBe(FORK_MIGRATION_VERSION_FLOOR - 1);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    it("keeps future upstream rows fail-closed while allowing fork-only rows", () => {
-        const future = new Database(":memory:");
-        const forkOnly = new Database(":memory:");
-        try {
-            for (const db of [future, forkOnly]) {
-                db.exec(
-                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER)",
-                );
-            }
-            future
-                .prepare("INSERT INTO schema_migrations(version) VALUES (?)")
-                .run(LATEST_SUPPORTED_VERSION + 1);
-            forkOnly
-                .prepare("INSERT INTO schema_migrations(version) VALUES (?)")
-                .run(FORK_MIGRATION_VERSION_FLOOR);
-
-            expect(enforceSchemaFence(future, ":future:", LATEST_SUPPORTED_VERSION)).toBe(false);
-            expect(getSchemaFenceRejection()).toEqual({
-                persistedVersion: LATEST_SUPPORTED_VERSION + 1,
-                supportedVersion: LATEST_SUPPORTED_VERSION,
-            });
-            expect(enforceSchemaFence(forkOnly, ":fork:", LATEST_SUPPORTED_VERSION)).toBe(true);
-            expect(getSchemaFenceRejection()).toBeNull();
-        } finally {
-            closeQuietly(future);
-            closeQuietly(forkOnly);
         }
     });
 });
 
-describe("storage-db", () => {
-    describe("#given openDatabase", () => {
-        it("#when a reset marker is pending #then refuses without opening or changing the family", () => {
-            const dir = makeTempDir("storage-db-reset-pending-");
-            const dbPath = join(dir, "context.db");
-            writeFileSync(dbPath, "database bytes");
-            writeFileSync(`${dbPath}.mc-reset`, "pending marker");
-            const beforeMain = readFileSync(dbPath);
-            const beforeMarker = readFileSync(`${dbPath}.mc-reset`);
+describe("storage-db direct format", () => {
+    describe("#given openDatabase on a pristine family", () => {
+        it("#when called first time #then bootstraps the exact current direct format", () => {
+            const dataHome = useTempDataHome("storage-db-bootstrap-");
 
-            expect(() => openDatabase(dbPath)).toThrow(/reset marker .* is pending/);
-            expect(readFileSync(dbPath)).toEqual(beforeMain);
-            expect(readFileSync(`${dbPath}.mc-reset`)).toEqual(beforeMarker);
-        });
+            const db = openDatabase();
 
-        it("#when only an orphan sidecar exists #then refuses pristine bootstrap", () => {
-            const dir = makeTempDir("storage-db-orphan-sidecar-");
-            const dbPath = join(dir, "context.db");
-            writeFileSync(`${dbPath}-wal`, "orphan wal");
-            const before = readFileSync(`${dbPath}-wal`);
-
-            expect(() => openDatabase(dbPath)).toThrow(/orphan family artifacts: wal/);
-            expect(existsSync(dbPath)).toBe(false);
-            expect(readFileSync(`${dbPath}-wal`)).toEqual(before);
+            const dbPath = resolveDbPath(dataHome);
+            expect(existsSync(dbPath)).toBe(true);
+            expect(isDatabasePersisted(db)).toBe(true);
+            const marker = readDirectFormatMarker(db);
+            expect(marker.status).toBe("present");
+            const applicationId = Object.values(
+                db.prepare("PRAGMA application_id").get() as Record<string, unknown>,
+            )[0];
+            expect(Number(applicationId)).toBe(MC_APPLICATION_ID);
+            expect(getPersistedSchemaVersion(db)).toBe(DIRECT_FORMAT_FENCE_MIGRATION_VERSION);
+            expect(getFormatRefusal()).toBeNull();
+            expect(getSchemaFenceRejection()).toBeNull();
         });
 
         it("#when called first time #then creates DB with WAL mode and busy_timeout", () => {
@@ -245,9 +175,166 @@ describe("storage-db", () => {
             expect(wal.journal_mode.toLowerCase()).toBe("wal");
             expect(Object.values(timeout)[0]).toBe(5000);
             expect(existsSync(resolveDbPath(dataHome))).toBe(true);
-            expect(isDatabasePersisted(db)).toBe(true);
         });
 
+        it("#when reopened #then the database incarnation is stable", () => {
+            useTempDataHome("storage-db-incarnation-");
+
+            const first = openDatabase();
+            const firstMarker = readDirectFormatMarker(first as Database);
+            if (firstMarker.status !== "present") throw new Error("marker missing after open");
+            closeDatabase();
+
+            const second = openDatabase();
+            const secondMarker = readDirectFormatMarker(second as Database);
+            if (secondMarker.status !== "present") throw new Error("marker missing after reopen");
+            expect(secondMarker.marker.databaseIncarnationId).toBe(
+                firstMarker.marker.databaseIncarnationId,
+            );
+        });
+
+        it("#when two processes bootstrap one pristine family #then both converge on one incarnation (AE1)", async () => {
+            const dir = makeTempDir("storage-db-concurrent-bootstrap-");
+            const dbPath = join(dir, "context.db");
+            const workerPath = join(dir, "bootstrap-worker.ts");
+            const storageDbModule = join(import.meta.dir, "storage-db.ts");
+            writeFileSync(
+                workerPath,
+                [
+                    `const { openDatabase } = await import(${JSON.stringify(storageDbModule)});`,
+                    `const db = openDatabase(${JSON.stringify(dbPath)});`,
+                    `if (!db) { console.error("refused"); process.exit(2); }`,
+                    `const row = db.prepare("SELECT database_incarnation_id AS id FROM mc_format_marker").get();`,
+                    `console.log(row.id);`,
+                    `process.exit(0);`,
+                ].join("\n"),
+            );
+            const spawnWorker = () =>
+                Bun.spawn(["bun", workerPath], {
+                    stdout: "pipe",
+                    stderr: "pipe",
+                    env: { ...process.env, NODE_ENV: "test" },
+                });
+            const workers = [spawnWorker(), spawnWorker()];
+            const outputs = await Promise.all(
+                workers.map(async (proc) => ({
+                    exitCode: await proc.exited,
+                    stdout: (await new Response(proc.stdout).text()).trim(),
+                    stderr: (await new Response(proc.stderr).text()).trim(),
+                })),
+            );
+            for (const output of outputs) {
+                expect(output.exitCode, output.stderr).toBe(0);
+                expect(output.stdout).toMatch(/^[0-9a-f]{32}$/);
+            }
+            expect(outputs[0].stdout).toBe(outputs[1].stdout);
+        });
+    });
+
+    describe("#given openDatabase on an unsupported family", () => {
+        it("#when a reset marker is pending #then refuses without changing the family", () => {
+            const dir = makeTempDir("storage-db-reset-pending-");
+            const dbPath = seedDirectDatabase(dir);
+            writeFileSync(`${dbPath}.mc-reset`, "pending marker");
+            const beforeMain = fileDigest(dbPath);
+
+            expect(openDatabase(dbPath)).toBeNull();
+            const refusal = getFormatRefusal();
+            expect(refusal).not.toBeNull();
+            expect(refusal?.reasons.join("; ")).toContain("reset marker");
+            expect(fileDigest(dbPath)).toBe(beforeMain);
+        });
+
+        it("#when only an orphan sidecar exists #then refuses pristine bootstrap unchanged", () => {
+            const dir = makeTempDir("storage-db-orphan-sidecar-");
+            const dbPath = join(dir, "context.db");
+            writeFileSync(`${dbPath}-wal`, "orphan wal");
+            const before = readFileSync(`${dbPath}-wal`);
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getFormatRefusal()?.family).toBe("orphan-artifacts");
+            expect(readFileSync(`${dbPath}-wal`)).toEqual(before);
+        });
+
+        it("#when the database is a legacy migration-lane family #then refuses it unchanged", () => {
+            const dir = makeTempDir("storage-db-legacy-refusal-");
+            const dbPath = join(dir, "context.db");
+            const legacy = new Database(dbPath);
+            legacy.exec(`
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL);
+                CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT NOT NULL);
+                INSERT INTO schema_migrations (version, description, applied_at) VALUES (86, 'legacy head', 0);
+            `);
+            legacy.close();
+            const before = fileDigest(dbPath);
+
+            expect(openDatabase(dbPath)).toBeNull();
+            const refusal = getFormatRefusal();
+            expect(refusal?.family).toBe("unsupported");
+            expect(refusal?.reasons.join("; ")).toContain("direct-format marker is absent");
+            expect(getSchemaFenceRejection()).toBeNull();
+            expect(fileDigest(dbPath)).toBe(before);
+            expect(existsSync(`${dbPath}-wal`)).toBe(false);
+        });
+
+        it("#when the database carries a newer format fence #then reports a schema-fence rejection", () => {
+            const dir = makeTempDir("storage-db-newer-format-");
+            const dbPath = join(dir, "context.db");
+            const future = new Database(dbPath);
+            const futureMarker = buildDirectFormatMarker({
+                componentManifestDigest: "a".repeat(64),
+                createdAtMs: 1,
+                formatEpoch: 2,
+            });
+            future.exec(`
+                CREATE TABLE mc_format_marker (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    format_epoch INTEGER NOT NULL,
+                    database_incarnation_id TEXT NOT NULL,
+                    component_manifest_digest TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    marker_digest TEXT NOT NULL
+                );
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL);
+            `);
+            future
+                .prepare(
+                    "INSERT INTO mc_format_marker (id, format_epoch, database_incarnation_id, component_manifest_digest, created_at_ms, marker_digest) VALUES (1, ?, ?, ?, ?, ?)",
+                )
+                .run(
+                    futureMarker.formatEpoch,
+                    futureMarker.databaseIncarnationId,
+                    futureMarker.componentManifestDigest,
+                    futureMarker.createdAtMs,
+                    computeMarkerDigest(futureMarker),
+                );
+            future
+                .prepare(
+                    "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, 'future fence', 0)",
+                )
+                .run(LATEST_SUPPORTED_VERSION + 1);
+            future.close();
+            const before = fileDigest(dbPath);
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getSchemaFenceRejection()).toEqual({
+                persistedVersion: LATEST_SUPPORTED_VERSION + 1,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+            });
+            expect(getFormatRefusal()).toBeNull();
+            expect(fileDigest(dbPath)).toBe(before);
+        });
+
+        it("#when the file is not a database #then throws so callers fail closed", () => {
+            const dir = makeTempDir("storage-db-not-a-db-");
+            const dbPath = join(dir, "context.db");
+            writeFileSync(dbPath, "not a database");
+
+            expect(() => openDatabase(dbPath)).toThrow(/storage unavailable/i);
+        });
+    });
+
+    describe("#given openDatabase housekeeping", () => {
         it("#when called first time #then restricts storage dir to 0o700 and DB files to 0o600", () => {
             // POSIX-only: chmod is a no-op on Windows (modes are not honored).
             if (process.platform === "win32") return;
@@ -257,7 +344,6 @@ describe("storage-db", () => {
 
             const dbPath = resolveDbPath(dataHome);
             const dbDir = dirname(dbPath);
-            // Low 9 permission bits only (mask off file-type/setuid bits).
             expect(statSync(dbDir).mode & 0o777).toBe(0o700);
             expect(statSync(dbPath).mode & 0o777).toBe(0o600);
             for (const suffix of ["-wal", "-shm"]) {
@@ -350,8 +436,16 @@ describe("storage-db", () => {
                     "source_contents",
                     "compression_depth",
                     "session_meta",
+                    "claims",
+                    "claim_revisions",
+                    "claim_public_ids",
+                    "claim_operation_receipts",
+                    "mc_format_marker",
                 ]),
             );
+            expect(tableNames).not.toContain("memories");
+            expect(tableNames).not.toContain("memory_embeddings");
+            expect(tableNames).not.toContain("legacy_memory_claims");
         });
 
         it("#when clearSession runs #then every session-scoped table is emptied", () => {
@@ -456,565 +550,13 @@ describe("storage-db", () => {
             expect(db1).toBe(db2);
         });
 
-        it("#when the RPC port tree is empty #then allows a pending migration", () => {
-            const dataHome = useTempDataHome("storage-db-empty-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            mkdirSync(join(dirname(dbPath), "rpc"), { recursive: true });
-
-            expect(openDatabase()).not.toBeNull();
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
-            expect(getMigrationOnOpenRefusal()).toBeNull();
-        });
-
-        for (const scenario of [
-            {
-                name: "a confirmed live OpenCode server",
-                pid: () => process.pid,
-                configure: () => setLinuxIdentityProbe(),
-                blocksMigration: true,
-            },
-            {
-                name: "a dead OpenCode server PID",
-                pid: () => 2_147_483_647,
-                configure: () => undefined,
-                blocksMigration: false,
-            },
-            {
-                name: "an OpenCode server probe that sandbox policy prevents from running",
-                pid: () => process.pid,
-                configure: () => {
-                    const permissionDenied = new Error(
-                        "sandbox denied process probe",
-                    ) as NodeJS.ErrnoException;
-                    permissionDenied.code = "EPERM";
-                    __setRpcIdentityTestHooks({
-                        platform: "linux",
-                        processKill: (() => {
-                            throw permissionDenied;
-                        }) as typeof process.kill,
-                        readFileSync: (() => {
-                            throw permissionDenied;
-                        }) as typeof readFileSync,
-                    });
-                },
-                blocksMigration: false,
-            },
-        ]) {
-            it(`#when RPC discovery finds ${scenario.name} #then only the confirmed server blocks migration`, () => {
-                const dataHome = useTempDataHome("storage-db-rpc-probe-matrix-");
-                const dbPath = seedPendingMigration(dataHome);
-                const portDir = join(dirname(dbPath), "rpc", "test-project");
-                mkdirSync(portDir, { recursive: true });
-                const pid = scenario.pid();
-                writeFileSync(
-                    join(portDir, `port-${pid}.json`),
-                    JSON.stringify({ port: 43123, pid, started_at: 1_200_000 }),
-                );
-                scenario.configure();
-
-                const opened = openDatabase();
-
-                expect(opened === null).toBe(scenario.blocksMigration);
-                expect(readPersistedVersion(dbPath)).toBe(
-                    scenario.blocksMigration
-                        ? LATEST_SUPPORTED_VERSION - 1
-                        : LATEST_SUPPORTED_VERSION,
-                );
-                if (!scenario.blocksMigration && pid === process.pid) {
-                    expect(inspectRpcServerDiscovery(dirname(dbPath))).toMatchObject({
-                        state: "inconclusive",
-                        serverPids: [],
-                        inconclusivePids: [process.pid],
-                    });
-                    // Sandbox uncertainty must not look like a real multi-instance
-                    // refusal: users need to know that migration continued safely.
-                    expect(
-                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
-                    ).toContain("continuing migration");
-                    expect(
-                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
-                    ).toContain("OS sandbox denied kill(0) or ps");
-                }
-            });
-        }
-
-        it("#when an older Pi harness is live #then refuses a pending migration", () => {
-            const dataHome = useTempDataHome("storage-db-live-pi-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            __setRpcIdentityTestHooks({
-                processListExecFileSync: (() =>
-                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
-            });
-
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()).toEqual({
-                persistedVersion: LATEST_SUPPORTED_VERSION - 1,
-                supportedVersion: LATEST_SUPPORTED_VERSION,
-                serverPids: [41001],
-                blockingProcesses: [{ kind: "Pi", pid: 41001 }],
-            });
-            expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { kind: "Pi", pid: 41001 },
-            ]);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {
-            const dataHome = useTempDataHome("storage-db-inconclusive-pi-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            __setRpcIdentityTestHooks({
-                processListExecFileSync: (() => {
-                    const error = new Error("sandbox denied ps") as NodeJS.ErrnoException;
-                    error.code = "EPERM";
-                    throw error;
-                }) as typeof execFileSync,
-            });
-
-            expect(openDatabase()).not.toBeNull();
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
-            expect(getMigrationOnOpenRefusal()).toBeNull();
-        });
-
-        it("#when every advertised PID is stale #then deletes stale files and allows migration", () => {
-            const dataHome = useTempDataHome("storage-db-stale-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const portFile = join(portDir, "port-2147483647.json");
-            writeFileSync(
-                portFile,
-                JSON.stringify({ port: 43123, pid: 2_147_483_647, started_at: 1 }),
-            );
-
-            expect(openDatabase()).not.toBeNull();
-            expect(existsSync(portFile)).toBe(false);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
-        });
-
-        it("#when a fresh port file is unparseable #then refuses migration during the grace window", () => {
-            const dataHome = useTempDataHome("storage-db-invalid-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const portFile = join(portDir, "port-12345.json");
-            writeFileSync(portFile, "{not-json");
-
-            // The writer uses temp-file-plus-rename, but the grace window is cheap
-            // insurance for files left by older or interrupted installations.
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()).toEqual({
-                persistedVersion: LATEST_SUPPORTED_VERSION - 1,
-                supportedVersion: LATEST_SUPPORTED_VERSION,
-                serverPids: [],
-                blockingProcesses: [],
-                unreadableFile: portFile,
-                unreadableArm: "parse",
-            });
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when old malformed and pidless records are discovered #then deletes them and allows migration", () => {
-            const dataHome = useTempDataHome("storage-db-junk-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const junk = [
-                ["port-1001.json", ""],
-                ["port-1002.json", '{"port":'],
-                ["port-1003.json", JSON.stringify({ port: 43123, started_at: 1 })],
-                ["port-1004.json", "\\u0000\\uffffbinary"],
-                ["port-1005.json", JSON.stringify({ port: 43123, pid: 0 })],
-            ].map(([name, content]) => {
-                const file = join(portDir, name);
-                writeFileSync(file, content);
-                const old = new Date(Date.now() - 11 * 60 * 1000);
-                utimesSync(file, old, old);
-                return file;
-            });
-
-            expect(openDatabase()).not.toBeNull();
-            for (const file of junk) expect(existsSync(file)).toBe(false);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
-            expect(getMigrationOnOpenRefusal()).toBeNull();
-        });
-
-        it("#when malformed records are fresh #then leaves them and refuses migration", () => {
-            const dataHome = useTempDataHome("storage-db-fresh-junk-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const junk = [
-                ["port-1001.json", ""],
-                ["port-1002.json", '{"port":'],
-                ["port-1003.json", JSON.stringify({ port: 43123, started_at: 1 })],
-                ["port-1004.json", "\\u0000\\uffffbinary"],
-                ["port-1005.json", JSON.stringify({ port: 43123, pid: 0 })],
-            ].map(([name, content]) => {
-                const file = join(portDir, name);
-                writeFileSync(file, content);
-                return file;
-            });
-
-            expect(openDatabase()).toBeNull();
-            expect(junk.some((file) => getMigrationOnOpenRefusal()?.unreadableFile === file)).toBe(
-                true,
-            );
-            expect(getMigrationOnOpenRefusal()?.unreadableArm).toBe("parse");
-            for (const file of junk) expect(existsSync(file)).toBe(true);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when a port path cannot be read as a file #then refuses migration and names the io arm", () => {
-            const dataHome = useTempDataHome("storage-db-unreadable-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            const unreadableFile = join(portDir, "port-12345.json");
-            mkdirSync(unreadableFile, { recursive: true });
-
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()).toMatchObject({
-                unreadableFile,
-                unreadableArm: "io",
-            });
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when reading a port file returns EACCES #then refuses migration without deleting it", () => {
-            const dataHome = useTempDataHome("storage-db-eacces-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const unreadableFile = join(portDir, "port-12345.json");
-            writeFileSync(unreadableFile, JSON.stringify({ port: 43123, pid: 12345 }));
-            __setRpcDiscoveryFsForTests({
-                readFileSync: (path) => {
-                    if (path === unreadableFile) {
-                        const error = new Error("permission denied") as NodeJS.ErrnoException;
-                        error.code = "EACCES";
-                        throw error;
-                    }
-                    throw new Error(`unexpected discovery read: ${path}`);
-                },
-            });
-
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()).toMatchObject({
-                unreadableFile,
-                unreadableArm: "io",
-            });
-            expect(existsSync(unreadableFile)).toBe(true);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when stale junk cleanup returns EACCES #then refuses migration with the cleanup file named", () => {
-            const dataHome = useTempDataHome("storage-db-unlink-eacces-rpc-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const staleFile = join(portDir, "port-12345.json");
-            writeFileSync(staleFile, "{not-json");
-            const old = new Date(Date.now() - 11 * 60 * 1000);
-            utimesSync(staleFile, old, old);
-            __setRpcDiscoveryFsForTests({
-                unlinkSync: (path) => {
-                    if (path === staleFile) {
-                        const error = new Error("permission denied") as NodeJS.ErrnoException;
-                        error.code = "EACCES";
-                        throw error;
-                    }
-                    throw new Error(`unexpected discovery unlink: ${path}`);
-                },
-            });
-
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()).toMatchObject({
-                unreadableFile: staleFile,
-                unreadableArm: "io",
-            });
-            expect(existsSync(staleFile)).toBe(true);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when the RPC directory cannot be enumerated #then refuses migration", () => {
-            const dataHome = useTempDataHome("storage-db-unreadable-rpc-dir-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const rpcPath = join(dirname(dbPath), "rpc");
-            writeFileSync(rpcPath, "not-a-directory");
-
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()?.unreadableFile).toBe(rpcPath);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when an alive PID is reused by a newer process #then removes the record and allows migration", () => {
-            const dataHome = useTempDataHome("storage-db-reused-pid-migration-");
-            const dbPath = seedPendingMigration(dataHome);
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const portFile = join(portDir, `port-${process.pid}.json`);
-            writeFileSync(
-                portFile,
-                JSON.stringify({ port: 43123, pid: process.pid, started_at: 500_000 }),
-            );
-            setLinuxIdentityProbe();
-
-            // The mocked process starts at 1,100,000ms, far after this record's
-            // timestamp, so process.kill(pid, 0) cannot make it look live.
-            expect(inspectRpcServerDiscovery(dirname(dbPath))).toEqual({
-                state: "stale",
-                serverPids: [],
-                staleFiles: [portFile],
-            });
-            expect(existsSync(portFile)).toBe(false);
-            expect(openDatabase()).not.toBeNull();
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
-            expect(getMigrationOnOpenRefusal()).toBeNull();
-        });
-
-        it("#when a live record shares a directory with old junk #then live wins, junk is cleaned, and migration stays blocked", () => {
-            const dataHome = useTempDataHome("storage-db-live-with-junk-rpc-migration-");
-            const dbPath = resolveDbPath(dataHome);
-            mkdirSync(dirname(dbPath), { recursive: true });
-            const legacy = new Database(dbPath);
-            legacy.exec(`
-                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
-            `);
-            legacy.close();
-
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const livePortFile = join(portDir, `port-${process.pid}.json`);
-            const junkFiles = [
-                ["port-41001.json", ""],
-                ["port-41002.json", "{not-json"],
-                ["port-41003.json", JSON.stringify({ port: 43125, started_at: 1 })],
-            ].map(([name, content]) => {
-                const file = join(portDir, name);
-                writeFileSync(file, content);
-                const old = new Date(Date.now() - 11 * 60 * 1000);
-                utimesSync(file, old, old);
-                return file;
-            });
-            writeFileSync(
-                livePortFile,
-                JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
-            );
-            setLinuxIdentityProbe();
-
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()).toMatchObject({
-                serverPids: [process.pid],
-            });
-            for (const junkFile of junkFiles) expect(existsSync(junkFile)).toBe(false);
-            expect(existsSync(livePortFile)).toBe(true);
-            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
-        });
-
-        it("#when a discovery record provides a process kind #then it takes precedence over command probes", () => {
-            const dataHome = useTempDataHome("storage-db-record-kind-migration-");
-            const dbPath = resolveDbPath(dataHome);
-            mkdirSync(dirname(dbPath), { recursive: true });
-            const legacy = new Database(dbPath);
-            legacy.exec(`
-                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
-                INSERT INTO schema_migrations(version) VALUES (${FORK_MIGRATION_VERSION_FLOOR});
-            `);
-            legacy.close();
-
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            writeFileSync(
-                join(portDir, `port-${process.pid}.json`),
-                JSON.stringify({
-                    port: 43123,
-                    pid: process.pid,
-                    started_at: 1_200_000,
-                    kind: "Pi",
-                }),
-            );
-            setLinuxIdentityProbe();
-
-            expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()?.blockingProcesses).toEqual([
-                { kind: "Pi", pid: process.pid },
-            ]);
-        });
-
-        it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
-            const dataHome = useTempDataHome("storage-db-live-server-migration-");
-            const dbPath = resolveDbPath(dataHome);
-            mkdirSync(dirname(dbPath), { recursive: true });
-            const legacy = new Database(dbPath);
-            legacy.exec(`
-                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
-                INSERT INTO schema_migrations(version) VALUES (${FORK_MIGRATION_VERSION_FLOOR});
-            `);
-            legacy.close();
-
-            const portDir = join(dirname(dbPath), "rpc", "test-project");
-            mkdirSync(portDir, { recursive: true });
-            const livePortFile = join(portDir, `port-${process.pid}.json`);
-            const stalePortFile = join(portDir, "port-2147483647.json");
-            const junkFiles = [
-                ["port-31001.json", ""],
-                ["port-31002.json", "{not-json"],
-                ["port-31003.json", JSON.stringify({ port: 43125, started_at: 1 })],
-            ].map(([name, content]) => {
-                const file = join(portDir, name);
-                writeFileSync(file, content);
-                const old = new Date(Date.now() - 11 * 60 * 1000);
-                utimesSync(file, old, old);
-                return file;
-            });
-            writeFileSync(
-                livePortFile,
-                JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
-            );
-            writeFileSync(
-                stalePortFile,
-                JSON.stringify({ port: 43124, pid: 2_147_483_647, started_at: 1 }),
-            );
-            setLinuxIdentityProbe();
-
-            // The port file makes this test prove the pre-migration refusal. If the
-            // guard is removed, openDatabase migrates this fixture and this assertion
-            // goes red because the DB is no longer left at the previous version.
-            expect(openDatabase()).toBeNull();
-            expect(existsSync(stalePortFile)).toBe(false);
-            for (const junkFile of junkFiles) expect(existsSync(junkFile)).toBe(false);
-            expect(existsSync(livePortFile)).toBe(true);
-            expect(getMigrationOnOpenRefusal()).toEqual({
-                persistedVersion: LATEST_SUPPORTED_VERSION - 1,
-                supportedVersion: LATEST_SUPPORTED_VERSION,
-                serverPids: [process.pid],
-                blockingProcesses: [{ kind: "process", pid: process.pid }],
-            });
-            expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { kind: "process", pid: process.pid },
-            ]);
-            const unchanged = new Database(dbPath);
-            expect(getPersistedSchemaVersion(unchanged)).toBe(LATEST_SUPPORTED_VERSION - 1);
-            expect(
-                unchanged
-                    .prepare("SELECT 1 FROM schema_migrations WHERE version = ?")
-                    .get(FORK_MIGRATION_VERSION_FLOOR),
-            ).toEqual({ 1: 1 });
-            unchanged.close();
-        });
-
         it("#when file path setup fails #then throws so callers fail closed (no in-memory fallback)", () => {
             const dataHome = useTempDataHome("storage-db-fallback-");
             // Block mkdirSync by planting a file at the cortexkit segment of
             // the new shared path. See storage.test.ts for the same pattern.
             writeFileSync(join(dataHome, "cortexkit"), "not-a-directory", "utf-8");
 
-            // Failing closed is intentional. Falling back to :memory: silently
-            // disables persistent state (memories, historian compartments,
-            // tags) but keeps the transform running, which on Pi/OpenCode can
-            // let the full raw history reach the model and overflow context.
-            // Callers must catch this and disable Magic Context for the run.
             expect(() => openDatabase()).toThrow(/storage unavailable/i);
-        });
-
-        it("#when an existing session_meta table lacks compartment_in_progress #then openDatabase adds the missing column", () => {
-            const dataHome = useTempDataHome("storage-db-migrate-compartment-flag-");
-            const dbPath = resolveDbPath(dataHome);
-            mkdirSync(join(dataHome, "cortexkit", "magic-context"), {
-                recursive: true,
-            });
-            const legacyDb = new Database(dbPath);
-            legacyDb.run(`
-        CREATE TABLE session_meta (
-          session_id TEXT PRIMARY KEY,
-          last_response_time INTEGER,
-          cache_ttl TEXT,
-          counter INTEGER DEFAULT 0,
-          last_nudge_tokens INTEGER DEFAULT 0,
-          last_nudge_band TEXT DEFAULT '',
-          last_transform_error TEXT DEFAULT '',
-          nudge_anchor_message_id TEXT DEFAULT '',
-          nudge_anchor_text TEXT DEFAULT '',
-          sticky_turn_reminder_text TEXT DEFAULT '',
-          sticky_turn_reminder_message_id TEXT DEFAULT '',
-          is_subagent INTEGER DEFAULT 0,
-          last_context_percentage REAL DEFAULT 0,
-          last_input_tokens INTEGER DEFAULT 0,
-          observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
-          cache_alert_sent INTEGER NOT NULL DEFAULT 0,
-          times_execute_threshold_reached INTEGER DEFAULT 0,
-          historian_failure_count INTEGER DEFAULT 0,
-          historian_last_error TEXT DEFAULT NULL,
-          historian_last_failure_at INTEGER DEFAULT NULL,
-          cleared_reasoning_through_tag INTEGER DEFAULT 0,
-      harness TEXT NOT NULL DEFAULT 'opencode'
-    );
-      `);
-            closeQuietly(legacyDb);
-
-            const db = openDatabase();
-            const columns = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
-                name?: string;
-            }>;
-
-            expect(columns.map((column) => column.name)).toEqual(
-                expect.arrayContaining([
-                    "compartment_in_progress",
-                    "historian_failure_count",
-                    "historian_last_error",
-                    "historian_last_failure_at",
-                ]),
-            );
-        });
-
-        it("#when an existing memory_embeddings table lacks model_id #then openDatabase adds the missing column", () => {
-            const dataHome = useTempDataHome("storage-db-migrate-embedding-model-");
-            const dbPath = resolveDbPath(dataHome);
-            mkdirSync(join(dataHome, "cortexkit", "magic-context"), {
-                recursive: true,
-            });
-            const legacyDb = new Database(dbPath);
-            legacyDb.run(`
-        CREATE TABLE memories (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          project_path TEXT NOT NULL,
-          category TEXT NOT NULL,
-          content TEXT NOT NULL,
-          normalized_hash TEXT NOT NULL,
-          source_session_id TEXT,
-          source_type TEXT DEFAULT 'historian',
-          seen_count INTEGER DEFAULT 1,
-          retrieval_count INTEGER DEFAULT 0,
-          first_seen_at INTEGER NOT NULL,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          last_seen_at INTEGER NOT NULL,
-          last_retrieved_at INTEGER,
-          status TEXT DEFAULT 'active',
-          expires_at INTEGER,
-          verification_status TEXT DEFAULT 'unverified',
-          verified_at INTEGER,
-          superseded_by_memory_id INTEGER,
-          merged_from TEXT,
-          metadata_json TEXT,
-          UNIQUE(project_path, category, normalized_hash)
-        );
-
-        CREATE TABLE memory_embeddings (
-          memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-          embedding BLOB NOT NULL
-        );
-      `);
-            closeQuietly(legacyDb);
-
-            const db = openDatabase();
-            const columns = db.prepare("PRAGMA table_info(memory_embeddings)").all() as Array<{
-                name?: string;
-            }>;
-
-            expect(columns.map((column) => column.name)).toContain("model_id");
         });
     });
 
