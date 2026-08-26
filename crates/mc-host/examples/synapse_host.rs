@@ -4,7 +4,7 @@
 //! connection file, and serves until SIGINT/SIGTERM.
 //!
 //! Usage:
-//!   synapse_host <data-dir> <bundle-dir> <ort-library> <ort-library-sha256>
+//!   synapse_host <data-dir> <bundle-dir> <ort-library> <ort-library-sha256> [--stats-secs N]
 //!
 //! Pass `-` as <bundle-dir> to start with Synapse deliberately unconfigured
 //! (degraded-lane smoke).
@@ -17,6 +17,13 @@ use mc_host::{
     InitError, ManifestSnapshot, PrimaryComponent, RequestCtx, RequestOutcome, RouteHandle,
     RouteIdentity, SecondaryComponent, ShutdownError, StaticComposite,
 };
+
+fn emit_metrics(metrics: &mc_host::synapse::SynapseMetrics) {
+    eprintln!(
+        "{}",
+        serde_json::to_string(&metrics.snapshot()).expect("metrics serialize")
+    );
+}
 
 struct EchoPrimary;
 
@@ -119,11 +126,26 @@ impl SecondaryComponent for PlaceholderBroca {
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: synapse_host <data-dir> <bundle-dir|-> <ort-library> <ort-library-sha256>";
+    let usage = "usage: synapse_host <data-dir> <bundle-dir|-> <ort-library> <ort-library-sha256> [--stats-secs N]";
     let data_dir = std::path::PathBuf::from(args.next().expect(usage));
     let bundle_dir = args.next().expect(usage);
     let ort_library = std::path::PathBuf::from(args.next().expect(usage));
     let ort_library_sha256 = args.next().expect(usage);
+    let remaining = args.collect::<Vec<_>>();
+    let stats_secs = match remaining.as_slice() {
+        [] => None,
+        [flag, value] if flag == "--stats-secs" => match value.parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Some(seconds),
+            _ => {
+                eprintln!("{usage}");
+                std::process::exit(2);
+            }
+        },
+        _ => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
 
     let synapse_config = (bundle_dir != "-").then(|| SynapseConfig {
         bundle_dir: std::path::PathBuf::from(bundle_dir),
@@ -132,6 +154,7 @@ async fn main() {
         limits: SynapseLimits::default(),
     });
     let synapse = SynapseComponent::new(synapse_config);
+    let metrics = synapse.metrics_handle();
     let composite = StaticComposite::new(EchoPrimary, synapse, PlaceholderBroca)
         .expect("composite module IDs are distinct");
 
@@ -146,6 +169,23 @@ async fn main() {
         .join(mc_host::CONNECTION_FILE_NAME);
     let shutdown = CancellationToken::new();
     let host = tokio::spawn(mc_host::run(composite, config, shutdown.clone()));
+    let stats = stats_secs.map(|seconds| {
+        let shutdown = shutdown.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let period = Duration::from_secs(seconds);
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => emit_metrics(&metrics),
+                }
+            }
+        })
+    });
 
     while !publication.exists() {
         if host.is_finished() {
@@ -164,7 +204,15 @@ async fn main() {
         _ = sigterm.recv() => {}
     }
     shutdown.cancel();
-    match host.await {
+    let host_result = host.await;
+    if let Some(stats) = stats {
+        if let Err(join) = stats.await {
+            eprintln!("stats join failed: {join}");
+            std::process::exit(1);
+        }
+    }
+    emit_metrics(&metrics);
+    match host_result {
         Ok(Ok(())) => println!("SHUTDOWN graceful"),
         Ok(Err(error)) => {
             eprintln!("SHUTDOWN failed: {error}");
