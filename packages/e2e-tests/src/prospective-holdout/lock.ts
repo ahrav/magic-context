@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HoldoutContractError } from "./contract";
 
@@ -68,20 +68,94 @@ function readLockOwner(lock: string): LockOwner | null {
     }
 }
 
-function lockAbandoned(lock: string): boolean {
+/**
+ * Verdict the abandonment test reaches on a lock, produced only for a lock judged
+ * abandoned. `owner` is the record the judgement rested on, or null for a
+ * directory with no parseable record, whose abandonment rests on the directory's
+ * own age instead. Carrying that record is what lets a takeover confirm it acts on
+ * the lock that was judged rather than on whatever occupies the path by the time
+ * it runs.
+ */
+export interface LockAbandonment {
+    owner: LockOwner | null;
+}
+
+/**
+ * Judges whether the lock at `lock` was left behind by a holder that is gone, and
+ * returns the evidence that judgement rests on so a takeover can act on the same
+ * lock. A lock still inside its lease, or held by a process whose death is not
+ * proven, is never abandoned.
+ */
+export function lockAbandoned(lock: string): LockAbandonment | null {
     const owner = readLockOwner(lock);
     if (owner !== null) {
-        return Date.now() - owner.acquiredAt > LOCK_LEASE_MS && !holderAlive(owner.pid);
+        const expired = Date.now() - owner.acquiredAt > LOCK_LEASE_MS && !holderAlive(owner.pid);
+        return expired ? { owner } : null;
     }
     // Without a parseable record there is no pid to interrogate, so the directory's
     // own age is the only available evidence. A live holder publishes its record
     // microseconds after `mkdirSync`, so a record-less directory older than the
     // lease was orphaned inside that window and its holder is gone.
     try {
-        return Date.now() - statSync(lock).mtimeMs > LOCK_LEASE_MS;
+        return Date.now() - statSync(lock).mtimeMs > LOCK_LEASE_MS ? { owner: null } : null;
     } catch {
-        return false;
+        return null;
     }
+}
+
+function sameLockOwner(left: LockOwner | null, right: LockOwner | null): boolean {
+    // An absent record matches only an absent record: a lock reclaimed and re-taken
+    // since the judgement publishes a record where the judged directory had none.
+    if (left === null || right === null) return left === right;
+    return left.pid === right.pid && left.nonce === right.nonce && left.acquiredAt === right.acquiredAt;
+}
+
+/**
+ * Path a reclaimer moves an abandoned lock to before removing it. The sideline is a
+ * sibling of the lock because a rename cannot cross filesystems, and it ends in
+ * this process's nonce so two reclaimers of the same lock cannot pick the same
+ * name. The whole name is derived from the lock's own plus that nonce, so no reader
+ * of the guarded resource can mistake it for one of that resource's records.
+ */
+export function lockSidelinePath(lock: string): string {
+    return `${lock}.reclaimed-${LOCK_NONCE}`;
+}
+
+/**
+ * Removes the abandoned lock `judged` was reached on, by renaming it aside and
+ * removing what the rename moved.
+ *
+ * `renameSync` is what makes the takeover exclusive. Two waiters can judge the same
+ * expired lock abandoned; the rename that lands first leaves nothing at `lock`, so
+ * the other rename fails and that waiter removes nothing. An unconditional `rmSync`
+ * hands it no such failure: it deletes whatever occupies the path, which by then is
+ * the fresh lock the winner has already claimed and holds, and both waiters go on
+ * to run the guarded operation at once. Re-reading the record before that `rmSync`
+ * narrows the window without closing it, because the lock can still be reclaimed
+ * and replaced between the read and the delete. Only a single operation that both
+ * moves the directory and fails once it is already gone leaves one winner.
+ *
+ * The record comparison guards a different gap than the rename rather than standing
+ * in for it: it refuses a takeover whose subject is no longer the holder the
+ * abandonment test judged, so a lock released and legitimately re-taken between the
+ * judgement and the takeover keeps its new holder even though a rename would have
+ * succeeded against it.
+ *
+ * A hard kill between the rename and the removal leaves the sideline directory in
+ * the lock's parent, where no later acquisition removes it.
+ */
+export function takeOverLock(lock: string, judged: LockAbandonment): void {
+    if (!sameLockOwner(readLockOwner(lock), judged.owner)) return;
+    const sideline = lockSidelinePath(lock);
+    try {
+        renameSync(lock, sideline);
+    } catch {
+        // Every rename failure leaves the lock where it stands, and none of them can be
+        // told apart from another waiter having taken the lock over first, so the lock
+        // is left alone and the next attempt treats it as ordinary contention.
+        return;
+    }
+    rmSync(sideline, { recursive: true, force: true });
 }
 
 /**
@@ -171,9 +245,14 @@ export function withRecoverableLock<T>(
         // keeps the errno: the callers name their busy codes in different areas, so
         // no single contract code could carry a cause that belongs to the path.
         if (claim.status === "structural") throw claim.error;
-        if (!reclaimed && lockAbandoned(lockPath)) {
+        // The verdict carries the record it rests on, so the takeover acts on the lock
+        // that was judged abandoned rather than on whatever holds the path once it runs.
+        // A takeover that loses its rename removes nothing, which leaves the state the
+        // next iteration reads as ordinary contention.
+        const abandoned = reclaimed ? null : lockAbandoned(lockPath);
+        if (abandoned !== null) {
             reclaimed = true;
-            rmSync(lockPath, { recursive: true, force: true });
+            takeOverLock(lockPath, abandoned);
             continue;
         }
         // Contention is all that remains, and a holder that releases mid-wait leaves

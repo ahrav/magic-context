@@ -233,7 +233,15 @@ export function cellResultFixture(
     };
 }
 
-export function closeManifest(freeze = freezeManifest()): CohortCloseManifest {
+/**
+ * `subjective` marks the single admitted case as needing adjudication, which is the only
+ * condition under which an epoch owes a trusted `adjudication-close.json`. Omitting it keeps
+ * the manifest, and therefore its subject fingerprint, byte-identical to the objective cohort.
+ */
+export function closeManifest(
+    freeze = freezeManifest(),
+    options: { subjective?: boolean } = {},
+): CohortCloseManifest {
     const body = {
         epochId: freeze.body.epochId,
         freezeManifestFingerprint: canonicalFingerprint(freeze),
@@ -244,7 +252,7 @@ export function closeManifest(freeze = freezeManifest()): CohortCloseManifest {
             caseCommitment: H1,
             familyId: "fam-context-loss",
             scenarioFingerprint: H2,
-            subjective: false,
+            subjective: options.subjective ?? false,
         }],
         rejected: [{ intakeId: `intake-${"b".repeat(32)}`, reasonCode: "privacy-rejected" as const }],
         late: [{ intakeId: `intake-${"c".repeat(32)}` }],

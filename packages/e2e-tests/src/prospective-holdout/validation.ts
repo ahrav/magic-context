@@ -161,8 +161,16 @@ export function validateHoldoutRepository(
             }
         }
         const runningEvent = requiredEvent(events, "running");
+        // Every later state is reachable only through running, so any of them means the
+        // outcomes file exists and the running event has already bound its content.
+        const reachedRunning = Boolean(
+            runningEvent ||
+            requiredEvent(events, "reported") ||
+            requiredEvent(events, "insufficient-evidence") ||
+            requiredEvent(events, "graduated"),
+        );
         let outcomes: ProspectiveOutcomes = { attempts: [], aa: [] };
-        if (runningEvent || requiredEvent(events, "reported") || requiredEvent(events, "insufficient-evidence") || requiredEvent(events, "graduated")) {
+        if (reachedRunning) {
             expectedEntries.add("outcomes.json");
             const raw = canonicalFile(join(epochRoot, "outcomes.json"), "outcomes");
             const violations = scanForSensitiveContent(raw);
@@ -225,6 +233,13 @@ export function validateHoldoutRepository(
                 ) {
                     throw new HoldoutContractError(["adjudication-close: cohort-binding-invalid"]);
                 }
+                // The cohort close's approvers attest which cases the cohort admits, so one of
+                // them approving the adjudication close approves subjective verdicts over cases
+                // they admitted. The trust registry pins this file's fingerprint without reading
+                // its approver, so independence holds here as well as at construction.
+                if (close.manifest.approvals.some((approval) => approval.approver === adjudicationClose.approval.approver)) {
+                    throw new HoldoutContractError(["adjudication-close.approval: independence-required"]);
+                }
                 // The cohort manifest fixes the case set the judgments cover, so a close
                 // stamped before it claims verdicts over cases intake could still admit.
                 // The same instant is legal: the cohort is fixed at that point.
@@ -270,7 +285,13 @@ export function validateHoldoutRepository(
                 throw new HoldoutContractError(["lifecycle: graduation-artifact-mismatch"]);
             }
         }
-        const actualEntries = readdirSync(epochRoot).sort();
+        // The lifecycle append lock and the directory a reclaim renames aside both live
+        // beside the ledger, so a validation run concurrent with a transition, or one after
+        // a worker was killed mid-reclaim, would otherwise read them as unexpected committed
+        // artifacts. They are runtime state under a name no artifact uses.
+        const actualEntries = readdirSync(epochRoot)
+            .filter((entry) => !/^lifecycle\.jsonl\.lock(?:\.reclaimed-[0-9a-f]+)?$/.test(entry))
+            .sort();
         if (
             actualEntries.length !== expectedEntries.size ||
             actualEntries.some((entry) => !expectedEntries.has(entry))
@@ -294,6 +315,20 @@ export function validateHoldoutRepository(
                 `${coordinate}:release-n`, `${coordinate}:release-n-minus-1`,
             ]));
             const expectedCells = new Set(selectedCells);
+            // Reaching running binds this file's canonical fingerprint into the ledger, so the
+            // matrix can no longer be filled in afterwards: supplying the missing cells changes
+            // the fingerprint the running event committed to, while leaving them out keeps every
+            // report short of a pair. An attempt set that is empty while the freeze still expects
+            // cells therefore reports that nothing ran at all, whose only exit is invalidation,
+            // rather than a run that covered part of the matrix.
+            if (reachedRunning && selectedCells.size > 0 && outcomes.attempts.length === 0) {
+                throw new HoldoutContractError(["outcomes: attempts-empty"]);
+            }
+            // A/A evidence lives in the same fingerprinted file and the report path requires one
+            // pair per selected coordinate, so an empty set strands the epoch the same way.
+            if (reachedRunning && selectedCells.size > 0 && outcomes.aa.length === 0) {
+                throw new HoldoutContractError(["outcomes: aa-empty"]);
+            }
             const seenAttempts = new Set<string>();
             const cellKey = (cell: ProspectiveCellResult): string =>
                 `${cell.caseId}:${cell.model}:${cell.seed}:${cell.platform}:${cell.releaseRole}`;

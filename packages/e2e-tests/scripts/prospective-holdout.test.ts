@@ -3,6 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint, canonicalJson } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
+import {
+    appendJudgment,
+    closeAdjudication,
+    publishAdjudicationClose,
+    type AdjudicationClose,
+    type JudgmentEvent,
+} from "../src/prospective-holdout/adjudication";
+import { buildBlindedPacket } from "../src/prospective-holdout/blinding";
+import type { CohortCloseManifest } from "../src/prospective-holdout/contract";
 import { appendLifecycleEvent, parseLifecycleLedger } from "../src/prospective-holdout/lifecycle";
 import { LOCK_LEASE_MS, LOCK_OWNER_FILE } from "../src/prospective-holdout/lock";
 import { buildProspectiveReport, type ReportRecomputers } from "../src/prospective-holdout/report";
@@ -37,10 +46,72 @@ export const scorecard = {
 `;
 }
 
-function completeRepository(
-    root: string,
-    options: { sufficient?: boolean; lifecycleState?: "reported" | "insufficient-evidence" } = {},
-): ReportRecomputers {
+/** Authenticates the judgment chain a subjective cohort's adjudication close commits to. */
+const ADJUDICATION_KEY = new TextEncoder().encode("a".repeat(32));
+
+type EpochTerminalState = "cohort-closed" | "running" | "reported" | "insufficient-evidence";
+
+interface RepositoryOptions {
+    sufficient?: boolean;
+    lifecycleState?: EpochTerminalState;
+    /**
+     * Drops one arm of the outcomes evidence. The running event binds the canonical fingerprint
+     * of whatever is written, so the dropped arm can never be supplied afterwards.
+     */
+    outcomes?: "complete" | "attempts-empty" | "aa-empty";
+    /** Marks the admitted case subjective, which obliges the epoch to carry an adjudication close. */
+    subjective?: boolean;
+    /** Approver stamped onto the adjudication close in place of the independent one. */
+    adjudicationApprover?: string;
+}
+
+/**
+ * Mints a subjective cohort's adjudication close through the real constructor: judgments are
+ * signed over sealed packets covering exactly the subjective case ids, and `closeAdjudication`
+ * derives the approval subject fingerprint that `parseAdjudicationClose` recomputes on load.
+ */
+function subjectiveAdjudicationClose(
+    close: { manifest: CohortCloseManifest; manifestFingerprint: string },
+    approver: string,
+): AdjudicationClose {
+    const sealedPackets = close.manifest.body.cases
+        .filter((entry) => entry.subjective)
+        .map((entry) => buildBlindedPacket({
+            caseId: entry.caseId,
+            assignment: { caseId: entry.caseId, buildA: "release-n", buildB: "release-n-minus-1" },
+            observations: {
+                "release-n": { status: "pass", checkIds: [] },
+                "release-n-minus-1": { status: "fail", checkIds: ["check-current"] },
+            },
+            allowedCheckIds: ["check-current"],
+            secret: ADJUDICATION_KEY,
+        }));
+    let judgments: JudgmentEvent[] = [];
+    for (const packet of sealedPackets) {
+        judgments = appendJudgment({
+            prior: judgments,
+            packet,
+            sealedPackets,
+            adjudicator: "judge-one",
+            verdict: "build-a",
+            authenticationKey: ADJUDICATION_KEY,
+        });
+    }
+    return closeAdjudication({
+        close: close.manifest,
+        trustedCloseFingerprint: close.manifestFingerprint,
+        closedAt: "2026-09-09T00:00:00Z",
+        judgments,
+        sealedPackets,
+        authenticationKey: ADJUDICATION_KEY,
+        approver,
+    });
+}
+
+function completeRepository(root: string, options: RepositoryOptions = {}): ReportRecomputers {
+    const terminal: EpochTerminalState = options.lifecycleState ?? "reported";
+    const reachedRunning = terminal !== "cohort-closed";
+    const reportState = terminal === "reported" || terminal === "insufficient-evidence" ? terminal : null;
     const holdout = join(root, "prospective-holdout");
     const epoch = join(holdout, "epochs", "epoch-test-release");
     mkdirSync(join(holdout, "policies"), { recursive: true });
@@ -49,20 +120,27 @@ function completeRepository(
     writeJson(join(holdout, "policies", "analysis-policy.json"), policies.analysis);
     writeJson(join(holdout, "policies", "scorecard-policy.json"), policies.scorecard);
     const freeze = publishFreeze(freezeManifest(), join(epoch, "freeze"), policies);
-    const close = publishClose(closeManifest(freeze.manifest), join(epoch, "close"), freeze);
+    const close = publishClose(
+        closeManifest(freeze.manifest, { subjective: options.subjective ?? false }),
+        join(epoch, "close"),
+        freeze,
+    );
     const releaseN = cellResultFixture("release-n", {}, freeze.manifest);
     const releaseNMinus1 = cellResultFixture("release-n-minus-1", {}, freeze.manifest);
     const outcomes = {
         schema: "prospective-outcomes/v1",
-        attempts: [
+        attempts: options.outcomes === "attempts-empty" ? [] : [
             { attempt: 0, cell: releaseN },
             { attempt: 0, cell: releaseNMinus1 },
         ],
         // One same-build control per frozen coordinate, which is what the comparison gate
         // requires before it accepts the release-N versus release-N-1 cells.
-        aa: [{ left: releaseNMinus1, right: structuredClone(releaseNMinus1) }],
+        aa: options.outcomes === "aa-empty"
+            ? []
+            : [{ left: releaseNMinus1, right: structuredClone(releaseNMinus1) }],
     };
-    writeJson(join(epoch, "outcomes.json"), outcomes);
+    // A cohort-closed epoch has not run, so the file a running event would bind is absent.
+    if (reachedRunning) writeJson(join(epoch, "outcomes.json"), outcomes);
     const pair = {
         caseId: releaseN.caseId,
         familyId: releaseN.familyId,
@@ -94,7 +172,7 @@ function completeRepository(
             }),
         },
     };
-    const report = buildProspectiveReport({
+    const report = reportState === null ? undefined : buildProspectiveReport({
         epochId: freeze.manifest.body.epochId,
         freezeManifestFingerprint: freeze.manifestFingerprint,
         closeManifestFingerprint: close.manifestFingerprint,
@@ -104,7 +182,21 @@ function completeRepository(
         ...recomputers,
         invalidated: false,
     });
-    writeJson(join(epoch, "report.json"), report);
+    if (report) writeJson(join(epoch, "report.json"), report);
+    let adjudication: AdjudicationClose | undefined;
+    if (report && close.manifest.body.cases.some((entry) => entry.subjective)) {
+        const independent = subjectiveAdjudicationClose(close, "reviewer-three");
+        // The approver sits outside the fingerprinted subject, so restamping it leaves the
+        // artifact parseable. `closeAdjudication` refuses to mint a dependent approval itself,
+        // which is the only way a repository acquires one.
+        adjudication = options.adjudicationApprover === undefined
+            ? independent
+            : {
+                ...independent,
+                approval: { ...independent.approval, approver: options.adjudicationApprover },
+            };
+        publishAdjudicationClose(adjudication, join(epoch, "adjudication-close.json"));
+    }
     let lifecycle = appendLifecycleEvent([], {
         epochId: freeze.manifest.body.epochId,
         state: "frozen",
@@ -129,22 +221,26 @@ function completeRepository(
         reasonCode: null,
         approvers: ["reviewer-one"],
     });
-    lifecycle = appendLifecycleEvent(lifecycle, {
-        epochId: freeze.manifest.body.epochId,
-        state: "running",
-        occurredAt: "2026-09-08T00:00:01Z",
-        artifactFingerprint: canonicalFingerprint(outcomes),
-        reasonCode: null,
-        approvers: ["operator-one"],
-    });
-    lifecycle = appendLifecycleEvent(lifecycle, {
-        epochId: freeze.manifest.body.epochId,
-        state: options.lifecycleState ?? "reported",
-        occurredAt: "2026-09-09T00:00:00Z",
-        artifactFingerprint: report.reportFingerprint,
-        reasonCode: null,
-        approvers: ["reviewer-one"],
-    });
+    if (reachedRunning) {
+        lifecycle = appendLifecycleEvent(lifecycle, {
+            epochId: freeze.manifest.body.epochId,
+            state: "running",
+            occurredAt: "2026-09-08T00:00:01Z",
+            artifactFingerprint: canonicalFingerprint(outcomes),
+            reasonCode: null,
+            approvers: ["operator-one"],
+        });
+    }
+    if (report && reportState) {
+        lifecycle = appendLifecycleEvent(lifecycle, {
+            epochId: freeze.manifest.body.epochId,
+            state: reportState,
+            occurredAt: "2026-09-09T00:00:00Z",
+            artifactFingerprint: report.reportFingerprint,
+            reasonCode: null,
+            approvers: ["reviewer-one"],
+        });
+    }
     writeFileSync(join(epoch, "lifecycle.jsonl"), lifecycle.map(canonicalJson).join("\n") + "\n");
     const trust = [
         { schema: "prospective-trust-entry/v1", epochId: freeze.manifest.body.epochId, kind: "freeze", sequence: null, manifestFingerprint: freeze.manifestFingerprint },
@@ -156,10 +252,28 @@ function completeRepository(
             sequence: index + 1,
             manifestFingerprint: canonicalFingerprint(lifecycle.slice(0, index + 1)),
         })),
-        { schema: "prospective-trust-entry/v1", epochId: freeze.manifest.body.epochId, kind: "report", sequence: null, manifestFingerprint: canonicalFingerprint(report) },
+        ...(report
+            ? [{ schema: "prospective-trust-entry/v1", epochId: freeze.manifest.body.epochId, kind: "report", sequence: null, manifestFingerprint: canonicalFingerprint(report) }]
+            : []),
+        ...(adjudication
+            ? [{ schema: "prospective-trust-entry/v1", epochId: freeze.manifest.body.epochId, kind: "adjudication-close", sequence: null, manifestFingerprint: canonicalFingerprint(adjudication) }]
+            : []),
     ];
     writeFileSync(join(holdout, "trusted-manifests.jsonl"), trust.map(canonicalJson).join("\n") + "\n");
     return recomputers;
+}
+
+/** Captures the exit code and every line the CLI emits, so a diagnostic can be matched exactly. */
+async function validateRepository(
+    root: string,
+    recomputers?: ReportRecomputers,
+): Promise<{ code: number; messages: string[] }> {
+    const messages: string[] = [];
+    const code = await runProspectiveHoldoutCli(["validate", root], {
+        out: (message) => messages.push(message),
+        err: (message) => messages.push(message),
+    }, recomputers);
+    return { code, messages };
 }
 
 describe("prospective holdout CLI", () => {
@@ -202,6 +316,106 @@ describe("prospective holdout CLI", () => {
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }
+        }
+    });
+
+    it("rejects a running epoch whose outcomes file holds no attempts", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-attempts-empty-"));
+        try {
+            const recomputers = completeRepository(root, {
+                lifecycleState: "running",
+                outcomes: "attempts-empty",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["outcomes: attempts-empty"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a running epoch whose outcomes file holds no A/A evidence", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-aa-empty-"));
+        try {
+            const recomputers = completeRepository(root, {
+                lifecycleState: "running",
+                outcomes: "aa-empty",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["outcomes: aa-empty"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("validates a cohort-closed epoch that carries no outcomes file", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-cohort-closed-"));
+        try {
+            const recomputers = completeRepository(root, { lifecycleState: "cohort-closed" });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("ignores a lifecycle lock and a reclaimed sideline in the epoch root", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-epoch-lock-"));
+        try {
+            const recomputers = completeRepository(root, { lifecycleState: "cohort-closed" });
+            // The append lock and the directory a reclaim renames aside sit beside the
+            // ledger, so the artifact-set check has to read past them or a validation run
+            // during a transition, or after a worker died mid-reclaim, would fail.
+            const epoch = join(root, "prospective-holdout", "epochs", "epoch-test-release");
+            mkdirSync(join(epoch, "lifecycle.jsonl.lock"), { recursive: true });
+            mkdirSync(join(epoch, `lifecycle.jsonl.lock.reclaimed-${"a".repeat(32)}`), { recursive: true });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+            mkdirSync(join(epoch, "unexpected-artifact"), { recursive: true });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["epoch: artifact-set-invalid"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects an adjudication close approved by either cohort close approver", async () => {
+        for (const approver of ["custodian-one", "reviewer-two"]) {
+            const root = mkdtempSync(join(tmpdir(), "holdout-cli-adjudication-dependent-"));
+            try {
+                const recomputers = completeRepository(root, {
+                    subjective: true,
+                    adjudicationApprover: approver,
+                });
+                expect(await validateRepository(root, recomputers)).toEqual({
+                    code: 1,
+                    messages: ["adjudication-close.approval: independence-required"],
+                });
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        }
+    });
+
+    it("validates a subjective epoch whose adjudication close is independently approved", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-adjudication-independent-"));
+        try {
+            const recomputers = completeRepository(root, { subjective: true });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
         }
     });
 
