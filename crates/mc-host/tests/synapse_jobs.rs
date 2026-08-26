@@ -136,6 +136,8 @@ async fn queued_byte_boundary_is_exact_and_releases_on_completion() {
     engine.set_delay(Duration::from_millis(200));
     let limits = SynapseLimits {
         max_queued_request_bytes: 8,
+        max_batch_text_bytes: 8,
+        max_text_bytes: 8,
         ..Default::default()
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;

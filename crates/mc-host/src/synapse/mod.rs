@@ -38,6 +38,10 @@ pub const SYNAPSE_MODULE_ID: &str = "synapse";
 /// select these; they live in trusted startup configuration only.
 #[derive(Debug, Clone)]
 pub struct SynapseLimits {
+    /// Queries allowed to wait behind the one running query. Zero preserves
+    /// loss-system admission: one query may run and every concurrent query is
+    /// rejected immediately.
+    pub max_waiting_queries: usize,
     pub max_queued_jobs: usize,
     pub max_queued_request_bytes: u64,
     pub max_retained_jobs: usize,
@@ -53,6 +57,23 @@ pub struct SynapseLimits {
 }
 
 impl SynapseLimits {
+    /// Maximum resident charge retained by one admitted query while it waits
+    /// for or uses the CPU lane. JSON decoding may retain twice the decoded
+    /// text length as `String` capacity, and the handler keeps response
+    /// scratch until its terminal is encoded.
+    pub fn per_waiter_charge_bound(&self) -> Option<u64> {
+        u64::try_from(self.max_text_bytes)
+            .ok()?
+            .checked_mul(2)?
+            .checked_add(RESPONSE_SCRATCH_BYTES as u64)
+    }
+
+    fn query_admission_permits(&self) -> Option<usize> {
+        self.max_waiting_queries
+            .checked_add(1)
+            .filter(|permits| *permits <= tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
     /// The most items one result page can attainably hold: a job never
     /// holds more than `max_batch_items` items so no page can either, and
     /// the pager always places at least one item per page. Shared by the
@@ -69,6 +90,7 @@ impl Default for SynapseLimits {
     fn default() -> Self {
         let max_batch_items = 64;
         Self {
+            max_waiting_queries: 0,
             max_queued_jobs: 64,
             max_queued_request_bytes: 64 * 1024 * 1024,
             max_retained_jobs: 64,
@@ -171,8 +193,9 @@ struct SynapseInner {
     /// One permit: at most one native inference call runs at a time, and
     /// waiters are served FIFO.
     cpu: Arc<tokio::sync::Semaphore>,
-    /// At most one query may wait for or use the serialized CPU lane. Batch
-    /// work is bounded separately by the job table.
+    /// One running query plus at most `max_waiting_queries` FIFO waiters may
+    /// use the serialized CPU lane. Batch work is bounded separately by the
+    /// job table.
     query_admission: Arc<tokio::sync::Semaphore>,
     /// Owns every started native call through shutdown.
     tracker: TaskTracker,
@@ -190,6 +213,10 @@ impl SynapseComponent {
             .as_ref()
             .map(|config| config.limits.clone())
             .unwrap_or_default();
+        // Invalid configured limits are disabled by `load_bundle` during
+        // initialization. Keep construction non-panicking until that typed
+        // validation can report the owner error.
+        let query_admission_permits = limits.query_admission_permits().unwrap_or(1);
         Self {
             inner: Arc::new(SynapseInner {
                 config,
@@ -199,22 +226,31 @@ impl SynapseComponent {
                     reason: "not initialized".to_owned(),
                 }),
                 cpu: Arc::new(tokio::sync::Semaphore::new(1)),
-                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
             }),
         }
     }
 
-    /// Test seam: a component whose lane is immediately ready over the
-    /// supplied engine, bypassing bundle loading and ORT.
+    /// Test and example seam: a component whose lane is immediately ready
+    /// over the supplied engine, bypassing bundle loading and ORT.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`bundle::BundleError`] when the lane and serving limits cannot
+    /// satisfy the same startup bounds enforced for a loaded bundle.
     pub fn ready_with_engine(
         mut lane: LaneInfo,
         engine: Arc<dyn EmbeddingEngine>,
         limits: SynapseLimits,
-    ) -> Self {
+    ) -> Result<Self, bundle::BundleError> {
+        bundle::validate_serving_limits(lane.dims, lane.recommended_rows as usize, &limits)?;
+        let query_admission_permits = limits.query_admission_permits().ok_or_else(|| {
+            bundle::BundleError("query admission capacity exceeds the semaphore limit".to_owned())
+        })?;
         lane.max_text_bytes = limits.max_text_bytes;
-        Self {
+        Ok(Self {
             inner: Arc::new(SynapseInner {
                 config: None,
                 jobs: JobTable::new(limits.clone()),
@@ -224,11 +260,11 @@ impl SynapseComponent {
                     lane,
                 }))),
                 cpu: Arc::new(tokio::sync::Semaphore::new(1)),
-                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
             }),
-        }
+        })
     }
 
     pub fn status(&self) -> SynapseStatus {

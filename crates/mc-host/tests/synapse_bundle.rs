@@ -15,7 +15,7 @@ use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits, SynapseSt
 use mc_host::{CompositeComponent, HostError, SecondaryComponent, StaticComposite};
 use sha2::{Digest, Sha256};
 
-use support::synapse::EchoPrimary;
+use support::synapse::{test_lane, DeterministicEngine, EchoPrimary};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synapse-tiny")
@@ -104,6 +104,31 @@ async fn expect_limits_disabled(mutate: impl FnOnce(&mut SynapseLimits), expecte
         reason.contains(expected_fragment),
         "reason {reason:?} does not mention {expected_fragment:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_query_memory_bound_rejects_both_construction_paths() {
+    expect_limits_disabled(
+        |limits| limits.max_waiting_queries = 3,
+        "query admission capacity requires",
+    )
+    .await;
+
+    let limits = SynapseLimits {
+        max_waiting_queries: 3,
+        ..SynapseLimits::default()
+    };
+    let error = match SynapseComponent::ready_with_engine(
+        test_lane(),
+        DeterministicEngine::new(),
+        limits,
+    ) {
+        Ok(_) => panic!("the ready-engine seam must apply serving-limit validation"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("query admission capacity requires"));
 }
 
 fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {

@@ -192,7 +192,11 @@ pub fn load_bundle(dir: &Path, limits: &SynapseLimits) -> Result<VerifiedBundle,
     let manifest_bytes = read_artifact(dir, "manifest.json", MAX_MANIFEST_BYTES)?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
-    validate_serving_limits(&manifest, limits)?;
+    validate_serving_limits(
+        manifest.dims as usize,
+        manifest.recommended_batch.rows as usize,
+        limits,
+    )?;
 
     let mut listed: Vec<&ArtifactRef> = vec![&manifest.model_file, &manifest.corpus];
     listed.extend(manifest.external_initializers.iter());
@@ -327,10 +331,18 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), BundleError> {
     Ok(())
 }
 
-fn validate_serving_limits(
-    manifest: &BundleManifest,
+pub(crate) fn validate_serving_limits(
+    dims: usize,
+    recommended_rows: usize,
     limits: &SynapseLimits,
 ) -> Result<(), BundleError> {
+    if limits
+        .max_waiting_queries
+        .checked_add(1)
+        .is_none_or(|permits| permits > tokio::sync::Semaphore::MAX_PERMITS)
+    {
+        return Err(err("query admission capacity exceeds the semaphore limit"));
+    }
     if limits.max_text_bytes < 4 {
         return Err(err("host max text bytes must hold one UTF-8 code point"));
     }
@@ -357,7 +369,6 @@ fn validate_serving_limits(
     // conversion is universally safe. The validated byte cap travels with
     // the bundle and is advertised beside max_tokens instead.
 
-    let recommended_rows = manifest.recommended_batch.rows as usize;
     if recommended_rows > limits.max_batch_items {
         return Err(err(format!(
             "recommended batch rows ({recommended_rows}) exceed the host's max batch items ({})",
@@ -365,7 +376,7 @@ fn validate_serving_limits(
         )));
     }
 
-    let max_result_bytes = jobs::max_result_bytes(limits.max_batch_items, manifest.dims as usize)
+    let max_result_bytes = jobs::max_result_bytes(limits.max_batch_items, dims)
         .ok_or_else(|| err("maximum retained result size overflows"))?;
     if max_result_bytes > limits.max_retained_result_bytes {
         return Err(err(format!(
@@ -438,9 +449,11 @@ fn validate_serving_limits(
             )
             .saturating_add(BODY_ENVELOPE_BYTES),
     );
+    let mut worst_parse_reservation = 0u64;
     for worst_body in [worst_query_body, worst_batch_body] {
         let reservation = super::protocol::parse_reservation_bytes(worst_body, limits)
             .ok_or_else(|| err("the worst-case parse reservation overflows"))?;
+        worst_parse_reservation = worst_parse_reservation.max(reservation as u64);
         if reservation as u64 > reservable_scratch {
             return Err(err(format!(
                 "the parse reservation for a maximal advertised request ({reservation} bytes \
@@ -449,6 +462,29 @@ fn validate_serving_limits(
                 reservable_scratch
             )));
         }
+    }
+
+    // Every admitted query retains its decoded String capacity and response
+    // scratch while waiting. The active query and all K waiters must coexist
+    // with a full queued-batch budget and the largest parse reservation.
+    let query_slots = u64::try_from(limits.max_waiting_queries)
+        .ok()
+        .and_then(|waiting| waiting.checked_add(1))
+        .ok_or_else(|| err("query admission capacity overflows"))?;
+    let waiter_bound = limits
+        .per_waiter_charge_bound()
+        .ok_or_else(|| err("per-query resident charge bound overflows"))?;
+    let required_scratch = query_slots
+        .checked_mul(waiter_bound)
+        .and_then(|queries| queries.checked_add(limits.max_queued_request_bytes))
+        .and_then(|used| used.checked_add(worst_parse_reservation))
+        .ok_or_else(|| err("combined query and queue resident bound overflows"))?;
+    if required_scratch > reservable_scratch {
+        return Err(err(format!(
+            "query admission capacity requires {required_scratch} scratch bytes but only \
+             {reservable_scratch} are reservable; lower max_waiting_queries, \
+             max_queued_request_bytes, max_batch_items, or the text limits"
+        )));
     }
 
     // A full retention set that overflowed its reserved slice would starve
@@ -802,6 +838,17 @@ mod tests {
         }
     }
 
+    fn validate_test_serving(
+        manifest: &BundleManifest,
+        limits: &SynapseLimits,
+    ) -> Result<(), BundleError> {
+        validate_serving_limits(
+            manifest.dims as usize,
+            manifest.recommended_batch.rows as usize,
+            limits,
+        )
+    }
+
     #[test]
     fn fingerprint_binds_initializer_names_to_their_hashes() {
         let mut manifest = manifest();
@@ -839,13 +886,13 @@ mod tests {
             .expect("bounded result size");
 
         assert!(limits.max_retained_result_bytes >= exact);
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
 
         limits.max_retained_result_bytes = exact;
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
 
         limits.max_retained_result_bytes = exact - 1;
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("one byte below the maximum result is invalid");
         assert!(error.0.contains("maximum batch result"));
     }
@@ -868,7 +915,7 @@ mod tests {
             max_retained_result_bytes: u64::MAX,
             ..SynapseLimits::default()
         };
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("a page bound above the scratch pool is a permanent outage");
         assert!(error.0.contains("result-page metadata"));
 
@@ -878,7 +925,7 @@ mod tests {
             max_page_vectors: boundary,
             ..SynapseLimits::default()
         };
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
     /// A configuration whose advertised limits permit a request the fixed
@@ -894,17 +941,17 @@ mod tests {
             max_retained_result_bytes: u64::MAX,
             ..SynapseLimits::default()
         };
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("an unservable advertised request is a permanent outage");
         assert!(error.0.contains("parse reservation"));
 
-        // A large advertised query alone (default item cap) stays valid:
+        // A moderately larger advertised query alone (default item cap) stays valid:
         // the reservation's item term is what overflows the pool.
         let limits = SynapseLimits {
-            max_text_bytes: 8 * 1024 * 1024,
+            max_text_bytes: 2 * 1024 * 1024,
             ..SynapseLimits::default()
         };
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
     /// A retention set whose worst metadata overflows its reserved slice
@@ -922,7 +969,7 @@ mod tests {
             max_retained_result_bytes: u64::MAX,
             ..SynapseLimits::default()
         };
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("an oversized retention set is a permanent outage");
         assert!(error.0.contains("retained job metadata"));
 
@@ -934,7 +981,7 @@ mod tests {
             max_retained_jobs: 32,
             ..SynapseLimits::default()
         };
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
     #[test]

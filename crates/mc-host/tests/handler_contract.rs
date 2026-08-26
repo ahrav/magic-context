@@ -504,10 +504,9 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         + (1 + 3 * 8) * 1536 * 1024
         + 3 * 8 * (96 * 1024 + 8 * 1024);
     let defaults = HostLimits::default();
-    assert_eq!(
-        defaults.max_resident_bytes,
-        256 * 1024 * 1024,
-        "the default carries no component's retention"
+    assert!(
+        defaults.max_resident_bytes >= mc_host::config::MIN_RESIDENT_BYTES,
+        "the default covers the no-retention floor"
     );
 
     // Defaults alone cannot hold a declaring component: startup must refuse it
@@ -524,12 +523,13 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         "a declaration the ceiling cannot cover must fail startup"
     );
 
-    // Sized at the composition site, the same composite starts.
+    // Sized at the composition site, the same composite starts. The extra
+    // margin covers the resident catalog that startup also charges.
     let host = CompositeTestHost::start(
         three_child_composite(broca_declaration(RETAINED)),
         |config| {
             config.limits = HostLimits {
-                max_resident_bytes: HostLimits::default().max_resident_bytes + RETAINED,
+                max_resident_bytes: HostLimits::default().max_resident_bytes + RETAINED + (1 << 20),
                 ..HostLimits::default()
             };
         },

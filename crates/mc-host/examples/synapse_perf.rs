@@ -259,7 +259,8 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         lane(),
         Arc::new(ZeroDelayEngine),
         SynapseLimits::default(),
-    );
+    )
+    .map_err(|error| format!("validate Synapse limits: {error}"))?;
     let composite = StaticComposite::new(PerfPrimary, synapse, PlaceholderBroca)
         .map_err(|error| format!("compose host: {error}"))?;
     let config = HostConfig {
