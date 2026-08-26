@@ -124,10 +124,13 @@ describe("rust and typescript embeddings", () => {
             /pub const RELEASE_CONTRACT_JSON: &str = "((?:[^"\\]|\\.)*)";/,
         );
         expect(jsonMatch).not.toBeNull();
-        const rustJson = (jsonMatch as RegExpMatchArray)[1]
-            .replace(/\\n/g, "\n")
-            .replace(/\\"/g, '"')
-            .replace(/\\\\/g, "\\");
+        // Single left-to-right pass: sequential global replaces are not the
+        // inverse of escapeRustString once the content contains a literal
+        // backslash followed by `n` or `"`.
+        const rustJson = (jsonMatch as RegExpMatchArray)[1].replace(
+            /\\(n|"|\\)/g,
+            (_, escaped: string) => (escaped === "n" ? "\n" : escaped),
+        );
         expect(rustJson).toBe(canonical);
         const digestMatch = rust.match(
             /pub const RELEASE_CONTRACT_SHA256: &str = "([0-9a-f]{64})";/,
@@ -411,6 +414,45 @@ describe("platform floors", () => {
             expect(mac.synapse).toBe("unsupported");
             expect(mac.synapseReason).toBe("synapse_unsupported");
         }
+    });
+
+    test("real-world version strings at the floor are supported", () => {
+        // RHEL/Rocky 8 report exactly these shapes at the contract floors.
+        const rhel8 = evaluatePlatform(contract, {
+            os: "linux",
+            arch: "x64",
+            libc: "gnu",
+            kernel: "4.18.0-513.el8.x86_64",
+            glibc: "2.28-236.el8",
+            procfsSelfFdExec: true,
+        });
+        expect(rhel8).toEqual({
+            supported: true,
+            target: "linux-x64-gnu",
+            synapse: "certified_cpu",
+        });
+        // A messy string below the floor still fails it.
+        expect(
+            evaluatePlatform(contract, {
+                os: "linux",
+                arch: "x64",
+                libc: "gnu",
+                kernel: "4.17.0-generic",
+                glibc: "2.28",
+                procfsSelfFdExec: true,
+            }),
+        ).toEqual({ supported: false, reason: "unsupported_platform" });
+        // Entirely non-numeric components count as 0, failing closed.
+        expect(
+            evaluatePlatform(contract, {
+                os: "linux",
+                arch: "x64",
+                libc: "gnu",
+                kernel: "rolling",
+                glibc: "2.28",
+                procfsSelfFdExec: true,
+            }),
+        ).toEqual({ supported: false, reason: "unsupported_platform" });
     });
 
     test("below-floor and missing-capability hosts are unsupported_platform", () => {

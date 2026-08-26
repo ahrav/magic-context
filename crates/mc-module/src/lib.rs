@@ -35037,6 +35037,23 @@ mod release_contract_tests {
         );
         assert_eq!(release_contract::TRANSACTION_LOCK_NAME, "transaction.lock");
         assert_eq!(release_contract::LIFETIME_LOCK_NAME, "lifetime.lock");
+        // Bind the frozen contract to the constants the daemon actually
+        // locks: the coordination names exist in two authorities (mc-host
+        // cannot depend on the contract-bearing mc-module), and drift
+        // between them is mixed-release lock-splitting — the exact failure
+        // the stable coordination files exist to prevent.
+        assert_eq!(
+            release_contract::COORDINATION_DIRECTORY,
+            mc_host::COORDINATION_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::TRANSACTION_LOCK_NAME,
+            mc_host::TRANSACTION_LOCK_NAME
+        );
+        assert_eq!(
+            release_contract::LIFETIME_LOCK_NAME,
+            mc_host::LIFETIME_LOCK_NAME
+        );
         let coordination = contract()["coordination"].clone();
         assert_eq!(
             coordination["directory"],
@@ -35049,6 +35066,19 @@ mod release_contract_tests {
         assert_eq!(
             coordination["lifetime_lock"],
             json!(release_contract::LIFETIME_LOCK_NAME)
+        );
+    }
+
+    /// The contract freezes the daemon version, while mc-host derives its
+    /// advertised `daemon_ver` from `CARGO_PKG_VERSION`. Binding them here
+    /// makes a crate version bump force contract regeneration instead of
+    /// shipping a daemon that trips `incompatible_daemon` against its own
+    /// launcher.
+    #[test]
+    fn the_default_daemon_ver_matches_the_frozen_contract() {
+        assert_eq!(
+            mc_host::HostConfig::default().daemon_ver,
+            release_contract::DAEMON_VERSION
         );
     }
 

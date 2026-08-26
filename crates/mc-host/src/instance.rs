@@ -228,7 +228,8 @@ impl InstanceGuard {
         lock_instance(&dir, &dir_path)?;
         // An unknown lifecycle schema at the record name is quarantined:
         // starting here would overwrite it, so refuse before any mutation.
-        if crate::lifecycle::quarantined_record_present(&dir) {
+        // The gate fails closed: an undecidable record blocks the start.
+        if crate::lifecycle::quarantined_record_present(&dir, &dir_path)? {
             return Err(InstanceError::UnsupportedStateSchema {
                 path: dir_path.join(crate::lifecycle::LIFECYCLE_RECORD_NAME),
             });
@@ -555,7 +556,11 @@ pub(crate) fn write_atomic_owner_only(
 /// overlap: renaming `run` or `cortexkit` away lets a successor anchor a
 /// fresh inode under the same name. Overlap across replacement is refused by
 /// `crate::lifecycle::LifetimeLock`, acquired before this lock on the
-/// never-renamed coordination file.
+/// never-renamed coordination file — but only among coordination-aware
+/// releases: a rollback to a release that predates the lifetime fence
+/// reinstates the replacement-overlap hazard unless the daemon is fully
+/// stopped first, and an external rename of `.mc-host-coordination` itself
+/// (out of contract) splits the fence the same way.
 /// commentlint: allow(JUDGE)
 fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
     match flock(dir, FlockOperation::NonBlockingLockExclusive) {

@@ -1178,15 +1178,27 @@ export interface PlatformProbe {
     procfsSelfFdExec?: boolean;
 }
 
-function compareDotted(a: string, b: string): number {
-    const pa = a.split(".").map(Number);
-    const pb = b.split(".").map(Number);
-    const len = Math.max(pa.length, pb.length);
-    for (let i = 0; i < len; i++) {
-        const da = pa[i] ?? 0;
-        const db = pb[i] ?? 0;
-        if (da !== db) return da - db;
-        if (Number.isNaN(da) || Number.isNaN(db)) return Number.NaN;
+/**
+ * Compares a host-reported dotted version against a contract floor over the
+ * floor's precision. Host strings are messy in exactly the deployments the
+ * floors encode — `uname -r` reports `4.18.0-513.el8.x86_64` and glibc
+ * reports `2.28-236.el8` on the RHEL-8 floor — so each probe component
+ * contributes its leading integer and a component with no leading digits
+ * counts as 0 (conservative: it can only fail the floor, never satisfy it).
+ * Floors themselves are validated as clean dotted versions; a malformed
+ * floor yields NaN so `>= 0` checks fail closed.
+ */
+function compareDotted(probe: string, floor: string): number {
+    const floorParts = floor.split(".").map(Number);
+    const probeParts = probe.split(".").map((part) => {
+        const digits = /^\d+/.exec(part);
+        return digits === null ? 0 : Number(digits[0]);
+    });
+    for (let i = 0; i < floorParts.length; i++) {
+        const df = floorParts[i] ?? 0;
+        if (Number.isNaN(df)) return Number.NaN;
+        const dp = probeParts[i] ?? 0;
+        if (dp !== df) return dp - df;
     }
     return 0;
 }

@@ -40,7 +40,11 @@
         }
     },
     "files": {
-        "includes": ["src/**/*.ts", "scripts/**/*.mjs"]
+        "includes": [
+            "src/**/*.ts",
+            "scripts/**/*.mjs",
+            "!src/shared/mc-host-lifecycle/generated-contract.ts"
+        ]
     },
     "overrides": [
         {
