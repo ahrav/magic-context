@@ -1,6 +1,6 @@
-commit=6b4913922b6cfe486c80d2d5507a1b34bd5bd1ba
+commit=6b91b7cd91480943ffa30cd163cb853a5ab10f25
 kernel=Linux 6.12.100-125.179.amzn2023.aarch64 aarch64 GNU/Linux
 rustc=rustc 1.94.1 (e408947bf 2026-03-25)
 cpus=32
-host_load_before=2.34 4.26 4.07
+host_load_before=2.54 3.91 3.42
 command=cargo run -q -p mc-host --release --example synapse_perf -- --rate 1000 --seconds 5

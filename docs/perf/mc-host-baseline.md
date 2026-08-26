@@ -179,13 +179,13 @@ successful-response throughput was
 `[301, 306, 336]`.
 
 The post-instrument artifacts are in
-`docs/perf/runs/synapse-metrics-after-6b491392/` at commit
-`6b4913922b6cfe486c80d2d5507a1b34bd5bd1ba`. Across n=3 runs,
+`docs/perf/runs/synapse-metrics-after-6b91b7cd/` at commit
+`6b91b7cd91480943ffa30cd163cb853a5ab10f25`. Across n=3 runs,
 successful-response throughput was
-`[931.2, 954.4, 934.0]` requests/s and p99 was
-`[1696156, 1664541, 1704532]` ns. Post medians were 934.0 requests/s and
-1,696,156 ns; both are inside the corresponding baseline envelope. Rejected
-responses were `[344, 228, 330]`. Both p99 arrays contain successful responses
+`[945.8, 938.4, 930.4]` requests/s and p99 was
+`[1382652, 1232615, 1532503]` ns. Post medians were 938.4 requests/s and
+1,382,652 ns; both are inside the corresponding baseline envelope. Rejected
+responses were `[271, 308, 348]`. Both p99 arrays contain successful responses
 only, and throughput is successful responses per send-window second. The
 differing rejection counts mean the arms observed different successful
 populations, which limits any latency or throughput comparison between them.
@@ -194,7 +194,7 @@ Verdict: no detectable regression.
 
 This is low-resolution evidence from three five-second runs per arm. Recorded
 pre-run load also differed: 2.40/1.66/0.99 for the
-baseline and 2.34/4.26/4.07 after instrumentation. Do not use this result to
+baseline and 2.54/3.91/3.42 after instrumentation. Do not use this result to
 claim a smaller effect than the run spread can resolve.
 
 ## Environment record (fill per collection)
