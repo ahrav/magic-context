@@ -26,19 +26,23 @@ afterEach(async () => {
     const cleanup = [
         ...harnesses.splice(0).map((harness) => () => harness.dispose()),
         ...spawned.splice(0).map((opencode) => async () => {
-            const killed = await Promise.allSettled([opencode.kill()]);
-            const tempRoot = dirname(opencode.env.configDir);
-            const removed = await Promise.allSettled([
-                Promise.resolve().then(() => {
-                    rmSync(tempRoot, { recursive: true, force: true });
-                    expect(existsSync(tempRoot)).toBe(false);
-                }),
-            ]);
-            const failure = [...killed, ...removed].find(
-                (result): result is PromiseRejectedResult =>
-                    result.status === "rejected",
-            );
-            if (failure) throw failure.reason;
+            // Both steps always run: a failed kill must not leak the temp tree,
+            // and a failed removal must not hide a kill error. First failure
+            // wins, matching the cleanup idiom in `spawn.ts`.
+            let cleanupError: unknown;
+            try {
+                await opencode.kill();
+            } catch (error) {
+                cleanupError = error;
+            }
+            try {
+                const tempRoot = dirname(opencode.env.configDir);
+                rmSync(tempRoot, { recursive: true, force: true });
+                expect(existsSync(tempRoot)).toBe(false);
+            } catch (error) {
+                cleanupError ??= error;
+            }
+            if (cleanupError !== undefined) throw cleanupError;
         }),
         ...mocks.splice(0).map((mock) => () => mock.stop()),
     ];

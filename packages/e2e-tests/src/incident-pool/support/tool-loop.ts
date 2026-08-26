@@ -94,8 +94,21 @@ export function caseNamespaceIsUnique(context: CaseDriverContext): boolean {
     );
 }
 
+/**
+ * Historian identity substring, deliberately shorter than the production
+ * signature line so this stays a *selector* rather than the broad hidden-agent
+ * *filter* in `cache-analysis.ts`. This one answers "should my matcher reply to
+ * this request", so it must match the historian and not the dreamer, sidekick,
+ * or OpenCode's own title/summary/compaction agents.
+ *
+ * Its relationship to the shared signature is pinned by a test in
+ * `cache-analysis.test.ts`: editing the production historian opener without
+ * updating this marker fails loudly instead of silently desyncing.
+ */
 const HISTORIAN_SYSTEM_MARKER =
     "the hippocampus of a long-running coding agent";
+
+export const HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST = HISTORIAN_SYSTEM_MARKER;
 
 function isHistorianRequest(body: Record<string, unknown>): boolean {
     if (JSON.stringify(body.messages ?? "").includes("<new_messages>"))
