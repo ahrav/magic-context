@@ -2151,3 +2151,46 @@ describe("facade helpers", () => {
         expect(isMcHostCallError(null)).toBe(false);
     });
 });
+
+describe("shm re-upgrade probe eligibility (R11)", () => {
+    test("exact unavailable emits fallbackReason and starts a shadow probe", async () => {
+        const provider = createFakePairedProvider();
+        const events: McHostDiagnosticsEvent[] = [];
+        const peer = await startPeer({
+            negotiate: (frame, conn) => {
+                void conn.send({
+                    ty: PeerFrameType.Response,
+                    channel: 0,
+                    epoch: 0,
+                    corr: frame.corr,
+                    body: Buffer.from(
+                        JSON.stringify({
+                            op: "transport.negotiate",
+                            negotiation_version: 1,
+                            selected: { transport: "tcp", capability_version: 1 },
+                            reason: "unavailable",
+                        }),
+                        "utf8",
+                    ),
+                });
+            },
+        });
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        const client = await McHostClient.connect({
+            connectionFile: filePath,
+            transportProviders: [provider],
+            diagnostics: (event) => events.push(event),
+        });
+        clients.push(client);
+        const connectedEvent = events.find((e) => e.type === "connected") as McHostDiagnosticsEvent;
+        expect(connectedEvent.transport).toBe("tcp");
+        expect(connectedEvent.fallbackReason).toBe("unavailable");
+        // The shadow probe dials a SECOND authenticated connection while
+        // the primary stays published and usable.
+        await waitUntil(() => peer.connections.length >= 2, 10_000);
+        const shadow = peer.connections[1] as FakePeerConnection;
+        await shadow.authenticated;
+        expect(shadow.clientAuthValid).toBe(true);
+    });
+});

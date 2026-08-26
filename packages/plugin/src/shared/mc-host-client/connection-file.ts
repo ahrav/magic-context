@@ -36,7 +36,9 @@ export const WIRE_VERSION = 2;
 export type ConnectionFileErrorCode =
     | "unsupported_platform"
     | "deadline_expired"
+    | "not_found"
     | "open_failed"
+    | "stat_failed"
     | "not_regular_file"
     | "foreign_owner"
     | "insecure_permissions"
@@ -115,6 +117,14 @@ function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
     return a.dev === b.dev && a.ino === b.ino;
 }
 
+function statErrno(error: unknown): string | undefined {
+    if (error && typeof error === "object" && "code" in error) {
+        const code = (error as { code?: unknown }).code;
+        return typeof code === "string" ? code : undefined;
+    }
+    return undefined;
+}
+
 function currentUid(): number {
     if (typeof process.getuid !== "function") {
         throw new ConnectionFileError(
@@ -132,6 +142,16 @@ async function openNoFollow(filePath: string): Promise<FileHandle> {
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
     } catch (error) {
+        // Only absence (ENOENT) is retryable republication churn; EACCES,
+        // ELOOP, descriptor exhaustion, and every other open fault is
+        // permanent evidence that must stop a recovery episode.
+        if (statErrno(error) === "ENOENT") {
+            throw new ConnectionFileError(
+                `connection file ${filePath} does not exist`,
+                "not_found",
+                error,
+            );
+        }
         throw new ConnectionFileError(
             `failed to open connection file ${filePath}`,
             "open_failed",
@@ -197,7 +217,25 @@ async function snapshotDirect(
     afterOpen?: () => void | Promise<void>,
 ): Promise<Uint8Array> {
     checkDeadline(deadline);
-    const before = await lstat(filePath);
+    // Stat failures split by errno: an absent path (ENOENT) during daemon
+    // republication is retryable `not_found` churn, while EACCES, ENOTDIR,
+    // ELOOP, and every other stat fault is permanent configuration
+    // evidence (`stat_failed`) that must stop a recovery episode instead
+    // of retrying to its deadline.
+    const before = await lstat(filePath).catch((error: unknown) => {
+        if (statErrno(error) === "ENOENT") {
+            throw new ConnectionFileError(
+                `connection file ${filePath} does not exist`,
+                "not_found",
+                error,
+            );
+        }
+        throw new ConnectionFileError(
+            `failed to stat connection file ${filePath}`,
+            "stat_failed",
+            error,
+        );
+    });
     if (before.isSymbolicLink()) {
         throw new ConnectionFileError(
             `connection file ${filePath} is a symlink; client discovery must reject symbolic links`,
@@ -225,7 +263,23 @@ async function snapshotDirect(
         checkDeadline(deadline);
         const bytes = await readBounded(handle, deadline);
         checkDeadline(deadline);
-        const after = await lstat(filePath);
+        // An unlink after the read (ENOENT) is a replacement event: the
+        // one-restart rule (KTD3) and churn retry classification apply.
+        // Any other stat fault is permanent evidence, as above.
+        const after = await lstat(filePath).catch((error: unknown) => {
+            if (statErrno(error) === "ENOENT") {
+                throw new ConnectionFileError(
+                    `connection file ${filePath} was removed during the snapshot`,
+                    "replaced_during_read",
+                    error,
+                );
+            }
+            throw new ConnectionFileError(
+                `failed to re-stat connection file ${filePath}`,
+                "stat_failed",
+                error,
+            );
+        });
         if (!after.isFile() || !sameIdentity(during, after)) {
             throw new ConnectionFileError(
                 `connection file ${filePath} was replaced during the snapshot`,

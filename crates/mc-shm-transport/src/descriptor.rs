@@ -538,6 +538,8 @@ pub enum DescriptorError {
     RandomSourceUnavailable,
     /// Hardware-profile identifier is malformed.
     InvalidHardwareProfile,
+    /// Fixed structure is shorter than its declared layout.
+    Truncated,
     /// Descriptor schema is unsupported.
     UnsupportedSchema,
     /// Release belongs to another incarnation.
@@ -575,6 +577,7 @@ impl fmt::Display for DescriptorError {
         formatter.write_str(match self {
             Self::RandomSourceUnavailable => "operating-system random source unavailable",
             Self::InvalidHardwareProfile => "hardware profile identifier is invalid",
+            Self::Truncated => "fixed structure is truncated",
             Self::UnsupportedSchema => "descriptor schema is unsupported",
             Self::WrongIncarnation => "release identity does not match incarnation",
             Self::WrongLane => "release identity does not match lane",

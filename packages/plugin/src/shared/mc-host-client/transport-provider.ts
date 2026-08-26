@@ -46,6 +46,12 @@ export interface CandidateChannelArgs {
     budget: ByteBudget;
     maxBodyLen: number;
     handlers: FrameChannelHandlers;
+    /**
+     * Authenticated per-incarnation daemon identity from the connection
+     * snapshot that negotiated this grant. Providers scoping replay state
+     * (candidate watermarks) key on it, never on the reusable PID.
+     */
+    daemonId: Uint8Array;
 }
 
 export interface ClientTransportProvider {
@@ -242,7 +248,8 @@ export function sanitizedCandidateFactory(
     transport: string,
     provider: ClientTransportProvider,
     descriptor: OpaqueObject,
-): (args: CandidateChannelArgs) => SetupFrameChannel {
+    daemonId: Uint8Array,
+): (args: Omit<CandidateChannelArgs, "daemonId">) => SetupFrameChannel {
     return (args) => {
         // Wrapped flush() calls settle here on channel close, matching the
         // FrameChannel contract, instead of waiting out their deadlines.
@@ -430,6 +437,7 @@ export function sanitizedCandidateFactory(
                                 closeUpstream("protocol_violation", "channel");
                             }
                             charged = 0;
+                            args.handlers.onLeaseReleased?.();
                         },
                         copyCounter,
                         () => (providerLease.release() ? "released" : "quarantined"),
@@ -504,7 +512,7 @@ export function sanitizedCandidateFactory(
         };
         let channel: SetupFrameChannel;
         try {
-            channel = provider.connect(descriptor, { ...args, handlers });
+            channel = provider.connect(descriptor, { ...args, daemonId, handlers });
         } catch {
             throw sanitizedProviderError(transport, "connect");
         }

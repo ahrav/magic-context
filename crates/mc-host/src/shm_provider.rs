@@ -11,7 +11,7 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
 use crate::wire::{decode_header, EnvelopeHeader, FrameType};
@@ -23,7 +23,7 @@ use mc_shm_transport::descriptor::{
     SchedulingMode, TransportDescriptor, WorkloadClass,
 };
 use mc_shm_transport::profile::{
-    AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
+    Admission, AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
     ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
 };
 use tokio::sync::mpsc;
@@ -34,8 +34,12 @@ use crate::frame_channel::{
     frame_sender, validate_inbound_header, BoxedReceiver, CopyCounter, DirectFrame, FrameReceiver,
     InboundEvent, InboundFrame, OutboundFrame, ReadClose, RejectedFrame, SenderQueue, COMPLETE,
 };
+use crate::provider_recovery::{
+    CleanupOutcome, ProviderReadiness, ProviderRecovery, RecoveryBackend, SystemClock,
+};
 use crate::transport_provider::{
-    Candidate, InjectedProvider, PreparedCandidate, ProviderContext, ProviderFailure,
+    Candidate, InjectedProvider, PreflightEligibility, PreparedCandidate, ProviderContext,
+    ProviderFailure,
 };
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
@@ -51,6 +55,12 @@ const DESCRIPTOR_DEPTH: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
 static NEXT_CANDIDATE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Test-only observer invoked after each successful frame publication with
+/// the published frame's type and channel. It receives no descriptors,
+/// payloads, or provider data.
+#[doc(hidden)]
+pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
 /// Exact offer parameters required to select the test-only provider.
 pub fn qualified_test_parameters() -> serde_json::Value {
@@ -109,16 +119,59 @@ pub struct ShmProvider {
     admission: Arc<AdmissionController>,
     preparations: AtomicU64,
     quarantine_next_close: Arc<AtomicBool>,
+    recovery: ProviderRecovery,
+    recovery_cleanups: Arc<AtomicU64>,
+    publish_hook: Mutex<Option<PublishHook>>,
+    held_admission: Mutex<Option<Admission>>,
+}
+
+/// Recovery primitives for the thread-confined ring endpoint. The rings die
+/// with their endpoint thread, so a suspect close leaves alias state
+/// uncertain: cleanup isolates instead of reclaiming. commentlint: allow(JUDGE)
+struct ShmRecoveryBackend {
+    profile: Arc<TargetProfile>,
+    admission: Arc<AdmissionController>,
+    cleanups: Arc<AtomicU64>,
+}
+
+impl RecoveryBackend for ShmRecoveryBackend {
+    fn cleanup(&self, _candidate_id: u64) -> CleanupOutcome {
+        self.cleanups.fetch_add(1, Ordering::AcqRel);
+        CleanupOutcome::Uncertain
+    }
+
+    fn probe(&self) -> bool {
+        // No shared state outlives the endpoint thread, so isolation alone
+        // proves the provider side is clean.
+        true
+    }
+
+    fn admission_fits(&self) -> bool {
+        self.admission.can_admit(&self.profile, None).is_ok()
+    }
 }
 
 impl ShmProvider {
     /// Builds provider with explicit process-wide admission limits.
     pub fn for_qualified_test_profile(limits: ShmHostLimits) -> Self {
+        let profile = Arc::new(qualified_test_profile());
+        let admission = Arc::new(AdmissionController::new(limits));
+        let recovery_cleanups = Arc::new(AtomicU64::new(0));
+        let backend = Arc::new(ShmRecoveryBackend {
+            profile: Arc::clone(&profile),
+            admission: Arc::clone(&admission),
+            cleanups: Arc::clone(&recovery_cleanups),
+        });
+        let recovery = ProviderRecovery::new(backend, Arc::new(SystemClock::new()));
         Self {
-            profile: Arc::new(qualified_test_profile()),
-            admission: Arc::new(AdmissionController::new(limits)),
+            profile,
+            admission,
             preparations: AtomicU64::new(0),
             quarantine_next_close: Arc::new(AtomicBool::new(false)),
+            recovery,
+            recovery_cleanups,
+            publish_hook: Mutex::new(None),
+            held_admission: Mutex::new(None),
         }
     }
 
@@ -147,6 +200,55 @@ impl ShmProvider {
         self.quarantine_next_close.store(true, Ordering::Release);
     }
 
+    /// Test hook: install a publication observer for candidates prepared
+    /// after this call. The hook runs on the endpoint thread after the ring
+    /// commit. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn set_publish_hook(&self, hook: PublishHook) {
+        *self.publish_hook.lock().expect("publish hook lock") = Some(hook);
+    }
+
+    /// Test hook: hold one profile's admission charges so preflight reports
+    /// exact dynamic unavailability. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn hold_admission(&self) -> bool {
+        let mut held = self.held_admission.lock().expect("held admission lock");
+        if held.is_some() {
+            return false;
+        }
+        match self.admission.admit(&self.profile, None) {
+            Ok(admission) => {
+                *held = Some(admission);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Test hook: end the admission hold. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn release_admission(&self) {
+        if let Some(admission) = self
+            .held_admission
+            .lock()
+            .expect("held admission lock")
+            .take()
+        {
+            admission.release();
+        }
+    }
+
+    /// Provider offer readiness (R6): governs new offers only.
+    pub fn readiness(&self) -> ProviderReadiness {
+        self.recovery.readiness()
+    }
+
+    /// Number of recovery cleanup calls the controller dispatched. Preflight
+    /// must never move this counter (R6, seeded-defect detector).
+    pub fn recovery_cleanup_count(&self) -> u64 {
+        self.recovery_cleanups.load(Ordering::Acquire)
+    }
+
     fn offer_is_exact(parameters: Option<&serde_json::Value>) -> bool {
         parameters == Some(&qualified_test_parameters())
     }
@@ -170,23 +272,36 @@ impl InjectedProvider for ShmProvider {
         SHM_CAPABILITY_VERSION
     }
 
-    fn preflight(&self, parameters: Option<&serde_json::Value>) -> bool {
-        cfg!(target_os = "linux")
-            && Self::offer_is_exact(parameters)
-            && self.admission.can_admit(&self.profile, None).is_ok()
+    fn preflight(&self, parameters: Option<&serde_json::Value>) -> PreflightEligibility {
+        if !cfg!(target_os = "linux") || !Self::offer_is_exact(parameters) {
+            return PreflightEligibility::StaticallyOmitted;
+        }
+        if self.recovery.readiness() != ProviderReadiness::Ready
+            || self.admission.can_admit(&self.profile, None).is_err()
+        {
+            return PreflightEligibility::DynamicallyUnavailable;
+        }
+        PreflightEligibility::Serveable
     }
 
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure> {
         if !cfg!(target_os = "linux") || !Self::offer_is_exact(ctx.offer_parameters()) {
             return Err(ProviderFailure::Unavailable);
         }
-        let admission = self
-            .admission
-            .admit(&self.profile, None)
-            .map_err(|_| ProviderFailure::Unavailable)?;
-        self.preparations.fetch_add(1, Ordering::AcqRel);
-
         let candidate_id = NEXT_CANDIDATE_ID.fetch_add(1, Ordering::Relaxed);
+        // Readiness and admission are one atomic decision under the
+        // recovery lock: a suspect reported between a separate readiness
+        // check and the admission would otherwise let this preparation
+        // admit resources, create rings, and publish a grant into a
+        // recovery episode (KTD6: `Recovering` is unoffered). Custody of
+        // the exact admission charges moves into one lifecycle record
+        // before the candidate is exposed (KTD4).
+        let custody = self
+            .recovery
+            .admit_candidate_while_ready(candidate_id, &self.admission, &self.profile)
+            .ok_or(ProviderFailure::Unavailable)?;
+        self.preparations.fetch_add(1, Ordering::AcqRel);
+        let recovery = self.recovery.clone();
         let root = CancellationToken::new();
         let read_cancel = root.child_token();
         let (sender, queue) = frame_sender(ctx.queue_frames, root.clone(), ctx.frame_deadline);
@@ -199,6 +314,7 @@ impl InjectedProvider for ShmProvider {
         let worker_root = root.clone();
         let worker_read_cancel = read_cancel.clone();
         let quarantine_next_close = Arc::clone(&self.quarantine_next_close);
+        let publish_hook = self.publish_hook.lock().expect("publish hook lock").clone();
 
         let spawned = std::thread::Builder::new()
             .name("mc-host-shm-endpoint".to_owned())
@@ -241,13 +357,17 @@ impl InjectedProvider for ShmProvider {
                         frame_deadline,
                         worker_root,
                         worker_read_cancel,
+                        publish_hook,
                     ))
                 }))
                 .unwrap_or(false);
                 if clean && !quarantine_next_close.swap(false, Ordering::AcqRel) {
-                    admission.release();
+                    let _ = custody.release();
                 } else {
-                    let _ = admission.quarantine();
+                    // Unclean close (or the forced test hook): the record
+                    // becomes a suspect and the recovery controller decides
+                    // between reclamation and isolation (KTD4).
+                    recovery.report_suspect(custody);
                 }
                 let _ = done_tx.send(());
             });
@@ -336,6 +456,7 @@ impl FrameReceiver for ShmReceiver {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_endpoint(
     rings: DuplexRing,
     mut queue: SenderQueue,
@@ -344,6 +465,7 @@ async fn run_endpoint(
     frame_deadline: Duration,
     root: CancellationToken,
     read_cancel: CancellationToken,
+    publish_hook: Option<PublishHook>,
 ) -> bool {
     let discard = queue.discard.clone();
     let finish = queue.finish.clone();
@@ -358,6 +480,7 @@ async fn run_endpoint(
                 &ingress,
                 frame_deadline,
                 &read_cancel,
+                publish_hook.as_ref(),
             )
             .await
             {
@@ -412,7 +535,7 @@ async fn run_endpoint(
         let Some(queued) = queued else {
             continue;
         };
-        if publish_one(&rings.first, queued, frame_deadline).is_err() {
+        if publish_one(&rings.first, queued, frame_deadline, publish_hook.as_ref()).is_err() {
             queue.retired.cancel();
             root.cancel();
             return false;
@@ -427,6 +550,7 @@ async fn receive_one(
     ingress: &ByteBudget,
     frame_deadline: Duration,
     read_cancel: &CancellationToken,
+    publish_hook: Option<&PublishHook>,
 ) -> Result<bool, ReadClose> {
     let Some(lease) = rings
         .second
@@ -470,7 +594,7 @@ async fn receive_one(
         // would otherwise miss their deadlines behind it.
         match queue.try_recv() {
             Ok(queued) => {
-                if publish_one(&rings.first, queued, frame_deadline).is_err() {
+                if publish_one(&rings.first, queued, frame_deadline, publish_hook).is_err() {
                     return Err(ReadClose::Corrupt("shared-memory publish failed"));
                 }
             }
@@ -498,6 +622,7 @@ fn publish_one(
     ring: &Ring,
     mut queued: crate::frame_channel::QueuedOutboundFrame,
     frame_deadline: Duration,
+    publish_hook: Option<&PublishHook>,
 ) -> Result<(), ()> {
     if !queued.begin_publication() {
         return Ok(());
@@ -510,6 +635,12 @@ fn publish_one(
         charge,
         written,
     } = queued.frame;
+    let wire_header: Option<[u8; crate::wire::HEADER_LEN]> = match &direct {
+        Some(direct) => Some(direct.header()),
+        None => bytes
+            .get(..crate::wire::HEADER_LEN)
+            .and_then(|header| header.try_into().ok()),
+    };
     let deadline = StdInstant::now() + frame_deadline;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match direct {
         Some(direct) => publish_direct(ring, direct, deadline),
@@ -519,6 +650,11 @@ fn publish_one(
         return Err(());
     }
     completion.store(COMPLETE, Ordering::Release);
+    if let Some(hook) = publish_hook {
+        if let Some(header) = wire_header.and_then(|header| decode_header(&header).ok()) {
+            hook(header.ty, header.channel);
+        }
+    }
     if let Some(written) = written {
         written(Instant::now());
     }
@@ -690,19 +826,45 @@ mod tests {
     #[test]
     fn platform_preflight_is_side_effect_free() {
         let provider = ShmProvider::for_qualified_test_profile(single_candidate_limits());
+        let expected = if cfg!(target_os = "linux") {
+            PreflightEligibility::Serveable
+        } else {
+            PreflightEligibility::StaticallyOmitted
+        };
         assert_eq!(
             provider.preflight(Some(&qualified_test_parameters())),
-            cfg!(target_os = "linux")
+            expected
         );
+        assert_eq!(
+            provider.preflight(Some(&serde_json::json!({}))),
+            PreflightEligibility::StaticallyOmitted
+        );
+        assert_eq!(provider.readiness(), ProviderReadiness::Ready);
         assert_eq!(provider.preparation_count(), 0);
+        assert_eq!(provider.recovery_cleanup_count(), 0);
         let accounting = provider.accounting().unwrap();
         assert_eq!(accounting.active, ResourceCharges::ZERO);
         assert_eq!(accounting.quarantined, ResourceCharges::ZERO);
     }
 
+    #[test]
+    fn qualified_test_profile_pins_client_grant_geometry() {
+        let profile = qualified_test_profile();
+        assert_eq!(profile.descriptor_depth(), 8);
+        assert_eq!(profile.max_leases(), 8);
+        assert_eq!(profile.arena_bytes(), mc_shm_transport::MIN_ARENA_BYTES);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
         let rings = DuplexRing::create(&qualified_test_profile()).unwrap();
+        let encoded = rings.first.grant().encode();
+        assert_eq!(u64::from_le_bytes(encoded[22..30].try_into().unwrap()), 8);
+        assert_eq!(u64::from_le_bytes(encoded[38..46].try_into().unwrap()), 8);
+        assert_eq!(
+            u64::from_le_bytes(encoded[46..54].try_into().unwrap()),
+            (mc_shm_transport::MIN_ARENA_BYTES + 8_192) as u64
+        );
         let body = b"copy";
         let header = EnvelopeHeader {
             len: body.len() as u32,
@@ -730,6 +892,7 @@ mod tests {
             &ByteBudget::new(1024),
             Duration::from_secs(1),
             &CancellationToken::new(),
+            None,
         )
         .await
         .unwrap());

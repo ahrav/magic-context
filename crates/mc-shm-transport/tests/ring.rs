@@ -272,6 +272,20 @@ fn quarantine_rejects_all_operations_and_reports_conservation() {
 }
 
 #[test]
+fn probe_reads_shared_state_without_consuming_a_frame() {
+    let ring = Ring::create(&profile(), 27).unwrap();
+    publish(&ring, &[7]);
+    ring.probe().unwrap();
+    // The published frame is still receivable after the probe.
+    let lease = ring.try_receive().unwrap().unwrap();
+    assert_eq!(lease.segment(0).unwrap().read_byte(0), Some(7));
+    lease.release().unwrap();
+    ring.probe().unwrap();
+    ring.enter_quarantine();
+    assert!(matches!(ring.probe(), Err(RingError::Quarantined)));
+}
+
+#[test]
 fn lease_limit_reports_backpressure_then_recovers_after_release() {
     let ring = Ring::create(&lease_limited_profile(), 18).unwrap();
     publish(&ring, &[1]);
@@ -379,24 +393,45 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
     let ring = Ring::create(&profile(), 21).unwrap();
     let base = ring.grant().encode();
 
-    let mut cases = Vec::new();
+    // Geometry tampering fails closed inside the pure grant decoder.
     let mut version = base;
     version[0..2].copy_from_slice(&1u16.to_le_bytes());
-    cases.push(version);
-    let mut incarnation = base;
-    incarnation[2] ^= 1;
-    cases.push(incarnation);
-    let mut lane = base;
-    lane[18] ^= 1;
-    cases.push(lane);
+    let mut zero_depth = base;
+    zero_depth[22..30].copy_from_slice(&0u64.to_le_bytes());
+    let mut small_arena = base;
+    small_arena[30..38].copy_from_slice(&(MAX_FRAME_BYTES as u64 - 1).to_le_bytes());
+    let mut zero_leases = base;
+    zero_leases[38..46].copy_from_slice(&0u64.to_le_bytes());
+    let mut excess_leases = base;
+    excess_leases[38..46].copy_from_slice(&u64::MAX.to_le_bytes());
     let mut depth = base;
     depth[22..30].copy_from_slice(&31u64.to_le_bytes());
-    cases.push(depth);
     let mut arena = base;
     arena[30..38].copy_from_slice(&(MAX_FRAME_BYTES as u64 + 4096).to_le_bytes());
-    cases.push(arena);
+    let mut total = base;
+    total[46..54].copy_from_slice(&(ring.object_size() as u64 + 1).to_le_bytes());
+    let mut reserved = base;
+    reserved[54] = 1;
+    for bytes in [
+        version,
+        zero_depth,
+        small_arena,
+        zero_leases,
+        excess_leases,
+        depth,
+        arena,
+        total,
+        reserved,
+    ] {
+        assert_eq!(RingGrant::decode(bytes), Err(RingError::InvalidGrant));
+    }
 
-    for bytes in cases {
+    // Identity tampering passes `RingGrant::decode` but `Ring::attach` rejects it.
+    let mut incarnation = base;
+    incarnation[2] ^= 1;
+    let mut lane = base;
+    lane[18] ^= 1;
+    for bytes in [incarnation, lane] {
         let grant = RingGrant::decode(bytes).unwrap();
         assert!(matches!(
             Ring::attach(
@@ -407,10 +442,6 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
             Err(RingError::InvalidGrant)
         ));
     }
-
-    let mut reserved = base;
-    reserved[54] = 1;
-    assert_eq!(RingGrant::decode(reserved), Err(RingError::InvalidGrant));
 
     let name = c"mc-shm-unsealed-test";
     // SAFETY: static name and flags are valid for memfd_create.
@@ -433,6 +464,81 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
         Ring::attach(unsealed, ring.grant(), SchedulingMode::ColdParkWake),
         Err(RingError::ObjectValidationFailed)
     ));
+}
+
+#[test]
+fn grant_slice_rejects_every_truncation_point_and_one_byte_suffix() {
+    let encoded_len = RingGrant::encoded_len();
+    let valid = {
+        let ring = Ring::create(&profile(), 25).unwrap();
+        ring.grant().encode()
+    };
+    assert!(RingGrant::decode_slice(&valid).is_ok());
+
+    for cut in 0..encoded_len {
+        assert_eq!(
+            RingGrant::decode_slice(&valid[..cut]),
+            Err(RingError::InvalidGrant),
+            "truncation at byte {cut} must be rejected"
+        );
+    }
+    let mut suffixed = valid.to_vec();
+    suffixed.push(0);
+    assert_eq!(
+        RingGrant::decode_slice(&suffixed),
+        Err(RingError::InvalidGrant),
+        "one-byte suffix must be rejected"
+    );
+    assert_eq!(
+        RingGrant::decode_slice(&[]),
+        Err(RingError::InvalidGrant),
+        "empty grant must be rejected"
+    );
+}
+
+/// The fuzz corpus seed `provider_grant/valid` doubles as the golden grant
+/// fixture: one exact `RingGrant::encode` output carrying the frozen
+/// ring-profile geometry.
+#[test]
+fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
+    const GOLDEN_GRANT_HEX: &str = "0200d489c07ee46333a5fe7901df356f6f460000000020000000000000\
+                                    0000000004000000002000000000000000004000040000000000000000";
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/provider_grant/valid");
+    let bytes = std::fs::read(path).expect("golden grant fixture is readable");
+    let text: String = bytes.iter().fold(String::new(), |mut text, byte| {
+        use std::fmt::Write;
+        write!(text, "{byte:02x}").unwrap();
+        text
+    });
+    assert_eq!(
+        text,
+        GOLDEN_GRANT_HEX.replace(char::is_whitespace, ""),
+        "the checked-in fixture bytes moved; update the copy of this hex in \
+         packages/plugin/src/shared/mc-host-client/shm-transport-provider.test.ts too"
+    );
+    let grant = RingGrant::decode_slice(&bytes).expect("golden grant fixture decodes");
+    assert_eq!(
+        grant.encode().as_slice(),
+        bytes.as_slice(),
+        "golden grant fixture must round-trip byte-exactly"
+    );
+    let frozen = profile();
+    let field =
+        |range: std::ops::Range<usize>| u64::from_le_bytes(bytes[range].try_into().unwrap());
+    assert_eq!(
+        u16::from_le_bytes([bytes[0], bytes[1]]),
+        2,
+        "layout version"
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[18..22].try_into().unwrap()),
+        0,
+        "host-to-peer lane"
+    );
+    assert_eq!(field(22..30), frozen.descriptor_depth() as u64);
+    assert_eq!(field(30..38), frozen.arena_bytes() as u64);
+    assert_eq!(field(38..46), frozen.max_leases() as u64);
 }
 
 #[cfg(target_os = "linux")]

@@ -1,0 +1,10 @@
+{
+  "drill": "SHM-HARDENING-U6",
+  "mutations": [
+    {
+      "name": "SHM_U6_MACOS_IGNORED_SOAK_INVOCATION_REMOVED",
+      "status": "deferred",
+      "reason": "manifest-gated: the failure_hardening manifest is unresolved and retains no macOS tuple, so no dedicated macOS ignored-soak invocation exists to remove and no workflow-coverage validator is implemented yet; freezing a manifest with a retained macOS tuple must add both the invocation and the coverage check"
+    }
+  ]
+}

@@ -96,6 +96,16 @@ impl fmt::Debug for PreparedCandidate {
     }
 }
 
+/// Preflight verdict for one offer (KTD6). commentlint: allow(JUDGE)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightEligibility {
+    Serveable,
+    /// Permanent absence or static ineligibility. commentlint: allow(JUDGE)
+    StaticallyOmitted,
+    /// Transient readiness or admission pressure. commentlint: allow(JUDGE)
+    DynamicallyUnavailable,
+}
+
 /// A test-injected transport provider. Implementations must run KTD9's
 /// attachment gate inside `prepare` and fail with a bounded
 /// [`ProviderFailure`] before yielding a candidate.
@@ -103,10 +113,10 @@ pub trait InjectedProvider: Send + Sync + 'static {
     fn transport(&self) -> &str;
     fn capability_version(&self) -> u32;
 
-    /// Returning `false` omits this provider from selection and permits TCP
-    /// fallback. Implementations must not create resources here. commentlint: allow(JUDGE)
-    fn preflight(&self, _parameters: Option<&serde_json::Value>) -> bool {
-        true
+    /// Implementations must not create resources, run cleanup, or touch workers here (R6). commentlint: allow(JUDGE)
+    /// Readiness changes govern new offers only, never existing candidates. commentlint: allow(JUDGE)
+    fn preflight(&self, _parameters: Option<&serde_json::Value>) -> PreflightEligibility {
+        PreflightEligibility::Serveable
     }
 
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure>;

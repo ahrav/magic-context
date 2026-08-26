@@ -192,6 +192,18 @@ export interface ConnectionGenerationOptions {
     onRetired?: (info: RetirementInfo) => void;
     /** Route Goodbye events; the generation owns no route cache (KTD6). */
     onRouteGoodbye?: (channel: number, epoch: number) => void;
+    /**
+     * onPendingZero signals an owner that outstanding work has drained.
+     * Retirement does not invoke onPendingZero.
+     */
+    onPendingZero?: () => void;
+    /**
+     * Fires after any ReceiveLease minted by this generation's channel is
+     * released. A caller-held binary or stream lease keeps a draining
+     * generation's storage aliased after its pending set empties, so an
+     * owner deferring retirement on `activeReceiveLeases` re-checks here.
+     */
+    onLeaseReleased?: () => void;
     /** Bounded read-only diagnostics hook (KTD12); see ConnectionDiagnosticEvent. */
     onDiagnostic?: (event: ConnectionDiagnosticEvent) => void;
 }
@@ -206,6 +218,8 @@ export interface ConnectionStats {
     queuedDataFrames: number;
     queuedControlFrames: number;
     pendingRequests: number;
+    /** Live ReceiveLeases minted by the channel and not yet released. */
+    activeReceiveLeases: number;
     droppedFrames: number;
     activeTimers: number;
     readPaused: boolean;
@@ -307,6 +321,8 @@ export class ConnectionGeneration {
     private readonly cleanupTicketMs: number;
     private readonly onRetired?: (info: RetirementInfo) => void;
     private readonly onRouteGoodbyeHook?: (channel: number, epoch: number) => void;
+    private readonly onPendingZeroHook?: () => void;
+    private readonly onLeaseReleasedHook?: () => void;
     private readonly onDiagnostic?: (event: ConnectionDiagnosticEvent) => void;
 
     private retiredInfo: RetirementInfo | null = null;
@@ -333,6 +349,8 @@ export class ConnectionGeneration {
         this.cleanupTicketMs = options.cleanupTicketMs ?? DEFAULT_CLEANUP_TICKET_MS;
         this.onRetired = options.onRetired;
         this.onRouteGoodbyeHook = options.onRouteGoodbye;
+        this.onPendingZeroHook = options.onPendingZero;
+        this.onLeaseReleasedHook = options.onLeaseReleased;
         this.onDiagnostic = options.onDiagnostic;
         this.nextCorr = options.firstCorrelation ?? 1n;
         if (this.nextCorr < 1n || this.nextCorr > MAX_CORRELATION) {
@@ -346,6 +364,13 @@ export class ConnectionGeneration {
             onClosed: (reason: FrameChannelCloseReason, error) =>
                 this.retire(reason === "truncated_frame" ? "eof" : reason, error),
             onDiagnostic: (type, meta) => this.emitDiagnostic(type, meta),
+            onLeaseReleased: () => {
+                try {
+                    this.onLeaseReleasedHook?.();
+                } catch {
+                    // Observer exceptions must not affect lease accounting.
+                }
+            },
         };
         this.channel = options.channelFactory
             ? options.channelFactory({ budget: this.budget, maxBodyLen, handlers })
@@ -410,6 +435,7 @@ export class ConnectionGeneration {
             queuedDataFrames: channel.queuedDataFrames,
             queuedControlFrames: channel.queuedControlFrames,
             pendingRequests: this.pending.size,
+            activeReceiveLeases: channel.activeReceiveLeases,
             droppedFrames: this.droppedFrameCount,
             activeTimers: this.timers.size + channel.activeTimers,
             readPaused: channel.readPaused,
@@ -958,6 +984,13 @@ export class ConnectionGeneration {
         releaseReceiveBodies(entry.streamItems);
         entry.streamItems = [];
         this.resolveTicket(entry);
+        if (this.pending.size === 0 && this.retiredInfo === null) {
+            try {
+                this.onPendingZeroHook?.();
+            } catch {
+                // Observer exceptions must not affect protocol progress.
+            }
+        }
     }
 
     private clearEntryDeadline(entry: PendingEntry): void {

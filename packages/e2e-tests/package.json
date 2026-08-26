@@ -9,19 +9,21 @@
         "test:opencode-e2e": "bun scripts/run-test-selection.ts --mode ts --harness opencode --timeout 600000 --max-concurrency 1",
         "test:pi-e2e": "bun scripts/run-test-selection.ts --mode ts --harness pi --timeout 600000",
         "test:rust-e2e": "bun scripts/run-test-selection.ts --mode rust --timeout 600000 --max-concurrency 1",
-        "test:validate-manifest": "bun test scripts/validate-mode-manifest.test.ts scripts/check-rust-prerequisites.test.ts",
+        "test:validate-manifest": "bun test scripts/validate-mode-manifest.test.ts scripts/check-rust-prerequisites.test.ts scripts/validate-shm-hardening-matrix.test.ts",
         "validate-mode-manifest": "bun scripts/validate-mode-manifest.ts --mode ts",
         "validate:incident-history": "bun scripts/validate-incident-history.ts",
         "validate:incident-history:ci": "bun scripts/validate-incident-history.ts --ci",
         "validate:incident-verifiers": "bun scripts/validate-incident-verifiers.ts --base origin/main",
         "validate:incident-verifiers:ci": "bun scripts/validate-incident-verifiers.ts --ci",
+        "validate:shm-hardening-matrix": "bun scripts/validate-shm-hardening-matrix.ts",
         "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
         "test:incident-unit": "bun scripts/run-test-selection.ts --incident-unit --timeout 120000",
         "test:incidents": "bun scripts/run-incident-pool.ts --mode ts --report artifacts/incident-pool-ts-report.json",
         "test:incidents:pi": "bun scripts/run-incident-pool.ts --harness pi --lane known-red --report artifacts/incident-pool-pi-report.json",
         "test:incidents:rust": "bun scripts/run-incident-pool.ts --mode rust --report artifacts/incident-pool-rust-report.json",
         "mutation:rust-historian": "bun scripts/run-rust-historian-producer-mutation.ts",
-        "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts"
+        "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts",
+        "mutation:shm-hardening": "bun scripts/run-mc-shm-hardening-mutation.ts"
     },
     "dependencies": {
         "@opencode-ai/sdk": "^1.15.13"

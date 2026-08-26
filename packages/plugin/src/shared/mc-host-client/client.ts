@@ -84,6 +84,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_ROUTE_OPEN_DEADLINE_MS = 30_000;
 /** Separate bounded shutdown deadline for route and connection Goodbye. */
 const DEFAULT_SHUTDOWN_DEADLINE_MS = 5_000;
+export const DEFAULT_RECOVERY_DEADLINE_MS = 30_000;
 /** Channel-0 control bodies are capped below the frame limit (wire doc 7.1). */
 const MAX_CONTROL_BODY_LEN = 65_536;
 /**
@@ -173,11 +174,28 @@ interface ActiveConnection {
     /** Opaque token binding this connection's route handles. */
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
+    readonly liveRoutes: Map<number, RouteHandle>;
     /** The selected transport remains fixed from publication until retirement. */
     transport: string;
     /** Closed-set reason when the selection was an explicit TCP fallback. */
     fallbackReason?: FallbackReason;
+    role?: "shadow";
 }
+
+/**
+ * One client-wide re-upgrade episode: fenced to the exact source primary, bounded by one immutable deadline, and cancellable so owner close and primary retirement release every shadow connection permit (KTD5-KTD7). commentlint: allow(JUDGE)
+ */
+interface RecoveryEpisode {
+    readonly source: ActiveConnection;
+    readonly deadline: Deadline;
+    cancelled: boolean;
+    readonly shadowGenerations: Set<ConnectionGeneration>;
+}
+
+type ShadowOutcome =
+    | { kind: "promote"; conn: ActiveConnection }
+    | { kind: "retry" }
+    | { kind: "stop" };
 
 interface CachedManagedRoute {
     readonly key: string;
@@ -375,6 +393,26 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
 }
 
 /**
+ * Shadow recovery retries only discovery and dial failures; authentication
+ * and protocol failures stop the episode permanently. Recognition is
+ * name/code-based so a different bundled copy of an error class still
+ * classifies correctly.
+ */
+function isShadowDialTransient(err: unknown): boolean {
+    const name = err instanceof Error ? err.name : undefined;
+    if (name === "AuthError") return false;
+    if (name === "SocketClosedError" || name === "SocketTimeoutError") return true;
+    const code = errorCode(err);
+    return (
+        code === "ECONNREFUSED" ||
+        code === "ECONNRESET" ||
+        code === "EPIPE" ||
+        code === "ETIMEDOUT" ||
+        code === "ENOENT"
+    );
+}
+
+/**
  * The consumer-facing client: connect, route open, raw request, managed
  * call, catalog, and bounded close over one active connection generation.
  */
@@ -384,6 +422,7 @@ export class McHostClient {
     private readonly requestTimeoutMs: number;
     private readonly routeOpenDeadlineMs: number;
     private readonly shutdownDeadlineMs: number;
+    private readonly recoveryDeadlineMs = DEFAULT_RECOVERY_DEADLINE_MS;
     private readonly defaultIdentity: BindIdentity | undefined;
     private readonly defaultTargetKind: ManagedRouteKind;
     private readonly clock: MonotonicClock | undefined;
@@ -396,10 +435,23 @@ export class McHostClient {
 
     private active: ActiveConnection | null = null;
     private connecting: SetupFlight<ActiveConnection> | null = null;
-    private readonly liveRoutes = new Map<number, RouteHandle>();
+    /** Draining generation slot; occupied from promotion until drain completes (KTD7). commentlint: allow(JUDGE) */
+    private predecessor: ActiveConnection | null = null;
+    /** At most one client-wide recovery episode (KTD5). commentlint: allow(JUDGE) */
+    private recovery: RecoveryEpisode | null = null;
+    /** RouteHandles opened by the managed-route cache, not caller-owned raw handles; the drain closes orphaned managed handles at pending-zero while raw handles wait for their caller's explicit close (R10). commentlint: allow(JUDGE) */
+    private readonly managedHandles = new WeakSet<RouteHandle>();
     private readonly routes = new Map<string, CachedManagedRoute>();
     /** In-flight route.open attempts, drained bounded during owner close. */
     private readonly pendingRouteOpens = new Set<Promise<void>>();
+    /**
+     * In-flight route.open attempts per connection. A route.open terminal
+     * empties the pending set BEFORE its awaiting continuation inserts the
+     * new handle into `liveRoutes`, so a pending-zero retirement check
+     * alone would retire a draining predecessor between those two steps
+     * and hand the caller an immediately-stale handle.
+     */
+    private readonly routeOpenCounts = new Map<ActiveConnection, number>();
     private closeStarted = false;
     private closePromise: Promise<void> | null = null;
 
@@ -576,17 +628,15 @@ export class McHostClient {
      * route Goodbye, and await the write bounded by the shutdown deadline.
      */
     async closeRoute(handle: RouteHandle): Promise<void> {
-        const active = this.requireLiveHandle(handle);
-        this.liveRoutes.delete(handle.channel);
-        for (const [key, cached] of this.routes) {
-            if (cached.handle === handle) {
-                cached.closed = true;
-                cached.handle = null;
-                this.routes.delete(key);
-            }
+        const conn = this.requireLiveHandle(handle);
+        conn.liveRoutes.delete(handle.channel);
+        for (const [key, cached] of this.detachCachedHandle(handle)) {
+            cached.closed = true;
+            this.routes.delete(key);
         }
-        active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
-        await active.generation.flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock));
+        conn.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
+        await conn.generation.flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock));
+        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
     /**
@@ -699,6 +749,12 @@ export class McHostClient {
             onRouteGoodbye: (channel, epoch) => {
                 if (conn) this.onRouteGoodbye(conn, channel, epoch);
             },
+            onPendingZero: () => {
+                if (conn) this.onPendingDrained(conn);
+            },
+            onLeaseReleased: () => {
+                if (conn) this.onPendingDrained(conn);
+            },
             // Skip per-frame event allocation entirely when no observer is
             // configured; the generation's hook check short-circuits on
             // undefined.
@@ -709,6 +765,7 @@ export class McHostClient {
             generation,
             token: newConnectionToken(),
             snapshot,
+            liveRoutes: new Map(),
             transport: TRANSPORT_TCP,
         };
         try {
@@ -768,14 +825,9 @@ export class McHostClient {
         if (generation.isRetired()) return conn;
         conn.fallbackReason = selection.reason;
         this.active = conn;
-        this.liveRoutes.clear();
-        this.emitDiagnostics({
-            type: "connected",
-            daemonVer: snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
-            pid: snapshot.pid,
-            transport: conn.transport,
-            ...(conn.fallbackReason !== undefined ? { fallbackReason: conn.fallbackReason } : {}),
-        });
+        this.emitConnected(conn, conn.fallbackReason);
+        // R11: exact `unavailable` is the only fallback that starts an automatic shared-memory recovery probe; every other reason and reasonless TCP stay sticky. commentlint: allow(JUDGE)
+        if (conn.fallbackReason === "unavailable") this.startRecovery(conn);
         return conn;
     }
 
@@ -852,6 +904,29 @@ export class McHostClient {
         grant: Extract<NegotiateResponse, { kind: "grant" }>,
         stage: Deadline,
     ): Promise<ActiveConnection> {
+        const conn = await this.prepareCandidate(bootstrap, grant, stage);
+        // Atomic promotion: publish the finalized candidate, then retire the
+        // bootstrap; the host already replaced it after the commit response
+        // reached local completion.
+        this.active = conn;
+        bootstrap.generation.retire("owner_close");
+        this.emitConnected(conn);
+        return conn;
+    }
+
+    /**
+     * Run one grant through candidate construction, activation, and commit
+     * without publishing. Any failure or uncertainty retires BOTH the
+     * candidate and the bootstrap. A shadow caller passes its episode's
+     * `shadow` generation set so the candidate's retirement callbacks stay
+     * episode-internal until promotion clears the role.
+     */
+    private async prepareCandidate(
+        bootstrap: ActiveConnection,
+        grant: Extract<NegotiateResponse, { kind: "grant" }>,
+        stage: Deadline,
+        shadow?: Set<ConnectionGeneration>,
+    ): Promise<ActiveConnection> {
         const provider = this.transportRegistry.find(
             grant.selected.transport,
             grant.selected.capabilityVersion,
@@ -883,6 +958,7 @@ export class McHostClient {
                     grant.selected.transport,
                     provider,
                     grant.descriptor,
+                    snapshot.daemonId,
                 ),
                 firstCorrelation: ACTIVATION_CORRELATION,
                 onRetired: (info) => {
@@ -890,6 +966,12 @@ export class McHostClient {
                 },
                 onRouteGoodbye: (channel, epoch) => {
                     if (conn) this.onRouteGoodbye(conn, channel, epoch);
+                },
+                onPendingZero: () => {
+                    if (conn) this.onPendingDrained(conn);
+                },
+                onLeaseReleased: () => {
+                    if (conn) this.onPendingDrained(conn);
                 },
                 onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
                 ...this.generationOptions,
@@ -899,11 +981,14 @@ export class McHostClient {
             bootstrap.generation.retire("negotiation_failed", failure);
             throw failure;
         }
+        shadow?.add(candidate);
         conn = {
             generation: candidate,
             token: newConnectionToken(),
             snapshot,
+            liveRoutes: new Map(),
             transport: grant.selected.transport,
+            ...(shadow !== undefined ? { role: "shadow" as const } : {}),
         };
         try {
             await candidate.start(stage);
@@ -953,27 +1038,27 @@ export class McHostClient {
             bootstrap.generation.retire(reason, failure);
             throw failure;
         }
-        // Atomic promotion: publish the finalized candidate, then retire the
-        // bootstrap; the host already replaced it after the commit response
-        // reached local completion.
-        this.active = conn;
-        this.liveRoutes.clear();
-        bootstrap.generation.retire("owner_close");
-        this.emitDiagnostics({
-            type: "connected",
-            daemonVer: snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
-            pid: snapshot.pid,
-            transport: conn.transport,
-        });
         return conn;
     }
 
     private onGenerationRetired(conn: ActiveConnection, info: RetirementInfo): void {
+        // Shadow teardown is episode-internal; the recovery loop owns it.
+        if (conn.role === "shadow") return;
+        if (this.predecessor === conn) {
+            // Drain completion (or a failed predecessor) is internal handoff
+            // traffic under a live primary, never a client-level `retired`.
+            this.predecessor = null;
+            return;
+        }
         if (this.active === conn) {
             this.active = null;
-            this.liveRoutes.clear();
             for (const cached of this.routes.values()) {
                 cached.handle = null;
+            }
+            // The episode is fenced to this exact source primary (KTD6);
+            // cancel it so in-flight shadow permits are released promptly.
+            if (this.recovery !== null && this.recovery.source === conn) {
+                this.cancelRecovery(this.recovery);
             }
         } else if (this.active !== null) {
             // A non-active generation retiring while another connection is
@@ -988,37 +1073,308 @@ export class McHostClient {
     }
 
     private onRouteGoodbye(conn: ActiveConnection, channel: number, epoch: number): void {
-        if (this.active !== conn) return;
-        const handle = this.liveRoutes.get(channel);
+        if (this.active !== conn && this.predecessor !== conn) return;
+        const handle = conn.liveRoutes.get(channel);
         if (!handle || handle.epoch !== epoch) return;
-        this.liveRoutes.delete(channel);
-        for (const cached of this.routes.values()) {
-            if (cached.handle === handle) cached.handle = null;
-        }
+        conn.liveRoutes.delete(channel);
+        this.detachCachedHandle(handle);
+        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
-    private isLiveHandle(handle: RouteHandle): boolean {
-        const active = this.active;
-        return (
-            active !== null &&
-            !active.generation.isRetired() &&
-            belongsToConnection(handle, active.token) &&
-            this.liveRoutes.get(handle.channel) === handle
-        );
+    /** The live connection owning `handle`: the primary or the draining predecessor. */
+    private connectionFor(handle: RouteHandle): ActiveConnection | null {
+        for (const conn of [this.active, this.predecessor]) {
+            if (
+                conn !== null &&
+                !conn.generation.isRetired() &&
+                belongsToConnection(handle, conn.token) &&
+                conn.liveRoutes.get(handle.channel) === handle
+            ) {
+                return conn;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Managed-route cache eligibility: only the primary may serve a cached
+     * managed handle, so new managed acquisitions never land on a draining
+     * predecessor (R10).
+     */
+    private isPrimaryLiveHandle(handle: RouteHandle): boolean {
+        const conn = this.connectionFor(handle);
+        return conn !== null && conn === this.active;
     }
 
     private requireLiveHandle(handle: RouteHandle): ActiveConnection {
-        if (!this.isLiveHandle(handle)) throw new StaleRouteHandleError(handle);
-        return this.active as ActiveConnection;
+        const conn = this.connectionFor(handle);
+        if (conn === null) throw new StaleRouteHandleError(handle);
+        return conn;
     }
 
     private evictHandle(handle: RouteHandle): void {
-        if (this.liveRoutes.get(handle.channel) === handle) {
-            this.liveRoutes.delete(handle.channel);
+        const conn = this.connectionFor(handle);
+        if (conn !== null) conn.liveRoutes.delete(handle.channel);
+        this.detachCachedHandle(handle);
+    }
+
+    /**
+     * `closeRoute` uses the returned keys to mark and evict every cached
+     * entry for `handle`; the other callers only need the detach.
+     */
+    private detachCachedHandle(handle: RouteHandle): [string, CachedManagedRoute][] {
+        const detached: [string, CachedManagedRoute][] = [];
+        for (const [key, cached] of this.routes) {
+            if (cached.handle === handle) {
+                cached.handle = null;
+                detached.push([key, cached]);
+            }
         }
-        for (const cached of this.routes.values()) {
-            if (cached.handle === handle) cached.handle = null;
+        return detached;
+    }
+
+    private emitConnected(conn: ActiveConnection, fallbackReason?: FallbackReason): void {
+        this.emitDiagnostics({
+            type: "connected",
+            daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
+            pid: conn.snapshot.pid,
+            transport: conn.transport,
+            ...(fallbackReason !== undefined ? { fallbackReason } : {}),
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Fresh-generation TCP-to-shared-memory re-upgrade (R9-R11). commentlint: allow(JUDGE)
+    // ------------------------------------------------------------------
+
+    /**
+     * Begin one client-wide recovery episode fenced to `source`. Only an
+     * exact `unavailable` TCP fallback reaches this point; the deadline is
+     * created once here and never reset by any retry (KTD5). commentlint: allow(JUDGE)
+     */
+    private startRecovery(source: ActiveConnection): void {
+        if (this.closeStarted) return;
+        const prior = this.recovery;
+        // A prior episode is fenced to a superseded primary; cancel it so
+        // its shadow permits are released before the new episode dials.
+        if (prior !== null) this.cancelRecovery(prior);
+        const episode: RecoveryEpisode = {
+            source,
+            deadline: Deadline.start(this.recoveryDeadlineMs, this.clock),
+            cancelled: false,
+            shadowGenerations: new Set(),
+        };
+        this.recovery = episode;
+        void this.runRecoveryEpisode(episode)
+            .catch(() => {})
+            .finally(() => {
+                if (this.recovery === episode) this.recovery = null;
+            });
+    }
+
+    private cancelRecovery(episode: RecoveryEpisode): void {
+        episode.cancelled = true;
+        for (const generation of [...episode.shadowGenerations]) {
+            generation.retire("owner_close");
         }
+    }
+
+    private recoveryStopped(episode: RecoveryEpisode): boolean {
+        return (
+            episode.cancelled ||
+            this.closeStarted ||
+            this.active !== episode.source ||
+            episode.source.generation.isRetired()
+        );
+    }
+
+    private async runRecoveryEpisode(episode: RecoveryEpisode): Promise<void> {
+        let delayMs = SETUP_RETRY_BASE_MS;
+        const pace = async (): Promise<void> => {
+            await this.sleep(episode.deadline.stageBudgetMs(delayMs));
+            delayMs = Math.min(delayMs * 2, SETUP_RETRY_CAP_MS);
+        };
+        for (;;) {
+            if (this.recoveryStopped(episode) || episode.deadline.isExpired()) return;
+            // An occupied predecessor slot defers the whole attempt: wait
+            // without creating a candidate so no third generation and no
+            // extra connection permit exist while two are still draining.
+            if (this.predecessor !== null) {
+                await pace();
+                continue;
+            }
+            const outcome = await this.shadowAttempt(episode);
+            if (outcome.kind === "promote") {
+                this.finishPromotion(episode, outcome.conn);
+                return;
+            }
+            if (outcome.kind === "stop") return;
+            await pace();
+        }
+    }
+
+    /**
+     * One full fresh setup attempt: reread the connection file, dial,
+     * authenticate, negotiate, and — on a grant — activate and commit,
+     * all bounded by the episode deadline. Retries only discovery/dial
+     * transients and repeated exact `unavailable`; every other outcome
+     * stops the episode permanently (KTD6). commentlint: allow(JUDGE)
+     */
+    private async shadowAttempt(episode: RecoveryEpisode): Promise<ShadowOutcome> {
+        const stage = episode.deadline.stage(this.handshakeTimeoutMs);
+        let snapshot: ConnectionSnapshot;
+        try {
+            snapshot = await readConnectionFile(this.connectionFile, {
+                deadline: stage,
+            });
+        } catch (error) {
+            // Only discovery churn retries: a daemon rewriting its
+            // connection file mid-restart surfaces as a briefly missing
+            // file, a replaced-during-read race, or an expired stage (the
+            // loop's episode deadline bounds repeats). Every other
+            // connection-file failure — permissions, ownership, malformed
+            // content — is permanent validation evidence and stops the
+            // episode, matching the reconnect path's terminal
+            // classification (KTD6).
+            if (
+                error instanceof ConnectionFileError &&
+                (error.code === "not_found" ||
+                    error.code === "replaced_during_read" ||
+                    error.code === "deadline_expired")
+            ) {
+                return { kind: "retry" };
+            }
+            return { kind: "stop" };
+        }
+        const generation = new ConnectionGeneration({
+            host: snapshot.endpoint.host,
+            port: snapshot.endpoint.port,
+            credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
+            ...this.generationOptions,
+        });
+        episode.shadowGenerations.add(generation);
+        try {
+            try {
+                await generation.start(stage);
+            } catch (error) {
+                return { kind: isShadowDialTransient(error) ? "retry" : "stop" };
+            }
+            if (this.recoveryStopped(episode)) {
+                generation.retire("owner_close");
+                return { kind: "stop" };
+            }
+            if (generation.isRetired()) return { kind: "retry" };
+            let selection: NegotiateResponse;
+            try {
+                selection = await this.negotiateTransport(generation, stage);
+            } catch (error) {
+                // Malformed negotiation and host error terminals stop the
+                // episode; they are never fallback or retry evidence.
+                generation.retire("negotiation_failed", error);
+                return { kind: "stop" };
+            }
+            if (selection.kind === "tcp") {
+                generation.retire("owner_close");
+                // Repeated exact `unavailable` keeps the episode alive under
+                // its ORIGINAL deadline; a reasonless selection, a legacy
+                // fallback, and every other reason stop it permanently.
+                return { kind: selection.reason === "unavailable" ? "retry" : "stop" };
+            }
+            const bootstrap: ActiveConnection = {
+                generation,
+                token: newConnectionToken(),
+                snapshot,
+                liveRoutes: new Map(),
+                transport: TRANSPORT_TCP,
+                role: "shadow",
+            };
+            let conn: ActiveConnection;
+            try {
+                conn = await this.prepareCandidate(
+                    bootstrap,
+                    selection,
+                    stage,
+                    episode.shadowGenerations,
+                );
+            } catch {
+                // Grant attachment, activation, and commit failures stop
+                // recovery; prepareCandidate already retired both channels,
+                // releasing the shadow permits.
+                return { kind: "stop" };
+            }
+            // The host replaced the bootstrap at commit; only the committed
+            // candidate survives to the promotion fence.
+            generation.retire("owner_close");
+            return { kind: "promote", conn };
+        } finally {
+            episode.shadowGenerations.delete(generation);
+        }
+    }
+
+    /**
+     * Source-fenced publication: the shadow commit becomes the primary only
+     * while the exact source primary is still published and the predecessor
+     * slot is free; any other state retires the candidate instead (KTD6). commentlint: allow(JUDGE)
+     */
+    private finishPromotion(episode: RecoveryEpisode, conn: ActiveConnection): void {
+        episode.shadowGenerations.delete(conn.generation);
+        if (
+            this.recoveryStopped(episode) ||
+            this.predecessor !== null ||
+            conn.generation.isRetired()
+        ) {
+            conn.generation.retire("owner_close");
+            return;
+        }
+        conn.role = undefined;
+        this.predecessor = episode.source;
+        this.active = conn;
+        this.emitConnected(conn);
+        this.maybeRetirePredecessor();
+    }
+
+    private onPendingDrained(conn: ActiveConnection): void {
+        if (this.predecessor === conn) this.maybeRetirePredecessor();
+    }
+
+    /**
+     * Retire the draining predecessor once no pending work AND no live
+     * route handles remain on it. Orphaned managed-cache routes close at
+     * pending-zero; caller-owned raw handles keep the drain open until
+     * their explicit close (R10). commentlint: allow(JUDGE)
+     */
+    private maybeRetirePredecessor(): void {
+        const pred = this.predecessor;
+        if (pred === null) return;
+        if (pred.generation.isRetired()) {
+            this.predecessor = null;
+            return;
+        }
+        const stats = pred.generation.stats();
+        if (stats.pendingRequests > 0) return;
+        // A route.open whose terminal already settled but whose awaiting
+        // continuation has not yet recorded the handle keeps the drain
+        // open; the continuation's completion re-invokes this check.
+        if ((this.routeOpenCounts.get(pred) ?? 0) > 0) return;
+        // A settled binary or stream terminal hands its ReceiveLease to the
+        // caller, whose storage aliases the channel until an explicit
+        // release; retirement force-releases every lease, so a drain with
+        // live leases stays open and each release re-invokes this check.
+        if (stats.activeReceiveLeases > 0) return;
+        for (const [channel, handle] of [...pred.liveRoutes]) {
+            if (!this.managedHandles.has(handle)) continue;
+            pred.liveRoutes.delete(channel);
+            pred.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
+            this.detachCachedHandle(handle);
+        }
+        if (pred.liveRoutes.size > 0) return;
+        this.predecessor = null;
+        const generation = pred.generation;
+        generation.enqueueConnectionGoodbye();
+        void generation
+            .flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock))
+            .catch(() => {})
+            .finally(() => generation.retire("owner_close"));
     }
 
     // ------------------------------------------------------------------
@@ -1149,7 +1505,17 @@ export class McHostClient {
             () => undefined,
         );
         this.pendingRouteOpens.add(tracked);
-        void tracked.finally(() => this.pendingRouteOpens.delete(tracked));
+        this.routeOpenCounts.set(active, (this.routeOpenCounts.get(active) ?? 0) + 1);
+        void tracked.finally(() => {
+            this.pendingRouteOpens.delete(tracked);
+            const remaining = (this.routeOpenCounts.get(active) ?? 1) - 1;
+            if (remaining <= 0) this.routeOpenCounts.delete(active);
+            else this.routeOpenCounts.set(active, remaining);
+            // The settled continuation may have been the last obligation
+            // holding a draining predecessor open (its handle is in
+            // `liveRoutes` now, or the attempt failed): re-evaluate.
+            if (this.predecessor === active) this.maybeRetirePredecessor();
+        });
         return run;
     }
 
@@ -1199,7 +1565,7 @@ export class McHostClient {
                 "route_closed",
             );
         }
-        this.liveRoutes.set(handle.channel, handle);
+        active.liveRoutes.set(handle.channel, handle);
         return handle;
     }
 
@@ -1245,7 +1611,8 @@ export class McHostClient {
                 };
                 this.routes.set(key, cached);
             }
-            if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
+            // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for NEW managed acquisitions even while raw callers still use it (R10). commentlint: allow(JUDGE)
+            if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) return cached.handle;
             let flight = cached.opening;
             let owner = false;
             if (!flight) {
@@ -1277,7 +1644,7 @@ export class McHostClient {
             if (
                 this.routes.get(key) === cached &&
                 cached.handle === handle &&
-                this.isLiveHandle(handle)
+                this.isPrimaryLiveHandle(handle)
             ) {
                 return handle;
             }
@@ -1285,7 +1652,7 @@ export class McHostClient {
             // Pace the replacement open unless a live handle is already
             // installed (the loop head adopts it without new I/O).
             const current = this.routes.get(key);
-            if (!(current?.handle && this.isLiveHandle(current.handle))) {
+            if (!(current?.handle && this.isPrimaryLiveHandle(current.handle))) {
                 await pace();
                 if (stage.isExpired()) throw routeStageError();
             }
@@ -1347,7 +1714,7 @@ export class McHostClient {
                     error,
                 );
             }
-            if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
+            if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) return cached.handle;
             try {
                 const handle = await this.controlRouteOpen(
                     active,
@@ -1357,7 +1724,7 @@ export class McHostClient {
                     deadline,
                 );
                 if (cached.closed) {
-                    this.liveRoutes.delete(handle.channel);
+                    active.liveRoutes.delete(handle.channel);
                     active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
                     throw new McHostCallError(
                         "not_sent",
@@ -1366,6 +1733,7 @@ export class McHostClient {
                     );
                 }
                 cached.handle = handle;
+                this.managedHandles.add(handle);
                 return handle;
             } catch (error) {
                 if (!isMcHostCallError(error)) {
@@ -1412,6 +1780,8 @@ export class McHostClient {
 
     private async runClose(): Promise<void> {
         const deadline = Deadline.start(this.shutdownDeadlineMs, this.clock);
+        // Cancel shadow publication FIRST: a commit racing owner close must not publish, and every shadow connection permit is released (R11). commentlint: allow(JUDGE)
+        if (this.recovery !== null) this.cancelRecovery(this.recovery);
         if (this.connecting) {
             try {
                 await this.connecting.promise;
@@ -1434,12 +1804,13 @@ export class McHostClient {
                 cancelWait?.();
             }
         }
-        const active = this.active;
-        if (active && !active.generation.isRetired()) {
-            active.generation.enqueueConnectionGoodbye();
-            await active.generation.flushWrites(deadline);
-            active.generation.retire("owner_close");
-        }
+        // Primary and predecessor close under the same bounded deadline.
+        const conns = [this.active, this.predecessor].filter(
+            (conn): conn is ActiveConnection => conn !== null && !conn.generation.isRetired(),
+        );
+        for (const conn of conns) conn.generation.enqueueConnectionGoodbye();
+        await Promise.all(conns.map((conn) => conn.generation.flushWrites(deadline)));
+        for (const conn of conns) conn.generation.retire("owner_close");
     }
 
     // ------------------------------------------------------------------

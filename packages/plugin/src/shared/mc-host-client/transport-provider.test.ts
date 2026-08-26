@@ -60,6 +60,7 @@ function wrap(
         "fake",
         provider,
         {},
+        new Uint8Array(16),
     )({
         budget,
         maxBodyLen: 1024,

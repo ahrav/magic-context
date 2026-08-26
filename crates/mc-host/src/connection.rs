@@ -36,7 +36,7 @@ use crate::transport_negotiation::{
 };
 use crate::transport_provider::{
     fresh_activation_token, Candidate, GrantBinding, GrantRecord, InjectedProvider,
-    PreparedCandidate, ProviderContext, TCP_CAPABILITY_VERSION,
+    PreflightEligibility, PreparedCandidate, ProviderContext, TCP_CAPABILITY_VERSION,
 };
 use crate::wire::{encode_owned_frame, pure_header_flags, response_flags, FrameId};
 
@@ -863,7 +863,7 @@ async fn handle_negotiate<H: McHostHandler>(
     }
     // The first serveable offer in client preference order wins.
     let mut capability_mismatch = false;
-    let mut non_tcp_offered = false;
+    let mut dynamically_unavailable = false;
     for offer in &request.offers {
         if offer.transport == TRANSPORT_TCP {
             if offer.capability_version == TCP_CAPABILITY_VERSION {
@@ -871,7 +871,6 @@ async fn handle_negotiate<H: McHostHandler>(
             }
             continue;
         }
-        non_tcp_offered = true;
         // Provider identity is `(transport, capability_version)`: a
         // name-only lookup would hide a serveable provider behind a
         // mismatched sibling at the same name.
@@ -879,43 +878,58 @@ async fn handle_negotiate<H: McHostHandler>(
             .providers
             .find(&offer.transport, offer.capability_version)
         {
-            Some(provider)
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Some(provider) => {
+                // A panicking preflight fails toward static omission: reasonless TCP and no client probe (KTD6). commentlint: allow(JUDGE)
+                let eligibility = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::panic_boundary::redact_sync(|| {
                         provider.preflight(offer.parameters.as_ref())
                     })
                 }))
-                .unwrap_or(false) =>
-            {
-                let provider = Arc::clone(provider);
-                let selected = SelectedTransport {
-                    transport: offer.transport.clone(),
-                    capability_version: offer.capability_version,
-                };
-                return grant_candidate(
-                    shared,
-                    gen,
-                    corr,
-                    selected,
-                    provider,
-                    offer.parameters.clone(),
-                    setup,
-                )
-                .await;
+                .unwrap_or(PreflightEligibility::StaticallyOmitted);
+                match eligibility {
+                    PreflightEligibility::Serveable => {
+                        let provider = Arc::clone(provider);
+                        let selected = SelectedTransport {
+                            transport: offer.transport.clone(),
+                            capability_version: offer.capability_version,
+                        };
+                        return grant_candidate(
+                            shared,
+                            gen,
+                            corr,
+                            selected,
+                            provider,
+                            offer.parameters.clone(),
+                            setup,
+                        )
+                        .await;
+                    }
+                    // Exact `unavailable` is reserved for an installed, statically eligible provider's dynamic readiness or admission pressure (KTD6). commentlint: allow(JUDGE)
+                    PreflightEligibility::DynamicallyUnavailable => {
+                        dynamically_unavailable = true;
+                    }
+                    PreflightEligibility::StaticallyOmitted => {}
+                }
             }
-            Some(_) => {}
             // Known transport at another version: name the real cause
             // (§7.7.3) rather than reporting it as unavailable.
             None if shared.providers.serves_transport(&offer.transport) => {
                 capability_mismatch = true;
             }
+            // Permanent absence selects reasonless TCP, never `unavailable`, so a client cannot probe for a provider that cannot appear (KTD6). commentlint: allow(JUDGE)
             None => {}
         }
     }
-    let reason = if capability_mismatch {
-        Some(FallbackReason::CapabilityVersionMismatch)
-    } else if non_tcp_offered {
+    // `unavailable` outranks `capability_version_mismatch` across the
+    // evaluated offers: it is the only reason that authorizes a client
+    // re-upgrade probe (§7.7.3), and a dynamically unavailable eligible
+    // offer is transient — a later probe can succeed. Reporting a static
+    // mismatch from a lower-preference sibling would permanently suppress
+    // recovery of the unavailable transport.
+    let reason = if dynamically_unavailable {
         Some(FallbackReason::Unavailable)
+    } else if capability_mismatch {
+        Some(FallbackReason::CapabilityVersionMismatch)
     } else {
         None
     };

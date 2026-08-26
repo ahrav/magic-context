@@ -1,0 +1,25 @@
+{
+  "drill": "SHM-HARDENING-U4",
+  "command": "cargo test -p mc-host --test shm_failure_modes held_zombie_starts_observation_timing_only_after_reap",
+  "mutations": [
+    {
+      "name": "SHM_U4_OBSERVATION_TIMING_STARTS_AT_KILL",
+      "applied_diff": {
+        "path": "crates/mc-host/tests/support/shm_process.rs",
+        "before": "        self.child.kill().expect(\"SIGKILL role process\");\n        KillEvidence {",
+        "after": "        self.child.kill().expect(\"SIGKILL role process\");\n        let started_at = Instant::now();\n        self.window = Some(ObservationWindow {\n            started_at,\n            deadline: started_at + OBSERVATION_TIMEOUT,\n        });\n        KillEvidence {",
+        "changed": true
+      },
+      "observed_failure": {
+        "exit_status": 101,
+        "output": "\nrunning 1 test\ntest held_zombie_starts_observation_timing_only_after_reap ... FAILED\n\nfailures:\n\n---- held_zombie_starts_observation_timing_only_after_reap stdout ----\n\nthread 'held_zombie_starts_observation_timing_only_after_reap' (3925664) panicked at crates/mc-host/tests/shm_failure_modes.rs:195:5:\nobservation timing must not start at kill\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    held_zombie_starts_observation_timing_only_after_reap\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.22s\n\n   Compiling mc-host v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-host)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.90s\n     Running tests/shm_failure_modes.rs (target/debug/deps/shm_failure_modes-e9de8bb9861673ac)\nerror: test failed, to rerun pass `-p mc-host --test shm_failure_modes`\n"
+      },
+      "reverted_rerun": {
+        "exit_status": 0,
+        "output": "\nrunning 1 test\ntest held_zombie_starts_observation_timing_only_after_reap ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.25s\n\n   Compiling mc-host v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-host)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.04s\n     Running tests/shm_failure_modes.rs (target/debug/deps/shm_failure_modes-e9de8bb9861673ac)\n",
+        "status": "pass"
+      },
+      "adequacy_finding": null
+    }
+  ]
+}

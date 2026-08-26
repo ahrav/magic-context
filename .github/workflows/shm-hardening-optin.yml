@@ -1,0 +1,81 @@
+name: SHM hardening opt-in
+
+on:
+  workflow_dispatch:
+    inputs:
+      soak_cycles:
+        description: Measured soak cycles (MC_SHM_SOAK_CYCLES)
+        required: false
+        default: "1000"
+      fuzz_seconds:
+        description: Per-target libFuzzer -max_total_time seconds
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  full-soak:
+    name: Full resource soak (Linux, provisional ring tuple)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Ignored full soak (shm-soak nextest profile)
+        env:
+          MC_SHM_SOAK_CYCLES: ${{ inputs.soak_cycles }}
+        run: cargo nextest run -P shm-soak --run-ignored ignored-only
+
+  bounded-fuzz:
+    name: Bounded libFuzzer campaign (nested fuzz workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Nested fuzz workspace fmt and build
+        working-directory: crates/mc-shm-transport/fuzz
+        run: |
+          cargo fmt --check
+          cargo check --locked
+
+      - name: Bounded fuzz per target
+        working-directory: crates/mc-shm-transport
+        env:
+          FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
+        run: |
+          case "$FUZZ_SECONDS" in
+            ''|*[!0-9]*)
+              echo "fuzz_seconds must be an unsigned integer, got: $FUZZ_SECONDS" >&2
+              exit 1
+              ;;
+          esac
+          # libFuzzer's -max_total_time bounds the run only when positive;
+          # zero would run the first target until the workflow timeout and
+          # starve the remaining targets.
+          if [ "$FUZZ_SECONDS" -eq 0 ]; then
+            echo "fuzz_seconds must be a positive number of seconds" >&2
+            exit 1
+          fi
+          for target in frame_descriptor provider_grant provider_sample; do
+            cargo +nightly fuzz run "$target" -- \
+              -max_total_time="$FUZZ_SECONDS"
+          done

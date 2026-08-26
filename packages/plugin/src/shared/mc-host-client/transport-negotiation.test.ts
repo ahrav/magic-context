@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { decodeShmGrant, ShmGrantError, type ShmGrantErrorCode } from "./shm-grant";
+import { expectGrantCode, grantHex as sharedGrantHex } from "./test-support/shm-grant-fixtures";
 import {
     ACTIVATION_CORRELATION,
     ACTIVATION_TOKEN_LEN,
@@ -634,5 +636,192 @@ describe("encode-side validation", () => {
         });
         const decoded = decodeNegotiateRequest(encoded);
         expect(decoded.offers[0]?.parameters).toEqual({ ok: true });
+    });
+});
+
+describe("shared-memory grant descriptor schema (layer b)", () => {
+    const PROFILE = "mc-host-test-ring-v1";
+    const GRANT_OPTIONS = { expectedProfile: PROFILE };
+
+    // Field offsets mirror RingGrant::encode in backend/ring.rs.
+    function grantHex(lane: number, incarnation: number): string {
+        return sharedGrantHex({ lane, incarnation });
+    }
+
+    function validGrantDescriptor(candidateId = 1): Record<string, unknown> {
+        return {
+            profile: PROFILE,
+            pid: 1234,
+            candidate_id: candidateId,
+            host_to_peer_fd: 10,
+            host_to_peer_grant: grantHex(0, 0xab),
+            peer_to_host_fd: 11,
+            peer_to_host_grant: grantHex(1, 0xcd),
+        };
+    }
+
+    function grantResponse(descriptorJson: string): string {
+        return (
+            '{"op":"transport.negotiate","negotiation_version":1,' +
+            '"selected":{"transport":"shm","capability_version":1},' +
+            `"activation_token":"${VECTOR_TOKEN}","descriptor":${descriptorJson}}`
+        );
+    }
+
+    const SHM_OFFERS: TransportOffer[] = [shmOffer(1), tcpOffer(1)];
+
+    test("a full grant flows through both layers into validated primitives", () => {
+        const response = decodeNegotiateResponse(
+            bytes(grantResponse(JSON.stringify(validGrantDescriptor(7)))),
+            SHM_OFFERS,
+        );
+        expect(response.kind).toBe("grant");
+        if (response.kind !== "grant") return;
+        const grant = decodeShmGrant(response.descriptor, GRANT_OPTIONS);
+        expect(grant.candidateId).toBe(7);
+        expect(grant.pid).toBe(1234);
+        expect(grant.hostToPeerFd).toBe(10);
+        expect(grant.peerToHostFd).toBe(11);
+    });
+
+    test("duplicate security fields fail at the envelope even with identical values", () => {
+        const conflicting = grantResponse('{"pid":1,"pid":2}');
+        expectCode(() => decodeNegotiateResponse(bytes(conflicting), SHM_OFFERS), "malformed_json");
+        const identical = grantResponse('{"pid":1,"pid":1}');
+        expectCode(() => decodeNegotiateResponse(bytes(identical), SHM_OFFERS), "malformed_json");
+        const duplicateToken =
+            '{"op":"transport.negotiate","negotiation_version":1,' +
+            '"selected":{"transport":"shm","capability_version":1},' +
+            `"activation_token":"${VECTOR_TOKEN}","activation_token":"${VECTOR_TOKEN}",` +
+            '"descriptor":{}}';
+        expectCode(
+            () => decodeNegotiateResponse(bytes(duplicateToken), SHM_OFFERS),
+            "malformed_json",
+        );
+    });
+
+    test("unknown fields are rejected at their owning layer", () => {
+        const envelopeUnknown = grantResponse("{}").replace(
+            '"descriptor":{}}',
+            '"descriptor":{},"extra":1}',
+        );
+        expectCode(
+            () => decodeNegotiateResponse(bytes(envelopeUnknown), SHM_OFFERS),
+            "unexpected_field",
+        );
+        const descriptorUnknown = { ...validGrantDescriptor(), extra_field: 1 };
+        const error = expectGrantCode(
+            () => decodeShmGrant(descriptorUnknown, GRANT_OPTIONS),
+            "unexpected_field",
+        );
+        expect(error.path).toBe("descriptor");
+    });
+
+    test("an absent, stale, or unbound candidate_id is rejected", () => {
+        const { candidate_id: _absent, ...missing } = validGrantDescriptor();
+        expectGrantCode(() => decodeShmGrant(missing, GRANT_OPTIONS), "missing_field");
+        expectGrantCode(
+            () =>
+                decodeShmGrant(validGrantDescriptor(5), {
+                    ...GRANT_OPTIONS,
+                    previousCandidate: { pid: 1234, candidateId: 5 },
+                }),
+            "stale_candidate",
+        );
+        for (const unbound of ["7", null, true, 0, -1, 2.5, -0, Number.NaN]) {
+            const descriptor = { ...validGrantDescriptor(), candidate_id: unbound };
+            const error = expectGrantCode(
+                () => decodeShmGrant(descriptor, GRANT_OPTIONS),
+                typeof unbound === "number" &&
+                    Number.isSafeInteger(unbound) &&
+                    !Object.is(unbound, -0)
+                    ? "out_of_range"
+                    : "invalid_type",
+            );
+            expect(error.path).toBe("descriptor.candidate_id");
+        }
+    });
+
+    test("unsafe numeric representations are rejected across both layers", () => {
+        // Textual forms the envelope owns: non-finite exponents and
+        // integers beyond the double-safe range never reach layer b.
+        expectCode(
+            () => decodeNegotiateResponse(bytes(grantResponse('{"pid":1e999}')), SHM_OFFERS),
+            "malformed_json",
+        );
+        expectCode(
+            () =>
+                decodeNegotiateResponse(
+                    bytes(grantResponse('{"candidate_id":9007199254740993}')),
+                    SHM_OFFERS,
+                ),
+            "invalid_type",
+        );
+        // Value shapes the grant schema owns.
+        for (const pid of [2.5, -1, 0, -0, 4_294_967_296, Number.NaN, "1234"]) {
+            expectGrantCode(
+                () => decodeShmGrant({ ...validGrantDescriptor(), pid }, GRANT_OPTIONS),
+                typeof pid === "number" && Number.isSafeInteger(pid) && !Object.is(pid, -0)
+                    ? "out_of_range"
+                    : "invalid_type",
+            );
+        }
+        for (const fd of [-1, -0, 2 ** 31, 3.5, Number.POSITIVE_INFINITY]) {
+            expectGrantCode(
+                () =>
+                    decodeShmGrant(
+                        { ...validGrantDescriptor(), host_to_peer_fd: fd },
+                        GRANT_OPTIONS,
+                    ),
+                typeof fd === "number" && Number.isSafeInteger(fd) && !Object.is(fd, -0)
+                    ? "out_of_range"
+                    : "invalid_type",
+            );
+        }
+    });
+
+    test("non-ASCII and malformed grant text is rejected", () => {
+        const hostileGrants: [unknown, ShmGrantErrorCode][] = [
+            ["\u00e9".repeat(116), "malformed_grant"],
+            [grantHex(0, 0xab).toUpperCase(), "malformed_grant"],
+            [grantHex(0, 0xab).slice(0, 115), "malformed_grant"],
+            [`${grantHex(0, 0xab)}0`, "malformed_grant"],
+            ["", "malformed_grant"],
+            [42, "invalid_type"],
+            [null, "invalid_type"],
+        ];
+        for (const [grant, code] of hostileGrants) {
+            expectGrantCode(
+                () =>
+                    decodeShmGrant(
+                        { ...validGrantDescriptor(), host_to_peer_grant: grant },
+                        GRANT_OPTIONS,
+                    ),
+                code,
+            );
+        }
+    });
+
+    test("grant-layer failures never echo sentinel-bearing values", () => {
+        const SENTINEL = "SENTINEL-GRANT-SECRET";
+        const hostile = [
+            { ...validGrantDescriptor(), profile: SENTINEL },
+            { ...validGrantDescriptor(), host_to_peer_grant: SENTINEL.padEnd(116, "0") },
+            { ...validGrantDescriptor(), [SENTINEL]: 1 },
+        ];
+        for (const descriptor of hostile) {
+            let caught: unknown;
+            try {
+                decodeShmGrant(descriptor, GRANT_OPTIONS);
+            } catch (error) {
+                caught = error;
+            }
+            expect(caught).toBeInstanceOf(ShmGrantError);
+            const error = caught as ShmGrantError;
+            expect(error.message).not.toContain(SENTINEL);
+            expect(error.path).not.toContain(SENTINEL);
+            expect(error.stack ?? "").not.toContain(SENTINEL);
+            expect(error.cause).toBeUndefined();
+        }
     });
 });

@@ -12,12 +12,13 @@ use iceoryx2::sample_mut_uninit::SampleMutUninit;
 use iceoryx2::service::port_factory::publish_subscribe::PortFactory;
 
 use crate::arena::MAX_FRAME_BYTES;
+use crate::backend::sample::{SamplePrefix, SAMPLE_PREFIX_BYTES};
 use crate::descriptor::{
     BackendId, Incarnation, MemoryLayout, ReleaseIdentity, WIRE_V2_HEADER_BYTES,
 };
 use crate::profile::TargetProfile;
 
-const PREFIX_BYTES: usize = 2 + WIRE_V2_HEADER_BYTES + 16 + 4 + 8 + 8;
+const PREFIX_BYTES: usize = SAMPLE_PREFIX_BYTES;
 
 /// Starting data-segment slice size for the publisher. Loans larger than the
 /// current slice bound trigger a PowerOfTwo segment reallocation up to
@@ -143,6 +144,9 @@ impl IceoryxBackend {
     }
 
     /// Acquires one sample and hides iceoryx fragment representation.
+    ///
+    /// The lease exposes only the validated body range, never the full
+    /// allocation.
     pub fn try_receive(&self) -> Result<Option<IceoryxReceiveLease<'_>>, IceoryxError> {
         let Some(sample) = self
             .subscriber
@@ -151,72 +155,37 @@ impl IceoryxBackend {
         else {
             return Ok(None);
         };
-        let payload = sample.payload();
-        if payload.len() < PREFIX_BYTES {
-            return Err(IceoryxError::InvalidDescriptor);
-        }
-        let mut prefix = [0u8; PREFIX_BYTES];
-        prefix.copy_from_slice(&payload[..PREFIX_BYTES]);
-        let schema = u16::from_le_bytes([prefix[0], prefix[1]]);
-        let mut wire_header = [0u8; WIRE_V2_HEADER_BYTES];
-        wire_header.copy_from_slice(&prefix[2..2 + WIRE_V2_HEADER_BYTES]);
-        let identity_offset = 2 + WIRE_V2_HEADER_BYTES;
-        let incarnation = Incarnation::from_bytes(
-            prefix[identity_offset..identity_offset + 16]
-                .try_into()
-                .map_err(|_| IceoryxError::InvalidDescriptor)?,
-        );
-        let lane_offset = identity_offset + 16;
-        let lane = u32::from_le_bytes(
-            prefix[lane_offset..lane_offset + 4]
-                .try_into()
-                .map_err(|_| IceoryxError::InvalidDescriptor)?,
-        );
-        let sequence_offset = lane_offset + 4;
-        let sequence = u64::from_le_bytes(
-            prefix[sequence_offset..sequence_offset + 8]
-                .try_into()
-                .map_err(|_| IceoryxError::InvalidDescriptor)?,
-        );
-        let body_len_offset = sequence_offset + 8;
-        let body_len = u64::from_le_bytes(
-            prefix[body_len_offset..body_len_offset + 8]
-                .try_into()
-                .map_err(|_| IceoryxError::InvalidDescriptor)?,
-        );
-        let expected = self
+        let expected_sequence = self
             .next_receive
             .get()
             .checked_add(1)
             .ok_or(IceoryxError::SequenceExhausted)?;
-        let declared = u32::from_le_bytes([
-            wire_header[0],
-            wire_header[1],
-            wire_header[2],
-            wire_header[3],
-        ]);
-        if schema != crate::descriptor::DESCRIPTOR_SCHEMA_VERSION
-            || incarnation != self.incarnation
-            || lane != self.lane
-            || sequence != expected
-            || wire_header[4] != 2
-            || u64::from(declared) != body_len
-            || body_len > MAX_FRAME_BYTES as u64
-            || usize::try_from(body_len)
-                .ok()
-                .and_then(|len| len.checked_add(PREFIX_BYTES))
-                .is_none_or(|frame_len| frame_len > payload.len())
-        {
-            return Err(IceoryxError::InvalidDescriptor);
-        }
-        self.next_receive.set(expected);
+        let expected = ReleaseIdentity::new(self.incarnation, self.lane, expected_sequence);
+        let payload = sample.payload();
+        let validated = SamplePrefix::snapshot(payload)
+            .and_then(|prefix| prefix.validate(payload.len(), expected))
+            .map_err(|_| IceoryxError::InvalidDescriptor)?;
+        self.next_receive.set(expected_sequence);
         Ok(Some(IceoryxReceiveLease {
             sample,
-            body_len: body_len as usize,
-            identity: ReleaseIdentity::new(incarnation, lane, sequence),
+            body_len: validated.body_len(),
+            identity: validated.identity(),
             _backend: PhantomData,
             _not_send: PhantomData,
         }))
+    }
+    /// `stale_node_observed` reports a `NodeState::Dead` without performing cleanup or creating ports or services. commentlint: allow(JUDGE)
+    pub fn stale_node_observed() -> Result<bool, IceoryxError> {
+        let mut observed = false;
+        iceoryx2::node::Node::<IpcService>::list(Config::global_config(), |state| {
+            if matches!(state, iceoryx2::node::NodeState::Dead(_)) {
+                observed = true;
+                return CallbackProgression::Stop;
+            }
+            CallbackProgression::Continue
+        })
+        .map_err(|_| IceoryxError::SetupFailed)?;
+        Ok(observed)
     }
 }
 
@@ -341,6 +310,12 @@ impl fmt::Debug for IceoryxProducerReservation<'_> {
 }
 
 /// Scoped one-span iceoryx receive sample.
+///
+/// Exposes only the validated exact body range. Allocation bytes beyond the
+/// declared body (provider-documented capacity slack) are unreachable
+/// through this lease. Concurrent mutation of already-published bytes by
+/// the authenticated peer is a peer-contract violation (R4), not a
+/// boundary this lease defends.
 pub struct IceoryxReceiveLease<'backend> {
     sample: ByteSample,
     body_len: usize,

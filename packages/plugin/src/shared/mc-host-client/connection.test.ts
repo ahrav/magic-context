@@ -1028,3 +1028,63 @@ describe("setup failures", () => {
         await expect(generation.start(Deadline.start(100))).rejects.toThrow(/single-flight/);
     });
 });
+
+describe("pending-zero drain notification", () => {
+    test("fires when the last pending entry settles and again after the next drain", async () => {
+        const peer = await h.startPeer();
+        let drains = 0;
+        const generation = await h.dial(peer, { onPendingZero: () => drains++ });
+        const connection = await peer.waitForConnection();
+        const first = generation.request({
+            channel: CHANNEL,
+            epoch: EPOCH,
+            body: Buffer.from("a"),
+            deadline: Deadline.start(2_000),
+        });
+        const second = generation.request({
+            channel: CHANNEL,
+            epoch: EPOCH,
+            body: Buffer.from("b"),
+            deadline: Deadline.start(2_000),
+        });
+        await connection.waitForFrameCount(2);
+        await connection.send({
+            ty: PeerFrameType.Response,
+            channel: CHANNEL,
+            epoch: EPOCH,
+            corr: first.correlation,
+            body: Buffer.from("a"),
+        });
+        await first.result;
+        // One pending entry remains, so the drain has not completed.
+        expect(drains).toBe(0);
+        await connection.send({
+            ty: PeerFrameType.Response,
+            channel: CHANNEL,
+            epoch: EPOCH,
+            corr: second.correlation,
+            body: Buffer.from("b"),
+        });
+        await second.result;
+        expect(drains).toBe(1);
+        await roundTrip(generation, connection);
+        expect(drains).toBe(2);
+    });
+
+    test("retirement settles pending work without a drain notification", async () => {
+        const peer = await h.startPeer();
+        let drains = 0;
+        const generation = await h.dial(peer, { onPendingZero: () => drains++ });
+        const connection = await peer.waitForConnection();
+        const pending = generation.request({
+            channel: CHANNEL,
+            epoch: EPOCH,
+            body: Buffer.from("held"),
+            deadline: Deadline.start(5_000),
+        });
+        await connection.waitForFrameCount(1);
+        generation.retire("owner_close");
+        expectCallError(await rejection(pending.result), "outcome_unknown");
+        expect(drains).toBe(0);
+    });
+});

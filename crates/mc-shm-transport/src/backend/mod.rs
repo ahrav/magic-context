@@ -5,3 +5,5 @@
 pub mod iceoryx;
 /// Sealed descriptor-ring and FIFO arena. commentlint: allow(JUDGE)
 pub mod ring;
+/// Pure exact-consumption sample-prefix decoding. commentlint: allow(JUDGE)
+pub mod sample;

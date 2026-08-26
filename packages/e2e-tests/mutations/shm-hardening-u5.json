@@ -1,0 +1,25 @@
+{
+  "drill": "SHM-HARDENING-U5",
+  "command": "cargo test -p mc-host --test shm_soak soak_smoke_conserves_charges_and_stays_inside_the_envelope",
+  "mutations": [
+    {
+      "name": "SHM_U5_LEAK_ONE_FD_PER_PREPARED_CANDIDATE",
+      "applied_diff": {
+        "path": "crates/mc-host/src/shm_provider.rs",
+        "before": "        self.preparations.fetch_add(1, Ordering::AcqRel);",
+        "after": "        self.preparations.fetch_add(1, Ordering::AcqRel);\n        std::mem::forget(std::fs::File::open(\"/proc/self/stat\"));",
+        "changed": true
+      },
+      "observed_failure": {
+        "exit_status": 101,
+        "output": "\nrunning 1 test\ntest soak::soak_smoke_conserves_charges_and_stays_inside_the_envelope ... FAILED\n\nfailures:\n\n---- soak::soak_smoke_conserves_charges_and_stays_inside_the_envelope stdout ----\n\nthread 'soak::soak_smoke_conserves_charges_and_stays_inside_the_envelope' (3944886) panicked at crates/mc-host/tests/shm_soak.rs:573:41:\nsoak violation: role daemon cycle 5 counter fds expected 32 actual 37\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    soak::soak_smoke_conserves_charges_and_stays_inside_the_envelope\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 11 filtered out; finished in 15.06s\n\n   Compiling mc-host v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-host)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.03s\n     Running tests/shm_soak.rs (target/debug/deps/shm_soak-8cba19e7fbe19671)\nerror: test failed, to rerun pass `-p mc-host --test shm_soak`\n"
+      },
+      "reverted_rerun": {
+        "exit_status": 0,
+        "output": "\nrunning 1 test\ntest soak::soak_smoke_conserves_charges_and_stays_inside_the_envelope ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 4.85s\n\n   Compiling mc-host v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-host)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.89s\n     Running tests/shm_soak.rs (target/debug/deps/shm_soak-8cba19e7fbe19671)\n",
+        "status": "pass"
+      },
+      "adequacy_finding": null
+    }
+  ]
+}

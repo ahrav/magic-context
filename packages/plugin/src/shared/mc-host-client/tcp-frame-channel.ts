@@ -913,6 +913,7 @@ export class TcpFrameChannel implements FrameChannel {
                 } else {
                     this.quarantinedBytes += header.len;
                 }
+                this.handlers.onLeaseReleased?.();
             },
             this.copyCounter,
             // TCP receive buffers are never recycled. Releasing the reader
