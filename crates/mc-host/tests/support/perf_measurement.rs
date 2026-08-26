@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// Version label for the committed compact JSON workload fixture.
 pub const FIXTURE_LABEL: &str = "compact-json-v1";
@@ -187,6 +188,7 @@ pub struct LatencySummary {
     pub count: u64,
     pub p50_ns: u64,
     pub p90_ns: u64,
+    pub p95_ns: u64,
     pub p99_ns: u64,
     pub p999_ns: Option<u64>,
     pub max_ns: u64,
@@ -200,6 +202,7 @@ impl LatencySummary {
             count,
             p50_ns: nearest_rank(&samples, 50.0)?,
             p90_ns: nearest_rank(&samples, 90.0)?,
+            p95_ns: nearest_rank(&samples, 95.0)?,
             p99_ns: nearest_rank(&samples, 99.0)?,
             p999_ns: if tail_publishable(count) {
                 nearest_rank(&samples, 99.9)
@@ -209,4 +212,264 @@ impl LatencySummary {
             max_ns: *samples.last()?,
         })
     }
+}
+
+/// Wire methods exercised by the Synapse benchmark.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseMethod {
+    Query,
+    Batch,
+    Result,
+}
+
+impl SynapseMethod {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Query => "embed.query",
+            Self::Batch => "embed.batch",
+            Self::Result => "embed.result",
+        }
+    }
+}
+
+/// Mutually exclusive attempt-ledger categories from the frozen contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptDisposition {
+    Success,
+    RetryableRejection,
+    Timeout,
+    Poll,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttemptRecord {
+    pub logical_id: u64,
+    pub attempt_id: u64,
+    pub method: SynapseMethod,
+    pub disposition: AttemptDisposition,
+    pub code: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub actual_send_ns: u64,
+    pub terminal_ns: u64,
+    pub latency_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalDisposition {
+    Completed,
+    Rejected,
+    TimedOut,
+    InFlight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogicalRecord {
+    pub logical_id: u64,
+    pub scheduled_start_ns: Option<u64>,
+    pub actual_first_send_ns: u64,
+    pub terminal_ns: u64,
+    pub latency_ns: u64,
+    pub disposition: LogicalDisposition,
+    pub terminal_code: Option<String>,
+    pub attempts: u64,
+    pub polls: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SynapseLedgerSummary {
+    pub valid: bool,
+    pub errors: Vec<String>,
+    pub offered: u64,
+    pub offered_by_method: BTreeMap<String, u64>,
+    pub admitted_by_method: BTreeMap<String, u64>,
+    pub completed: u64,
+    pub completed_by_method: BTreeMap<String, u64>,
+    pub rejected_by_method_code: BTreeMap<String, u64>,
+    pub timed_out: u64,
+    pub timed_out_by_method_code: BTreeMap<String, u64>,
+    pub in_flight: u64,
+    pub attempts: u64,
+    pub successes: u64,
+    pub retryable_rejections: u64,
+    pub attempt_timeouts: u64,
+    pub polls: u64,
+    pub amplification: f64,
+}
+
+/// Validates both frozen count ledgers before any rate or percentile is used.
+pub fn validate_synapse_ledgers(
+    logical: &[LogicalRecord],
+    attempts: &[AttemptRecord],
+) -> SynapseLedgerSummary {
+    let offered = logical.len() as u64;
+    let completed = logical
+        .iter()
+        .filter(|record| record.disposition == LogicalDisposition::Completed)
+        .count() as u64;
+    let terminal_rejected = logical
+        .iter()
+        .filter(|record| record.disposition == LogicalDisposition::Rejected)
+        .count() as u64;
+    let timed_out = logical
+        .iter()
+        .filter(|record| record.disposition == LogicalDisposition::TimedOut)
+        .count() as u64;
+    let in_flight = logical
+        .iter()
+        .filter(|record| record.disposition == LogicalDisposition::InFlight)
+        .count() as u64;
+
+    let successes = attempts
+        .iter()
+        .filter(|record| record.disposition == AttemptDisposition::Success)
+        .count() as u64;
+    let retryable_rejections = attempts
+        .iter()
+        .filter(|record| record.disposition == AttemptDisposition::RetryableRejection)
+        .count() as u64;
+    let attempt_timeouts = attempts
+        .iter()
+        .filter(|record| record.disposition == AttemptDisposition::Timeout)
+        .count() as u64;
+    let polls = attempts
+        .iter()
+        .filter(|record| record.disposition == AttemptDisposition::Poll)
+        .count() as u64;
+
+    let mut admitted_by_method = BTreeMap::new();
+    let mut rejected_by_method_code = BTreeMap::new();
+    let mut timed_out_by_method_code = BTreeMap::new();
+    for attempt in attempts {
+        let queue_full = attempt.code.as_deref() == Some("queue_full");
+        if !queue_full {
+            *admitted_by_method
+                .entry(attempt.method.wire_name().to_owned())
+                .or_default() += 1;
+        }
+        if queue_full {
+            let key = format!(
+                "{}:{}",
+                attempt.method.wire_name(),
+                attempt.code.as_deref().unwrap_or("unknown")
+            );
+            *rejected_by_method_code.entry(key).or_default() += 1;
+        }
+        if attempt.disposition == AttemptDisposition::Timeout
+            || attempt
+                .code
+                .as_deref()
+                .is_some_and(|code| code.contains("timeout"))
+        {
+            let key = format!(
+                "{}:{}",
+                attempt.method.wire_name(),
+                attempt.code.as_deref().unwrap_or("timeout")
+            );
+            *timed_out_by_method_code.entry(key).or_default() += 1;
+        }
+    }
+    let mut offered_by_method = BTreeMap::new();
+    let mut completed_by_method = BTreeMap::new();
+    for request in logical {
+        let method = attempts
+            .iter()
+            .find(|attempt| attempt.logical_id == request.logical_id)
+            .map(|attempt| attempt.method.wire_name())
+            .unwrap_or("unknown")
+            .to_owned();
+        *offered_by_method.entry(method.clone()).or_default() += 1;
+        if request.disposition == LogicalDisposition::Completed {
+            *completed_by_method.entry(method).or_default() += 1;
+        }
+    }
+
+    let mut errors = Vec::new();
+    if offered != completed + terminal_rejected + timed_out + in_flight {
+        errors.push(format!(
+            "logical ledger: {offered} != {completed} + {terminal_rejected} + {timed_out} + {in_flight}"
+        ));
+    }
+    let attempt_total = attempts.len() as u64;
+    if attempt_total != successes + retryable_rejections + attempt_timeouts + polls {
+        errors.push(format!(
+            "attempt ledger: {attempt_total} != {successes} + {retryable_rejections} + {attempt_timeouts} + {polls}"
+        ));
+    }
+    for request in logical {
+        let actual = attempts
+            .iter()
+            .filter(|attempt| attempt.logical_id == request.logical_id)
+            .count() as u64;
+        if actual != request.attempts {
+            errors.push(format!(
+                "logical {} records {} attempts but owns {actual}",
+                request.logical_id, request.attempts
+            ));
+        }
+    }
+
+    SynapseLedgerSummary {
+        valid: errors.is_empty(),
+        errors,
+        offered,
+        offered_by_method,
+        admitted_by_method,
+        completed,
+        completed_by_method,
+        rejected_by_method_code,
+        timed_out,
+        timed_out_by_method_code,
+        in_flight,
+        attempts: attempt_total,
+        successes,
+        retryable_rejections,
+        attempt_timeouts,
+        polls,
+        amplification: if offered == 0 {
+            0.0
+        } else {
+            attempt_total as f64 / offered as f64
+        },
+    }
+}
+
+/// Deterministic generator used only by the benchmark's jitter policy.
+#[derive(Debug, Clone)]
+pub struct DeterministicRng(u64);
+
+impl DeterministicRng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    pub fn unit(&mut self) -> f64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value as f64 / (u64::MAX as f64 + 1.0)
+    }
+
+    /// Mirrors plugin retry jitter: `[base, 3 * base)`.
+    pub fn retry_delay_ms(&mut self, base_ms: u64) -> f64 {
+        base_ms as f64 * (1.0 + 2.0 * self.unit())
+    }
+
+    /// Mirrors plugin fast-first poll jitter: `[1ms, 2ms)`.
+    pub fn first_poll_delay_ms(&mut self) -> f64 {
+        1.0 + self.unit()
+    }
+}
+
+/// Advances one pending-poll delay using the landed plugin policy.
+pub fn next_poll_delay_ms(previous_ms: f64, served_cap_ms: u64) -> f64 {
+    (previous_ms * 1.6)
+        .max(10.0)
+        .min(served_cap_ms.max(10) as f64)
 }

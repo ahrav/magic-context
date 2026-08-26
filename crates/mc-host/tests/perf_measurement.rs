@@ -5,6 +5,9 @@
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
 
+#[path = "support/raw_client.rs"]
+mod raw_client;
+
 use perf_measurement::{
     fixture_workload, nearest_rank, open_loop_interval_ns, tail_publishable, LatencySummary,
     Outcome, OutcomeCounts, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
@@ -134,4 +137,154 @@ fn tail_suppression_below_sample_floor() {
     let large: Vec<u64> = (1..=TAIL_SAMPLE_FLOOR).collect();
     let summary = LatencySummary::from_unsorted(large).unwrap();
     assert!(summary.p999_ns.is_some());
+}
+
+#[test]
+fn synapse_ledgers_reconcile_exactly() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod,
+    };
+    let attempts = vec![
+        AttemptRecord {
+            logical_id: 7,
+            attempt_id: 1,
+            method: SynapseMethod::Batch,
+            disposition: AttemptDisposition::Success,
+            code: None,
+            retry_after_ms: None,
+            actual_send_ns: 10,
+            terminal_ns: 20,
+            latency_ns: 10,
+        },
+        AttemptRecord {
+            logical_id: 7,
+            attempt_id: 2,
+            method: SynapseMethod::Result,
+            disposition: AttemptDisposition::Poll,
+            code: None,
+            retry_after_ms: Some(50),
+            actual_send_ns: 30,
+            terminal_ns: 40,
+            latency_ns: 10,
+        },
+    ];
+    let logical = vec![LogicalRecord {
+        logical_id: 7,
+        scheduled_start_ns: Some(0),
+        actual_first_send_ns: 10,
+        terminal_ns: 40,
+        latency_ns: 40,
+        disposition: LogicalDisposition::Completed,
+        terminal_code: None,
+        attempts: 2,
+        polls: 1,
+    }];
+    let ledger = validate_synapse_ledgers(&logical, &attempts);
+    assert!(ledger.valid, "{:?}", ledger.errors);
+    assert_eq!(ledger.offered, 1);
+    assert_eq!(ledger.completed, 1);
+    assert_eq!(ledger.attempts, 2);
+    assert_eq!(ledger.polls, 1);
+    assert_eq!(ledger.amplification, 2.0);
+
+    let mut broken = logical;
+    broken[0].attempts = 1;
+    let ledger = validate_synapse_ledgers(&broken, &attempts);
+    assert!(!ledger.valid);
+    assert!(ledger.errors[0].contains("records 1 attempts"));
+}
+
+#[test]
+fn retry_and_poll_schedule_matches_plugin_policy() {
+    let mut rng = perf_measurement::DeterministicRng::new(9);
+    for _ in 0..100 {
+        let retry = rng.retry_delay_ms(50);
+        assert!((50.0..150.0).contains(&retry));
+        let first = rng.first_poll_delay_ms();
+        assert!((1.0..2.0).contains(&first));
+    }
+    assert_eq!(perf_measurement::next_poll_delay_ms(1.5, 50), 10.0);
+    assert_eq!(perf_measurement::next_poll_delay_ms(40.0, 50), 50.0);
+    assert_eq!(perf_measurement::next_poll_delay_ms(40.0, 5), 10.0);
+}
+
+#[test]
+fn raw_error_surfaces_retry_after_ms() {
+    let frame = raw_client::RawFrame {
+        len: 45,
+        ver: raw_client::WIRE_VERSION,
+        ty: raw_client::TY_ERROR,
+        flags: raw_client::FLAGS_RESPONSE_TEXT_LAST,
+        channel: 1,
+        epoch: 1,
+        corr: 1,
+        body: br#"{"code":"queue_full","retry_after_ms":73}"#.to_vec(),
+    };
+    assert_eq!(frame.error_code(), "queue_full");
+    assert_eq!(frame.error_retry_after_ms(), Some(73));
+}
+
+#[test]
+fn overload_and_closed_singleton_ledgers_keep_expected_amplification() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod,
+    };
+    let attempt = |logical_id, attempt_id, disposition| AttemptRecord {
+        logical_id,
+        attempt_id,
+        method: SynapseMethod::Query,
+        disposition,
+        code: (disposition == AttemptDisposition::RetryableRejection)
+            .then(|| "queue_full".to_owned()),
+        retry_after_ms: None,
+        actual_send_ns: attempt_id,
+        terminal_ns: attempt_id + 1,
+        latency_ns: 1,
+    };
+    let logical = |logical_id, disposition, attempts| LogicalRecord {
+        logical_id,
+        scheduled_start_ns: None,
+        actual_first_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        disposition,
+        terminal_code: (disposition == LogicalDisposition::Rejected)
+            .then(|| "queue_full".to_owned()),
+        attempts,
+        polls: 0,
+    };
+
+    let singleton = validate_synapse_ledgers(
+        &[logical(1, LogicalDisposition::Completed, 1)],
+        &[attempt(1, 1, AttemptDisposition::Success)],
+    );
+    assert!(singleton.valid);
+    assert_eq!(singleton.amplification, 1.0, "closed concurrency 1 has A=1");
+
+    // A deterministic 2x-capacity shape: one request completes, one exhausts
+    // four retryable attempts. The repetition remains exactly accounted even
+    // though its >1% censoring makes its latency summary unpublishable.
+    let overload = validate_synapse_ledgers(
+        &[
+            logical(1, LogicalDisposition::Completed, 1),
+            logical(2, LogicalDisposition::Rejected, 4),
+        ],
+        &[
+            attempt(1, 1, AttemptDisposition::Success),
+            attempt(2, 2, AttemptDisposition::RetryableRejection),
+            attempt(2, 3, AttemptDisposition::RetryableRejection),
+            attempt(2, 4, AttemptDisposition::RetryableRejection),
+            attempt(2, 5, AttemptDisposition::RetryableRejection),
+        ],
+    );
+    assert!(overload.valid, "{:?}", overload.errors);
+    assert_eq!(overload.offered, 2);
+    assert_eq!(overload.completed, 1);
+    assert_eq!(overload.amplification, 2.5);
+    assert_eq!(
+        overload.rejected_by_method_code["embed.query:queue_full"],
+        4
+    );
 }
