@@ -9,12 +9,13 @@
 # them testable without a GUI.
 #
 # Run from the crate directory rather than passing --manifest-path from the repo
-# root. `cargo fmt` re-resolves the workspace from the working directory, so the
-# root-relative form loads the ROOT workspace and fails on `crates/mc-core`'s
-# ../commons/* sibling path dependencies, which are absent unless
-# provision-rust-ci-stubs.sh has run. Entering the directory makes this crate's
-# own [workspace] the root, and its dependency graph genuinely excludes the
-# cortexkit-* crates because it takes mc-core with default-features = false.
+# root, so this crate's own [workspace] is the resolution root for clippy and
+# test. `cargo fmt` still walks up past it to the repository root, whose members
+# reference the ../commons/* siblings, so a bare checkout needs
+# provision-rust-ci-stubs.sh to have run first — the CI job does that, and a dev
+# checkout already has the real siblings. The crate's own dependency graph
+# excludes the cortexkit-* crates, because it takes mc-core with
+# default-features = false; the stubs only satisfy workspace resolution.
 set -e
 
 cd "$(dirname "$0")/../packages/dashboard/db-adapter"

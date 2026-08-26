@@ -342,9 +342,14 @@ jobs:
       # stack, so this crate re-includes both via #[path] to keep the adapter
       # testable without a GUI. Skipping it leaves the dashboard's claim
       # mutation, visibility, and direct-format verification paths uncovered.
-      # It builds standalone because mc-core is taken with
-      # default-features = false, which drops the cortexkit-* sibling deps and
-      # so needs no metadata stub provisioning.
+      # `cargo fmt` resolves the workspace from the working directory and walks
+      # up past this crate's own [workspace] to the repository root, which
+      # references the ../commons/* siblings, so the stub provisioning every
+      # other Rust job here performs is required even though this crate's own
+      # dependency graph excludes those crates.
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
       - name: Dashboard adapter conformance (Rust)
         run: sh scripts/test-dashboard-adapter.sh
 
