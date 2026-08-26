@@ -46,6 +46,11 @@
         "comment-json": "^5.0.0",
         "jsonc-parser": "^3.3.1"
     },
+    "optionalDependencies": {
+        "@cortexkit/mc-host-darwin-arm64": "0.38.0",
+        "@cortexkit/mc-host-darwin-x64": "0.38.0",
+        "@cortexkit/mc-host-linux-x64-gnu": "0.38.0"
+    },
     "devDependencies": {
         "@biomejs/biome": "^2.5.1",
         "@types/better-sqlite3": "^7.6.13",

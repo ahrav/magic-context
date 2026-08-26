@@ -80,6 +80,11 @@
     "bun-types": "^1.3.10",
     "typescript": "^5.8.0"
   },
+  "optionalDependencies": {
+    "@cortexkit/mc-host-darwin-arm64": "0.38.0",
+    "@cortexkit/mc-host-darwin-x64": "0.38.0",
+    "@cortexkit/mc-host-linux-x64-gnu": "0.38.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
