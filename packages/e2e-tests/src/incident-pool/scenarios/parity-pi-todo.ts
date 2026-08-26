@@ -394,6 +394,12 @@ export async function drivePiTodoCapture(
                 wireTodosMatch(
                     pairTodoInput(missingPriorityPair),
                     MISSING_PRIORITY_TODOS,
+                ) &&
+                // The agent reads the RESULT, so a correct defaulted input
+                // beside a stale result is still a contradictory pair.
+                wireTodosMatch(
+                    pairToolResultTodos(missingPriorityPair),
+                    MISSING_PRIORITY_TODOS,
                 ),
         };
     } finally {
@@ -595,7 +601,8 @@ export async function drivePiTodoDeferReplay(
             "Pi defer replay t1",
         );
         const metaT1 = readPiTodoMeta(h, replay.sessionId);
-        const bytes0 = t0 ? syntheticPairBytes(t0, replay.callId) : null;
+        const pair0 = t0 ? findSyntheticPair(t0, replay.callId) : null;
+        const bytes0 = pair0?.bytes ?? null;
         const bytes1 = t1 ? syntheticPairBytes(t1, replay.callId) : null;
 
         const newer = await preparePiCacheBust(context, h);
@@ -635,6 +642,10 @@ export async function drivePiTodoDeferReplay(
         const legacyAdapter = piAdapter(h);
         const legacyAnchorExisted =
             legacy.meta?.todo_synthetic_call_id === legacy.callId;
+        // The anchor the frozen pair is already replayed at. Healing rebuilds the
+        // deleted state json and must keep pointing here.
+        const legacyPreHealAnchorId =
+            legacy.meta?.todo_synthetic_anchor_message_id ?? null;
         updatePiTodoMeta(
             h,
             legacy.sessionId,
@@ -674,7 +685,16 @@ export async function drivePiTodoDeferReplay(
                 newer.body !== null &&
                 legacy.body !== null,
             firstReplayPresent: bytes0 !== null && bytes1 !== null,
-            byteIdenticalReplay: bytes0 !== null && bytes1 === bytes0,
+            // Byte-equality across the two defer passes proves the replay is
+            // stable, not that what is replayed is right: this variant declares
+            // no `blocked_by` dependency on the injection variant, so a
+            // consistently malformed pair would otherwise publish a resolution
+            // candidate here.
+            byteIdenticalReplay:
+                bytes0 !== null &&
+                bytes1 === bytes0 &&
+                wireTodosMatch(pairTodoInput(pair0), STATE_X_TODOS) &&
+                wireTodosMatch(pairToolResultTodos(pair0), STATE_X_TODOS),
             // Comparing the two reads only to each other is satisfied by two
             // nulls, so an implementation that replays the deterministic pair
             // while persisting no anchor at all reads as stable — the catalog's
@@ -708,12 +728,21 @@ export async function drivePiTodoDeferReplay(
             legacyAnchorExisted,
             // A rebuilt pair plus a correct state json is not a healed anchor:
             // the durable linkage is the third field, and leaving it unset is
-            // the catalog's invalid wrong-persisted-state-linkage shape. The
-            // Rust twin requires the same non-null anchor after healing.
+            // the catalog's invalid wrong-persisted-state-linkage shape.
+            //
+            // Nonempty is not enough either — an unrelated message id admits the
+            // same invalid shape. Healing must PRESERVE the anchor recorded
+            // before the heal, because that is the message the frozen pair is
+            // replayed at; re-anchoring elsewhere changes the wire position on
+            // later defers. So compare against the pre-heal value rather than
+            // `legacy.expectedAnchorId`, which names the newest assistant of the
+            // heal turn and is not where the original pair lives.
             legacyAnchorHealed:
                 legacyBytes !== null &&
                 legacyDeferBytes === legacyBytes &&
-                (legacyMeta?.todo_synthetic_anchor_message_id ?? "") !== "" &&
+                (legacyPreHealAnchorId ?? "") !== "" &&
+                legacyMeta?.todo_synthetic_anchor_message_id ===
+                    legacyPreHealAnchorId &&
                 legacyMeta?.todo_synthetic_state_json ===
                     normalizedTodoJson(STATE_X_TODOS),
         };

@@ -581,6 +581,20 @@ export function compareWithAcceptedSnapshot(
                 after.variants,
                 `variant of ${before.id}`,
                 (variantBefore, variantAfter) => {
+                    // An appended baseline authorizes the rewrite, but it must
+                    // not let one immutable revision id denote two different
+                    // contracts across history: a changed fingerprint means the
+                    // semantic content moved, so the id has to move with it.
+                    if (
+                        variantBefore.semantic_revision.fingerprint !==
+                            variantAfter.semantic_revision.fingerprint &&
+                        variantBefore.semantic_revision.id ===
+                            variantAfter.semantic_revision.id
+                    ) {
+                        throw new Error(
+                            `variant ${variantBefore.id} changed its semantic fingerprint while reusing revision id ${variantBefore.semantic_revision.id}`,
+                        );
+                    }
                     requireRowIntegrity(
                         context,
                         "variant",

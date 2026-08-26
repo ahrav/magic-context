@@ -270,6 +270,11 @@ function normalizedMemoryHash(content: string): string {
  * these are the modules whose behavior the checks assert.
  */
 const MEMORY_SEARCH_PRODUCT_FILES = [
+    // Every one of these cases gates scoring on a tool being PUBLISHED, and
+    // inclusion plus allowed-action wiring is decided in the registry, not in the
+    // tool modules. A change to those gates turns a case from scored to
+    // precondition_unmet with both digests unchanged.
+    "packages/plugin/src/plugin/tool-registry.ts",
     "packages/plugin/src/tools/ctx-memory/index.ts",
     "packages/plugin/src/tools/ctx-memory/tools.ts",
     "packages/plugin/src/tools/ctx-memory/types.ts",
@@ -1213,8 +1218,15 @@ export async function driveEmbeddingFreshness(
                 staleSearch.resultText.includes("[memory]"),
             staleQueryMatchSemantic:
                 staleSearch.resultText.includes("match=semantic"),
+            // A bare `[memory]` header is satisfied by ANY memory result, so an
+            // unrelated or fabricated hit passed while the edited row itself
+            // stayed unrecalled — and the vector assertions never couple a
+            // result to `memoryId`. Require the fresh lane to name the edited
+            // row and carry its new content.
             freshQueryReturnsMemory:
-                freshSearch.resultText.includes("[memory]"),
+                freshSearch.resultText.includes("[memory]") &&
+                freshSearch.resultText.includes(`id=${memoryId}`) &&
+                freshSearch.resultText.includes(fixture.newContent),
             passageReembedObserved,
             vectorReplacedBySearchTime,
         };
