@@ -29,7 +29,9 @@
             },
             {
                 "name": "claim-applicability",
-                "dependsOn": ["claims-evidence"],
+                "dependsOn": [
+                    "claims-evidence"
+                ],
                 "provides": [
                     "git_anchors",
                     "git_anchor_representations",
@@ -42,7 +44,10 @@
             },
             {
                 "name": "claim-policy",
-                "dependsOn": ["claims-evidence", "claim-applicability"],
+                "dependsOn": [
+                    "claims-evidence",
+                    "claim-applicability"
+                ],
                 "provides": [
                     "claim_revision_policy_subjects",
                     "claim_maturity_streams",
@@ -58,7 +63,11 @@
             },
             {
                 "name": "claim-memory",
-                "dependsOn": ["claims-evidence", "claim-applicability", "claim-policy"],
+                "dependsOn": [
+                    "claims-evidence",
+                    "claim-applicability",
+                    "claim-policy"
+                ],
                 "provides": [
                     "claim_public_ids",
                     "claim_memory_revision_attributes",
@@ -74,17 +83,113 @@
                     "claim_memory_lifecycle_heads",
                     "claim_project_generations"
                 ]
+            },
+            {
+                "name": "session-runtime",
+                "dependsOn": [],
+                "provides": [
+                    "authority_capture_bounds",
+                    "authority_managed",
+                    "authority_repair_pending",
+                    "compartment_chunk_embeddings",
+                    "compartment_events",
+                    "compartment_state_lease",
+                    "compartments",
+                    "compression_depth",
+                    "context_privilege_state",
+                    "context_store_meta",
+                    "domain_mutation_epoch",
+                    "dream_queue",
+                    "dream_runs",
+                    "dream_state",
+                    "embedding_identity_active",
+                    "embedding_measurement_corpus",
+                    "embedding_registrations",
+                    "git_commit_embeddings",
+                    "git_commits",
+                    "git_commits_fts",
+                    "git_commits_fts_config",
+                    "git_commits_fts_content",
+                    "git_commits_fts_data",
+                    "git_commits_fts_docsize",
+                    "git_commits_fts_idx",
+                    "git_sweep_coordinator",
+                    "historian_runs",
+                    "identity_merge_log",
+                    "m0_mutation_log",
+                    "message_history_fts",
+                    "message_history_fts_config",
+                    "message_history_fts_content",
+                    "message_history_fts_data",
+                    "message_history_fts_docsize",
+                    "message_history_fts_idx",
+                    "message_history_index",
+                    "message_history_orphan_sweep",
+                    "message_history_source",
+                    "migration_pending",
+                    "mirror_cursors",
+                    "mirror_identity",
+                    "mirror_live_memory_rows",
+                    "mirror_live_staging",
+                    "mirror_note_revisions",
+                    "mirror_pending_references",
+                    "mirror_resnapshot_state",
+                    "mural_manifest",
+                    "notes",
+                    "notes_fts",
+                    "notes_fts_config",
+                    "notes_fts_data",
+                    "notes_fts_docsize",
+                    "notes_fts_idx",
+                    "notes_search_view",
+                    "pending_ops",
+                    "pending_session_cleanup",
+                    "plugin_messages",
+                    "primer_candidates",
+                    "primers",
+                    "primers_fts",
+                    "primers_fts_config",
+                    "primers_fts_data",
+                    "primers_fts_docsize",
+                    "primers_fts_idx",
+                    "project_key_files",
+                    "project_key_files_version",
+                    "project_state",
+                    "recomp_compartments",
+                    "recomp_facts",
+                    "retrospective_processed_windows",
+                    "schema_migrations",
+                    "schema_migrations_meta",
+                    "session_facts",
+                    "session_meta",
+                    "session_projects",
+                    "shadow_embedding_registrations",
+                    "source_contents",
+                    "subagent_invocations",
+                    "synapse_batch_ledger",
+                    "tags",
+                    "task_schedule_state",
+                    "tool_definition_measurements",
+                    "tool_owner_backfill_state",
+                    "transform_decisions",
+                    "user_memories",
+                    "user_memory_candidates",
+                    "v22_backfill_failures",
+                    "v22_identity_rekey_map",
+                    "workspace_members",
+                    "workspaces"
+                ]
             }
         ]
     },
     "goldens": {
-        "manifestDigest": "b42201a1617760e89cd84487e6789a9d0531413141f755aa471aefe8761a3944",
+        "manifestDigest": "be9f5192a0c07ca1a3279392e01ce83ff7d964a6571900cbb2a80e875b97c29e",
         "marker": {
             "formatEpoch": 1,
             "databaseIncarnationId": "00112233445566778899aabbccddeeff",
-            "componentManifestDigest": "b42201a1617760e89cd84487e6789a9d0531413141f755aa471aefe8761a3944",
+            "componentManifestDigest": "be9f5192a0c07ca1a3279392e01ce83ff7d964a6571900cbb2a80e875b97c29e",
             "createdAtMs": 1755900000000,
-            "markerDigest": "71e7c2147d24a9689a8b08ecc64f042ba2edeb427cdf7d88ed226d5bf87624e0"
+            "markerDigest": "dc6e923be3883ac26a401d152d091512b1173c8339686c8d758e2b2c19a67424"
         }
     }
 }

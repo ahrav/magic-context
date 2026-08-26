@@ -57,6 +57,8 @@ export const FORK_MIGRATION_VERSION_FLOOR = 10_000;
 
 export const DIRECT_FORMAT_SUPERSEDED_MIGRATION_HEAD = 89;
 
+export const DIRECT_FORMAT_FENCE_MIGRATION_VERSION = DIRECT_FORMAT_SUPERSEDED_MIGRATION_HEAD + 1;
+
 /**
  * Versioned migration framework for magic-context's SQLite database.
  *

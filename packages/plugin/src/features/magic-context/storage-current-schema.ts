@@ -33,6 +33,10 @@ import {
     CLAIMS_AND_EVIDENCE_TABLES,
     createClaimsAndEvidenceSchema,
 } from "./storage-claims-schema.ts";
+import {
+    createSessionRuntimeSchema,
+    SESSION_RUNTIME_TABLES,
+} from "./storage-session-runtime-schema.ts";
 
 /** Canonical protocol tag for the registered-component manifest digest. */
 export const SCHEMA_MANIFEST_PROTOCOL = "mc-schema-manifest-v1";
@@ -90,6 +94,12 @@ export const CURRENT_SCHEMA_COMPONENTS: readonly RegisteredSchemaComponent[] = [
             "claim_project_generations",
         ],
         create: createClaimMemoryComponentSchema,
+    },
+    {
+        name: "session-runtime",
+        dependsOn: [],
+        provides: SESSION_RUNTIME_TABLES,
+        create: createSessionRuntimeSchema,
     },
 ];
 
