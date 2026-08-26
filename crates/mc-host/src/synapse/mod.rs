@@ -20,7 +20,7 @@ pub mod protocol;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -630,23 +630,17 @@ const RESPONSE_SCRATCH_BYTES: usize = 256;
 /// fewer than `owned` bytes proves the reservation formula no longer
 /// dominates real usage: loud in debug builds, a `queue_full` rejection
 /// (no state created) in release builds.
-fn shrink_covered(
-    charge: &mut crate::wire::ByteCharge,
-    owned: usize,
-) -> Result<(), RequestOutcome> {
+fn shrink_covered(charge: &mut crate::wire::ByteCharge, owned: usize) -> bool {
     charge.shrink_to(owned);
     if charge.bytes() < owned {
         debug_assert!(
             false,
-            "parse reservation ({} bytes) is smaller than the post-decode owned bytes ({owned})",
+            "resident reservation ({} bytes) is smaller than the owned bytes ({owned})",
             charge.bytes(),
         );
-        return Err(app_error(
-            "queue_full",
-            "the parse reservation did not cover the decoded request",
-        ));
+        return false;
     }
-    Ok(())
+    true
 }
 
 /// Post-decode resident bytes the handler still owns for one decoded
@@ -690,6 +684,27 @@ fn app_error(code: &str, message: &str) -> RequestOutcome {
     RequestOutcome::Error {
         code: code.to_owned(),
         message: message.to_owned(),
+    }
+}
+
+fn queue_full(metrics: &SynapseMetrics, reason: QueueFullReason, message: &str) -> RequestOutcome {
+    metrics.increment_queue_full(reason);
+    RequestOutcome::Error {
+        code: "queue_full".to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+fn poll_metric_outcome(outcome: &PollOutcome) -> PollMetricOutcome {
+    match outcome {
+        PollOutcome::Restarted => PollMetricOutcome::Restarted,
+        PollOutcome::KeyMismatch => PollMetricOutcome::KeyMismatch,
+        PollOutcome::BadCursor => PollMetricOutcome::BadCursor,
+        PollOutcome::Failed { .. } => PollMetricOutcome::Failed,
+        PollOutcome::Pending { status: "queued" } => PollMetricOutcome::PendingQueued,
+        PollOutcome::Pending { status: "running" } => PollMetricOutcome::PendingRunning,
+        PollOutcome::Pending { status } => unreachable!("unknown pending job status: {status}"),
+        PollOutcome::Page(_) => PollMetricOutcome::Page,
     }
 }
 
@@ -748,7 +763,11 @@ impl SynapseComponent {
             return app_error("cancelled", "the host is shutting down");
         }
         let Ok(query_permit) = Arc::clone(&self.inner.query_admission).try_acquire_owned() else {
-            return app_error("queue_full", "query admission capacity is exhausted");
+            return queue_full(
+                &self.inner.metrics,
+                QueueFullReason::QueryAdmission,
+                "query admission capacity is exhausted",
+            );
         };
         // The handler copy keeps the query lane charged while the response is
         // produced; the worker copy keeps the charge through a native call
@@ -761,6 +780,7 @@ impl SynapseComponent {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<Vec<f32>>, QueryFault>>();
         let inner = Arc::clone(&self.inner);
         let lane_task = Arc::clone(&lane);
+        let wait_started = Instant::now();
         // The tracked task owns the native call; this handler future is only
         // the response waiter, so route loss or a deadline cancels waiting
         // without orphaning inference.
@@ -771,6 +791,9 @@ impl SynapseComponent {
             let permit = tokio::select! {
                 biased;
                 () = inner.closing.cancelled() => {
+                    inner.metrics.increment_query_wait_outcome(
+                        QueryWaitOutcome::CancelledOrClosed,
+                    );
                     let _ = tx.send(Err(QueryFault::Cancelled));
                     return;
                 }
@@ -778,33 +801,56 @@ impl SynapseComponent {
                 // still be honored with zero native work while the call is
                 // only queued; once the permit is held the call runs to
                 // completion regardless.
-                () = tx.closed() => return,
+                () = tx.closed() => {
+                    inner
+                        .metrics
+                        .increment_query_wait_outcome(QueryWaitOutcome::WaiterGone);
+                    return;
+                }
                 () = tokio::time::sleep_until(deadline) => {
+                    inner
+                        .metrics
+                        .increment_query_wait_outcome(QueryWaitOutcome::Timeout);
                     let _ = tx.send(Err(QueryFault::Timeout));
                     return;
                 }
                 permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
             };
             let Ok(_permit) = permit else {
+                inner
+                    .metrics
+                    .increment_query_wait_outcome(QueryWaitOutcome::CancelledOrClosed);
                 let _ = tx.send(Err(QueryFault::Engine(InferenceError::Invariant(
                     "cpu semaphore closed".to_owned(),
                 ))));
                 return;
             };
+            let hold_started = Instant::now();
+            inner
+                .metrics
+                .increment_query_wait_outcome(QueryWaitOutcome::Granted);
+            inner.metrics.record_cpu_wait_query(wait_started.elapsed());
             // Serialized queries queue behind one another, so a predecessor's
             // invariant failure can condemn the lane while this call waits.
             // The lane is already marked, so this reports the existing fault
             // rather than declaring a new one.
             if let Some(reason) = lane_failure_reason(&inner) {
                 let _ = tx.send(Err(QueryFault::Engine(InferenceError::Artifact(reason))));
+                inner.metrics.record_cpu_hold_query(hold_started.elapsed());
                 return;
             }
             let lane_blocking = Arc::clone(&lane_task);
-            let joined =
-                tokio::task::spawn_blocking(move || lane_blocking.backend.embed(&[text.as_str()]))
-                    .await;
+            let metrics = Arc::clone(&inner.metrics);
+            let joined = tokio::task::spawn_blocking(move || {
+                let inference_started = Instant::now();
+                let result = lane_blocking.backend.embed(&[text.as_str()]);
+                metrics.record_inference_query(inference_started.elapsed());
+                result
+            })
+            .await;
             let result = settle_inference(&inner, joined).map_err(QueryFault::Engine);
             let _ = tx.send(result);
+            inner.metrics.record_cpu_hold_query(hold_started.elapsed());
         });
 
         let result = match tokio::time::timeout_at(deadline, rx).await {
@@ -890,7 +936,11 @@ impl SynapseComponent {
                 "idempotency_conflict",
                 "the request_key is retained with a different payload",
             ),
-            AdmitOutcome::Full => app_error("queue_full", "job admission capacity is exhausted"),
+            AdmitOutcome::Full => queue_full(
+                &self.inner.metrics,
+                QueueFullReason::JobAdmission,
+                "job admission capacity is exhausted",
+            ),
             AdmitOutcome::ResultTooLarge => app_error(
                 "schema_violation",
                 "batch result exceeds the retained-result byte limit",
@@ -909,15 +959,31 @@ impl SynapseComponent {
 
     fn spawn_batch_worker(&self, lane: Arc<ReadyLane>, seq: u64) {
         let inner = Arc::clone(&self.inner);
+        let wait_started = Instant::now();
         self.inner.tracker.spawn(async move {
             let permit = tokio::select! {
                 biased;
                 // A queued wrapper is cancellable; a started native call is
                 // not. close_admission already dropped the queued job.
-                () = inner.closing.cancelled() => return,
+                () = inner.closing.cancelled() => {
+                    inner
+                        .metrics
+                        .increment_batch_wait_outcome(BatchWaitOutcome::Cancelled);
+                    return;
+                }
                 permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
             };
-            let Ok(_permit) = permit else { return };
+            let Ok(_permit) = permit else {
+                inner
+                    .metrics
+                    .increment_batch_wait_outcome(BatchWaitOutcome::Closed);
+                return;
+            };
+            let hold_started = Instant::now();
+            inner
+                .metrics
+                .increment_batch_wait_outcome(BatchWaitOutcome::Granted);
+            inner.metrics.record_cpu_wait_batch(wait_started.elapsed());
             // A queued batch inherits the same hazard as a queued query: the
             // lane can be condemned while this worker waits for the permit,
             // and the job fails against the existing reason instead of
@@ -926,9 +992,11 @@ impl SynapseComponent {
                 inner
                     .jobs
                     .publish_failed(seq, "artifact_invalid".to_owned(), reason);
+                inner.metrics.record_cpu_hold_batch(hold_started.elapsed());
                 return;
             }
             let Some(items) = inner.jobs.start(seq) else {
+                inner.metrics.record_cpu_hold_batch(hold_started.elapsed());
                 return;
             };
             // `fail_job` is idempotent, so a normal publication wins even if
@@ -939,9 +1007,14 @@ impl SynapseComponent {
                 armed: true,
             };
             let lane_blocking = Arc::clone(&lane);
+            let metrics = Arc::clone(&inner.metrics);
             let joined = tokio::task::spawn_blocking(move || {
                 let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
-                lane_blocking.backend.embed(&texts)
+                metrics.add_batch_items_embedded(texts.len());
+                let inference_started = Instant::now();
+                let result = lane_blocking.backend.embed(&texts);
+                metrics.record_inference_batch(inference_started.elapsed());
+                result
             })
             .await;
             match settle_inference(&inner, joined) {
@@ -958,6 +1031,7 @@ impl SynapseComponent {
                 }
             }
             settle_guard.armed = false;
+            inner.metrics.record_cpu_hold_batch(hold_started.elapsed());
         });
     }
 
@@ -993,16 +1067,20 @@ impl SynapseComponent {
             }
         };
         let Some(mut meta_charge) = reserved else {
-            return app_error(
-                "queue_full",
+            return queue_full(
+                &self.inner.metrics,
+                QueueFullReason::ResultPageResident,
                 "resident capacity for the result page is exhausted",
             );
         };
-        match self
+        let poll = self
             .inner
             .jobs
-            .poll(&job_id, &request_key, cursor.as_deref())
-        {
+            .poll(&job_id, &request_key, cursor.as_deref());
+        self.inner
+            .metrics
+            .increment_poll_outcome(poll_metric_outcome(&poll));
+        match poll {
             PollOutcome::Restarted => app_error(
                 "module_restarted",
                 "the job is unknown to this host incarnation",
@@ -1033,8 +1111,12 @@ impl SynapseComponent {
                     .iter()
                     .map(|(id, hash, _)| id.len() + hash.len())
                     .sum();
-                if let Err(outcome) = shrink_covered(&mut meta_charge, meta_bytes) {
-                    return outcome;
+                if !shrink_covered(&mut meta_charge, meta_bytes) {
+                    return queue_full(
+                        &self.inner.metrics,
+                        QueueFullReason::CoverageShort,
+                        "the result page reservation did not cover its metadata",
+                    );
                 }
                 let items: Vec<protocol::VectorItemView<'_>> = page
                     .vectors
@@ -1090,7 +1172,11 @@ impl CompositeComponent for SynapseComponent {
         let Some(reservation_bytes) =
             protocol::parse_reservation_bytes(ctx.body.len(), &self.inner.limits)
         else {
-            return app_error("queue_full", "the parse reservation bound is unsatisfiable");
+            return queue_full(
+                &self.inner.metrics,
+                QueueFullReason::ParseReservationUnsatisfiable,
+                "the parse reservation bound is unsatisfiable",
+            );
         };
         // The scratch pool funds only the parse reservation — the body's own
         // charge lives in the ingress pool, held since frame admission — so
@@ -1119,8 +1205,9 @@ impl CompositeComponent for SynapseComponent {
             }
         };
         let Some(mut charge) = reserved else {
-            return app_error(
-                "queue_full",
+            return queue_full(
+                &self.inner.metrics,
+                QueueFullReason::ParseResidentExhausted,
                 "resident capacity for request parsing is exhausted",
             );
         };
@@ -1133,8 +1220,12 @@ impl CompositeComponent for SynapseComponent {
         };
         // One coverage gate for every arm, sized by the single owned-bytes
         // source so no arm can grow a term the reservation does not cover.
-        if let Err(outcome) = shrink_covered(&mut charge, owned_input_bytes(&request)) {
-            return outcome;
+        if !shrink_covered(&mut charge, owned_input_bytes(&request)) {
+            return queue_full(
+                &self.inner.metrics,
+                QueueFullReason::CoverageShort,
+                "the parse reservation did not cover the decoded request",
+            );
         }
         match request {
             Request::ModelsList => {
