@@ -2,6 +2,13 @@
 //!
 //! Every request keeps its absolute scheduled time through completion, so
 //! scheduler lag and overload remain in the reported latency distribution.
+//! The sender paces each request with a coarse sleep followed by a spin to
+//! the exact deadline: tokio's timer rounds wakes up to whole-millisecond
+//! ticks, so an uncompensated `sleep_until` would add a per-run constant
+//! offset of up to a full tick to every latency sample and collapse
+//! sub-millisecond intervals into per-tick bursts. A run whose observed
+//! send lag ever reaches one arrival interval fails instead of publishing
+//! a schedule it did not deliver.
 
 #[path = "../tests/support/perf_measurement.rs"]
 mod perf_measurement;
@@ -30,6 +37,18 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(10);
 /// this window. Distinct from `DRAIN_BUDGET`, which bounds post-send
 /// response drain; the two are equal by coincidence, not by meaning.
 const STARTUP_BUDGET: Duration = Duration::from_secs(10);
+/// How far ahead of each scheduled send the coarse timer wait targets.
+/// Tokio timer wakes are quantized to whole-millisecond ticks, so the
+/// task sleeps to `scheduled - PACING_SLACK` and spins the remainder;
+/// one tick of slack absorbs the worst-case round-up, the second covers
+/// wake jitter.
+const PACING_SLACK: Duration = Duration::from_millis(2);
+/// Largest fraction of offered requests (per mille) that may miss the
+/// latency distribution before the run is unpublishable. Percentiles are
+/// computed over completions only, so every shed or timed-out request
+/// censors a sample that would have occupied the tail; two arms can only
+/// be differenced when both censor at most this negligibly.
+const MAX_CENSORED_PER_MILLE: u128 = 10;
 /// Lane fingerprint every request pins; responses must echo it exactly.
 const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 /// Text every measured request embeds; the response must carry its digest
@@ -351,9 +370,32 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
 
     let start = Instant::now() + Duration::from_millis(25);
     let mut sender = tokio::spawn(async move {
+        let mut send_lag_max_ns = 0u64;
+        let mut missed_slots = 0u64;
         for slot in 0..offered {
             let scheduled = start + Duration::from_nanos(slot * interval_ns);
-            tokio::time::sleep_until(scheduled.into()).await;
+            // Two-stage pacing. A bare `sleep_until(scheduled)` fires up to
+            // a whole timer tick late (tokio rounds wakes up to 1 ms), which
+            // books a per-run constant offset into every latency sample and
+            // collapses sub-tick intervals into per-tick bursts. The coarse
+            // sleep lands slack-early; the spin covers the remainder
+            // exactly. The spin occupies one worker thread, which is the
+            // load generator's job; the reader drains on another worker.
+            tokio::time::sleep_until((scheduled - PACING_SLACK).into()).await;
+            let mut now = Instant::now();
+            while now < scheduled {
+                std::hint::spin_loop();
+                now = Instant::now();
+            }
+            // Send lag is load-generator debt, never host latency: a slot
+            // that starts one full interval late means the delivered
+            // arrival process no longer matches the requested rate label.
+            let lag_ns = u64::try_from(now.duration_since(scheduled).as_nanos())
+                .unwrap_or(u64::MAX);
+            send_lag_max_ns = send_lag_max_ns.max(lag_ns);
+            if lag_ns >= interval_ns {
+                missed_slots += 1;
+            }
             let corr = 1_000_000 + slot;
             let mut frame = raw_client::header(
                 request_len,
@@ -369,7 +411,7 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
                 .await
                 .map_err(|error| format!("send correlation {corr}: {error}"))?;
         }
-        Ok::<_, String>(writer)
+        Ok::<_, String>((writer, send_lag_max_ns, missed_slots))
     });
 
     let drain_deadline = start + Duration::from_secs(opts.seconds) + DRAIN_BUDGET;
@@ -454,17 +496,27 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     // in `write_all` against peer backpressure has nothing left to unblock
     // it, and an unbounded await would keep an overload run alive
     // indefinitely past the drain deadline.
-    let _writer = match tokio::time::timeout(DRAIN_BUDGET, &mut sender).await {
-        Ok(joined) => joined.map_err(|error| format!("sender task: {error}"))??,
-        Err(_) => {
-            sender.abort();
-            return Err(format!(
-                "sender still blocked {}s after the drain deadline with {} requests unresolved",
-                DRAIN_BUDGET.as_secs(),
-                pending.len()
-            ));
-        }
-    };
+    let (_writer, send_lag_max_ns, missed_slots) =
+        match tokio::time::timeout(DRAIN_BUDGET, &mut sender).await {
+            Ok(joined) => joined.map_err(|error| format!("sender task: {error}"))??,
+            Err(_) => {
+                sender.abort();
+                return Err(format!(
+                    "sender still blocked {}s after the drain deadline with {} requests unresolved",
+                    DRAIN_BUDGET.as_secs(),
+                    pending.len()
+                ));
+            }
+        };
+    if missed_slots != 0 {
+        // The delivered arrival process fell at least one full interval
+        // behind the requested schedule; the run would carry the requested
+        // `rate_per_sec` label for traffic it never generated.
+        return Err(format!(
+            "sender missed {missed_slots} of {offered} slots (max send lag {send_lag_max_ns} ns \
+             >= interval {interval_ns} ns); the run did not deliver the requested rate"
+        ));
+    }
     let completed = responses.len() as u64;
     // The full embed.query contract for every completion, checked after the
     // drain loop so validation cost stays out of the recorded latencies: a
@@ -540,6 +592,20 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     if completed == 0 {
         return Err("run completed no successful requests".to_owned());
     }
+    // Percentiles cover completions only, so every rejected or timed-out
+    // request censors a sample that would have occupied the tail; the
+    // censored fraction the host sheds under load is exactly the traffic a
+    // slower arm sheds more of, which can flip the sign of a cross-arm
+    // percentile comparison. Cap censoring rather than publish
+    // success-only percentiles as if they described the offered load.
+    let censored = offered - completed;
+    if u128::from(censored) * 1000 > u128::from(offered) * MAX_CENSORED_PER_MILLE {
+        return Err(format!(
+            "{censored} of {offered} requests have no latency sample \
+             (rejected={rejected} timed_out={timed_out}); censoring exceeds \
+             {MAX_CENSORED_PER_MILLE}/1000, so success-only percentiles are not publishable"
+        ));
+    }
     latencies_ns.sort_unstable();
     let p50_ns = perf_measurement::nearest_rank(&latencies_ns, 50.0).expect("nonempty samples");
     let p95_ns = perf_measurement::nearest_rank(&latencies_ns, 95.0).expect("nonempty samples");
@@ -567,6 +633,8 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         "rejected": rejected,
         "timed_out": timed_out,
         "in_flight": in_flight,
+        "send_lag_max_ns": send_lag_max_ns,
+        "latency_samples": completed,
         "throughput_per_sec": completed as f64 / opts.seconds as f64,
         "p50_ns": p50_ns,
         "p95_ns": p95_ns,
