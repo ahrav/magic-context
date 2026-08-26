@@ -59,8 +59,15 @@ These terms are mandatory in manifests, raw records, summaries, and plots.
 - **service time** **S**: host busy time holding the `cpu` permit for one engine
   `embed` call. Tiny-engine S comes from the test double around the injected
   delay. Real-bundle S comes from the harness's engine-call boundary. Each run
-  reports S and its coefficient of variation, and estimates capacity as 1/S
-  separately for each injected-delay level and batch shape.
+  retains raw S samples and reports mean S and its coefficient of variation.
+  For 5 ms and 25 ms injected delays, estimated capacity is 1/mean S. The
+  approximately-zero-delay arm is transport- and generator-bound: its measured
+  engine S implies an unrealizable in-process arrival rate, so its frozen
+  reference capacity is 4,000 logical requests per second. Pilot calibration
+  completed 5,000 and 8,000 scheduled requests per second, while 10,000 missed
+  scheduled slots. The lower reference keeps the required 2x arm inside the
+  observed generator envelope. This substitution is explicit evidence about
+  the host path, not an engine-capacity estimate.
 - **retry amplification** **A** = attempts / logical requests, reported overall
   and by method. The report also gives the poll-count distribution per job.
 
@@ -125,7 +132,7 @@ stopped by a declared gate.
 | --- | --- |
 | Loop discipline | closed loop; scheduled-send open loop |
 | Closed-loop concurrency | 1, 2, 3, 4, 8, 16 |
-| Open-loop offered λ_off | 0.25, 0.5, 0.75, 1.0, 1.5, 2.0 × estimated capacity 1/S |
+| Open-loop offered λ_off | 0.25, 0.5, 0.75, 1.0, 1.5, 2.0 × the per-delay reference capacity defined above |
 | Variant | baseline, hygiene-only, A, B, C, A+C |
 | Injected service time | approximately 0 ms, 5 ms, 25 ms |
 | Batch shape | 1×16, 4×16 paged, 1×64 |
@@ -137,9 +144,7 @@ bundle and is the reference arm for every candidate delta. The harness is
 client-faithful retry and poll loops mirror plugin semantics and use the same
 constant set; the shipped plugin does not drive cells.
 
-The following fields are intentionally unresolved until pilot blocks estimate
-process variance and queue accumulation. They must be filled, reviewed, and
-frozen in this file and the run manifest before any treatment collection:
+The pilot froze these fields before treatment collection:
 
 - `INDEPENDENT_BLOCK_COUNT = 2`
 - `BLOCK_HOLD_DURATION = 1 second`
@@ -159,11 +164,13 @@ Process restart boundaries and the randomization seed are recorded.
 ## Delay and blocking objective
 
 At each injected-delay level and batch shape, measure baseline blocking and
-waiting at open-loop λ_off = 1/S. Candidate A targets a lower terminal blocking
-probability than baseline at the same measured load while keeping logical-
-request p95 permit wait below 100 ms, the existing query retry quantum this work
-is intended to remove. The same objective is reported at every other offered
-load; the 1/S point is the K derivation point.
+waiting at the 1.0x reference capacity. Candidate A targets a lower terminal
+blocking probability than baseline at the same measured load while keeping
+logical-request p95 permit wait below 100 ms, the existing query retry quantum
+this work is intended to remove. The same objective is reported at every other
+offered load; the 1.0x point is the K derivation point. For 5 ms and 25 ms this
+point remains 1/mean S. The approximately-zero-delay arm uses the explicit
+transport reference above and is not used to infer engine capacity.
 
 For each service-time level, derive candidate A's `max_waiting_queries` K with
 M/M/1/K as bound-shaped guidance, not as a fitted truth:
@@ -185,7 +192,7 @@ distribution against the budget and makes no enforcement claim.
 
 ## Hypotheses
 
-- A lowers terminal rejection and A near 1/S by replacing common-path client
+- A lowers terminal rejection and A near the 1.0x reference load by replacing common-path client
   retries with finite server waiting. It may raise admitted-request waiting and
   resident bytes.
 - B lowers synchronized retry tails and retry clustering but need not lower
