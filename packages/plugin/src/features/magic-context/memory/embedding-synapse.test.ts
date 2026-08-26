@@ -27,6 +27,7 @@ import {
     SYNAPSE_MAX_INPUT_TOKENS,
     type SynapseClientLike,
     SynapseEmbeddingProvider,
+    type SynapseEmbeddingProviderOptions,
 } from "./embedding-synapse";
 
 class MockSynapseClient implements SynapseClientLike {
@@ -93,6 +94,26 @@ afterEach(() => {
     _resetSynapseClientForTests();
 });
 
+function virtualTime(randomValues: number[] = [0]): {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    random: () => number;
+    sleeps: number[];
+} {
+    let time = 0;
+    let randomIndex = 0;
+    const sleeps: number[] = [];
+    return {
+        now: () => time,
+        sleep: async (ms) => {
+            sleeps.push(ms);
+            time += ms;
+        },
+        random: () => randomValues[randomIndex++] ?? randomValues.at(-1) ?? 0,
+        sleeps,
+    };
+}
+
 describe("SynapseEmbeddingProvider", () => {
     it("discovers a certified model and sends the required artifact constraints", async () => {
         const client = new MockSynapseClient();
@@ -104,6 +125,7 @@ describe("SynapseEmbeddingProvider", () => {
         });
 
         expect(await provider.initialize()).toBe(true);
+        expect(client.requests.find((entry) => entry.method === "models.list")?.params).toEqual({});
         expect(provider.maxInputTokens).toBe(SYNAPSE_MAX_INPUT_TOKENS);
         expect(provider.modelId).toBe(getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-live"));
 
@@ -664,8 +686,9 @@ describe("connect discovery and retry policy", () => {
         expect(queryCalls).toBe(4);
     });
 
-    it("retries queue-full admission through the request deadline", async () => {
+    it("keeps queue-full admission inside the finite four-attempt budget", async () => {
         let queryCalls = 0;
+        const time = virtualTime([0]);
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
             projectRoot: "/repo",
@@ -674,31 +697,93 @@ describe("connect discovery and retry policy", () => {
             tableEpoch: 0,
             dims: 3,
             queryTimeoutMs: 5_000,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
             clientFactory: async () =>
                 ({
                     async call<Response = unknown>(): Promise<Response> {
                         queryCalls += 1;
-                        if (queryCalls <= 4) {
-                            const error = new Error("query admission is full") as Error & {
-                                code: string;
-                                retry_after_ms: number;
-                            };
-                            error.code = "queue_full";
-                            error.retry_after_ms = 0;
-                            throw error;
-                        }
-                        return {
-                            vector: [1, 2, 3],
-                            fingerprint: "fp-live",
-                            table_epoch: 0,
-                        } as Response;
+                        const error = new Error("query admission is full") as Error & {
+                            code: string;
+                            retry_after_ms: number;
+                        };
+                        error.code = "queue_full";
+                        error.retry_after_ms = 0;
+                        throw error;
                     },
                     close() {},
                 }) as SynapseClientLike,
         });
 
+        expect(await provider.embed("hello")).toBeNull();
+        expect(queryCalls).toBe(4);
+        expect(time.sleeps).toEqual([1, 1, 1]);
+    });
+
+    it("uses authoritative retry-after jitter and rebuilds attempt deadlines", async () => {
+        const time = virtualTime([0.25, 0.75]);
+        const calls: Array<Record<string, unknown>> = [];
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 100,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () => ({
+                async call<Response = unknown>(_m: string, _method: string, params?: unknown) {
+                    calls.push(params as Record<string, unknown>);
+                    if (calls.length < 3) {
+                        const error = new Error("full") as Error & {
+                            code: string;
+                            retry_after_ms: number;
+                        };
+                        error.code = "queue_full";
+                        error.retry_after_ms = 20;
+                        throw error;
+                    }
+                    return {
+                        vector: [1, 2, 3],
+                        fingerprint: "fp-live",
+                        table_epoch: 0,
+                    } as Response;
+                },
+                close() {},
+            }),
+        });
+
         expect(await provider.embed("hello")).toEqual(new Float32Array([1, 2, 3]));
-        expect(queryCalls).toBe(5);
+        expect(time.sleeps).toEqual([30, 50]);
+        expect(calls.map((params) => params.deadline_ms)).toEqual([100, 70, 20]);
+    });
+
+    it("classifies cancellation distinctly and never retries it", async () => {
+        let calls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            clientFactory: async () => ({
+                async call() {
+                    calls += 1;
+                    const error = new Error("request cancelled") as Error & { code: string };
+                    error.code = "cancelled";
+                    throw error;
+                },
+                close() {},
+            }),
+        });
+
+        expect(await provider.embed("hello")).toBeNull();
+        expect(calls).toBe(1);
     });
 
     it("stops retrying when the next delay would cross the absolute deadline", async () => {
@@ -780,6 +865,7 @@ describe("embedItemsDetailed", () => {
             string,
             Array<{ id: string; content_sha256: string }>
         >();
+        batchRetryAfterMs = 50;
         batchError?: (batchCallIndex: number) => Error | null;
         resultPages?: (
             jobId: string,
@@ -818,7 +904,7 @@ describe("embedItemsDetailed", () => {
                         request_key: record.params.request_key,
                         done: false,
                         status: "queued",
-                        retry_after_ms: 0,
+                        retry_after_ms: this.batchRetryAfterMs,
                     },
                 } as Response;
             }
@@ -882,7 +968,10 @@ describe("embedItemsDetailed", () => {
         };
     }
 
-    function detailedProvider(client: SynapseClientLike): SynapseEmbeddingProvider {
+    function detailedProvider(
+        client: SynapseClientLike,
+        overrides: Partial<SynapseEmbeddingProviderOptions> = {},
+    ): SynapseEmbeddingProvider {
         return new SynapseEmbeddingProvider({
             connectionFile: "fixture",
             projectRoot: "/repo",
@@ -894,6 +983,7 @@ describe("embedItemsDetailed", () => {
             recommendedBatch: 2,
             batchTimeoutMs: 5_000,
             clientFactory: async () => client,
+            ...overrides,
         });
     }
 
@@ -994,6 +1084,7 @@ describe("embedItemsDetailed", () => {
     it("persists polling state at admission, records cursors as diagnostics, and stops at ready", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0.5]);
             const host = new DetailedHost();
             let stateAtFirstPoll: Record<string, unknown> | null = null;
             host.resultPages = (_jobId, items, index) => {
@@ -1028,7 +1119,11 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+            });
             const items = detailedItems([
                 { id: "memory:1", group: "g1" },
                 { id: "memory:2", group: "g1" },
@@ -1043,13 +1138,15 @@ describe("embedItemsDetailed", () => {
             expect(firstPoll?.state).toBe("polling");
             expect(firstPoll?.job_id).toBe("job-1");
             expect(typeof firstPoll?.attempt_id).toBe("string");
-            expect(firstPoll?.deadline_at as number).toBeGreaterThan(Date.now());
+            expect(firstPoll?.deadline_at as number).toBeGreaterThan(time.now());
 
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("ready");
             expect(row.cursor).toBe("cursor-1");
             expect(row.state_version).toBe(result.receipts[0].stateVersion);
             expect(result.receipts[0].vectors.get("memory:2")).toEqual(new Float32Array([4, 5, 6]));
+            expect(time.sleeps).toEqual([1.5]);
+            expect(host.calls.every((call) => !("deadline_ms" in call.params))).toBe(true);
         } finally {
             closeQuietly(db);
         }
@@ -1058,10 +1155,11 @@ describe("embedItemsDetailed", () => {
     it("treats done:false without a cursor as explicit pending and keeps polling", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0.5]);
             const host = new DetailedHost();
             host.resultPages = (_jobId, items, index) => {
                 if (index < 2) {
-                    return { result: { done: false, status: "running", retry_after_ms: 0 } };
+                    return { result: { done: false, status: "running", retry_after_ms: 50 } };
                 }
                 return {
                     result: {
@@ -1075,14 +1173,56 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+                pollDefaultDelayMs: 50,
+            });
             const result = await provider.embedItemsDetailed(
                 detailedItems([{ id: "memory:1", group: "g1" }]),
                 detailedContext(db),
             );
             expect(result.receipts).toHaveLength(1);
             expect(host.resultCalls()).toHaveLength(3);
+            expect(time.sleeps).toHaveLength(3);
+            expect(time.sleeps[0]).toBeCloseTo(1.5);
+            expect(time.sleeps[1]).toBeGreaterThanOrEqual(10);
+            expect(time.sleeps[2]).toBeGreaterThanOrEqual(10);
             expect(ledgerRows(db)[0].state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("clamps escalating polls to the page deadline and keeps the 120s count finite", async () => {
+        const db = ledgerDb();
+        try {
+            const time = virtualTime([0]);
+            const host = new DetailedHost();
+            host.batchRetryAfterMs = 50_000;
+            host.resultPages = () => ({
+                result: { done: false, status: "running", retry_after_ms: 50_000 },
+            });
+            const provider = detailedProvider(host, {
+                batchTimeoutMs: 120_000,
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+                pollInitialDelayMs: 30_000,
+                pollDefaultDelayMs: 50_000,
+            });
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            expect(result.receipts).toEqual([]);
+            expect(result.failures[0]?.code).toBe("timeout");
+            expect(host.resultCalls().length).toBeLessThanOrEqual(3);
+            expect(time.sleeps).toEqual([30_000, 48_000, 42_000]);
+            expect(time.now()).toBe(120_000);
         } finally {
             closeQuietly(db);
         }
@@ -2047,6 +2187,7 @@ describe("embedItemsDetailed", () => {
     it("keeps polling the canonical pending reply on the legacy embedItems path", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0]);
             const host = new DetailedHost();
             host.resultPages = (_jobId, items, index) => {
                 if (index === 0) {
@@ -2064,12 +2205,18 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+            });
             const vectors = await provider.embedItems([
                 { id: "memory:1", text: "one", contentSha256: "a" },
             ]);
             expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
             expect(host.resultCalls()).toHaveLength(2);
+            expect(time.sleeps).toEqual([1, 10]);
+            expect(host.calls.every((call) => !("deadline_ms" in call.params))).toBe(true);
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);
@@ -2079,6 +2226,7 @@ describe("embedItemsDetailed", () => {
     it("keeps the cursor while a later legacy result page is pending", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0]);
             const host = new DetailedHost();
             const cursors: unknown[] = [];
             host.resultPages = (_jobId, items, index, cursor) => {
@@ -2116,7 +2264,11 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+            });
 
             const vectors = await provider.embedItems([
                 { id: "memory:1", text: "one", contentSha256: "a" },
@@ -2126,6 +2278,7 @@ describe("embedItemsDetailed", () => {
             expect([...vectors.keys()]).toEqual(["memory:1", "memory:2"]);
             expect(vectors.get("memory:2")).toEqual(new Float32Array([4, 5, 6]));
             expect(cursors).toEqual([null, "cursor-1", "cursor-1"]);
+            expect(time.sleeps).toEqual([1, 10]);
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);

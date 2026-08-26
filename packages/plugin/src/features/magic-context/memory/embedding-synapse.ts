@@ -30,6 +30,10 @@ export const SYNAPSE_MAX_INPUT_TOKENS = 8192;
 export const SYNAPSE_MAX_INPUT_BYTES = 1024 * 1024;
 export const SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS = 3_000;
 export const SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS = 120_000;
+const SYNAPSE_POLL_INITIAL_DELAY_MS = 1;
+const SYNAPSE_POLL_DELAY_MULTIPLIER = 1.6;
+const SYNAPSE_POLL_MIN_DELAY_MS = 10;
+const SYNAPSE_POLL_DEFAULT_DELAY_MS = 50;
 /**
  * Connect budget for the shared provider client. The client-wide default is
  * sized for the hook transport, which reconnects on a per-pass deadline; this
@@ -52,6 +56,7 @@ export type SynapseErrorCode =
     | "idempotency_conflict"
     | "page_terminal"
     | "schema_violation"
+    | "cancelled"
     | "module_restarted";
 
 export interface SynapseCatalogEntry {
@@ -109,6 +114,13 @@ export interface SynapseEmbeddingProviderOptions {
     queryTimeoutMs?: number;
     batchTimeoutMs?: number;
     clientFactory?: () => Promise<SynapseClientLike>;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+    random?: () => number;
+    pollInitialDelayMs?: number;
+    pollDelayMultiplier?: number;
+    pollMinDelayMs?: number;
+    pollDefaultDelayMs?: number;
 }
 
 export class SynapseEmbeddingError extends Error {
@@ -127,7 +139,8 @@ export class SynapseEmbeddingError extends Error {
         this.name = "SynapseEmbeddingError";
         this.code = code;
         this.permanent = options?.permanent ?? isPermanentSynapseCode(code);
-        this.retryAfterMs = options?.retryAfterMs ?? (this.permanent ? undefined : 100);
+        this.retryAfterMs =
+            options?.retryAfterMs ?? (this.permanent || code === "cancelled" ? undefined : 100);
     }
 }
 
@@ -222,11 +235,14 @@ function classifyError(value: unknown): SynapseEmbeddingError {
     else if (normalized.includes("probe_required")) mapped = "probe_required";
     else if (normalized.includes("idempotency_conflict")) mapped = "idempotency_conflict";
     else if (normalized.includes("schema")) mapped = "schema_violation";
+    else if (normalized.includes("cancel") || normalized.includes("abort")) mapped = "cancelled";
     else if (normalized.includes("module_restarted") || normalized.includes("module restarted"))
         mapped = "module_restarted";
     const message = value instanceof Error ? value.message : String(value);
     return new SynapseEmbeddingError(mapped, message, {
-        retryAfterMs: readRetryAfter(value) ?? (isPermanentSynapseCode(mapped) ? undefined : 100),
+        retryAfterMs:
+            readRetryAfter(value) ??
+            (isPermanentSynapseCode(mapped) || mapped === "cancelled" ? undefined : 100),
         cause: value,
     });
 }
@@ -235,24 +251,32 @@ function wait(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+interface PollDelayState {
+    nextDelayMs: number;
+    multiplier: number;
+    minDelayMs: number;
+    defaultDelayMs: number;
+}
+
 /**
  * The canonical R13 pending rule for one `embed.result` reply: a reply that
  * neither reports `done:true` nor carries a cursored vector page is queue
  * state, never termination, so the only correct response is to wait and poll
  * again. Returns the bounded wait, or null when the reply is a page the caller
- * must consume. The 10ms floor keeps a served `retry_after_ms` of 0 from
- * busy-looping the event loop with full-rate `embed.result` calls.
+ * must consume. Escalating intervals have a positive floor, and the served
+ * `retry_after_ms` remains their cap.
  */
 function pendingPollDelay(
     parsed: Record<string, unknown>,
     hasVectors: boolean,
     deadlineAt: number,
+    state: PollDelayState,
+    now: number,
 ): number | null {
     if (parsed.done === true || (hasVectors && parsed.next_cursor != null)) return null;
-    return Math.min(
-        Math.max(readRetryAfter(parsed) ?? 50, 10),
-        Math.max(0, deadlineAt - Date.now()),
-    );
+    const cap = Math.max(state.minDelayMs, readRetryAfter(parsed) ?? state.defaultDelayMs);
+    state.nextDelayMs = Math.max(state.minDelayMs, state.nextDelayMs * state.multiplier);
+    return Math.min(state.nextDelayMs, cap, Math.max(0, deadlineAt - now));
 }
 
 function sha256(value: string): string {
@@ -508,9 +532,35 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private permanentFailure = false;
     private batchLimit = 16;
     private tokenBudget: number | null = null;
+    private readonly sleep: (ms: number) => Promise<void>;
+    private readonly now: () => number;
+    private readonly random: () => number;
+    private readonly pollInitialDelayMs: number;
+    private readonly pollDelayMultiplier: number;
+    private readonly pollMinDelayMs: number;
+    private readonly pollDefaultDelayMs: number;
 
     constructor(options: SynapseEmbeddingProviderOptions) {
         this.options = options;
+        this.sleep = options.sleep ?? wait;
+        this.now = options.now ?? Date.now;
+        this.random = options.random ?? Math.random;
+        this.pollInitialDelayMs = this.positiveOption(
+            options.pollInitialDelayMs,
+            SYNAPSE_POLL_INITIAL_DELAY_MS,
+        );
+        this.pollDelayMultiplier = this.positiveOption(
+            options.pollDelayMultiplier,
+            SYNAPSE_POLL_DELAY_MULTIPLIER,
+        );
+        this.pollMinDelayMs = this.positiveOption(
+            options.pollMinDelayMs,
+            SYNAPSE_POLL_MIN_DELAY_MS,
+        );
+        this.pollDefaultDelayMs = this.positiveOption(
+            options.pollDefaultDelayMs,
+            SYNAPSE_POLL_DEFAULT_DELAY_MS,
+        );
         this.pageTimeoutMs = options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
         const model = options.model || SYNAPSE_DEFAULT_MODEL;
         const fingerprint = options.fingerprint ?? "";
@@ -685,10 +735,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             // ledger state the daemon must dedupe.
             const value = await this.callWithRetry(
                 "embed.query",
-                this.requestConstraints({
-                    text,
-                    deadline_ms: this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS,
-                }),
+                (deadlineMs: number) => this.requestConstraints({ text, deadline_ms: deadlineMs }),
                 this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS,
                 true,
                 signal,
@@ -745,7 +792,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         );
                         const first = responseBody(body);
                         const jobId = typeof first.job_id === "string" ? first.job_id : null;
-                        if (jobId) body = await this.pollBatch(jobId, requestKey, signal);
+                        if (jobId) {
+                            body = await this.pollBatch(
+                                jobId,
+                                requestKey,
+                                readRetryAfter(first),
+                                signal,
+                            );
+                        }
                         break;
                     } catch (error) {
                         const classified = classifyError(error);
@@ -896,7 +950,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             createSynapseLedgerPage(db, {
                 ...identity,
                 manifest,
-                deadlineAt: Date.now() + timeoutMs,
+                deadlineAt: this.now() + timeoutMs,
             });
         const openPage = () => {
             const existing = findSynapseLedgerPage(db, identity);
@@ -939,7 +993,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 error.ledgerRowId = row.rowId;
                 throw error;
             }
-            if (row.failureDisposition === "retryable" && (row.deadlineAt ?? 0) > Date.now()) {
+            if (row.failureDisposition === "retryable" && (row.deadlineAt ?? 0) > this.now()) {
                 row = retrySynapseLedgerPage(db, {
                     rowId: row.rowId,
                     expectedStateVersion: row.stateVersion,
@@ -959,13 +1013,13 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             // (collectJobPages times out before its first poll, and the
             // recovery signal `module_restarted` would never be observed), so
             // such a row is obsoleted and rebuilt like a restarted module.
-            if (row.jobId && (row.deadlineAt ?? 0) > Date.now()) {
+            if (row.jobId && (row.deadlineAt ?? 0) > this.now()) {
                 try {
                     const vectors = await this.collectJobPages(
                         row.jobId,
                         requestKey,
                         page,
-                        row.deadlineAt ?? Date.now() + timeoutMs,
+                        row.deadlineAt ?? this.now() + timeoutMs,
                         signal,
                     );
                     return {
@@ -1003,7 +1057,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     // daemon resubmits it without bound. `page_terminal` is the
                     // page-scoped code for a spent budget: it belongs to this
                     // row alone and leaves the lane's other pages runnable.
-                    if (row.restartCount !== 0 || (row.deadlineAt ?? 0) <= Date.now()) {
+                    if (row.restartCount !== 0 || (row.deadlineAt ?? 0) <= this.now()) {
                         const terminal = new SynapseEmbeddingError(
                             "page_terminal",
                             "restart budget or page deadline exhausted",
@@ -1020,27 +1074,35 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             row = freshPage();
         }
 
-        const deadlineAt = row.deadlineAt ?? Date.now() + timeoutMs;
+        const deadlineAt = row.deadlineAt ?? this.now() + timeoutMs;
+        let servedPollDelayMs: number | undefined;
         try {
             if (row.state === "pending") {
-                const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                const submitted = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                servedPollDelayMs = submitted.retryAfterMs;
                 row = markSynapseLedgerPolling(db, {
                     rowId: row.rowId,
                     expectedStateVersion: row.stateVersion,
                     attemptId: randomUUID(),
-                    jobId,
+                    jobId: submitted.jobId,
                 });
             }
             for (;;) {
                 if (!row.jobId) {
                     // A crash between the restart CAS and resubmission leaves a
                     // polling row without a job; resubmit the same page key.
-                    const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                    const submitted = await this.submitBatchPage(
+                        page,
+                        requestKey,
+                        deadlineAt,
+                        signal,
+                    );
+                    servedPollDelayMs = submitted.retryAfterMs;
                     row = recordSynapseLedgerJob(db, {
                         rowId: row.rowId,
                         expectedStateVersion: row.stateVersion,
                         attemptId: randomUUID(),
-                        jobId,
+                        jobId: submitted.jobId,
                     });
                 }
                 const jobId = row.jobId as string;
@@ -1059,6 +1121,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                                 cursor,
                             });
                         },
+                        servedPollDelayMs,
                     );
                     try {
                         row = markSynapseLedgerReady(db, {
@@ -1155,8 +1218,8 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         requestKey: string,
         deadlineAt: number,
         signal?: AbortSignal,
-    ): Promise<string> {
-        const remainingMs = deadlineAt - Date.now();
+    ): Promise<{ jobId: string; retryAfterMs?: number }> {
+        const remainingMs = deadlineAt - this.now();
         if (remainingMs <= 0) {
             throw new SynapseEmbeddingError("timeout", "Synapse page deadline exhausted");
         }
@@ -1176,7 +1239,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 "embed.batch returned no job descriptor",
             );
         }
-        return jobId;
+        return { jobId, retryAfterMs: readRetryAfter(parsed) };
     }
 
     private async collectJobPages(
@@ -1186,6 +1249,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         deadlineAt: number,
         signal?: AbortSignal,
         onCursor?: (cursor: string) => void,
+        servedPollDelayMs?: number,
     ): Promise<Map<string, Float32Array>> {
         const metadata = this.metadata;
         if (!metadata) {
@@ -1194,11 +1258,13 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         const expected = new Map(page.map((item) => [item.id, item.contentSha256]));
         const collected = new Map<string, Float32Array>();
         let cursor: string | null = null;
+        const pollDelay = this.newPollDelayState(servedPollDelayMs);
+        await this.sleep(Math.min(pollDelay.nextDelayMs, Math.max(0, deadlineAt - this.now())));
         for (;;) {
             if (signal?.aborted) {
-                throw new SynapseEmbeddingError("transport", "Synapse request aborted");
+                throw new SynapseEmbeddingError("cancelled", "Synapse request aborted");
             }
-            const remainingMs = deadlineAt - Date.now();
+            const remainingMs = deadlineAt - this.now();
             if (remainingMs <= 0) {
                 throw new SynapseEmbeddingError("timeout", "Synapse page deadline exhausted");
             }
@@ -1211,9 +1277,15 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
             const parsed = responseBody(body);
             const hasVectors = Array.isArray(parsed.vectors);
-            const pendingDelay = pendingPollDelay(parsed, hasVectors, deadlineAt);
+            const pendingDelay = pendingPollDelay(
+                parsed,
+                hasVectors,
+                deadlineAt,
+                pollDelay,
+                this.now(),
+            );
             if (pendingDelay !== null) {
-                await wait(pendingDelay);
+                await this.sleep(pendingDelay);
                 continue;
             }
             if (!hasVectors) {
@@ -1320,6 +1392,24 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         });
     }
 
+    private positiveOption(value: number | undefined, fallback: number): number {
+        return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+    }
+
+    private newPollDelayState(servedPollDelayMs?: number): PollDelayState {
+        const random = Math.min(Math.max(this.random(), 0), 1 - Number.EPSILON);
+        const defaultDelayMs = Math.max(
+            this.pollMinDelayMs,
+            servedPollDelayMs ?? this.pollDefaultDelayMs,
+        );
+        return {
+            nextDelayMs: Math.min(this.pollInitialDelayMs * (1 + random), defaultDelayMs),
+            multiplier: this.pollDelayMultiplier,
+            minDelayMs: this.pollMinDelayMs,
+            defaultDelayMs,
+        };
+    }
+
     private requestKey(
         items: readonly { id: string; text: string; contentSha256: string }[],
     ): string {
@@ -1343,6 +1433,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private async pollBatch(
         jobId: string,
         requestKey: string,
+        servedPollDelayMs?: number,
         signal?: AbortSignal,
     ): Promise<unknown> {
         let cursor: unknown = null;
@@ -1350,10 +1441,13 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         // One absolute deadline spans the whole poll sequence, so a job that
         // never leaves the queue cannot poll without bound; each call is
         // bounded by the remaining budget.
-        const deadlineAt = Date.now() + this.pageTimeoutMs;
+        const deadlineAt = this.now() + this.pageTimeoutMs;
+        const pollDelay = this.newPollDelayState(servedPollDelayMs);
+        await this.sleep(Math.min(pollDelay.nextDelayMs, Math.max(0, deadlineAt - this.now())));
         for (;;) {
-            if (signal?.aborted) return {};
-            const remainingMs = deadlineAt - Date.now();
+            if (signal?.aborted)
+                throw new SynapseEmbeddingError("cancelled", "Synapse request aborted");
+            const remainingMs = deadlineAt - this.now();
             if (remainingMs <= 0) {
                 throw new SynapseEmbeddingError("timeout", "Synapse job poll deadline exhausted");
             }
@@ -1376,9 +1470,15 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 items.length === 0 &&
                 (nextCursor === undefined || nextCursor === null)
             ) {
-                const pendingDelay = pendingPollDelay(parsed, false, deadlineAt);
+                const pendingDelay = pendingPollDelay(
+                    parsed,
+                    false,
+                    deadlineAt,
+                    pollDelay,
+                    this.now(),
+                );
                 if (pendingDelay !== null) {
-                    await wait(pendingDelay);
+                    await this.sleep(pendingDelay);
                     continue;
                 }
             }
@@ -1397,33 +1497,36 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private async callWithRetry<T>(
         method: string,
-        params: unknown,
+        params: unknown | ((deadlineMs: number) => unknown),
         timeoutMs: number,
         retryEmbeddings: boolean,
         signal?: AbortSignal,
     ): Promise<T> {
         // One absolute application deadline spans the whole retry sequence:
         // each retry is a new managed call bounded by the remaining budget.
-        const deadlineAtMs = Date.now() + timeoutMs;
+        const deadlineAtMs = this.now() + timeoutMs;
         let attempt = 0;
         for (;;) {
             if (signal?.aborted)
-                throw new SynapseEmbeddingError("transport", "Synapse request aborted");
-            const remainingMs = deadlineAtMs - Date.now();
-            if (remainingMs <= 0)
+                throw new SynapseEmbeddingError("cancelled", "Synapse request aborted");
+            const remainingMs = deadlineAtMs - this.now();
+            if (remainingMs < 1)
                 throw new SynapseEmbeddingError(
                     "timeout",
                     `Synapse ${method} deadline of ${timeoutMs}ms exhausted`,
                 );
+            const attemptDeadlineMs = Math.floor(remainingMs);
             try {
                 if (!this.client)
                     throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
+                const attemptParams =
+                    typeof params === "function" ? params(attemptDeadlineMs) : params;
                 return await this.client.call<T>(
                     this.options.moduleId ?? "synapse",
                     method,
-                    params,
+                    attemptParams,
                     {
-                        timeoutMs: remainingMs,
+                        timeoutMs: attemptDeadlineMs,
                         // Synapse registers exactly one provider role, ManagementSurface;
                         // every op (embed.*, models.list, jobs) is dispatched by the JSON
                         // method field over that single route.
@@ -1441,20 +1544,19 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 // R21: module_restarted bypasses generic retry entirely; the
                 // caller owns the single durable restart resubmission.
                 if (classified.code === "module_restarted") throw classified;
+                if (classified.code === "cancelled") throw classified;
                 const outcomeUnknown = isMcHostCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
-                // A queue-full reply creates no host state. Retry it through
-                // the request deadline so the host's bounded query lane sheds
-                // global handler occupancy without silently dropping a
-                // concurrent search after the generic four-attempt cap.
-                const retryQueryAdmission =
-                    method === "embed.query" && classified.code === "queue_full";
-                if (!retryable || (!retryQueryAdmission && attempt >= 3)) throw classified;
-                const delay =
-                    classified.retryAfterMs ?? Math.min(2_000, 100 * 2 ** Math.min(attempt, 4));
-                if (Date.now() + delay >= deadlineAtMs) throw classified;
+                if (!retryable || attempt >= 3) throw classified;
+                const base = Math.max(
+                    1,
+                    classified.retryAfterMs ?? Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)),
+                );
+                const random = Math.min(Math.max(this.random(), 0), 1 - Number.EPSILON);
+                const delay = base + random * 2 * base;
+                if (this.now() + delay >= deadlineAtMs) throw classified;
                 attempt += 1;
-                await wait(delay);
+                await this.sleep(delay);
             }
         }
     }
