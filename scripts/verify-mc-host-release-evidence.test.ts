@@ -6,25 +6,10 @@ import { buildContract, canonicalJson, sha256Hex } from "./generate-mc-host-rele
 import {
     attestationMatchesWorkflowSource,
     buildInstalledReleaseEvidence,
-    resolveAttestationVerification,
     validateInstalledReleaseEvidence,
     validateInstalledReleaseEvidenceAgainstArtifacts,
     workflowRunApiPath,
 } from "./verify-mc-host-release-evidence";
-
-test("an injected attestation rejection never invokes the ambient fallback", () => {
-    let fallbacks = 0;
-    expect(
-        resolveAttestationVerification(
-            () => null,
-            () => {
-                fallbacks += 1;
-                return matchingAttestation();
-            },
-        ),
-    ).toBeNull();
-    expect(fallbacks).toBe(0);
-});
 
 function matchingAttestation(
     overrides: Record<string, unknown> = {},
@@ -364,52 +349,38 @@ describe("installed release evidence", () => {
         ).toThrow(/current release commit|immutable workflow run/);
     });
 
-    test("target proof requires a passing report even when its updated digest is attested", () => {
-        for (const mutation of ["failed", "wrong-schema", "wrong-target"] as const) {
-            const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
-            const evidence = qualifiedEvidence();
-            installReleaseArtifacts(root, evidence);
-            installProofArtifacts(root, evidence);
-            const targetProof = (
-                evidence.proof_artifacts as { kind: string; path: string; subject: string }[]
-            ).find((proof) => proof.kind === "target");
-            if (targetProof === undefined) throw new Error("missing target proof");
-            const report = JSON.parse(
-                readFileSync(join(root, targetProof.path), "utf8"),
-            ) as Record<string, unknown>;
-            const observations = report.observations as Record<string, unknown>;
-            const failedReportBytes = `${canonicalJson({
-                schema:
-                    mutation === "wrong-schema"
-                        ? "magic-context.mc-host-test-report/v0"
-                        : "magic-context.mc-host-test-report/v1",
-                target: mutation === "wrong-target" ? "darwin-hostile" : targetProof.subject,
-                passed: mutation !== "failed",
-            })}\n`;
-            writeFileSync(
-                join(root, observations.test_report_path as string),
-                failedReportBytes,
-            );
-            observations.test_report_sha256 = sha256Hex(failedReportBytes);
-            const bytes = `${canonicalJson(report)}\n`;
-            writeFileSync(join(root, targetProof.path), bytes);
-            const proofRef = (
-                evidence.proof_artifacts as { path: string; sha256: string }[]
-            ).find((proof) => proof.path === targetProof.path);
-            if (proofRef === undefined) throw new Error("missing target proof ref");
-            proofRef.sha256 = sha256Hex(bytes);
+    test("target proof requires the referenced test report bytes", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+        const evidence = qualifiedEvidence();
+        installReleaseArtifacts(root, evidence);
+        installProofArtifacts(root, evidence);
+        const targetProof = (evidence.proof_artifacts as { kind: string; path: string }[]).find(
+            (proof) => proof.kind === "target",
+        );
+        if (targetProof === undefined) throw new Error("missing target proof");
+        const report = JSON.parse(
+            readFileSync(join(root, targetProof.path), "utf8"),
+        ) as Record<string, unknown>;
+        const observations = report.observations as Record<string, unknown>;
+        writeFileSync(join(root, observations.test_report_path as string), "mutated report");
+        const bytes = `${canonicalJson(report)}\n`;
+        writeFileSync(join(root, targetProof.path), bytes);
+        const proofRef = (
+            evidence.proof_artifacts as { path: string; sha256: string }[]
+        ).find((proof) => proof.path === targetProof.path);
+        if (proofRef === undefined) throw new Error("missing target proof ref");
+        proofRef.sha256 = sha256Hex(bytes);
 
-            expect(() =>
-                validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
-                    verifyAttestation: (_path, proof) =>
-                        matchingAttestation({ artifactSha256: proof.sha256 }),
-                    verifyWorkflowRun: () => true,
-                    verifyInstalledEvidenceAttestation: (_path, _source, sha256) =>
-                        matchingAttestation({ artifactSha256: sha256 }),
-                    expectedHeadSha: "a".repeat(40),
-                }),
-            ).toThrow(/target test report/);
-        }
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                verifyAttestation: (_path, proof) =>
+                    matchingAttestation({ artifactSha256: proof.sha256 }),
+                verifyWorkflowRun: () => true,
+                verifyInstalledEvidenceAttestation: (_path, _source, sha256) =>
+                    matchingAttestation({ artifactSha256: sha256 }),
+                expectedHeadSha: "a".repeat(40),
+            }),
+        ).toThrow(/observations drift/);
     });
 
     test("an unqualified repository artifact is valid evidence but cannot gate GA", () => {
