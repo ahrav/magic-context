@@ -14,6 +14,7 @@ import { dirname, join, resolve } from "node:path";
 import { initializeIsolatedContextDb } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
 import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
+import { isSecretEnvKey } from "../secret-env-keys";
 import {
     buildDirectHostFixture,
     detectRustModePrereqs,
@@ -94,6 +95,13 @@ export interface SpawnOptions {
      * "127.0.0.1" to keep the API off non-loopback interfaces.
      */
     hostname?: ServeHostname;
+    /**
+     * Waive the loopback requirement for a secret-shaped `extraEnv` key. Set it
+     * only when the value is a fake fixture credential, and say why at the call
+     * site: it re-permits publishing an unauthenticated serve API on all
+     * interfaces alongside something named like a secret.
+     */
+    allowSecretEnvOffLoopback?: boolean;
     /** Verified immutable release root. Omitted keeps active-checkout behavior. */
     releaseRoot?: VerifiedReleaseRoot;
 }
@@ -387,6 +395,45 @@ async function provisionRustMode(releaseRoot?: VerifiedReleaseRoot): Promise<Rus
     }
 }
 
+/**
+ * Refuse to publish an unauthenticated serve API on a non-loopback interface
+ * while the child env carries a secret-shaped variable.
+ *
+ * The pairing was previously a convention: `liveModelSpawnOptions()` returns the
+ * credential and `hostname: "127.0.0.1"` together, and a comment asked callers
+ * to keep them together. Nothing held it. The recipe is a `Pick<SpawnOptions>`,
+ * so any partial merge that forwards `extraEnv` without `hostname` falls back to
+ * the all-interfaces default — and neither `TestHarnessOptions` nor
+ * `RustTestHarnessOptions` carries `hostname`, so routing a real key through a
+ * harness instead of raw `spawnOpencode` drops the pin silently. The serve API
+ * has no authentication, so the failure publishes a live credential to anything
+ * that can reach the port for the process lifetime.
+ *
+ * Fail closed on the name, before any port, directory, or config is allocated.
+ * Names are matched rather than values because a fake test credential is shaped
+ * like a real one, so a value check would guess per vendor and would pull the
+ * secret into the diagnostic. A spawn that genuinely wants a secret-shaped
+ * variable off loopback — the fake-key config assertions, which need the
+ * all-interfaces default to dodge a Bun `fetch()` flake on GitHub-hosted
+ * runners — says so with `allowSecretEnvOffLoopback`. Requiring the waiver to be
+ * written down keeps the unsafe combination reviewable instead of reachable by
+ * omission. `assertSafeExtraEnv` applies the same predicate to refuse secrets
+ * from incident cases outright.
+ */
+function assertSecretsBoundToLoopback(
+    resolvedOpts: SpawnOptions,
+    hostname: ServeHostname,
+): void {
+    if (hostname === "127.0.0.1" || resolvedOpts.allowSecretEnvOffLoopback) return;
+    const secretKeys = Object.keys(resolvedOpts.extraEnv ?? {}).filter(isSecretEnvKey);
+    if (secretKeys.length === 0) return;
+    throw new Error(
+        `refusing to bind the unauthenticated serve API to ${hostname} while extraEnv carries ` +
+            `${secretKeys.join(", ")}. Pass hostname: "127.0.0.1" to keep the API on loopback, ` +
+            `or allowSecretEnvOffLoopback: true if the value is a fake fixture credential.`,
+    );
+}
+
 async function spawnOpencodeWithProvision(
     opts: SpawnOptions,
     provision: () => Promise<RustSpawnResources>,
@@ -433,6 +480,8 @@ async function spawnOpencodeWithProvision(
                   },
               }
             : opts;
+        const hostname = resolvedOpts.hostname ?? "0.0.0.0";
+        assertSecretsBoundToLoopback(resolvedOpts, hostname);
 
         // Reuse a caller-provided env for the Rust-mode harness (connection file
         // pre-placed, data dir shared across a serve restart); otherwise allocate.
@@ -494,7 +543,8 @@ async function spawnOpencodeWithProvision(
         // `127.0.0.1:${port}` — only the listen socket changes. Safe for the
         // default fake-credential spawns: process is short-lived, port is
         // random. Spawns carrying a real credential pass `hostname` to pin the
-        // unauthenticated API to loopback.
+        // unauthenticated API to loopback, which
+        // `assertSecretsBoundToLoopback` enforces above rather than trusting.
         child = spawn(
             "opencode",
             [
@@ -502,7 +552,7 @@ async function spawnOpencodeWithProvision(
                 "--port",
                 String(port),
                 "--hostname",
-                resolvedOpts.hostname ?? "0.0.0.0",
+                hostname,
             ],
             {
                 cwd: env.workdir,

@@ -93,11 +93,14 @@ describe("oracle arm presets", () => {
         // The recipe pins loopback for real-credential runs; this CI spawn uses
         // a fake key and overrides back to the all-interfaces default because
         // GitHub-hosted runners sometimes time out Bun's fetch() against a
-        // 127.0.0.1-bound server.
+        // 127.0.0.1-bound server. The override needs the explicit waiver: the
+        // spawn guard refuses a secret-shaped extraEnv key off loopback, and
+        // "live-test-key" is a fixture value that reaches no real provider.
         const opencode = await spawnOpencode({
             mockProviderURL: baseURL,
             ...recipe,
             hostname: "0.0.0.0",
+            allowSecretEnvOffLoopback: true,
         });
         spawned.push(opencode);
         const config = JSON.parse(
@@ -107,6 +110,31 @@ describe("oracle arm presets", () => {
         expect(config.provider).toEqual(providerBlock);
         expect(mock.requests()).toHaveLength(0);
     }, 120_000);
+
+    it("refuses a secret-shaped extraEnv key off loopback without an explicit waiver", async () => {
+        const mock = new MockProvider();
+        mocks.push(mock);
+        const { baseURL } = await mock.start();
+        const recipe = liveModelSpawnOptions({
+            apiKey: "live-test-key",
+            providerBlock: { anthropic: { models: {} } },
+        });
+
+        // The recipe's own pairing is what a real-credential caller spreads, so
+        // it must satisfy the guard untouched. Overriding hostname back to the
+        // all-interfaces default is what must fail: that is the shape a partial
+        // options merge or a harness that drops `hostname` degrades into.
+        await expect(
+            spawnOpencode({ mockProviderURL: baseURL, ...recipe, hostname: "0.0.0.0" }),
+        ).rejects.toThrow(/refusing to bind the unauthenticated serve API to 0\.0\.0\.0/);
+        await expect(
+            spawnOpencode({ mockProviderURL: baseURL, ...recipe, hostname: "0.0.0.0" }),
+        ).rejects.toThrow(/ANTHROPIC_API_KEY/);
+
+        // Nothing was allocated: the guard runs before any port, directory, or
+        // config, so a refused spawn leaves no process to clean up.
+        expect(mock.requests()).toHaveLength(0);
+    }, 30_000);
 
     it("passes gold evidence verbatim in the main-agent request", async () => {
         const harness = await createHarness();

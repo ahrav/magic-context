@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
+import { isSecretEnvKey } from "../secret-env-keys";
 import {
     CHECK_ID_RE,
     EXECUTABLE_LANES,
@@ -791,9 +792,7 @@ export function assertSafeExtraEnv(extraEnv: Record<string, string>): void {
             /^(?:AWS|AZURE|GOOGLE|GCP|OPENAI|ANTHROPIC|COHERE|HUGGINGFACE|SSH)_/i.test(
                 key,
             ) ||
-            /(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY|PRIVATE_KEY|COOKIE|AUTH)/i.test(
-                key,
-            );
+            isSecretEnvKey(key);
         if (unsafe) {
             throw new Error(`unsafe incident case extraEnv key ${key}`);
         }
