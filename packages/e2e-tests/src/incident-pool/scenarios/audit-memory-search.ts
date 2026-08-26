@@ -26,6 +26,7 @@ import {
 } from "../../mock-provider/server";
 import { updateMemoryVerification } from "../../../../plugin/src/features/magic-context/memory";
 import { withClaimsWriteCapabilityInCurrentTransaction } from "../../../../plugin/src/features/magic-context/memory/storage-memory-claims";
+import { runScriptedToolCall } from "../../scripted-tool-call";
 import type {
     CaseDriverContext,
     JsonValue,
@@ -41,7 +42,6 @@ import {
     DEFER_USAGE,
     EXECUTE_USAGE,
     readContextDb,
-    runScriptedToolCall,
     writeContextDb,
 } from "../support/tool-loop";
 

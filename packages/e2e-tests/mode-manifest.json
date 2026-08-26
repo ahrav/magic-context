@@ -136,6 +136,22 @@
             ]
         },
         {
+            "path": "tests/oracle-arms-demo.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "oracle-arm capability matrix uses the TypeScript-authority-only direct memory seeding contract",
+            "contract_refs": [
+                "ORACLE-ARMS-U4",
+                "R8",
+                "KTD4",
+                "KTD6",
+                "KTD7"
+            ]
+        },
+        {
             "path": "tests/overflow-recovery.test.ts",
             "tier": "both-modes",
             "invocation": {

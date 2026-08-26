@@ -18,7 +18,7 @@ import { Database as PluginDatabase } from "../../plugin/src/shared/sqlite";
  */
 export function openTestDb(
 	path: string,
-	options?: { readonly?: boolean; readwrite?: boolean },
+	options?: { readonly?: boolean; readwrite?: boolean; create?: boolean },
 ): Database & PluginDatabase {
 	const db = new Database(path, options);
 	db.exec("PRAGMA busy_timeout=5000");
