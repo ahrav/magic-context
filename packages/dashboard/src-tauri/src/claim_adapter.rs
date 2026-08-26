@@ -1001,10 +1001,30 @@ pub fn read_claim_memories(
             .skip(offset as usize)
             .take(limit as usize)
             .collect::<AdapterResult<Vec<_>>>()?;
-        let project_ids = candidates
+        let mut project_ids = candidates
             .iter()
             .map(|candidate| candidate.project_id)
             .collect::<Vec<_>>();
+        // A project-scoped query with no matching candidates yields an empty id
+        // list, so neither snapshot vector carries that project's generation and
+        // the two compare equal no matter what happened during hydration. The
+        // first claim inserted concurrently would then be missed and the empty
+        // result published as authoritative. Seed the requested project so its
+        // generation is always part of the comparison.
+        if let Some(identity) = project {
+            let requested: Option<i64> = sql(conn
+                .query_row(
+                    "SELECT id FROM projects WHERE canonical_identity = ?1",
+                    [identity],
+                    |row| row.get(0),
+                )
+                .optional())?;
+            if let Some(requested) = requested {
+                if !project_ids.contains(&requested) {
+                    project_ids.push(requested);
+                }
+            }
+        }
         let vector = read_snapshot_vector(conn, &project_ids)?;
         Ok((claims, project_ids, vector))
     })();

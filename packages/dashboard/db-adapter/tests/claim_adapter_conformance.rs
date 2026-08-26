@@ -957,6 +957,40 @@ fn tauri_content_edits_keep_explicit_user_eligibility() {
 }
 
 #[test]
+fn an_empty_project_scoped_read_still_tracks_the_requested_project() {
+    // With no matching candidates the id list was empty, so neither snapshot
+    // vector carried the project's generation and the comparison could not
+    // notice a concurrent first insert — the empty result was published as
+    // authoritative.
+    let conn = test_db();
+    conn.execute(
+        "INSERT INTO projects (id, canonical_identity, created_at) VALUES (9, 'git:empty-project', 1)",
+        [],
+    )
+    .unwrap();
+
+    let listed = claim_adapter::read_claim_memories(
+        &conn,
+        Some("git:empty-project"),
+        None,
+        None,
+        None,
+        50,
+        0,
+    )
+    .unwrap();
+    assert!(listed.claims.is_empty(), "no claims exist for that project");
+    let vector = listed
+        .snapshot_vector
+        .expect("an empty project-scoped read still carries a vector");
+    assert!(
+        vector.project_generations.contains_key("9"),
+        "the requested project must be tracked so a concurrent insert is detected: {:?}",
+        vector.project_generations
+    );
+}
+
+#[test]
 fn the_project_picker_omits_a_project_whose_claims_are_all_hidden() {
     // The picker enumerated every current head, so a project holding only
     // hard-hidden claims was offered and then `read_claim_memories` withheld

@@ -169,3 +169,19 @@ export function reconcileDraft(
       previous.revisionAdvanced || previous.revisionLocator !== claim.revisionLocator,
   };
 }
+
+/**
+ * The snapshot-error banner text for a settled read result.
+ *
+ * A stale result reports why it could not be published; any settled non-stale
+ * result supersedes that report and must clear it. Returning the value rather
+ * than only setting it on the stale branch is what keeps a transient concurrent
+ * write from leaving the banner up through every later successful refresh.
+ */
+export function snapshotErrorFor(result: {
+  outcome: string;
+  staleReasons?: readonly string[];
+}): string | null {
+  if (result.outcome !== "stale") return null;
+  return (result.staleReasons ?? []).join("; ") || "Claim snapshot changed during refresh";
+}

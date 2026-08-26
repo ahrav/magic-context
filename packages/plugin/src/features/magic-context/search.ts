@@ -1521,6 +1521,11 @@ export function resolveClaimsByLocatorsForSearch(args: {
                     sharedCategories: workspace.shareCategories ?? [],
                 },
                 workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+                // Named so the provider recomputes the fingerprint at
+                // publication time; without them it echoes the value above into
+                // both snapshot vectors and a revocation in flight goes
+                // undetected.
+                workspaceIdentities: workspace.identities,
                 surface: "explicit_search",
                 lifecycleStates: ["active", "archived"],
             });

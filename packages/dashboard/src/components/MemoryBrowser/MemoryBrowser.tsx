@@ -23,6 +23,7 @@ import {
   type SelectionEntry,
   selectionState,
   selectionTargets,
+  snapshotErrorFor,
   toggleClaimSelection,
   toggleClaimsSelection,
 } from "./claim-selection";
@@ -83,10 +84,13 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
   createEffect(() => {
     const result = memories();
     if (!result) return;
-    if (result.outcome === "stale") {
-      setError(result.staleReasons.join("; ") || "Claim snapshot changed during refresh");
-      return;
-    }
+    // A settled snapshot supersedes the previous staleness report, so a
+    // successful read clears the banner. Leaving it set kept "Claim snapshot
+    // changed during refresh" on screen through every later successful filter
+    // change and refetch — a transient concurrent write looked like a stuck
+    // error until the user started a mutation or remounted the browser.
+    setError(snapshotErrorFor(result));
+    if (result.outcome === "stale") return;
     setVisibleClaims(result.claims);
     setSelected((previous) => reconcileClaimSelection(previous, result.claims));
     setFocusedClaim((previous) => {

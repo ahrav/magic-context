@@ -89,6 +89,7 @@ export function ensureMuralRendered(
         const result = readProjectMemoryCurrentState(db, {
             projectIds,
             workspaceEpoch,
+            workspaceIdentities: [projectIdentity],
             surface: "auto_inject",
         });
         if (result.status === "ok") {

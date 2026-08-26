@@ -8,6 +8,7 @@ import {
   selectionTargets,
   toggleClaimSelection,
   toggleClaimsSelection,
+  snapshotErrorFor,
 } from "./claim-selection";
 
 function claim(publicClaimId: string, revision = 1): ClaimMemory {
@@ -218,5 +219,20 @@ describe("claim selection", () => {
     expect(reconciled?.revisionLocator).toBe(base.revisionLocator);
     // Not the refreshed token, which is what would overwrite silently.
     expect(reconciled?.mutationToken).not.toEqual(advanced.mutationToken);
+  });
+});
+
+describe("snapshotErrorFor", () => {
+  it("clears the banner once a settled result supersedes a stale one", () => {
+    // The stale branch set the banner and returned, so a later successful
+    // refresh left it on screen indefinitely.
+    expect(snapshotErrorFor({ outcome: "stale", staleReasons: ["projectGenerations"] })).toBe(
+      "projectGenerations",
+    );
+    expect(snapshotErrorFor({ outcome: "stale", staleReasons: [] })).toBe(
+      "Claim snapshot changed during refresh",
+    );
+    expect(snapshotErrorFor({ outcome: "ok", staleReasons: [] })).toBeNull();
+    expect(snapshotErrorFor({ outcome: "ok" })).toBeNull();
   });
 });
