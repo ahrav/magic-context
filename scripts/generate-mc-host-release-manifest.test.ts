@@ -616,6 +616,29 @@ describe("stop-provenance schema", () => {
         });
         expect(foreign.valid).toBe(false);
         expect(foreign.legacyStopAuthority).toBe(false);
+        // Present-but-invalid values must not reach legacy stop authority: the
+        // required-field loop only rejects undefined, null, and "".
+        for (const [field, value] of [
+            ["legacy_proof_version", false],
+            ["legacy_proof_version", 2],
+            ["payload_manifest_digest", false],
+            ["predecessor_manifest", "not-an-object"],
+            ["predecessor_manifest", []],
+            ["predecessor_release_version", "0.37"],
+            ["predecessor_daemon_version", "0.0.9"],
+            ["target", "linux-arm64-musl"],
+            ["target", true],
+        ] as [string, unknown][]) {
+            const result = validateStopProvenance(contract, {
+                ...complete,
+                [field]: value,
+            });
+            expect(
+                result.valid,
+                `${field}=${JSON.stringify(value)} must be rejected`,
+            ).toBe(false);
+            expect(result.legacyStopAuthority).toBe(false);
+        }
     });
 
     test("untagged and unknown-tag records are rejected", () => {

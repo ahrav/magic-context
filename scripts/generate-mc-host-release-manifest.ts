@@ -1379,6 +1379,51 @@ export function validateStopProvenance(
     if (rec.release_version !== contract.release.version) {
         return invalid("predecessor must bind the current release identity");
     }
+    // Presence is not validity. This is the consumer-facing gate for the only
+    // tag that grants legacy stop authority, so every bound field is checked
+    // for type, and each field whose value the contract fixes is bound to it.
+    // The loop above only proves a key is present and not `""`, which admits
+    // `false`, `0`, and structurally wrong values.
+    const nonEmptyString = (field: string): string | null => {
+        const value = rec[field];
+        return typeof value === "string" && value.length > 0 ? value : null;
+    };
+    if (rec.legacy_proof_version !== contract.proof.legacy_stop_only.version) {
+        return invalid(
+            "predecessor must carry the contract's legacy stop-only proof version",
+        );
+    }
+    const target = nonEmptyString("target");
+    if (target === null) {
+        return invalid("predecessor target must be a nonempty string");
+    }
+    if (!contract.platforms.supported.some((row) => row.target === target)) {
+        return invalid(`predecessor target ${target} is not a supported platform`);
+    }
+    if (nonEmptyString("payload_manifest_digest") === null) {
+        return invalid(
+            "predecessor payload_manifest_digest must be a nonempty string",
+        );
+    }
+    const predecessorRelease = nonEmptyString("predecessor_release_version");
+    if (predecessorRelease === null || !SEMVER_RE.test(predecessorRelease)) {
+        return invalid("predecessor_release_version must be exact semver");
+    }
+    const predecessorDaemon = nonEmptyString("predecessor_daemon_version");
+    if (
+        predecessorDaemon === null ||
+        !/^mc-host\/\d+\.\d+\.\d+$/.test(predecessorDaemon)
+    ) {
+        return invalid("predecessor_daemon_version must be mc-host/<semver>");
+    }
+    const manifest = rec.predecessor_manifest;
+    if (
+        manifest === null ||
+        typeof manifest !== "object" ||
+        Array.isArray(manifest)
+    ) {
+        return invalid("predecessor_manifest must be an object");
+    }
     return { valid: true, legacyStopAuthority: true };
 }
 
