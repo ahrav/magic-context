@@ -1203,6 +1203,16 @@ mod tests {
         tempfile::tempdir().expect("temp data root")
     }
 
+    fn plant_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("set fifo mode");
+    }
+
     fn record_path(guard: &InstanceGuard) -> PathBuf {
         guard.dir_path().join(LIFECYCLE_RECORD_NAME)
     }
@@ -1718,12 +1728,7 @@ mod tests {
             let root = temp_root();
             let coordination = coordination_dir_path(Some(root.path())).expect("path");
             std::fs::create_dir_all(&coordination).expect("coordination root");
-            rustix::fs::mkfifoat(
-                rustix::fs::CWD,
-                coordination.join(name).as_path(),
-                Mode::from_raw_mode(0o600),
-            )
-            .expect("plant fifo");
+            plant_fifo(&coordination.join(name));
             let mutator_err = if name == TRANSACTION_LOCK_NAME {
                 LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
             } else {
@@ -1926,8 +1931,7 @@ mod tests {
             // writing, so a blocking open can never complete.
             let path = guard.dir_path().join(name);
             let _ = std::fs::remove_file(&path);
-            rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
-                .expect("plant fifo");
+            plant_fifo(&path);
 
             let root_path = root.path().to_path_buf();
             let state = within(
@@ -1960,8 +1964,7 @@ mod tests {
         let root = temp_root();
         let guard = acquire(root.path());
         let path = record_path(&guard);
-        rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
-            .expect("plant fifo");
+        plant_fifo(&path);
 
         within(
             Duration::from_secs(5),

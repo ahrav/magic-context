@@ -213,6 +213,9 @@ jobs:
       - name: Check compiled TUI freshness
         run: bun run --cwd packages/plugin check:tui-compiled
 
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
       - name: Test
         run: bun run test
 
