@@ -72,25 +72,6 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
             classification: "VERDICT",
             reason: "Correct by scope: session_meta migration completes before the first projection is built for this database handle.",
         },
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryImportanceColumnCache":
-        {
-            classification: "VERDICT",
-            reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
-        },
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryScopeColumnCache": {
-        classification: "VERDICT",
-        reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
-    },
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryShareableColumnCache":
-        {
-            classification: "VERDICT",
-            reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
-        },
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryClassifiedAtColumnCache":
-        {
-            classification: "VERDICT",
-            reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
-        },
     "packages/plugin/src/hooks/magic-context/ctx-reduce-availability.ts:ctxReduceRegisteredGlobally":
         {
             classification: "VERDICT",

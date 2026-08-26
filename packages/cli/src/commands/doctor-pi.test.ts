@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc } from "comment-json";
 import { openExistingContextDatabase } from "../lib/database-access";
@@ -146,23 +147,13 @@ function writePiCachePackage(cacheRoot: string, version: string): string {
 }
 
 function createMockDb(): Database {
-    const db = new Database(":memory:");
-    db.exec(`
-		CREATE TABLE tags (id INTEGER);
-		CREATE TABLE compartments (id INTEGER);
-		CREATE TABLE memories (id INTEGER);
-		CREATE TABLE notes (id INTEGER);
-		CREATE TABLE dream_runs (id INTEGER);
-		INSERT INTO tags VALUES (1);
-		INSERT INTO memories VALUES (1);
-	`);
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 function baseOptions(root: string, cwd: string, prompts: MockPrompts): RunDoctorOptions {
     const storageDir = join(root, ".local", "share", "cortexkit", "magic-context");
     mkdirSync(storageDir, { recursive: true });
-    writeFileSync(join(storageDir, "context.db"), "mock");
+    createDirectTestDatabase({ path: join(storageDir, "context.db") }).db.close();
     return {
         cwd,
         prompts,
@@ -254,7 +245,7 @@ describe("Pi doctor", () => {
         expect(output).toContain("bunx @cortexkit/magic-context@latest doctor repair-db");
     });
 
-    it("leaves an older supported shared DB schema unchanged", async () => {
+    it("refuses an older migration-lane database unchanged", async () => {
         const root = makeTempRoot();
         const cwd = makeTempRoot("mc-pi-doctor-cwd-");
         const agentDir = setEnv(root, cwd);
@@ -279,7 +270,7 @@ describe("Pi doctor", () => {
 
         const code = await runDoctor(options);
 
-        expect(code).toBe(0);
+        expect(code).toBe(1);
         const reopened = new Database(dbPath);
         const version = reopened
             .prepare("SELECT MAX(version) AS version FROM schema_migrations")

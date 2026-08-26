@@ -3,7 +3,6 @@ import {
     AUTHORITY_DOMAINS,
     type AuthorityState,
 } from "@magic-context/core/features/magic-context/context-authority";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
 import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { Database } from "@magic-context/core/shared/sqlite";
@@ -511,7 +510,6 @@ describe("applyMigrateSession — direct claims", () => {
         const oc = makeOpencodeDb();
         const ctx = createDirectTestDatabase().db;
         databases.push(ctx);
-        initializeDatabase(ctx);
         oc.prepare(
             "INSERT INTO session (id, project_id, directory, path) VALUES (?, 'global', '/old/dir', 'old/dir')",
         ).run(SID);

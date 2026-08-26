@@ -72,11 +72,7 @@ export const SESSION_RUNTIME_TABLES: readonly string[] = [
     "migration_pending",
     "mirror_cursors",
     "mirror_identity",
-    "mirror_live_memory_rows",
-    "mirror_live_staging",
     "mirror_note_revisions",
-    "mirror_pending_references",
-    "mirror_resnapshot_state",
     "mural_manifest",
     "notes",
     "notes_fts",
@@ -102,7 +98,6 @@ export const SESSION_RUNTIME_TABLES: readonly string[] = [
     "recomp_facts",
     "retrospective_processed_windows",
     "schema_migrations",
-    "schema_migrations_meta",
     "session_facts",
     "session_meta",
     "session_projects",
@@ -113,7 +108,6 @@ export const SESSION_RUNTIME_TABLES: readonly string[] = [
     "tags",
     "task_schedule_state",
     "tool_definition_measurements",
-    "tool_owner_backfill_state",
     "transform_decisions",
     "user_memories",
     "user_memory_candidates",
@@ -446,11 +440,6 @@ CREATE TABLE project_key_files_version (
       version      INTEGER NOT NULL DEFAULT 0
     );
 
-CREATE TABLE schema_migrations_meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
 CREATE TABLE project_state (
       project_path TEXT PRIMARY KEY,
       project_memory_epoch INTEGER NOT NULL DEFAULT 0,
@@ -630,9 +619,7 @@ CREATE TABLE session_meta (
       cached_m0_workspace_fingerprint TEXT,
       cached_m0_project_user_profile_version INTEGER,
       cached_m0_max_compartment_seq INTEGER,
-      cached_m0_max_memory_id INTEGER,
       cached_m0_max_mutation_id INTEGER,
-      cached_m0_max_memory_mutation_id INTEGER,
       cached_m0_project_docs_hash TEXT,
       cached_m1_bytes BLOB,
       last_observed_model_key TEXT,
@@ -659,15 +646,6 @@ CREATE TABLE session_meta (
        upgrade_reminded_at INTEGER,
        pi_stable_id_scheme INTEGER
     , note_last_read_at INTEGER DEFAULT 0, cleared_reasoning_through_tag INTEGER DEFAULT 0, tool_reclaim_watermark INTEGER DEFAULT 0, stripped_placeholder_ids TEXT DEFAULT '', stale_reduce_stripped_ids TEXT DEFAULT '', processed_image_stripped_ids TEXT DEFAULT '', merged_reasoning_stripped_ids TEXT DEFAULT '', trailing_blank_decisions TEXT DEFAULT '', system_prompt_tokens INTEGER DEFAULT 0, compaction_marker_state TEXT DEFAULT '', key_files TEXT DEFAULT '', conversation_tokens INTEGER DEFAULT 0, tool_call_tokens INTEGER DEFAULT 0, recomp_partial_range_start INTEGER DEFAULT 0, recomp_partial_range_end INTEGER DEFAULT 0, detected_context_limit INTEGER DEFAULT 0, detected_context_limit_model_key TEXT, needs_emergency_recovery INTEGER DEFAULT 0, emergency_recovery_origin TEXT DEFAULT '', upgrade_reminder_last_sent_at INTEGER, upgrade_reminder_count INTEGER NOT NULL DEFAULT 0, cached_m0_mural_data_url TEXT, cached_m0_mural_hash TEXT);
-
-CREATE TABLE tool_owner_backfill_state (
-      session_id TEXT PRIMARY KEY,
-      status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'skipped')),
-      started_at INTEGER,
-      lease_expires_at INTEGER,
-      completed_at INTEGER,
-      last_error TEXT
-    );
 
 CREATE TABLE subagent_invocations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -924,14 +902,6 @@ CREATE TABLE authority_capture_bounds (
                     PRIMARY KEY(project_path, domain)
                 );
 
-CREATE TABLE mirror_pending_references (
-                    domain TEXT NOT NULL CHECK(domain = 'memories'),
-                    module_project TEXT NOT NULL,
-                    module_row_id INTEGER NOT NULL,
-                    target_module_row_id INTEGER NOT NULL,
-                    PRIMARY KEY(domain, module_project, module_row_id)
-                );
-
 CREATE TABLE mirror_note_revisions (
                     module_project TEXT NOT NULL,
                     module_row_id INTEGER NOT NULL,
@@ -946,29 +916,6 @@ CREATE TABLE domain_mutation_epoch (
                     domain TEXT NOT NULL CHECK(domain IN ('memories', 'notes')),
                     epoch INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(project_path, domain)
-                );
-
-CREATE TABLE mirror_live_memory_rows (
-                    module_project TEXT NOT NULL,
-                    module_row_id INTEGER NOT NULL,
-                    category TEXT NOT NULL,
-                    normalized_hash TEXT NOT NULL, full_row_snapshot TEXT,
-                    PRIMARY KEY(module_project, module_row_id)
-                );
-
-CREATE TABLE mirror_resnapshot_state (
-                    domain TEXT PRIMARY KEY CHECK(domain = 'memories'),
-                    status TEXT NOT NULL CHECK(status IN ('pending_check', 'resnapshotting', 'complete')),
-                    updated_at INTEGER NOT NULL
-                , generation TEXT);
-
-CREATE TABLE mirror_live_staging (
-                    generation TEXT NOT NULL,
-                    module_project TEXT NOT NULL,
-                    module_row_id INTEGER NOT NULL,
-                    category TEXT NOT NULL,
-                    normalized_hash TEXT NOT NULL, full_row_snapshot TEXT,
-                    PRIMARY KEY(generation, module_project, module_row_id)
                 );
 
 CREATE TABLE mural_manifest (
@@ -1061,9 +1008,6 @@ CREATE INDEX idx_message_history_index_orphan_sweep
 
 CREATE INDEX idx_message_history_source_session_ordinal
       ON message_history_source(session_id, message_ordinal);
-
-CREATE INDEX idx_tool_owner_backfill_state_status
-      ON tool_owner_backfill_state(status);
 
 CREATE INDEX idx_sai_session_started
       ON subagent_invocations(session_id, started_at DESC);
@@ -1168,15 +1112,6 @@ CREATE INDEX idx_notes_smart_checks_liveness
 CREATE INDEX idx_cce_session ON compartment_chunk_embeddings(session_id);
 
 CREATE INDEX idx_cce_project_model ON compartment_chunk_embeddings(project_path, model_id);
-
-CREATE INDEX idx_mirror_pending_reference_target
-                    ON mirror_pending_references(domain, module_project, target_module_row_id);
-
-CREATE INDEX idx_mirror_live_memory_content
-                    ON mirror_live_memory_rows(module_project, category, normalized_hash);
-
-CREATE INDEX idx_mirror_live_staging_generation
-                    ON mirror_live_staging(generation);
 
 CREATE TRIGGER primers_ai AFTER INSERT ON primers BEGIN
       INSERT INTO primers_fts(rowid, question, answer, project_path)

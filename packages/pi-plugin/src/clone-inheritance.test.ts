@@ -11,7 +11,6 @@ import {
 	getSourceContents,
 	getTagsBySession,
 } from "@magic-context/core/features/magic-context/storage";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
 import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
@@ -100,6 +99,7 @@ function seedCompartment(
 			  episode_type, legacy, created_at, harness)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
+		// pi-lens-ignore: sql-injection
 		.run(
 			args.sessionId ?? "source",
 			args.sequence,
@@ -141,6 +141,7 @@ function seedTag(
 			  caveman_depth, tool_owner_message_id)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
+		// pi-lens-ignore: sql-injection
 		.run(
 			"source",
 			args.messageId,
@@ -739,7 +740,6 @@ describe("Pi clone state inheritance", () => {
 	it("U7 scenario 7: clone copies session runtime without cloning claim history or receipt identity", () => {
 		const database = createDirectTestDatabase().db;
 		openDatabases.push(database);
-		initializeDatabase(database);
 		seedCompartment(database, { sequence: 1, startId: "u1", endId: "a1" });
 		seedTag(database, { tagNumber: 1, messageId: "a1" });
 		seedProjectMemoryClaim(database, {

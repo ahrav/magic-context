@@ -132,6 +132,15 @@ export function openExistingContextDatabase(
     path: string,
     options: { readonly: boolean; minimumSupportedVersion?: number },
 ): DatabaseType | null {
+    if (!existsSync(path)) return null;
+    if (!options.readonly) {
+        const family = inspectDirectDatabaseFamilyState(path);
+        if (family.state !== "current") {
+            throw new Error(
+                `Refusing to mutate ${path}: database is not the exact supported direct format (${family.state}). Run 'npx @cortexkit/magic-context@latest doctor reset-db' only if you intend to abandon it.`,
+            );
+        }
+    }
     const db = openExistingDatabase(path, options);
     if (db === null) return null;
 

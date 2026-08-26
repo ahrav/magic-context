@@ -15,10 +15,7 @@ import { databaseResetMarkerPath } from "@magic-context/core/features/magic-cont
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter } from "../adapters/types";
-import {
-    openExistingContextDatabase,
-    openExistingContextDatabaseForMutation,
-} from "../lib/database-access";
+import { openExistingContextDatabaseForMutation } from "../lib/database-access";
 import { DATABASE_RESET_COMMAND } from "../lib/database-repair-guidance";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { confirm, intro, log, outro, selectMany, spinner } from "../lib/prompts";

@@ -14,7 +14,6 @@ import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
-import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
@@ -1281,13 +1280,7 @@ export async function runDoctor(
                 // Row counts across the major tables — informational, not pass/fail.
                 try {
                     const counts: Record<string, number> = {};
-                    for (const table of [
-                        "tags",
-                        "compartments",
-                        "notes",
-                        "claims",
-                        "dream_runs",
-                    ]) {
+                    for (const table of ["tags", "compartments", "notes", "claims", "dream_runs"]) {
                         try {
                             const row = db.prepare(`SELECT COUNT(*) as c FROM ${table}`).get() as
                                 | { c?: number }

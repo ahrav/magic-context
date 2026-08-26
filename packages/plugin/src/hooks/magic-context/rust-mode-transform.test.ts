@@ -9,11 +9,9 @@ import {
     type AuthorityStatus,
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
-import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
-import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
-import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
+import { openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import {
     getEmergencyRecoveryArmedAt,
@@ -23,6 +21,7 @@ import {
     resetEmergencyRecoveryRegistryForTest,
 } from "../../features/magic-context/storage-meta-persisted";
 import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import {
     scheduleOpenCodeTransformDecisionWrite,
     __test as transformDecisionTest,
@@ -143,9 +142,7 @@ afterEach(() => {
 });
 
 function makeDb(): ContextDatabase {
-    const db = new Database(":memory:") as ContextDatabase;
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db as ContextDatabase;
     databases.push(db);
     return db;
 }
@@ -272,11 +269,6 @@ describe("Rust mode authority adapter", () => {
         const sessionId = "ses-directory-root";
         installRawProvider(sessionId);
         const db = makeDb();
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed me', 'seed-hash', 0, 0, 0, 0)",
-            ).run("git:identity");
-        });
         const authorityRoots: string[] = [];
         const statuses = new Map<string, AuthorityStatus>();
         const module: RustModeModuleClient = {
@@ -1252,7 +1244,6 @@ describe("Rust mode authority adapter", () => {
         const sessionId = `rust-claim-visibility-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
-        db.transaction(() => createClaimMemorySchema(db)).immediate();
         installRawProvider(sessionId);
         const firstClaim = seedProjectMemoryClaim(db, {
             projectIdentity: "dir:/tmp/project",
@@ -1306,9 +1297,12 @@ describe("Rust mode authority adapter", () => {
         };
 
         await run();
-        expect(transformClaimLanes.at(-1)).toEqual({
-            enabled: false,
-            snapshot_vector: null,
+        expect(transformClaimLanes.at(-1)).toMatchObject({
+            enabled: true,
+            snapshot_vector: {
+                vectorVersion: 1,
+                databaseIncarnationId: firstLane.snapshotVector.databaseIncarnationId,
+            },
         });
         expect(getVisibleRevisionLocators(db, sessionId)).toEqual(
             new Set([firstClaim.revisionLocator]),

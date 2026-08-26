@@ -314,6 +314,36 @@ describe("doctor reset-db U11 scenarios", () => {
         }
     });
 
+    it("scenario 5b: a sidecar replaced between moves is preserved and aborts quarantine", async () => {
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "context.db");
+        seedFullCorruptFamily(dbPath);
+        const replacement = Buffer.from("replacement shm after reset began");
+        let replaced = false;
+
+        const code = await runResetDb({
+            dbPath,
+            storageDir,
+            prompts: new MockPrompts(),
+            yes: true,
+            deps: {
+                inspectHolders: safeHolders,
+                renameFile: (source, destination) => {
+                    renameSync(source, destination);
+                    if (!replaced && source.endsWith("-journal")) {
+                        replaced = true;
+                        rmSync(`${dbPath}-shm`, { force: true });
+                        writeFileSync(`${dbPath}-shm`, replacement);
+                    }
+                },
+            },
+        });
+
+        expect(code).toBe(RESET_DB_EXIT.refused);
+        expect(readFileSync(`${dbPath}-shm`)).toEqual(replacement);
+        expect(existsSync(dbPath)).toBe(true);
+    });
+
     it("scenario 6: holder appearing after initial inspection refuses before first move", async () => {
         const storageDir = tempStorage();
         const dbPath = join(storageDir, "context.db");

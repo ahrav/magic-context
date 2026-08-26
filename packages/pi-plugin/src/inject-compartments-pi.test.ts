@@ -11,14 +11,11 @@ import {
 	reviseProjectMemoryClaim,
 	setProjectMemoryClaimLifecycle,
 } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
-import { insertMemory as insertMemoryRaw } from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
 	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
-import { createClaimMemorySchema } from "@magic-context/core/features/magic-context/storage-claim-memory-schema";
 import {
 	type SeededProjectMemoryClaim,
 	seedProjectMemoryClaim,
@@ -41,65 +38,38 @@ import {
 } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
-function queueMemoryMutation(
-	db: ReturnType<typeof createTestDb>,
-	input: {
-		projectPath: string;
-		mutationType: string;
-		targetMemoryId: number;
-		newContent: string;
-		queuedAt: number;
-	},
-): void {
-	db.prepare(
-		"INSERT INTO memory_mutation_log (project_path, mutation_type, target_memory_id, new_content, queued_at) VALUES (?, ?, ?, ?, ?)",
-	).run(
-		input.projectPath,
-		input.mutationType,
-		input.targetMemoryId,
-		input.newContent,
-		input.queuedAt,
-	);
-}
-
-const directSchemaDatabases = new WeakSet<ReturnType<typeof createTestDb>>();
 const seededClaims = new WeakMap<
 	ReturnType<typeof createTestDb>,
 	Map<number, SeededProjectMemoryClaim>
 >();
 
-const insertMemory: typeof insertMemoryRaw = (db, input, operationIdentity) => {
-	if (!directSchemaDatabases.has(db)) {
-		db.transaction(() => createClaimMemorySchema(db)).immediate();
-		directSchemaDatabases.add(db);
-	}
-	const memory = insertMemoryRaw(
-		db,
-		{ sourceType: "user", ...input },
-		operationIdentity,
-	);
-	const category = [
-		"PROJECT_RULES",
-		"ARCHITECTURE",
-		"CONSTRAINTS",
-		"CONFIG_VALUES",
-		"NAMING",
-	].includes(input.category)
-		? input.category
-		: "ARCHITECTURE";
+let testMemoryId = 0;
+
+function insertMemory(
+	db: ReturnType<typeof createTestDb>,
+	input: {
+		projectPath: string;
+		category: string;
+		content: string;
+		importance?: number;
+		expiresAt?: number | null;
+		sourceType?: string;
+	},
+): { id: number } {
+	testMemoryId += 1;
 	const claim = seedProjectMemoryClaim(db, {
 		projectIdentity: input.projectPath,
 		content: input.content,
-		category,
+		category: input.category,
 		...(input.importance == null ? {} : { importance: input.importance }),
 		...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
 	});
 	const byMemoryId =
 		seededClaims.get(db) ?? new Map<number, SeededProjectMemoryClaim>();
-	byMemoryId.set(memory.id, claim);
+	byMemoryId.set(testMemoryId, claim);
 	seededClaims.set(db, byMemoryId);
-	return memory;
-};
+	return { id: testMemoryId };
+}
 
 function seededClaim(
 	db: ReturnType<typeof createTestDb>,
@@ -169,33 +139,6 @@ function archiveSeededClaim(
 	refreshSeededClaim(db, memoryId);
 }
 
-function reviseSeededClaimContent(
-	db: ReturnType<typeof createTestDb>,
-	memoryId: number,
-	content: string,
-): void {
-	const claim = seededClaim(db, memoryId);
-	reviseProjectMemoryClaim(
-		db,
-		{ producer: "test", operationKey: `revise-${claim.publicClaimId}` },
-		{
-			token: claim.token,
-			content,
-			provenance: {
-				sourceLocator: `transcript://revise/${claim.publicClaimId}`,
-				sourceContent: content,
-				extractor: "historian",
-				extractorVersion: "1",
-				extractorRunId: `revise-${claim.publicClaimId}`,
-				independenceKey: `revise-${claim.publicClaimId}`,
-				sourceTrustClass: "explicit_user",
-			},
-			actor: "user:test",
-		},
-	);
-	refreshSeededClaim(db, memoryId);
-}
-
 function projectMemoryEpochOf(
 	db: ReturnType<typeof createTestDb>,
 	projectPath: string,
@@ -260,11 +203,6 @@ describe("workspace memory sharing", () => {
 				category: "CONSTRAINTS",
 				content: "foreign constraint is shared",
 			});
-			runInMemoryClaimsWriteTransaction(db, () =>
-				db
-					.prepare("UPDATE memories SET shareable = 1 WHERE id = ?")
-					.run(shared.id),
-			);
 			makeSeededClaimShareable(db, shared.id);
 			insertMemory(db, {
 				projectPath: "git:foreign",
@@ -454,7 +392,6 @@ describe("trimPiMessagesToBoundary", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-frozen-cp-profile-"));
 		try {
-			db.transaction(() => createClaimMemorySchema(db)).immediate();
 			const state = piState("ses-pi-frozen-cp-profile", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
@@ -1404,98 +1341,6 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
-	it("skips memory mutation deltas for memories trimmed out of m0", () => {
-		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-trimmed-delta-"));
-		try {
-			const state = {
-				...piState("ses-pi-m1-trimmed-delta", cwd),
-				injectionBudgetTokens: 1,
-			};
-			const memory = insertMemory(db, {
-				projectPath: state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "This memory is too large for a one-token m0 budget.",
-				sourceType: "user",
-			});
-			injectM0M1Pi(
-				state,
-				db,
-				[userMessage("hello", 10)] as never,
-				undefined,
-				true,
-			);
-			queueMemoryMutation(db, {
-				projectPath: state.projectIdentity,
-				mutationType: "update",
-				targetMemoryId: memory.id,
-				newContent: "Updated but not resident.",
-				queuedAt: 10,
-			});
-
-			const bust = [userMessage("bust", 11)];
-			injectM0M1Pi(state, db, bust as never, undefined, true);
-
-			expect(textOf(bust[1] as never)).not.toContain("<memory-updates>");
-			expect(textOf(bust[1] as never)).not.toContain(
-				"Updated but not resident.",
-			);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-
-	it("revision policy removes a candidate claim from automatic injection on vector fold", () => {
-		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-reconcile-delta-"));
-		try {
-			const state = piState("ses-pi-m1-reconcile-delta", cwd);
-			const memory = insertMemory(db, {
-				projectPath: state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "Old baseline content.",
-				sourceType: "user",
-			});
-			injectM0M1Pi(
-				state,
-				db,
-				[userMessage("hello", 10)] as never,
-				undefined,
-				true,
-			);
-			runInMemoryClaimsWriteTransaction(db, () =>
-				db
-					.prepare(
-						"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-					)
-					.run("Reconciled content.", "reconciled-hash", Date.now(), memory.id),
-			);
-			reviseSeededClaimContent(db, memory.id, "Reconciled content.");
-			queueMemoryMutation(db, {
-				projectPath: state.projectIdentity,
-				mutationType: "update",
-				targetMemoryId: memory.id,
-				newContent: "Reconciled content.",
-				queuedAt: 10,
-			});
-			// The insert-time eligibility bump already moved the epoch past its
-			// cached value; reconcile needs a value the cache has not seen.
-			setProjectState(db, state.projectIdentity, {
-				projectMemoryEpoch: projectMemoryEpochOf(db, state.projectIdentity) + 1,
-			});
-
-			const bust = [userMessage("bust", 11)];
-			const result = injectM0M1Pi(state, db, bust as never, undefined, true);
-
-			expect(result.m0Materialized).toBe(true);
-			expect(textOf(bust[0] as never)).not.toContain("Old baseline content.");
-			expect(textOf(bust[0] as never)).not.toContain("Reconciled content.");
-			expect(textOf(bust[1] as never)).not.toContain("<memory-updates>");
-		} finally {
-			closeQuietly(db);
-		}
-	});
-
 	it("soft m1 refresh CAS rolls back and replays a sibling cached m1 on marker mismatch", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-"));
@@ -1514,7 +1359,7 @@ describe("injectM0M1Pi", () => {
 				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
 					injectedSibling = true;
 					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
+						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_claim_format_epoch = ?, cached_m1_bytes = ? WHERE session_id = ?",
 					).run(
 						Buffer.from(
 							`<session-history>${"baseline ".repeat(300)}</session-history>`,
@@ -2535,7 +2380,7 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
 					injectedSibling = true;
 					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
+						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_claim_format_epoch = ?, cached_m1_bytes = ? WHERE session_id = ?",
 					).run(
 						Buffer.from(
 							`<session-history>${"baseline ".repeat(300)}</session-history>`,

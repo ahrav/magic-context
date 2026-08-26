@@ -491,99 +491,19 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
     return row.hasAny ? 1 : 0;
 }
 
-/** Exact explicit-user evidence for this revision: a supports observation
- * with the explicit-user trust class, or — for revisions at or below the
- * recorded seed boundary only — retained raw `user` source provenance on the
- * revision's memory metadata. Post-boundary revisions must carry the trust
- * class on the observation itself, so retained legacy metadata cannot
- * qualify later rewrites.
- *
- * Both branches are restricted to the claim's FIRST revision — with one
- * carve-out. The pre-v86 rewrite path passed the retained `user` source
- * type into the new observation and left the revision metadata untouched,
- * so a later revision's explicit-user stamp can be model-authored
- * replacement bytes; a held-open pre-v86 writer keeps producing such
- * observations AFTER the seed boundary too, so the boundary alone cannot
- * clear them. First revisions come from the original user write or legacy
- * adoption and keep their stated provenance. The carve-out: a post-boundary
- * later revision whose bytes still equal the first revision's bytes (the
- * v86 classification path re-observes unchanged content) keeps its
- * evidence, because no writer can smuggle new content through it. A missing
- * boundary key reads as 0 (never seeded): every revision on such a database
- * was written by a build that classifies rewrites as model inference. */
+/** Exact explicit-user supporting evidence for this revision. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
-    // Direct-format databases carry neither schema_migrations_meta nor the
-    // v84 memory-metadata table; there the boundary reads as 0 (never
-    // seeded) and the metadata branch cannot apply.
-    const hasLegacyMeta =
+    return (
         db
             .prepare(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations_meta'",
-            )
-            .get() != null;
-    const boundarySql = hasLegacyMeta
-        ? `COALESCE((
-                           SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
-                           WHERE key = 'claim_policy_seed_boundary_revision_id'
-                       ), 0)`
-        : "0";
-    const byObservation = db
-        .prepare(
-            // Post-boundary observations are NOT unconditionally trusted:
-            // a held-open pre-v86 writer's rewrite path copies the retained
-            // `user` trust class onto the model-authored successor's
-            // observation. A post-boundary later revision qualifies only
-            // while its bytes ARE still the claim's first-revision bytes
-            // (the v86 classification path re-observes unchanged content;
-            // no v86 path authors NEW user-content revisions), so a
-            // content-changing compatibility rewrite can never ride the
-            // copied stamp to VERIFIED.
-            // Interpolation is a compile-time boundary expression, not
-            // caller input.
-            // pi-lens-ignore: sql-injection
-            `SELECT 1 FROM claim_evidence e
+                `SELECT 1 FROM claim_evidence e
              JOIN observations o ON o.id = e.observation_id
-             JOIN claim_revisions cr ON cr.id = e.revision_id
              WHERE e.revision_id = ? AND e.relation = 'supports'
                AND o.source_trust_class = 'explicit_user'
-               AND (
-                   cr.revision = 1
-                   OR (
-                       e.revision_id > ${boundarySql}
-                       AND cr.content_sha256 = (
-                           SELECT first.content_sha256 FROM claim_revisions first
-                           WHERE first.claim_id = cr.claim_id AND first.revision = 1
-                       )
-                   )
-               )
              LIMIT 1`,
-        )
-        .get(revisionId);
-    if (byObservation) return true;
-    if (
-        !hasLegacyMeta ||
-        db
-            .prepare(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_revision_memory_metadata'",
             )
-            .get() == null
-    ) {
-        return false;
-    }
-    const byMetadata = db
-        .prepare(
-            `SELECT 1 FROM claim_revision_memory_metadata m
-             JOIN claim_revisions cr ON cr.id = m.revision_id
-             WHERE m.revision_id = ? AND m.source_type = 'user'
-               AND cr.revision = 1
-               AND m.revision_id <= (
-                   SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
-                   WHERE key = 'claim_policy_seed_boundary_revision_id'
-               )
-             LIMIT 1`,
-        )
-        .get(revisionId);
-    return byMetadata != null;
+            .get(revisionId) != null
+    );
 }
 
 export function readActiveDispositions(db: Database, revisionId: number): ActiveDispositions {

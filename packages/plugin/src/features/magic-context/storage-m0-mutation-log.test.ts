@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { initializeDatabase } from "./storage-db";
 import {
     clearM0MutationsForSession,
     deleteM0Mutation,
@@ -10,12 +9,12 @@ import {
     getMaxM0MutationId,
     queueM0Mutation,
 } from "./storage-m0-mutation-log";
+import { createDirectTestDatabase } from "./test-database";
 
 let db: Database | null = null;
 
 function makeDb(): Database {
-    db = new Database(":memory:");
-    initializeDatabase(db);
+    db = createDirectTestDatabase().db;
     return db;
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Database, withPrivilegedWriter } from "../../shared/sqlite";
+import { type Database, withPrivilegedWriter } from "../../shared/sqlite";
 import type { AuthorityModuleClient, AuthorityStatus } from "./context-authority";
 import {
     applyMirrorPage,
@@ -11,16 +11,12 @@ import {
     getModuleNoteEvaluationBridge,
     installAuthorityManagedMarker,
     prepareAuthority,
-    reconcileAuthorityProject,
     registerModuleNoteEvaluationBridge,
 } from "./context-authority";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 function db(): Database {
-    const value = new Database(":memory:");
-    initializeDatabase(value);
-    runMigrations(value);
+    const value = createDirectTestDatabase().db;
     return value;
 }
 
@@ -848,23 +844,6 @@ describe("memory authority protocol", () => {
         ).toEqual({
             count: 1,
         });
-    });
-
-    test("restart reconciliation reinstalls a missing marker before tools can write", async () => {
-        const database = db();
-        const module = protocol({ bytes: [] });
-        module.authorityStatus = async (args) => ({
-            authority: { ...authority("MODULE", 2), domain: args.domain },
-        });
-        await reconcileAuthorityProject({ db: database, projectPath: "/repo", module });
-        expect(getAuthorityManagedMarker(database, "/repo")).not.toBeNull();
-        expect(() =>
-            database
-                .prepare(
-                    "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'blocked', 'h', 0, 0, 0, 0)",
-                )
-                .run("/repo"),
-        ).toThrow("managed by the Rust module");
     });
 
     test("privileged same-connection UPDATE between capture and verify aborts prepare", async () => {

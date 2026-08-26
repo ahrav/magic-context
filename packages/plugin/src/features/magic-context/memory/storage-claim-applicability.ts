@@ -16,12 +16,11 @@
 
 import { createHash } from "node:crypto";
 import type { Database } from "../../../shared/sqlite.ts";
-import {
-    APPLICABILITY_STREAM_KEY_PROTOCOL,
-    type ApplicabilityOwnerKind,
-    type ApplicabilityPathKind,
-    type ApplicabilityPathsState,
-    type ApplicabilityState,
+import type {
+    ApplicabilityOwnerKind,
+    ApplicabilityPathKind,
+    ApplicabilityPathsState,
+    ApplicabilityState,
 } from "../storage-claim-applicability-schema.ts";
 
 export class ApplicabilityWriteError extends Error {
@@ -614,4 +613,3 @@ export function syncRevisionApplicabilityPathsInCurrentTransaction(
     });
     return { appended: true };
 }
-

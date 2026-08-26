@@ -34,7 +34,7 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
-        expect(validation.files.length).toBe(60);
+        expect(validation.files.length).toBe(61);
         expect(validation.manifest.entries).toHaveLength(
             validation.files.length,
         );
@@ -50,13 +50,13 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(41);
-        expect(rust).toHaveLength(31);
+        expect(ts).toHaveLength(42);
+        expect(rust).toHaveLength(32);
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(
-            21,
+            22,
         );
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(20);
-        expect(filesForMode(validation, "ts", "pi")).toHaveLength(21);
+        expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length);
         expect(filesForMode(validation, "ts", "pi")).not.toContain(
             "tests/pi-todo-synthesis.test.ts",

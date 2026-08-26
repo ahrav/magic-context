@@ -2298,5 +2298,151 @@ mod tests {
             output.length_capped,
             "the cap travels with the text it truncated"
         );
+        assert_eq!(
+            log.sends[0]["model"],
+            json!({ "provider": "prov", "model": "model-a" }),
+            "model is llm-runner's nested ModelParams object, split at the FIRST slash"
+        );
+        assert_eq!(log.sends[0]["tools"], json!([]));
+        assert_eq!(
+            log.sends[0]["generation"]["max_output_tokens"],
+            json!(HISTORIAN_MAX_OUTPUT_TOKENS),
+            "an explicit output budget rides every send: llm-runner's default truncated a real summarization pass"
+        );
+        assert_eq!(
+            log.sends[0]["generation"]["temperature"],
+            json!(HISTORIAN_TEMPERATURE),
+            "the calibrated temperature rides every send: prompt and sampling were calibrated together"
+        );
+        assert_eq!(
+            log.sends[0]["system"],
+            json!("role guidance"),
+            "system rides the role-scoped SendParams field, byte-exact"
+        );
+        assert_eq!(log.goodbyes, vec![10]);
+    }
+
+    #[tokio::test]
+    async fn start_omits_system_param_when_empty() {
+        // Empty means absent on the wire (the field's empty-as-absent rule); omitting it
+        // entirely keeps the send byte-shape identical to pre-system clients.
+        let server = fake_server(json!({"state":"active","run_id":"run-9"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:9", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 1);
+        assert!(
+            log.sends[0].get("system").is_none(),
+            "empty system must be omitted, not sent as \"\""
+        );
+    }
+
+    #[test]
+    fn unit_text_collects_only_assistant_message_units() {
+        let leaked = json!({
+            "type": "example_replay",
+            "message": {"content": [{"type": "text", "text": "seed output"}]},
+            "text": "flat seed output"
+        });
+        let assistant = json!({
+            "type": "assistant_message",
+            "message": {"content": [{"type": "text", "text": "real output"}]}
+        });
+
+        assert_eq!(unit_text(&leaked), None);
+        assert_eq!(unit_text(&assistant).as_deref(), Some("real output"));
+    }
+
+    #[tokio::test]
+    async fn await_output_uses_control_terminal_not_stream_end() {
+        let terminal_text = r#"<output><compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments><meta><messages_processed>1-1</messages_processed></meta></output>"#;
+        let events = vec![
+            json!({"kind":"display","event":{"type":"text_delta","text":"ignored"}}),
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"assistant_message","message":{"message_id":"m-1","content":[
+                {"type":"reasoning","text":"planning prose that restates start=\"FIRST\" and walks the seed examples"},
+                {"type":"text","text":terminal_text}
+            ]}}}),
+            json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
+        ];
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:2", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        let output = client.await_output("run-1").await.unwrap();
+        client.close().await;
+        for _ in 0..50 {
+            if server.log.lock().await.goodbyes.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(output.text, terminal_text);
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_sessions,
+            vec!["mc-historian:proj:2", "mc-historian:proj:2"]
+        );
+        assert_eq!(log.subscribes, vec![json!({"from":"start"})]);
+        assert_eq!(
+            log.goodbyes,
+            vec![11, 10],
+            "close releases subscribe and command routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_without_matching_run_started_fails_loud() {
+        let events = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"other-run"}}),
+            json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
+        ];
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:3", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+
+        let err = client.await_output("run-1").await.unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianProducerError::TerminalRunMismatch {
+                expected,
+                found: Some(found),
+            } if expected == "run-1" && found == "other-run"
+        ));
+    }
+
+    #[tokio::test]
+    async fn paused_unit_returns_run_paused() {
+        let events = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"paused","run_id":"run-1","reason":"auth_required"}}),
+        ];
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:4", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+
+        let err = client.await_output("run-1").await.unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianProducerError::RunPaused {
+                run_id,
+                reason: Some(reason),
+                ..
+            } if run_id == "run-1" && reason == "auth_required"
+        ));
     }
 }

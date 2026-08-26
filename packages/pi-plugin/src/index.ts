@@ -48,7 +48,6 @@ import {
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
-import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	getOrCreateSessionMeta,
@@ -80,10 +79,7 @@ import {
 import { preloadTokenizer } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
-import {
-	beginBootQuietPeriod,
-	scheduleAfterBootQuiet,
-} from "@magic-context/core/plugin/boot-quiet";
+import { beginBootQuietPeriod } from "@magic-context/core/plugin/boot-quiet";
 import {
 	ANNOUNCEMENT_FEATURES,
 	ANNOUNCEMENT_FOOTER,
@@ -154,7 +150,6 @@ import {
 	registerPiDreamerProject,
 	unregisterPiDreamerProject,
 } from "./dreamer";
-import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
@@ -854,27 +849,6 @@ async function startPiMagicContextRuntime(
 	dbPath: string,
 ): Promise<void> {
 	const db = database;
-
-	scheduleAfterBootQuiet(() => {
-		void (async () => {
-			try {
-				const api = await loadDefaultPiSessionApi();
-				const sessions = (await api.listSessions()) as Array<{
-					id?: unknown;
-					cwd?: unknown;
-				}>;
-				await runSessionProjectBackfill(
-					database,
-					sessions.map((session) => ({
-						sessionId: typeof session?.id === "string" ? session.id : "",
-						directory: typeof session?.cwd === "string" ? session.cwd : "",
-					})),
-				);
-			} catch (err) {
-				warn(`[session-projects] background runner failed: ${err}`);
-			}
-		})();
-	}, 0);
 
 	// Capture boot project for initial config load and logging only. Runtime
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd

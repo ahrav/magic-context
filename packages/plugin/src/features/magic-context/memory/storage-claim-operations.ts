@@ -868,15 +868,23 @@ function appendLifecycleEvent(
 
 function assertNoLiveDuplicate(
     db: Database,
-    args: { projectId: number; category: string; normalizedHash: string; claimId: number },
+    args: {
+        projectId: number;
+        category: string;
+        normalizedHash: string;
+        claimId: number;
+        excludedClaimIds?: readonly number[];
+    },
 ): void {
+    const excludedClaimIds = args.excludedClaimIds ?? [args.claimId];
+    const placeholders = excludedClaimIds.map(() => "?").join(", ");
     const duplicate = db
         .prepare(
             `SELECT claim_id AS claimId FROM claim_memory_current_heads
               WHERE project_id = ? AND category = ? AND normalized_hash = ?
-                AND lifecycle_state = 'active' AND claim_id <> ?`,
+                AND lifecycle_state = 'active' AND claim_id NOT IN (${placeholders})`,
         )
-        .get(args.projectId, args.category, args.normalizedHash, args.claimId) as
+        .get(args.projectId, args.category, args.normalizedHash, ...excludedClaimIds) as
         | { claimId: number }
         | undefined;
     if (duplicate) {
@@ -1527,6 +1535,7 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         category: targetAttributes.category,
         normalizedHash,
         claimId: target.claimId,
+        excludedClaimIds: [target.claimId, ...sources.map((source) => source.claimId)],
     });
 
     const sourceObservations = sources.flatMap((source) =>
@@ -1565,15 +1574,6 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         projectId: target.projectId,
         attributes: { ...targetAttributes, category: targetAttributes.category },
         normalizedHash,
-        nowMs,
-    });
-    upsertCurrentHead(db, {
-        claimId: target.claimId,
-        projectId: target.projectId,
-        category: targetAttributes.category,
-        normalizedHash,
-        revisionId: appended.revisionId,
-        lifecycleState: lifecycleHead(db, target.claimId)?.state ?? "active",
         nowMs,
     });
     createPolicySubjectForRevision(db, {
@@ -1632,6 +1632,15 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         });
         policyRevisionIds.push(source.currentRevisionId);
     }
+    upsertCurrentHead(db, {
+        claimId: target.claimId,
+        projectId: target.projectId,
+        category: targetAttributes.category,
+        normalizedHash,
+        revisionId: appended.revisionId,
+        lifecycleState: lifecycleHead(db, target.claimId)?.state ?? "active",
+        nowMs,
+    });
     const locator = {
         publicClaimId: target.publicClaimId,
         revision: appended.revision,

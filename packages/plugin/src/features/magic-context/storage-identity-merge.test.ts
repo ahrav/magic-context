@@ -1,9 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
 import { auditIdentityMerge, mergeProjectIdentities } from "./storage-identity-merge";
 import { seedProjectMemoryClaim } from "./test-claim-database";
 import { createDirectTestDatabase } from "./test-database";
@@ -11,34 +8,13 @@ import { createDirectTestDatabase } from "./test-database";
 let db: Database | null = null;
 
 function makeDb(): Database {
-    db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    db = createDirectTestDatabase().db;
     return db;
 }
 
 function makeDirectDb(): Database {
     db = createDirectTestDatabase().db;
-    initializeDatabase(db);
     return db;
-}
-
-function insertMemory(
-    database: Database,
-    projectPath: string,
-    content: string,
-    hash: string,
-): number {
-    return runInMemoryClaimsWriteTransaction(database, () => {
-        const result = database
-            .prepare(
-                `INSERT INTO memories
-                (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
-             VALUES (?, 'CONSTRAINTS', ?, ?, 1, 1, 1, 1)`,
-            )
-            .run(projectPath, content, hash) as { lastInsertRowid?: number };
-        return Number(result.lastInsertRowid);
-    });
 }
 
 afterEach(() => {
@@ -47,44 +23,6 @@ afterEach(() => {
 });
 
 describe("project identity merge", () => {
-    test("dry-run audits schema-scoped tables without writing", () => {
-        const database = makeDb();
-        insertMemory(database, "dir:old", "old", "old-hash");
-        database.prepare("INSERT INTO project_state(project_path) VALUES (?)").run("dir:old");
-
-        const report = mergeProjectIdentities(database, "dir:old", "git:new", { dryRun: true });
-
-        expect(report.dryRun).toBe(true);
-        expect(report.auditedTables.map((table) => table.tableName)).toContain("memories");
-        expect(report.auditedTables.map((table) => table.tableName)).toContain("project_state");
-        expect(report.changedRows).toBe(2);
-        expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
-            count: 0,
-        });
-        expect(database.prepare("SELECT project_path FROM memories").get()).toEqual({
-            project_path: "dir:old",
-        });
-    });
-
-    test("a legacy memories pool fails closed instead of merging memory rows", () => {
-        const database = makeDb();
-        const sourceId = insertMemory(database, "dir:old", "legacy", "same-hash");
-        database
-            .prepare("INSERT INTO project_state(project_path, project_memory_epoch) VALUES (?, 4)")
-            .run("git:new");
-
-        expect(() => mergeProjectIdentities(database, "dir:old", "git:new", { now: 10 })).toThrow(
-            "v84 claims-write kernel",
-        );
-
-        expect(
-            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(sourceId),
-        ).toEqual({ project_path: "dir:old" });
-        expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
-            count: 0,
-        });
-    });
-
     test("preserves the oldest open broad cycle when task schedule rows collide", async () => {
         const database = makeDb();
         database
@@ -118,7 +56,6 @@ describe("project identity merge", () => {
     });
     test("refuses a module-owned source pool before any mutation", () => {
         const database = makeDb();
-        insertMemory(database, "dir:module", "memory", "module-hash");
         database
             .prepare(
                 "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",
@@ -128,8 +65,8 @@ describe("project identity merge", () => {
         expect(() => mergeProjectIdentities(database, "dir:module", "git:new")).toThrow(
             "managed by the Rust module",
         );
-        expect(auditIdentityMerge(database, "dir:module", "git:new").changedRows).toBe(2);
-        expect(database.prepare("SELECT project_path FROM memories").get()).toEqual({
+        expect(auditIdentityMerge(database, "dir:module", "git:new").changedRows).toBe(1);
+        expect(database.prepare("SELECT project_path FROM authority_managed").get()).toEqual({
             project_path: "dir:module",
         });
     });
@@ -207,15 +144,11 @@ describe("project identity merge", () => {
         database
             .prepare("INSERT INTO episodes (project_id, created_at) VALUES (?, 1)")
             .run(sourceId);
-        insertMemory(database, "git:source", "payload", "payload-hash");
 
         expect(() => mergeProjectIdentities(database, "git:source", "git:target")).toThrow(
             /authoritative episodes or claims/,
         );
 
-        expect(database.prepare("SELECT project_path FROM memories").get()).toEqual({
-            project_path: "git:source",
-        });
         expect(
             database
                 .prepare(

@@ -11,14 +11,12 @@ import {
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "../../features/magic-context/memory/storage-claim-current-state";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { reserveProtectedTailDrainTokens } from "../../features/magic-context/storage-meta-persisted";
 import { getPrimerCandidatesForProject } from "../../features/magic-context/storage-primers";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { getUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import type { PluginContext } from "../../plugin/types";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runCompartmentAgent } from "./compartment-runner";
 import {
@@ -29,11 +27,7 @@ import { readSessionChunk, setRawMessageProvider } from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
 
 function createDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
-    db.transaction(() => createClaimMemorySchema(db)).immediate();
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 function projectClaims(db: Database, projectIdentity: string) {

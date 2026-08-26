@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
-import { insertMemory } from "../../features/magic-context/memory";
 import { indexMessagesAfterOrdinal } from "../../features/magic-context/message-index";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import * as searchModule from "../../features/magic-context/search";
@@ -114,11 +113,6 @@ describe("createCtxSearchTools", () => {
     });
 
     it("preserves an explicit empty sources list as no sources", async () => {
-        insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "This should not appear when sources is empty.",
-        });
         const tools = createCtxSearchTools({
             db,
             resolveProjectPath: () => "/repo/project",
@@ -374,10 +368,10 @@ describe("createCtxSearchTools", () => {
         }
     });
 
-    it("invokes normal search exactly once when every requested id is missing or hidden", async () => {
-        const hidden = insertMemory(db, {
-            projectPath: "/repo/other",
-            category: "ARCHITECTURE_DECISIONS",
+    it("invokes normal search exactly once when every requested claim is missing or hidden", async () => {
+        const hidden = seedProjectMemoryClaim(db, {
+            projectIdentity: "dir:/repo/other",
+            category: "ARCHITECTURE",
             content: "Hidden because it belongs to another project.",
         });
         let calls = 0;
@@ -413,7 +407,7 @@ describe("createCtxSearchTools", () => {
 
             // A row outside the project scope is as invisible as a missing one.
             const hiddenResult = await tools.ctx_search.execute(
-                { query: `#${hidden.id}` },
+                { query: hidden.publicClaimId },
                 toolContext(),
             );
             expect(hiddenResult).toContain("Fallback text search hit.");

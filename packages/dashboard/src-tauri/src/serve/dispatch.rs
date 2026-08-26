@@ -2,7 +2,9 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{claim_adapter, commands, config, db, embedding_probe, log_parser, workspaces, AppState};
+use crate::{
+    claim_adapter, commands, config, db, embedding_probe, log_parser, workspaces, AppState,
+};
 
 #[derive(Debug)]
 pub enum DispatchError {
@@ -579,14 +581,6 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             let conn = open_readonly(state)?;
             json(
                 db::get_dream_runs(&conn, a.project_path.as_deref(), a.limit.unwrap_or(20))
-                    .map_err(DispatchError::Command)?,
-            )
-        }
-        "get_dream_run_memory_changes" => {
-            let a: RunIdArgs = parse_args(args)?;
-            let conn = open_readonly(state)?;
-            json(
-                db::get_dream_run_memory_changes(&conn, a.run_id)
                     .map_err(DispatchError::Command)?,
             )
         }

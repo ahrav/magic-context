@@ -3,18 +3,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
-import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
-import { createClaimMemorySchema } from "../features/magic-context/storage-claim-memory-schema";
+import { FORK_MIGRATION_VERSION_FLOOR } from "../features/magic-context/migrations";
 import {
     getPersistedSchemaVersion,
-    initializeDatabase,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
 import { seedProjectMemoryClaim } from "../features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../features/magic-context/test-database";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
-import { Database } from "../shared/sqlite";
+import type { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import {
     buildSidebarSnapshot,
@@ -24,9 +23,7 @@ import {
 import { resetSidebarSnapshotCache } from "./sidebar-snapshot-cache";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 
@@ -185,7 +182,6 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
     test("computes memoryTokens on-demand when memory_block_cache is empty but memory_block_count > 0", () => {
         const db = createTestDb();
         try {
-            db.transaction(() => createClaimMemorySchema(db)).immediate();
             const sessionId = "ses-test-1";
             // Resolve a project identity that getMemoriesByProject will key on.
             // Using process.cwd() as the directory matches what the production
@@ -596,22 +592,6 @@ describe("buildStatusDetail — storage versions probe", () => {
             expect(detail.storage_versions.context_db_schema_version).toBe(
                 LATEST_SUPPORTED_VERSION,
             );
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("follows an older live DB version while the fence stays put", () => {
-        const db = createTestDb();
-        try {
-            // Simulate a DB migrated by an older plugin: drop the recorded versions
-            // above 50. The probe must follow the live value down.
-            db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(50);
-
-            const detail = buildStatusDetail(db, "ses-storage-versions-old", process.cwd());
-
-            expect(detail.storage_versions.context_db_schema_version).toBe(50);
-            expect(detail.storage_versions.plugin_supported_version).toBe(LATEST_SUPPORTED_VERSION);
         } finally {
             closeQuietly(db);
         }

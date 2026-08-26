@@ -11,7 +11,6 @@ import {
     reviseProjectMemoryClaim,
 } from "../memory/storage-claim-operations";
 import { ensureProject } from "../memory/storage-claims";
-import { initializeDatabase } from "../storage-db";
 import { createDirectTestDatabase } from "../test-database";
 import { readDreamerProjectClaims } from "./claim-manifest";
 import { applyClassifications, type ClassifyArgs, runClassify } from "./classify";
@@ -19,7 +18,6 @@ import { acquireLease } from "./lease";
 
 function freshDb(): Database {
     const db = createDirectTestDatabase().db;
-    initializeDatabase(db);
     return db;
 }
 

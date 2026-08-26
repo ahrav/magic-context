@@ -36,7 +36,6 @@ import {
     updateSessionMeta,
     updateTagStatus,
 } from "../../features/magic-context/storage";
-import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
 import {
     getEmergencyInputSample,
     setEmergencyDropSample,
@@ -57,16 +56,10 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getSlot, resetLkgSlotsForTest } from "./lkg-slot";
 import { createTransform } from "./transform";
 
-const claimSchemaDatabases = new WeakSet<Database>();
-
 function insertMemory(
     db: Database,
     input: { projectPath: string; category: string; content: string },
 ): void {
-    if (!claimSchemaDatabases.has(db)) {
-        db.transaction(() => createClaimMemorySchema(db)).immediate();
-        claimSchemaDatabases.add(db);
-    }
     seedProjectMemoryClaim(db, {
         projectIdentity: input.projectPath,
         category: [
@@ -319,7 +312,7 @@ describe("createTransform", () => {
         expect(bySession.get(toolSession)?.tool_call_tokens).toBeGreaterThan(0);
 
         const moduleStatus = {
-            usage: { current_total_input_tokens: 10_000, context_limit_tokens: 100_000 },
+            usage: { current_total_input_tokens: 100_000, context_limit_tokens: 200_000 },
         };
         const shortSnapshot = buildSidebarSnapshot(
             db,

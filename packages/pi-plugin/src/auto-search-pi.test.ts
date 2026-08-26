@@ -1,18 +1,10 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { insertMemory } from "@magic-context/core/features/magic-context/memory";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
-import {
-	runInMemoryClaimsWriteTransaction,
-	updateMemoryContentWithClaimsInCurrentTransaction,
-	updateMemoryVerificationWithClaimsInCurrentTransaction,
-} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage";
-import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearAutoSearchForPiSession,
@@ -45,39 +37,6 @@ function memoryResult(
 		category: "WORKFLOW_RULES",
 		matchType: "exact",
 		...(contentDigest === undefined ? {} : { contentDigest }),
-	};
-}
-
-/** A real claim-backed memory plus the search result the lane would emit for
- * it: fresh hints pass the same eligibility gate as replays, so mocked
- * results need a policy-eligible id and the digest of the loaded bytes. */
-function seedEligibleMemory(
-	db: DatabaseType,
-	content = "historian cache wiring details",
-): { id: number; digest: string; result: UnifiedSearchResult } {
-	const seeded = insertMemory(db, {
-		projectPath: "git:test",
-		category: "WORKFLOW_RULES",
-		content,
-	});
-	// A fresh insert is a CANDIDATE (auto-ineligible); the auto-search lane
-	// only surfaces verified rows, so promote the seed the same way.
-	runInMemoryClaimsWriteTransaction(db, () =>
-		updateMemoryVerificationWithClaimsInCurrentTransaction(
-			db,
-			{
-				producer: "auto-search-pi-test",
-				operationKey: `verify:${seeded.id}`,
-				requestDigest: sha256Utf8Hex(`verify:${seeded.id}`),
-			},
-			{ memoryId: seeded.id, verificationStatus: "verified", nowMs: 2_000 },
-		),
-	);
-	const digest = sha256Utf8Hex(content);
-	return {
-		id: seeded.id,
-		digest,
-		result: memoryResult(0.9, content, seeded.id, digest),
 	};
 }
 
@@ -127,57 +86,6 @@ describe("runAutoSearchHintForPi", () => {
 
 			expect(spy).toHaveBeenCalledTimes(1);
 			expect(textOf(replayMessages[0])).toContain("<ctx-search-hint>");
-		} finally {
-			spy.mockRestore();
-			closeQuietly(db);
-		}
-	});
-
-	it("suppresses a persisted legacy hint whose contributing memory is no longer eligible", async () => {
-		const db = createTestDb();
-		const seeded = seedEligibleMemory(db);
-		// A pre-cutover persisted decision that bound fragments keeps its
-		// replay gate; fresh decisions record no claim fragments.
-		const persisted = appendAutoSearchHintDecision(db, "ses-auto", {
-			// The default test entry-id shape for message index 0, timestamp 1.
-			messageId: "test-entry-0:1",
-			decision: "hint",
-			text: "\n\n<ctx-search-hint>historian cache wiring details</ctx-search-hint>",
-			memoryFragments: [{ id: seeded.id, hash: seeded.digest }],
-		});
-		expect(persisted.ok).toBeTrue();
-		runInMemoryClaimsWriteTransaction(db, () =>
-			updateMemoryContentWithClaimsInCurrentTransaction(
-				db,
-				{
-					producer: "auto-search-pi-test",
-					operationKey: `rewrite:${seeded.id}`,
-					requestDigest: sha256Utf8Hex(`rewrite:${seeded.id}`),
-				},
-				{
-					memoryId: seeded.id,
-					content: "rewritten after the hint was persisted",
-					normalizedHash: "hash:rewritten",
-				},
-			),
-		);
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => {
-				throw new Error("replay must not re-search");
-			},
-		);
-		try {
-			const replayMessages = [
-				userMessage("explain the historian cache wiring", 1),
-			];
-			await runAutoSearchHintForPi({
-				sessionId: "ses-auto",
-				db,
-				messages: replayMessages,
-				options: baseOptions,
-			});
-			expect(spy).toHaveBeenCalledTimes(0);
-			expect(textOf(replayMessages[0])).not.toContain("<ctx-search-hint>");
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);
@@ -259,9 +167,8 @@ describe("runAutoSearchHintForPi", () => {
 		// now-removed message's id ("entry-OLD-WRONG"). The reference-keyed map
 		// must win and anchor the hint to the real id ("entry-REAL").
 		const db = createTestDb();
-		const seeded = seedEligibleMemory(db);
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => [seeded.result],
+			async () => [memoryResult()],
 		);
 		try {
 			const latest = userMessage("explain the historian cache wiring", 1);
@@ -544,9 +451,8 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("does not double-append an already present cached hint", async () => {
 		const db = createTestDb();
-		const seeded = seedEligibleMemory(db);
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => [seeded.result],
+			async () => [memoryResult()],
 		);
 		try {
 			const messages = [userMessage("explain the historian cache wiring", 1)];

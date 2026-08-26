@@ -15,7 +15,6 @@ import {
     runClaimOperation,
 } from "../../features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../features/magic-context/memory/storage-claims";
-import { runMigrations } from "../../features/magic-context/migrations";
 import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
@@ -23,8 +22,6 @@ import {
     getCompartments,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
-import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     buildDirectFormatMarker,
     createDirectFormatMarkerSchema,
@@ -37,9 +34,10 @@ import {
     updateTagDropMode,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
-import { McHostCallError } from "../../shared/mc-host-client";
-import { Database } from "../../shared/sqlite";
+import { SubcCallError } from "../../shared/mc-host-client";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     buildAuthorizedClaimMirrorSnapshot,
@@ -91,7 +89,7 @@ function createOpenCodeDb(
 ): void {
     const dbPath = join(process.env.XDG_DATA_HOME ?? "", "opencode", "opencode.db");
     mkdirSync(dirname(dbPath), { recursive: true });
-    const db = new Database(dbPath);
+    const db = createDirectTestDatabase({ path: dbPath }).db;
     try {
         db.exec(`
             CREATE TABLE message (
@@ -140,11 +138,8 @@ function createOpenCodeDb(
 }
 
 function createContextDb(): Database {
-    const db = new Database(":memory:");
+    const db = createDirectTestDatabase().db;
     databases.push(db);
-    initializeDatabase(db);
-    runMigrations(db);
-    db.transaction(() => createClaimMemorySchema(db)).immediate();
     return db;
 }
 
@@ -1041,10 +1036,7 @@ describe("module incremental and paged assembly", () => {
 
 describe("module compartment mirror-back", () => {
     it("copies the authoritative row set idempotently", async () => {
-        const db = new Database(":memory:");
-        databases.push(db);
-        initializeDatabase(db);
-        runMigrations(db);
+        const db = createContextDb();
         const calls: number[] = [];
         const reader = {
             async getCompartmentsAfter(_sessionId: string, afterSequence: number) {

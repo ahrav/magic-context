@@ -113,17 +113,6 @@ export type EnforcementArtifactResult = (typeof ENFORCEMENT_ARTIFACT_RESULTS)[nu
  * artifact row; there is no mutate-in-place path. */
 export const ENFORCEMENT_ARTIFACT_EVENT_ACTIONS = ["revoked"] as const;
 
-/** schema_migrations_meta keys for the bounded fail-closed seed (KTD11, R28). */
-export const CLAIM_POLICY_SEED_META_KEYS = {
-    boundaryRevisionId: "claim_policy_seed_boundary_revision_id",
-    expectedCount: "claim_policy_seed_expected_count",
-    cursor: "claim_policy_seed_cursor",
-    phase: "claim_policy_seed_phase",
-    completionWatermark: "claim_policy_seed_completion_watermark",
-    seededCounts: "claim_policy_seed_counts",
-    reconcileEventWatermark: "claim_policy_reconcile_event_watermark",
-} as const;
-
 const sqlList = (values: readonly string[]): string =>
     values.map((value) => `'${value}'`).join(", ");
 
@@ -700,5 +689,4 @@ export function dropClaimPolicyObjectsForTests(db: Database): void {
         DROP TABLE IF EXISTS claim_revision_policy_subjects;
     `);
     db.prepare("DELETE FROM schema_migrations WHERE version >= 86").run();
-    db.prepare("DELETE FROM schema_migrations_meta WHERE key LIKE 'claim_policy_seed_%'").run();
 }

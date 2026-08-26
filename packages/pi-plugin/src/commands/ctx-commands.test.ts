@@ -1,11 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { replaceAllCompartmentState } from "@magic-context/core/features/magic-context/compartment-storage";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { queuePendingOp } from "@magic-context/core/features/magic-context/storage-ops";
 import { insertTag } from "@magic-context/core/features/magic-context/storage-tags";
-import { Database } from "@magic-context/core/shared/sqlite";
-
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { awaitInFlightRecomps } from "../pi-recomp-runner";
 import { registerCtxDreamCommand } from "./ctx-dream";
 import { registerCtxFlushCommand } from "./ctx-flush";
@@ -51,9 +48,7 @@ interface MockCommandContext {
 }
 
 function createDb() {
-	const db = new Database(":memory:");
-	initializeDatabase(db);
-	runMigrations(db);
+	const db = createDirectTestDatabase().db;
 	return db;
 }
 

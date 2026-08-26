@@ -15,8 +15,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-authority";
 import {
-    computeExpectedDirectFormat,
     composeRegisteredSchema,
+    computeExpectedDirectFormat,
 } from "@magic-context/core/features/magic-context/storage-current-schema";
 import {
     getPersistedSchemaVersion,
@@ -413,17 +413,19 @@ function prepareFreshDatabase(path: string): SalvageResult {
         const schemaVersionBefore = getPersistedSchemaVersion(db);
         const expected = computeExpectedDirectFormat();
         const fresh = db;
-        fresh.transaction(() => {
-            composeRegisteredSchema(fresh);
-            createDirectFormatMarkerSchema(fresh);
-            stampDirectFormatMarker(
-                fresh,
-                buildDirectFormatMarker({
-                    componentManifestDigest: expected.componentManifestDigest,
-                    createdAtMs: Date.now(),
-                }),
-            );
-        }).immediate();
+        fresh
+            .transaction(() => {
+                composeRegisteredSchema(fresh);
+                createDirectFormatMarkerSchema(fresh);
+                stampDirectFormatMarker(
+                    fresh,
+                    buildDirectFormatMarker({
+                        componentManifestDigest: expected.componentManifestDigest,
+                        createdAtMs: Date.now(),
+                    }),
+                );
+            })
+            .immediate();
         ensureContextStoreUuid(db);
         const schemaVersionAfter = getPersistedSchemaVersion(db);
         const errors = integrityErrors(db);

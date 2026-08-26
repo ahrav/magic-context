@@ -5,8 +5,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
 import {
     appendAutoSearchHintDecision,
     appendNoteNudgeAnchor,
@@ -14,11 +12,17 @@ import {
     getNoteNudgeAnchors,
     pruneNoteNudgeAnchors,
 } from "./storage-meta-persisted";
+import { createDirectTestDatabase } from "./test-database";
 
 function createRaceDb(path: string): Database {
+    return createDirectTestDatabase({ path }).db;
+}
+
+function openRaceDb(path: string): Database {
     const db = new Database(path);
-    initializeDatabase(db);
-    runMigrations(db);
+    db.exec("PRAGMA busy_timeout=5000");
+    db.exec("PRAGMA foreign_keys=ON");
+    db.exec("PRAGMA journal_mode=WAL");
     return db;
 }
 
@@ -28,7 +32,7 @@ describe("sticky-injection CAS helpers", () => {
         try {
             const path = join(dir, "context.db");
             const a = createRaceDb(path);
-            const b = createRaceDb(path);
+            const b = openRaceDb(path);
             expect(appendNoteNudgeAnchor(a, "s1", "m1", "text-1")).toBe(true);
             expect(appendNoteNudgeAnchor(b, "s1", "m2", "text-2")).toBe(true);
             expect(getNoteNudgeAnchors(a, "s1")).toEqual([
@@ -49,7 +53,7 @@ describe("sticky-injection CAS helpers", () => {
         try {
             const path = join(dir, "context.db");
             const a = createRaceDb(path);
-            const b = createRaceDb(path);
+            const b = openRaceDb(path);
             expect(appendNoteNudgeAnchor(a, "s1", "m1", "text-1")).toBe(true);
             expect(appendNoteNudgeAnchor(b, "s1", "m2", "text-2")).toBe(true);
             expect(pruneNoteNudgeAnchors(a, "s1", new Set(["m2"]))).toBe(1);

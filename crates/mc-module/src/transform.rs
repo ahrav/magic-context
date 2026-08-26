@@ -26,17 +26,14 @@ use crate::injection::{
     is_synthetic_todo_id, InjectionOutcome,
 };
 use crate::m0_compose::{
-    compose_m0_from_claim_mirror, compose_m0_from_store, trim_claims_to_budget,
-    trim_memories_to_budget, trim_user_profile_to_budget,
+    compose_m0_from_claim_mirror, trim_claims_to_budget, trim_user_profile_to_budget,
 };
 use crate::m1_compose::{
-    claim_and_render_notes, compose_m1_from_claim_mirror, compose_m1_from_store,
-    m1_revision_signal_parts_for_claims_timed, m1_revision_signal_parts_for_pass_timed,
-    M1RevisionReadTimings, M1RevisionSignal,
+    claim_and_render_notes, compose_m1_from_claim_mirror,
+    m1_revision_signal_parts_for_claims_timed, M1RevisionReadTimings, M1RevisionSignal,
 };
 use crate::memory_render::{
-    render_claim_memory_block, render_m0, workspace_source_names, M0Inputs, MirroredClaimMemory,
-    M1_PLACEHOLDER,
+    render_claim_memory_block, render_m0, M0Inputs, MirroredClaimMemory, M1_PLACEHOLDER,
 };
 use crate::project_docs::read_project_docs_canonical;
 use crate::prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
@@ -57,11 +54,11 @@ use mc_core::claim_operation::{canonical_snapshot_vector, SnapshotVector};
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
     BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
-    LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
-    MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
-    PendingAgentDrop, PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint,
-    StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TemporalMarkInput,
-    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow, ModuleMeta,
+    ModuleUsage, NoteDelivery, PassSchedulerObservation, PendingAgentDrop,
+    PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint, StoredCompartment,
+    TagCacheSummary, TagMintInput, TailHygieneBaseline, TemporalMarkInput, TemporalMarkRow,
+    TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1484,10 +1481,6 @@ pub struct TransformResponse {
     pub committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_ordinal: Option<u64>,
-    /// Memory IDs currently shown in the module's memory view. The host copies this list to
-    /// filter search results, using the module manifest rather than its TypeScript render cache.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub rendered_memory_ids: Option<Vec<i64>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rendered_revision_locators: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1565,7 +1558,6 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
-            rendered_memory_ids: None,
             rendered_revision_locators: None,
             memory_snapshot_vector: None,
             lineage_switch_consumed_id: None,
@@ -1602,7 +1594,6 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
-            rendered_memory_ids: None,
             rendered_revision_locators: None,
             memory_snapshot_vector: None,
             lineage_switch_consumed_id: None,
@@ -1928,18 +1919,6 @@ impl From<crate::m1_compose::M1ComposeError> for TransformError {
     }
 }
 
-fn legacy_memory_compat(ctx: &ProducerContext<'_>) -> bool {
-    #[cfg(test)]
-    {
-        ctx.claim_lane.is_none()
-    }
-    #[cfg(not(test))]
-    {
-        let _ = ctx;
-        false
-    }
-}
-
 fn claim_state_vector(state: &mc_store::claim_mirror::ClaimMirrorState) -> SnapshotVector {
     SnapshotVector {
         vector_version: state.vector_version,
@@ -1991,27 +1970,15 @@ fn claim_snapshot_for_context(
 #[allow(clippy::too_many_arguments)]
 fn revision_signal_for_context(
     store: &McStore,
-    project_path: &str,
+    _project_path: &str,
     note_project_path: &str,
     session_id: &str,
     user_profile_version: u64,
     memory_enabled: bool,
-    now_ms: i64,
+    _now_ms: i64,
     timings: Option<&mut M1RevisionReadTimings>,
     ctx: &ProducerContext<'_>,
 ) -> Result<M1RevisionSignal, McStoreError> {
-    if legacy_memory_compat(ctx) {
-        return m1_revision_signal_parts_for_pass_timed(
-            store,
-            project_path,
-            note_project_path,
-            session_id,
-            user_profile_version,
-            memory_enabled,
-            now_ms,
-            timings,
-        );
-    }
     let vector = claim_snapshot_for_context(store, ctx).map(|(vector, _)| vector);
     m1_revision_signal_parts_for_claims_timed(
         store,
@@ -2030,9 +1997,6 @@ fn compose_m0_for_context(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     ctx: &ProducerContext<'_>,
 ) -> Result<crate::m0_compose::M0Composition, crate::m0_compose::M0ComposeError> {
-    if legacy_memory_compat(ctx) {
-        return compose_m0_from_store(store, inputs, estimate_tokens);
-    }
     let snapshot = claim_snapshot_for_context(store, ctx);
     let claims = snapshot
         .as_ref()
@@ -2046,33 +2010,18 @@ fn compose_m0_for_context(
 #[allow(clippy::too_many_arguments)]
 fn compose_m1_for_context(
     store: &McStore,
-    project_path: &str,
+    _project_path: &str,
     note_project_path: &str,
     session_id: &str,
     meta: &ModuleMeta,
     now_ms: i64,
     memory_enabled: bool,
-    memory_budget_tokens: f64,
+    _memory_budget_tokens: f64,
     user_profile_budget_tokens: f64,
     temporal_awareness: bool,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
-    ctx: &ProducerContext<'_>,
+    _ctx: &ProducerContext<'_>,
 ) -> Result<crate::m1_compose::M1Composition, crate::m1_compose::M1ComposeError> {
-    if legacy_memory_compat(ctx) {
-        return compose_m1_from_store(
-            store,
-            project_path,
-            note_project_path,
-            session_id,
-            meta,
-            now_ms,
-            memory_enabled,
-            memory_budget_tokens,
-            user_profile_budget_tokens,
-            temporal_awareness,
-            estimate_tokens,
-        );
-    }
     compose_m1_from_claim_mirror(
         store,
         note_project_path,
@@ -2639,49 +2588,18 @@ fn todo_synthesis_verdict(req: &TransformRequest) -> Option<bool> {
 struct AdditiveM0Composition {
     m0_bytes: String,
     mural: Option<crate::m0_compose::M0MuralBlock>,
-    rendered_memory_ids: Vec<i64>,
     rendered_revision_locators: Vec<String>,
     claim_snapshot_vector: Option<SnapshotVector>,
-    memory_revision: MemoryRevision,
 }
 
 fn compose_additive_m0(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
-    expiry_cutoff_ms: i64,
+    _expiry_cutoff_ms: i64,
     serializer_profile: Option<SerializerProfile>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<AdditiveM0Composition, TransformError> {
-    let membership = if legacy_memory_compat(ctx) {
-        store.resolve_workspace_membership(ctx.project_path)?
-    } else {
-        None
-    };
-    let snapshot = if ctx.memory_enabled && legacy_memory_compat(ctx) {
-        store.load_memory_render_snapshot(
-            ctx.project_path,
-            membership.as_ref(),
-            expiry_cutoff_ms,
-        )?
-    } else {
-        mc_store::MemoryRenderSnapshot {
-            memories: Vec::new(),
-            revision: MemoryRevision::default(),
-        }
-    };
-    let source_name_by_id = membership
-        .as_ref()
-        .map(|value| workspace_source_names(&snapshot.memories, value))
-        .unwrap_or_default();
-    let selected_memories = trim_memories_to_budget(
-        snapshot.memories,
-        membership.as_ref(),
-        &source_name_by_id,
-        ctx.memory_budget_tokens,
-        estimate_tokens,
-    );
-    let rendered_memory_ids = selected_memories.iter().map(|memory| memory.id).collect();
     let claim_snapshot = claim_snapshot_for_context(store, ctx);
     let selected_claims = claim_snapshot
         .as_ref()
@@ -2713,8 +2631,6 @@ fn compose_additive_m0(
             user_profile: &user_profile,
             covered_system_messages: &[],
             compartments: &[],
-            memories: &selected_memories,
-            source_name_by_id: &source_name_by_id,
             history_budget_tokens: 0.0,
             decay_pressure_multiplier: 1.0,
         },
@@ -2732,10 +2648,8 @@ fn compose_additive_m0(
     Ok(AdditiveM0Composition {
         m0_bytes,
         mural,
-        rendered_memory_ids,
         rendered_revision_locators,
         claim_snapshot_vector: claim_snapshot.map(|(vector, _)| vector),
-        memory_revision: snapshot.revision,
     })
 }
 
@@ -2953,7 +2867,6 @@ fn apply_additive_only(
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
 
     let compose_started_at = Instant::now();
-    let mut commit_memory_revision = None;
     let mut commit_compartment_max_seq = None;
     let mut note_deliveries = Vec::new();
     match plan {
@@ -3027,11 +2940,8 @@ fn apply_additive_only(
             // Compaction-off ignores stored compartments. Record the current maximum sequence
             // so rows created before this mode was enabled do not reappear in m1 as new history.
             meta.folded_compartment_seq = applied_m1_signal.max_compartment_seq;
-            meta.rendered_memory_ids = composition.rendered_memory_ids;
             meta.rendered_revision_locators = composition.rendered_revision_locators;
             meta.claim_snapshot_vector = composition.claim_snapshot_vector;
-            meta.memory_mutation_cursor = composition.memory_revision.mutation_cursor;
-            meta.max_memory_id = composition.memory_revision.max_memory_id;
             meta.expiry_cutoff_ms = ctx.now_ms;
             meta.memory_disabled = !ctx.memory_enabled;
             meta.m1_revision = applied_m1_signal.revision;
@@ -3043,7 +2953,6 @@ fn apply_additive_only(
             meta.m1_pending_since_ms = None;
             meta.soft_refresh_pending = false;
             commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
-            commit_memory_revision = Some(composition.memory_revision);
         }
         PassPlan::Soft => {
             let mut additive_meta = meta.clone();
@@ -3095,14 +3004,6 @@ fn apply_additive_only(
             meta.m1_pending_since_ms = None;
             meta.soft_refresh_pending = false;
             commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
-            if ctx.memory_enabled {
-                commit_memory_revision = Some(memory_revision_fence(
-                    store,
-                    ctx.project_path,
-                    meta.expiry_cutoff_ms,
-                    &applied_m1_signal,
-                )?);
-            }
         }
         PassPlan::Defer => {
             if m1_signal.revision != loaded.meta.m1_revision {
@@ -3162,7 +3063,6 @@ fn apply_additive_only(
                 meta: &meta,
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
-                memory_revision: commit_memory_revision.as_ref(),
                 claim_snapshot_vector: meta.claim_snapshot_vector.as_ref(),
                 compartment_max_seq: commit_compartment_max_seq,
                 project_root: Some(ctx.project_directory),
@@ -3243,8 +3143,6 @@ fn apply_additive_only(
             surface_state: SurfaceState::Inactive,
             committed: commit_required,
             coverage_ordinal: None,
-            rendered_memory_ids: legacy_memory_compat(ctx)
-                .then(|| meta.rendered_memory_ids.clone()),
             rendered_revision_locators: meta
                 .claim_snapshot_vector
                 .as_ref()
@@ -3661,7 +3559,6 @@ fn apply_once(
                         meta: &next_meta,
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
-                        memory_revision: None,
                         claim_snapshot_vector: next_meta.claim_snapshot_vector.as_ref(),
                         compartment_max_seq: None,
                         project_root: Some(ctx.project_directory),
@@ -3698,8 +3595,6 @@ fn apply_once(
                 req,
                 mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
                 row_version,
-                rendered_memory_ids: next_meta.rendered_memory_ids.clone(),
-                include_legacy_memory_ids: legacy_memory_compat(ctx),
                 rendered_revision_locators: next_meta.rendered_revision_locators.clone(),
                 memory_snapshot_vector: next_meta.claim_snapshot_vector.clone(),
                 revert_epoch: next_meta.revert_epoch,
@@ -3775,7 +3670,6 @@ fn apply_once(
                 meta: &meta,
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
-                memory_revision: None,
                 claim_snapshot_vector: meta.claim_snapshot_vector.as_ref(),
                 compartment_max_seq: None,
                 project_root: Some(ctx.project_directory),
@@ -3813,8 +3707,6 @@ fn apply_once(
             req,
             mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
             row_version,
-            rendered_memory_ids: meta.rendered_memory_ids.clone(),
-            include_legacy_memory_ids: legacy_memory_compat(ctx),
             rendered_revision_locators: meta.rendered_revision_locators.clone(),
             memory_snapshot_vector: meta.claim_snapshot_vector.clone(),
             revert_epoch: meta.revert_epoch,
@@ -4501,7 +4393,6 @@ fn apply_once(
             overlay_frontier,
             mutation_exempt_mid,
             lineage_anchor_mid,
-            &meta.rendered_memory_ids,
         )? {
             if !hint.hint_text.is_empty()
                 && user_hint_target_was_served(&loaded.meta, &hint.block_id)
@@ -4587,7 +4478,6 @@ fn apply_once(
 
     let mut coverage_shrunk_on_bust = false;
     let compose_m0m1_started_at = Instant::now();
-    let mut commit_memory_revision = None;
     let mut note_deliveries: Vec<NoteDelivery> = Vec::new();
     let mut committed_mural_hash = persisted_mural_hash;
 
@@ -4886,12 +4776,8 @@ fn apply_once(
                 meta.coverage_start_ordinal = comp.first_covered_ordinal;
                 meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
                 meta.folded_compartment_seq = comp.folded_compartment_seq;
-                commit_memory_revision = Some(comp.memory_revision.clone());
-                meta.rendered_memory_ids = comp.rendered_memory_ids;
                 meta.rendered_revision_locators = comp.rendered_revision_locators;
                 meta.claim_snapshot_vector = comp.claim_snapshot_vector;
-                meta.memory_mutation_cursor = comp.memory_mutation_cursor;
-                meta.max_memory_id = comp.max_memory_id;
                 meta.expiry_cutoff_ms = ctx.now_ms; // FROZEN here, atomic with the m0 bytes
                                                     // The post-fold m1 baseline digest — NOT 0. After folding up to the current
                                                     // watermarks, "no delta" == "watermarks unchanged since this digest"; setting
@@ -4916,16 +4802,6 @@ fn apply_once(
             }
             PassPlan::Soft => {
                 meta.memory_disabled = !ctx.memory_enabled;
-                commit_memory_revision = if ctx.memory_enabled {
-                    Some(memory_revision_fence(
-                        store,
-                        ctx.project_path,
-                        meta.expiry_cutoff_ms,
-                        &m1_signal,
-                    )?)
-                } else {
-                    None
-                };
                 // EXPENSIVE bust-only: compose the m1 delta body from the store against the
                 // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
                 // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
@@ -5090,11 +4966,8 @@ fn apply_once(
                     meta.coverage_start_ordinal = comp.first_covered_ordinal;
                     meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
                     meta.folded_compartment_seq = comp.folded_compartment_seq;
-                    meta.rendered_memory_ids = comp.rendered_memory_ids;
                     meta.rendered_revision_locators = comp.rendered_revision_locators;
                     meta.claim_snapshot_vector = comp.claim_snapshot_vector;
-                    meta.memory_mutation_cursor = comp.memory_mutation_cursor;
-                    meta.max_memory_id = comp.max_memory_id;
                     meta.expiry_cutoff_ms = ctx.now_ms;
                     let applied_m1_signal = revision_signal_for_context(
                         store,
@@ -5113,7 +4986,6 @@ fn apply_once(
                     meta.m1_external_revision = applied_m1_signal.external_revision;
                     meta.project_memory_epoch_pending = false;
                     meta.m1_pending_since_ms = None;
-                    commit_memory_revision = Some(comp.memory_revision);
                 } else {
                     let mut rendered = vec![render_m1_body(&m1.body)];
                     rendered.extend(new_reduction_units(
@@ -5643,7 +5515,6 @@ fn apply_once(
                 meta: &meta,
                 consumed_drop_ids: &consumed_drop_ids,
                 first_applied_command_ids: &first_applied_command_ids,
-                memory_revision: commit_memory_revision.as_ref(),
                 claim_snapshot_vector: meta.claim_snapshot_vector.as_ref(),
                 compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),
                 project_root: Some(ctx.project_directory),
@@ -5750,8 +5621,6 @@ fn apply_once(
             surface_state,
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
-            rendered_memory_ids: legacy_memory_compat(ctx)
-                .then(|| meta.rendered_memory_ids.clone()),
             rendered_revision_locators: meta
                 .claim_snapshot_vector
                 .as_ref()
@@ -6016,25 +5885,6 @@ fn effective_hard_context_limit_tokens(
         })
 }
 
-fn memory_revision_fence(
-    store: &McStore,
-    project_path: &str,
-    expiry_cutoff_ms: i64,
-    signal: &crate::m1_compose::M1RevisionSignal,
-) -> Result<MemoryRevision, McStoreError> {
-    let project_paths = match store.resolve_workspace_membership(project_path)? {
-        Some(membership) => membership.union_identities,
-        None => vec![project_path.to_string()],
-    };
-    Ok(MemoryRevision {
-        project_paths,
-        reader_project_path: project_path.to_string(),
-        expiry_cutoff_ms,
-        max_memory_id: signal.max_memory_id,
-        mutation_cursor: signal.max_memory_mutation_id,
-    })
-}
-
 fn fold_mural_content_identity(render_config: &str, mural_hash: &str) -> String {
     if mural_hash.is_empty() {
         return render_config.to_string();
@@ -6092,7 +5942,7 @@ fn m0_mural_input(
 }
 
 fn m0_content_epoch_for_pass(
-    store: &McStore,
+    _store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     serializer_profile: Option<SerializerProfile>,
@@ -6122,7 +5972,11 @@ fn m0_content_epoch_for_pass(
         &prompt_surface_selection(req),
     );
     Ok(M0ContentEpoch {
-        workspace_fingerprint: store.workspace_fingerprint(ctx.project_path, ctx.now_ms)?,
+        workspace_fingerprint: ctx
+            .claim_lane
+            .and_then(|lane| lane.snapshot_vector.as_ref())
+            .map(|vector| vector.workspace_epoch.clone())
+            .unwrap_or_default(),
         upgrade_state: req.upgrade_state.clone(),
         memory_content_epoch: String::new(),
         memory_render_epoch,
@@ -7419,8 +7273,6 @@ struct PendingPassthroughArgs<'a> {
     req: &'a TransformRequest,
     mutation_exempt_mid: Option<String>,
     row_version: u64,
-    rendered_memory_ids: Vec<i64>,
-    include_legacy_memory_ids: bool,
     rendered_revision_locators: Vec<String>,
     memory_snapshot_vector: Option<SnapshotVector>,
     revert_epoch: u64,
@@ -7473,8 +7325,6 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         req,
         mutation_exempt_mid,
         row_version,
-        rendered_memory_ids,
-        include_legacy_memory_ids,
         rendered_revision_locators,
         memory_snapshot_vector,
         revert_epoch,
@@ -7493,7 +7343,6 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         TransformResponse::passthrough(Vec::new(), req.full_array_fingerprint.clone());
     response.ck_messages = Some(messages);
     response.row_version = row_version;
-    response.rendered_memory_ids = include_legacy_memory_ids.then_some(rendered_memory_ids);
     response.rendered_revision_locators = memory_snapshot_vector
         .as_ref()
         .map(|_| rendered_revision_locators);
@@ -8862,13 +8711,12 @@ fn compute_active_overlay_decisions(
 fn maybe_decide_live_user_hint(
     store: &McStore,
     req: &TransformRequest,
-    ctx: &ProducerContext<'_>,
+    _ctx: &ProducerContext<'_>,
     projection: &FlatProjection,
     user_hint_rows: &[UserHintRow],
     overlay_frontier: Option<u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
-    rendered_memory_ids: &[i64],
 ) -> Result<Option<UserHintDecisionInput>, TransformError> {
     let Some(message) = eligible_authored_user_tail(req)
         .filter(|message| {
@@ -8907,12 +8755,9 @@ fn maybe_decide_live_user_hint(
     } else {
         let results = run_user_hint_lexical_search(
             store,
-            ctx.project_path,
             &req.session_id,
             &raw_prompt,
-            ctx.memory_enabled,
             req.auto_search_score_threshold,
-            rendered_memory_ids,
         )?;
         render_user_hint(&results).unwrap_or_default()
     };
@@ -8942,12 +8787,9 @@ fn lexical_tokens(text: &str) -> BTreeSet<String> {
 
 fn run_user_hint_lexical_search(
     store: &McStore,
-    project_path: &str,
     session_id: &str,
     query: &str,
-    include_memories: bool,
     score_threshold: f64,
-    rendered_memory_ids: &[i64],
 ) -> Result<Vec<crate::memory_tool::MemorySearchResult>, TransformError> {
     #[cfg(test)]
     USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(count.get() + 1));
@@ -8963,29 +8805,6 @@ fn run_user_hint_lexical_search(
         return Ok(Vec::new());
     }
     let mut candidates = Vec::new();
-    if include_memories {
-        for memory in
-            store.load_visible_memory_candidates(project_path, USER_HINT_CANDIDATE_LIMIT)?
-        {
-            if rendered_memory_ids.contains(&memory.id) {
-                continue;
-            }
-            candidates.push(Candidate {
-                tokens: lexical_tokens(&memory.content),
-                recency: memory.updated_at,
-                result: crate::memory_tool::MemorySearchResult {
-                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                    id: memory.id,
-                    snippet: memory.content,
-                    category: Some(memory.category),
-                    sequence: None,
-                    title: None,
-                    note_status: None,
-                    surface_condition: None,
-                },
-            });
-        }
-    }
     for compartment in store.load_compartment_candidates(session_id, USER_HINT_CANDIDATE_LIMIT)? {
         let body = [
             Some(compartment.title.as_str()),
@@ -12751,12 +12570,10 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::m1_compose::{m1_revision_signal, m1_revision_signal_parts_for_pass};
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{
-        InsertMemoryInput, McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage,
-        NoteCasOutcome, NoteEvaluationInput, NoteWriteInput, StoredCompartment,
+        McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage, StoredCompartment,
     };
 
     fn resolve_test_cache_ttl(
@@ -14158,26 +13975,6 @@ pub(crate) mod tests {
         request
     }
 
-    fn memory_input<'a>(
-        project_path: &'a str,
-        category: &'a str,
-        content: &'a str,
-        now_ms: i64,
-    ) -> InsertMemoryInput<'a> {
-        InsertMemoryInput {
-            project_path,
-            route_project_root: None,
-            category,
-            content,
-            source_session_id: None,
-            source_type: Some("tool"),
-            importance: Some(70),
-            expires_at: None,
-            metadata_json: None,
-            now_ms,
-        }
-    }
-
     /// A producer context over a throwaway project dir (no docs on disk → empty docs
     /// block). `now_ms` is FIXED per test (never wall-clock) so the frozen expiry cutoff
     /// is deterministic.
@@ -14293,7 +14090,6 @@ pub(crate) mod tests {
             first.rendered_revision_locators,
             Some(vec![claim.revision_locator.clone()])
         );
-        assert!(first.rendered_memory_ids.is_none());
 
         store
             .apply_claim_mirror_receipt(
@@ -14405,17 +14201,6 @@ pub(crate) mod tests {
         assert!(!bytes.contains("stale claim bytes"));
         assert!(bytes.contains("live prompt"));
         assert!(response.memory_snapshot_vector.is_none());
-    }
-
-    fn seed_unrelated_hint_candidates(store: &McStore) {
-        for (id, content) in [
-            (9_998, "unrelated fixture material"),
-            (9_999, "separate archive subject"),
-        ] {
-            store
-                .seed_memory(id, "git:proj", "CONSTRAINTS", content, 50)
-                .unwrap();
-        }
     }
 
     fn with_usage(
@@ -15052,30 +14837,6 @@ pub(crate) mod tests {
                 text: text.to_string(),
             },
         )
-    }
-
-    fn opaque_result_carrier(mid: &str, ordinal: u64, role: &str) -> CkIngressMessage {
-        CkIngressMessage {
-            mid: mid.to_string(),
-            ordinal,
-            ck: CkWireMessage::from_parts(
-                role,
-                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Opaque(
-                    ck_wire::OpaqueBlock {
-                        source: json!({ "type": "tool_result" }),
-                        kind: "tool_result".to_string(),
-                        raw: json!({ "output": "transport" }),
-                        arc: None,
-                    },
-                ))],
-                None,
-                ck_wire::ProviderExtras::new(),
-                ck_wire::HarnessMeta {
-                    harness_id: Some(mid.to_string()),
-                    ..Default::default()
-                },
-            ),
-        }
     }
 
     fn tool_result_with_output(
@@ -16305,40 +16066,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pending_in_session_delta_is_consumed_on_execute_but_deferred_passes_replay() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
-            .unwrap();
-        let memory_id = s
-            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
-            .unwrap();
-        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
-        let boot = run(&s, &execute_req, &spine());
-        assert_eq!(boot.action, "HARD");
-        s.update_memory_content("git:proj", memory_id, "pending rule", 1)
-            .unwrap();
-
-        let consumed =
-            transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
-        assert_eq!(consumed.action, "SOFT");
-        assert!(m1_bytes(&consumed).contains("pending rule"));
-        let consumed_bytes = serde_json::to_vec(&consumed.ck_messages).unwrap();
-
-        let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
-        for _ in 0..3 {
-            let deferred =
-                transform(&s, &defer_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
-            assert_eq!(deferred.action, "SOFT+");
-            assert_eq!(
-                serde_json::to_vec(&deferred.ck_messages).unwrap(),
-                consumed_bytes
-            );
-            assert!(m1_bytes(&deferred).contains("pending rule"));
-        }
-    }
-
-    #[test]
     fn project_memory_epoch_from_state_sync_is_an_eager_hard_input() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -16359,10 +16086,6 @@ pub(crate) mod tests {
             strip_seed_skipped: 0,
             reasoning_cleared_through_tag: None,
             compartments: &[],
-            memories: &[],
-            memories_replace_projects: None,
-            memories_delete_ids: None,
-            memory_mutations: &[],
             user_profile: &[],
             user_profile_present: true,
             workspace: None,
@@ -16388,213 +16111,6 @@ pub(crate) mod tests {
         assert!(s.load("ses").unwrap().meta.project_memory_epoch_pending);
         assert_eq!(run(&s, &request, &spine()).action, "HARD");
         assert!(!s.load("ses").unwrap().meta.project_memory_epoch_pending);
-    }
-
-    #[test]
-    fn compaction_off_is_additive_only_and_byte_stable_across_defers() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.insert_memory(memory_input(
-            "git:proj",
-            "USER_DIRECTIVES",
-            "Always use Bun",
-            0,
-        ))
-        .unwrap();
-        let mut expiring = memory_input(
-            "git:proj",
-            "CONSTRAINTS",
-            "Keep this frozen across the defer",
-            0,
-        );
-        expiring.expires_at = Some(10);
-        s.insert_memory(expiring).unwrap();
-        s.replace_compartments(
-            "off-additive",
-            &[comp(1, 1, 1, "head", "historian output must stay hidden")],
-        )
-        .unwrap();
-        let mut request = active_opencode_req(
-            "off-additive",
-            "cfg0",
-            vec![
-                item("head", 1, "raw head"),
-                item("tail", 2, "tool output body"),
-            ],
-        );
-        request.todo_tool_present = Some(true);
-        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        ctx.compaction_enabled = false;
-        ctx.injected_reductions = vec![reduce("tail#0", "drop", "[dropped by mutation]")];
-
-        let first = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(first.action, "HARD");
-        assert!(first.committed);
-        assert_eq!(first.messages().len(), request.messages.len() + 2);
-        assert_eq!(&*first.messages()[2], &request.messages[0].ck);
-        assert_eq!(&*first.messages()[3], &request.messages[1].ck);
-        assert!(m0_bytes(&first).contains("<project-memory>"));
-        assert!(m0_bytes(&first).contains("Always use Bun"));
-        assert!(m0_bytes(&first).contains("Keep this frozen across the defer"));
-        assert!(m0_bytes(&first).contains("<session-history></session-history>"));
-        assert!(!m0_bytes(&first).contains("historian output must stay hidden"));
-        assert_eq!(m1_bytes(&first), M1_PLACEHOLDER);
-        let first_bytes = serde_json::to_vec(first.messages()).unwrap();
-        let first_native = opencode_native_bytes(&first, "off-additive");
-        let text = String::from_utf8(first_bytes.clone()).unwrap();
-        assert!(!text.contains("§"));
-        assert!(!text.contains("[dropped by mutation]"));
-
-        ctx.now_ms = 20;
-        let defer = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(defer.action, "SOFT+");
-        assert!(!defer.committed);
-        assert_eq!(serde_json::to_vec(defer.messages()).unwrap(), first_bytes);
-        assert_eq!(opencode_native_bytes(&defer, "off-additive"), first_native);
-    }
-
-    #[test]
-    fn compaction_off_additive_changes_defer_then_ride_m1_and_fold_on_hard() {
-        let dir = tempfile::tempdir().unwrap();
-        let project_dir = dir.path().join("project");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(
-            project_dir.join("ARCHITECTURE.md"),
-            "# Architecture\n\nFrozen docs A\n",
-        )
-        .unwrap();
-        let s = store(dir.path());
-        s.insert_memory(memory_input(
-            "git:proj",
-            "ARCHITECTURE",
-            "Frozen memory A",
-            0,
-        ))
-        .unwrap();
-        let request = active_opencode_req(
-            "off-deltas",
-            "cfg0",
-            vec![item("tail", 1, "raw tail must remain unchanged")],
-        );
-        let project_directory = project_dir.to_str().unwrap();
-        let mut ctx = pctx("git:proj", project_directory, 0);
-        ctx.compaction_enabled = false;
-
-        let first = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(first.action, "HARD");
-        assert!(m0_bytes(&first).contains("Frozen memory A"));
-        assert!(m0_bytes(&first).contains("Frozen docs A"));
-        assert_eq!(m1_bytes(&first), M1_PLACEHOLDER);
-        let first_bytes = serde_json::to_vec(first.messages()).unwrap();
-        let first_m0 = m0_bytes(&first).to_string();
-
-        s.insert_memory(memory_input(
-            "git:proj",
-            "CONSTRAINTS",
-            "Deferred memory B",
-            1,
-        ))
-        .unwrap();
-        std::fs::write(
-            project_dir.join("ARCHITECTURE.md"),
-            "# Architecture\n\nDeferred docs B\n",
-        )
-        .unwrap();
-
-        let deferred = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(deferred.action, "SOFT+");
-        assert!(!deferred.committed);
-        assert_eq!(
-            serde_json::to_vec(deferred.messages()).unwrap(),
-            first_bytes,
-            "additive store and docs changes cannot rewrite the frozen prefix on defer",
-        );
-        assert!(!m0_bytes(&deferred).contains("Deferred memory B"));
-        assert!(!m0_bytes(&deferred).contains("Deferred docs B"));
-
-        let execute_request = with_usage(request.clone(), 70, 100);
-        let soft = transform(&s, &execute_request, &ctx).unwrap();
-        assert_eq!(soft.action, "SOFT");
-        assert_eq!(m0_bytes(&soft), first_m0);
-        assert!(m1_bytes(&soft).contains("<new-memories>"));
-        assert!(m1_bytes(&soft).contains("Deferred memory B"));
-        assert!(!m0_bytes(&soft).contains("Deferred docs B"));
-        assert_eq!(&*soft.messages()[2], &request.messages[0].ck);
-        let soft_bytes = serde_json::to_vec(soft.messages()).unwrap();
-
-        let replay = transform(&s, &execute_request, &ctx).unwrap();
-        assert_eq!(replay.action, "SOFT+");
-        assert!(!replay.committed);
-        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), soft_bytes);
-
-        let mut hard_request = execute_request;
-        hard_request.render_config = "cfg1".to_string();
-        let folded = transform(&s, &hard_request, &ctx).unwrap();
-        assert_eq!(folded.action, "HARD");
-        assert!(m0_bytes(&folded).contains("Deferred memory B"));
-        assert!(m0_bytes(&folded).contains("Deferred docs B"));
-        assert_eq!(m1_bytes(&folded), M1_PLACEHOLDER);
-        assert_eq!(&*folded.messages()[2], &request.messages[0].ck);
-    }
-
-    #[test]
-    fn compaction_off_uses_normal_model_system_and_ttl_hard_authority() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.insert_memory(memory_input(
-            "git:proj",
-            "ARCHITECTURE",
-            "identity baseline",
-            0,
-        ))
-        .unwrap();
-        let mut request =
-            active_opencode_req("off-hard-authority", "cfg0", vec![item("tail", 1, "raw")]);
-        request.model_key = Some("provider/model-a".to_string());
-        request.system_prompt_hash = "system-a".to_string();
-        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        ctx.compaction_enabled = false;
-
-        let first = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(first.action, "HARD");
-
-        s.insert_memory(memory_input(
-            "git:proj",
-            "CONSTRAINTS",
-            "model-folded memory",
-            1,
-        ))
-        .unwrap();
-        request.model_key = Some("provider/model-b".to_string());
-        let model_fold = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(model_fold.action, "HARD");
-        assert!(m0_bytes(&model_fold).contains("model-folded memory"));
-
-        s.insert_memory(memory_input(
-            "git:proj",
-            "CONSTRAINTS",
-            "system-folded memory",
-            2,
-        ))
-        .unwrap();
-        request.system_prompt_hash = "system-b".to_string();
-        let system_fold = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(system_fold.action, "HARD");
-        assert!(m0_bytes(&system_fold).contains("system-folded memory"));
-
-        s.insert_memory(memory_input(
-            "git:proj",
-            "CONSTRAINTS",
-            "ttl-folded memory",
-            3,
-        ))
-        .unwrap();
-        ctx.observed_last_response_at_ms = Some(1);
-        ctx.now_ms = FIVE_MINUTE_CACHE_TTL_MS as i64 + 2;
-        let ttl_fold = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(ttl_fold.action, "HARD");
-        assert_eq!(ttl_fold.materialize_reason.as_deref(), Some("ttl_expiry"));
-        assert!(m0_bytes(&ttl_fold).contains("ttl-folded memory"));
     }
 
     #[test]
@@ -16735,10 +16251,6 @@ pub(crate) mod tests {
             strip_seed_skipped: 0,
             reasoning_cleared_through_tag: None,
             compartments: &[],
-            memories: &[],
-            memories_replace_projects: None,
-            memories_delete_ids: None,
-            memory_mutations: &[],
             user_profile: &[],
             user_profile_present: false,
             workspace: None,
@@ -17363,129 +16875,6 @@ pub(crate) mod tests {
             red_count(&reference),
             0,
             "the no-pressure reference must never reduce"
-        );
-    }
-
-    #[test]
-    fn force_band_admits_age_batch_and_advances_watermark_under_historian_veto() {
-        // An active historian vetoes the ordinary execute-band arm (queued work waits for
-        // the next materializing pass), but the veto must not reach the force band: a
-        // Force85/Emergency95 pass engages the emergency arm, which exempts the veto, so
-        // the waiting age batch is admitted and the watermark advances on that same pass.
-        // The aged arc is a T1 `read` and the fresh arc a T2 `edit`, each the only arc in
-        // its tier: the emergency tier selector reserves both (newest-20% per tier), so
-        // any freeze of the aged arc is uniquely the force-band age arm's work.
-        const SESSION: &str = "force-band-veto";
-
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
-            .unwrap();
-        let mut messages = vec![
-            item("a", 1, "covered head"),
-            assistant_tool_call("aged-call", 2, "aged-read"),
-            tool_result("aged-result", 3, "aged-read", "aged eligible output"),
-        ];
-        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
-        context.cache_ttl = "never".to_string();
-        let boot = transform(
-            &s,
-            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
-            &context,
-        )
-        .unwrap();
-        assert_eq!(boot.action, "HARD");
-
-        // Stamp the watermark over the aged arc with an empty riding opportunity.
-        s.arm_soft_refresh(SESSION).unwrap();
-        let stamp = transform(
-            &s,
-            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
-            &context,
-        )
-        .unwrap();
-        assert_eq!(stamp.action, "SOFT");
-        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
-
-        // Mint a fresh arc above the watermark; a low-usage defer cannot move it.
-        messages.push(assistant_edit_call("fresh-call", 4, "fresh-edit", "a.txt"));
-        messages.push(edit_result("fresh-result", 5, "fresh-edit", "fresh output"));
-        let minted = transform(
-            &s,
-            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
-            &context,
-        )
-        .unwrap();
-        assert_eq!(minted.action, "SOFT+");
-        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
-
-        // Queue a pending memory change: it reaches the rendered m1 memory block only
-        // when a bust materializes it, and an engaged veto defers that. The queued change
-        // therefore makes the veto itself observable on the ordinary pass below.
-        s.insert_memory(memory_input(
-            "git:proj",
-            "ARCHITECTURE",
-            "veto probe rule",
-            0,
-        ))
-        .unwrap();
-
-        let mut veto_ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        veto_ctx.cache_ttl = "never".to_string();
-        veto_ctx.historian_active = true;
-
-        // Ordinary execute under the historian veto: the veto engages (the m1 delta stays
-        // queued), the age batch is not admitted and the watermark stays frozen.
-        let ordinary = transform(
-            &s,
-            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
-            &veto_ctx,
-        )
-        .unwrap();
-        assert_eq!(
-            ordinary.action, "SOFT+",
-            "the vetoed ordinary execute must stay defer-shaped"
-        );
-        assert!(
-            !m1_bytes(&ordinary).contains("veto probe rule"),
-            "the engaged historian veto must defer the queued m1 delta"
-        );
-        let loaded = s.load(SESSION).unwrap();
-        assert_eq!(
-            loaded.meta.last_execute_ordinal, 3,
-            "the vetoed ordinary pass must keep the watermark frozen"
-        );
-        assert!(frozen_red_payload(&loaded.core, "aged-call#0").is_none());
-        assert!(frozen_red_payload(&loaded.core, "aged-result#0").is_none());
-
-        // Force85 under the same active historian: the emergency arm bypasses the veto.
-        let force = transform(
-            &s,
-            &with_usage(req(SESSION, "cfg0", messages.clone()), 90, 100),
-            &veto_ctx,
-        )
-        .unwrap();
-        assert_eq!(force.action, "SOFT");
-        assert!(
-            m1_bytes(&force).contains("veto probe rule"),
-            "the force pass busts and consumes the queued m1 delta"
-        );
-        let loaded = s.load(SESSION).unwrap();
-        assert!(
-            frozen_red_payload(&loaded.core, "aged-call#0").is_some(),
-            "the force-band edge must admit the waiting age batch despite the historian veto"
-        );
-        assert!(
-            frozen_red_payload(&loaded.core, "aged-result#0").is_some(),
-            "the admitted age batch drops the paired result"
-        );
-        assert!(
-            frozen_red_payload(&loaded.core, "fresh-call#0").is_none(),
-            "the fresh arc stays above the pre-pass watermark"
-        );
-        assert_eq!(
-            loaded.meta.last_execute_ordinal, 5,
-            "the force pass must advance the watermark on that same pass"
         );
     }
 
@@ -21047,8 +20436,6 @@ pub(crate) mod tests {
                         predicate: &predicate,
                         project_path: "git:proj",
                         compartments: std::slice::from_ref(&published_compartment),
-                        facts: &[],
-                        promote_facts: false,
                         events: &[],
                         primer_candidates: &[],
                         user_memory_candidates: &[],
@@ -21149,8 +20536,6 @@ pub(crate) mod tests {
                     predicate: &predicate,
                     project_path: "git:proj",
                     compartments: std::slice::from_ref(&published_compartment),
-                    facts: &[],
-                    promote_facts: false,
                     events: &[],
                     primer_candidates: &[],
                     user_memory_candidates: &[],
@@ -21177,36 +20562,6 @@ pub(crate) mod tests {
                 .max_compartment_end_ordinal("astro-torn-read")
                 .unwrap(),
             2_440
-        );
-    }
-
-    #[test]
-    fn post_end_revalidation_detects_a_sequence_move_even_when_the_digest_collides() {
-        let before = M1RevisionSignal {
-            revision: 0xfeed,
-            external_revision: 0xbeef,
-            max_compartment_seq: 47,
-            max_memory_id: 9,
-            max_memory_mutation_id: 3,
-            note_status_version: 2,
-            user_profile_version: 1,
-        };
-        let sequence_collision = M1RevisionSignal {
-            max_compartment_seq: 48,
-            ..before
-        };
-        assert!(
-            post_end_revision_inputs_moved(&before, &sequence_collision),
-            "the structural sequence watermark must not be hidden by a digest collision"
-        );
-
-        let digest_only_move = M1RevisionSignal {
-            revision: before.revision + 1,
-            ..before
-        };
-        assert!(
-            post_end_revision_inputs_moved(&before, &digest_only_move),
-            "the digest remains a second revalidation leg"
         );
     }
 
@@ -21266,52 +20621,6 @@ pub(crate) mod tests {
         assert!(!boundary_divergence_reset_allowed(
             false, false, true, false, false, true,
         ));
-    }
-
-    #[test]
-    fn legacy_revision_exclusion_escalates_despite_project_memory_churn() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let request = seed_astro_divergence(&store, "astro-memory-churn", 2_402);
-        let loaded = store.load("astro-memory-churn").unwrap();
-        let mut legacy = loaded.meta.clone();
-        legacy.m1_compartment_seq = None;
-        store
-            .commit(
-                "astro-memory-churn",
-                loaded.row_version,
-                &loaded.core,
-                &legacy,
-            )
-            .unwrap();
-        store
-            .insert_memory(memory_input(
-                "git:proj",
-                "ARCHITECTURE",
-                "unrelated project churn",
-                1,
-            ))
-            .unwrap();
-
-        for expected_count in 1..BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT {
-            let deferred = run(&store, &request, &spine());
-            assert_eq!(deferred.action, "SOFT+");
-            assert_eq!(
-                store
-                    .load("astro-memory-churn")
-                    .unwrap()
-                    .meta
-                    .boundary_divergence_pending_count,
-                expected_count
-            );
-        }
-        let escalated = run(&store, &request, &spine());
-        assert_eq!(escalated.action, "HARD");
-        assert_eq!(
-            escalated.materialize_reason.as_deref(),
-            Some("boundary_divergence_recut")
-        );
-        assert_eq!(escalated.coverage_ordinal, Some(2_400));
     }
 
     #[test]
@@ -21514,10 +20823,6 @@ pub(crate) mod tests {
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
                 compartments: &stale_compartments,
-                memories: &[],
-                memories_replace_projects: None,
-                memories_delete_ids: None,
-                memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
                 workspace: None,
@@ -21744,286 +21049,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn public_memory_update_rides_soft_not_hard() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let memory_id = s
-            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
-            .unwrap();
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        let before = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(before.action, "HARD");
-
-        s.update_memory_content("git:proj", memory_id, "corrected", 1)
-            .unwrap();
-        s.arm_soft_refresh("ses").unwrap();
-        let soft = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(soft.action, "SOFT", "public update port should not HARD");
-        assert_eq!(m0_bytes(&soft), m0_bytes(&before));
-        assert!(
-            m1_bytes(&soft).contains("<memory-updates>"),
-            "{}",
-            m1_bytes(&soft)
-        );
-        assert!(m1_bytes(&soft).contains("corrected"), "{}", m1_bytes(&soft));
-    }
-
-    #[test]
-    fn public_memory_insert_rides_soft_not_hard() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        let before = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(before.action, "HARD");
-
-        s.insert_memory(memory_input(
-            "git:proj",
-            "ARCHITECTURE",
-            "a durable rule",
-            1,
-        ))
-        .unwrap();
-        s.arm_soft_refresh("ses").unwrap();
-        let soft = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(soft.action, "SOFT", "public insert port should not HARD");
-        assert_eq!(m0_bytes(&soft), m0_bytes(&before));
-        assert!(
-            m1_bytes(&soft).contains("<new-memories>"),
-            "{}",
-            m1_bytes(&soft)
-        );
-        assert!(
-            m1_bytes(&soft).contains("a durable rule"),
-            "{}",
-            m1_bytes(&soft)
-        );
-    }
-
-    #[test]
-    fn memory_off_absorbs_legacy_digest_without_leaking_and_reenable_hard_restores_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        s.seed_workspace_member("ws", "git:proj", "[\"CONSTRAINTS\"]")
-            .unwrap();
-        s.seed_workspace_member("ws", "git:foreign", "[\"CONSTRAINTS\"]")
-            .unwrap();
-        s.seed_memory(5, "git:proj", "ARCHITECTURE", "private baseline rule", 70)
-            .unwrap();
-        let off_request = req("ses", "cfg-memory-off", vec![item("m1msg", 1, "raw")]);
-        let mut off_ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        off_ctx.memory_enabled = false;
-
-        let boot = transform(&s, &off_request, &off_ctx).unwrap();
-        assert_eq!(boot.action, "HARD");
-        assert!(!m0_bytes(&boot).contains("private baseline rule"));
-        assert_eq!(m1_bytes(&boot), M1_PLACEHOLDER);
-
-        // Simulate metadata written by the pre-gate implementation. Its memory-off HARD stored
-        // zero watermarks in m0 but persisted the ungated memory digest as the m1 baseline.
-        let gated_signal =
-            m1_revision_signal_parts_for_pass(&s, "git:proj", "git:proj", "ses", 0, false, 0)
-                .unwrap();
-        let ungated_signal =
-            m1_revision_signal_parts_for_pass(&s, "git:proj", "git:proj", "ses", 0, true, 0)
-                .unwrap();
-        assert_ne!(gated_signal.revision, ungated_signal.revision);
-        let loaded = s.load("ses").unwrap();
-        let mut legacy_meta = loaded.meta.clone();
-        legacy_meta.m1_revision = ungated_signal.revision;
-        legacy_meta.memory_disabled = false;
-        s.commit("ses", loaded.row_version, &loaded.core, &legacy_meta)
-            .unwrap();
-
-        // Memory can change again before upgrade code sees the session. The gated digest remains
-        // stable, and the old cache mismatch is still pending work rather than permission to bust.
-        s.seed_memory(6, "git:foreign", "CONSTRAINTS", "first shared rule", 70)
-            .unwrap();
-        let deferred = transform(&s, &off_request, &off_ctx).unwrap();
-        assert_eq!(deferred.action, "SOFT+");
-        assert!(!deferred.committed);
-        assert_eq!(m1_bytes(&deferred), M1_PLACEHOLDER);
-
-        // An independently scheduled execute absorbs the gated digest without rendering memory.
-        let execute_request = with_usage(off_request.clone(), 70, 100);
-        let migrated = transform(&s, &execute_request, &off_ctx).unwrap();
-        assert_eq!(migrated.action, "SOFT");
-        assert_eq!(m1_bytes(&migrated), M1_PLACEHOLDER);
-        let migrated_meta = s.load("ses").unwrap().meta;
-        assert_eq!(migrated_meta.m1_revision, gated_signal.revision);
-        assert!(migrated_meta.memory_disabled);
-
-        // Later workspace-memory churn is revision-neutral and cannot populate or bust m1.
-        s.seed_memory(7, "git:foreign", "CONSTRAINTS", "new shared rule", 70)
-            .unwrap();
-        let after_churn = transform(&s, &off_request, &off_ctx).unwrap();
-        assert_eq!(after_churn.action, "SOFT+");
-        assert!(!after_churn.committed);
-        assert_eq!(m1_bytes(&after_churn), M1_PLACEHOLDER);
-
-        // The coordinator includes the memory gate in its render-config fingerprint. Re-enabling
-        // therefore differs from the last fold and forces a HARD rebuild from the current memories.
-        let on_request = req("ses", "cfg-memory-on", vec![item("m1msg", 1, "raw")]);
-        let on_ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let reenabled = transform(&s, &on_request, &on_ctx).unwrap();
-        assert_eq!(reenabled.action, "HARD");
-        assert!(m0_bytes(&reenabled).contains("private baseline rule"));
-        assert_eq!(m1_bytes(&reenabled), M1_PLACEHOLDER);
-        assert!(!s.load("ses").unwrap().meta.memory_disabled);
-    }
-
-    #[test]
-    fn new_memory_rides_m1_soft_and_m0_stays_frozen() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        let before = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(before.action, "HARD");
-
-        // a NEW memory lands (id past the folded max) → the digest moves → a SOFT
-        s.seed_memory(5, "git:proj", "ARCHITECTURE", "a durable rule", 70)
-            .unwrap();
-        s.arm_soft_refresh("ses").unwrap();
-        let soft = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(soft.action, "SOFT", "a new store memory rides a SOFT");
-        assert_eq!(
-            m0_bytes(&soft),
-            m0_bytes(&before),
-            "m0 frozen across the SOFT"
-        );
-        assert!(
-            m1_bytes(&soft).contains("<new-memories>"),
-            "{}",
-            m1_bytes(&soft)
-        );
-        assert!(m1_bytes(&soft).contains("a durable rule"));
-        assert!(soft.committed);
-
-        // defer after: the store is unchanged → digest stable → pure SOFT+ replay, no write
-        let after = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(after.action, "SOFT+");
-        assert!(!after.committed);
-        assert_eq!(
-            m1_bytes(&after),
-            m1_bytes(&soft),
-            "m1 replays byte-identical"
-        );
-        assert_eq!(m0_bytes(&after), m0_bytes(&before));
-    }
-
-    #[test]
-    fn in_m0_memory_update_rides_m1_as_a_supersede_delta() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        // a memory is in the m0 baseline (seeded before bootstrap → in the manifest)
-        s.seed_memory(5, "git:proj", "ARCHITECTURE", "original", 70)
-            .unwrap();
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        let before = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert!(
-            m0_bytes(&before).contains("original"),
-            "memory in m0 baseline"
-        );
-
-        // an in-session UPDATE to that in-m0 memory → a mutation-log row → digest moves → SOFT
-        s.seed_mutation("git:proj", "update", 5, "corrected")
-            .unwrap();
-        s.arm_soft_refresh("ses").unwrap();
-        let r = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(r.action, "SOFT", "an in-m0 memory mutation rides a SOFT");
-        assert_eq!(
-            m0_bytes(&r),
-            m0_bytes(&before),
-            "m0 frozen (the supersede rides m1)"
-        );
-        assert!(
-            m1_bytes(&r).contains("corrected"),
-            "memory-updates delta: {}",
-            m1_bytes(&r)
-        );
-    }
-
-    #[test]
-    fn render_config_change_hard_folds_the_m1_delta_into_m0() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        // ride a new memory on m1
-        s.seed_memory(5, "git:proj", "ARCHITECTURE", "folded rule", 70)
-            .unwrap();
-        s.arm_soft_refresh("ses").unwrap();
-        let soft = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(soft.action, "SOFT");
-        assert!(!m0_bytes(&soft).contains("folded rule"), "not in m0 yet");
-
-        // a render_config (model/system) change → HARD: re-compose m0 from the store, which
-        // now INCLUDES the memory, and reset m1 to the placeholder.
-        let r = run(
-            &s,
-            &req("ses", "cfg1", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(r.action, "HARD");
-        assert!(
-            m0_bytes(&r).contains("folded rule"),
-            "m1 delta folded into m0: {}",
-            m0_bytes(&r)
-        );
-        assert_eq!(m1_bytes(&r), M1_PLACEHOLDER, "m1 reset to placeholder");
-    }
-
-    #[test]
     fn new_compartment_extends_coverage_on_soft_advancing_the_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -22199,77 +21224,6 @@ pub(crate) mod tests {
         assert_eq!(defer.action, "SOFT+");
         assert_eq!(m1_bytes(&defer), m1_bytes(&folded));
         assert_eq!(m0_bytes(&defer), m0_bytes(&folded));
-    }
-
-    #[test]
-    fn frozen_expiry_cutoff_survives_a_wall_clock_advance_on_recompose() {
-        // Resume-determinism guard for the frozen expiry cutoff: a memory live under the
-        // FROZEN cutoff must keep rendering even when a later SOFT recomposes at a
-        // wall-clock past its expiry (e.g. after a restart). A live-clock bug (using now_ms
-        // instead of the frozen meta cutoff) drops it here and ONLY here — the non-vacuous
-        // proof.
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        // bootstrap at now_ms=500 → expiry cutoff FROZEN at 500. No memories folded yet.
-        transform(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &pctx("git:proj", "/nonexistent-docs", 500),
-        )
-        .unwrap();
-
-        // a NEW memory expiring at 1000: LIVE under cutoff 500, EXPIRED under wall-clock 2000.
-        s.seed_expiring_memory(5, "git:proj", "ARCHITECTURE", "still valid", 70, 1000)
-            .unwrap();
-        s.arm_soft_refresh("ses").unwrap();
-
-        // a SOFT recompose at wall-clock 2000 — the cutoff stays FROZEN at 500, so the
-        // memory is live and renders. A bug using now_ms=2000 would expire + drop it.
-        let soft = transform(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &pctx("git:proj", "/nonexistent-docs", 2000),
-        )
-        .unwrap();
-        assert_eq!(soft.action, "SOFT");
-        assert!(
-            m1_bytes(&soft).contains("still valid"),
-            "frozen cutoff (500) keeps the memory live at wall-clock 2000: {}",
-            m1_bytes(&soft)
-        );
-    }
-
-    #[test]
-    fn workspace_membership_change_is_a_render_config_hard() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        // a steady defer (no change)
-        let defer = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(defer.action, "SOFT+");
-
-        // joining a workspace changes the deterministic workspace_fingerprint → the folded
-        // render_config changes → a HARD (m0 is now composed over a different project set).
-        s.seed_workspace_member("ws1", "git:proj", "[\"CONSTRAINTS\"]")
-            .unwrap();
-        let r = run(
-            &s,
-            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
-            &spine(),
-        );
-        assert_eq!(r.action, "HARD", "a membership change re-materializes m0");
     }
 
     #[test]
@@ -23278,33 +22232,6 @@ pub(crate) mod tests {
         run(s, &req("ses", "cfg0", vec![item("a", 1, "raw")]), &spine());
     }
 
-    fn seed_pressure_memory(s: &McStore) -> Vec<i64> {
-        (1..=41)
-            .inspect(|&id| {
-                s.seed_memory(
-                    id,
-                    "git:proj",
-                    "ARCHITECTURE",
-                    &format!("initial rule {id}"),
-                    70,
-                )
-                .unwrap();
-            })
-            .collect()
-    }
-
-    fn add_pressure_memory_updates(s: &McStore, memory_ids: &[i64]) {
-        for (revision, memory_id) in memory_ids.iter().enumerate() {
-            s.update_memory_content(
-                "git:proj",
-                *memory_id,
-                &format!("updated rule {revision}"),
-                revision as i64 + 1,
-            )
-            .unwrap();
-        }
-    }
-
     fn legacy_tag_mint_inputs(
         projection: &FlatProjection,
         core: &CoreState,
@@ -24090,517 +23017,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rendered_user_hint_matches_fragment_limits_and_headers() {
-        let single = vec![crate::memory_tool::MemorySearchResult {
-            source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-            id: 1,
-            snippet: "single fragment".to_string(),
-            category: None,
-            sequence: None,
-            title: None,
-            note_status: None,
-            surface_condition: None,
-        }];
-        let singular = render_user_hint(&single).unwrap();
-        assert!(singular.contains("Your memory may contain 1 related fragment:"));
-
-        let results = (1..=4)
-            .map(|id| crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id,
-                snippet: format!("fragment {id} {}", "word ".repeat(40)),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-            })
-            .collect::<Vec<_>>();
-        let hint = render_user_hint(&results).unwrap();
-        let bullets = hint
-            .lines()
-            .filter(|line| line.starts_with("- "))
-            .collect::<Vec<_>>();
-        assert_eq!(bullets.len(), 3);
-        assert!(bullets.iter().all(|line| line.chars().count() <= 82));
-        assert!(hint.contains("Your memory may contain 3 related fragments:"));
-        assert!(hint.contains("If the fragments above seem relevant to the current request"));
-        assert!(hint.chars().count() <= USER_HINT_TOTAL_CHAR_CAP + 2);
-
-        let golden = render_user_hint(&[
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 1,
-                snippet: "alpha".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-            },
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 2,
-                snippet: "beta".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-            },
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 3,
-                snippet: "gamma".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-            },
-        ])
-        .unwrap();
-        assert_eq!(
-            golden,
-            "\n\n<ctx-search-hint>\nYour memory may contain 3 related fragments:\n- alpha\n- beta\n- gamma\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>"
-        );
-
-        let capped = truncate_hint_to_total_cap(
-            &format!(
-                "<ctx-search-hint>\n{}\n</ctx-search-hint>",
-                "x".repeat(2_000)
-            ),
-            USER_HINT_TOTAL_CHAR_CAP,
-        );
-        assert!(utf16_len(&capped) <= USER_HINT_TOTAL_CHAR_CAP);
-
-        let astral_fragment = one_line_fragment(&"🦀".repeat(41), USER_HINT_FRAGMENT_CHAR_CAP);
-        assert_eq!(astral_fragment, format!("{}…", "🦀".repeat(39)));
-        assert!(astral_fragment.encode_utf16().count() <= USER_HINT_FRAGMENT_CHAR_CAP);
-
-        let astral_wrapped = format!(
-            "<ctx-search-hint>\n{}\n</ctx-search-hint>",
-            "🦀".repeat(USER_HINT_TOTAL_CHAR_CAP)
-        );
-        let astral_capped = truncate_hint_to_total_cap(&astral_wrapped, USER_HINT_TOTAL_CHAR_CAP);
-        assert!(astral_capped.encode_utf16().count() <= USER_HINT_TOTAL_CHAR_CAP);
-    }
-
-    #[test]
-    fn auto_search_respects_enabled_min_length_and_threshold_controls() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        for id in 1..=30 {
-            let content = if id == 1 {
-                "rust ownership beta durable context".to_string()
-            } else {
-                format!("unrelated fixture content {id}")
-            };
-            s.seed_memory(id, "git:proj", "CONSTRAINTS", &content, 50)
-                .unwrap();
-        }
-
-        let mut request = active_cc_req(
-            "auto-search-controls",
-            "cfg0",
-            vec![wire_item("user", "m1", 1, &["rust ownership beta"])],
-        );
-        request.auto_search_min_prompt_chars = "rust ownership beta".chars().count();
-        let projection = project_messages(&request.messages).unwrap();
-        let at_boundary = maybe_decide_live_user_hint(
-            &s,
-            &request,
-            &pctx("git:proj", "/nonexistent-docs", 1),
-            &projection,
-            &[],
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!at_boundary.hint_text.is_empty());
-
-        request.auto_search_min_prompt_chars += 1;
-        let below_boundary = maybe_decide_live_user_hint(
-            &s,
-            &request,
-            &pctx("git:proj", "/nonexistent-docs", 1),
-            &projection,
-            &[],
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(below_boundary.hint_text.is_empty());
-
-        let admitted = run_user_hint_lexical_search(
-            &s,
-            "git:proj",
-            "auto-search-controls",
-            "rust ownership beta gamma",
-            true,
-            0.6,
-            &[],
-        )
-        .unwrap();
-        let rejected = run_user_hint_lexical_search(
-            &s,
-            "git:proj",
-            "auto-search-controls",
-            "rust ownership beta gamma",
-            true,
-            0.95,
-            &[],
-        )
-        .unwrap();
-        assert!(!admitted.is_empty());
-        assert!(rejected.is_empty());
-    }
-
-    #[test]
-    fn auto_search_threshold_gates_only_the_top_ranked_result() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        for id in 1..=30 {
-            let content = match id {
-                1 => "alpha beta gamma delta".to_string(),
-                2 => "alpha beta".to_string(),
-                _ => format!("unrelated archive material {id}"),
-            };
-            store
-                .seed_memory(id, "git:proj", "CONSTRAINTS", &content, 50)
-                .unwrap();
-        }
-
-        let results = run_user_hint_lexical_search(
-            &store,
-            "git:proj",
-            "top-result-threshold",
-            "alpha beta gamma delta",
-            true,
-            0.8,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            results.iter().map(|result| result.id).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-    }
-
-    #[test]
-    fn auto_search_excludes_memories_already_rendered_in_session_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        store
-            .seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership beta already visible",
-                70,
-            )
-            .unwrap();
-        store
-            .seed_memory(
-                2,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership alternate context",
-                60,
-            )
-            .unwrap();
-        seed_unrelated_hint_candidates(&store);
-        let session = "auto-search-visible-memory";
-        let loaded = store.load(session).unwrap();
-        let mut meta = loaded.meta.clone();
-        meta.rendered_memory_ids = vec![1];
-        store
-            .commit(session, loaded.row_version, &loaded.core, &meta)
-            .unwrap();
-        let mut request = cc_req(
-            session,
-            "cfg0",
-            vec![wire_item("user", "m1", 1, &["rust ownership beta"])],
-        );
-        request.auto_search_score_threshold = 0.0;
-
-        let response = run(&store, &request, &spine());
-        let rendered = tail_bytes(&response, "m1");
-        assert!(rendered.contains("rust ownership alternate context"));
-        assert!(!rendered.contains("rust ownership beta already visible"));
-    }
-
-    #[test]
-    fn auto_search_checks_uncapped_prompt_length_and_suppresses_stacked_augmentations() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.seed_memory(
-            1,
-            "git:proj",
-            "CONSTRAINTS",
-            "rust ownership beta durable context",
-            70,
-        )
-        .unwrap();
-        seed_unrelated_hint_candidates(&s);
-        USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-
-        let long_prompt = "rust ownership beta ".repeat(40);
-        let mut long_request = active_cc_req(
-            "auto-search-uncapped-length",
-            "cfg0",
-            vec![wire_item("user", "m1", 1, &[&long_prompt])],
-        );
-        long_request.auto_search_min_prompt_chars = 501;
-        let long_projection = project_messages(&long_request.messages).unwrap();
-        let long_decision = maybe_decide_live_user_hint(
-            &s,
-            &long_request,
-            &pctx("git:proj", "/nonexistent-docs", 1),
-            &long_projection,
-            &[],
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!long_decision.hint_text.is_empty());
-        assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-
-        let stacked_request = active_cc_req(
-            "auto-search-stacked",
-            "cfg0",
-            vec![wire_item(
-                "user",
-                "m1",
-                1,
-                &["rust ownership beta <sidekick-augmentation>existing</sidekick-augmentation>"],
-            )],
-        );
-        let stacked_projection = project_messages(&stacked_request.messages).unwrap();
-        let stacked_decision = maybe_decide_live_user_hint(
-            &s,
-            &stacked_request,
-            &pctx("git:proj", "/nonexistent-docs", 1),
-            &stacked_projection,
-            &[],
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(stacked_decision.hint_text.is_empty());
-        assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-    }
-
-    #[test]
-    fn auto_search_runs_without_tagging_but_not_when_disabled() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.seed_memory(
-            1,
-            "git:proj",
-            "CONSTRAINTS",
-            "rust ownership beta durable context",
-            70,
-        )
-        .unwrap();
-        seed_unrelated_hint_candidates(&s);
-        let messages = vec![wire_item("user", "m1", 1, &["rust ownership beta"])];
-
-        let mut enabled = cc_req("auto-search-untagged", "cfg0", messages.clone());
-        enabled.auto_search_min_prompt_chars = 0;
-        enabled.auto_search_score_threshold = DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD;
-        let hinted = run(&s, &enabled, &spine());
-        assert!(tail_bytes(&hinted, "m1").contains("<ctx-search-hint>"));
-        assert!(!tail_bytes(&hinted, "m1").contains("§1§"));
-
-        let mut disabled = active_cc_req("auto-search-disabled", "cfg0", messages);
-        disabled.auto_search_enabled = false;
-        disabled.auto_search_min_prompt_chars = 0;
-        disabled.auto_search_score_threshold = DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD;
-        let no_hint = run(&s, &disabled, &spine());
-        assert!(!tail_bytes(&no_hint, "m1").contains("<ctx-search-hint>"));
-    }
-
-    #[test]
-    fn user_hint_is_computed_once_replayed_and_inactive_is_verbatim() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership uses borrowing safely",
-                70,
-            )
-            .unwrap();
-            seed_unrelated_hint_candidates(&s);
-            let messages = vec![wire_item("user", "m1", 1, &["rust ownership"])];
-            let request = active_cc_req("user-hint", "cfg0", messages.clone());
-            run(&s, &request, &spine());
-            let first = run(&s, &request, &spine());
-            let expected_hint = "\n\n<ctx-search-hint>\nYour memory may contain 1 related fragment:\n- rust ownership uses borrowing safely\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
-            assert_eq!(
-                tail_bytes(&first, "m1"),
-                format!("§1§ rust ownership{expected_hint}")
-            );
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-
-            let replay = run(&s, &request, &spine());
-            assert_eq!(tail_bytes(&replay, "m1"), tail_bytes(&first, "m1"));
-            assert_eq!(
-                USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get),
-                1,
-                "a durable row bypasses the lexical query on replay"
-            );
-            assert_eq!(s.load_user_hints("user-hint").unwrap().len(), 1);
-
-            let mut dormant = cc_req("user-hint", "cfg0", messages);
-            dormant.auto_search_enabled = false;
-            let false_window = run(&s, &dormant, &spine());
-            assert_eq!(tail_bytes(&false_window, "m1"), "rust ownership");
-        });
-    }
-
-    #[test]
-    fn user_hint_new_physical_tail_renders_on_same_low_pressure_pass() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            let session = "user-hint-low-pressure";
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership beta durable context",
-                70,
-            )
-            .unwrap();
-            seed_unrelated_hint_candidates(&s);
-            s.replace_compartments(session, &[comp(1, 1, 1, "a", "SUMMARY")])
-                .unwrap();
-            let mut ctx = pctx("git:proj", "/nonexistent-docs", 1);
-            ctx.cache_ttl = "never".to_string();
-            ctx.memory_budget_tokens = 0.0;
-            let baseline = req(session, "cfg0", vec![item("a", 1, "baseline")]);
-            assert_eq!(transform(&s, &baseline, &ctx).unwrap().action, "HARD");
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-
-            let request = req(
-                session,
-                "cfg0",
-                vec![
-                    item("a", 1, "baseline"),
-                    wire_item("user", "m1", 2, &["rust ownership beta"]),
-                ],
-            );
-            let low_pressure = with_usage(request.clone(), 10, 100);
-            let expected_hint = "\n\n<ctx-search-hint>\nYour memory may contain 1 related fragment:\n- rust ownership beta durable context\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
-
-            let first_defer = transform(&s, &low_pressure, &ctx).unwrap();
-            assert_eq!(first_defer.action, "SOFT+");
-            assert_eq!(
-                tail_bytes(&first_defer, "m1"),
-                format!("rust ownership beta{expected_hint}")
-            );
-            let after_decision = s.load(session).unwrap();
-            assert!(after_decision.meta.pending_user_hint_block_ids.is_empty());
-            assert!(s
-                .load_user_hints(session)
-                .unwrap()
-                .iter()
-                .any(|row| row.block_id == "m1#0" && row.hint_text == expected_hint));
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-
-            for now_ms in 2..=3 {
-                ctx.now_ms = now_ms;
-                let deferred = transform(&s, &low_pressure, &ctx).unwrap();
-                assert_eq!(deferred.action, "SOFT+");
-                assert_eq!(tail_bytes(&deferred, "m1"), tail_bytes(&first_defer, "m1"));
-            }
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-
-            ctx.now_ms = 4;
-            let mut bust_request = with_usage(request, 10, 100);
-            bust_request.render_config = "cfg1".to_string();
-            let force = transform(&s, &bust_request, &ctx).unwrap();
-            assert_eq!(force.action, "HARD");
-            assert_eq!(tail_bytes(&force, "m1"), tail_bytes(&first_defer, "m1"));
-        });
-    }
-
-    #[test]
-    fn user_hint_for_a_served_tail_waits_for_an_independent_bust() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            let session = "user-hint-served-tail";
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership beta durable context",
-                70,
-            )
-            .unwrap();
-            seed_unrelated_hint_candidates(&s);
-            let messages = vec![wire_item("user", "m1", 1, &["rust ownership beta"])];
-            let mut dormant = req(session, "cfg0", messages.clone());
-            dormant.auto_search_enabled = false;
-            let mut ctx = pctx("git:proj", "/nonexistent-docs", 1);
-            ctx.cache_ttl = "never".to_string();
-            ctx.memory_budget_tokens = 0.0;
-            let first_serve = transform(&s, &dormant, &ctx).unwrap();
-            assert_eq!(first_serve.action, "HARD");
-            assert_eq!(tail_bytes(&first_serve, "m1"), "rust ownership beta");
-
-            let request = with_usage(req(session, "cfg0", messages.clone()), 10, 100);
-            ctx.now_ms = 2;
-            let deferred = transform(&s, &request, &ctx).unwrap();
-            assert_eq!(deferred.action, "SOFT+");
-            assert_eq!(tail_bytes(&deferred, "m1"), "rust ownership beta");
-            assert!(s
-                .load(session)
-                .unwrap()
-                .meta
-                .pending_user_hint_block_ids
-                .contains("m1#0"));
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-
-            let mut bust_request = request;
-            bust_request.render_config = "cfg1".to_string();
-            ctx.now_ms = 3;
-            let bust = transform(&s, &bust_request, &ctx).unwrap();
-            assert_eq!(bust.action, "HARD");
-            assert_eq!(
-                tail_bytes(&bust, "m1"),
-                "rust ownership beta\n\n<ctx-search-hint>\nYour memory may contain 1 related fragment:\n- rust ownership beta durable context\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>"
-            );
-            assert!(s
-                .load(session)
-                .unwrap()
-                .meta
-                .pending_user_hint_block_ids
-                .is_empty());
-        });
-    }
-
-    #[test]
     fn empty_user_hint_decision_skips_future_queries() {
         run_active_surface_test(|| {
             USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
@@ -24621,74 +23037,6 @@ pub(crate) mod tests {
 
             run(&s, &request, &spine());
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-        });
-    }
-
-    #[test]
-    fn buried_user_does_not_mint_a_hint_or_backfill_later() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "newer prompt carries related durable context",
-                70,
-            )
-            .unwrap();
-            let both = vec![
-                wire_item("user", "m1", 1, &["older prompt"]),
-                wire_item("user", "m2", 2, &["newer prompt"]),
-                wire_item("assistant", "m3", 3, &["trailing answer"]),
-            ];
-            let request = active_cc_req("hint-frontier", "cfg0", both);
-            run(&s, &request, &spine());
-            run(&s, &request, &spine());
-            assert!(s.load_user_hints("hint-frontier").unwrap().is_empty());
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
-            assert_eq!(s.overlay_watermark("hint-frontier").unwrap(), Some(2));
-
-            let older_only = active_cc_req(
-                "hint-frontier",
-                "cfg0",
-                vec![wire_item("user", "m1", 1, &["older prompt"])],
-            );
-            let response = run(&s, &older_only, &spine());
-            assert_eq!(tail_bytes(&response, "m1"), "§1§ older prompt");
-            assert!(s.load_user_hints("hint-frontier").unwrap().is_empty());
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
-        });
-    }
-
-    #[test]
-    fn ordinal_zero_user_is_eligible_on_a_fresh_frontier() {
-        run_active_surface_test(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership uses borrowing safely",
-                70,
-            )
-            .unwrap();
-            seed_unrelated_hint_candidates(&s);
-            let request = active_cc_req(
-                "zero-frontier",
-                "cfg0",
-                vec![wire_item("user", "m0", 0, &["rust ownership"])],
-            );
-            run(&s, &request, &spine());
-            let active = run(&s, &request, &spine());
-            assert!(tail_bytes(&active, "m0").contains("<ctx-search-hint>"));
-            assert_eq!(s.overlay_watermark("zero-frontier").unwrap(), Some(0));
-            assert_eq!(
-                s.load_user_hints("zero-frontier").unwrap()[0].block_id,
-                "m0#0"
-            );
         });
     }
 
@@ -24722,210 +23070,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn synthetic_notification_after_user_blocks_same_pass_hint_decision() {
-        USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        store
-            .seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership uses borrowing safely",
-                70,
-            )
-            .unwrap();
-        seed_unrelated_hint_candidates(&store);
-        let mut notification = wire_item("user", "notice", 2, &["synthetic notification"]);
-        notification.ck.meta.synthetic = true;
-        let request = active_cc_req(
-            "synthetic-tail",
-            "cfg0",
-            vec![
-                wire_item("user", "m1", 1, &["rust ownership"]),
-                notification,
-            ],
-        );
-        let projection = project_messages(&request.messages).unwrap();
-
-        assert_eq!(eligible_authored_user_tail(&request).unwrap().mid, "m1");
-        assert!(maybe_decide_live_user_hint(
-            &store,
-            &request,
-            &pctx("git:proj", "/nonexistent-docs", 1),
-            &projection,
-            &[],
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap()
-        .is_none());
-        assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
-    }
-
-    #[test]
-    fn trailing_tool_role_transport_blocks_same_pass_user_hint_mutation() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let store = store(dir.path());
-            store
-                .seed_memory(
-                    1,
-                    "git:proj",
-                    "CONSTRAINTS",
-                    "rust ownership uses borrowing safely",
-                    70,
-                )
-                .unwrap();
-            seed_unrelated_hint_candidates(&store);
-            let request = active_cc_req(
-                "tool-role-tail",
-                "cfg0",
-                vec![
-                    wire_item("user", "m1", 1, &["rust ownership"]),
-                    wire_item("tool", "result", 2, &["transport output"]),
-                ],
-            );
-            assert_eq!(eligible_authored_user_tail(&request).unwrap().mid, "m1");
-            let response = run(&store, &request, &spine());
-            assert!(!tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
-            assert!(store.load_user_hints("tool-role-tail").unwrap().is_empty());
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
-        });
-    }
-
-    #[test]
-    fn user_role_result_carrier_blocks_hint_but_not_semantic_temporal_selection() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let store = store(dir.path());
-            store
-                .seed_memory(
-                    1,
-                    "git:proj",
-                    "CONSTRAINTS",
-                    "rust ownership uses borrowing safely",
-                    70,
-                )
-                .unwrap();
-            seed_unrelated_hint_candidates(&store);
-            let mut request = active_cc_req(
-                "user-result-tail",
-                "cfg0",
-                vec![
-                    wire_item("user", "m1", 1, &["rust ownership"]),
-                    opaque_result_carrier("result", 2, "user"),
-                ],
-            );
-            request.prev_response_completed_at_ms = Some(1);
-            run(&store, &request, &spine());
-            let response = transform(
-                &store,
-                &request,
-                &pctx("git:proj", "/nonexistent-docs", 700_000),
-            )
-            .unwrap();
-            assert!(!tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
-            assert!(store
-                .load_user_hints("user-result-tail")
-                .unwrap()
-                .is_empty());
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
-            assert_eq!(
-                store.overlay_watermark("user-result-tail").unwrap(),
-                Some(1)
-            );
-            assert_eq!(
-                store
-                    .load_temporal_marks("user-result-tail")
-                    .unwrap()
-                    .iter()
-                    .map(|row| row.block_id.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["m1#0"]
-            );
-            let result = response
-                .messages()
-                .iter()
-                .find(|message| message.meta.harness_id.as_deref() == Some("result"))
-                .expect("result carrier remains in the tail");
-            assert!(matches!(
-                &result.content[0].kind,
-                ck_wire::CkKind::Opaque(opaque) if opaque.raw == json!({ "output": "transport" })
-            ));
-        });
-    }
-
-    #[test]
-    fn lexical_hint_scoring_requires_two_specific_tokens() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        for id in 1..=30 {
-            let content = if id == 1 {
-                "rust ownership borrowing safely across async tasks".to_string()
-            } else if id == 2 {
-                "quasar appears in an otherwise unrelated archive".to_string()
-            } else {
-                format!("fixture memory {id} about ordinary unrelated material")
-            };
-            s.seed_memory(id, "git:proj", "CONSTRAINTS", &content, 50)
-                .unwrap();
-        }
-
-        let related = run_user_hint_lexical_search(
-            &s,
-            "git:proj",
-            "lexical",
-            "rust ownership",
-            true,
-            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(related[0].id, 1);
-        let unrelated = run_user_hint_lexical_search(
-            &s,
-            "git:proj",
-            "lexical",
-            "galaxy telescope",
-            true,
-            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
-            &[],
-        )
-        .unwrap();
-        assert!(unrelated.is_empty());
-        let one_common_token = run_user_hint_lexical_search(
-            &s,
-            "git:proj",
-            "lexical",
-            "quasar deployment",
-            true,
-            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
-            &[],
-        )
-        .unwrap();
-        assert!(one_common_token.is_empty());
-        let ubiquitous_tokens = run_user_hint_lexical_search(
-            &s,
-            "git:proj",
-            "lexical",
-            "fixture memory",
-            true,
-            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
-            &[],
-        )
-        .unwrap();
-        assert!(
-            ubiquitous_tokens.is_empty(),
-            "matches need at least one token present in less than half the candidate pool"
-        );
-    }
-
-    #[test]
     fn user_hint_query_keeps_terms_beyond_the_old_character_cap() {
         let complete_prefix = "word ".repeat(110);
         let full_prompt = format!("{complete_prefix}discriminatingterm suffix");
@@ -24933,133 +23077,6 @@ pub(crate) mod tests {
         assert_eq!(query, full_prompt.trim());
         assert!(query.contains("discriminatingterm suffix"));
         assert!(query.chars().count() > 500);
-    }
-
-    #[test]
-    fn user_hint_targets_first_text_after_media() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "media prompt has a remembered fragment",
-                70,
-            )
-            .unwrap();
-            seed_unrelated_hint_candidates(&s);
-            let mut message = wire_item("user", "m1", 1, &["media prompt"]);
-            message.ck.content.insert(
-                0,
-                CkWireBlock::bare(ck_wire::CkKind::Media(ck_wire::MediaBlock {
-                    kind: ck_wire::MediaKind::Image,
-                    media_type: "image/png".to_string(),
-                    filename: None,
-                    source: serde_json::json!({"type": "base64", "data": "AA=="}),
-                })),
-            );
-            let request = active_cc_req("media-hint", "cfg0", vec![message]);
-            run(&s, &request, &spine());
-            let response = run(&s, &request, &spine());
-            let rendered = response
-                .messages()
-                .iter()
-                .find(|message| message.meta.harness_id.as_deref() == Some("m1"))
-                .unwrap();
-            let ck_wire::CkKind::Text { text } = &rendered.content[1].kind else {
-                panic!("second block must remain text");
-            };
-            assert!(text.starts_with("§1§ media prompt"));
-            assert!(text.contains("<ctx-search-hint>"));
-            assert_eq!(s.load_user_hints("media-hint").unwrap()[0].block_id, "m1#1");
-        });
-    }
-
-    #[test]
-    fn pending_rewrite_passthrough_replays_only_existing_overlays() {
-        run_active_surface_test(|| {
-            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "foreign prompt has durable context",
-                70,
-            )
-            .unwrap();
-            s.seed_memory(
-                2,
-                "git:proj",
-                "CONSTRAINTS",
-                "unrelated fixture material",
-                50,
-            )
-            .unwrap();
-            s.replace_compartments("pending-hint", &[comp(1, 1, 2, "t2#0", "summary")])
-                .unwrap();
-            let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
-            ctx.memory_budget_tokens = 0.0;
-            let present = active_cc_req(
-                "pending-hint",
-                "cfg0",
-                vec![
-                    wire_item("assistant", "t2", 2, &["covered"]),
-                    wire_item("assistant", "t3", 3, &["tail"]),
-                ],
-            );
-            transform(&s, &present, &ctx).unwrap();
-            transform(&s, &present, &ctx).unwrap();
-            let mut loaded = s.load("pending-hint").unwrap();
-            loaded.meta.pending_rewrite = Some(PendingRewriteState {
-                armed_at_ms: 1,
-                absent_shape_fingerprint: "held".to_string(),
-                absent_request_count: 1,
-                last_present_at_ms: Some(1),
-            });
-            s.commit(
-                "pending-hint",
-                loaded.row_version,
-                &loaded.core,
-                &loaded.meta,
-            )
-            .unwrap();
-
-            let absent = active_cc_req(
-                "pending-hint",
-                "cfg0",
-                vec![wire_item("user", "foreign", 50, &["foreign prompt"])],
-            );
-            let response = transform(&s, &absent, &ctx).unwrap();
-            assert_eq!(response.action, "PASSTHROUGH");
-            assert!(!tail_bytes(&response, "foreign").contains("<ctx-search-hint>"));
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
-            assert!(s.load_user_hints("pending-hint").unwrap().is_empty());
-            assert_eq!(s.overlay_watermark("pending-hint").unwrap(), None);
-
-            // The recovered request changes render identity, supplying the independent bust
-            // required before a fresh auto-search hint may append to the user tail.
-            let accepted = active_cc_req(
-                "pending-hint",
-                "cfg1",
-                vec![
-                    present.messages[0].clone(),
-                    present.messages[1].clone(),
-                    wire_item("user", "foreign", 50, &["foreign prompt"]),
-                ],
-            );
-            let active = transform(&s, &accepted, &ctx).unwrap();
-            assert_eq!(active.action, "HARD");
-            assert!(tail_bytes(&active, "foreign").contains("<ctx-search-hint>"));
-            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
-            assert_eq!(
-                s.load_user_hints("pending-hint").unwrap()[0].block_id,
-                "foreign#0"
-            );
-        });
     }
 
     #[test]
@@ -25228,95 +23245,6 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>(),
                 vec!["m1#0"]
             );
-        });
-    }
-
-    #[test]
-    fn boundary_rejection_leaves_all_overlay_decisions_uncommitted() {
-        run_active_surface_test(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            s.seed_memory(
-                1,
-                "git:proj",
-                "CONSTRAINTS",
-                "rust ownership durable context",
-                70,
-            )
-            .unwrap();
-            s.seed_memory(
-                2,
-                "git:proj",
-                "CONSTRAINTS",
-                "unrelated fixture material",
-                50,
-            )
-            .unwrap();
-            let baseline = active_cc_req(
-                "overlay-reject",
-                "cfg0",
-                vec![wire_item("user", "m1", 1, &["baseline prompt"])],
-            );
-            let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
-            ctx.memory_budget_tokens = 0.0;
-            transform(&s, &baseline, &ctx).unwrap();
-            transform(&s, &baseline, &ctx).unwrap();
-            let tags_before = s.load_tags_for_session("overlay-reject").unwrap();
-            let hints_before = s.load_user_hints("overlay-reject").unwrap();
-            let temporal_before = s.load_temporal_marks("overlay-reject").unwrap();
-            let channel1_before = s.load_channel1_appends("overlay-reject").unwrap();
-            let frontier_before = s.overlay_watermark("overlay-reject").unwrap();
-
-            s.replace_compartments(
-                "overlay-reject",
-                &[comp(1, 3, 3, "m3#0", "only the last message")],
-            )
-            .unwrap();
-            let mut rejected = active_cc_req(
-                "overlay-reject",
-                "cfg0",
-                vec![
-                    baseline.messages[0].clone(),
-                    wire_item("assistant", "m2", 2, &["answer"]),
-                    wire_item("user", "m3", 3, &["rust ownership"]),
-                ],
-            );
-            rejected.prev_response_completed_at_ms = Some(1);
-            ctx.now_ms = 700_000;
-            let error = transform(&s, &rejected, &ctx).unwrap_err();
-            assert!(matches!(error, TransformError::CoverageGap(_)));
-            assert_eq!(
-                s.load_tags_for_session("overlay-reject").unwrap(),
-                tags_before
-            );
-            assert_eq!(s.load_user_hints("overlay-reject").unwrap(), hints_before);
-            assert_eq!(
-                s.load_temporal_marks("overlay-reject").unwrap(),
-                temporal_before
-            );
-            assert_eq!(
-                s.overlay_watermark("overlay-reject").unwrap(),
-                frontier_before
-            );
-            assert_eq!(
-                s.load_channel1_appends("overlay-reject").unwrap(),
-                channel1_before
-            );
-
-            s.replace_compartments("overlay-reject", &[comp(1, 1, 3, "m3#0", "complete range")])
-                .unwrap();
-            transform(&s, &rejected, &ctx).unwrap();
-            assert!(s
-                .load_user_hints("overlay-reject")
-                .unwrap()
-                .iter()
-                .any(|row| row.block_id == "m3#0" && !row.hint_text.is_empty()));
-            assert_eq!(s.overlay_watermark("overlay-reject").unwrap(), Some(3));
-            assert!(s
-                .load_temporal_marks("overlay-reject")
-                .unwrap()
-                .iter()
-                .any(|row| row.block_id == "m3#0"));
         });
     }
 
@@ -26223,7 +24151,6 @@ pub(crate) mod tests {
                     meta: &loaded.meta,
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
-                    memory_revision: None,
                     claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: None,
@@ -26311,7 +24238,6 @@ pub(crate) mod tests {
                     meta: &loaded.meta,
                     consumed_drop_ids: &[pending_a[0].id],
                     first_applied_command_ids: &command_a,
-                    memory_revision: None,
                     claim_snapshot_vector: None,
                     compartment_max_seq: None,
                     project_root: None,
@@ -27068,278 +24994,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn coalesced_memory_delta_and_reduction_one_soft() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        bootstrap_covering_a(&s);
-
-        // both a store m1 delta (a new memory) AND a new reduction on one pass → ONE SOFT
-        s.seed_memory(5, "git:proj", "ARCHITECTURE", "a rule", 70)
-            .unwrap();
-        let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
-        let items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
-        let r = run(&s, &req("ses", "cfg0", items.clone()), &d);
-        assert_eq!(r.action, "SOFT");
-        assert!(
-            m1_bytes(&r).contains("a rule"),
-            "m1 delta rendered: {}",
-            m1_bytes(&r)
-        );
-        assert_eq!(
-            tail_bytes(&r, "t2"),
-            "[dropped 1]",
-            "reduction frozen, same SOFT"
-        );
-
-        // defer after: both replay byte-identical, no second bust
-        let after = run(&s, &req("ses", "cfg0", items), &d);
-        assert_eq!(after.action, "SOFT+");
-        assert!(!after.committed);
-        assert_eq!(m1_bytes(&after), m1_bytes(&r));
-        assert_eq!(tail_bytes(&after, "t2"), "[dropped 1]");
-    }
-
-    #[test]
-    fn pressure_refold_renders_ready_note_and_ack_prevents_redelivery() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
-            .unwrap();
-        let memory_ids = seed_pressure_memory(&s);
-        let messages = vec![item("a", 1, "raw")];
-        let boot = run(&s, &req("ses", "cfg0", messages.clone()), &spine());
-        assert_eq!(boot.action, "HARD");
-
-        let note = s
-            .insert_project_note(NoteWriteInput {
-                project_path: "git:proj",
-                route_project_root: None,
-                session_id: Some("writer"),
-                content: "ready note survives pressure refold",
-                surface_condition: Some("condition true"),
-                anchor_block_id: None,
-                anchor_ordinal: None,
-                compiled_provider: None,
-                compiled_config: None,
-                compiled_at: None,
-                compile_status: None,
-                now_ms: 1,
-            })
-            .unwrap();
-        assert!(matches!(
-            s.write_note_evaluation(NoteEvaluationInput {
-                project_path: "git:proj",
-                note_id: note.id,
-                source_revision: note.status_version,
-                verdict: true,
-                compiled_check: None,
-                manifest_json: None,
-                check_hash: None,
-                next_due_at: None,
-                now_ms: 2,
-            })
-            .unwrap(),
-            NoteCasOutcome::Applied(note) if note.status == "ready"
-        ));
-        add_pressure_memory_updates(&s, &memory_ids);
-
-        let pressure = transform(
-            &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap();
-        assert_eq!(pressure.action, "HARD");
-        assert_eq!(
-            pressure.materialize_reason.as_deref(),
-            Some("pressure_refold")
-        );
-        assert!(
-            m1_bytes(&pressure).contains("ready note survives pressure refold"),
-            "pressure refold must keep the claimed note model-visible"
-        );
-        // Exact-once across layers: the pressure-causing memory deltas fold into m0 and
-        // must NOT survive in the post-fold m1 (the ordinary-HARD notes-only contract).
-        assert!(
-            m0_bytes(&pressure).contains("updated rule 1"),
-            "folded m0 must carry the memory deltas that caused the pressure"
-        );
-        assert!(
-            !m1_bytes(&pressure).contains("updated rule"),
-            "post-refold m1 must not duplicate memory deltas already folded into m0"
-        );
-        assert!(
-            !m1_bytes(&pressure).contains("<memory-updates>"),
-            "post-refold m1 must be notes-only"
-        );
-        let deliveries = pressure.note_deliveries.clone().expect("note delivery");
-        assert_eq!(deliveries.len(), 1);
-
-        let stable = transform(
-            &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap();
-        assert_eq!(stable.action, "SOFT+");
-        assert_eq!(m1_bytes(&stable), m1_bytes(&pressure));
-
-        let delivery = &deliveries[0];
-        assert_eq!(
-            s.ack_note_delivery("git:proj", "ses", &delivery.transform_pass_id, 3,)
-                .unwrap(),
-            1
-        );
-        let next_bust = transform(
-            &s,
-            &with_usage(req("ses", "cfg1", messages), 10, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap();
-        assert_eq!(next_bust.action, "HARD");
-        assert!(next_bust.note_deliveries.is_none());
-        assert!(!m1_bytes(&next_bust).contains("ready note survives pressure refold"));
-    }
-
-    #[test]
-    fn legacy_full_body_refold_state_replays_verbatim_on_defer() {
-        // Sessions that took a pressure refold under the short-lived full-body binary
-        // froze an m1 unit carrying the ENTIRE composed body (memory updates included).
-        // The corrected notes-only contract must not spuriously re-render that state:
-        // an unchanged pass defers and serves the legacy bytes verbatim; healing waits
-        // for the next genuine bust.
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
-            .unwrap();
-        let memory_ids = seed_pressure_memory(&s);
-        let messages = vec![item("a", 1, "raw")];
-        run(&s, &req("ses", "cfg0", messages.clone()), &spine());
-        add_pressure_memory_updates(&s, &memory_ids);
-        let pressure = transform(
-            &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap();
-        assert_eq!(
-            pressure.materialize_reason.as_deref(),
-            Some("pressure_refold")
-        );
-
-        // Rewrite the frozen m1 into the pre-fix full-body shape the old binary froze.
-        let loaded = s.load("ses").unwrap();
-        let mut core = loaded.core.clone();
-        let legacy_body =
-            "<memory-updates>\n#1: updated rule 0 (legacy full body)\n</memory-updates>";
-        let m1 = core
-            .frozen_units
-            .iter_mut()
-            .find(|unit| unit.key == "m1")
-            .expect("refold froze an m1 unit");
-        m1.frozen_payload = legacy_body.to_string();
-        s.commit("ses", loaded.row_version, &core, &loaded.meta)
-            .unwrap();
-
-        let replay = transform(
-            &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap();
-        assert_eq!(replay.action, "SOFT+");
-        assert!(
-            m1_bytes(&replay).contains("legacy full body"),
-            "an unchanged pass must serve the legacy frozen bytes verbatim"
-        );
-        let after = s.load("ses").unwrap();
-        assert_eq!(
-            after
-                .core
-                .frozen_units
-                .iter()
-                .find(|unit| unit.key == "m1")
-                .unwrap()
-                .frozen_payload,
-            legacy_body,
-            "a defer pass must not rewrite the legacy frozen unit"
-        );
-    }
-
-    #[test]
-    fn pressure_refold_rejects_sparse_coverage_like_ordinary_hard() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let messages = vec![
-            item("a", 1, "raw a"),
-            item("gap", 2, "uncovered live"),
-            item("tail", 3, "raw tail"),
-        ];
-        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "S1")])
-            .unwrap();
-        let memory_ids = seed_pressure_memory(&s);
-        run(&s, &req("ses", "cfg0", messages.clone()), &spine());
-        add_pressure_memory_updates(&s, &memory_ids);
-        s.replace_compartments(
-            "ses",
-            &[comp(1, 1, 1, "a", "S1"), comp(2, 3, 3, "tail", "S2")],
-        )
-        .unwrap();
-
-        let pressure = transform(
-            &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap_err();
-        assert!(matches!(pressure, TransformError::CoverageGap(_)));
-
-        let ordinary = transform(
-            &s,
-            &with_usage(req("ses", "cfg1", messages), 10, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap_err();
-        assert!(matches!(ordinary, TransformError::CoverageGap(_)));
-    }
-
-    #[test]
-    fn pressure_refold_rejects_absent_anchor_like_ordinary_hard() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let messages = vec![item("a", 1, "raw a"), item("tail", 2, "raw tail")];
-        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "S1")])
-            .unwrap();
-        let memory_ids = seed_pressure_memory(&s);
-        run(&s, &req("ses", "cfg0", messages.clone()), &spine());
-        add_pressure_memory_updates(&s, &memory_ids);
-        s.replace_compartments(
-            "ses",
-            &[
-                comp(1, 1, 1, "a", "S1"),
-                comp(2, 2, 2, "missing-anchor", "S2"),
-            ],
-        )
-        .unwrap();
-
-        let pressure = transform(
-            &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap_err();
-        assert!(matches!(pressure, TransformError::BoundaryNotPresent(_)));
-
-        let ordinary = transform(
-            &s,
-            &with_usage(req("ses", "cfg1", messages), 10, 100),
-            &pctx("git:proj", "/nonexistent-docs", 0),
-        )
-        .unwrap_err();
-        assert!(matches!(ordinary, TransformError::BoundaryNotPresent(_)));
-    }
-
-    #[test]
     fn reverted_orphan_reduction_gcd_on_surviving_prefix_reconcile_hard() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -27439,196 +25093,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn missing_m1_rebuilds_but_arbitrary_shape_still_rejects() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let dc = pctx("git:proj", "/nonexistent-docs", 0);
-        // An initialized state with m0 + a red:* but NO m1 is the recoverable
-        // `cached_m1_missing` shape from the TypeScript materializer.
-        let bad = CoreState {
-            version: 1,
-            boundary_id: "a#0".into(),
-            frozen_units: vec![
-                synth_region("m0", "BASE".into()),
-                red_unit("t2#0", "drop", "[dropped 1]"),
-            ],
-            pending_changes: vec![],
-            reconcile_pending: false,
-        };
-        let meta = ModuleMeta {
-            initialized: true,
-            last_render_config: "cfg0".into(),
-            coverage_ordinal: Some(1),
-            ..Default::default()
-        };
-        s.commit("ses", None, &bad, &meta).unwrap();
-        let rebuilt = transform(&s, &req("ses", "cfg0", vec![item("a", 1, "BASE")]), &dc)
-            .expect("missing m1 is reconstructed by a HARD pass");
-        assert_eq!(rebuilt.action, "HARD");
-        assert!(
-            s.load("ses")
-                .unwrap()
-                .core
-                .frozen_units
-                .iter()
-                .any(|unit| unit.key == "m1"),
-            "the recovery fold writes the missing m1 placeholder"
-        );
-
-        // a valid m0 + m1 + red:* state classifies normally (does NOT reject). Use the
-        // effective render_config (with the empty-workspace fingerprint folded) and the
-        // matching post-HARD m1 digest so the steady-state pass is a clean SOFT+ (no
-        // phantom delta from a mismatched digest).
-        let good = CoreState {
-            version: 1,
-            boundary_id: "a#0".into(),
-            frozen_units: vec![
-                synth_region("m0", "BASE".into()),
-                synth_region("m1", M1_PLACEHOLDER.into()),
-                red_unit("t2#0", "drop", "[dropped 1]"),
-            ],
-            pending_changes: vec![],
-            reconcile_pending: false,
-        };
-        let good_cfg = fold_m0_content_epoch(
-            "cfg0",
-            &M0ContentEpoch {
-                workspace_fingerprint: s.workspace_fingerprint("git:proj", 0).unwrap(),
-                upgrade_state: String::new(),
-                memory_content_epoch: String::new(),
-                memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
-                compartment_render_epoch: format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
-                profile_render_epoch: String::new(),
-                prompt_surface_epoch: String::new(),
-                tagger_feature_epoch: String::new(),
-                transition_epoch: String::new(),
-            },
-        );
-        let good_meta = ModuleMeta {
-            initialized: true,
-            last_render_config: good_cfg,
-            coverage_ordinal: Some(1),
-            m1_revision: m1_revision_signal(&s, "git:proj", "ses2").unwrap(),
-            ..Default::default()
-        };
-        s.commit("ses2", None, &good, &good_meta).unwrap();
-        let ok = transform(&s, &req("ses2", "cfg0", vec![item("a", 1, "BASE")]), &dc).unwrap();
-        assert_eq!(ok.action, "SOFT+", "m0+m1+red is a valid shape");
-    }
-
-    #[test]
-    fn token_estimator_is_hard_only_never_called_on_soft_or_defer() {
-        // The protected publication floor shares the injected BPE interface with m0 composition.
-        // It is frozen on an already-HARD pass; SOFT and replay passes must never recompute it.
-        use std::cell::Cell;
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let calls = Cell::new(0usize);
-        let counting = |text: &str| -> usize {
-            calls.set(calls.get() + 1);
-            mc_tokenizer::estimate_tokens(text)
-        };
-        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-
-        // HARD bootstrap: m0 folds C1, so compose_m0_from_store runs the decay renderer
-        // whose budget guard evaluates the estimator at least once (non-empty pool).
-        s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "S1")])
-            .unwrap();
-        let boot = apply_once_with_estimator(
-            &s,
-            &req(
-                "ses",
-                "cfg0",
-                vec![item("m10", 10, "raw"), item("t11", 11, "tail")],
-            ),
-            &ctx,
-            counting,
-            None,
-        )
-        .unwrap();
-        assert_eq!(boot.response.action, "HARD");
-        assert!(
-            calls.get() > 0,
-            "the HARD m0 compose must exercise the estimator"
-        );
-        let loaded = s.load("ses").unwrap();
-        assert!(
-            loaded.meta.publication_floor_ordinal.is_none(),
-            "a bootstrap before historian publication must not advance the trigger floor"
-        );
-        let mut published_meta = loaded.meta;
-        published_meta.publication_floor_ordinal = Some(11);
-        s.commit("ses", loaded.row_version, &loaded.core, &published_meta)
-            .unwrap();
-
-        // SOFT: a second compartment rides m1 at fixed tier 1 (no decay budget guard).
-        s.replace_compartments(
-            "ses",
-            &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 20, "m20", "S2")],
-        )
-        .unwrap();
-        s.arm_soft_refresh("ses").unwrap();
-        calls.set(0);
-        let soft_items = vec![
-            item("m10", 10, "raw"),
-            item("m20", 20, "raw2"),
-            item("t21", 21, "tail"),
-        ];
-        let soft = apply_once_with_estimator(
-            &s,
-            &req("ses", "cfg0", soft_items.clone()),
-            &ctx,
-            counting,
-            None,
-        )
-        .unwrap();
-        assert_eq!(soft.response.action, "SOFT");
-        assert_eq!(
-            calls.get(),
-            0,
-            "a SOFT composes m1 without the m0 decay budget guard → estimator must NOT be called"
-        );
-
-        // Defer replays frozen bytes under two deliberately incompatible estimator versions.
-        calls.set(0);
-        let first_defer = apply_once_with_estimator(
-            &s,
-            &req("ses", "cfg0", soft_items.clone()),
-            &ctx,
-            counting,
-            None,
-        )
-        .unwrap();
-        assert_eq!(first_defer.response.action, "SOFT+");
-        assert_eq!(calls.get(), 0, "a defer must not call the estimator");
-        let first_bytes = serde_json::to_vec(&first_defer.response.ck_messages).unwrap();
-
-        // Simulate an initialized legacy row that predates publication-floor persistence. With no
-        // coverage gap, it remains a pure defer and waits for a later HARD to backfill.
-        let loaded = s.load("ses").unwrap();
-        let mut legacy_meta = loaded.meta;
-        legacy_meta.publication_floor_ordinal = None;
-        s.commit("ses", loaded.row_version, &loaded.core, &legacy_meta)
-            .unwrap();
-
-        let alternate_calls = Cell::new(0usize);
-        let alternate = |_text: &str| -> usize {
-            alternate_calls.set(alternate_calls.get() + 1);
-            usize::MAX / 2
-        };
-        let second_defer =
-            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items), &ctx, alternate, None)
-                .unwrap();
-        assert_eq!(second_defer.response.action, "SOFT+");
-        assert_eq!(alternate_calls.get(), 0);
-        assert_eq!(
-            first_bytes,
-            serde_json::to_vec(&second_defer.response.ck_messages).unwrap(),
-            "defer bytes must be independent of estimator-version behavior"
-        );
-    }
-
-    #[test]
     fn protected_floor_has_no_global_estimator_bypass() {
         let source = include_str!("transform.rs");
         let helper = source
@@ -27686,7 +25150,7 @@ pub(crate) mod tests {
     }
 
     fn effective_render_config_with_epochs(
-        store: &McStore,
+        _store: &McStore,
         cfg: &str,
         memory_render_epoch: String,
         compartment_render_epoch: String,
@@ -27696,7 +25160,7 @@ pub(crate) mod tests {
         fold_m0_content_epoch(
             cfg,
             &M0ContentEpoch {
-                workspace_fingerprint: store.workspace_fingerprint("git:proj", 0).unwrap(),
+                workspace_fingerprint: String::new(),
                 upgrade_state: String::new(),
                 memory_content_epoch: String::new(),
                 memory_render_epoch,
@@ -27824,7 +25288,7 @@ pub(crate) mod tests {
             ),
             coverage_ordinal: Some(0),
             folded_compartment_seq: 0,
-            m1_revision: m1_revision_signal(&store, "git:proj", "decl").unwrap(),
+            m1_revision: 0,
             ..Default::default()
         };
         store.commit("decl", None, &core, &meta).unwrap();
@@ -27869,10 +25333,6 @@ pub(crate) mod tests {
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
                 compartments: &[],
-                memories: &[],
-                memories_replace_projects: None,
-                memories_delete_ids: None,
-                memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
                 workspace: None,
@@ -28493,10 +25953,6 @@ pub(crate) mod tests {
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
                 compartments: &compartments,
-                memories: &[],
-                memories_replace_projects: None,
-                memories_delete_ids: None,
-                memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
                 workspace: None,
@@ -29341,7 +26797,6 @@ pub(crate) mod tests {
                 meta: &poisoned.meta,
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
-                memory_revision: None,
                 claim_snapshot_vector: None,
                 compartment_max_seq: None,
                 project_root: None,

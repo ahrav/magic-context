@@ -497,16 +497,6 @@ pub fn get_dream_runs(
     db::get_dream_runs(&conn, project_path.as_deref(), limit.unwrap_or(20))
 }
 
-#[tauri::command(async)]
-pub fn get_dream_run_memory_changes(
-    state: State<'_, AppState>,
-    run_id: i64,
-) -> Result<db::DreamRunMemoryDetail, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_dream_run_memory_changes(&conn, run_id)
-}
-
 // ── Log commands ────────────────────────────────────────────
 
 #[tauri::command(async)]

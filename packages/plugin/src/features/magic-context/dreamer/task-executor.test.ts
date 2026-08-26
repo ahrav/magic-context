@@ -2,19 +2,16 @@
 
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createDreamTimerModuleClient } from "../../../plugin/dream-timer-module-client";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { ensureContextStoreUuid } from "../context-authority";
-import { insertMemory } from "../memory";
 import {
     applyProjectMemoryMapping,
     computeProjectMemoryMutationToken,
 } from "../memory/storage-claim-operations";
-import { runMigrations } from "../migrations";
 import { getClaimMuralCueStates } from "../mural/storage-mural-cues";
-import { createClaimMemorySchema } from "../storage-claim-memory-schema";
-import { initializeDatabase } from "../storage-db";
 import { type SeededProjectMemoryClaim, seedProjectMemoryClaim } from "../test-claim-database";
+import { createDirectTestDatabase } from "../test-database";
 import {
     getUserMemoryCandidates,
     insertUserMemory,
@@ -41,11 +38,7 @@ afterEach(() => {
 });
 
 function freshDb(): Database {
-    const database = new Database(":memory:");
-    initializeDatabase(database);
-    runMigrations(database);
-    database.transaction(() => createClaimMemorySchema(database)).immediate();
-    return database;
+    return createDirectTestDatabase().db;
 }
 
 function mapClaim(database: Database, claim: SeededProjectMemoryClaim, paths: string[]): void {
@@ -520,9 +513,8 @@ describe("createDreamTaskExecutor — parent session resolution", () => {
         db = freshDb();
         const project = "dir:/repo/project";
         for (let i = 0; i < 3; i += 1) {
-            insertMemory(db, {
-                sourceType: "user",
-                projectPath: project,
+            seedProjectMemoryClaim(db, {
+                projectIdentity: project,
                 category: "ARCHITECTURE",
                 content: `Memory ${i} backed by src/file${i}.ts.`,
             });
@@ -1020,9 +1012,8 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         db = freshDb();
         const project = "dir:/repo/draining-cues";
         ensureContextStoreUuid(db);
-        const memory = insertMemory(db, {
-            sourceType: "user",
-            projectPath: project,
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             category: "ARCHITECTURE",
             content: "A cue candidate must wait for module drain replay.",
         });
@@ -1060,9 +1051,9 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         expect(String(thrown)).toContain("dreamer mutation deferred");
         expect(create).not.toHaveBeenCalled();
         expect(moduleCall).not.toHaveBeenCalled();
-        expect(db.prepare("SELECT mural_cue FROM memories WHERE id = ?").get(memory.id)).toEqual({
-            mural_cue: null,
-        });
+        expect(getClaimMuralCueStates(db, [claim.publicClaimId]).get(claim.publicClaimId)).toBe(
+            undefined,
+        );
     });
 
     test("reports a structural membership failure as transient", async () => {

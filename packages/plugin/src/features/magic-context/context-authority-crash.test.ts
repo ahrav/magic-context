@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,9 +21,7 @@ import { type ContextClaimCommit, commitModuleClaimIntent } from "./context-auth
 import { computeClaimOperationRequestDigest } from "./memory/claim-operation-contract";
 import { createProjectMemoryClaim, runClaimOperation } from "./memory/storage-claim-operations";
 import { ensureProject } from "./memory/storage-claims";
-import { runMigrations } from "./migrations";
-import { createClaimMemorySchema } from "./storage-claim-memory-schema";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 const databases: Database[] = [];
 const tempDirs: string[] = [];
@@ -74,14 +72,11 @@ afterEach(() => {
 });
 
 function openContext(path: string): Database {
-    const db = new Database(path);
+    const db = existsSync(path) ? new Database(path) : createDirectTestDatabase({ path }).db;
+    db.exec("PRAGMA busy_timeout=5000");
+    db.exec("PRAGMA foreign_keys=ON");
+    db.exec("PRAGMA journal_mode=WAL");
     databases.push(db);
-    initializeDatabase(db);
-    runMigrations(db);
-    const hasClaimSchema = db
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_public_ids'")
-        .get();
-    if (!hasClaimSchema) db.transaction(() => createClaimMemorySchema(db)).immediate();
     return db;
 }
 
@@ -98,6 +93,18 @@ function newModuleState(): DurableModuleState {
         effectCommits: new Map(),
         deliveryOrder: [],
         callerResponses: [],
+    };
+}
+
+function reloadModuleState(state: DurableModuleState): DurableModuleState {
+    return {
+        intents: new Map([...state.intents].map(([key, value]) => [key, structuredClone(value)])),
+        receiptGroups: new Map(
+            [...state.receiptGroups].map(([key, value]) => [key, structuredClone(value)]),
+        ),
+        effectCommits: new Map(state.effectCommits),
+        deliveryOrder: [...state.deliveryOrder],
+        callerResponses: [...state.callerResponses],
     };
 }
 
@@ -406,9 +413,10 @@ describe("U5 claim intent crash recovery", () => {
 
             closeContext(f.db);
             const restarted = openContext(f.path);
+            const restartedState = reloadModuleState(f.state);
             const response = await runAttempt({
                 db: restarted,
-                state: f.state,
+                state: restartedState,
                 operationKey,
                 target: f.target,
                 applications: f.applications,
@@ -418,7 +426,9 @@ describe("U5 claim intent crash recovery", () => {
                 producer: PRODUCER,
                 operationKey,
             });
-            const intent = f.state.intents.get(commandKey({ producer: PRODUCER, operationKey }));
+            const intent = restartedState.intents.get(
+                commandKey({ producer: PRODUCER, operationKey }),
+            );
 
             expect(response).toBe(`response:${operationKey}`);
             expect(intent).toEqual(
@@ -427,10 +437,12 @@ describe("U5 claim intent crash recovery", () => {
             expect(receiptCount(restarted, operationKey)).toBe(1);
             expect(f.applications.count).toBe(1);
             expect(proof.effects).toHaveLength(2);
-            expect(f.state.deliveryOrder.at(-1)).toBe(proof.receiptId);
-            expect([...f.state.effectCommits.values()].every((count) => count === 1)).toBe(true);
+            expect(restartedState.deliveryOrder.at(-1)).toBe(proof.receiptId);
+            expect([...restartedState.effectCommits.values()].every((count) => count === 1)).toBe(
+                true,
+            );
             if (cut === "after-caller-ack") {
-                expect(f.state.callerResponses).toEqual([response]);
+                expect(restartedState.callerResponses).toEqual([response]);
             }
         }
     });

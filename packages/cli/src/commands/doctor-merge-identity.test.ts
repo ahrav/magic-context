@@ -3,12 +3,9 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-    initializeDatabase,
-    runMigrations,
-} from "@magic-context/core/features/magic-context/storage";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { Database } from "@magic-context/core/shared/sqlite";
-import { CLI_SCHEMA_FLOOR_VERSION, OutdatedSchemaVersionError } from "../lib/database-access";
+import { CLI_SCHEMA_FLOOR_VERSION } from "../lib/database-access";
 import { runMergeIdentityCli } from "./doctor-merge-identity";
 
 const tempDirs: string[] = [];
@@ -27,10 +24,7 @@ function createVersionedDatabase(path: string, version: number): void {
 }
 
 function createCurrentDatabase(path: string): void {
-    const db = new Database(path);
-    initializeDatabase(db);
-    runMigrations(db);
-    db.close();
+    createDirectTestDatabase({ path }).db.close();
 }
 
 function fileHash(path: string): string {
@@ -57,7 +51,7 @@ describe("doctor merge-identity schema guard", () => {
                 path,
                 "--yes",
             ]),
-        ).toThrow(OutdatedSchemaVersionError);
+        ).toThrow("database is not the exact supported direct format");
         expect(() =>
             runMergeIdentityCli([
                 "--from",
@@ -68,13 +62,10 @@ describe("doctor merge-identity schema guard", () => {
                 path,
                 "--yes",
             ]),
-        ).toThrow("Run a session or doctor migrate first");
+        ).toThrow("doctor reset-db");
         expect(fileHash(path)).toBe(before);
     });
 
-    // Explicit ceiling: createCurrentDatabase replays the full migration
-    // chain, whose wall time grows with every release and crossed bun's 5s
-    // default under CI load at v76 (release run 31447211517).
     it("works against the current checkout schema without running migrations", () => {
         const path = join(tempDir(), "context.db");
         createCurrentDatabase(path);

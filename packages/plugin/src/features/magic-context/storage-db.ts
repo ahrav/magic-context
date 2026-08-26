@@ -1,13 +1,20 @@
-import { chmodSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import {
+    chmodSync,
+    type Dirent,
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    statSync,
+    unlinkSync,
+} from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { getMagicContextStorageDir } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
     classifyProcessKind,
     discoverLivePiProcessIds,
-    inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
@@ -25,14 +32,8 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
 import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
-import {
-    DIRECT_FORMAT_FENCE_MIGRATION_VERSION,
-    FORK_MIGRATION_VERSION_FLOOR,
-} from "./migrations";
-import {
-    composeRegisteredSchema,
-    computeExpectedDirectFormat,
-} from "./storage-current-schema";
+import { DIRECT_FORMAT_FENCE_MIGRATION_VERSION, FORK_MIGRATION_VERSION_FLOOR } from "./migrations";
+import { composeRegisteredSchema, computeExpectedDirectFormat } from "./storage-current-schema";
 import {
     buildDirectFormatMarker,
     classifyDatabaseFormatFamily,
@@ -47,7 +48,6 @@ import {
     loadToolDefinitionMeasurements,
     setDatabase as setToolDefinitionDatabase,
 } from "./tool-definition-tokens";
-import { runToolOwnerBackfill } from "./tool-owner-backfill";
 
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
@@ -169,8 +169,6 @@ export function resolveDatabasePath(dbPathOverride?: string): { dbDir: string; d
 export function getDatabasePath(db: Database): string | null {
     return pathByDatabase.get(db) ?? null;
 }
-
-
 
 export function getPersistedSchemaVersion(db: Database): number {
     const hasMigrationsTable = db
@@ -481,7 +479,6 @@ export function getLiveMigrationBlockingProcesses(storageDir: string): FailClose
     return [...openCode, ...pi];
 }
 
-
 // Per-connection SQLite tuning, settable once at plugin init (before the first
 // openDatabase) so the 27 openDatabase call sites don't each need config
 // threading. Defaults match the config schema (64 MiB cache, mmap disabled) so
@@ -561,27 +558,6 @@ function finishDatabaseOpen(db: Database, dbPath: string, explicitDbPath: boolea
     // cached-handle reuses both run this TTL-scoped heal so long-lived
     // processes eventually unwind stuck stale claims without a restart.
     healWedgedChannel2Claims(db);
-    // Initial boot-time backfill populates tool_owner_message_id on legacy tool
-    // tags. The module short-circuits when every session is already complete or
-    // skipped, so re-running it is cheap.
-    //
-    // The backfill is best-effort: missing OpenCode DB, transient
-    // SQLite errors, and per-session failures are logged but
-    // never fail-close the plugin. Lazy adoption covers rows the backfill could
-    // not reach.
-    if (!explicitDbPath) {
-        const runBackfill = () => {
-            try {
-                runToolOwnerBackfill(db);
-            } catch (error) {
-                log(
-                    `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
-                );
-            }
-        };
-        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfill);
-        else runBackfill();
-    }
     // Wire the persistence-backed tool-definition measurement store and
     // rehydrate the in-memory map from any prior writes. Doing this here
     // (after migrations) means migration v9 has already created the
@@ -601,7 +577,6 @@ function finishDatabaseOpen(db: Database, dbPath: string, explicitDbPath: boolea
     }
     return db;
 }
-
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
 
@@ -731,8 +706,16 @@ function refusePreOpenFamily(dbPath: string): DatabaseFormatRefusal | null {
             reasons: [`a reset marker ${dbPath}.mc-reset is pending for this database family`],
         };
     }
+    if (artifacts.includes("journal")) {
+        return {
+            family: existsSync(dbPath) ? "unsupported" : "orphan-artifacts",
+            reasons: [
+                `a pre-existing rollback journal ${dbPath}-journal must be refused before SQLite open-time recovery`,
+            ],
+        };
+    }
     if (existsSync(dbPath) && statSync(dbPath).size > 0) return null;
-    const orphans = artifacts.filter((artifact) => artifact !== "journal");
+    const orphans = artifacts;
     if (orphans.length === 0) return null;
     return {
         family: "orphan-artifacts",

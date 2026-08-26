@@ -10,7 +10,6 @@ import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
-import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
     DreamTaskName,
@@ -21,13 +20,10 @@ import {
     getLastHookInitFailure,
 } from "./features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
-import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
     getSchemaFenceRejection,
-    isDatabasePersisted,
-    openDatabase,
     setSqlitePragmaConfig,
 } from "./features/magic-context/storage-db";
 import { recordToolDefinition } from "./features/magic-context/tool-definition-tokens";
@@ -41,7 +37,7 @@ import { createLiveSessionState } from "./hooks/magic-context/live-session-state
 import { McHostModuleTransport } from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
-import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
+import { beginBootQuietPeriod } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
 import { createDreamTimerModuleClient } from "./plugin/dream-timer-module-client";
@@ -64,7 +60,6 @@ import { log } from "./shared/logger";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
 import { MagicContextRpcServer } from "./shared/rpc-server";
-import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 
 const server: Plugin = async (ctx) => {
@@ -286,55 +281,6 @@ const server: Plugin = async (ctx) => {
         promptSurfaceRuntime,
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
     });
-
-    // A conflict-disabled plugin must not touch storage at all
-    // (openDatabase() would CREATE context.db, breaking the disabled-path
-    // invariant that no state is written).
-    if (pluginConfig.enabled && magicContextRuntime.magicContext) {
-        scheduleAfterBootQuiet(() => {
-            void (async () => {
-                const db = openDatabase();
-                if (!db || !isDatabasePersisted(db)) return;
-                const ocDb = openOpenCodeDb();
-                if (!ocDb) return;
-                try {
-                    await runSessionProjectBackfill(db, (afterSessionId, limit) => {
-                        const rows = (
-                            afterSessionId === null
-                                ? ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
-                                       FROM session
-                                       ORDER BY id ASC
-                                       LIMIT ?`,
-                                      )
-                                      .all(limit)
-                                : ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
-                                       FROM session
-                                       WHERE id > ?
-                                       ORDER BY id ASC
-                                       LIMIT ?`,
-                                      )
-                                      .all(afterSessionId, limit)
-                        ) as Array<{
-                            id: string;
-                            directory: string;
-                        }>;
-                        return rows.map((session) => ({
-                            sessionId: session.id,
-                            directory: session.directory,
-                        }));
-                    });
-                } finally {
-                    closeQuietly(ocDb);
-                }
-            })().catch((err) => {
-                log(`[session-projects] background runner failed: ${err}`);
-            });
-        }, 0);
-    }
 
     // Resolve storage dir up front. Used by the RPC server below AND by
     // the auto-update checker (for cross-process dedup of npm hits when

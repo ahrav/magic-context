@@ -1,10 +1,9 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { injectM0M1, type M0M1State } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
@@ -13,9 +12,7 @@ const SESSION_ID = "ses_mural_inject";
 const PROJECT_ID = "git:mural-project";
 
 function makeDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     getOrCreateSessionMeta(db, SESSION_ID);
     return db;
 }

@@ -16,7 +16,6 @@ import {
 } from "../memory/storage-claim-operations";
 import { recordApprovalActionInCurrentTransaction } from "../memory/storage-claim-policy";
 import { ensureProject } from "../memory/storage-claims";
-import { initializeDatabase } from "../storage-db";
 import { createDirectTestDatabase } from "../test-database";
 import { readDreamerProjectClaims } from "./claim-manifest";
 import { acquireLease } from "./lease";
@@ -27,7 +26,6 @@ const tempDirs: string[] = [];
 
 function freshDb(): Database {
     const db = createDirectTestDatabase().db;
-    initializeDatabase(db);
     return db;
 }
 

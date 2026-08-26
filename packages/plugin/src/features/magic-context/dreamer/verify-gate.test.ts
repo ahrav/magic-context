@@ -16,7 +16,6 @@ import {
     recordProjectMemoryVerification,
 } from "../memory/storage-claim-operations";
 import { ensureProject } from "../memory/storage-claims";
-import { initializeDatabase } from "../storage-db";
 import { createDirectTestDatabase } from "../test-database";
 import { acquireLease } from "./lease";
 import {
@@ -31,7 +30,6 @@ const dirs: string[] = [];
 
 function freshDb(): Database {
     const db = createDirectTestDatabase().db;
-    initializeDatabase(db);
     return db;
 }
 

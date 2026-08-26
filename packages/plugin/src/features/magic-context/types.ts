@@ -89,7 +89,6 @@ export interface SessionMeta {
     cachedM0WorkspaceFingerprint: string | null;
     cachedM0ProjectUserProfileVersion: number | null;
     cachedM0MaxCompartmentSeq: number | null;
-    cachedM0MaxMemoryId: number | null;
     /**
      * Pi message stable-id scheme version (Pi-only; OpenCode ignores it).
      * NULL/0 = legacy index-based `pi-msg-*` ids; >=1 = real-SessionEntry-id
@@ -98,7 +97,6 @@ export interface SessionMeta {
      */
     piStableIdScheme: number | null;
     cachedM0MaxMutationId: number | null;
-    cachedM0MaxMemoryMutationId: number | null;
     cachedM0ProjectDocsHash: string | null;
     cachedM0MaterializedAt: number | null;
     cachedM0SessionFactsVersion: number | null;

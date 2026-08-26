@@ -129,11 +129,7 @@
                     "migration_pending",
                     "mirror_cursors",
                     "mirror_identity",
-                    "mirror_live_memory_rows",
-                    "mirror_live_staging",
                     "mirror_note_revisions",
-                    "mirror_pending_references",
-                    "mirror_resnapshot_state",
                     "mural_manifest",
                     "notes",
                     "notes_fts",
@@ -159,7 +155,6 @@
                     "recomp_facts",
                     "retrospective_processed_windows",
                     "schema_migrations",
-                    "schema_migrations_meta",
                     "session_facts",
                     "session_meta",
                     "session_projects",
@@ -170,7 +165,6 @@
                     "tags",
                     "task_schedule_state",
                     "tool_definition_measurements",
-                    "tool_owner_backfill_state",
                     "transform_decisions",
                     "user_memories",
                     "user_memory_candidates",
@@ -183,13 +177,13 @@
         ]
     },
     "goldens": {
-        "manifestDigest": "be9f5192a0c07ca1a3279392e01ce83ff7d964a6571900cbb2a80e875b97c29e",
+        "manifestDigest": "7006b7e53e06ae463b46963c125a7b6629238d19c90b37e6c81db133b1be7767",
         "marker": {
             "formatEpoch": 1,
             "databaseIncarnationId": "00112233445566778899aabbccddeeff",
-            "componentManifestDigest": "be9f5192a0c07ca1a3279392e01ce83ff7d964a6571900cbb2a80e875b97c29e",
+            "componentManifestDigest": "7006b7e53e06ae463b46963c125a7b6629238d19c90b37e6c81db133b1be7767",
             "createdAtMs": 1755900000000,
-            "markerDigest": "dc6e923be3883ac26a401d152d091512b1173c8339686c8d758e2b2c19a67424"
+            "markerDigest": "c64a00f228d0bf89626f64beaaef5135a7c225fcf8ea940bd99d5f953c618125"
         }
     }
 }

@@ -592,11 +592,6 @@ export async function reconcileAuthorityProject(args: {
                         )
                         .run(domain, args.projectPath);
                     args.db
-                        .prepare(
-                            "DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ?",
-                        )
-                        .run(domain, args.projectPath);
-                    args.db
                         .prepare("DELETE FROM mirror_note_revisions WHERE module_project = ?")
                         .run(args.projectPath);
                     args.db

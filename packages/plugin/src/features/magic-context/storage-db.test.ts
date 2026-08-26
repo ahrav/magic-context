@@ -256,6 +256,23 @@ describe("storage-db direct format", () => {
             expect(readFileSync(`${dbPath}-wal`)).toEqual(before);
         });
 
+        it("#when a nonempty main has a pre-existing rollback journal #then refuses before SQLite recovery", () => {
+            const dir = makeTempDir("storage-db-hot-journal-refusal-");
+            const dbPath = join(dir, "context.db");
+            const db = new Database(dbPath);
+            db.exec("CREATE TABLE legacy_state (id INTEGER PRIMARY KEY, value TEXT)");
+            db.close();
+            const journalPath = `${dbPath}-journal`;
+            writeFileSync(journalPath, "pre-existing rollback journal");
+            const beforeMain = fileDigest(dbPath);
+            const beforeJournal = fileDigest(journalPath);
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getFormatRefusal()?.family).toBe("unsupported");
+            expect(fileDigest(dbPath)).toBe(beforeMain);
+            expect(fileDigest(journalPath)).toBe(beforeJournal);
+        });
+
         it("#when the database is a legacy migration-lane family #then refuses it unchanged", () => {
             const dir = makeTempDir("storage-db-legacy-refusal-");
             const dbPath = join(dir, "context.db");
@@ -275,6 +292,33 @@ describe("storage-db direct format", () => {
             expect(getSchemaFenceRejection()).toBeNull();
             expect(fileDigest(dbPath)).toBe(before);
             expect(existsSync(`${dbPath}-wal`)).toBe(false);
+        });
+
+        it("#when an unsupported family has committed WAL state #then refuses without checkpointing or truncating it", () => {
+            const dir = makeTempDir("storage-db-legacy-wal-refusal-");
+            const dbPath = join(dir, "context.db");
+            const legacy = new Database(dbPath);
+            legacy.exec(`
+                PRAGMA journal_mode=WAL;
+                PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL);
+                CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT NOT NULL);
+                INSERT INTO schema_migrations (version, description, applied_at) VALUES (86, 'legacy head', 0);
+                INSERT INTO memories (content) VALUES ('committed only in the WAL');
+            `);
+            const walPath = `${dbPath}-wal`;
+            expect(existsSync(walPath)).toBe(true);
+            const beforeMain = fileDigest(dbPath);
+            const beforeWal = fileDigest(walPath);
+
+            try {
+                expect(openDatabase(dbPath)).toBeNull();
+                expect(getFormatRefusal()?.family).toBe("unsupported");
+                expect(fileDigest(dbPath)).toBe(beforeMain);
+                expect(fileDigest(walPath)).toBe(beforeWal);
+            } finally {
+                legacy.close();
+            }
         });
 
         it("#when the database carries a newer format fence #then reports a schema-fence rejection", () => {

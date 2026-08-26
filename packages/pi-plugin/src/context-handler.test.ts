@@ -3,12 +3,6 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { insertMemory } from "@magic-context/core/features/magic-context/memory";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
-import {
-	runInMemoryClaimsWriteTransaction,
-	updateMemoryVerificationWithClaimsInCurrentTransaction,
-} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	__resetMessageIndexAsyncForTests,
 	isSessionReconciled,
@@ -52,6 +46,7 @@ import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/
 import { setBootQuietPeriodForTests } from "@magic-context/core/plugin/boot-quiet";
 import { clearModelsDevCache } from "@magic-context/core/shared/models-dev-cache";
 import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface";
+import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
@@ -464,7 +459,7 @@ describe("Pi fallback tag adoption", () => {
 		const dir = mkdtempSync(join(tmpdir(), "mc-pi-fallback-race-"));
 		const dbPath = join(dir, "context.db");
 		const db = createTestDb(dbPath);
-		const siblingDb = createTestDb(dbPath);
+		const siblingDb = new Database(dbPath);
 		try {
 			db.exec("PRAGMA journal_mode = WAL");
 			siblingDb.exec("PRAGMA journal_mode = WAL");
@@ -1821,36 +1816,17 @@ describe("registerPiContextHandler", () => {
 
 	it("appends an auto-search hint to the latest user message when the threshold is met", async () => {
 		const db = createTestDb();
-		// Fresh hints pass the same eligibility gate as replays, so the mocked
-		// result needs a real verified memory id and the loaded-bytes digest.
 		const content = "Relevant Pi search wiring";
-		const seeded = insertMemory(db, {
-			projectPath: "git:test",
-			category: "WORKFLOW_RULES",
-			content,
-		});
-		runInMemoryClaimsWriteTransaction(db, () =>
-			updateMemoryVerificationWithClaimsInCurrentTransaction(
-				db,
-				{
-					producer: "context-handler-test",
-					operationKey: `verify:${seeded.id}`,
-					requestDigest: sha256Utf8Hex(`verify:${seeded.id}`),
-				},
-				{ memoryId: seeded.id, verificationStatus: "verified", nowMs: 2_000 },
-			),
-		);
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () =>
 				[
 					{
-						source: "memory",
+						source: "message",
 						content,
 						score: 0.9,
-						memoryId: seeded.id,
-						category: "WORKFLOW_RULES",
-						matchType: "fts",
-						contentDigest: sha256Utf8Hex(content),
+						messageOrdinal: 1,
+						messageId: "m-search-result",
+						role: "assistant",
 					},
 				] as never,
 		);
@@ -3934,7 +3910,7 @@ describe("registerPiContextHandler", () => {
 				process.cwd(),
 				["entry-1", "entry-2", "entry-3"],
 				messages as never,
-			) as never as {
+			) as ReturnType<typeof fakeContext> & {
 				sessionManager: {
 					appendCompaction?: (...args: unknown[]) => string | undefined;
 				};

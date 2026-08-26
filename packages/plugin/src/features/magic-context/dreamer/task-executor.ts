@@ -18,7 +18,6 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getCompartmentEvents } from "../compartment-events";
-import { censusProjectMemoryClaims } from "../memory/storage-claim-current-state";
 import type { CanonicalJsonValue } from "../memory/claim-operation-contract";
 import {
     type AutonomousManifestIdentity,
@@ -26,6 +25,7 @@ import {
     runAutonomousManifestInCurrentTransaction,
 } from "../memory/storage-claim-autonomous";
 import type { ProjectMemoryClaimSnapshot } from "../memory/storage-claim-current-state";
+import { censusProjectMemoryClaims } from "../memory/storage-claim-current-state";
 import {
     stageCreateProjectMemoryClaimInCurrentTransaction,
     stageMergeProjectMemoryClaimsInCurrentTransaction,

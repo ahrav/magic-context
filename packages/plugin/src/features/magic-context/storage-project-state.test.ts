@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { initializeDatabase } from "./storage-db";
 import {
     bumpProjectMemoryEpoch,
     bumpProjectUserProfileVersion,
@@ -11,12 +10,12 @@ import {
     getProjectState,
     setProjectState,
 } from "./storage-project-state";
+import { createDirectTestDatabase } from "./test-database";
 
 let db: Database | null = null;
 
 function makeDb(): Database {
-    db = new Database(":memory:");
-    initializeDatabase(db);
+    db = createDirectTestDatabase().db;
     return db;
 }
 

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { initializeDatabase } from "../storage-db";
 import { clearSession, updateSessionMeta } from "../storage-meta-session";
 import { seedProjectMemoryClaim } from "../test-claim-database";
 import { createDirectTestDatabase } from "../test-database";
@@ -10,7 +9,6 @@ import { ensureProject } from "./storage-claims";
 
 function directDb() {
     const db = createDirectTestDatabase().db;
-    initializeDatabase(db);
     return db;
 }
 

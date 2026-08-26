@@ -36,9 +36,7 @@ const SESSION_META_FALLBACK_SELECTS: Partial<
     cached_m0_project_memory_epoch: "NULL AS cached_m0_project_memory_epoch",
     cached_m0_project_user_profile_version: "NULL AS cached_m0_project_user_profile_version",
     cached_m0_max_compartment_seq: "NULL AS cached_m0_max_compartment_seq",
-    cached_m0_max_memory_id: "NULL AS cached_m0_max_memory_id",
     cached_m0_max_mutation_id: "NULL AS cached_m0_max_mutation_id",
-    cached_m0_max_memory_mutation_id: "NULL AS cached_m0_max_memory_mutation_id",
     cached_m0_project_docs_hash: "NULL AS cached_m0_project_docs_hash",
     cached_m0_materialized_at: "NULL AS cached_m0_materialized_at",
     cached_m0_session_facts_version: "NULL AS cached_m0_session_facts_version",
@@ -228,19 +226,12 @@ export function retryPendingSessionCleanups(
     return { attempted: rows.length, cleared, failedSessionIds };
 }
 
-function sessionCleanupTableExists(db: Database, tableName: string): boolean {
-    return Boolean(
-        db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName),
-    );
-}
-
 export function clearSession(db: Database, sessionId: string): void {
     // Every session-scoped table must be cleared here; the structural storage-db
     // test discovers tables with session_id and seeds each one to enforce this list.
     db.transaction(() => {
         db.prepare("DELETE FROM pending_ops WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM source_contents WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM tool_owner_backfill_state WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM tags WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM session_meta WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM session_projects WHERE session_id = ?").run(sessionId);
@@ -249,16 +240,10 @@ export function clearSession(db: Database, sessionId: string): void {
         clearCompressionDepth(db, sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM compartment_state_lease WHERE session_id = ?").run(sessionId);
-        if (sessionCleanupTableExists(db, "notes")) {
-            db.prepare("DELETE FROM notes WHERE session_id = ? AND type = 'session'").run(
-                sessionId,
-            );
-        }
+        db.prepare("DELETE FROM notes WHERE session_id = ? AND type = 'session'").run(sessionId);
         db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
-        if (sessionCleanupTableExists(db, "user_memory_candidates")) {
-            db.prepare("DELETE FROM user_memory_candidates WHERE session_id = ?").run(sessionId);
-        }
+        db.prepare("DELETE FROM user_memory_candidates WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM primer_candidates WHERE session_id = ?").run(sessionId);
         // v2: m[0]/m[1] delta log + historian-extracted events are session-scoped
         // and must be cleared on session deletion (both have session_id). Without
@@ -267,9 +252,7 @@ export function clearSession(db: Database, sessionId: string): void {
         db.prepare("DELETE FROM compartment_events WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM subagent_invocations WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM historian_runs WHERE session_id = ?").run(sessionId);
-        if (sessionCleanupTableExists(db, "plugin_messages")) {
-            db.prepare("DELETE FROM plugin_messages WHERE session_id = ?").run(sessionId);
-        }
+        db.prepare("DELETE FROM plugin_messages WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM transform_decisions WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM synapse_batch_ledger WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM embedding_measurement_corpus WHERE session_id = ?").run(sessionId);

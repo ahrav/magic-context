@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { getAuthorityManagedMarker } from "@magic-context/core/features/magic-context/context-authority";
 import { V2_MEMORY_CATEGORIES } from "@magic-context/core/features/magic-context/memory";
 import { getProjectEmbeddingSnapshot } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -167,6 +168,14 @@ export function createCtxMemoryTool(
 				if (!toolCallId && !["get", "list"].includes(action)) {
 					return err(
 						"Error: ctx_memory mutation requires a stable tool-call identity.",
+					);
+				}
+				if (
+					!["get", "list"].includes(action) &&
+					getAuthorityManagedMarker(deps.db, projectIdentity)
+				) {
+					return err(
+						"Error: memory authority is module-owned or transitioning; retry from an OpenCode host with staged-intent support.",
 					);
 				}
 				const text = executeCtxMemoryClaimAction({
