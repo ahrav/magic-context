@@ -177,11 +177,19 @@ function validateRingGrant(hex: string, expectedLane: number, path: string): Rin
 export interface ShmGrantOptions {
     expectedProfile: string;
     /**
-     * Highest `candidate_id` already attached through this provider; a
-     * descriptor at or below it is a replayed or stale candidate. `0`
-     * accepts any valid id (host ids start at 1).
+     * Replay high-water mark from the last accepted grant: the issuing
+     * daemon incarnation's `pid` and the highest `candidate_id` attached
+     * from it. Candidate ids are monotonic within one host process
+     * (`shm_provider::NEXT_CANDIDATE_ID` is process-local and restarts at
+     * 1), so a grant from the same pid at or below the mark is a replayed
+     * or stale candidate, while a different pid is a fresh incarnation
+     * whose sequence starts over. A verbatim cross-incarnation replay
+     * carries the old pid and stays fenced here; a forged descriptor with
+     * a fresh pid is stopped downstream at attachment (KTD9: ring
+     * incarnation fencing plus fd validity), which this sequence check
+     * never replaced.
      */
-    previousCandidateId?: number;
+    previousCandidate?: { pid: number; candidateId: number };
 }
 
 /**
@@ -231,7 +239,11 @@ export function decodeShmGrant(value: unknown, options: ShmGrantOptions): ShmGra
         "descriptor.candidate_id",
         integerParser(1, Number.MAX_SAFE_INTEGER),
     );
-    if (candidateId <= (options.previousCandidateId ?? 0)) {
+    if (
+        options.previousCandidate !== undefined &&
+        pid === options.previousCandidate.pid &&
+        candidateId <= options.previousCandidate.candidateId
+    ) {
         throw new ShmGrantError("stale_candidate", "descriptor.candidate_id");
     }
     const hostToPeerFd = readOnce(source, "host_to_peer_fd", "descriptor.host_to_peer_fd", parseFd);

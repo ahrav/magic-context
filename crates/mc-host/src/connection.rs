@@ -970,10 +970,16 @@ async fn handle_negotiate<H: McHostHandler>(
             None => {}
         }
     }
-    let reason = if capability_mismatch {
-        Some(FallbackReason::CapabilityVersionMismatch)
-    } else if dynamically_unavailable {
+    // `unavailable` outranks `capability_version_mismatch` across the
+    // evaluated offers: it is the only reason that authorizes a client
+    // re-upgrade probe (§7.7.3), and a dynamically unavailable eligible
+    // offer is transient — a later probe can succeed. Reporting a static
+    // mismatch from a lower-preference sibling would permanently suppress
+    // recovery of the unavailable transport.
+    let reason = if dynamically_unavailable {
         Some(FallbackReason::Unavailable)
+    } else if capability_mismatch {
+        Some(FallbackReason::CapabilityVersionMismatch)
     } else {
         None
     };

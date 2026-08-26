@@ -232,6 +232,18 @@ describe("shm hardening matrix validator", () => {
         );
     });
 
+    it("rejects a retained active platform omitted from active_platforms", () => {
+        const tuples = [tuple(), tuple({ os: "macos" })];
+        const result = validateHardeningMatrix(
+            manifestWith(tuples, { active_platforms: ["linux"] }),
+            fullInventory(tuples),
+        );
+        expect(result.outcome).toBe("invalid");
+        expect(result.errors.join(" ")).toMatch(
+            /retained active platform macos is missing from active_platforms/,
+        );
+    });
+
     it("rejects malformed geometry, host limits, os, runtime, and expectation", () => {
         const entry = tuple({
             os: "windows",

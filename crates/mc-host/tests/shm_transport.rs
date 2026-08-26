@@ -641,6 +641,54 @@ async fn preflight_matrix_keeps_static_and_dynamic_states_distinct_and_side_effe
     held.release();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_outranks_capability_mismatch_across_offers() {
+    // A dynamically unavailable eligible offer alongside a version-
+    // mismatched sibling must fall back with exact `unavailable` in either
+    // preference order: it is the only reason that authorizes a client
+    // re-upgrade probe (§7.7.3), and only the unavailable offer is
+    // transient — a static mismatch reported instead would permanently
+    // suppress recovery of the unavailable transport.
+    for unavailable_first in [true, false] {
+        let provider = MatrixProvider::install(MatrixMode::Uncertain, 1);
+        let held = provider
+            .admission
+            .admit(&provider.profile, None)
+            .expect("held admission");
+        let eligible = serde_json::json!({
+            "transport": MATRIX_TRANSPORT,
+            "capability_version": 1,
+            "parameters": matrix_parameters()
+        });
+        let mismatched = serde_json::json!({
+            "transport": MATRIX_TRANSPORT,
+            "capability_version": 99,
+            "parameters": matrix_parameters()
+        });
+        let mut offer_list = if unavailable_first {
+            vec![eligible, mismatched]
+        } else {
+            vec![mismatched, eligible]
+        };
+        offer_list.push(serde_json::json!({"transport": "tcp", "capability_version": 1}));
+        let body = serde_json::json!({
+            "op": "transport.negotiate",
+            "negotiation_version": 1,
+            "offers": offer_list
+        });
+        let registry = TransportProviders::with_injected(vec![
+            Arc::clone(&provider) as Arc<dyn InjectedProvider>
+        ]);
+        let host = TestHost::start_with(move |config| config.transport_providers = registry).await;
+        let mut client = host.client().await;
+        let response = control_response(&mut client, &body).await;
+        host.shutdown_gracefully().await;
+        assert_eq!(response.json()["selected"]["transport"], "tcp");
+        assert_eq!(response.json()["reason"], "unavailable");
+        held.release();
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn commit_candidate(host: &TestHost) -> TestShmPeer {
     let mut bootstrap = host.client().await;

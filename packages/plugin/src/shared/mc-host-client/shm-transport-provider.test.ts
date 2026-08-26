@@ -11,10 +11,10 @@ import { expectGrantCode as expectCode, grantHex } from "./test-support/shm-gran
 import type { CandidateChannelArgs } from "./transport-provider";
 import { sanitizedCandidateFactory } from "./transport-provider";
 
-function validGrant(candidateId = 1): Record<string, unknown> {
+function validGrant(candidateId = 1, pid = 1234): Record<string, unknown> {
     return {
         profile: QUALIFIED_TEST_PROFILE,
-        pid: 1234,
+        pid,
         candidate_id: candidateId,
         host_to_peer_fd: 10,
         host_to_peer_grant: grantHex({ lane: 0, incarnation: 0xab }),
@@ -100,18 +100,28 @@ describe("grant geometry and duplex-pair binding", () => {
         expectCode(() => decodeShmGrant(sameIncarnation, OPTIONS), "aliased_lanes");
     });
 
-    test("a replayed or stale candidate is rejected", () => {
+    test("a replayed or stale candidate is rejected within one daemon incarnation", () => {
+        const mark = { pid: 1234, candidateId: 5 };
         expect(
-            decodeShmGrant(validGrant(5), { ...OPTIONS, previousCandidateId: 4 }).candidateId,
+            decodeShmGrant(validGrant(5), {
+                ...OPTIONS,
+                previousCandidate: { pid: 1234, candidateId: 4 },
+            }).candidateId,
         ).toBe(5);
         expectCode(
-            () => decodeShmGrant(validGrant(5), { ...OPTIONS, previousCandidateId: 5 }),
+            () => decodeShmGrant(validGrant(5), { ...OPTIONS, previousCandidate: mark }),
             "stale_candidate",
         );
         expectCode(
-            () => decodeShmGrant(validGrant(4), { ...OPTIONS, previousCandidateId: 5 }),
+            () => decodeShmGrant(validGrant(4), { ...OPTIONS, previousCandidate: mark }),
             "stale_candidate",
         );
+        // A fresh daemon incarnation (different pid) restarts the host's
+        // process-local candidate sequence: id 1 is valid, not a replay.
+        expect(
+            decodeShmGrant(validGrant(1, 4321), { ...OPTIONS, previousCandidate: mark })
+                .candidateId,
+        ).toBe(1);
     });
 });
 
@@ -214,6 +224,18 @@ describe("provider grant handling before any native effect", () => {
         provider.connect(validGrant(8), channelArgs());
         // Construction records no attachment: fd access starts in start().
         expect(activeNativeChannels()).toBe(channels);
+    });
+
+    test("a daemon restart resets the replay watermark with the new incarnation", () => {
+        const provider = createExplicitShmTestProvider(QUALIFIED_TEST_PROFILE);
+        if (!provider) return;
+        provider.connect(validGrant(7, 1000), channelArgs());
+        // The replacement daemon's process-local sequence restarts at 1;
+        // its first grant must attach instead of failing stale_candidate.
+        provider.connect(validGrant(1, 2000), channelArgs());
+        // Monotonicity now tracks the NEW incarnation.
+        expectCode(() => provider.connect(validGrant(1, 2000), channelArgs()), "stale_candidate");
+        provider.connect(validGrant(2, 2000), channelArgs());
     });
 
     test("sanitized candidate construction keeps sentinel grant bytes out of errors", () => {

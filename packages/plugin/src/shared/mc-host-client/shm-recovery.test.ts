@@ -14,7 +14,6 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { SubcClient, type SubcClientOptions, type SubcDiagnosticsEvent } from "./client";
-import type { BindIdentity, RouteTarget } from "./types";
 import {
     encodePeerFrame,
     FakePeer,
@@ -25,8 +24,8 @@ import {
 import {
     grantSelectionBody,
     RECOVERY_GRANT_TOKEN,
-    recoveryProvider,
     type RecoveryScenario,
+    recoveryProvider,
     runRecoveryScenario,
     scriptNegotiations,
     serveTcpRoutes,
@@ -40,6 +39,7 @@ import {
     waitUntil,
     writeConnectionFile,
 } from "./test-support/test-util";
+import type { BindIdentity, RouteTarget } from "./types";
 
 const IDENTITY: BindIdentity = {
     project_root: "/workspace/project",

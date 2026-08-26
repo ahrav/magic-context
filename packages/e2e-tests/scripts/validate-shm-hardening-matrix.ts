@@ -255,6 +255,26 @@ export function validateHardeningMatrix(
             );
         }
     }
+    // Reverse coverage: every platform with an active retained provider
+    // must be claimed, so retained coverage cannot be silently omitted
+    // from the active_platforms contract.
+    const retainedActivePlatforms = new Set(
+        section.retained_tuples
+            .filter(
+                (tuple): tuple is Record<string, unknown> =>
+                    isRecord(tuple) &&
+                    tuple.expectation === "active" &&
+                    typeof tuple.os === "string",
+            )
+            .map((tuple) => tuple.os as string),
+    );
+    for (const platform of retainedActivePlatforms) {
+        if (!activePlatforms.includes(platform)) {
+            errors.push(
+                `retained active platform ${platform} is missing from active_platforms`,
+            );
+        }
+    }
 
     if (errors.length > 0)
         return { outcome: "invalid", errors: errors.slice(0, MAX_ERRORS) };

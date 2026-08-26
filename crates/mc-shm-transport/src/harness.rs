@@ -92,10 +92,14 @@ pub fn frame_descriptor(bytes: &[u8]) -> bool {
         false
     };
 
-    // Reject path: a fixed foreign identity never matches decoded bytes
-    // whose sequence differs.
-    let foreign = ReleaseIdentity::new(Incarnation::from_bytes([0xa5; 16]), u32::MAX, u64::MAX);
-    let _ = descriptor.validate(foreign, MAX_FRAME_BYTES);
+    // Reject path: an identity derived from the decoded one with a flipped
+    // lane is guaranteed distinct, so validation must fail — a fixed
+    // sentinel could coincide with decoded input and silently pass.
+    let foreign = ReleaseIdentity::new(Incarnation::from_bytes(incarnation), lane ^ 1, sequence);
+    assert!(
+        descriptor.validate(foreign, MAX_FRAME_BYTES).is_err(),
+        "foreign identity must be rejected"
+    );
     accepted
 }
 
@@ -138,8 +142,18 @@ pub fn provider_sample(bytes: &[u8]) -> bool {
     } else {
         false
     };
-    // Reject path with one fixed foreign identity.
-    let foreign = ReleaseIdentity::new(Incarnation::from_bytes([0x5a; 16]), u32::MAX, u64::MAX);
-    let _ = prefix.validate(bytes.len(), foreign);
+    // Reject path: flipping the lane of the snapshotted identity yields a
+    // guaranteed-distinct identity, so validation must fail — a fixed
+    // sentinel could coincide with snapshotted input and silently pass.
+    let identity = prefix.identity();
+    let foreign = ReleaseIdentity::new(
+        identity.incarnation(),
+        identity.lane() ^ 1,
+        identity.sequence(),
+    );
+    assert!(
+        prefix.validate(bytes.len(), foreign).is_err(),
+        "foreign identity must be rejected"
+    );
     accepted
 }

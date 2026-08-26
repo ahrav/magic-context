@@ -71,7 +71,7 @@ fn payload(
     bytes
 }
 
-/// Seeded-defect detector for U1: a receive path that hands the full sample
+/// Seeded-defect detector: a receive path that hands the full sample
 /// allocation to frame decoding instead of the validated declared body
 /// range must fail this test.
 #[test]

@@ -19,7 +19,11 @@ export function createExplicitShmTestProvider(
     profile: string,
 ): ClientTransportProvider | undefined {
     if (profile !== QUALIFIED_TEST_PROFILE || !probeCapabilities().available) return undefined;
-    let lastCandidateId = 0;
+    // Replay watermark scoped to one daemon incarnation: the host's
+    // candidate sequence is process-local, so a restarted daemon (new pid)
+    // legitimately starts over at 1 and must not be rejected against the
+    // previous incarnation's high-water mark.
+    let previousCandidate: { pid: number; candidateId: number } | undefined;
     return {
         transport: "shm",
         capabilityVersion: 1,
@@ -28,9 +32,9 @@ export function createExplicitShmTestProvider(
             // Attachment I/O runs in start(), after this decode. commentlint: allow(JUDGE)
             const decoded = decodeShmGrant(grant, {
                 expectedProfile: QUALIFIED_TEST_PROFILE,
-                previousCandidateId: lastCandidateId,
+                ...(previousCandidate !== undefined ? { previousCandidate } : {}),
             });
-            lastCandidateId = decoded.candidateId;
+            previousCandidate = { pid: decoded.pid, candidateId: decoded.candidateId };
             const descriptor: NativeDescriptor = {
                 profile: decoded.profile,
                 pid: decoded.pid,

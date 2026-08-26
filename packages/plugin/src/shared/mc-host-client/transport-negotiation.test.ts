@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { decodeShmGrant, ShmGrantError, type ShmGrantErrorCode } from "./shm-grant";
+import { expectGrantCode, grantHex as sharedGrantHex } from "./test-support/shm-grant-fixtures";
 import {
     ACTIVATION_CORRELATION,
     ACTIVATION_TOKEN_LEN,
@@ -29,8 +31,6 @@ import {
     TRANSPORT_TCP,
     type TransportOffer,
 } from "./transport-negotiation";
-import { decodeShmGrant, ShmGrantError } from "./shm-grant";
-import { expectGrantCode, grantHex as sharedGrantHex } from "./test-support/shm-grant-fixtures";
 
 const VECTOR_TOKEN = "00112233445566778899aabbccddeeff";
 
@@ -750,7 +750,7 @@ describe("shared-memory grant descriptor schema (layer b)", () => {
             () =>
                 decodeShmGrant(validGrantDescriptor(5), {
                     ...GRANT_OPTIONS,
-                    previousCandidateId: 5,
+                    previousCandidate: { pid: 1234, candidateId: 5 },
                 }),
             "stale_candidate",
         );

@@ -62,6 +62,12 @@ jobs:
         env:
           FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
         run: |
+          case "$FUZZ_SECONDS" in
+            ''|*[!0-9]*)
+              echo "fuzz_seconds must be an unsigned integer, got: $FUZZ_SECONDS" >&2
+              exit 1
+              ;;
+          esac
           for target in frame_descriptor provider_grant provider_sample; do
             cargo +nightly fuzz run "$target" -- \
               -max_total_time="$FUZZ_SECONDS"

@@ -221,6 +221,25 @@ if (occurrences !== 1) {
         `${selected.name}: expected one mutation target, found ${occurrences}`,
     );
 }
+// Restoration must survive termination while the mutation is applied:
+// `finally` never runs when a SIGINT/SIGTERM default action kills the
+// process, which would leave the mutated source in the working copy.
+// The handlers restore byte-exactly (idempotent) and re-raise the exit.
+const restoreSource = (): void => {
+    try {
+        writeFileSync(selected.source, before);
+    } catch {
+        // The exit path must not throw; the byte-exact check below (or
+        // the operator) catches a failed restoration on the normal path.
+    }
+};
+const onTermination = (signal: NodeJS.Signals): void => {
+    restoreSource();
+    process.exit(signal === "SIGINT" ? 130 : 143);
+};
+process.on("SIGINT", onTermination);
+process.on("SIGTERM", onTermination);
+process.on("exit", restoreSource);
 writeFileSync(
     selected.source,
     before.replace(selected.oldText, selected.replacement),
@@ -230,6 +249,9 @@ try {
     observedFailure = runDetector(selected.detector);
 } finally {
     writeFileSync(selected.source, before);
+    process.off("SIGINT", onTermination);
+    process.off("SIGTERM", onTermination);
+    process.off("exit", restoreSource);
 }
 if (readFileSync(selected.source, "utf8") !== before) {
     throw new Error(`${selected.name}: byte-exact restoration failed`);
