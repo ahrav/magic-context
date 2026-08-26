@@ -1008,7 +1008,9 @@ fn a_global_read_tracks_projects_absent_from_its_candidates() {
     .unwrap();
 
     let listed = claim_adapter::read_claim_memories(&conn, None, None, None, None, 50, 0).unwrap();
-    let vector = listed.snapshot_vector.expect("a global read carries a vector");
+    let vector = listed
+        .snapshot_vector
+        .expect("a global read carries a vector");
     assert!(
         vector.project_generations.contains_key("7"),
         "a global read must track every generation row, not only candidate projects: {:?}",
