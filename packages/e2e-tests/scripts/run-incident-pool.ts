@@ -43,6 +43,7 @@ import {
     INCIDENTS_DIR,
     loadHistorySnapshot,
 } from "./validate-incident-history";
+import { detectRustPrerequisites } from "./check-rust-prerequisites";
 
 const REPO_ROOT = resolve(E2E_ROOT, "../..");
 
@@ -239,6 +240,21 @@ async function main(): Promise<number> {
             : ["rust"]
         : [args.harness ?? "opencode"];
     const workspaceParentDir = mkdtempSync(join(tmpdir(), "incident-pool-"));
+    // Resolve the direct-host fixture in the PARENT, which still has the real
+    // Cargo state, and publish the path so every case child inherits it through
+    // the environment allowlist. A child that had to fall back to a Cargo build
+    // would run it against the empty per-case `CARGO_HOME` the workspace
+    // relocation creates, and fail offline with no registry cache to reuse.
+    if (harnesses.includes("rust")) {
+        const prereqs = detectRustPrerequisites({ allowBuild: true });
+        if (!prereqs.ok) {
+            console.error(
+                `[incident-pool] rust prerequisites unresolved: ${prereqs.missing.join("; ")}`,
+            );
+        } else if (prereqs.fixtureBin) {
+            process.env.MC_E2E_DIRECT_HOST_FIXTURE_BIN = prereqs.fixtureBin;
+        }
+    }
     try {
         const reports: IncidentPoolReport[] = [];
         for (const harness of harnesses) {
