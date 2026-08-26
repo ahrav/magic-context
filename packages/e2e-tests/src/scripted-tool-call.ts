@@ -81,6 +81,15 @@ let scriptedCallCounter = 0;
  * Drive one real tool loop and capture its provider-visible tool result.
  * Missing publication or result is an infrastructure failure, not a behavioral
  * verdict.
+ *
+ * Starts from `mock.reset()`, which clears the captured request history as well
+ * as the queue, default response, and matchers. A turn driven before this call
+ * is therefore not observable after it: the caller keeps no wire baseline
+ * across the boundary, and must reinstall its own matchers and default for the
+ * next step. Chained calls see only the most recent turn's requests, which is
+ * what makes `findToolResultText` a bounded scan and the `published === null`
+ * diagnostic name only this turn's published tools. Observe a turn before
+ * scripting the next one, or capture the observation first.
  */
 export async function runScriptedToolCall(
     harness: TestHarness,

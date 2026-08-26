@@ -110,8 +110,10 @@ scenario to retrieval, formation, or representation. The helpers operate on a
   entries and is rendered in caller order as `#id` tokens. Larger sets are
   rejected, not chunked. A string is used as the query unchanged. The helper
   propagates tool-loop infrastructure failures, including an unpublished
-  `ctx_search`, and its shared driver resets the mock and removes installed
-  matchers, so reinstall extra matchers before the next step.
+  `ctx_search`, and its shared driver resets the mock, which removes installed
+  matchers and clears the captured request history, so reinstall extra matchers
+  before the next step and read any earlier turn's wire observation before
+  scripting this one.
 - `goldEvidencePrompt(blocks)` renders `{ label, content }` values as
   `<gold-evidence label="...">` blocks separated by blank lines. It returns the
   prompt string for `harness.sendPrompt`; labels and content are passed through

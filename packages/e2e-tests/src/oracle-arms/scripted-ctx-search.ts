@@ -33,8 +33,10 @@ function idQuery(ids: readonly GoldMemoryId[]): string {
  *
  * Candidate rows are searchable. Rows already injected into this session are
  * omitted by the plugin's `visibleMemoryIds` filter. The shared tool driver
- * calls `mock.reset()`, which wipes every installed matcher; callers must
- * reinstall any additional matchers for each subsequent step that needs them.
+ * starts from `mock.reset()`, which wipes every installed matcher and the
+ * captured request history; callers must reinstall additional matchers for each
+ * subsequent step, and must read any wire observation they need from an earlier
+ * turn before scripting this one.
  */
 export async function scriptedCtxSearchTurn(
     harness: TestHarness,
