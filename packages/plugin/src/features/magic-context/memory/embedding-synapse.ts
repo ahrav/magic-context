@@ -654,7 +654,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         return provider.metadata;
     }
 
-    async initialize(signal?: AbortSignal): Promise<boolean> {
+    async initialize(signal?: AbortSignal, demandDeadlineMs?: number): Promise<boolean> {
         if (this.initialized) return true;
         if (this.permanentFailure) return false;
         if (this.connectionOrigin === "managed-default") {
@@ -671,7 +671,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     demand = this.demandStart({
                         origin: this.connectionOrigin,
                         capability: "synapse",
-                        deadlineMs: this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS,
+                        deadlineMs:
+                            demandDeadlineMs ??
+                            this.options.queryTimeoutMs ??
+                            SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS,
                     });
                     this.managedDemand = demand;
                     const evict = (): void => {
@@ -789,6 +792,25 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         }
     }
 
+    private async rebindAfterModuleRestart(
+        deadlineAt: number,
+        signal?: AbortSignal,
+    ): Promise<void> {
+        this.initialized = false;
+        this.compatibleDaemonId = null;
+        this.managedDemand = null;
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= 0) {
+            throw new SynapseEmbeddingError("timeout", "Synapse page deadline exhausted");
+        }
+        if (!(await this.initialize(signal, remainingMs))) {
+            throw new SynapseEmbeddingError(
+                "transport",
+                "Synapse daemon compatibility rebind failed",
+            );
+        }
+    }
+
     async embed(text: string, signal?: AbortSignal): Promise<Float32Array | null> {
         if (!(await this.initialize(signal)) || signal?.aborted || !this.metadata) return null;
         try {
@@ -854,23 +876,34 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 const requestKey = this.requestKey(page);
                 let body: unknown = {};
                 let restarted = false;
+                const deadlineAt = Date.now() + this.pageTimeoutMs;
                 for (;;) {
                     try {
+                        const remainingMs = deadlineAt - Date.now();
+                        if (remainingMs <= 0) {
+                            throw new SynapseEmbeddingError(
+                                "timeout",
+                                "Synapse page deadline exhausted",
+                            );
+                        }
                         body = await this.callWithRetry(
                             "embed.batch",
                             this.batchRequest(page, requestKey),
-                            this.pageTimeoutMs,
+                            remainingMs,
                             true,
                             signal,
                         );
                         const first = responseBody(body);
                         const jobId = typeof first.job_id === "string" ? first.job_id : null;
-                        if (jobId) body = await this.pollBatch(jobId, requestKey, signal);
+                        if (jobId) {
+                            body = await this.pollBatch(jobId, requestKey, deadlineAt, signal);
+                        }
                         break;
                     } catch (error) {
                         const classified = classifyError(error);
                         if (classified.code !== "module_restarted" || restarted) throw classified;
                         restarted = true;
+                        await this.rebindAfterModuleRestart(deadlineAt, signal);
                     }
                 }
                 const batchEnvelope = responseBody(body);
@@ -1123,7 +1156,8 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     // daemon resubmits it without bound. `page_terminal` is the
                     // page-scoped code for a spent budget: it belongs to this
                     // row alone and leaves the lane's other pages runnable.
-                    if (row.restartCount !== 0 || (row.deadlineAt ?? 0) <= Date.now()) {
+                    const readyDeadlineAt = row.deadlineAt ?? 0;
+                    if (row.restartCount !== 0 || readyDeadlineAt <= Date.now()) {
                         const terminal = new SynapseEmbeddingError(
                             "page_terminal",
                             "restart budget or page deadline exhausted",
@@ -1131,6 +1165,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         terminal.ledgerRowId = row.rowId;
                         throw terminal;
                     }
+                    await this.rebindAfterModuleRestart(readyDeadlineAt, signal);
                 }
             }
             markSynapseLedgerObsolete(db, {
@@ -1229,6 +1264,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             expectedStateVersion: row.stateVersion,
                             jobId,
                         });
+                        await this.rebindAfterModuleRestart(deadlineAt, signal);
                     } catch (casError) {
                         if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
                         // The single durable restart is already spent or the
@@ -1463,14 +1499,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private async pollBatch(
         jobId: string,
         requestKey: string,
+        deadlineAt: number,
         signal?: AbortSignal,
     ): Promise<unknown> {
         let cursor: unknown = null;
         const allItems: Array<Record<string, unknown>> = [];
-        // One absolute deadline spans the whole poll sequence, so a job that
-        // never leaves the queue cannot poll without bound; each call is
-        // bounded by the remaining budget.
-        const deadlineAt = Date.now() + this.pageTimeoutMs;
+        // The caller's absolute page deadline spans submission, daemon rebind,
+        // resubmission, and polling. A job that never leaves the queue cannot
+        // gain a fresh budget at this boundary.
         for (;;) {
             if (signal?.aborted) return {};
             const remainingMs = deadlineAt - Date.now();
