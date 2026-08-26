@@ -288,19 +288,19 @@ impl InjectedProvider for ShmProvider {
         if !cfg!(target_os = "linux") || !Self::offer_is_exact(ctx.offer_parameters()) {
             return Err(ProviderFailure::Unavailable);
         }
-        if self.recovery.readiness() != ProviderReadiness::Ready {
-            return Err(ProviderFailure::Unavailable);
-        }
-        let admission = self
-            .admission
-            .admit(&self.profile, None)
-            .map_err(|_| ProviderFailure::Unavailable)?;
-        self.preparations.fetch_add(1, Ordering::AcqRel);
-
         let candidate_id = NEXT_CANDIDATE_ID.fetch_add(1, Ordering::Relaxed);
-        // Custody of the exact admission charges moves into one lifecycle
-        // record before the candidate is exposed (KTD4).
-        let custody = self.recovery.admit_candidate(candidate_id, admission);
+        // Readiness and admission are one atomic decision under the
+        // recovery lock: a suspect reported between a separate readiness
+        // check and the admission would otherwise let this preparation
+        // admit resources, create rings, and publish a grant into a
+        // recovery episode (KTD6: `Recovering` is unoffered). Custody of
+        // the exact admission charges moves into one lifecycle record
+        // before the candidate is exposed (KTD4).
+        let custody = self
+            .recovery
+            .admit_candidate_while_ready(candidate_id, &self.admission, &self.profile)
+            .ok_or(ProviderFailure::Unavailable)?;
+        self.preparations.fetch_add(1, Ordering::AcqRel);
         let recovery = self.recovery.clone();
         let root = CancellationToken::new();
         let read_cancel = root.child_token();

@@ -314,6 +314,33 @@ impl ProviderRecovery {
         })
     }
 
+    /// Atomically checks `Ready` readiness, admits the profile's charges,
+    /// and binds them into a custody record — all under the recovery lock,
+    /// so a suspect reported by another candidate cannot flip readiness to
+    /// `Recovering` between the readiness decision and the admission. A
+    /// candidate admitted through this gate was provably admitted while the
+    /// provider was `Ready`.
+    pub fn admit_candidate_while_ready(
+        &self,
+        candidate_id: u64,
+        admission: &Arc<mc_shm_transport::profile::AdmissionController>,
+        profile: &mc_shm_transport::profile::TargetProfile,
+    ) -> Option<Arc<CandidateCustody>> {
+        let state = self.shared.state.lock().expect("recovery lock");
+        if state.readiness != ProviderReadiness::Ready {
+            return None;
+        }
+        // Lock order is recovery -> admission accounting, matching the
+        // cleanup path (recovery -> custody -> admission); no path takes
+        // the admission lock first.
+        let charges = admission.admit(profile, None).ok()?;
+        Some(Arc::new(CandidateCustody {
+            candidate_id,
+            incarnation: state.incarnation,
+            state: Mutex::new(CustodyState::Active(charges)),
+        }))
+    }
+
     /// Feeds one suspect record into the bounded, deduplicated inbox and
     /// starts or continues a recovery episode.
     pub fn report_suspect(&self, record: Arc<CandidateCustody>) {
@@ -814,6 +841,48 @@ mod tests {
         assert_eq!(rig.backend.probe_calls.load(Ordering::SeqCst), 0);
         assert_eq!(rig.active(), ResourceCharges::ZERO);
         assert_eq!(rig.quarantined(), ResourceCharges::ZERO);
+    }
+
+    /// Seeded-defect detector for the readiness/admission race: a gate that
+    /// checks readiness and admits in two separate steps would admit a
+    /// candidate whose preparation crosses the `Ready`-to-`Recovering`
+    /// transition; the atomic gate refuses while a suspect is unresolved
+    /// even though admission capacity is free.
+    #[test]
+    fn ready_gate_admission_is_refused_while_recovering() {
+        let rig = Rig::new(2);
+        let ready = rig
+            .recovery
+            .admit_candidate_while_ready(1, &rig.admission, &rig.profile)
+            .expect("ready provider admits");
+        assert_eq!(ready.admitted_incarnation(), 1);
+
+        // A blocked cleanup keeps the episode open: readiness is
+        // `Recovering` while a second candidate's charges would still fit.
+        rig.backend.push(Scripted::Block);
+        rig.recovery.report_suspect(Arc::clone(&ready));
+        wait_for("recovering readiness", || {
+            rig.recovery.readiness() == ProviderReadiness::Recovering
+        });
+        assert!(
+            rig.recovery
+                .admit_candidate_while_ready(2, &rig.admission, &rig.profile)
+                .is_none(),
+            "a recovering provider must not admit a new candidate"
+        );
+
+        // Clean reclamation resolves the episode; admission reopens with
+        // the freshly minted incarnation bound into the custody record.
+        rig.backend.release_blocked(CleanupOutcome::Reclaimed);
+        wait_for("ready readiness", || {
+            rig.recovery.readiness() == ProviderReadiness::Ready
+        });
+        let reopened = rig
+            .recovery
+            .admit_candidate_while_ready(3, &rig.admission, &rig.profile)
+            .expect("recovered provider admits");
+        assert_eq!(reopened.admitted_incarnation(), 2);
+        assert!(reopened.release());
     }
 
     #[test]
