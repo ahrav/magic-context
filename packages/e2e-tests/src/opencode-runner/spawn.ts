@@ -439,13 +439,22 @@ function isInheritableEnvKey(key: string): boolean {
  * Refuse to publish an unauthenticated serve API on a non-loopback interface
  * while a caller-supplied secret reaches the child.
  *
- * Scope is exactly `extraEnv`, and that is the whole effective surface rather
- * than a narrower slice of it: the inherited `process.env` copy below drops
- * secret-shaped names outright, so ambient runner credentials never reach the
- * child on any interface, and the fake `ANTHROPIC_API_KEY` default it sets is a
- * fixture value. `extraEnv` is therefore the only channel a real credential can
- * arrive on. Checking the assembled child env instead would refuse every default
- * spawn, since that fake default is always present and is shaped like a secret.
+ * Scope is exactly `extraEnv`, and that is the whole effective *environment*
+ * surface rather than a narrower slice of it: the inherited `process.env` copy
+ * below drops secret-shaped names outright, so ambient runner credentials never
+ * reach the child on any interface, and the fake `ANTHROPIC_API_KEY` default it
+ * sets is a fixture value. `extraEnv` is therefore the only channel a real
+ * credential can arrive on as a variable. Checking the assembled child env
+ * instead would refuse every default spawn, since that fake default is always
+ * present and is shaped like a secret.
+ *
+ * It does not cover a credential written directly into `openCodeConfigExtra`,
+ * which lands in the generated `opencode.json` rather than the environment.
+ * `liveModelSpawnOptions()` deliberately keeps the value in `extraEnv` and has
+ * the provider block reference it by name, so the sanctioned path stays covered;
+ * a caller that inlines an `apiKey` into the provider map instead is outside this
+ * guard. Extending to it needs a separate predicate, since config keys are
+ * camelCase and match none of the environment-name shapes.
  *
  * The pairing this enforces was previously a convention: `liveModelSpawnOptions()`
  * returns the credential and `hostname: "127.0.0.1"` together, and a comment

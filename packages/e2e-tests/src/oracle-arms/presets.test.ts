@@ -133,13 +133,14 @@ describe("oracle arm presets", () => {
         // The recipe's own pairing is what a real-credential caller spreads, so
         // it must satisfy the guard untouched. Overriding hostname back to the
         // all-interfaces default is what must fail: that is the shape a partial
-        // options merge or a harness that drops `hostname` degrades into.
+        // options merge or a harness that drops `hostname` degrades into. One
+        // pattern asserts the refused address and the offending key together, so
+        // a message that names only one of them cannot pass.
         await expect(
             spawnOpencode({ mockProviderURL: baseURL, ...recipe, hostname: "0.0.0.0" }),
-        ).rejects.toThrow(/refusing to bind the unauthenticated serve API to 0\.0\.0\.0/);
-        await expect(
-            spawnOpencode({ mockProviderURL: baseURL, ...recipe, hostname: "0.0.0.0" }),
-        ).rejects.toThrow(/ANTHROPIC_API_KEY/);
+        ).rejects.toThrow(
+            /refusing to bind the unauthenticated serve API to 0\.0\.0\.0 while extraEnv carries ANTHROPIC_API_KEY/,
+        );
 
         // Nothing was allocated: the guard runs at the top of the spawn path,
         // ahead of Rust-mode provisioning as well as the port, directory, and
