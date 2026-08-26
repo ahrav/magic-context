@@ -164,7 +164,10 @@ export function asEnum<T extends string>(
 
 export function asId(value: unknown, re: RegExp, label: string): string {
     if (typeof value !== "string" || !re.test(value)) {
-        fail(label, `must be a static id matching ${re.source}`);
+        // Wording kept identical to `contract.ts`'s copy on purpose: the two
+        // validators are mirrors, and a diverging message is the first visible
+        // symptom of them drifting apart.
+        fail(label, `must be a static lowercase id matching ${re.source}`);
     }
     return value;
 }
