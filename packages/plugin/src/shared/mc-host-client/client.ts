@@ -1683,7 +1683,7 @@ export class McHostClient {
                 ) {
                     return cached.handle;
                 }
-                this.liveRoutes.delete(cached.handle.channel);
+                active?.liveRoutes.delete(cached.handle.channel);
                 active?.generation.enqueueRouteGoodbye(cached.handle.channel, cached.handle.epoch);
                 cached.handle = null;
                 cached.identity = currentIdentity;

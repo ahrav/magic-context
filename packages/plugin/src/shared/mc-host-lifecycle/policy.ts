@@ -87,6 +87,8 @@ export interface LifecyclePolicyOptions {
     payloadManifestDigest?: string;
     /** Deferred certified package lookup after native current validation says missing. */
     payloadDirFallback?: () => string | null;
+    /** Credential-only fallback used by CLI start/restart callers. */
+    defaultStartupEnvelope?: NativeStartupEnvelope;
     outerAggregateMs?: number;
 }
 
@@ -147,6 +149,7 @@ export class McHostLifecyclePolicy {
     private readonly payloadDir: string | undefined;
     private readonly payloadManifestDigest: string | undefined;
     private readonly payloadDirFallback: (() => string | null) | undefined;
+    private readonly defaultStartupEnvelope: NativeStartupEnvelope | undefined;
     private readonly outerAggregateMs: number;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
 
@@ -161,6 +164,7 @@ export class McHostLifecyclePolicy {
         this.payloadDir = options.payloadDir;
         this.payloadManifestDigest = options.payloadManifestDigest;
         this.payloadDirFallback = options.payloadDirFallback;
+        this.defaultStartupEnvelope = options.defaultStartupEnvelope;
         this.outerAggregateMs = options.outerAggregateMs ?? OUTER_AGGREGATE_MS;
     }
 
@@ -169,7 +173,9 @@ export class McHostLifecyclePolicy {
         return this.inflightStarts.size;
     }
 
-    async start(startupEnvelope?: NativeStartupEnvelope): Promise<DaemonResultV1> {
+    async start(
+        startupEnvelope: NativeStartupEnvelope | undefined = this.defaultStartupEnvelope,
+    ): Promise<DaemonResultV1> {
         return this.mutatingCommand("start", startupEnvelope);
     }
 
@@ -178,8 +184,10 @@ export class McHostLifecyclePolicy {
     }
 
     /** One native restart transaction; never emulated as TS stop+start. */
-    async restart(): Promise<DaemonResultV1> {
-        return this.mutatingCommand("restart");
+    async restart(
+        startupEnvelope: NativeStartupEnvelope | undefined = this.defaultStartupEnvelope,
+    ): Promise<DaemonResultV1> {
+        return this.mutatingCommand("restart", startupEnvelope);
     }
 
     async status(): Promise<DaemonResultV1> {

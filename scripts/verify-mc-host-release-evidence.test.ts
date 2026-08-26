@@ -162,7 +162,7 @@ describe("installed release evidence", () => {
             production_inputs_sha256:
                 "release/mc-host-production-inputs.lock.json",
             qualification_sha256:
-                "docs/evidence/mc-host-release-qualification.json",
+                "tmp/mc-host-release-qualification.json",
             payload_index_sha256: "release/mc-host-payload-index.json",
             stop_provenance_sha256:
                 "release/mc-host-n-minus-one-stop.json",
@@ -233,7 +233,7 @@ describe("installed release evidence", () => {
             production_inputs_sha256:
                 "release/mc-host-production-inputs.lock.json",
             qualification_sha256:
-                "docs/evidence/mc-host-release-qualification.json",
+                "tmp/mc-host-release-qualification.json",
             payload_index_sha256: "release/mc-host-payload-index.json",
             stop_provenance_sha256:
                 "release/mc-host-n-minus-one-stop.json",

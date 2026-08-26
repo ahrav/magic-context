@@ -7,9 +7,10 @@
 
 #![cfg(unix)]
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -41,13 +42,42 @@ impl CliOutput {
 }
 
 fn run(root: &Path, args: &[&str]) -> CliOutput {
-    let output = Command::new(BIN)
+    run_with_envelope(root, args, None)
+}
+
+fn run_with_envelope(root: &Path, args: &[&str], envelope: Option<&Value>) -> CliOutput {
+    run_with_envelope_and_env(root, args, envelope, &[])
+}
+
+fn run_with_envelope_and_env(
+    root: &Path,
+    args: &[&str],
+    envelope: Option<&Value>,
+    env: &[(&str, &str)],
+) -> CliOutput {
+    let mut command = Command::new(BIN);
+    command
         .args(args)
         .env_clear()
         .env("XDG_DATA_HOME", root)
         .env("CK_MC_HOST_TEST_PHASE_CAP_MS", PHASE_CAP_MS)
-        .output()
-        .expect("ck-mc-host spawns");
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("ck-mc-host spawns");
+    if let Some(envelope) = envelope {
+        let bytes = serde_json::to_vec(envelope).expect("launcher envelope serializes");
+        child
+            .stdin
+            .take()
+            .expect("launcher stdin")
+            .write_all(&bytes)
+            .expect("launcher envelope writes");
+    }
+    let output = child.wait_with_output().expect("ck-mc-host exits");
     CliOutput {
         code: output.status.code().expect("ck-mc-host exits with a code"),
         stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
@@ -94,6 +124,15 @@ fn write_payload(dir: &Path) {
 
 fn coordination_dir(root: &Path) -> PathBuf {
     root.join(".mc-host-coordination")
+}
+
+fn daemon_id(root: &Path) -> [u8; 16] {
+    let publication = mc_host::runtime_dir_path(Some(root))
+        .expect("runtime dir")
+        .join(mc_host::CONNECTION_FILE_NAME);
+    mc_host::read_connection_file(publication)
+        .expect("connection file")
+        .daemon_id
 }
 
 fn try_flock_exclusive(path: &Path) -> bool {
@@ -412,6 +451,222 @@ async fn full_dev_mode_lifecycle_roundtrip() {
         & 0o777;
     assert_eq!(mode, 0o600, "daemon log must be owner-only");
     tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+#[test]
+fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
+    let root = tempfile::tempdir().expect("root");
+    let data = root.path().join("data");
+    let payload = root.path().join("payload");
+    write_payload(&payload);
+    let payload_arg = payload.to_str().expect("payload path");
+    let first_envelope = serde_json::json!({
+        "schema": 1,
+        "credentials": {"OPENAI_API_KEY": "first-owner-secret"}
+    });
+    let changed_envelope = serde_json::json!({
+        "schema": 1,
+        "credentials": {"OPENAI_API_KEY": "second-owner-secret"}
+    });
+    let merged_envelope = serde_json::json!({
+        "schema": 1,
+        "credentials": {
+            "ANTHROPIC_API_KEY": "second-owner-secret",
+            "OPENAI_API_KEY": "first-owner-secret"
+        }
+    });
+    let mut janitor = DaemonJanitor {
+        root: data.clone(),
+        active: false,
+    };
+
+    let started = run_with_envelope(
+        &data,
+        &["start", "--payload-dir", payload_arg],
+        Some(&first_envelope),
+    );
+    janitor.active = true;
+    assert_eq!(
+        started.code, 0,
+        "credentialed start failed: {} {}",
+        started.stdout, started.stderr
+    );
+    let first_id = daemon_id(&data);
+
+    let plain_start = run(&data, &["start"]);
+    assert_eq!(plain_start.code, 0);
+    assert_result(
+        &plain_start.json(),
+        "start",
+        true,
+        "running",
+        "already_running",
+    );
+    assert_eq!(daemon_id(&data), first_id);
+
+    let conflicting_start = run_with_envelope(&data, &["start"], Some(&changed_envelope));
+    assert_eq!(conflicting_start.code, 1);
+    assert_result(
+        &conflicting_start.json(),
+        "start",
+        false,
+        "running",
+        "harness_unavailable",
+    );
+    assert_eq!(
+        daemon_id(&data),
+        first_id,
+        "start must never replace a healthy daemon"
+    );
+
+    let rejected_restart = run_with_envelope(&data, &["restart"], Some(&changed_envelope));
+    assert_eq!(rejected_restart.code, 1);
+    assert_result(
+        &rejected_restart.json(),
+        "restart",
+        false,
+        "running",
+        "harness_unavailable",
+    );
+    assert_eq!(effects(&rejected_restart.json()), (false, false));
+    assert_eq!(
+        daemon_id(&data),
+        first_id,
+        "credential mismatch must fail before restart commits"
+    );
+
+    let invalid_descriptor = serde_json::json!({
+        "schema": 1,
+        "opencode": {
+            "manifest_sha256": "f".repeat(64),
+            "source_roots": {"runtime": "/missing/qualified-runtime"}
+        },
+        "credentials": {"OPENAI_API_KEY": "first-owner-secret"}
+    });
+    let rejected_descriptor_restart =
+        run_with_envelope(&data, &["restart"], Some(&invalid_descriptor));
+    assert_eq!(rejected_descriptor_restart.code, 1);
+    assert_result(
+        &rejected_descriptor_restart.json(),
+        "restart",
+        false,
+        "running",
+        "harness_unavailable",
+    );
+    assert_eq!(effects(&rejected_descriptor_restart.json()), (false, false));
+    assert_eq!(
+        daemon_id(&data),
+        first_id,
+        "invalid descriptor must fail before restart commits"
+    );
+
+    let additive_start = run_with_envelope(&data, &["start"], Some(&merged_envelope));
+    assert_eq!(additive_start.code, 1);
+    assert_result(
+        &additive_start.json(),
+        "start",
+        false,
+        "running",
+        "harness_unavailable",
+    );
+    assert_eq!(
+        daemon_id(&data),
+        first_id,
+        "start must not restart to merge an additional credential row"
+    );
+
+    let restarted = run_with_envelope(&data, &["restart"], Some(&merged_envelope));
+    assert_eq!(
+        restarted.code, 0,
+        "credentialed restart failed: {} {}",
+        restarted.stdout, restarted.stderr
+    );
+    assert_result(&restarted.json(), "restart", true, "running", "started");
+    assert_eq!(effects(&restarted.json()), (true, true));
+    assert_ne!(
+        daemon_id(&data),
+        first_id,
+        "explicit restart must rotate daemon identity"
+    );
+
+    let failed_commit = run_with_envelope_and_env(
+        &data,
+        &["restart"],
+        Some(&merged_envelope),
+        &[("CK_MC_HOST_TEST_FAIL_SELECTION_COMMIT", "1")],
+    );
+    assert_eq!(failed_commit.code, 1);
+    assert_result(
+        &failed_commit.json(),
+        "restart",
+        false,
+        "stopped",
+        "internal_error",
+    );
+    assert_eq!(effects(&failed_commit.json()), (true, true));
+    janitor.active = false;
+
+    let stopped = run(&data, &["stop"]);
+    assert_eq!(stopped.code, 0);
+    janitor.active = false;
+
+    let selection = data
+        .join("cortexkit")
+        .join("mc-host-harness-closures")
+        .join("active-selection.json");
+    let unknown = b"{\"schema\":2,\"future\":\"preserve-me\"}";
+    std::fs::write(&selection, unknown).expect("unknown selection fixture");
+    std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o600))
+        .expect("unknown selection mode");
+    let unknown_start = run(&data, &["start"]);
+    assert_eq!(unknown_start.code, 1);
+    assert_result(
+        &unknown_start.json(),
+        "start",
+        false,
+        "wedged",
+        "unsupported_state_schema",
+    );
+    let unknown_restart = run(&data, &["restart"]);
+    assert_eq!(unknown_restart.code, 1);
+    assert_result(
+        &unknown_restart.json(),
+        "restart",
+        false,
+        "wedged",
+        "unsupported_state_schema",
+    );
+    assert_eq!(effects(&unknown_restart.json()), (false, false));
+    let unknown_stop = run(&data, &["stop"]);
+    assert_eq!(unknown_stop.code, 1);
+    assert_result(
+        &unknown_stop.json(),
+        "stop",
+        false,
+        "wedged",
+        "unsupported_state_schema",
+    );
+    assert_eq!(
+        std::fs::read(&selection).expect("unknown selection preserved"),
+        unknown
+    );
+
+    std::fs::write(&selection, b"{\"schema\":1}").expect("stale selection fixture");
+    std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o600))
+        .expect("stale selection mode");
+    let stopped_again = run(&data, &["stop"]);
+    assert_eq!(stopped_again.code, 0);
+    assert_result(
+        &stopped_again.json(),
+        "stop",
+        true,
+        "stopped",
+        "already_stopped",
+    );
+    assert!(
+        !selection.exists(),
+        "already-stopped cleanup must remove stale active selection"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

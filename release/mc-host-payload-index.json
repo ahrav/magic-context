@@ -16,7 +16,7 @@
       },
       "synapse": "unsupported",
       "target": "darwin-arm64",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
       "version": "0.38.0"
     },
     {
@@ -35,7 +35,7 @@
       },
       "synapse": "unsupported",
       "target": "darwin-x64",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
       "version": "0.38.0"
     },
     {
@@ -55,11 +55,11 @@
       },
       "synapse": "certified_cpu",
       "target": "linux-x64-gnu",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
       "version": "0.38.0"
     }
   ],
-  "production_inputs_lock_sha256": "2359e7efe026b1e91e28373d0de2086bdd3d5484bcd2e7c4527b5659a3d52d5c",
+  "production_inputs_lock_sha256": "2abdc0ba8fa220e046e4dd995c617ef39d99b352462864d8a7c0d27ce1efae5a",
   "production_qualified": false,
   "publication": {
     "order": [

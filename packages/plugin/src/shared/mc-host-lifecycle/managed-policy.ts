@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import payloadIndex from "../../../../../release/mc-host-payload-index.json";
-import { McHostClient } from "../mc-host-client";
+import { BROCA_CREDENTIAL_NAMES, McHostClient } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
+import type { NativeStartupEnvelope } from "./native-launcher";
 import {
     type PayloadTrustIndex,
     prepareManagedLaunchTarget,
@@ -18,6 +19,21 @@ import {
 
 const MAX_PARENT_WALK = 8;
 const READINESS_POLL_MS = 50;
+
+export function buildManagedCredentialEnvelope(
+    env: Record<string, string | undefined>,
+): NativeStartupEnvelope {
+    const credentials = Object.fromEntries(
+        BROCA_CREDENTIAL_NAMES.flatMap((name) => {
+            const value = env[name];
+            return value === undefined || value.length === 0 ? [] : [[name, value]];
+        }),
+    );
+    return {
+        schema: 1,
+        ...(Object.keys(credentials).length === 0 ? {} : { credentials }),
+    };
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -190,6 +206,7 @@ export function createManagedLifecyclePolicy(
             ...options,
             env,
             launchTarget: prepared,
+            defaultStartupEnvelope: buildManagedCredentialEnvelope(env),
             storageProbe:
                 options.storageProbe ?? ((budgetMs) => probeManagedStorage(root.root, budgetMs)),
             readinessProbe:

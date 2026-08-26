@@ -16,8 +16,8 @@ import {
     sha256Hex,
 } from "./generate-mc-host-release-manifest";
 
-const EVIDENCE_PATH = "docs/evidence/mc-host-installed-release-evidence.json";
-const QUALIFICATION_PATH = "docs/evidence/mc-host-release-qualification.json";
+const EVIDENCE_PATH = "tmp/mc-host-installed-release-evidence.json";
+const QUALIFICATION_PATH = "tmp/mc-host-release-qualification.json";
 const INPUT_LOCK_PATH = "release/mc-host-production-inputs.lock.json";
 const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";

@@ -6,7 +6,7 @@
  *
  *   - release/mc-host-production-inputs.lock.json      (immutable input lock)
  *   - release/mc-host-provider-credentials.json        (closed harness/provider matrix)
- *   - docs/evidence/mc-host-release-qualification.json (qualification evidence)
+ *   - tmp/mc-host-release-qualification.json (local qualification evidence)
  *
  * Inputs:
  *   - The U8 pre-build release contract (scripts/generate-mc-host-release-manifest.ts).
@@ -61,7 +61,7 @@ export const SOURCE_MANIFEST_PATH =
 export const OUTPUT_PATHS = {
     lock: "release/mc-host-production-inputs.lock.json",
     credentials: "release/mc-host-provider-credentials.json",
-    evidence: "docs/evidence/mc-host-release-qualification.json",
+    evidence: "tmp/mc-host-release-qualification.json",
     closureCatalog:
         "packages/plugin/src/shared/mc-host-lifecycle/generated-production-inputs.ts",
     closureCatalogRust: "release/generated/mc-host-harness-closures.rs",
@@ -2606,7 +2606,7 @@ export function generate(
         const expected = outputs[key];
         if (options.check) {
             if (!existsSync(path)) {
-                drift.push(`${relative}: missing`);
+                if (key !== "evidence") drift.push(`${relative}: missing`);
             } else if (readFileSync(path, "utf8") !== expected) {
                 drift.push(
                     `${relative}: content drift (regenerate with bun scripts/qualify-mc-host-production-inputs.ts)`,

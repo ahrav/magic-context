@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildManagedCredentialEnvelope } from "./managed-policy";
 import { McHostLifecyclePolicy, type WaiterDetachedError } from "./policy";
 
 function tempDir(prefix: string): string {
@@ -59,6 +60,16 @@ function restartResultJson(): string {
         ...JSON.parse(startResultJson("restart")),
         reason: "started",
         effects: { stop_committed: true, start_committed: true },
+    });
+}
+
+function harnessUnavailableResultJson(): string {
+    return JSON.stringify({
+        ...JSON.parse(startResultJson("start")),
+        ok: false,
+        state: "running",
+        reason: "harness_unavailable",
+        readiness: null,
     });
 }
 
@@ -203,6 +214,19 @@ describe("observational commands without a trusted bootstrap (U3 scenario 21)", 
 });
 
 describe("native invocation mapping", () => {
+    test("managed credential envelopes include only bounded Broca credential names", () => {
+        expect(
+            buildManagedCredentialEnvelope({
+                OPENAI_API_KEY: "secret",
+                PATH: "/poisoned",
+                EMPTY: "",
+            }),
+        ).toEqual({
+            schema: 1,
+            credentials: { OPENAI_API_KEY: "secret" },
+        });
+    });
+
     test("native current validation precedes one deferred certified package lookup", async () => {
         const root = tempDir("mc-policy-fallback-");
         const invocationLog = path.join(root, "fallback-invocations.log");
@@ -339,9 +363,71 @@ describe("native invocation mapping", () => {
             rmSync(root, { recursive: true, force: true });
         }
     });
+
+    test("restart sends the default credential envelope", async () => {
+        const root = tempDir("mc-policy-restart-envelope-");
+        const envelopeLog = path.join(root, "restart-envelope.json");
+        const binary = path.join(root, "restart-envelope-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\ncat > ${envelopeLog}\necho '${restartResultJson()}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                defaultStartupEnvelope: {
+                    schema: 1,
+                    credentials: { OPENAI_API_KEY: "preserved-secret" },
+                },
+            });
+            const result = await policy.restart();
+            expect(result.ok).toBe(true);
+            expect(JSON.parse(readFileSync(envelopeLog, "utf8"))).toEqual({
+                schema: 1,
+                credentials: { OPENAI_API_KEY: "preserved-secret" },
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
 });
 
 describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
+    test("managed harness mismatch never preempts the running daemon", async () => {
+        const root = tempDir("mc-policy-converge-");
+        const invocationLog = path.join(root, "converge-invocations.log");
+        const binary = path.join(root, "converge-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$1" >> ${invocationLog}\n` +
+                `if [ "$1" = "start" ]; then echo '${harnessUnavailableResultJson()}'; exit 1; fi\n` +
+                `echo '${restartResultJson()}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                startupEnvelope: {
+                    schema: 1,
+                    credentials: { OPENAI_API_KEY: "shared-secret" },
+                },
+            });
+            expect(outcome.result.command).toBe("start");
+            expect(outcome.result.reason).toBe("harness_unavailable");
+            expect(outcome.result.effects).toBeNull();
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("non-managed origins are refused before any work", async () => {
         const policy = policyFor({ env: { HOME: "/nonexistent-home" } });
         for (const origin of ["explicit", "injected"] as const) {

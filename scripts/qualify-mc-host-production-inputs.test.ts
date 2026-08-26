@@ -1246,9 +1246,9 @@ describe("harness runtime closure graph qualification", () => {
 });
 
 describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
-    test("committed qualification remains blocked on the exact kernel floor", () => {
+    test("production build rejects absent local qualification evidence", () => {
         expect(() => requireQualificationEvidence(repoRoot)).toThrow(
-            /not production-qualified/,
+            /absent/,
         );
     });
 

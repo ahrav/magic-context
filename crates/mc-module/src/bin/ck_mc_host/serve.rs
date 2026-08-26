@@ -9,11 +9,12 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hmac::{Hmac, Mac};
 use mc_host::broca::backend::{
     BackendError, BackendFuture, BackendRequest, BackendTerminal, ErrorClass, EventSink,
     HarnessDispatchBackend, LlmExecutionBackend,
@@ -29,10 +30,13 @@ use mc_host::harness_closure::{
 };
 use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits};
 use mc_host::{CancellationToken, HostConfig, HostInit, StaticComposite};
+use sha2::Sha256;
 
 use crate::spawn::MAX_ENVELOPE_BYTES;
 
 const STORE_FILE: &str = "mc-store.db";
+const ACTIVE_HARNESS_SELECTION: &str = "active-selection.json";
+const ACTIVE_SELECTION_CREDENTIAL_DOMAIN: &[u8] = b"mc-host-active-selection-credential-v1";
 const MAX_DESCRIPTOR_ITEMS: usize = 32;
 const MAX_DESCRIPTOR_ITEM_BYTES: usize = 4096;
 const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
@@ -46,7 +50,7 @@ const CREDENTIAL_NAMES: [&str; 3] = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPE
 /// The launcher materializes qualified harness candidates before detach, so
 /// this serve envelope carries only retained closure digests or closed
 /// per-harness unavailability reasons. Source paths never cross into serve.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupEnvelope {
     pub schema: u32,
@@ -82,11 +86,65 @@ pub struct HarnessCandidate {
     pub source_roots: BTreeMap<String, PathBuf>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HarnessSnapshot {
     Ready { manifest_sha256: String },
     Unavailable { reason: String },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessSelection {
+    schema: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opencode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credential_identities: BTreeMap<String, String>,
+}
+
+pub struct PreparedLauncherEnvelope {
+    data_dir: PathBuf,
+    closure_root: PathBuf,
+    selection: HarnessSelection,
+    opencode: Option<HarnessSnapshot>,
+    pi: Option<HarnessSnapshot>,
+    credentials: BTreeMap<String, String>,
+    pub changed: bool,
+}
+
+pub enum SelectionMode<'a> {
+    Fresh,
+    Running {
+        credential_identity_key: &'a [u8; 32],
+        require_previous_credentials: bool,
+    },
+}
+
+impl PreparedLauncherEnvelope {
+    pub fn to_startup(&self, payload_manifest_digest: String) -> StartupEnvelope {
+        StartupEnvelope {
+            schema: 1,
+            data_dir: self.data_dir.clone(),
+            payload_manifest_digest,
+            opencode: self.opencode.clone(),
+            pi: self.pi.clone(),
+            credentials: self.credentials.clone(),
+        }
+    }
+
+    pub fn commit_selection(&self, publication: &Path) -> Result<(), &'static str> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CK_MC_HOST_TEST_FAIL_SELECTION_COMMIT").is_some() {
+            return Err("injected active selection commit failure");
+        }
+        let key = credential_identity_key(publication)?;
+        let mut selection = self.selection.clone();
+        selection.credential_identities = credential_identities(&self.credentials, &key);
+        write_selection(&self.closure_root, &selection)
+    }
 }
 
 impl StartupEnvelope {
@@ -124,24 +182,151 @@ impl LauncherEnvelope {
         validate_credentials(&self.credentials)
     }
 
-    pub fn materialize_into_startup(
+    pub fn prepare(
         self,
         data_dir: PathBuf,
-        payload_manifest_digest: String,
-    ) -> StartupEnvelope {
+        mode: SelectionMode<'_>,
+    ) -> Result<PreparedLauncherEnvelope, &'static str> {
         let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
         let store = HarnessClosureStore::open(&closure_root).ok();
-        let opencode = materialize_snapshot("opencode", self.opencode, store.as_ref());
-        let pi = materialize_snapshot("pi", self.pi, store.as_ref());
-        StartupEnvelope {
-            schema: 1,
+        let running = matches!(mode, SelectionMode::Running { .. });
+        let (previous, mut credential_identities, require_previous_credentials) = match mode {
+            SelectionMode::Fresh => {
+                read_selection(&closure_root, store.as_ref())?;
+                (
+                    HarnessSelection {
+                        schema: 1,
+                        ..HarnessSelection::default()
+                    },
+                    BTreeMap::new(),
+                    false,
+                )
+            }
+            SelectionMode::Running {
+                credential_identity_key,
+                require_previous_credentials,
+            } => (
+                read_selection(&closure_root, store.as_ref())?,
+                credential_identities(&self.credentials, credential_identity_key),
+                require_previous_credentials,
+            ),
+        };
+        if running && !require_previous_credentials && self.credentials.is_empty() {
+            credential_identities = previous.credential_identities.clone();
+        }
+        let supplied_opencode = self.opencode.is_some();
+        let supplied_pi = self.pi.is_some();
+        let opencode_candidate = materialize_snapshot("opencode", self.opencode, store.as_ref());
+        let pi_candidate = materialize_snapshot("pi", self.pi, store.as_ref());
+        if running
+            && ((supplied_opencode
+                && matches!(
+                    &opencode_candidate,
+                    Some(HarnessSnapshot::Unavailable { .. })
+                ))
+                || (supplied_pi
+                    && matches!(&pi_candidate, Some(HarnessSnapshot::Unavailable { .. }))))
+        {
+            return Err("new owner supplied an unavailable harness descriptor");
+        }
+        let next_opencode = match &opencode_candidate {
+            Some(HarnessSnapshot::Ready { manifest_sha256 }) => Some(manifest_sha256.clone()),
+            _ => None,
+        };
+        let next_pi = match &pi_candidate {
+            Some(HarnessSnapshot::Ready { manifest_sha256 }) => Some(manifest_sha256.clone()),
+            _ => None,
+        };
+        let (selection, changed) = merge_selection(
+            &previous,
+            next_opencode,
+            next_pi,
+            credential_identities,
+            require_previous_credentials,
+        )?;
+        let opencode = selected_snapshot(
+            "opencode",
+            selection.opencode.as_deref(),
+            opencode_candidate,
+            store.as_ref(),
+        );
+        let pi = selected_snapshot("pi", selection.pi.as_deref(), pi_candidate, store.as_ref());
+        Ok(PreparedLauncherEnvelope {
             data_dir,
-            payload_manifest_digest,
+            closure_root,
+            selection,
             opencode,
             pi,
             credentials: self.credentials,
-        }
+            changed,
+        })
     }
+}
+
+fn merge_selection(
+    previous: &HarnessSelection,
+    opencode: Option<String>,
+    pi: Option<String>,
+    credential_identities: BTreeMap<String, String>,
+    require_previous_credentials: bool,
+) -> Result<(HarnessSelection, bool), &'static str> {
+    let mut selection = previous.clone();
+    if let Some(opencode) = opencode {
+        selection.opencode = Some(opencode);
+    }
+    if let Some(pi) = pi {
+        selection.pi = Some(pi);
+    }
+    let changed = selection.opencode != previous.opencode
+        || selection.pi != previous.pi
+        || credential_identities != previous.credential_identities;
+    if (changed || require_previous_credentials)
+        && previous
+            .credential_identities
+            .iter()
+            .any(|(name, identity)| credential_identities.get(name) != Some(identity))
+    {
+        return Err("new owner cannot preserve the active credential source");
+    }
+    selection.credential_identities = credential_identities;
+    Ok((selection, changed))
+}
+
+fn credential_identities(
+    credentials: &BTreeMap<String, String>,
+    connection_key: &[u8; 32],
+) -> BTreeMap<String, String> {
+    let mut derive =
+        Hmac::<Sha256>::new_from_slice(connection_key).expect("HMAC accepts any key length");
+    derive.update(ACTIVE_SELECTION_CREDENTIAL_DOMAIN);
+    let derived = derive.finalize().into_bytes();
+    credentials
+        .iter()
+        .map(|(name, value)| {
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(&derived).expect("HMAC accepts any key length");
+            mac.update(&(name.len() as u64).to_be_bytes());
+            mac.update(name.as_bytes());
+            mac.update(&(value.len() as u64).to_be_bytes());
+            mac.update(value.as_bytes());
+            let identity = mac
+                .finalize()
+                .into_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            (name.clone(), identity)
+        })
+        .collect()
+}
+
+pub fn credential_identity_key(publication: &Path) -> Result<[u8; 32], &'static str> {
+    let info =
+        mc_host::read_connection_file(publication).map_err(|_| "connection key is unavailable")?;
+    info.key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "connection key is invalid")
 }
 
 fn validate_credentials(credentials: &BTreeMap<String, String>) -> Result<(), &'static str> {
@@ -261,6 +446,165 @@ fn materialize_snapshot(
         Err(_) => Some(HarnessSnapshot::Unavailable {
             reason: "closure_incomplete".to_owned(),
         }),
+    }
+}
+
+fn selected_snapshot(
+    harness: &str,
+    digest: Option<&str>,
+    candidate: Option<HarnessSnapshot>,
+    store: Option<&HarnessClosureStore>,
+) -> Option<HarnessSnapshot> {
+    if matches!(candidate, Some(HarnessSnapshot::Unavailable { .. })) {
+        return candidate;
+    }
+    let digest = digest?;
+    if qualified_manifest(harness, digest).is_none()
+        || store
+            .and_then(|store| store.validate(digest).ok())
+            .is_none()
+    {
+        return Some(HarnessSnapshot::Unavailable {
+            reason: "closure_incomplete".to_owned(),
+        });
+    }
+    Some(HarnessSnapshot::Ready {
+        manifest_sha256: digest.to_owned(),
+    })
+}
+
+fn read_selection(
+    closure_root: &Path,
+    store: Option<&HarnessClosureStore>,
+) -> Result<HarnessSelection, &'static str> {
+    let path = closure_root.join(ACTIVE_HARNESS_SELECTION);
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HarnessSelection {
+                schema: 1,
+                ..HarnessSelection::default()
+            })
+        }
+        Err(_) => return Err("active harness selection is unreadable"),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| "active harness selection is unreadable")?;
+    let root_metadata =
+        std::fs::metadata(closure_root).map_err(|_| "active harness selection is unreadable")?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_ENVELOPE_BYTES as u64
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.nlink() != 1
+        || metadata.uid() != root_metadata.uid()
+    {
+        return Err("active harness selection is invalid");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| "active harness selection is unreadable")?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "active harness selection is invalid")?;
+    if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("unsupported active harness selection schema");
+    }
+    let selection: HarnessSelection =
+        serde_json::from_value(value).map_err(|_| "active harness selection is invalid")?;
+    if selection.schema != 1
+        || selection
+            .credential_identities
+            .iter()
+            .any(|(name, identity)| {
+                !CREDENTIAL_NAMES.contains(&name.as_str())
+                    || !mc_host::is_canonical_payload_digest(identity)
+            })
+    {
+        return Err("active harness selection is invalid");
+    }
+    for (harness, digest) in [
+        ("opencode", selection.opencode.as_deref()),
+        ("pi", selection.pi.as_deref()),
+    ] {
+        if let Some(digest) = digest {
+            if qualified_manifest(harness, digest).is_none()
+                || store
+                    .and_then(|store| store.validate(digest).ok())
+                    .is_none()
+            {
+                return Err("active harness selection is invalid");
+            }
+        }
+    }
+    Ok(selection)
+}
+
+fn write_selection(closure_root: &Path, selection: &HarnessSelection) -> Result<(), &'static str> {
+    let bytes = serde_json::to_vec(selection).map_err(|_| "selection serialization failed")?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "active harness selection clock failed")?
+        .as_nanos();
+    let temp = closure_root.join(format!(
+        ".{ACTIVE_HARNESS_SELECTION}.{}.{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
+        .map_err(|_| "active harness selection temp creation failed")?;
+    let mut promoted = false;
+    let result = (|| {
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "active harness selection write failed")?;
+        std::fs::rename(&temp, closure_root.join(ACTIVE_HARNESS_SELECTION))
+            .map_err(|_| "active harness selection promotion failed")?;
+        promoted = true;
+        std::fs::File::open(closure_root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|_| "active harness selection fsync failed")
+    })();
+    if !promoted {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
+pub fn clear_active_selection() -> Result<(), &'static str> {
+    let data_dir = mc_host::runtime_dir_path(None)
+        .ok()
+        .and_then(|run_dir| {
+            run_dir
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .ok_or("active harness selection root is unavailable")?;
+    let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
+    let path = closure_root.join(ACTIVE_HARNESS_SELECTION);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("active harness selection is unreadable"),
+    }
+    let store = HarnessClosureStore::open(&closure_root)
+        .map_err(|_| "active harness selection root is unavailable")?;
+    read_selection(&closure_root, Some(&store))?;
+    match std::fs::remove_file(path) {
+        Ok(()) => std::fs::File::open(closure_root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|_| "active harness selection fsync failed"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("active harness selection removal failed"),
     }
 }
 
@@ -541,4 +885,110 @@ pub fn run() -> Result<(), &'static str> {
         let _ = signal_task.await;
         result.map_err(|_| "host runtime exited with an error")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_selection_merges_without_losing_prior_credentials() {
+        let key = [7; 32];
+        let previous_credentials =
+            BTreeMap::from([("ANTHROPIC_API_KEY".to_owned(), "shared-secret".to_owned())]);
+        let previous = HarnessSelection {
+            schema: 1,
+            opencode: Some("a".repeat(64)),
+            pi: None,
+            credential_identities: credential_identities(&previous_credentials, &key),
+        };
+        let credentials = BTreeMap::from([
+            ("ANTHROPIC_API_KEY".to_owned(), "shared-secret".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "second-secret".to_owned()),
+        ]);
+        let (merged, changed) = merge_selection(
+            &previous,
+            None,
+            Some("b".repeat(64)),
+            credential_identities(&credentials, &key),
+            false,
+        )
+        .expect("qualified second owner merges");
+        assert!(changed);
+        assert_eq!(merged.opencode, previous.opencode);
+        assert_eq!(merged.pi, Some("b".repeat(64)));
+        assert!(merged
+            .credential_identities
+            .contains_key("ANTHROPIC_API_KEY"));
+        assert!(merged.credential_identities.contains_key("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn harness_selection_requires_exact_prior_credentials() {
+        let key = [9; 32];
+        let previous_credentials =
+            BTreeMap::from([("ANTHROPIC_API_KEY".to_owned(), "first-secret".to_owned())]);
+        let previous = HarnessSelection {
+            schema: 1,
+            opencode: Some("a".repeat(64)),
+            pi: None,
+            credential_identities: credential_identities(&previous_credentials, &key),
+        };
+        assert!(merge_selection(
+            &previous,
+            None,
+            Some("b".repeat(64)),
+            credential_identities(
+                &BTreeMap::from([("OPENAI_API_KEY".to_owned(), "other-secret".to_owned())]),
+                &key,
+            ),
+            false,
+        )
+        .is_err());
+        assert!(merge_selection(
+            &previous,
+            None,
+            None,
+            credential_identities(
+                &BTreeMap::from([(
+                    "ANTHROPIC_API_KEY".to_owned(),
+                    "different-secret".to_owned()
+                )]),
+                &key,
+            ),
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn harness_selection_persists_only_digests_and_keyed_credential_identities() {
+        let root = tempfile::tempdir().expect("selection root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("selection root mode");
+        let store = HarnessClosureStore::open(root.path()).expect("closure store");
+        let credentials = BTreeMap::from([(
+            "ANTHROPIC_API_KEY".to_owned(),
+            "credential-value".to_owned(),
+        )]);
+        let selection = HarnessSelection {
+            schema: 1,
+            opencode: None,
+            pi: None,
+            credential_identities: credential_identities(&credentials, &[11; 32]),
+        };
+        write_selection(root.path(), &selection).expect("write selection");
+        let loaded = read_selection(root.path(), Some(&store)).expect("read selection");
+        assert_eq!(loaded, selection);
+        let bytes =
+            std::fs::read(root.path().join(ACTIVE_HARNESS_SELECTION)).expect("selection bytes");
+        assert!(!String::from_utf8_lossy(&bytes).contains("credential-value"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("first-secret"));
+        let mode = std::fs::metadata(root.path().join(ACTIVE_HARNESS_SELECTION))
+            .expect("selection metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }
