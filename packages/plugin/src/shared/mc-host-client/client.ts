@@ -958,6 +958,7 @@ export class McHostClient {
                     grant.selected.transport,
                     provider,
                     grant.descriptor,
+                    snapshot.daemonId,
                 ),
                 firstCorrelation: ACTIVATION_CORRELATION,
                 onRetired: (info) => {

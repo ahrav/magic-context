@@ -37,6 +37,7 @@ export type ConnectionFileErrorCode =
     | "unsupported_platform"
     | "deadline_expired"
     | "open_failed"
+    | "stat_failed"
     | "not_regular_file"
     | "foreign_owner"
     | "insecure_permissions"
@@ -113,6 +114,14 @@ interface FileIdentity {
 
 function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
     return a.dev === b.dev && a.ino === b.ino;
+}
+
+function statErrno(error: unknown): string | undefined {
+    if (error && typeof error === "object" && "code" in error) {
+        const code = (error as { code?: unknown }).code;
+        return typeof code === "string" ? code : undefined;
+    }
+    return undefined;
 }
 
 function currentUid(): number {
@@ -197,14 +206,22 @@ async function snapshotDirect(
     afterOpen?: () => void | Promise<void>,
 ): Promise<Uint8Array> {
     checkDeadline(deadline);
-    // A failed stat is discovery evidence, not a raw I/O fault: an absent
-    // path during daemon republication must reach callers as the same
-    // `open_failed` churn class as a failed open, or retry classification
-    // falls through to a permanent stop on the unwrapped ENOENT.
+    // Stat failures split by errno: an absent path (ENOENT) during daemon
+    // republication is the same retryable `open_failed` churn class as a
+    // failed open, while EACCES, ENOTDIR, ELOOP, and every other stat
+    // fault is permanent configuration evidence (`stat_failed`) that must
+    // stop a recovery episode instead of retrying to its deadline.
     const before = await lstat(filePath).catch((error: unknown) => {
+        if (statErrno(error) === "ENOENT") {
+            throw new ConnectionFileError(
+                `connection file ${filePath} does not exist`,
+                "open_failed",
+                error,
+            );
+        }
         throw new ConnectionFileError(
             `failed to stat connection file ${filePath}`,
-            "open_failed",
+            "stat_failed",
             error,
         );
     });
@@ -235,13 +252,20 @@ async function snapshotDirect(
         checkDeadline(deadline);
         const bytes = await readBounded(handle, deadline);
         checkDeadline(deadline);
-        // An unlink after the read is a replacement event: classify it as
-        // `replaced_during_read` so the one-restart rule (KTD3) and churn
-        // retry classification apply instead of a raw ENOENT escaping.
+        // An unlink after the read (ENOENT) is a replacement event: the
+        // one-restart rule (KTD3) and churn retry classification apply.
+        // Any other stat fault is permanent evidence, as above.
         const after = await lstat(filePath).catch((error: unknown) => {
+            if (statErrno(error) === "ENOENT") {
+                throw new ConnectionFileError(
+                    `connection file ${filePath} was removed during the snapshot`,
+                    "replaced_during_read",
+                    error,
+                );
+            }
             throw new ConnectionFileError(
-                `connection file ${filePath} was removed during the snapshot`,
-                "replaced_during_read",
+                `failed to re-stat connection file ${filePath}`,
+                "stat_failed",
                 error,
             );
         });

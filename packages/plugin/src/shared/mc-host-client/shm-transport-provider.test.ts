@@ -25,12 +25,12 @@ function validGrant(candidateId = 1, pid = 1234): Record<string, unknown> {
 
 const OPTIONS = { expectedProfile: QUALIFIED_TEST_PROFILE };
 
-function channelArgs(): CandidateChannelArgs {
+function channelArgs(daemonId: Uint8Array = new Uint8Array(16)): CandidateChannelArgs {
     const handlers: FrameChannelHandlers = {
         onFrame: () => {},
         onClosed: () => {},
     };
-    return { budget: new ByteBudget(1024), maxBodyLen: 1024, handlers };
+    return { budget: new ByteBudget(1024), maxBodyLen: 1024, handlers, daemonId };
 }
 
 describe("grant geometry and duplex-pair binding", () => {
@@ -238,6 +238,24 @@ describe("provider grant handling before any native effect", () => {
         provider.connect(validGrant(2, 2000), channelArgs());
     });
 
+    test("pid reuse across daemon incarnations does not inherit the watermark", () => {
+        const provider = createExplicitShmTestProvider(QUALIFIED_TEST_PROFILE);
+        if (!provider) return;
+        const firstIncarnation = new Uint8Array(16).fill(1);
+        const secondIncarnation = new Uint8Array(16).fill(2);
+        provider.connect(validGrant(7, 1000), channelArgs(firstIncarnation));
+        // A replacement daemon can receive its predecessor's recycled PID;
+        // the authenticated incarnation identity differs, so its candidate
+        // sequence restarts at 1 and must attach.
+        provider.connect(validGrant(1, 1000), channelArgs(secondIncarnation));
+        // Monotonicity now tracks the new incarnation under the same PID.
+        expectCode(
+            () => provider.connect(validGrant(1, 1000), channelArgs(secondIncarnation)),
+            "stale_candidate",
+        );
+        provider.connect(validGrant(2, 1000), channelArgs(secondIncarnation));
+    });
+
     test("sanitized candidate construction keeps sentinel grant bytes out of errors", () => {
         const provider = createExplicitShmTestProvider(QUALIFIED_TEST_PROFILE);
         if (!provider) return;
@@ -247,7 +265,7 @@ describe("provider grant handling before any native effect", () => {
         };
         let caught: unknown;
         try {
-            sanitizedCandidateFactory("shm", provider, hostile)(channelArgs());
+            sanitizedCandidateFactory("shm", provider, hostile, new Uint8Array(16))(channelArgs());
         } catch (error) {
             caught = error;
         }

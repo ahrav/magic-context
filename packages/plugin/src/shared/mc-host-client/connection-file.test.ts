@@ -188,6 +188,15 @@ describe("direct-file snapshot", () => {
         await expectFailure(freshPath("absent.json"), "open_failed");
     });
 
+    test("classifies a permanent stat failure as stat_failed, not churn", async () => {
+        const filePath = freshPath("not-a-dir.json");
+        await writePrivateFile(filePath, JSON.stringify(validJson()));
+        // A regular file used as a path component is a permanent
+        // configuration error (ENOTDIR), not republication churn: it must
+        // stop a recovery episode instead of retrying to its deadline.
+        await expectFailure(path.join(filePath, "child.json"), "stat_failed");
+    });
+
     test("classifies an unlink during the snapshot as discovery churn", async () => {
         const filePath = freshPath("unlinked-mid-read.json");
         await writePrivateFile(filePath, JSON.stringify(validJson()));
