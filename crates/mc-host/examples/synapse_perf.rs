@@ -26,6 +26,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 const ROOT: &str = "/workspace/synapse-perf";
 const DRAIN_BUDGET: Duration = Duration::from_secs(10);
+/// Bound on host startup: connection-file publication must appear within
+/// this window. Distinct from `DRAIN_BUDGET`, which bounds post-send
+/// response drain; the two are equal by coincidence, not by meaning.
+const STARTUP_BUDGET: Duration = Duration::from_secs(10);
 /// Lane fingerprint every request pins; responses must echo it exactly.
 const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 /// Text every measured request embeds; the response must carry its digest
@@ -205,11 +209,23 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<raw_client::
     Ok(frame)
 }
 
+/// Cancels the wrapped token when dropped. Declared after `data_root` in
+/// `run`, so on any exit path — including each early `return Err` — drop
+/// order requests host shutdown ahead of the `TempDir` removal of the
+/// directory the host writes.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 async fn wait_for_publication(
     publication: &std::path::Path,
     host: &tokio::task::JoinHandle<Result<(), mc_host::HostError>>,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + STARTUP_BUDGET;
     loop {
         if publication.is_file() {
             return Ok(());
@@ -246,6 +262,7 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     let shutdown = CancellationToken::new();
     let run_shutdown = shutdown.clone();
     let host = tokio::spawn(mc_host::run(composite, config, run_shutdown));
+    let _shutdown_guard = CancelOnDrop(shutdown.clone());
     wait_for_publication(&publication, &host).await?;
 
     let info = raw_client::discover(&publication)?;
@@ -286,8 +303,12 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     let (_, warmup) = client
         .frames_until_corr(warmup_corr, Duration::from_secs(5))
         .await?;
-    if warmup.ty != raw_client::TY_RESPONSE || warmup.json()["result"]["done"] != true {
-        return Err(format!("warmup request failed: {:?}", warmup.json()));
+    // The warmup body is network input: parse it fallibly so a malformed
+    // response fails the run with a message instead of a panic.
+    let warmup_json: serde_json::Value = serde_json::from_slice(&warmup.body)
+        .map_err(|error| format!("warmup response JSON: {error}"))?;
+    if warmup.ty != raw_client::TY_RESPONSE || warmup_json["result"]["done"] != true {
+        return Err(format!("warmup request failed: {warmup_json}"));
     }
     let stream = client.into_stream();
     stream
