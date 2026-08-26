@@ -36,6 +36,17 @@ pub mod smart_note_evaluation;
 mod tail_hygiene;
 pub mod transform;
 
+/// Generated pre-build release contract (U8). The file is emitted by
+/// `bun scripts/generate-mc-host-release-manifest.ts` into `release/generated/` and
+/// drift-checked with `--check`; it adds no crate dependency edge (in particular no
+/// `mc-host -> mc-module` edge).
+pub mod release_contract {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../release/generated/mc-host-release-contract.rs"
+    ));
+}
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
@@ -487,23 +498,30 @@ impl Drop for TransformDispatchTicket<'_> {
 /// safety fold.
 /// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
 /// category-grouped `#id: fact` format and applies to every serializer profile.
-pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
+/// Sourced from the generated U8 release contract so status and release compatibility
+/// cannot diverge.
+pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = release_contract::MEMORY_RENDER_EPOCH;
 /// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
 /// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
 /// historian-authored titles before placing them inside the session-history wrapper.
-pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
+pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = release_contract::COMPARTMENT_RENDER_EPOCH;
 /// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages. Epoch 2 flips the profile to full-array tail reclaim
 /// (the Thalamus peer retired the byte-splice at U0), so tool-absent sessions gain the
 /// age/pressure tail reclaim they never had; the bump forces one self-coordinated HARD
 /// fold on the first pass under the new binary, per the epoch contract above.
-pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 2;
+pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 =
+    release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC;
 /// Bumps when any active tag overlay changes provider-visible bytes. Epoch 3 freezes
 /// temporal-marker decisions in durable rows instead of deriving them from each request array.
 /// Every change requires one cache-breaking fold before the new overlay can render. Inactive
 /// requests omit the component and retain their identity.
-pub const TAGGER_FEATURE_EPOCH: u32 = 3;
+pub const TAGGER_FEATURE_EPOCH: u32 = release_contract::TAGGER_EPOCH;
+/// The numeric state-sync epoch (U8). Emitted in Magic Context status alongside the
+/// pre-existing boolean `state_sync_deltas` feature signal so compatibility policy can
+/// require the exact epoch instead of a boolean capability bit.
+pub const STATE_SYNC_EPOCH: u32 = release_contract::STATE_SYNC_EPOCH;
 
 /// The module-owned rendered-prefix format epoch for a serializer profile.
 ///
@@ -545,6 +563,14 @@ pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
     } else {
         0
     }
+}
+
+/// Exact-match compatibility check for the numeric state-sync epoch advertised by a
+/// Magic Context status `epochs` object. The boolean `state_sync_deltas` feature
+/// signal alone is insufficient: boolean-only, missing, nonnumeric, stale, and future
+/// values are all incompatible with this release's contract (U8).
+pub fn state_sync_epoch_compatible(epochs: &Value) -> bool {
+    epochs.get("state_sync_epoch").and_then(Value::as_u64) == Some(STATE_SYNC_EPOCH as u64)
 }
 
 /// Storage namespace for the cache-state domain.
@@ -6489,6 +6515,7 @@ impl McHandler {
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
                 "state_sync_deltas": true,
+                "state_sync_epoch": STATE_SYNC_EPOCH,
             },
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
@@ -8011,6 +8038,7 @@ impl McHandler {
                         "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                         "tagger_epoch": TAGGER_FEATURE_EPOCH,
                         "state_sync_deltas": true,
+                        "state_sync_epoch": STATE_SYNC_EPOCH,
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
@@ -8076,6 +8104,7 @@ impl McHandler {
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
                 "state_sync_deltas": true,
+                "state_sync_epoch": STATE_SYNC_EPOCH,
             },
             "storage_versions": storage_versions_block(&store),
         }))
@@ -35090,5 +35119,274 @@ mod tests {
         assert_eq!(schema["properties"]["message"]["minimum"], json!(0));
         assert_eq!(schema["properties"]["start"]["minimum"], json!(0));
         assert_eq!(schema["properties"]["end"]["minimum"], json!(0));
+    }
+
+    #[test]
+    fn module_status_emits_exact_numeric_state_sync_epoch_alongside_boolean_signal() {
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let outcome = handler.handle_status_value(&json!({"method": "status"}));
+        let PreparedOutcome::Response(bytes) = outcome else {
+            panic!("module status did not respond: {outcome:?}");
+        };
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        let epochs = &status["epochs"];
+        assert_eq!(epochs["state_sync_deltas"], json!(true));
+        assert_eq!(
+            epochs["state_sync_epoch"].as_u64(),
+            Some(release_contract::STATE_SYNC_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["memory_render_epoch"],
+            json!(MEMORY_RENDER_FORMAT_EPOCH)
+        );
+        assert_eq!(
+            epochs["compartment_render_epoch"],
+            json!(COMPARTMENT_RENDER_FORMAT_EPOCH)
+        );
+        assert_eq!(
+            epochs["profile_epoch"],
+            json!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC)
+        );
+        assert_eq!(epochs["tagger_epoch"], json!(TAGGER_FEATURE_EPOCH));
+        assert!(state_sync_epoch_compatible(epochs));
+    }
+}
+
+#[cfg(test)]
+mod release_contract_tests {
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+
+    use crate::{release_contract, state_sync_epoch_compatible};
+
+    fn contract() -> Value {
+        serde_json::from_str(release_contract::RELEASE_CONTRACT_JSON)
+            .expect("generated contract JSON decodes")
+    }
+
+    #[test]
+    fn rust_embedding_decodes_to_the_canonical_contract_and_digest() {
+        let digest = Sha256::digest(release_contract::RELEASE_CONTRACT_JSON.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(digest, release_contract::RELEASE_CONTRACT_SHA256);
+        let contract = contract();
+        assert_eq!(
+            contract["schema"],
+            json!("magic-context.mc-host-release/v1")
+        );
+        assert_eq!(
+            contract["release"]["version"],
+            json!(release_contract::RELEASE_VERSION)
+        );
+        assert_eq!(
+            contract["versions"]["daemon"],
+            json!(release_contract::DAEMON_VERSION)
+        );
+        assert_eq!(
+            contract["versions"]["wire_protocol"].as_u64(),
+            Some(release_contract::WIRE_PROTOCOL_VERSION as u64)
+        );
+    }
+
+    #[test]
+    fn generated_epoch_constants_match_the_decoded_contract_exactly() {
+        let epochs = contract()["epochs"].clone();
+        assert_eq!(
+            epochs["memory_render"].as_u64(),
+            Some(release_contract::MEMORY_RENDER_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["compartment_render"].as_u64(),
+            Some(release_contract::COMPARTMENT_RENDER_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["profile_claude_code_anthropic"].as_u64(),
+            Some(release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC as u64)
+        );
+        assert_eq!(
+            epochs["tagger"].as_u64(),
+            Some(release_contract::TAGGER_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["state_sync"].as_u64(),
+            Some(release_contract::STATE_SYNC_EPOCH as u64)
+        );
+        assert_eq!(epochs.as_object().unwrap().len(), 5);
+        assert_eq!(
+            crate::MEMORY_RENDER_FORMAT_EPOCH,
+            release_contract::MEMORY_RENDER_EPOCH
+        );
+        assert_eq!(
+            crate::COMPARTMENT_RENDER_FORMAT_EPOCH,
+            release_contract::COMPARTMENT_RENDER_EPOCH
+        );
+        assert_eq!(
+            crate::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+            release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
+        );
+        assert_eq!(crate::TAGGER_FEATURE_EPOCH, release_contract::TAGGER_EPOCH);
+        assert_eq!(crate::STATE_SYNC_EPOCH, release_contract::STATE_SYNC_EPOCH);
+    }
+
+    #[test]
+    fn exact_platform_floors_decode_identically_to_the_typescript_contract() {
+        let contract = contract();
+        let supported = contract["platforms"]["supported"].as_array().unwrap();
+        let linux = supported
+            .iter()
+            .find(|platform| platform["target"] == json!("linux-x64-gnu"))
+            .expect("linux platform row");
+        assert_eq!(linux["kernel_min"], json!("4.18"));
+        assert_eq!(linux["glibc_min"], json!("2.28"));
+        assert_eq!(linux["capabilities"]["procfs_self_fd_exec"], json!(true));
+        assert_eq!(linux["synapse"], json!("certified_cpu"));
+        for target in ["darwin-arm64", "darwin-x64"] {
+            let mac = supported
+                .iter()
+                .find(|platform| platform["target"] == json!(target))
+                .expect("macOS platform row");
+            assert_eq!(mac["os_min"], json!("13.5"));
+            assert_eq!(mac["synapse"], json!("unsupported"));
+            assert_eq!(mac["synapse_reason"], json!("synapse_unsupported"));
+        }
+        assert_eq!(
+            contract["platforms"]["unsupported_reason"],
+            json!("unsupported_platform")
+        );
+    }
+
+    #[test]
+    fn coordination_names_are_version_neutral_and_fixed() {
+        assert_eq!(
+            release_contract::COORDINATION_DIRECTORY,
+            ".mc-host-coordination"
+        );
+        assert_eq!(release_contract::TRANSACTION_LOCK_NAME, "transaction.lock");
+        assert_eq!(release_contract::LIFETIME_LOCK_NAME, "lifetime.lock");
+        // Bind the frozen contract to the constants the daemon actually
+        // locks: the coordination names exist in two authorities (mc-host
+        // cannot depend on the contract-bearing mc-module), and drift
+        // between them is mixed-release lock-splitting — the exact failure
+        // the stable coordination files exist to prevent.
+        assert_eq!(
+            release_contract::COORDINATION_DIRECTORY,
+            mc_host::COORDINATION_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::TRANSACTION_LOCK_NAME,
+            mc_host::TRANSACTION_LOCK_NAME
+        );
+        assert_eq!(
+            release_contract::LIFETIME_LOCK_NAME,
+            mc_host::LIFETIME_LOCK_NAME
+        );
+        let coordination = contract()["coordination"].clone();
+        assert_eq!(
+            coordination["directory"],
+            json!(release_contract::COORDINATION_DIRECTORY)
+        );
+        assert_eq!(
+            coordination["transaction_lock"],
+            json!(release_contract::TRANSACTION_LOCK_NAME)
+        );
+        assert_eq!(
+            coordination["lifetime_lock"],
+            json!(release_contract::LIFETIME_LOCK_NAME)
+        );
+    }
+
+    /// The contract freezes the daemon version, while mc-host derives its
+    /// advertised `daemon_ver` from `CARGO_PKG_VERSION`. Binding them here
+    /// makes a crate version bump force contract regeneration instead of
+    /// shipping a daemon that trips `incompatible_daemon` against its own
+    /// launcher.
+    #[test]
+    fn the_default_daemon_ver_matches_the_frozen_contract() {
+        assert_eq!(
+            mc_host::HostConfig::default().daemon_ver,
+            release_contract::DAEMON_VERSION
+        );
+    }
+
+    #[test]
+    fn pre_build_contract_carries_no_binary_model_or_payload_hashes() {
+        fn assert_no_hashes(value: &Value, path: &str) {
+            match value {
+                Value::String(text) => {
+                    assert!(
+                        !(text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())),
+                        "hash-like value at {path}"
+                    );
+                }
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        assert_no_hashes(item, &format!("{path}[{index}]"));
+                    }
+                }
+                Value::Object(map) => {
+                    for (key, child) in map {
+                        let lowered = key.to_ascii_lowercase();
+                        assert!(
+                            !(lowered.split('_').any(|part| part == "hash"
+                                || part == "digest"
+                                || part.starts_with("sha"))),
+                            "hash-bearing key at {path}.{key}"
+                        );
+                        assert_no_hashes(child, &format!("{path}.{key}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_hashes(&contract(), "$");
+    }
+
+    #[test]
+    fn genesis_stop_provenance_schema_carries_no_legacy_authority() {
+        let schema = contract()["stop_provenance_schema"].clone();
+        assert_eq!(schema["tags"], json!(["genesis", "predecessor"]));
+        assert_eq!(schema["genesis"]["legacy_stop_authority"], json!(false));
+        assert_eq!(schema["predecessor"]["legacy_stop_authority"], json!(true));
+        assert_eq!(
+            schema["genesis"]["required_fields"],
+            json!(["release_version", "tag"])
+        );
+        let forbidden = schema["genesis"]["forbidden_fields"].as_array().unwrap();
+        assert!(forbidden.contains(&json!("payload_manifest_digest")));
+        assert!(forbidden.contains(&json!("legacy_proof_version")));
+    }
+
+    #[test]
+    fn state_sync_epoch_compatibility_requires_the_exact_numeric_epoch() {
+        let current = release_contract::STATE_SYNC_EPOCH;
+        assert!(state_sync_epoch_compatible(&json!({
+            "state_sync_deltas": true,
+            "state_sync_epoch": current,
+        })));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_deltas": true })
+        ));
+        assert!(!state_sync_epoch_compatible(&json!({})));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": true })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": "1" })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": 1.5 })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": -1 })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": current - 1 })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": current + 1 })
+        ));
     }
 }
