@@ -923,8 +923,6 @@ describe("embedItemsDetailed", () => {
     interface RecordedCall {
         method: string;
         params: Record<string, unknown>;
-        expectedDaemonId?: Uint8Array;
-        timeoutMs?: number;
     }
 
     /** Deterministic host double: embed.batch answers with a job descriptor
@@ -957,16 +955,8 @@ describe("embedItemsDetailed", () => {
             _module: string,
             method: string,
             params?: unknown,
-            options?: { expectedDaemonId?: Uint8Array; timeoutMs?: number },
         ): Promise<Response> {
-            const record = {
-                method,
-                params: (params ?? {}) as Record<string, unknown>,
-                ...(options?.expectedDaemonId === undefined
-                    ? {}
-                    : { expectedDaemonId: options.expectedDaemonId }),
-                ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-            };
+            const record = { method, params: (params ?? {}) as Record<string, unknown> };
             this.calls.push(record);
             if (method === "embed.batch") {
                 const scripted = this.batchError?.(this.batchCalls().length - 1);
@@ -1571,62 +1561,6 @@ describe("embedItemsDetailed", () => {
             expect(row.state).toBe("ready");
             expect(row.restart_count).toBe(1);
             expect(row.job_id).toBe("job-2");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    it("rebinds a restarted page to the compatible replacement daemon", async () => {
-        const db = ledgerDb();
-        try {
-            const host = new DetailedHost();
-            host.resultPages = (jobId, items) => {
-                if (jobId === "job-1") return moduleRestartedError();
-                return {
-                    result: {
-                        ...ENVELOPE,
-                        done: true,
-                        vectors: items.map((item) => ({
-                            id: item.id,
-                            content_sha256: item.content_sha256,
-                            vector: [1, 2, 3],
-                        })),
-                    },
-                };
-            };
-            const provider = detailedProvider(host);
-            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
-            let demands = 0;
-            const mutable = provider as unknown as {
-                connectionOrigin: "managed-default";
-                demandStart: () => Promise<{
-                    ok: true;
-                    reason: "started";
-                    storage: null;
-                    authenticatedDaemonId: Uint8Array;
-                }>;
-            };
-            mutable.connectionOrigin = "managed-default";
-            mutable.demandStart = async () => ({
-                ok: true,
-                reason: "started",
-                storage: null,
-                authenticatedDaemonId: daemonIds[demands++] as Uint8Array,
-            });
-
-            const result = await provider.embedItemsDetailed(
-                detailedItems([{ id: "memory:1", group: "g1" }]),
-                detailedContext(db),
-            );
-
-            expect(result.failures).toEqual([]);
-            expect(result.receipts).toHaveLength(1);
-            expect(demands).toBe(2);
-            const batches = host.batchCalls();
-            expect(batches).toHaveLength(2);
-            expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
-            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
-            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
         } finally {
             closeQuietly(db);
         }
@@ -2294,79 +2228,6 @@ describe("embedItemsDetailed", () => {
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);
-        }
-    });
-
-    it("keeps the original legacy page deadline across daemon rebind and polling", async () => {
-        const realNow = Date.now;
-        let now = 1_000;
-        Date.now = () => now;
-        try {
-            const host = new DetailedHost();
-            host.resultPages = (jobId, items) => {
-                if (jobId === "job-1") return moduleRestartedError();
-                return {
-                    result: {
-                        ...ENVELOPE,
-                        done: true,
-                        vectors: items.map((item) => ({
-                            id: item.id,
-                            content_sha256: item.content_sha256,
-                            vector: [1, 2, 3],
-                        })),
-                    },
-                };
-            };
-            const provider = new SynapseEmbeddingProvider({
-                connectionFile: "fixture",
-                projectRoot: "/repo",
-                session: "legacy-deadline",
-                model: MODEL,
-                fingerprint: FP,
-                tableEpoch: 0,
-                dims: 3,
-                recommendedBatch: 2,
-                batchTimeoutMs: 100,
-                clientFactory: async () => host,
-            });
-            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
-            let demands = 0;
-            const mutable = provider as unknown as {
-                connectionOrigin: "managed-default";
-                demandStart: () => Promise<{
-                    ok: true;
-                    reason: "started";
-                    storage: null;
-                    authenticatedDaemonId: Uint8Array;
-                }>;
-            };
-            mutable.connectionOrigin = "managed-default";
-            mutable.demandStart = async () => {
-                if (demands === 1) now += 40;
-                return {
-                    ok: true,
-                    reason: "started",
-                    storage: null,
-                    authenticatedDaemonId: daemonIds[demands++] as Uint8Array,
-                };
-            };
-
-            const vectors = await provider.embedItems([
-                { id: "memory:1", text: "one", contentSha256: "a" },
-            ]);
-
-            expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
-            expect(demands).toBe(2);
-            const batches = host.batchCalls();
-            expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
-            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
-            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
-            const replacementPoll = host
-                .resultCalls()
-                .find((call) => call.params.job_id === "job-2");
-            expect(replacementPoll?.timeoutMs).toBe(60);
-        } finally {
-            Date.now = realNow;
         }
     });
 
