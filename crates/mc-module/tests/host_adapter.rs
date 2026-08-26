@@ -64,7 +64,23 @@ async fn host_lifecycle_uses_full_route_handles() {
         BindOutcome::Accept
     ));
     handler.route_gone(old).await;
-    assert_ne!(handler.health().await.status, HealthStatus::Failing);
+    let health = handler.health().await;
+    assert_ne!(health.status, HealthStatus::Failing);
+    let epochs = &health.metrics.expect("health metrics")["epochs"];
+    assert_eq!(
+        epochs["memory_render_epoch"],
+        mc_module::MEMORY_RENDER_FORMAT_EPOCH
+    );
+    assert_eq!(
+        epochs["compartment_render_epoch"],
+        mc_module::COMPARTMENT_RENDER_FORMAT_EPOCH
+    );
+    assert_eq!(
+        epochs["profile_epoch"],
+        mc_module::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
+    );
+    assert_eq!(epochs["tagger_epoch"], mc_module::TAGGER_FEATURE_EPOCH);
+    assert_eq!(epochs["state_sync_epoch"], mc_module::STATE_SYNC_EPOCH);
 
     handler.route_gone(newer).await;
     handler.shutdown().await.unwrap();

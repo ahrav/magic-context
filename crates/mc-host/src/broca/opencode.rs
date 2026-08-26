@@ -81,6 +81,13 @@ impl LlmExecutionBackend for OpenCodeBackend {
             let terminal = backend::harness_mismatch(Harness::OpenCode, request.harness);
             return Box::pin(async move { terminal });
         }
+        if events.emit(BackendEvent::HarnessDispatch {
+            harness: Harness::OpenCode,
+        }) == backend::SinkStatus::Closed
+        {
+            let terminal = backend::dispatch_closed(Harness::OpenCode);
+            return Box::pin(async move { terminal });
+        }
         let runtime = self.runtime.clone();
         let limits = self.limits.clone();
         let env = self.env.clone();
@@ -163,7 +170,10 @@ async fn run_opencode(
         "--format".to_owned(),
         "json".to_owned(),
     ];
-    let executable = match runtime.closure.resolve_node(&runtime.executable_node) {
+    let executable_node = match runtime
+        .closure
+        .resolve_node_descriptor(&runtime.executable_node)
+    {
         Ok(path) => path,
         Err(_) => {
             return subprocess::harness_unavailable_failure(
@@ -195,11 +205,15 @@ async fn run_opencode(
     child_env.push((OsString::from("HOME"), dir.path().as_os_str().to_owned()));
 
     let spec = SubprocessSpec {
-        executable,
+        executable: executable_node.path().to_path_buf(),
         args,
         env: child_env,
         working_dir: dir.path().to_path_buf(),
         stdin: request.prompt.clone().into_bytes(),
+        inherit_fds: vec![
+            runtime.closure.inherited_fd(),
+            executable_node.inherited_fd(),
+        ],
     };
 
     // No terminal probe: the OpenCode CLI closes its streams and exits when

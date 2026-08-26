@@ -97,6 +97,13 @@ impl LlmExecutionBackend for PiBackend {
             let terminal = backend::harness_mismatch(Harness::Pi, request.harness);
             return Box::pin(async move { terminal });
         }
+        if events.emit(BackendEvent::HarnessDispatch {
+            harness: Harness::Pi,
+        }) == backend::SinkStatus::Closed
+        {
+            let terminal = backend::dispatch_closed(Harness::Pi);
+            return Box::pin(async move { terminal });
+        }
         let descriptor = self.descriptor.clone();
         let thinking_level = self.thinking_level.clone();
         let limits = self.limits.clone();
@@ -280,24 +287,28 @@ async fn run_pi(
         "--no-approve".to_owned(),
         "--no-extensions".to_owned(),
     ];
-    let executable = match descriptor
+    let interpreter = match descriptor
         .closure
-        .resolve_node(&descriptor.interpreter_node)
+        .resolve_node_descriptor(&descriptor.interpreter_node)
     {
         Ok(path) => path,
         Err(_) => {
             return subprocess::harness_unavailable_failure(HarnessName::Pi, "closure_incomplete")
         }
     };
-    let entrypoint = match descriptor.closure.resolve_node(&descriptor.entrypoint_node) {
+    let entrypoint = match descriptor
+        .closure
+        .resolve_node_descriptor(&descriptor.entrypoint_node)
+    {
         Ok(path) => path,
         Err(_) => {
             return subprocess::harness_unavailable_failure(HarnessName::Pi, "closure_incomplete")
         }
     };
-    args.insert(0, entrypoint.to_string_lossy().into_owned());
+    args.insert(0, entrypoint.path().to_string_lossy().into_owned());
+    let mut resolved_extensions = Vec::with_capacity(descriptor.provider_extension_nodes.len());
     for extension_node in &descriptor.provider_extension_nodes {
-        let extension = match descriptor.closure.resolve_node(extension_node) {
+        let extension = match descriptor.closure.resolve_node_descriptor(extension_node) {
             Ok(path) => path,
             Err(_) => {
                 return subprocess::harness_unavailable_failure(
@@ -307,7 +318,8 @@ async fn run_pi(
             }
         };
         args.push("--extension".to_owned());
-        args.push(extension.to_string_lossy().into_owned());
+        args.push(extension.path().to_string_lossy().into_owned());
+        resolved_extensions.push(extension);
     }
     args.push("--extension".to_owned());
     args.push(hook_path.to_string_lossy().into_owned());
@@ -337,13 +349,22 @@ async fn run_pi(
     child_env.push((OsString::from("HOME"), dir.path().as_os_str().to_owned()));
 
     let spec = SubprocessSpec {
-        executable,
+        executable: interpreter.path().to_path_buf(),
         args,
         env: child_env,
         working_dir: dir.path().to_path_buf(),
         // Moved, not cloned: the prompt is the request's dominant byte cost
         // and nothing after spec construction reads it.
         stdin: request.prompt.into_bytes(),
+        inherit_fds: std::iter::once(descriptor.closure.inherited_fd())
+            .chain(std::iter::once(interpreter.inherited_fd()))
+            .chain(std::iter::once(entrypoint.inherited_fd()))
+            .chain(
+                resolved_extensions
+                    .iter()
+                    .map(|extension| extension.inherited_fd()),
+            )
+            .collect(),
     };
 
     let result = match subprocess::run(spec, &limits, &cancel, Some(pi_terminal_probe)).await {

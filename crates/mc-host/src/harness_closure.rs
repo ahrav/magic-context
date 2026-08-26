@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -143,6 +144,53 @@ impl ValidatedHarnessClosure {
             .map_err(|_| invalid("resolved node is missing or insecure"))?;
         verify_node_file(&fd, node)?;
         Ok(self.path.join(FILES_NAME).join(node_path))
+    }
+
+    /// Opens and revalidates one node, returning a descriptor path that names
+    /// the verified inode rather than a pathname that can be replaced before
+    /// child exec.
+    pub fn resolve_node_descriptor(
+        &self,
+        node_path: &str,
+    ) -> Result<ResolvedHarnessNode, HarnessClosureError> {
+        let node = self
+            .manifest
+            .nodes
+            .iter()
+            .find(|node| node.path == node_path)
+            .ok_or_else(|| invalid("resolved node is not listed by the manifest"))?;
+        let fd = open_relative_file(&self.files_fd, node_path)
+            .map_err(|_| invalid("resolved node is missing or insecure"))?;
+        verify_node_file(&fd, node)?;
+        let root = if cfg!(target_os = "macos") {
+            "/dev/fd"
+        } else {
+            "/proc/self/fd"
+        };
+        let path = PathBuf::from(root).join(fd.as_raw_fd().to_string());
+        Ok(ResolvedHarnessNode { path, fd })
+    }
+
+    #[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
+    pub fn inherited_fd(&self) -> RawFd {
+        self.files_fd.as_raw_fd()
+    }
+}
+
+#[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
+pub struct ResolvedHarnessNode {
+    path: PathBuf,
+    fd: OwnedFd,
+}
+
+#[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
+impl ResolvedHarnessNode {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn inherited_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 
@@ -630,10 +678,10 @@ fn copy_node(
         &parent,
         basename.as_str(),
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(node.mode),
+        mode_from_u32(node.mode),
     )
     .map_err(|_| invalid("closure node creation failed"))?;
-    rustix::fs::fchmod(&destination, Mode::from_raw_mode(node.mode))
+    rustix::fs::fchmod(&destination, mode_from_u32(node.mode))
         .map_err(|_| invalid("closure node chmod failed"))?;
 
     let mut reader = std::fs::File::from(
@@ -905,10 +953,10 @@ fn write_new_file(
         parent,
         name,
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(mode),
+        mode_from_u32(mode),
     )
     .map_err(|_| invalid("closure metadata file creation failed"))?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
+    rustix::fs::fchmod(&fd, mode_from_u32(mode))
         .map_err(|_| invalid("closure metadata file chmod failed"))?;
     let mut writer = std::fs::File::from(
         rustix::io::dup(&fd).map_err(|_| invalid("closure metadata descriptor dup failed"))?,
@@ -1028,6 +1076,16 @@ fn verify_safe_ancestor(fd: &OwnedFd) -> Result<(), HarnessClosureError> {
 
 fn owner_uid() -> u32 {
     rustix::process::geteuid().as_raw()
+}
+
+#[cfg(target_os = "macos")]
+fn mode_from_u32(mode: u32) -> Mode {
+    Mode::from_raw_mode(u16::try_from(mode).expect("validated mode fits macOS mode_t"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mode_from_u32(mode: u32) -> Mode {
+    Mode::from_raw_mode(mode)
 }
 
 #[cfg(target_os = "macos")]

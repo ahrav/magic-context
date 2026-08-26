@@ -13,6 +13,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::fd::RawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -272,6 +273,8 @@ pub struct SubprocessSpec {
     pub env: Vec<(OsString, OsString)>,
     pub working_dir: PathBuf,
     pub stdin: Vec<u8>,
+    /// Retained directory descriptors that child path arguments reference.
+    pub inherit_fds: Vec<RawFd>,
 }
 
 /// How a child run ended, structurally. Diagnostics built from this carry no
@@ -359,6 +362,7 @@ pub async fn run(
         env,
         working_dir,
         stdin: prompt,
+        inherit_fds,
     } = spec;
     let mut command = tokio::process::Command::new(&executable);
     command
@@ -389,6 +393,7 @@ pub async fn run(
     // not against init — so a host legitimately running as PID 1 (container
     // entrypoint) still spawns; only an actual re-parent aborts.
     let host_pid = std::process::id();
+    let child_inherit_fds = inherit_fds.clone();
     // SAFETY: the hook runs post-fork/pre-exec, where only async-signal-safe
     // operations are permitted. All three calls are raw syscalls (prctl,
     // getppid) with no allocation, locking, or libc state access.
@@ -398,11 +403,15 @@ pub async fn run(
             #[cfg(target_os = "linux")]
             rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
             let parent = rustix::process::getppid().map(|pid| pid.as_raw_nonzero().get() as u32);
-            if parent == Some(host_pid) {
-                Ok(())
-            } else {
-                Err(io::Error::other("host exited before spawn completed"))
+            if parent != Some(host_pid) {
+                return Err(io::Error::other("host exited before spawn completed"));
             }
+            for fd in &child_inherit_fds {
+                if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
         });
     }
     for (name, value) in &env {
@@ -421,6 +430,7 @@ pub async fn run(
     drop(args);
     drop(executable);
     drop(working_dir);
+    drop(inherit_fds);
     // With process_group(0) the leader's pid IS the group id.
     let group = child
         .id()

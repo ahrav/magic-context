@@ -18,6 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fd::OwnedFd;
@@ -217,6 +218,17 @@ impl ValidatedGeneration {
         &self.path
     }
 
+    /// Stable descriptor-rooted path for in-process loaders. The generation
+    /// object must remain alive while the path is used.
+    pub fn descriptor_root_path(&self) -> PathBuf {
+        let root = if cfg!(target_os = "macos") {
+            "/dev/fd"
+        } else {
+            "/proc/self/fd"
+        };
+        PathBuf::from(root).join(self.dir.as_raw_fd().to_string())
+    }
+
     /// Opens one manifest-listed file through the retained validated
     /// directory descriptor, rechecking shape and hash so the returned
     /// descriptor is execution-trustworthy even if the pathname was
@@ -286,6 +298,16 @@ fn open_rel_nofollow(dir: &OwnedFd, rel: &str) -> Option<OwnedFd> {
 
 fn owner_uid() -> u32 {
     rustix::process::geteuid().as_raw()
+}
+
+#[cfg(target_os = "macos")]
+fn mode_from_u32(mode: u32) -> Mode {
+    Mode::from_raw_mode(u16::try_from(mode).expect("validated mode fits macOS mode_t"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mode_from_u32(mode: u32) -> Mode {
+    Mode::from_raw_mode(mode)
 }
 
 fn verify_file_against_entry(fd: &OwnedFd, entry: &ManifestFile) -> Result<(), GenerationError> {
@@ -793,18 +815,18 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
             Err(_) => return Err(invalid("staging directory creation failed")),
         }
     }
-    let mode = if spec.executable { 0o700 } else { 0o600 };
+    let mode: u32 = if spec.executable { 0o700 } else { 0o600 };
     let dest_fd = openat(
         temp_fd,
         spec.rel_path.as_str(),
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(mode),
+        mode_from_u32(mode),
     )
     .map_err(|e| match e {
         rustix::io::Errno::NOSPC => GenerationError::InsufficientStorage,
         _ => invalid("staging output creation failed"),
     })?;
-    rustix::fs::fchmod(&dest_fd, Mode::from_raw_mode(mode))
+    rustix::fs::fchmod(&dest_fd, mode_from_u32(mode))
         .map_err(|_| invalid("staging output chmod failed"))?;
 
     let mut hasher = sha2::Sha256::new();
@@ -878,13 +900,13 @@ fn write_new_file(
         dir,
         name,
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(mode),
+        mode_from_u32(mode),
     )
     .map_err(|e| match e {
         rustix::io::Errno::NOSPC => GenerationError::InsufficientStorage,
         _ => invalid("file creation failed"),
     })?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode)).map_err(|_| invalid("file chmod failed"))?;
+    rustix::fs::fchmod(&fd, mode_from_u32(mode)).map_err(|_| invalid("file chmod failed"))?;
     write_all_fd(&fd, bytes).map_err(|e| {
         if e.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()) {
             GenerationError::InsufficientStorage
@@ -1133,6 +1155,35 @@ mod tests {
         // Restaging the identical sources converges on the same digest.
         let again = stage_default(&store, src.path());
         assert_eq!(again, digest);
+    }
+
+    #[test]
+    fn descriptor_root_survives_generation_path_replacement() {
+        let root = tempfile::tempdir().expect("root");
+        let src = tempfile::tempdir().expect("src");
+        let store = store_at(root.path());
+        let digest = stage_default(&store, src.path());
+        let validated = store.validate(&digest).expect("validate");
+        let descriptor_path = validated.descriptor_root_path().join("bin/ck-mc-host");
+        let expected = std::fs::read(&descriptor_path).expect("descriptor bytes");
+
+        let generation_path = store.root().join(GENERATIONS_DIR_NAME).join(&digest);
+        let moved = store
+            .root()
+            .join(GENERATIONS_DIR_NAME)
+            .join("moved-generation");
+        std::fs::rename(&generation_path, moved).expect("rename generation");
+        std::fs::create_dir_all(generation_path.join("bin")).expect("replacement tree");
+        std::fs::write(
+            generation_path.join("bin/ck-mc-host"),
+            b"malicious replacement",
+        )
+        .expect("replacement bytes");
+
+        assert_eq!(
+            std::fs::read(descriptor_path).expect("retained descriptor bytes"),
+            expected
+        );
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub fn spawn_detached(
     let log_fd = open_log(log_path)?;
     let exe_fd = match generation_launcher {
         Some(fd) => fd,
-        None => {
+        None if test_self_exec_allowed() => {
             let path = std::env::current_exe()
                 .map_err(|_| SpawnError("test executable path unavailable"))?;
             let exe =
@@ -90,6 +90,7 @@ pub fn spawn_detached(
             }
             OwnedFd::from(exe)
         }
+        None => return Err(SpawnError("verified generation launcher is required")),
     };
 
     let mut pipe_fds = [0 as libc::c_int; 2];
@@ -154,7 +155,11 @@ pub fn spawn_detached(
             // Close every other inherited descriptor. close_range needs
             // kernel >= 5.9; the plan floor is 4.18, so fall back to a
             // bounded loop above the CLI's descriptor ceiling.
-            if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0 {
+            #[cfg(target_os = "linux")]
+            let close_range_failed = libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0;
+            #[cfg(target_os = "macos")]
+            let close_range_failed = true;
+            if close_range_failed {
                 for fd in 4..8192 {
                     libc::close(fd);
                 }
@@ -177,6 +182,17 @@ pub fn spawn_detached(
         .and_then(|()| writer.flush())
         .map_err(|_| SpawnError("startup envelope delivery failed"))?;
     Ok(())
+}
+
+pub(super) fn test_self_exec_allowed() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("CK_MC_HOST_TEST_ALLOW_SELF_EXEC").is_some_and(|value| value == "1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 /// Ignores SIGPIPE in the launcher process so a child that dies before

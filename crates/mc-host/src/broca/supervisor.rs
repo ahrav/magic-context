@@ -957,12 +957,15 @@ fn begin_running(run: &Run) -> bool {
 /// first, then a short run-lock append. `Closed` tells the backend the run
 /// accepts nothing further.
 fn append_event(inner: &Arc<Inner>, run: &Arc<Run>, event: BackendEvent) -> SinkStatus {
-    let BackendEvent::AssistantText {
-        text,
-        finish_reason,
-    } = event;
-    let bytes: Box<[u8]> =
-        protocol::assistant_message_unit(&run.run_id, &text, finish_reason).into();
+    let bytes: Box<[u8]> = match event {
+        BackendEvent::HarnessDispatch { harness } => {
+            protocol::harness_dispatch_unit(&run.run_id, harness).into()
+        }
+        BackendEvent::AssistantText {
+            text,
+            finish_reason,
+        } => protocol::assistant_message_unit(&run.run_id, &text, finish_reason).into(),
+    };
     let len = bytes.len();
     let charge = match inner.retained.try_charge(len) {
         Some(charge) => Some(charge),

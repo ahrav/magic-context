@@ -164,6 +164,9 @@ pub enum BackendTerminal {
 /// cap (R18) without promoting it to the run terminal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BackendEvent {
+    HarnessDispatch {
+        harness: Harness,
+    },
     AssistantText {
         text: String,
         finish_reason: Option<FinishReason>,
@@ -269,6 +272,15 @@ pub(crate) fn harness_mismatch(expected: Harness, requested: Harness) -> Backend
             expected.as_str(),
             requested.as_str()
         ),
+        retry_after_secs: None,
+        provider_code: None,
+    })
+}
+
+pub(crate) fn dispatch_closed(harness: Harness) -> BackendTerminal {
+    BackendTerminal::Failed(BackendError {
+        class: ErrorClass::Permanent,
+        message: format!("{} run closed before subprocess dispatch", harness.as_str()),
         retry_after_secs: None,
         provider_code: None,
     })

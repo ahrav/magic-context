@@ -195,12 +195,31 @@ fn retained_closure_survives_source_deletion_and_deduplicates_by_digest() {
         .expect("read retained node"),
         b"export const answer = 42"
     );
-    let digest_directories = std::fs::read_dir(store_root)
+    let digest_directories = std::fs::read_dir(&store_root)
         .expect("read store")
         .filter_map(Result::ok)
         .filter(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp-"))
         .count();
     assert_eq!(digest_directories, 1);
+
+    let descriptor_path = second
+        .resolve_node_descriptor("node_modules/pi/dist/helper.js")
+        .expect("descriptor-rooted retained node");
+    let retained = store_root.join(&digest);
+    let moved = store_root.join("moved-retained");
+    std::fs::rename(&retained, &moved).expect("rename retained closure");
+    let replacement = retained.join("files/node_modules/pi/dist");
+    std::fs::create_dir_all(&replacement).expect("replacement tree");
+    std::fs::write(
+        replacement.join("helper.js"),
+        b"export const answer = 'malicious'",
+    )
+    .expect("replacement bytes");
+    assert_eq!(
+        std::fs::read(descriptor_path.path()).expect("read descriptor-rooted node"),
+        b"export const answer = 42",
+        "path replacement must not change the retained closure object"
+    );
 }
 
 #[test]

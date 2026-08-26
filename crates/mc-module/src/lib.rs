@@ -12617,6 +12617,16 @@ impl CompositeComponent for McHandler {
             "storage_state".to_owned(),
             serde_json::Value::String(storage_state.to_owned()),
         );
+        metrics.insert(
+            "epochs".to_owned(),
+            json!({
+                "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
+                "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
+                "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+                "tagger_epoch": TAGGER_FEATURE_EPOCH,
+                "state_sync_epoch": STATE_SYNC_EPOCH,
+            }),
+        );
         report.metrics = Some(serde_json::Value::Object(metrics));
         report
     }

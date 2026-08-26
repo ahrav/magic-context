@@ -15,7 +15,7 @@ use crate::synapse::protocol::{
 
 pub use crate::synapse::protocol::RequestError;
 
-use super::backend::{BackendError, FinishReason};
+use super::backend::{BackendError, FinishReason, Harness};
 use super::config::{MAX_OUTPUT_TOKENS_BOUND, MAX_SEND_BODY_BYTES, TEMPERATURE_RANGE};
 
 /// Whole-body structural depth cap, matching the profile convention set by
@@ -317,6 +317,14 @@ fn control_event(unit: serde_json::Value) -> Vec<u8> {
 
 pub fn run_started_unit(run_id: &str) -> Vec<u8> {
     control_event(serde_json::json!({ "type": "run_started", "run_id": run_id }))
+}
+
+pub fn harness_dispatch_unit(run_id: &str, harness: Harness) -> Vec<u8> {
+    control_event(serde_json::json!({
+        "type": "harness_dispatch",
+        "run_id": run_id,
+        "harness": harness.as_str(),
+    }))
 }
 
 /// Assistant text in the nested content-block shape the producer's
