@@ -260,19 +260,25 @@ fn byte_array(value: &serde_json::Value) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// `HMAC-SHA256(key, domain || client_nonce || server_nonce || daemon_id)`,
-/// written out from the protocol text rather than shared with the host.
+/// `HMAC-SHA256(key, domain || client_nonce || server_nonce ||
+/// u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`, written out
+/// from the protocol text rather than shared with the host.
 pub fn proof(
     key: &[u8],
     domain: &[u8],
     client_nonce: &[u8],
     server_nonce: &[u8],
+    daemon_ver: &str,
     daemon_id: &[u8],
 ) -> Vec<u8> {
+    let daemon_ver = daemon_ver.as_bytes();
+    let daemon_ver_len = u32::try_from(daemon_ver.len()).expect("bounded auth daemon version");
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(domain);
     mac.update(client_nonce);
     mac.update(server_nonce);
+    mac.update(&daemon_ver_len.to_be_bytes());
+    mac.update(daemon_ver);
     mac.update(daemon_id);
     mac.finalize().into_bytes().to_vec()
 }
@@ -362,6 +368,7 @@ impl RawClient {
             SERVER_DOMAIN,
             &client_nonce,
             &server_nonce,
+            &daemon_ver,
             &daemon_id,
         );
         if expected != server_proof {
@@ -376,6 +383,7 @@ impl RawClient {
             CLIENT_DOMAIN,
             &client_nonce,
             &server_nonce,
+            &daemon_ver,
             &daemon_id,
         );
         write_auth(

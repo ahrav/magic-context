@@ -8,7 +8,8 @@
  *
  * Each message is a `u32` little-endian byte length followed by at most
  * 4,096 UTF-8 JSON bytes. Proofs are
- * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce || daemon_id)`.
+ * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce ||
+ * u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`.
  * The client compares the server proof in constant time, then requires the
  * server's daemon ID to equal the connection-file daemon ID, and emits no
  * ClientAuth until both checks pass. Every failure is typed and redacted:
@@ -74,7 +75,8 @@ export interface AuthResult {
 }
 
 /**
- * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce || daemon_id)`
+ * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce ||
+ * u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`
  * per wire doc Section 5.2. Exported so tests can reproduce the committed
  * literal vectors independently of the transcript path.
  */
@@ -83,12 +85,18 @@ export function computeProof(
     domain: string,
     clientNonce: Uint8Array,
     serverNonce: Uint8Array,
+    daemonVer: string,
     daemonId: Uint8Array,
 ): Uint8Array {
+    const daemonVerBytes = Buffer.from(daemonVer, "utf8");
+    const daemonVerLen = Buffer.allocUnsafe(4);
+    daemonVerLen.writeUInt32BE(daemonVerBytes.length);
     const mac = createHmac("sha256", key);
     mac.update(Buffer.from(domain, "ascii"));
     mac.update(clientNonce);
     mac.update(serverNonce);
+    mac.update(daemonVerLen);
+    mac.update(daemonVerBytes);
     mac.update(daemonId);
     return new Uint8Array(mac.digest());
 }
@@ -256,6 +264,7 @@ export async function authenticateClient(
         SERVER_PROOF_DOMAIN,
         clientNonce,
         server.serverNonce,
+        server.daemonVer,
         server.daemonId,
     );
     if (!constantTimeEqual(expectedServerProof, server.serverProof)) {
@@ -272,6 +281,7 @@ export async function authenticateClient(
         CLIENT_AUTH_DOMAIN,
         clientNonce,
         server.serverNonce,
+        server.daemonVer,
         server.daemonId,
     );
     await writeMessage(io, { client_auth: Array.from(clientAuth) }, deadline);
