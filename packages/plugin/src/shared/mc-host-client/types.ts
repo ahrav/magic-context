@@ -107,6 +107,8 @@ export interface RequestOptions {
     timeoutMs?: number;
     /** The facade attaches `McHostCallError.cleanup` when this signal aborts the request. */
     signal?: AbortSignal;
+    /** Reject before publication unless the active authenticated generation has this daemon ID. */
+    expectedDaemonId?: Uint8Array;
 }
 
 /** Options for the managed `call()` path (embedding-synapse usage). */

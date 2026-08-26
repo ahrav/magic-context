@@ -15,10 +15,18 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
+import type { CatalogEntry } from "../mc-host-client";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
+    type CompatibilityVerdict,
+    evaluateCompatibility,
+    evaluateDaemonCompatibility,
+    evaluateEpochCompatibility,
+    evaluateModuleCompatibility,
+    type ObservedEpochs,
+} from "./compatibility";
+import {
     classifyPreNativeRoots,
-    type DaemonCheck,
     type DaemonReadiness,
     type DaemonReason,
     type DaemonResultV1,
@@ -47,9 +55,31 @@ export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor
 
 export type StorageReadiness = "ready" | "starting" | "unavailable";
 
-export interface ObservationalHealth {
-    readiness: DaemonReadiness;
+export type CompatibilityStage = "daemon" | "modules" | "epochs";
+
+export interface CompatibilitySnapshot {
     authenticatedDaemonVersion: string;
+    authenticatedDaemonId: Uint8Array;
+    catalog: CatalogEntry[];
+    epochs: ObservedEpochs;
+    /** Last stage reached by the ordered authenticated compatibility probe. */
+    evaluatedThrough?: CompatibilityStage;
+}
+
+export interface ObservationalHealth extends CompatibilitySnapshot {
+    readiness: DaemonReadiness;
+}
+
+function compatibilityInput(snapshot: CompatibilitySnapshot): {
+    authenticatedDaemonVer: string;
+    catalog: CatalogEntry[];
+    epochs: ObservedEpochs;
+} {
+    return {
+        authenticatedDaemonVer: snapshot.authenticatedDaemonVersion,
+        catalog: snapshot.catalog,
+        epochs: snapshot.epochs,
+    };
 }
 
 export class WaiterDetachedError extends Error {
@@ -79,6 +109,8 @@ export interface LifecyclePolicyOptions {
      * The default reports `ready` for explicit and test-only policy instances.
      */
     storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
+    /** Authenticated daemon, catalog, and Magic Context epoch snapshot for demand. */
+    compatibilityProbe?: (budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>;
     /** Authenticated route-free component health for status and doctor. */
     readinessProbe?: (budgetMs: number) => Promise<ObservationalHealth>;
     /** Dev/test payload directory forwarded to native start/restart. */
@@ -134,6 +166,8 @@ export interface DemandStartOutcome {
      * Callers must send no Rust application body unless this is `ready`.
      */
     storage: StorageReadiness | null;
+    /** Authenticated incarnation that passed compatibility; bind application traffic to it. */
+    authenticatedDaemonId?: Uint8Array;
 }
 
 export class McHostLifecyclePolicy {
@@ -143,6 +177,9 @@ export class McHostLifecyclePolicy {
     private readonly platformReaders: PlatformReaders | undefined;
     private readonly admissionIo: AdmissionIo | undefined;
     private readonly storageProbe: (budgetMs: number) => Promise<StorageReadiness>;
+    private readonly compatibilityProbe:
+        | ((budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>)
+        | undefined;
     private readonly readinessProbe:
         | ((budgetMs: number) => Promise<ObservationalHealth>)
         | undefined;
@@ -160,6 +197,7 @@ export class McHostLifecyclePolicy {
         this.platformReaders = options.platformReaders;
         this.admissionIo = options.admissionIo;
         this.storageProbe = options.storageProbe ?? (async () => "ready");
+        this.compatibilityProbe = options.compatibilityProbe;
         this.readinessProbe = options.readinessProbe;
         this.payloadDir = options.payloadDir;
         this.payloadManifestDigest = options.payloadManifestDigest;
@@ -224,14 +262,33 @@ export class McHostLifecyclePolicy {
                 });
         }
         const result = await this.raceWaiter(shared, request);
-        if (request.capability !== "magic-context" || !result.ok) {
+        if (!result.ok) {
             return { result, storage: null };
         }
-        const remainingMs =
+        const remaining = (): number | undefined =>
             request.deadlineMs === undefined
                 ? undefined
                 : Math.max(0, request.deadlineMs - (Date.now() - waiterStartedAt));
+        let remainingMs = remaining();
         if (remainingMs === 0) throw new WaiterDetachedError("deadline");
+        let compatibleResult = result;
+        let authenticatedDaemonId: Uint8Array | undefined;
+        if (this.compatibilityProbe !== undefined) {
+            const compatibilityBudget = remainingMs ?? this.outerAggregateMs;
+            const snapshot = await this.raceDetached(
+                this.compatibilityProbe(Math.max(1, compatibilityBudget), request.signal),
+                request.signal,
+                remainingMs,
+            );
+            compatibleResult = this.applyCompatibility(result, snapshot);
+            if (!compatibleResult.ok) return { result: compatibleResult, storage: null };
+            authenticatedDaemonId = Uint8Array.from(snapshot.authenticatedDaemonId);
+            remainingMs = remaining();
+            if (remainingMs === 0) throw new WaiterDetachedError("deadline");
+        }
+        if (request.capability !== "magic-context") {
+            return { result: compatibleResult, storage: null, authenticatedDaemonId };
+        }
         const storageBudget =
             remainingMs === undefined
                 ? STORAGE_HARD_BUDGET_MS
@@ -241,7 +298,7 @@ export class McHostLifecyclePolicy {
             request.signal,
             remainingMs,
         );
-        return { result, storage };
+        return { result: compatibleResult, storage, authenticatedDaemonId };
     }
 
     private raceWaiter(
@@ -383,6 +440,11 @@ export class McHostLifecyclePolicy {
     private async observationalCommand(command: "status" | "doctor"): Promise<DaemonResultV1> {
         const preflight = this.preflight(command);
         if (!preflight.ok) return preflight.result;
+        const platform = checkPlatform(this.platformReaders);
+        if (!platform.ok) {
+            const state = preNativeState(classifyPreNativeRoots(preflight.root));
+            return localResult(command, false, state, "unsupported_platform");
+        }
         if (this.launchTarget === null) {
             // No trusted retained current-release bootstrap: only the bounded
             // no-follow classifier may speak, and it authorizes nothing.
@@ -401,7 +463,10 @@ export class McHostLifecyclePolicy {
                 return { ...native, command };
             }
             const observed = await this.readinessProbe(Math.max(1, deadline - Date.now()));
-            const checks: DaemonCheck[] = [...native.checks];
+            const compatible = this.applyCompatibility(native, observed);
+            const checksById = new Map(
+                compatible.checks.map((check) => [check.id, check] as const),
+            );
             const addCheck = (
                 id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
@@ -412,7 +477,7 @@ export class McHostLifecyclePolicy {
                         : record.state === "unsupported"
                           ? "skip"
                           : "fail";
-                checks.push({
+                checksById.set(id, {
                     id,
                     status,
                     reason: record.reason,
@@ -428,25 +493,93 @@ export class McHostLifecyclePolicy {
             if (observed.readiness.synapse) {
                 addCheck("readiness.synapse", observed.readiness.synapse);
             }
-            checks.sort((left, right) => left.id.localeCompare(right.id));
-            const failed = checks.find((check) => check.status === "fail");
+            const checks = [...checksById.values()].sort((left, right) =>
+                left.id.localeCompare(right.id),
+            );
+            const readinessFailure = [
+                checksById.get("readiness.transport"),
+                checksById.get("readiness.storage"),
+                checksById.get("readiness.synapse"),
+            ].find((check) => check?.status === "fail");
+            const compatibility = evaluateCompatibility(compatibilityInput(observed));
+            const failureReason = compatibility.ok
+                ? readinessFailure?.reason
+                : compatibility.reason;
             return {
-                ...native,
+                ...compatible,
                 command,
-                ok: failed === undefined,
-                reason: failed?.reason ?? "healthy",
-                remediation: failed?.remediation ?? null,
+                ok: failureReason === undefined,
+                reason: failureReason ?? "healthy",
+                remediation:
+                    failureReason === undefined ? null : remediationForReason(failureReason),
                 readiness: observed.readiness,
                 checks,
-                versions: {
-                    ...native.versions,
-                    proof: "current",
-                    daemon: observed.authenticatedDaemonVersion,
-                },
             };
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
+    }
+
+    private applyCompatibility(
+        result: DaemonResultV1,
+        snapshot: CompatibilitySnapshot,
+    ): DaemonResultV1 {
+        const verdict = evaluateCompatibility(compatibilityInput(snapshot));
+        const stages: ReadonlyArray<{
+            stage: CompatibilityStage;
+            id: "compatibility.daemon" | "compatibility.modules" | "compatibility.epochs";
+            verdict: CompatibilityVerdict;
+        }> = [
+            {
+                stage: "daemon",
+                id: "compatibility.daemon",
+                verdict: evaluateDaemonCompatibility(snapshot.authenticatedDaemonVersion),
+            },
+            {
+                stage: "modules",
+                id: "compatibility.modules",
+                verdict: evaluateModuleCompatibility(snapshot.catalog),
+            },
+            {
+                stage: "epochs",
+                id: "compatibility.epochs",
+                verdict: evaluateEpochCompatibility(snapshot.epochs),
+            },
+        ];
+        const stageOrder: Record<CompatibilityStage, number> = {
+            daemon: 0,
+            modules: 1,
+            epochs: 2,
+        };
+        const evaluatedThrough = snapshot.evaluatedThrough ?? "epochs";
+        const checksById = new Map(result.checks.map((check) => [check.id, check] as const));
+        for (const stage of stages) {
+            if (stageOrder[stage.stage] > stageOrder[evaluatedThrough]) continue;
+            const reason = stage.verdict.ok ? "healthy" : stage.verdict.reason;
+            checksById.set(stage.id, {
+                id: stage.id,
+                status: stage.verdict.ok ? "pass" : "fail",
+                reason,
+                remediation: remediationForReason(reason),
+            });
+        }
+        const moduleVersion = (moduleId: string): string | null =>
+            snapshot.catalog.find((entry) => entry.module_id === moduleId)?.module_version ?? null;
+        return {
+            ...result,
+            ok: result.ok && verdict.ok,
+            reason: verdict.ok ? result.reason : verdict.reason,
+            remediation: verdict.ok ? result.remediation : remediationForReason(verdict.reason),
+            checks: [...checksById.values()].sort((left, right) => left.id.localeCompare(right.id)),
+            versions: {
+                ...result.versions,
+                proof: "current",
+                daemon: snapshot.authenticatedDaemonVersion,
+                magic_context: moduleVersion("magic-context"),
+                synapse: moduleVersion("synapse"),
+                broca: moduleVersion("broca"),
+            },
+        };
     }
 
     private nativeEnv(root: string): Record<string, string> {

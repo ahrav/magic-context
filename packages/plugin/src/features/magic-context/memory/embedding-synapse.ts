@@ -94,6 +94,7 @@ export interface SynapseClientLike {
             timeoutMs?: number;
             identity?: { project_root: string; harness: string; session: string };
             targetKind?: "management_surface" | "tool_provider";
+            expectedDaemonId?: Uint8Array;
         },
     ): Promise<Response>;
     close(): void;
@@ -126,7 +127,12 @@ export type SynapseDemandStart = (request: {
     capability: "synapse";
     signal?: AbortSignal;
     deadlineMs?: number;
-}) => Promise<{ ok: boolean; reason: string; storage: StorageReadiness | null }>;
+}) => Promise<{
+    ok: boolean;
+    reason: string;
+    storage: StorageReadiness | null;
+    authenticatedDaemonId?: Uint8Array;
+}>;
 
 let configuredManagedDemandStart: SynapseDemandStart | undefined;
 
@@ -270,6 +276,7 @@ function classifyError(value: unknown): SynapseEmbeddingError {
     else if (normalized.includes("probe_required")) mapped = "probe_required";
     else if (normalized.includes("idempotency_conflict")) mapped = "idempotency_conflict";
     else if (normalized.includes("schema")) mapped = "schema_violation";
+    else if (normalized.includes("daemon_generation_changed")) mapped = "module_restarted";
     else if (normalized.includes("module_restarted") || normalized.includes("module restarted"))
         mapped = "module_restarted";
     const message = value instanceof Error ? value.message : String(value);
@@ -551,10 +558,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private readonly options: SynapseEmbeddingProviderOptions;
     private readonly connectionOrigin: ConnectionOrigin;
     private readonly demandStart: SynapseDemandStart | undefined;
+    private compatibleDaemonId: Uint8Array | null = null;
     private client: SynapseClientLike | null = null;
     private initialized = false;
     private initializing: Promise<boolean> | null = null;
-    private managedDemand: Promise<{ ok: boolean; reason: string }> | null = null;
+    private managedDemand: ReturnType<SynapseDemandStart> | null = null;
     private permanentFailure = false;
     private batchLimit = 16;
     private tokenBudget: number | null = null;
@@ -651,6 +659,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         if (this.permanentFailure) return false;
         if (this.connectionOrigin === "managed-default") {
             try {
+                this.compatibleDaemonId = null;
                 if (!this.demandStart) {
                     throw Object.assign(
                         new Error("managed mc-host lifecycle owner is unavailable"),
@@ -677,6 +686,13 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         `managed Synapse demand failed: ${outcome.reason}`,
                     );
                 }
+                if (outcome.authenticatedDaemonId === undefined) {
+                    throw new SynapseEmbeddingError(
+                        "transport",
+                        "managed lifecycle compatibility returned no daemon identity",
+                    );
+                }
+                this.compatibleDaemonId = Uint8Array.from(outcome.authenticatedDaemonId);
             } catch (error) {
                 log(
                     `[magic-context] Synapse lane unavailable: ${error instanceof Error ? error.message : String(error)}`,
@@ -1537,6 +1553,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             harness: getHarness(),
                             session: this.options.session,
                         },
+                        ...(this.compatibleDaemonId === null
+                            ? {}
+                            : { expectedDaemonId: this.compatibleDaemonId }),
                     },
                 );
             } catch (error) {
@@ -1616,6 +1635,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private logCallFailure(error: unknown, operation: string): void {
         const classified = classifyError(error);
+        if (classified.code === "module_restarted") {
+            this.initialized = false;
+            this.compatibleDaemonId = null;
+        }
         if (classified.permanent && !isPageScopedSynapseCode(classified.code)) {
             this.permanentFailure = true;
         }

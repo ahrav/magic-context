@@ -30,7 +30,11 @@ import {
 } from "./embedding-synapse";
 
 class MockSynapseClient implements SynapseClientLike {
-    readonly requests: Array<{ method: string; params: unknown }> = [];
+    readonly requests: Array<{
+        method: string;
+        params: unknown;
+        expectedDaemonId?: Uint8Array;
+    }> = [];
     private batchAttempts = 0;
     constructor(private readonly batchSize = 2) {}
 
@@ -38,8 +42,20 @@ class MockSynapseClient implements SynapseClientLike {
         _module: string,
         method: string,
         params?: unknown,
+        options?: {
+            timeoutMs?: number;
+            identity?: { project_root: string; harness: string; session: string };
+            targetKind?: "management_surface" | "tool_provider";
+            expectedDaemonId?: Uint8Array;
+        },
     ): Promise<Response> {
-        this.requests.push({ method, params });
+        this.requests.push({
+            method,
+            params,
+            ...(options?.expectedDaemonId === undefined
+                ? {}
+                : { expectedDaemonId: options.expectedDaemonId }),
+        });
         if (method === "models.list") {
             return {
                 models: [
@@ -157,6 +173,25 @@ describe("SynapseEmbeddingProvider", () => {
             allow_equivalent: false,
             accept_declared: false,
         });
+    });
+
+    it("binds Synapse calls to the lifecycle-compatible daemon identity", async () => {
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "daemon-bound",
+            clientFactory: async () => client,
+        });
+        const expectedDaemonId = new Uint8Array([1, 2, 3, 4]);
+        (
+            provider as unknown as {
+                compatibleDaemonId: Uint8Array | null;
+            }
+        ).compatibleDaemonId = expectedDaemonId;
+
+        expect(await provider.initialize()).toBe(true);
+        expect(client.requests[0]?.expectedDaemonId).toEqual(expectedDaemonId);
     });
 
     it("adopts the catalog's advertised input limits", async () => {
