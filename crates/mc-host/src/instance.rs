@@ -60,6 +60,19 @@ pub enum InstanceError {
     },
     /// Another live host instance holds the lock.
     AlreadyRunning,
+    /// The supplied payload-manifest digest is not the canonical release
+    /// digest shape (64 lowercase hex characters).
+    InvalidPayloadDigest,
+    /// A persisted lifecycle record carries an unknown schema. The bytes are
+    /// quarantined: never interpreted, migrated, overwritten, or removed.
+    UnsupportedStateSchema {
+        path: PathBuf,
+    },
+    /// A retained managed-namespace descriptor no longer matches the identity
+    /// its name resolves to; the holder must abort its named-namespace result.
+    NamespaceDrift {
+        path: PathBuf,
+    },
     Random,
 }
 
@@ -83,6 +96,21 @@ impl fmt::Display for InstanceError {
                 path.display()
             ),
             Self::AlreadyRunning => write!(f, "another mc-host instance holds the lock"),
+            Self::InvalidPayloadDigest => write!(
+                f,
+                "payload-manifest digest must be {} lowercase hex characters",
+                crate::lifecycle::PAYLOAD_MANIFEST_DIGEST_LEN
+            ),
+            Self::UnsupportedStateSchema { path } => write!(
+                f,
+                "refusing to touch an unknown lifecycle state schema at {}",
+                path.display()
+            ),
+            Self::NamespaceDrift { path } => write!(
+                f,
+                "managed namespace identity drifted at {}",
+                path.display()
+            ),
             Self::Random => write!(f, "OS CSPRNG failure while minting credentials"),
         }
     }
@@ -105,21 +133,30 @@ pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -
     }
 }
 
+/// Resolves the data root: the override, a nonempty `$XDG_DATA_HOME`, or a
+/// nonempty `$HOME/.local/share`, in that order.
+pub(crate) fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
+    match data_dir_override {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => match std::env::var_os("XDG_DATA_HOME") {
+            Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+            _ => match std::env::var_os("HOME") {
+                Some(home) if !home.is_empty() => {
+                    Ok(PathBuf::from(home).join(".local").join("share"))
+                }
+                _ => Err(InstanceError::NoDataDir),
+            },
+        },
+    }
+}
+
 /// Resolves `${dataDir}/cortexkit/run`, where dataDir is the override, a
 /// nonempty `$XDG_DATA_HOME`, or a nonempty `$HOME/.local/share`, in that
 /// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
-    let data_dir = match data_dir_override {
-        Some(dir) => dir.to_path_buf(),
-        None => match std::env::var_os("XDG_DATA_HOME") {
-            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => match std::env::var_os("HOME") {
-                Some(home) if !home.is_empty() => PathBuf::from(home).join(".local").join("share"),
-                _ => return Err(InstanceError::NoDataDir),
-            },
-        },
-    };
-    Ok(data_dir.join("cortexkit").join("run"))
+    Ok(data_dir_path(data_dir_override)?
+        .join("cortexkit")
+        .join("run"))
 }
 
 /// One secured host incarnation: validated directory descriptor, held lock,
@@ -136,7 +173,12 @@ pub struct InstanceGuard {
     key: ConnectionKey,
     daemon_id: [u8; DAEMON_ID_LEN],
     launch_id: [u8; 16],
+    payload_manifest_digest: String,
     publication: Option<PublicationIdentity>,
+    /// The stable incarnation fence, declared after `dir` so the runtime
+    /// lock releases first and the lifetime fence outlives every
+    /// descriptor-relative cleanup step.
+    _lifetime: crate::lifecycle::LifetimeLock,
 }
 
 /// Identity retained at publish time for the best-effort check that the
@@ -157,16 +199,40 @@ impl fmt::Debug for InstanceGuard {
 }
 
 impl InstanceGuard {
-    /// Secures the runtime directory, acquires the single-instance lock, and
-    /// mints fresh credentials — in that order, so credentials never exist for
-    /// an incarnation that lost the lock race (protocol §8.1).
-    pub fn acquire(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
+    /// Takes the stable lifetime fence, secures the runtime directory,
+    /// acquires the runtime-directory lock, and mints fresh credentials — in
+    /// that order, so credentials never exist for an incarnation that lost a
+    /// lock race (protocol §8.1) and replacing the managed subtree can never
+    /// admit an overlapping incarnation while this guard lives.
+    ///
+    /// `payload_manifest_digest` is required identity for every persisted
+    /// lifecycle record: exactly the canonical release digest shape
+    /// (64 lowercase hex characters), rejected otherwise.
+    pub fn acquire(
+        data_dir_override: Option<&Path>,
+        payload_manifest_digest: &str,
+    ) -> Result<Self, InstanceError> {
         if !cfg!(unix) {
             return Err(InstanceError::UnsupportedPlatform);
         }
+        if !crate::lifecycle::is_canonical_payload_digest(payload_manifest_digest) {
+            return Err(InstanceError::InvalidPayloadDigest);
+        }
+        // The lifetime fence comes first: it lives outside the replaceable
+        // `cortexkit` subtree, so it is the authority that survives `run` or
+        // whole-subtree replacement. The runtime-directory lock below remains
+        // the publication/cleanup fence for descriptor-relative evidence.
+        let lifetime = crate::lifecycle::LifetimeLock::acquire(data_dir_override)?;
         let dir_path = runtime_dir_path(data_dir_override)?;
         let dir = secure_runtime_dir(&dir_path)?;
         lock_instance(&dir, &dir_path)?;
+        // An unknown lifecycle schema at the record name is quarantined:
+        // starting here would overwrite it, so refuse before any mutation.
+        if crate::lifecycle::quarantined_record_present(&dir) {
+            return Err(InstanceError::UnsupportedStateSchema {
+                path: dir_path.join(crate::lifecycle::LIFECYCLE_RECORD_NAME),
+            });
+        }
         // Sweep under the freshly held lock rather than at publish: an
         // incarnation that crash-loops before ever publishing still reclaims
         // its predecessors' stale temp files on each start.
@@ -185,7 +251,9 @@ impl InstanceGuard {
             key: ConnectionKey(key),
             daemon_id,
             launch_id,
+            payload_manifest_digest: payload_manifest_digest.to_owned(),
             publication: None,
+            _lifetime: lifetime,
         })
     }
 
@@ -199,6 +267,10 @@ impl InstanceGuard {
 
     pub fn launch_id(&self) -> &[u8; 16] {
         &self.launch_id
+    }
+
+    pub(crate) fn payload_manifest_digest(&self) -> &str {
+        &self.payload_manifest_digest
     }
 
     pub(crate) fn dir(&self) -> &OwnedFd {
@@ -470,21 +542,20 @@ pub(crate) fn write_atomic_owner_only(
 }
 
 /// Takes the nonblocking exclusive advisory lock that makes this process the
-/// single host for `dir`.
+/// publication owner for `dir`.
 ///
 /// One attempt, no waiting: contention is reported as `AlreadyRunning` so the
 /// caller decides how to wait. `run` retries on its own async timer rather
 /// than sleeping an executor thread; synchronous callers use
 /// [`flock_exclusive_bounded`].
 ///
-/// The lock is held on the runtime-directory descriptor itself. Every instance
-/// that serves this runtime directory must resolve this same inode to reach
-/// the shared publication, so all of them contend for one lock. A lock file
-/// addressed by name does not have that property: renaming it away lets the
-/// next instance create a fresh inode under the same name and lock that one
-/// instead, so both processes believe they hold it and publish over each
-/// other. `lock_ownership_survives_renaming_the_runtime_dir` pins the
-/// difference.
+/// The lock is held on the runtime-directory descriptor and fences
+/// descriptor-relative publication and evidence cleanup only. The directory
+/// is replaceable, so this lock alone does not prevent replacement-induced
+/// overlap: renaming `run` or `cortexkit` away lets a successor anchor a
+/// fresh inode under the same name. Overlap across replacement is refused by
+/// `crate::lifecycle::LifetimeLock`, acquired before this lock on the
+/// never-renamed coordination file.
 /// commentlint: allow(JUDGE)
 fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
     match flock(dir, FlockOperation::NonBlockingLockExclusive) {
@@ -499,7 +570,7 @@ fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
 ///
 /// An observer holds a lifecycle lock only long enough to read it — a probe
 /// tests instance-lock freedom with a shared lock, and holds the
-/// lifecycle-root lock shared for one sample — but shared still blocks
+/// coordination transaction lock shared for one sample — but shared still blocks
 /// exclusive, so an unlucky mutator can collide with one. Retrying briefly
 /// keeps that from being reported as a live holder. These are the single
 /// definition of that policy: [`flock_exclusive_bounded`] applies them
@@ -554,7 +625,7 @@ pub(crate) fn flock_exclusive_bounded(
 pub(crate) const S_IFMT: u32 = 0o170000;
 const S_ISVTX: u32 = 0o1000;
 pub(crate) const S_IFDIR: u32 = 0o040000;
-const S_IFREG: u32 = 0o100000;
+pub(crate) const S_IFREG: u32 = 0o100000;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
@@ -723,6 +794,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
+    const TEST_DIGEST: &str = "3d7f9a1c5b2e8f0a6d4c7b9e1f3a5c8d2b4e6f0a1c3d5e7f9b0d2f4a6c8e0b1d";
+
     /// `runtime_dir_path` reads process-global environment, so the tests that
     /// mutate it cannot run concurrently with each other.
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -788,7 +861,7 @@ mod tests {
     #[test]
     fn permissive_umask_still_yields_owner_only_dir_and_file() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(43123, "mc-host/test").expect("publish");
 
         assert_eq!(mode_of(guard.dir_path()), 0o700);
@@ -810,7 +883,7 @@ mod tests {
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777))
             .expect("loosen intermediate");
 
-        let err = InstanceGuard::acquire(Some(&loose)).expect_err("must refuse");
+        let err = InstanceGuard::acquire(Some(&loose), TEST_DIGEST).expect_err("must refuse");
         assert!(
             matches!(
                 err,
@@ -830,14 +903,14 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create dir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("loosen dir");
 
-        let guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         assert_eq!(mode_of(guard.dir_path()), 0o700);
     }
 
     #[test]
     fn publication_matches_schema_1_shape() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(43123, "mc-host/test").expect("publish");
 
         let bytes = std::fs::read(published(&guard)).expect("read publication");
@@ -856,11 +929,13 @@ mod tests {
     #[test]
     fn second_instance_fails_before_touching_the_first_publication() {
         let root = temp_root();
-        let mut first = InstanceGuard::acquire(Some(root.path())).expect("first acquire");
+        let mut first =
+            InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
         first.publish(1111, "mc-host/first").expect("publish");
         let before = std::fs::read(published(&first)).expect("read first");
 
-        let err = InstanceGuard::acquire(Some(root.path())).expect_err("second must fail");
+        let err =
+            InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect_err("second must fail");
         assert!(matches!(err, InstanceError::AlreadyRunning));
 
         let after = std::fs::read(published(&first)).expect("read first again");
@@ -870,7 +945,8 @@ mod tests {
     #[test]
     fn lock_ownership_survives_renaming_the_runtime_dir() {
         let root = temp_root();
-        let mut first = InstanceGuard::acquire(Some(root.path())).expect("first acquire");
+        let mut first =
+            InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
         first.publish(1111, "mc-host/first").expect("publish");
         let before = std::fs::read(published(&first)).expect("read first");
 
@@ -894,13 +970,14 @@ mod tests {
             "the holder must still own the renamed directory's lock"
         );
 
-        // A successor anchors to a different inode, so it cannot reach or
-        // overwrite the holder's publication.
-        let mut second = InstanceGuard::acquire(Some(root.path())).expect("successor acquires");
-        second
-            .publish(2222, "mc-host/second")
-            .expect("successor publishes");
-        assert_ne!(second.dir_path(), moved.as_path());
+        // A successor would anchor a fresh runtime inode, but the stable
+        // lifetime fence — held for the incarnation, outside the replaceable
+        // subtree — refuses a second incarnation.
+        let successor = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST);
+        assert!(
+            matches!(successor, Err(InstanceError::AlreadyRunning)),
+            "a renamed runtime directory must not admit an overlapping incarnation"
+        );
         assert_eq!(
             std::fs::read(moved.join(CONNECTION_FILE_NAME)).expect("read moved"),
             before,
@@ -911,6 +988,12 @@ mod tests {
         // the rename.
         first.remove_publication();
         assert!(!moved.join(CONNECTION_FILE_NAME).exists());
+
+        // Teardown of the displaced holder frees both fences for a successor.
+        drop(first);
+        let second =
+            InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("successor acquires");
+        drop(second);
     }
 
     #[test]
@@ -921,7 +1004,7 @@ mod tests {
         std::fs::create_dir_all(dir.parent().expect("parent")).expect("create parents");
         symlink(elsewhere.path(), &dir).expect("symlink runtime dir");
 
-        assert!(InstanceGuard::acquire(Some(root.path())).is_err());
+        assert!(InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).is_err());
     }
 
     #[test]
@@ -930,7 +1013,7 @@ mod tests {
         let elsewhere = temp_root();
         symlink(elsewhere.path(), root.path().join("cortexkit")).expect("symlink runtime ancestor");
 
-        assert!(InstanceGuard::acquire(Some(root.path())).is_err());
+        assert!(InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).is_err());
         assert!(
             !elsewhere.path().join("run").exists(),
             "the symlink target must not receive host files"
@@ -946,7 +1029,7 @@ mod tests {
         // so publication must fail closed rather than clobber it.
         std::fs::create_dir(dir.join(CONNECTION_FILE_NAME)).expect("plant directory");
 
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         assert!(guard.publish(4321, "mc-host/test").is_err());
         assert!(
             std::fs::symlink_metadata(dir.join(CONNECTION_FILE_NAME))
@@ -967,7 +1050,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create dir");
         symlink(&victim, dir.join(CONNECTION_FILE_NAME)).expect("plant symlink");
 
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(2222, "mc-host/test").expect("publish");
 
         // rename(2) replaces the link itself, so the outside target is intact.
@@ -985,7 +1068,7 @@ mod tests {
     #[test]
     fn cleanup_removes_only_our_own_publication() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(3333, "mc-host/test").expect("publish");
         let file = published(&guard);
         assert!(file.exists());
@@ -996,7 +1079,7 @@ mod tests {
     #[test]
     fn replaced_inode_prevents_unlink() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(4444, "mc-host/test").expect("publish");
         let file = published(&guard);
 
@@ -1013,7 +1096,7 @@ mod tests {
     #[test]
     fn mismatched_daemon_id_prevents_unlink() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(5555, "mc-host/test").expect("publish");
         let file = published(&guard);
 
@@ -1034,7 +1117,7 @@ mod tests {
     #[test]
     fn hard_linked_publication_prevents_unlink() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(6666, "mc-host/test").expect("publish");
         let file = published(&guard);
         std::fs::hard_link(&file, guard.dir_path().join("extra-link")).expect("hard link");
@@ -1049,7 +1132,7 @@ mod tests {
     #[test]
     fn publication_survives_and_replaces_across_republish() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(7777, "mc-host/test").expect("first publish");
         let first: serde_json::Value =
             serde_json::from_slice(&std::fs::read(published(&guard)).expect("read"))
@@ -1073,7 +1156,8 @@ mod tests {
         // A first incarnation creates the runtime directory, then "crashes"
         // (drop releases the lock), stranding the temps a predecessor would.
         let dir = {
-            let guard = InstanceGuard::acquire(Some(root.path())).expect("first acquire");
+            let guard =
+                InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
             guard.dir_path().to_path_buf()
         };
 
@@ -1100,7 +1184,7 @@ mod tests {
 
         // The successor sweeps at lock acquisition — before any publish — so
         // a crash-loop that never reaches publish still reclaims temps.
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
 
         assert!(!stale.exists(), "a stale temp must be swept");
         assert!(fresh.exists(), "an in-flight temp must be spared");
@@ -1112,7 +1196,7 @@ mod tests {
     #[test]
     fn no_temp_files_remain_after_a_successful_publish() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard.publish(1234, "mc-host/test").expect("publish");
 
         let prefix = format!(".{CONNECTION_FILE_NAME}.");
@@ -1131,7 +1215,7 @@ mod tests {
     #[test]
     fn diagnostics_never_render_key_bytes() {
         let root = temp_root();
-        let guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
 
         assert_eq!(
             format!("{:?}", guard.key()),
@@ -1159,8 +1243,8 @@ mod tests {
     #[test]
     fn error_display_carries_paths_but_no_secrets() {
         let root = temp_root();
-        let _holder = InstanceGuard::acquire(Some(root.path())).expect("acquire");
-        let err = InstanceGuard::acquire(Some(root.path())).expect_err("second fails");
+        let _holder = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
+        let err = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect_err("second fails");
         let rendered = format!("{err}");
         assert!(rendered.contains("holds the lock"), "{rendered}");
         assert!(!rendered.contains("key"), "{rendered}");

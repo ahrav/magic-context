@@ -71,8 +71,10 @@ pub use handler::{
 };
 pub use instance::{runtime_dir_path, InstanceError, CONNECTION_FILE_NAME};
 pub use lifecycle::{
-    lifecycle_dir_path, probe_lifecycle, LifecyclePhase, LifecycleProbe, LifecycleRecord,
-    LifecycleRootLock, LifecycleState, ProbeFreshness, PublicationSummary, LIFECYCLE_RECORD_NAME,
+    coordination_dir_path, is_canonical_payload_digest, lifecycle_dir_path, probe_lifecycle,
+    LifecyclePhase, LifecycleProbe, LifecycleRecord, LifecycleState, LifecycleTransactionLock,
+    NamespaceAnchor, ProbeFreshness, PublicationSummary, COORDINATION_DIR_NAME,
+    LIFECYCLE_RECORD_NAME, LIFETIME_LOCK_NAME, PAYLOAD_MANIFEST_DIGEST_LEN, TRANSACTION_LOCK_NAME,
 };
 pub use runtime::{run, HostError};
 /// The version-2 body cap. Published so a consumer preparing an output can

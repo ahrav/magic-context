@@ -1,0 +1,55 @@
+{
+  "schema": "magic-context.mc-host-registry-gate/v1",
+  "note": "R50 evidence file populated by release engineering after the real npm registry checks: six-name ownership/reservation, one inert non-GA reservation version plus a verified trusted publisher and revoked bootstrap credential for each new payload name, and one synchronized release version unpublished across all six names. No registry call runs locally; scripts/generate-mc-host-release-manifest.ts only validates this evidence and blocks generation when it is absent or failing. U7 repeats the unpublished-version gate immediately before publication.",
+  "release_version": "0.38.0",
+  "packages": [
+    {
+      "name": "@cortexkit/magic-context",
+      "kind": "parent",
+      "ownership_verified": true,
+      "trusted_publisher_configured": true,
+      "synchronized_version_unpublished": true
+    },
+    {
+      "name": "@cortexkit/opencode-magic-context",
+      "kind": "parent",
+      "ownership_verified": true,
+      "trusted_publisher_configured": true,
+      "synchronized_version_unpublished": true
+    },
+    {
+      "name": "@cortexkit/pi-magic-context",
+      "kind": "parent",
+      "ownership_verified": true,
+      "trusted_publisher_configured": true,
+      "synchronized_version_unpublished": true
+    },
+    {
+      "name": "@cortexkit/mc-host-darwin-arm64",
+      "kind": "payload",
+      "ownership_verified": true,
+      "reservation_version": "0.0.1-reserved.0",
+      "trusted_publisher_configured": true,
+      "bootstrap_credential_revoked": true,
+      "synchronized_version_unpublished": true
+    },
+    {
+      "name": "@cortexkit/mc-host-darwin-x64",
+      "kind": "payload",
+      "ownership_verified": true,
+      "reservation_version": "0.0.1-reserved.0",
+      "trusted_publisher_configured": true,
+      "bootstrap_credential_revoked": true,
+      "synchronized_version_unpublished": true
+    },
+    {
+      "name": "@cortexkit/mc-host-linux-x64-gnu",
+      "kind": "payload",
+      "ownership_verified": true,
+      "reservation_version": "0.0.1-reserved.0",
+      "trusted_publisher_configured": true,
+      "bootstrap_credential_revoked": true,
+      "synchronized_version_unpublished": true
+    }
+  ]
+}

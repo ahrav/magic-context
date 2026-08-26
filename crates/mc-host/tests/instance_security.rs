@@ -387,3 +387,63 @@ fn exactly_one_unsafe_escape_hatch_exists_in_the_crate() {
         "the unsafe escape hatch must carry a SAFETY justification"
     );
 }
+
+/// The coordination fences are owner-only regular files in an owner-only
+/// directory, present while the host serves and never removed by teardown
+/// (supported code never unlinks them).
+#[tokio::test]
+async fn coordination_locks_are_owner_only_and_survive_teardown() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let host = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("host publishes");
+
+    let coordination = data_root.path().join(mc_host::COORDINATION_DIR_NAME);
+    let dir_meta = std::fs::symlink_metadata(&coordination).expect("coordination dir");
+    assert!(dir_meta.is_dir());
+    assert_eq!(dir_meta.permissions().mode() & 0o7777, 0o700);
+    for name in [mc_host::TRANSACTION_LOCK_NAME, mc_host::LIFETIME_LOCK_NAME] {
+        let meta = std::fs::symlink_metadata(coordination.join(name)).expect("lock file");
+        assert!(meta.file_type().is_file(), "{name} must be a regular file");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600, "{name}");
+    }
+
+    host.shutdown_gracefully().await;
+    for name in [mc_host::TRANSACTION_LOCK_NAME, mc_host::LIFETIME_LOCK_NAME] {
+        assert!(
+            coordination.join(name).exists(),
+            "{name} must never be unlinked by supported teardown"
+        );
+    }
+}
+
+/// An unknown lifecycle schema at the record name blocks startup without
+/// interpreting, migrating, or overwriting the quarantined bytes.
+#[tokio::test]
+async fn startup_refuses_to_overwrite_an_unknown_lifecycle_schema() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let run_dir = data_root.path().join("cortexkit").join("run");
+    std::fs::create_dir_all(&run_dir).expect("runtime dir");
+    let record = run_dir.join(mc_host::LIFECYCLE_RECORD_NAME);
+    let future_bytes = br#"{"schema":9,"phase":"carried-forward"}"#.to_vec();
+    std::fs::write(&record, &future_bytes).expect("plant future record");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).expect("mode");
+
+    let refused = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await;
+    assert!(
+        matches!(refused, Err(mc_host::HostError::Instance(_))),
+        "startup over an unknown schema must fail closed"
+    );
+    assert_eq!(
+        std::fs::read(&record).expect("reread"),
+        future_bytes,
+        "the quarantined bytes must be preserved byte-for-byte"
+    );
+}

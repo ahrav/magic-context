@@ -28,6 +28,8 @@
     "test:rust": "sh scripts/test-rust.sh",
     "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
     "fmt:rust": "cargo fmt",
+    "release:contract": "bun scripts/generate-mc-host-release-manifest.ts",
+    "release:contract:check": "bun scripts/generate-mc-host-release-manifest.ts --check",
     "check:all": "bun run test && bun run test:rust && cargo clippy --workspace --all-targets -- -D warnings",
     "build:dists": "bun run --cwd packages/plugin build && bun run --cwd packages/pi-plugin build"
   }

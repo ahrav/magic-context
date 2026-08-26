@@ -1769,3 +1769,100 @@ async fn shutdown_during_candidate_setup_reaps_both_channels() {
     assert!(candidate.closed_within(BUDGET).await);
     assert!(client.closed_within(BUDGET).await);
 }
+
+// --- stable coordination fences (plan U1) ---
+
+/// Replacing the whole managed `cortexkit` subtree while a host serves leaves
+/// its descriptor-owned evidence isolated, but the stable lifetime fence still
+/// names the live incarnation: probes report `wedged`, never `stopped`, and a
+/// successor cannot start until the first daemon fully tears down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_cortexkit_subtree_cannot_admit_an_overlapping_incarnation() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let host = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("host publishes");
+
+    let cortexkit = data_root.path().join("cortexkit");
+    std::fs::rename(&cortexkit, data_root.path().join("cortexkit-old"))
+        .expect("replace the managed subtree");
+
+    let root = data_root.path().to_path_buf();
+    let observed = tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || mc_host::probe_lifecycle(Some(&root), &mc_host::ProbeFreshness::default())
+    })
+    .await
+    .expect("probe task")
+    .expect("probe");
+    assert_eq!(
+        observed.state,
+        mc_host::LifecycleState::Wedged,
+        "a displaced live incarnation must not read as stopped: {}",
+        observed.reason
+    );
+    assert!(!observed.lifetime_lock_free);
+
+    let blocked = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await;
+    assert!(
+        matches!(blocked, Err(HostError::Instance(_))),
+        "the lifetime fence must refuse a successor while the first host lives"
+    );
+
+    host.shutdown().await.expect("graceful shutdown");
+
+    // Teardown released both fences: a successor starts in the same root.
+    let successor = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("successor starts after the displaced host tears down");
+    successor.shutdown_gracefully().await;
+}
+
+/// Mixed-release coordination: every incarnation locks the same never-renamed
+/// coordination inodes, so two independent openers — a stand-in for release N
+/// and N-1 — contend on one lock instead of splitting ownership.
+#[tokio::test]
+async fn successive_incarnations_lock_the_same_coordination_inodes() {
+    use std::os::unix::fs::MetadataExt;
+
+    let data_root = tempfile::tempdir().expect("temp root");
+    let coordination = data_root
+        .path()
+        .join(mc_host::COORDINATION_DIR_NAME)
+        .join(mc_host::LIFETIME_LOCK_NAME);
+
+    let first = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("first host publishes");
+    let meta = std::fs::symlink_metadata(&coordination).expect("lifetime.lock exists");
+    assert!(meta.file_type().is_file());
+    let identity = (meta.dev(), meta.ino());
+    first.shutdown_gracefully().await;
+
+    let second = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("second host publishes");
+    let meta = std::fs::symlink_metadata(&coordination).expect("lifetime.lock still exists");
+    assert_eq!(
+        (meta.dev(), meta.ino()),
+        identity,
+        "supported code must never replace the coordination lock inode"
+    );
+    second.shutdown_gracefully().await;
+}
