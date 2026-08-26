@@ -483,18 +483,34 @@ describe("tail hygiene baseline and defer-window deltas", () => {
 });
 
 describe("tail hygiene walk performance", () => {
-    it("stays below 15ms p95 on a 250k-token rendered tail", () => {
+    // Guards the walk's cost against an algorithmic regression, not the
+    // runner it happens to execute on. The suite runs under
+    // `bun test --shard` with up to eight shards in parallel, so on a shared
+    // CI runner a near-max statistic tracks contention: a 25-sample p95 is
+    // the second-slowest sample, and one scheduling stall fails the gate.
+    // The median over a larger sample keeps the same budget while ignoring
+    // transient stalls — the walk is pure CPU over an in-memory tail, so a
+    // real regression moves the whole distribution, not just its tail.
+    it("stays below 15ms median on a 250k-token rendered tail", () => {
         const messages = [textMessage("perf", "token ".repeat(250_000))];
         const tags = [tag(1, "perf:p0", "message")];
+        // Unmeasured warmup: the first walks pay JIT and first-touch
+        // allocation costs that no steady-state pass repeats.
+        for (let warmup = 0; warmup < 5; warmup += 1) {
+            measureTailHygiene({ messages, tags, protectedTags: 0 });
+        }
         const durations: number[] = [];
-        for (let iteration = 0; iteration < 25; iteration += 1) {
+        for (let iteration = 0; iteration < 101; iteration += 1) {
             const start = performance.now();
             measureTailHygiene({ messages, tags, protectedTags: 0 });
             durations.push(performance.now() - start);
         }
         durations.sort((left, right) => left - right);
+        const median = durations[Math.floor(durations.length / 2)];
         const p95 = durations[Math.ceil(durations.length * 0.95) - 1];
-        console.log(`tail-hygiene-walk 250k-token p95=${p95.toFixed(3)}ms`);
-        expect(p95).toBeLessThan(15);
+        console.log(
+            `tail-hygiene-walk 250k-token median=${median.toFixed(3)}ms p95=${p95.toFixed(3)}ms`,
+        );
+        expect(median).toBeLessThan(15);
     });
 });

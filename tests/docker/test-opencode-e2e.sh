@@ -49,8 +49,14 @@ section() {
 # ----------------------------------------------------------------------
 section "Phase 0: install Magic Context locally"
 cd /test/mc-opencode
-npm install --silent --no-audit --no-fund --omit=dev 2>&1 | tail -5 || true
+# Not tolerant of failure: the plugin bundle marks @opencode-ai/plugin
+# external, so a failed install leaves it unresolvable, OpenCode swallows
+# the import error, and every later assertion measures a session that ran
+# without the plugin at all.
+npm install --no-audit --no-fund --omit=dev 2>&1 | tail -5
 npm link --silent --no-audit --no-fund 2>&1 | tail -3 || true
+test -d node_modules/@opencode-ai/plugin \
+    || { echo -e "${RED}@opencode-ai/plugin missing after install${NC}"; exit 1; }
 cd /test/project
 
 # ----------------------------------------------------------------------

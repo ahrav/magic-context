@@ -14,6 +14,7 @@
 import { describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
+import { reconcileCompatibilityVerifications } from "../../plugin/src/features/magic-context/claim-policy-backfill";
 import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
@@ -157,6 +158,19 @@ function writeDb<T>(h: PiTestHarness, fn: (db: Database) => T): T {
     }
 }
 
+/** Promote a memory to verified and settle the epoch bump its verification
+ * event queues. `reconcileCompatibilityVerifications` is the synchronous
+ * reconciler the plugin itself runs during injection: draining it here makes
+ * the write's ONE epoch bump land now instead of during the next turn, after
+ * `setProjectEpoch` has already pinned. Without this the pin is silently
+ * undone mid-turn and m[0] HARD-refolds
+ * (reason=project_memory_change), which routes the write into m[0] and leaves
+ * the m[1] delta lanes untested. */
+function verifyAndSettle(db: Database, memoryId: number): void {
+    updateMemoryVerification(db, memoryId, "verified");
+    reconcileCompatibilityVerifications(db);
+}
+
 function seedMemory(
     h: PiTestHarness,
     content: string,
@@ -173,7 +187,7 @@ function seedMemory(
             // deterministic before the next turn materializes m[0].
             sourceType: "user",
         }).id;
-        updateMemoryVerification(db, id, "verified");
+        verifyAndSettle(db, id);
         return id;
     });
 }
@@ -523,7 +537,7 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
             // starts CANDIDATE); re-verify through the real API so the revised
             // row stays render-eligible, then pin the epoch so the mutation
             // rides the m[1] delta instead of HARD-refolding m[0].
-            writeDb(h, (db) => updateMemoryVerification(db, memId, "verified"));
+            writeDb(h, (db) => verifyAndSettle(db, memId));
             setProjectEpoch(h, epochBeforeUpdate);
             await sendTurn(h, "pi B11 turn 5: execute pass renders the memory-updates delta.", "pi B11 reconcile");
 
