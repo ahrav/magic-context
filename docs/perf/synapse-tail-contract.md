@@ -157,6 +157,16 @@ keeps the complete matrix bounded while preserving raw request observations.
 Candidate A uses every feasible positive K: startup scratch validation accepts
 K=1 and K=2 and rejects K=3. K=0 remains the baseline admission behavior.
 
+Collected-evidence annotation, 2026-08-26: this does not amend the frozen
+contract or any decision rule. Pre-treatment calibration at commit `af8ef126`
+measured mean S of 5.0563266 ms and 25.0605536 ms. Round-half-up application of
+the frozen factors produced 5 ms rates `{49,99,148,198,297,396}` and 25 ms
+rates `{10,20,30,40,60,80}` per second. During collection, the harness rejected
+rates that do not divide one billion nanoseconds exactly. This affected ten
+frozen rates, including zero-delay 3,000 and 6,000/s. Those positions remain
+retained as invalid evidence in `docs/perf/runs/synapse-tail-af8ef126/`; no rate
+was substituted and no invalid position was replaced.
+
 Cell order is randomized as complete blocks. One independent block contains
 one repetition of each scheduled cell under one environment and artifact.
 Process restart boundaries and the randomization seed are recorded.
