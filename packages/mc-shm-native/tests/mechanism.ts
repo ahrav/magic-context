@@ -77,6 +77,27 @@ function loadRawAddon(): RawAttachAddon | null {
     return createRequire(import.meta.url)(path) as RawAttachAddon;
 }
 
+/** Geometry of the `mc-host-test-ring-v1` profile (`ring_profile`). */
+const GRANT_DESCRIPTOR_DEPTH = 32n;
+/** `MIN_ARENA_BYTES` == `MAX_FRAME_BYTES` == 64 MiB. */
+const GRANT_ARENA_BYTES = 67_108_864n;
+const GRANT_MAX_LEASES = 32n;
+/**
+ * Bytes the ring layout adds around a page-aligned arena: the control
+ * region that precedes it (producer, consumer, and reclaim cache lines
+ * plus `descriptor_depth` slots, rounded up to a page) and the trailing
+ * lifecycle page.
+ *
+ * `RingGrant::decode` recomputes the layout and rejects any grant whose
+ * `total_bytes` disagrees, so this value is not decoration: it must track
+ * `Layout::new(GRANT_DESCRIPTOR_DEPTH, GRANT_ARENA_BYTES).total`. Growing
+ * a control-region struct past a page boundary changes it, and a stale
+ * value surfaces as `invalid shared-memory descriptor` from whichever
+ * test needs the grant to be *valid* — see the unresolvable-descriptor
+ * test below, which is the only case that gets past decoding.
+ */
+const GRANT_LAYOUT_OVERHEAD_BYTES = 16_384n;
+
 /**
  * Encodes one RingGrant wire image (layout version 2) as lowercase hex:
  * layout_version u16, incarnation [16], lane u32, descriptor_depth u64,
@@ -89,10 +110,14 @@ function testGrantHex(lane: number, incarnation: number): string {
     view.setUint16(0, 2, true);
     bytes[2] = incarnation;
     view.setUint32(18, lane, true);
-    view.setBigUint64(22, 32n, true);
-    view.setBigUint64(30, 67_108_864n, true);
-    view.setBigUint64(38, 32n, true);
-    view.setBigUint64(46, 67_108_864n + 12_288n, true);
+    view.setBigUint64(22, GRANT_DESCRIPTOR_DEPTH, true);
+    view.setBigUint64(30, GRANT_ARENA_BYTES, true);
+    view.setBigUint64(38, GRANT_MAX_LEASES, true);
+    view.setBigUint64(
+        46,
+        GRANT_ARENA_BYTES + GRANT_LAYOUT_OVERHEAD_BYTES,
+        true,
+    );
     view.setUint32(54, 0, true);
     return [...bytes]
         .map((byte) => byte.toString(16).padStart(2, "0"))
