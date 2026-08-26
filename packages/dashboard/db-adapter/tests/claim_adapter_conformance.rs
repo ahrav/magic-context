@@ -1027,7 +1027,10 @@ fn a_revision_outside_the_direct_taxonomy_is_refused() {
             category: Some("arbitrary".to_string()),
         },
     );
-    assert!(refused.is_err(), "an out-of-taxonomy category must be refused");
+    assert!(
+        refused.is_err(),
+        "an out-of-taxonomy category must be refused"
+    );
 
     // Every one of the five remains accepted.
     for (index, category) in [
