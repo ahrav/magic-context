@@ -20,6 +20,7 @@ import type {
     ClaimMemorySharing,
 } from "../storage-claim-memory-schema.ts";
 import { readDirectFormatMarker } from "../storage-format-epoch.ts";
+import { computeWorkspaceEpochFingerprint } from "../workspaces.ts";
 import {
     type ClaimMutationToken,
     formatRevisionLocator,
@@ -71,6 +72,14 @@ export interface ProjectMemoryCurrentStateRequest {
     limit?: number;
     /** Opaque workspace-epoch signature bound into the SnapshotVector. */
     workspaceEpoch?: string;
+    /**
+     * Workspace identities the caller derived `workspaceEpoch` and
+     * `workspaceAuthorization` from. Supplying them lets the provider recompute
+     * the fingerprint from current state at publication time instead of echoing
+     * the caller's value, which is the only way a membership or shared-category
+     * revocation landing mid-read can be detected.
+     */
+    workspaceIdentities?: readonly string[];
     /** Expiry evaluation instant; defaults to Date.now(). */
     nowMs?: number;
 }
@@ -495,7 +504,27 @@ export function readProjectMemoryCurrentState(
 ): ProjectMemoryCurrentStateResult {
     const surface = request.surface ?? "explicit_search";
     const lifecycleStates = request.lifecycleStates ?? DEFAULT_LIFECYCLE_STATES;
-    const workspaceEpoch = request.workspaceEpoch ?? "";
+    const suppliedWorkspaceEpoch = request.workspaceEpoch ?? "";
+    // Echoing the caller's epoch into both the hydration vector and the "fresh"
+    // re-read made the staleness comparison compare a value to itself, so it
+    // could never fire: a workspace revocation in flight was undetectable and a
+    // claim from a since-removed project could still be published. Recompute
+    // from current state at each read when the caller names its identities.
+    const readWorkspaceEpoch = (): string =>
+        request.workspaceIdentities === undefined
+            ? suppliedWorkspaceEpoch
+            : computeWorkspaceEpochFingerprint(db, request.workspaceIdentities);
+    const workspaceEpoch = readWorkspaceEpoch();
+    // The caller authorized against a snapshot taken before this read. If the
+    // workspace has already moved, its `workspaceAuthorization` set is stale
+    // too, and only the caller can rebuild it.
+    if (
+        request.workspaceIdentities !== undefined &&
+        suppliedWorkspaceEpoch !== "" &&
+        suppliedWorkspaceEpoch !== workspaceEpoch
+    ) {
+        return { status: "stale", reasons: ["workspaceEpoch"] };
+    }
     const nowMs = request.nowMs ?? Date.now();
     let items: ProjectMemoryClaimSnapshot[] = [];
     let vector: SnapshotVector | undefined;
@@ -525,7 +554,7 @@ export function readProjectMemoryCurrentState(
     const fresh = readSnapshotVector(
         db,
         Object.keys(vector.projectGenerations).map((key) => Number(key)),
-        workspaceEpoch,
+        readWorkspaceEpoch(),
     );
     const mismatches = snapshotVectorMismatches(vector, fresh);
     if (mismatches.length > 0) return { status: "stale", reasons: mismatches };

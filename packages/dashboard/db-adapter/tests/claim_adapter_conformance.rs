@@ -957,6 +957,57 @@ fn tauri_content_edits_keep_explicit_user_eligibility() {
 }
 
 #[test]
+fn the_project_picker_omits_a_project_whose_claims_are_all_hidden() {
+    // The picker enumerated every current head, so a project holding only
+    // hard-hidden claims was offered and then `read_claim_memories` withheld
+    // every row, leaving the user on an inexplicably empty filter.
+    let conn = test_db();
+    seed_claim(&conn, CLAIM_A, "visible", "FACT", "active");
+    seed_claim(&conn, CLAIM_B, "hidden", "FACT", "active");
+
+    let hidden_revision: i64 = conn
+        .query_row(
+            "SELECT current_revision_id FROM claims WHERE id = (SELECT claim_id FROM claim_public_ids WHERE public_id = ?1)",
+            [CLAIM_B],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE claim_effective_policy SET hard_hidden = 1, explicit_eligible = 0 WHERE revision_id = ?1",
+        [hidden_revision],
+    )
+    .unwrap();
+
+    let projects = claim_adapter::enumerate_claim_projects(&conn).unwrap();
+    // Both claims sit in project 1, which still has a visible claim, so the
+    // project remains listed; the read path must agree with the picker.
+    let stats = claim_adapter::read_claim_memory_stats(&conn, None).unwrap();
+    assert_eq!(stats.total, 1, "only the visible claim is disclosed");
+    assert_eq!(projects.len(), 1);
+
+    // Hide the remaining claim: now nothing is disclosable and the project must
+    // disappear from the picker rather than offering an empty filter.
+    let visible_revision: i64 = conn
+        .query_row(
+            "SELECT current_revision_id FROM claims WHERE id = (SELECT claim_id FROM claim_public_ids WHERE public_id = ?1)",
+            [CLAIM_A],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE claim_effective_policy SET hard_hidden = 1, explicit_eligible = 0 WHERE revision_id = ?1",
+        [visible_revision],
+    )
+    .unwrap();
+
+    let projects = claim_adapter::enumerate_claim_projects(&conn).unwrap();
+    assert!(
+        projects.is_empty(),
+        "a project with only hidden claims must not be offered: {projects:?}"
+    );
+}
+
+#[test]
 fn a_revision_outside_the_direct_taxonomy_is_refused() {
     // Neither the revision attributes nor the current-head projection constrains
     // the category, so accepting any nonempty string persists an out-of-taxonomy

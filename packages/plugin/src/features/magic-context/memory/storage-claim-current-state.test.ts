@@ -5,6 +5,7 @@ import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import type { SourceTrustClass } from "../storage-claim-applicability-schema";
 import { createDirectTestDatabase } from "../test-database";
+import { computeWorkspaceEpochFingerprint } from "../workspaces";
 import { CLAIM_POLICY_VERSION } from "./claim-visibility-policy";
 import { readProjectMemoryCurrentState } from "./storage-claim-current-state";
 import {
@@ -137,6 +138,60 @@ describe("current-state provider: hydration", () => {
             expect(second.snapshotVector.projectGenerations[String(ctx.projectId)]).toBe(
                 (first.snapshotVector.projectGenerations[String(ctx.projectId)] as number) + 1,
             );
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+});
+
+describe("current-state provider: workspace revalidation", () => {
+    test("a workspace epoch change between authorization and publication is stale", () => {
+        // The caller authorizes against a snapshot taken before the read. If
+        // membership or shared categories are revoked in flight, echoing the
+        // caller's epoch made the staleness check compare a value to itself, so
+        // a claim from a since-removed project could still be published.
+        const ctx = setup();
+        try {
+            createClaimOp(ctx, "op-a", "Workspace claim content.");
+            const identities = ["git:u2-current"];
+            // The direct fixture carries claim tables only; the workspace
+            // fingerprint reads the project epoch from `project_state`.
+            ctx.db.exec(`
+                CREATE TABLE IF NOT EXISTS project_state (
+                    project_path TEXT PRIMARY KEY,
+                    project_memory_epoch INTEGER NOT NULL DEFAULT 0
+                );
+            `);
+            ctx.db
+                .prepare(
+                    "INSERT OR REPLACE INTO project_state (project_path, project_memory_epoch) VALUES (?, 1)",
+                )
+                .run("git:u2-current");
+            const epochBefore = computeWorkspaceEpochFingerprint(ctx.db, identities);
+
+            // Same state: the read publishes.
+            const ok = readProjectMemoryCurrentState(ctx.db, {
+                projectIds: [ctx.projectId],
+                workspaceEpoch: epochBefore,
+                workspaceIdentities: identities,
+            });
+            expect(ok.status).toBe("ok");
+
+            // Revoke: bump the project's memory epoch, which the fingerprint covers.
+            ctx.db
+                .prepare(
+                    "UPDATE project_state SET project_memory_epoch = project_memory_epoch + 1 WHERE project_path = ?",
+                )
+                .run("git:u2-current");
+            expect(computeWorkspaceEpochFingerprint(ctx.db, identities)).not.toBe(epochBefore);
+
+            const stale = readProjectMemoryCurrentState(ctx.db, {
+                projectIds: [ctx.projectId],
+                // The epoch the caller authorized against is now out of date.
+                workspaceEpoch: epochBefore,
+                workspaceIdentities: identities,
+            });
+            expect(stale.status).toBe("stale");
         } finally {
             closeQuietly(ctx.db);
         }

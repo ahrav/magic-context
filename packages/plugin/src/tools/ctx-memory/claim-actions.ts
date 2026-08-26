@@ -76,6 +76,9 @@ interface WorkspaceReadScope {
     ownProjectIds: number[];
     sharedCategories: string[];
     workspaceEpoch: string;
+    /** Identities the epoch and authorization derive from, so the provider can
+     *  recompute the fingerprint at publication time. */
+    workspaceIdentities: string[];
 }
 
 function workspaceReadScope(db: Database, projectIdentity: string): WorkspaceReadScope {
@@ -97,6 +100,7 @@ function workspaceReadScope(db: Database, projectIdentity: string): WorkspaceRea
             ? (resolveWorkspaceShareCategories(db, projectIdentity) ?? [])
             : [],
         workspaceEpoch: computeWorkspaceEpochFingerprint(db, workspace.identities),
+        workspaceIdentities: [...workspace.identities],
     };
 }
 
@@ -344,6 +348,7 @@ function getClaims(
         surface: "explicit_search",
         lifecycleStates: ["active"],
         workspaceEpoch: scope.workspaceEpoch,
+        workspaceIdentities: scope.workspaceIdentities,
     });
     const byId = new Map(active.map((item) => [item.publicClaimId, item]));
     const ownMissing = requested.filter((publicClaimId) => !byId.has(publicClaimId));
@@ -358,6 +363,7 @@ function getClaims(
             surface: "explicit_search",
             lifecycleStates: ["archived", "retired"],
             workspaceEpoch: scope.workspaceEpoch,
+            workspaceIdentities: scope.workspaceIdentities,
         });
         for (const item of inactiveOwn) byId.set(item.publicClaimId, item);
     }
@@ -400,6 +406,7 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
             surface: "explicit_search",
             lifecycleStates: ["active"],
             workspaceEpoch: scope.workspaceEpoch,
+            workspaceIdentities: scope.workspaceIdentities,
         })
             .filter((item) => !category || item.category === category)
             .slice(0, normalizeLimit(args.limit));

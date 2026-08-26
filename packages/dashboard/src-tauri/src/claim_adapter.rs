@@ -1121,30 +1121,48 @@ pub fn read_claim_memory_stats(
 }
 
 pub fn enumerate_claim_projects(conn: &Connection) -> AdapterResult<Vec<ClaimProjectRow>> {
+    // Enumerating every current-head row lists a project whose claims are all
+    // hard-hidden, expired, or rejected — the picker offers it, then
+    // `read_claim_memories` withholds every row and the user lands on an
+    // inexplicably empty filter. The picker has to apply the same
+    // explicit-visibility predicate the list and statistics paths use.
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut statement = sql(conn.prepare(
-        "SELECT DISTINCT project.canonical_identity \
+        "SELECT DISTINCT project.canonical_identity, head.revision_id \
          FROM claim_memory_current_heads head \
          JOIN projects project ON project.id = head.project_id \
          ORDER BY project.canonical_identity",
     ))?;
-    sql(statement
-        .query_map([], |row| {
-            let identity: String = row.get(0)?;
-            let display_name = identity
-                .split_once(':')
-                // Canonical identities carry filesystem names, so truncate by
-                // characters: byte slicing splits multi-byte sequences.
-                .map(|(prefix, rest)| match rest.char_indices().nth(10) {
-                    Some((cut, _)) => format!("{prefix}:{}…", &rest[..cut]),
-                    None => format!("{prefix}:{rest}"),
-                })
-                .unwrap_or_else(|| identity.clone());
-            Ok(ClaimProjectRow {
-                identity,
-                display_name,
+    // Collected before filtering: `revision_is_explicitly_visible` needs the
+    // connection, which `statement` borrows for the life of the row iterator.
+    let heads: Vec<(String, i64)> = sql(statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|rows| rows.collect()))?;
+    drop(statement);
+
+    let mut projects: Vec<ClaimProjectRow> = Vec::new();
+    for (identity, revision_id) in heads {
+        if projects.iter().any(|row| row.identity == identity) {
+            continue;
+        }
+        if !revision_is_explicitly_visible(conn, revision_id, now_ms)? {
+            continue;
+        }
+        let display_name = identity
+            .split_once(':')
+            // Canonical identities carry filesystem names, so truncate by
+            // characters: byte slicing splits multi-byte sequences.
+            .map(|(prefix, rest)| match rest.char_indices().nth(10) {
+                Some((cut, _)) => format!("{prefix}:{}…", &rest[..cut]),
+                None => format!("{prefix}:{rest}"),
             })
-        })
-        .and_then(|rows| rows.collect()))
+            .unwrap_or_else(|| identity.clone());
+        projects.push(ClaimProjectRow {
+            identity,
+            display_name,
+        });
+    }
+    Ok(projects)
 }
 
 fn provenance_shape(channel: MutationChannel, operation_key: &str) -> Value {
