@@ -1,9 +1,7 @@
 /**
  * Shared public shapes for the mc-host consumer client.
  *
- * Leaf module: imports nothing from connection or facade code and no npm
- * subc-client code. The shapes mirror the subset of `@cortexkit/subc-client`
- * 0.4.1 that in-repo consumers actually use. Wire semantics
+ * Leaf module: imports nothing from connection or facade code. Wire semantics
  * come from `docs/mc-host-wire-protocol.md`.
  */
 
@@ -62,7 +60,7 @@ export const AdmissionClass = {
 } as const;
 export type AdmissionClass = (typeof AdmissionClass)[keyof typeof AdmissionClass];
 
-/** Options for `SubcClient.connect()` as used by current repo consumers. */
+/** Options for `McHostClient.connect()` as used by current repo consumers. */
 export interface ConnectOptions {
     connectionFile: string;
     handshakeTimeoutMs?: number;
@@ -77,7 +75,7 @@ export interface RequestOptions {
     priority?: Priority;
     admissionClass?: AdmissionClass;
     timeoutMs?: number;
-    /** The facade attaches `SubcCallError.cleanup` when this signal aborts the request. */
+    /** The facade attaches `McHostCallError.cleanup` when this signal aborts the request. */
     signal?: AbortSignal;
 }
 

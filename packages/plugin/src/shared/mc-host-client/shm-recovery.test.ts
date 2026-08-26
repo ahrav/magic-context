@@ -13,7 +13,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { SubcClient, type SubcClientOptions, type SubcDiagnosticsEvent } from "./client";
+import { McHostClient, type McHostClientOptions, type McHostDiagnosticsEvent } from "./client";
 import {
     encodePeerFrame,
     FakePeer,
@@ -58,22 +58,22 @@ describe("shm re-upgrade key scenarios (runtime-neutral)", () => {
 
 interface Harness {
     peer: FakePeer;
-    client: SubcClient;
-    events: SubcDiagnosticsEvent[];
+    client: McHostClient;
+    events: McHostDiagnosticsEvent[];
     cleanup(): Promise<void>;
 }
 
 async function connectHarness(
     peerSetup: (peer: FakePeer) => void,
-    overrides: Partial<SubcClientOptions> = {},
+    overrides: Partial<McHostClientOptions> = {},
 ): Promise<Harness> {
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mc-shm-recovery-bun-"));
     const peer = await FakePeer.start();
     peerSetup(peer);
     const filePath = path.join(tmpDir, "conn.json");
     await writeConnectionFile(filePath, peer);
-    const events: SubcDiagnosticsEvent[] = [];
-    const client = await SubcClient.connect({
+    const events: McHostDiagnosticsEvent[] = [];
+    const client = await McHostClient.connect({
         connectionFile: filePath,
         shutdownDeadlineMs: 1_000,
         identity: IDENTITY,
@@ -92,7 +92,7 @@ async function connectHarness(
     };
 }
 
-function connectedTransports(events: SubcDiagnosticsEvent[]): string[] {
+function connectedTransports(events: McHostDiagnosticsEvent[]): string[] {
     return events.filter((e) => e.type === "connected").map((e) => e.transport ?? "");
 }
 

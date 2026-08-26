@@ -30,7 +30,6 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
     it(
         "continues briefly through SIGKILL, then refuses before attempting an LKG replay",
         async () => {
-            h.subc.assertModuleNotSupervised();
             const sessionId = await h.createSession();
             await driveToSteadyState(h, sessionId, 2);
 
@@ -49,7 +48,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
                 };
             });
 
-            await h.subc.killModuleAndWait();
+            await h.mcHost.crashHost();
             try {
                 await h.sendPrompt(sessionId, `FM-OC-6 arm after SIGKILL: ${h.ballast(400)}`);
             } catch {

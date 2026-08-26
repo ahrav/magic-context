@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
+use crate::wire::{decode_header, EnvelopeHeader, FrameType};
 #[cfg(target_os = "linux")]
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{DuplexRing, ProducerReservation, Ring};
@@ -25,7 +26,6 @@ use mc_shm_transport::profile::{
     Admission, AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
     ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
 };
-use subc_protocol::{decode_header, EnvelopeHeader, FrameType};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -635,10 +635,10 @@ fn publish_one(
         charge,
         written,
     } = queued.frame;
-    let wire_header: Option<[u8; subc_protocol::HEADER_LEN]> = match &direct {
+    let wire_header: Option<[u8; crate::wire::HEADER_LEN]> = match &direct {
         Some(direct) => Some(direct.header()),
         None => bytes
-            .get(..subc_protocol::HEADER_LEN)
+            .get(..crate::wire::HEADER_LEN)
             .and_then(|header| header.try_into().ok()),
     };
     let deadline = StdInstant::now() + frame_deadline;
@@ -678,10 +678,8 @@ fn publish_direct(ring: &Ring, direct: DirectFrame, deadline: StdInstant) -> Res
 }
 
 fn publish_owned(ring: &Ring, bytes: &[u8], tail: &[u8], deadline: StdInstant) -> Result<(), ()> {
-    let (header, first_body) = bytes
-        .split_at_checked(subc_protocol::HEADER_LEN)
-        .ok_or(())?;
-    let header: [u8; subc_protocol::HEADER_LEN] = header.try_into().map_err(|_| ())?;
+    let (header, first_body) = bytes.split_at_checked(crate::wire::HEADER_LEN).ok_or(())?;
+    let header: [u8; crate::wire::HEADER_LEN] = header.try_into().map_err(|_| ())?;
     let body_len = first_body.len().checked_add(tail.len()).ok_or(())?;
     let mut reservation = ring
         .reserve_until(body_len, header, deadline)
@@ -823,7 +821,7 @@ impl std::error::Error for TestPeerError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_protocol::{Flags, Priority, PROTOCOL_VERSION};
+    use crate::wire::{Flags, Priority, PROTOCOL_VERSION};
 
     #[test]
     fn platform_preflight_is_side_effect_free() {

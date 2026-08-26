@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use mc_host::shm_provider::{qualified_test_profile, TestShmPeer, SHM_TRANSPORT};
-use subc_protocol::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
+use mc_host::wire::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
 use support::raw_client::{FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
 use support::shm_process::{
     commit_shm_peer, daemon_info, daemon_role, goodbye_header, live_descendants, negotiate_grant,

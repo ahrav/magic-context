@@ -13,15 +13,15 @@ import {
     type BindIdentity,
     Deadline,
     isConsumerReconnectTransient,
-    isSubcCallError,
+    isMcHostCallError,
+    McHostCallError,
+    McHostClient,
     Priority,
     type RouteHandle,
     type RouteTarget,
     SocketClosedError,
     SocketTimeoutError,
     StaleRouteHandleError,
-    SubcCallError,
-    SubcClient,
 } from "../../shared/mc-host-client";
 import { isRecord } from "../../shared/record-type-guard";
 
@@ -101,7 +101,7 @@ function isConnectionFailure(error: unknown): boolean {
                 "request_deadline",
                 "deadline_exceeded_no_drop_observed",
                 "connection_dropped",
-                "SUBC_CONNECTION_BACKOFF",
+                "MC_HOST_CONNECTION_BACKOFF",
             ].includes(code) ||
             /\bclient closed\b|\bconnection closed\b|\bclosed the connection\b/i.test(message)
         );
@@ -109,12 +109,12 @@ function isConnectionFailure(error: unknown): boolean {
 }
 
 /**
- * `SubcCallError.kind` recognized via the shared cross-bundle check, which
+ * `McHostCallError.kind` recognized via the shared cross-bundle check, which
  * requires a real `Error` carrying the wire-visible name. The kind is still
  * validated at runtime because a foreign bundle copy's field is untyped.
  */
-function subcCallErrorKind(error: unknown): SubcCallError["kind"] | undefined {
-    if (!isSubcCallError(error)) return undefined;
+function mcHostCallErrorKind(error: unknown): McHostCallError["kind"] | undefined {
+    if (!isMcHostCallError(error)) return undefined;
     const kind: unknown = error.kind;
     return kind === "not_sent" || kind === "outcome_unknown" || kind === "terminal"
         ? kind
@@ -137,7 +137,7 @@ function isStaleRouteHandleFailure(error: unknown): boolean {
 
 /** The bounded cleanup ticket the facade attaches when a caller abort races a possible send. */
 function cleanupTicketOf(error: unknown): Promise<void> | null {
-    if (!isRecord(error) || error.name !== "SubcCallError") return null;
+    if (!isRecord(error) || error.name !== "McHostCallError") return null;
     const cleanup = (error as { cleanup?: unknown }).cleanup;
     return cleanup instanceof Promise ? (cleanup as Promise<void>) : null;
 }
@@ -148,7 +148,7 @@ interface CachedRoute {
 }
 
 interface EnsuredRoute {
-    client: SubcClient;
+    client: McHostClient;
     route: RouteHandle;
     routeKey: string;
     generation: number;
@@ -187,19 +187,19 @@ interface SerialLane {
 }
 
 interface OpeningRoute {
-    client: SubcClient;
+    client: McHostClient;
     generation: number;
     /** Set by `closeSession` while the open is in flight; the open must not cache its route. */
     closed: boolean;
     promise: Promise<EnsuredRoute>;
 }
 
-export class SubcModuleTransport {
+export class McHostModuleTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
     private readonly requestTimeoutMs: number;
     private readonly routeSessionPrefix: string;
-    private client: SubcClient | null = null;
+    private client: McHostClient | null = null;
     private routes = new Map<string, CachedRoute>();
     private routeOpenings = new Map<string, OpeningRoute>();
     private canonicalRootCache = new Map<string, string>();
@@ -209,7 +209,7 @@ export class SubcModuleTransport {
     private queuedLaneWaiters = 0;
     private wrapupSessions = new Map<string, number>();
     private nextProbeMs = 0;
-    private connectionPromise: Promise<SubcClient> | null = null;
+    private connectionPromise: Promise<McHostClient> | null = null;
     private authorityProjectRoot = "";
     /**
      * Filesystem root used to bind authority/mirror routes. Authority request
@@ -544,7 +544,7 @@ export class SubcModuleTransport {
                         // The body may be on the wire: a local deadline after
                         // request invocation is a possible send, never not_sent.
                         () =>
-                            new SubcCallError(
+                            new McHostCallError(
                                 "outcome_unknown",
                                 "module transport deadline expired waiting for the module response",
                                 "request_deadline",
@@ -561,7 +561,7 @@ export class SubcModuleTransport {
                     return response;
                 } catch (error) {
                     cleanupTicket = cleanupTicketOf(error);
-                    const kind = subcCallErrorKind(error);
+                    const kind = mcHostCallErrorKind(error);
                     const callerAborted = args.signal?.aborted === true;
                     // Host-proven no-dispatch (wire doc 10.2): evict and retry once.
                     const unknownChannel =
@@ -695,6 +695,8 @@ export class SubcModuleTransport {
             body,
         );
         if (!isRecord(response.authority)) throw new Error("authority.prepare omitted authority");
+        // SAFETY: casting assumes the module response carries the
+        // AuthorityStatus fields; isRecord only proves it is an object.
         return { authority: response.authority as unknown as AuthorityStatus };
     }
 
@@ -720,7 +722,7 @@ export class SubcModuleTransport {
     async authorityDrain(args: Record<string, unknown>): Promise<AuthorityDrainResponse> {
         this.authorityProjectRoot = String(args.project ?? this.authorityProjectRoot);
         const method = String(args.method ?? "authority.drain.step") as Parameters<
-            SubcModuleTransport["authorityRequest"]
+            McHostModuleTransport["authorityRequest"]
         >[2];
         const { projectRoot, ...body } = args;
         const response = await this.authorityRequest(
@@ -730,6 +732,8 @@ export class SubcModuleTransport {
             body,
         );
         if (isRecord(response.authority)) {
+            // SAFETY: casting assumes the module response carries the
+            // AuthorityStatus fields; isRecord only proves it is an object.
             return { authority: response.authority as unknown as AuthorityStatus };
         }
         if (typeof response.code === "string") {
@@ -756,6 +760,8 @@ export class SubcModuleTransport {
             body,
         );
         if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
+        // SAFETY: casting assumes the module response carries the
+        // ChangefeedPage fields; isRecord only proves it is an object.
         return { page: response.page as unknown as ChangefeedPage };
     }
 
@@ -830,6 +836,7 @@ export class SubcModuleTransport {
             client,
             generation,
             closed: false,
+            // SAFETY: placeholder for two-phase construction. commentlint: allow(JUDGE)
             promise: undefined as unknown as Promise<EnsuredRoute>,
         };
         routeOpening.promise = (async (): Promise<EnsuredRoute> => {
@@ -897,35 +904,35 @@ export class SubcModuleTransport {
         return resolved;
     }
 
-    private connectClient(deadline?: Deadline): Promise<SubcClient> {
+    private connectClient(deadline?: Deadline): Promise<McHostClient> {
         // Derive the handshake stage from the operation deadline without ever
         // extending the preserved 2-second handshake budget (plan KTD5).
         const handshakeTimeoutMs = deadline
             ? Math.max(1, deadline.stageBudgetMs(HANDSHAKE_TIMEOUT_MS))
             : HANDSHAKE_TIMEOUT_MS;
-        return SubcClient.connect({
+        return McHostClient.connect({
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
         });
     }
 
-    private async ensureConnected(deadline?: Deadline): Promise<SubcClient> {
+    private async ensureConnected(deadline?: Deadline): Promise<McHostClient> {
         if (this.client) return this.client;
         if (this.connectionPromise) return await this.connectionPromise;
         const now = Date.now();
         if (now < this.nextProbeMs) {
             const error = new Error(
-                `subc connection backoff active until ${this.nextProbeMs}`,
+                `mc-host connection backoff active until ${this.nextProbeMs}`,
             ) as Error & {
                 code?: string;
             };
-            error.code = "SUBC_CONNECTION_BACKOFF";
+            error.code = "MC_HOST_CONNECTION_BACKOFF";
             throw error;
         }
 
         const generation = this.connectionGeneration;
-        const connecting = (async (): Promise<SubcClient> => {
-            let candidate: SubcClient | null = null;
+        const connecting = (async (): Promise<McHostClient> => {
+            let candidate: McHostClient | null = null;
             try {
                 candidate = await this.connectClient(deadline);
                 if (generation !== this.connectionGeneration) {
@@ -953,7 +960,7 @@ export class SubcModuleTransport {
         }
     }
 
-    private invalidateConnection(client: SubcClient | null = this.client): void {
+    private invalidateConnection(client: McHostClient | null = this.client): void {
         if (client && this.client !== client) return;
         this.connectionGeneration += 1;
         this.invalidateStateSyncCapabilities();

@@ -32,7 +32,6 @@ describe.skipIf(!active)("rust failure-mode drill FM-OC-1: LKG after SIGKILL", (
     it(
         "continues on the LKG wire and logs the process fault",
         async () => {
-            h.subc.assertModuleNotSupervised();
             const sessionId = await h.createSession();
             await driveToSteadyState(h, sessionId, 2);
             h.setSessionCacheTtl(sessionId, "0");
@@ -46,7 +45,7 @@ describe.skipIf(!active)("rust failure-mode drill FM-OC-1: LKG after SIGKILL", (
             const beforeCount = h.readRustPasses().length;
             const priorWire = JSON.parse(h.lastMainWireSerialized()) as unknown[];
 
-            await h.subc.killModuleAndWait();
+            await h.mcHost.crashHost();
             await h.sendPrompt(sessionId, `FM-OC-1 after SIGKILL: ${h.ballast(400)}`);
 
             const passes = await h.waitForRustPasses(beforeCount + 1);

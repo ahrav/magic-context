@@ -141,6 +141,12 @@ pub(crate) const SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024
 const TAG_BASELINE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const TAG_MINT_FRONTIER_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
+/// Both tag caches are process-global `OnceLock` singletons, so their retention
+/// is per-process rather than per-handler. Summed here so the component's
+/// declaration to the host cannot drift from the budgets actually enforced.
+pub(crate) const TAG_CACHE_COMBINED_BUDGET_BYTES: usize =
+    TAG_BASELINE_CACHE_BUDGET_BYTES + TAG_MINT_FRONTIER_CACHE_BUDGET_BYTES;
+
 /// One served CK message plus the canonical bytes used by the module response writer.
 /// The typed value stays behind an `Arc`, so a cache hit does not clone large tool output trees.
 #[derive(Debug, Clone)]

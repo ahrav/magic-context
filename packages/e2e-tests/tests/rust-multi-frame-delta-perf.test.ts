@@ -107,7 +107,7 @@ describe.skipIf(!rustPrereqs.ok)("rust transport: large tail delta", () => {
         expect(smallDelta.prefixGuardMs).toBeLessThan(10);
         expect(smallDelta.stateSyncMs).toBeLessThan(15);
         expect(smallDelta.wireBuildMs).toBeLessThan(10);
-        // The hermetic daemon uses ck-mc over external TCP, which can add scheduling overhead.
+        // The hermetic daemon uses McHandler over external TCP, which can add scheduling overhead.
         // Apply timing limits only in strict production-like environments; enforce message,
         // page-count, and payload-size limits in every environment.
         if (process.env.MC_RUST_E2E_STRICT_PERF === "1") {

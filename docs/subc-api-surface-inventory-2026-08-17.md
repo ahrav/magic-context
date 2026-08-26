@@ -1,32 +1,19 @@
-# `subc` API Surface Inventory and Shim-vs-Rewrite Decision
+# Historical `subc` API Surface Inventory
 
 Task: `magic-context-c50.1` (epic `magic-context-c50`, hand-rolled Rust module host)
 Date: 2026-08-17
 Plan: `2026-08-17-0505-subc-api-surface-spike-plan.md`
+Final disposition: direct migration completed by the direct `mc-host` boundary plan dated 2026-08-24.
 
-## Decision
+## Final decision
 
-> **Superseded (2026-08-22).** The shim-adoption decision below is the original
-> c50.1 analysis, preserved as the record of that spike. `magic-context-c50.1`
-> has since decided the boundary is ported directly to the mc-host SDK with no
-> `subc-*` compatibility shims (executed by `magic-context-c50.4`). The
-> inventory and its compiler-closure proof
-> (`docs/evidence/subc-compiler-closure/`) remain the authoritative enumeration
-> of the surface that port must cover.
+`mc-host` is the single production authority for wire, authentication, discovery, control, routing, component lifecycle, and managed Rust clients. `mc-module` implements the host-owned component contract directly. Production Rust and TypeScript callers use host-owned APIs. No `subc-*` compatibility crate, alias, shim, published dependency, provider process, or fallback API is recommended or supported.
 
-**Option (a): compatible local `subc-*` crates, so `mc-module` compiles unmodified.**
-Option (b), rewriting the `mc-module` boundary against a repo-owned SDK, is rejected.
+The inventories below and `docs/evidence/subc-compiler-closure/` remain historical proof of the surface that the migration had to close. `docs/evidence/subc-surface-probe/` remains an excluded historical crate and is not an implementation dependency. Old option analysis is retained only to explain the spike's evidence and must not be read as current architecture guidance.
 
-The decisive fact is that four of the five crates are **MIT-licensed and published on
-crates.io**, and their published source is shape-compatible with 83 of the 86 enumerated
-`mc-module` requirements. The compatible-crate path therefore does not require *writing*
-a compatible client SDK; it requires **adopting** one (vendored into this repo, or
-depended on from crates.io) and patching three compiler-confirmed deltas. Only
-`subc-core` — the daemon — is unpublished, and replacing that daemon is the epic's actual
-work regardless of which option is chosen.
+## Historical spike decision (superseded)
 
-Rewriting the boundary would buy nothing that adoption does not already give, and would
-cost a 350-site edit inside `crates/mc-module/src/lib.rs` alone.
+On 2026-08-17, the spike favored adopting compatible local crates because published MIT sources matched 83 of 86 enumerated `mc-module` requirements and isolated three deltas. The later direct-boundary decision superseded that recommendation after the compiler-closure inventory made a complete direct port tractable. No production compatibility layer was retained.
 
 ## Evidence Provenance
 
@@ -72,7 +59,7 @@ Reproduction artifacts in this repository:
 - `docs/evidence/subc-surface-probe/delta-ledger.txt` — the compiler output when the probe
   is flipped to `mc-module`'s exact forms, isolating the deltas to exactly three errors.
 
-## Compiler Closure: Complete (2026-08-24)
+## Historical compiler closure: complete (2026-08-24)
 
 The disposable-stub compiler pass (plan step 4) ran on 2026-08-24 with the `../commons`
 and `../subconscious` siblings restored, at revision
@@ -97,7 +84,7 @@ therefore mechanically proven **complete** for the current code, not just correc
 per-row: with those reconciliations the inventory *is* the compile footprint. The
 completeness gate on `magic-context-c50.4` is cleared.
 
-## Rust Inventory
+## Historical Rust inventory
 
 86 API rows across four crates, plus one declared-only dependency edge. Every row's build
 target is the `mc_module` lib unless noted. Weight legend: **T** type-only, **P**
@@ -221,7 +208,7 @@ compatible-crate path cannot satisfy by adoption, and it is exactly what `mc-hos
 (`subc_reversibility_*`). No import, no call. Classified as non-API so the sweep is
 closed.
 
-## TypeScript Inventory
+## Historical TypeScript inventory
 
 The installed version **is** the latest published version, so every row below is verified
 against the exact 0.4.1 source and declarations; all 34 are `exact`.
@@ -278,7 +265,7 @@ Sweep closure: 8 files across `packages/` import `@cortexkit/subc-client` direct
 above). The other 28 files matching `subc` reference only env vars, connection-file paths,
 config keys, or prose.
 
-## Compatibility Matrix Summary
+## Historical compatibility matrix
 
 | | Rows | exact | changed | absent | private/unknown |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -302,7 +289,9 @@ The three deltas, each isolated to one `rustc` error in
 3. `error[E0599]: no associated function 'new' found for struct 'ErrorBody'` — a 2-arg
    constructor added after 0.10.0, used once, in a test. Fix: add three lines.
 
-## Why Shims, Criterion by Criterion
+## Historical shim rationale (superseded)
+
+This table records why the 2026-08-17 spike initially favored shims. It is not a current recommendation; the direct migration is final.
 
 | Criterion | Finding | Favors |
 | --- | --- | --- |
@@ -319,7 +308,7 @@ the manifest types through 350+ sites of unrelated transform logic, and discardi
 already 96% shape-identical to freely licensed source. No third option is introduced: the
 crates.io-vs-vendored choice is an implementation detail *inside* the shim path.
 
-## Downstream Constraints
+## Historical downstream constraints
 
 ### `magic-context-c50.2` (minimal wire protocol + handshake)
 

@@ -36,7 +36,7 @@ const received = new Promise<ReceiveLease>((resolve, reject) => {
 const channel = new ShmFrameChannel({
     nativeChannel: pair.first,
     budget: new ByteBudget(1024),
-    maxBodyLen: 1024,
+    maxBodyLen: 1 << 20,
     handlers: {
         onFrame: (frame) => resolveBody?.(frame.body),
         onClosed: (_reason, error) => rejectBody?.(error ?? new Error("channel closed")),

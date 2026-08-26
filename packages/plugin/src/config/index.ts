@@ -377,6 +377,7 @@ function parsePluginConfig(
         // resolved value itself, because `{env:...}` / `{file:...}`
         // substitution may have already expanded secrets into rawConfig.
         delete patched[key];
+        // SAFETY: every top-level Zod issue path names a field in defaults.
         const defaultVal = (defaults as unknown as Record<string, unknown>)[key];
         const reason = customMessagesByKey.get(key);
         warnings.push(
@@ -431,7 +432,7 @@ export function loadPluginConfig(
 }
 
 function hasUserTierSubcConfig(config: Record<string, unknown> | undefined): boolean {
-    const subc = config?.subc;
+    const { subc } = config ?? {};
     if (typeof subc !== "object" || subc === null || Array.isArray(subc)) return false;
     const connectionFile = (subc as Record<string, unknown>).connection_file;
     return typeof connectionFile === "string" && connectionFile.trim().length > 0;

@@ -3,6 +3,8 @@
 //! preserved open-loop arrival schedules, missed-slot accounting under a
 //! full in-flight queue, and throughput-arm rate separation.
 
+#![allow(clippy::duplicate_mod)]
+
 #[path = "support/raw_client.rs"]
 mod raw_client;
 

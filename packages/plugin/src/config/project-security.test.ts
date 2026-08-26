@@ -85,7 +85,7 @@ describe("stripUnsafeProjectConfigFields", () => {
         const warnings = stripUnsafeProjectConfigFields(raw);
 
         expect(raw.transform_mode).toBe("rust");
-        expect(raw.subc).toBeUndefined();
+        expect(raw).not.toHaveProperty("subc");
         expect(warnings.some((w) => w.includes("subc"))).toBe(true);
         expect(warnings.some((w) => w.includes("transform_mode"))).toBe(false);
     });

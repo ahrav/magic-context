@@ -19,7 +19,8 @@ describe("embedding routing", () => {
             model: "Xenova/bge-small-en-v1.5",
         });
         expect(routing.primary).not.toHaveProperty("fallback_provider");
-        expect(config.subc?.connection_file).toBe(`${homedir()}/run/subc.json`);
+        const { subc } = config;
+        expect(subc?.connection_file).toBe(`${homedir()}/run/subc.json`);
         expect(routing.warnings.some((warning) => warning.includes("Synapse"))).toBe(true);
     });
 

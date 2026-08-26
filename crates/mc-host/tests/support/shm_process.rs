@@ -61,8 +61,8 @@ use mc_host::shm_provider::{
     SHM_CAPABILITY_VERSION, SHM_TRANSPORT,
 };
 use mc_host::transport_provider::{InjectedProvider, TransportProviders};
+use mc_host::wire::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
 use mc_shm_transport::profile::HostLimits as ShmHostLimits;
-use subc_protocol::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
 
 use super::raw_client::{self, Discovered, RawClient, FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
 use super::{connection_file, TestHost, LINKED_MODULE_ID};
@@ -657,7 +657,7 @@ pub fn victim_role() {
         .build()
         .expect("victim runtime");
     let (mut client, grant) = runtime.block_on(async {
-        let mut client = RawClient::connect(&info)
+        let mut client = RawClient::connect_setup_only(&info)
             .await
             .expect("victim authenticates");
         let corr = client
@@ -850,7 +850,7 @@ impl Observer {
 }
 
 pub async fn negotiate_grant(info: &Discovered) -> (RawClient, serde_json::Value) {
-    let mut bootstrap = RawClient::connect(info)
+    let mut bootstrap = RawClient::connect_setup_only(info)
         .await
         .expect("bootstrap authenticates");
     let corr = bootstrap.control(&shm_offers()).await.expect("negotiate");

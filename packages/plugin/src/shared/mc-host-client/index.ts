@@ -1,10 +1,10 @@
 export {
     connectionFileExists,
     isConsumerReconnectTransient,
-    SubcClient,
-    type SubcClientOptions,
-    type SubcDiagnosticsEvent,
-    type SubcDiagnosticsObserver,
+    McHostClient,
+    type McHostClientOptions,
+    type McHostDiagnosticsEvent,
+    type McHostDiagnosticsObserver,
 } from "./client";
 export {
     armExpiryTimer,
@@ -13,11 +13,11 @@ export {
     type MonotonicClock,
 } from "./deadline";
 export {
-    isSubcCallError,
+    isMcHostCallError,
+    McHostCallError,
+    McHostClientError,
     SocketClosedError,
     SocketTimeoutError,
-    SubcCallError,
-    SubcError,
 } from "./errors";
 export { ReceiveLease, type ReceiveReleaseOutcome } from "./frame-channel";
 export { RouteHandle, StaleRouteHandleError } from "./route-handle";

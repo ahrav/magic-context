@@ -40,7 +40,7 @@ import {
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
-import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
+import { McHostModuleTransport } from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
@@ -210,8 +210,17 @@ const server: Plugin = async (ctx) => {
     }
 
     const liveSessionState = createLiveSessionState();
+    // The transport dials a connection file written by an externally
+    // launched mc-host daemon; this build ships no host binary, so a
+    // missing daemon otherwise surfaces only as per-request connect
+    // errors. One startup line names the dependency.
+    if (pluginConfig.transform_mode === "rust") {
+        log(
+            '[magic-context] transform_mode "rust" requires an externally launched mc-host daemon; requests will retry until its connection file appears',
+        );
+    }
     const rustModeModuleClient: RustModeModuleClient | undefined =
-        pluginConfig.transform_mode === "rust" ? new SubcModuleTransport() : undefined;
+        pluginConfig.transform_mode === "rust" ? new McHostModuleTransport() : undefined;
 
     const hooks = await createSessionHooksAsync({
         ctx,
@@ -631,6 +640,7 @@ const server: Plugin = async (ctx) => {
                 );
             },
         }),
+        // SAFETY: wrapper matches the hook's runtime call shape. commentlint: allow(JUDGE)
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: magicContextRuntime.magicContext,
             getMagicContext: () => magicContextRuntime.magicContext,

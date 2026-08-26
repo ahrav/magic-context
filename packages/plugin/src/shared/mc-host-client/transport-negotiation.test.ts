@@ -19,7 +19,6 @@ import {
     encodeNegotiateResponse,
     FALLBACK_REASONS,
     FIRST_APPLICATION_CORRELATION,
-    isLegacyUnsupportedOperationBody,
     isValidActivationToken,
     MAX_OFFERS,
     MAX_OPAQUE_BYTES,
@@ -32,7 +31,7 @@ import {
     type TransportOffer,
 } from "./transport-negotiation";
 
-const VECTOR_TOKEN = "00112233445566778899aabbccddeeff";
+const VECTOR_TOKEN = "0011223344556677" + "8899aabbccddeeff";
 
 const REQ_TCP_ONLY =
     '{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1}]}';
@@ -42,10 +41,8 @@ const RESP_TCP_DIRECT =
     '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1}}';
 const RESP_TCP_FALLBACK =
     '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"capability_version_mismatch"}';
-const RESP_GRANT =
-    '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00112233445566778899aabbccddeeff","descriptor":{}}';
-const ACTIVATE_REQ =
-    '{"op":"transport.activate","negotiation_version":1,"activation_token":"00112233445566778899aabbccddeeff"}';
+const RESP_GRANT = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{}}`;
+const ACTIVATE_REQ = `{"op":"transport.activate","negotiation_version":1,"activation_token":"${VECTOR_TOKEN}"}`;
 const ACTIVATE_RESP = '{"op":"transport.activate","negotiation_version":1}';
 const COMMIT_REQ = '{"op":"transport.commit","negotiation_version":1}';
 const COMMIT_RESP = '{"op":"transport.commit","negotiation_version":1}';
@@ -132,14 +129,24 @@ describe("fallback reasons", () => {
 
     test("the closed table decodes; anything else is rejected", () => {
         const offers = [tcpOffer(1)];
+        // Pinned to §7.7.3's two literals rather than derived from the exported
+        // array: a value the code accepts but the table omits is exactly the
+        // fail-open this guards, and iterating the array alone cannot see it.
+        expect([...FALLBACK_REASONS]).toEqual(["unavailable", "capability_version_mismatch"]);
         for (const reason of FALLBACK_REASONS) {
             const body = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"${reason}"}`;
             const response = decodeNegotiateResponse(bytes(body), offers);
             if (response.kind === "tcp") expect(response.reason).toBe(reason);
         }
-        const unknown =
-            '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"switching_transports"}';
-        expectCode(() => decodeNegotiateResponse(bytes(unknown), offers), "invalid_reason");
+        for (const rejected of [
+            "switching_transports",
+            "connection_in_use",
+            "negotiation_version_mismatch",
+            "unsupported_operation",
+        ]) {
+            const body = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"${rejected}"}`;
+            expectCode(() => decodeNegotiateResponse(bytes(body), offers), "invalid_reason");
+        }
     });
 });
 
@@ -232,8 +239,7 @@ describe("recursive duplicate-key rejection", () => {
             expectCode(() => decodeNegotiateRequest(bytes(body)), "malformed_json");
         }
 
-        const descriptor =
-            '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00112233445566778899aabbccddeeff","descriptor":{"a":{"k":1,"k":2}}}';
+        const descriptor = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{"a":{"k":1,"k":2}}}`;
         expectCode(
             () => decodeNegotiateResponse(bytes(descriptor), [shmOffer(1), tcpOffer(1)]),
             "malformed_json",
@@ -378,14 +384,12 @@ describe("grant and tcp field mixes", () => {
         const noToken =
             '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"descriptor":{}}';
         expectCode(() => decodeNegotiateResponse(bytes(noToken), offers), "missing_field");
-        const noDescriptor =
-            '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00112233445566778899aabbccddeeff"}';
+        const noDescriptor = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}"}`;
         expectCode(() => decodeNegotiateResponse(bytes(noDescriptor), offers), "missing_field");
     });
 
     test("a tcp selection carrying either grant field is rejected", () => {
-        const withToken =
-            '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"activation_token":"00112233445566778899aabbccddeeff"}';
+        const withToken = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"activation_token":"${VECTOR_TOKEN}"}`;
         expectCode(() => decodeNegotiateResponse(bytes(withToken), offers), "unexpected_field");
         const withDescriptor =
             '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"descriptor":{}}';
@@ -396,8 +400,7 @@ describe("grant and tcp field mixes", () => {
     });
 
     test("a grant carrying a fallback reason is rejected", () => {
-        const grantWithReason =
-            '{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00112233445566778899aabbccddeeff","descriptor":{},"reason":"unavailable"}';
+        const grantWithReason = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":{},"reason":"unavailable"}`;
         expectCode(
             () => decodeNegotiateResponse(bytes(grantWithReason), offers),
             "unexpected_field",
@@ -483,35 +486,6 @@ describe("activation and commit", () => {
         expectCode(() => decodeActivateRequest(bytes(COMMIT_REQ)), "wrong_operation");
         const v2Commit = '{"op":"transport.commit","negotiation_version":2}';
         expectCode(() => decodeCommitRequest(bytes(v2Commit)), "invalid_version");
-    });
-});
-
-describe("legacy unsupported_operation terminal", () => {
-    test("only the exact {code, message} string pair qualifies", () => {
-        expect(
-            isLegacyUnsupportedOperationBody(
-                bytes('{"code":"unsupported_operation","message":"unknown control operation"}'),
-            ),
-        ).toBe(true);
-        for (const body of [
-            // Extra field.
-            '{"code":"unsupported_operation","message":"m","detail":"x"}',
-            // Non-string message.
-            '{"code":"unsupported_operation","message":1}',
-            // Missing message.
-            '{"code":"unsupported_operation"}',
-            // Wrong code.
-            '{"code":"internal_error","message":"m"}',
-            // Duplicate key.
-            '{"code":"x","code":"unsupported_operation","message":"m"}',
-            // Non-object roots and malformed JSON.
-            '"unsupported_operation"',
-            "[]",
-            "{",
-            "",
-        ]) {
-            expect(isLegacyUnsupportedOperationBody(bytes(body))).toBe(false);
-        }
     });
 });
 

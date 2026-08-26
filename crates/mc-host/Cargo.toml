@@ -4,19 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
+description = "Directly linked host for Magic Context, Synapse, and Broca components."
 
 [lints.clippy]
 # Shared integration helpers are intentionally compiled into independent test targets.
 duplicate_mod = "allow"
 
 [dependencies]
-# The host implements the published wire authority; module crates continue to
-# use the workspace's sibling dependencies for local SDK co-development.
-subc-protocol = "=0.10.0"
-subc-transport = "=0.5.0"
-subc-control = "=0.1.1"
-
 serde = { workspace = true }
+hmac = "0.12"
+subtle = "2"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 fastembed = { version = "=6.0.0", default-features = false, features = ["ort-load-dynamic"] }
@@ -28,7 +25,6 @@ getrandom = "0.2"
 mc-shm-transport = { path = "../mc-shm-transport", default-features = false }
 
 [dev-dependencies]
-hmac = "0.12"
 libc = "0.2"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "signal"] }

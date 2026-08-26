@@ -1,7 +1,7 @@
 /**
  * Runtime-neutral fresh-generation re-upgrade scenarios (U3, R9-R11).
  *
- * Each scenario drives a real `SubcClient` against the independent
+ * Each scenario drives a real `McHostClient` against the independent
  * `FakePeer` plus the in-process fake paired provider using
  * `node:assert/strict` only — no bun:test — so the same key scenarios also
  * execute under Node 24 through `run-mc-host-client-node.ts`.
@@ -16,9 +16,9 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
     DEFAULT_RECOVERY_DEADLINE_MS,
-    SubcClient,
-    type SubcClientOptions,
-    type SubcDiagnosticsEvent,
+    McHostClient,
+    type McHostClientOptions,
+    type McHostDiagnosticsEvent,
 } from "../client";
 import type { BindIdentity, RouteTarget } from "../types";
 import {
@@ -53,12 +53,12 @@ export interface RecoveryScenario {
 /** Tracked peers/clients/tmp files, torn down after each scenario. */
 export interface RecoveryContext {
     startPeer(options?: Parameters<typeof FakePeer.start>[0]): Promise<FakePeer>;
-    connect(peer: FakePeer, overrides?: Partial<SubcClientOptions>): Promise<SubcClient>;
+    connect(peer: FakePeer, overrides?: Partial<McHostClientOptions>): Promise<McHostClient>;
 }
 
 export async function runRecoveryScenario(scenario: RecoveryScenario): Promise<void> {
     const peers: FakePeer[] = [];
-    const clients: SubcClient[] = [];
+    const clients: McHostClient[] = [];
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mc-shm-recovery-"));
     let fileCounter = 0;
     const ctx: RecoveryContext = {
@@ -71,7 +71,7 @@ export async function runRecoveryScenario(scenario: RecoveryScenario): Promise<v
             fileCounter += 1;
             const filePath = path.join(tmpDir, `conn-${fileCounter}.json`);
             await writeConnectionFile(filePath, peer);
-            const client = await SubcClient.connect({
+            const client = await McHostClient.connect({
                 connectionFile: filePath,
                 shutdownDeadlineMs: 1_000,
                 identity: IDENTITY,
@@ -228,7 +228,7 @@ export function recoveryProvider(): FakePairedProvider {
     return provider;
 }
 
-function connectedTransports(events: SubcDiagnosticsEvent[]): string[] {
+function connectedTransports(events: McHostDiagnosticsEvent[]): string[] {
     return events.filter((e) => e.type === "connected").map((e) => e.transport ?? "");
 }
 
@@ -257,7 +257,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 if (index === 0) return tcpSelectionBody("unavailable");
                 return allowGrant ? grantSelectionBody() : tcpSelectionBody("unavailable");
             });
-            const events: SubcDiagnosticsEvent[] = [];
+            const events: McHostDiagnosticsEvent[] = [];
             const client = await ctx.connect(peer, {
                 transportProviders: [provider],
                 diagnostics: (event) => events.push(event),
@@ -310,7 +310,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 if (index === 1) return tcpSelectionBody("unavailable");
                 return grantSelectionBody();
             });
-            const events: SubcDiagnosticsEvent[] = [];
+            const events: McHostDiagnosticsEvent[] = [];
             const client = await ctx.connect(peer, {
                 transportProviders: [provider],
                 diagnostics: (event) => events.push(event),
@@ -359,14 +359,12 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
     },
     {
         // R11: every non-`unavailable` selection starts no automatic probe.
+        // The fallback vocabulary is closed to `unavailable` and
+        // `capability_version_mismatch` (§7.7.3); any other reason string is
+        // malformed and fails closed before probe logic can even observe it.
         name: "no other fallback reason or reasonless TCP starts a recovery probe",
         async run(ctx) {
-            const reasons: (string | undefined)[] = [
-                undefined,
-                "negotiation_version_mismatch",
-                "capability_version_mismatch",
-                "connection_in_use",
-            ];
+            const reasons: (string | undefined)[] = [undefined, "capability_version_mismatch"];
             for (const reason of reasons) {
                 const label = `reason=${reason ?? "none"}`;
                 const provider = recoveryProvider();
@@ -394,22 +392,26 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 assert.equal(provider.connectCount, 0, label);
                 assert.equal(paces, 0, label);
             }
-            // Legacy fallback (exact unsupported_operation) is TCP
-            // continuation evidence but never probe evidence.
+            // The legacy terminal (exact `unsupported_operation`) is not
+            // fallback evidence (§7.7.3): negotiation fails closed with no
+            // same-generation TCP continuation and no recovery probe.
             const provider = recoveryProvider();
             const peer = await ctx.startPeer({ negotiate: "unsupported-op" });
             let paces = 0;
-            const client = await ctx.connect(peer, {
-                transportProviders: [provider],
-                sleep: async () => {
-                    paces += 1;
-                },
-            });
-            serveTcpRoutes(peer.connections[0] as FakePeerConnection, 7);
-            assert.deepEqual(await client.call("magic-context", "m1"), { served: "tcp" });
-            await client.closeAsync();
+            let failure: unknown;
+            try {
+                await ctx.connect(peer, {
+                    transportProviders: [provider],
+                    sleep: async () => {
+                        paces += 1;
+                    },
+                });
+            } catch (error) {
+                failure = error;
+            }
+            assert.ok(failure instanceof Error, "legacy terminal must fail closed");
+            assert.equal((failure as { code?: string }).code, "host_negotiation_rejected");
             await settle();
-            assert.equal(peer.connections.length, 1);
             assert.equal(provider.connectCount, 0);
             assert.equal(paces, 0);
         },

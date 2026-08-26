@@ -233,7 +233,7 @@ describe("context overflow recovery", () => {
             const mainCallsBeforeFollowup = mainCalls;
 
             if (process.env.MC_E2E_MODE === "rust") {
-                // Rust delegates the transform/recovery ladder to ck-mc rather
+                // Rust delegates the transform/recovery ladder to McHandler rather
                 // than the OpenCode-only fail-closed request sequencing below.
                 // Its successful historian fold is also unavailable without the
                 // hermetic Broca runner, so retain the shared overflow-detection

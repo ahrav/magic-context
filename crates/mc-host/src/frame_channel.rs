@@ -16,8 +16,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use subc_protocol::{AdmissionClass, EnvelopeHeader, FrameType};
 use tokio::sync::mpsc;
+
+use crate::wire::{AdmissionClass, EnvelopeHeader, FrameType};
 use tokio::time::{timeout_at, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -606,7 +607,7 @@ pub(crate) type DirectSerializer =
     Box<dyn FnOnce(&mut dyn io::Write) -> io::Result<()> + Send + 'static>;
 
 pub struct DirectFrame {
-    header: [u8; subc_protocol::HEADER_LEN],
+    header: [u8; crate::wire::HEADER_LEN],
     body_len: usize,
     serializer: DirectSerializer,
 }
@@ -624,7 +625,7 @@ impl DirectFrame {
         }
     }
 
-    pub(crate) const fn header(&self) -> [u8; subc_protocol::HEADER_LEN] {
+    pub(crate) const fn header(&self) -> [u8; crate::wire::HEADER_LEN] {
         self.header
     }
 
@@ -637,7 +638,7 @@ impl DirectFrame {
     }
 
     pub(crate) fn into_owned(self) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(subc_protocol::HEADER_LEN + self.body_len);
+        let mut bytes = Vec::with_capacity(crate::wire::HEADER_LEN + self.body_len);
         bytes.extend_from_slice(&self.header);
         {
             let mut writer = ExactWriter::new(&mut bytes, self.body_len);

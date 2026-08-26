@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use subc_protocol::{EnvelopeHeader, FrameType};
+use crate::wire::{EnvelopeHeader, Flags, FrameType, HEADER_LEN};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
@@ -97,6 +97,49 @@ fn escaped_json_len(s: &str) -> usize {
 }
 
 /// Builds an error terminal body under a pre-acquired egress reservation.
+/// Charges `bytes` of frame budget, or gives up and tears the generation down.
+///
+/// `None` means abandon the frame. Two ways to get there, and they are not the
+/// same event: a cancellation won the race, in which case the generation is
+/// already going away; or admission outlived the writer's deadline, which proves
+/// the writer is not draining, so the generation is cancelled here rather than
+/// left accumulating waiters behind a stalled socket.
+///
+/// `also_cancelled` is the request-scoped token where one exists (stream paths
+/// watch both it and the generation's).
+///
+/// Single-sourced because five call sites — unary responses, error terminals,
+/// stream reservations, direct stream sends, and the shutdown ack — each encoded
+/// this interaction by hand. A correctness fix applied to one and missed in
+/// another would leave those five paths with different cancellation semantics,
+/// which is exactly the kind of divergence nothing in the type system catches.
+async fn charge_frame_or_cancel(
+    budget: &crate::wire::ByteBudget,
+    generation: &GenerationCore,
+    bytes: u32,
+    deadline: Instant,
+    also_cancelled: Option<&CancellationToken>,
+) -> Option<crate::wire::ByteCharge> {
+    let request_cancelled = async {
+        match also_cancelled {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = request_cancelled => None,
+        () = generation.token.cancelled() => None,
+        charge = timeout_at(deadline, budget.charge(bytes)) => match charge {
+            Ok(charge) => Some(charge),
+            Err(_) => {
+                generation.token.cancel();
+                None
+            }
+        },
+    }
+}
+
 /// The encoded size is computed exactly from the escaped field lengths, so
 /// the charge exists BEFORE the body materializes — concurrent handler
 /// errors wait on the budget as bytes, not as retained encoded buffers.
@@ -125,24 +168,16 @@ async fn charged_error_body(
     if gen.writer.is_retired() || gen.token.is_cancelled() {
         return Err(());
     }
-    let frame_bytes = u32::try_from(body_len + subc_protocol::HEADER_LEN).map_err(|_| ())?;
+    let frame_bytes = u32::try_from(body_len + HEADER_LEN).map_err(|_| ())?;
     let deadline = gen.writer.admission_deadline();
-    let charge = tokio::select! {
-        biased;
-        () = gen.token.cancelled() => return Err(()),
-        charge = tokio::time::timeout_at(deadline, budget.charge(frame_bytes)) => match charge {
-            Ok(charge) => charge,
-            Err(_) => {
-                gen.token.cancel();
-                return Err(());
-            }
-        },
-    };
+    let charge = charge_frame_or_cancel(budget, gen, frame_bytes, deadline, None)
+        .await
+        .ok_or(())?;
     let body = error_body_json_into(
         // Header spare capacity up front: an exactly sized buffer would force
         // `encode_owned_frame`'s reserve to reallocate, transiently retaining
         // two near-maximum bodies against one charge.
-        Vec::with_capacity(body_len + subc_protocol::HEADER_LEN),
+        Vec::with_capacity(body_len + HEADER_LEN),
         code,
         message,
     );
@@ -185,7 +220,7 @@ pub async fn emit_frame(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
     ty: FrameType,
-    flags: subc_protocol::Flags,
+    flags: Flags,
     id: FrameId,
     body: Vec<u8>,
 ) -> Result<(), ()> {
@@ -199,18 +234,10 @@ pub async fn emit_frame(
     let charge = if body.is_empty() {
         crate::wire::ByteCharge::none()
     } else {
-        let frame_bytes = u32::try_from(body.len() + subc_protocol::HEADER_LEN).map_err(|_| ())?;
-        tokio::select! {
-            biased;
-            () = gen.token.cancelled() => return Err(()),
-            charge = timeout_at(deadline, budget.charge(frame_bytes)) => match charge {
-                Ok(charge) => charge,
-                Err(_) => {
-                    gen.token.cancel();
-                    return Err(());
-                }
-            },
-        }
+        let frame_bytes = u32::try_from(body.len() + HEADER_LEN).map_err(|_| ())?;
+        charge_frame_or_cancel(budget, gen, frame_bytes, deadline, None)
+            .await
+            .ok_or(())?
     };
     let (bytes, tail) = crate::wire::encode_split_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
@@ -238,7 +265,7 @@ pub async fn emit_frame(
 async fn emit_reserved_frame(
     gen: &GenerationCore,
     ty: FrameType,
-    flags: subc_protocol::Flags,
+    flags: Flags,
     id: FrameId,
     body: OutputBuffer,
     deadline: Instant,
@@ -256,7 +283,7 @@ async fn emit_reserved_frame(
             let len = u32::try_from(body.len).map_err(|_| ())?;
             let header = EnvelopeHeader {
                 len,
-                ver: subc_protocol::PROTOCOL_VERSION,
+                ver: crate::wire::PROTOCOL_VERSION,
                 ty,
                 flags,
                 channel: id.channel,
@@ -439,20 +466,12 @@ impl StreamSink {
         {
             return Err(StreamClosed);
         }
-        let bytes = u32::try_from(max_len + subc_protocol::HEADER_LEN).map_err(|_| StreamClosed)?;
+        let bytes = u32::try_from(max_len + HEADER_LEN).map_err(|_| StreamClosed)?;
         let deadline = self.gen.writer.admission_deadline();
-        let charge = tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => return Err(StreamClosed),
-            () = self.gen.token.cancelled() => return Err(StreamClosed),
-            charge = timeout_at(deadline, self.budget.charge(bytes)) => match charge {
-                Ok(charge) => charge,
-                Err(_) => {
-                    self.gen.token.cancel();
-                    return Err(StreamClosed);
-                }
-            },
-        };
+        let charge =
+            charge_frame_or_cancel(&self.budget, &self.gen, bytes, deadline, Some(&self.cancel))
+                .await
+                .ok_or(StreamClosed)?;
         if self.cancel.is_cancelled()
             || self.gen.token.is_cancelled()
             || self.settlement.won.load(Ordering::SeqCst)
@@ -460,7 +479,7 @@ impl StreamSink {
             return Err(StreamClosed);
         }
         Ok(OutputBuffer {
-            body: Vec::with_capacity(max_len + subc_protocol::HEADER_LEN),
+            body: Vec::with_capacity(max_len + HEADER_LEN),
             direct: None,
             charge,
             max_len,
@@ -478,21 +497,12 @@ impl StreamSink {
         {
             return Err(StreamClosed);
         }
-        let bytes =
-            u32::try_from(exact_len + subc_protocol::HEADER_LEN).map_err(|_| StreamClosed)?;
+        let bytes = u32::try_from(exact_len + crate::wire::HEADER_LEN).map_err(|_| StreamClosed)?;
         let deadline = self.gen.writer.admission_deadline();
-        let charge = tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => return Err(StreamClosed),
-            () = self.gen.token.cancelled() => return Err(StreamClosed),
-            charge = timeout_at(deadline, self.budget.charge(bytes)) => match charge {
-                Ok(charge) => charge,
-                Err(_) => {
-                    self.gen.token.cancel();
-                    return Err(StreamClosed);
-                }
-            },
-        };
+        let charge =
+            charge_frame_or_cancel(&self.budget, &self.gen, bytes, deadline, Some(&self.cancel))
+                .await
+                .ok_or(StreamClosed)?;
         if self.cancel.is_cancelled()
             || self.gen.token.is_cancelled()
             || self.settlement.won.load(Ordering::SeqCst)
@@ -637,18 +647,11 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
         return;
     }
     let deadline = gen.writer.admission_deadline();
-    let frame_bytes =
-        u32::try_from(body.len() + subc_protocol::HEADER_LEN).expect("fixed-size body");
-    let charge = tokio::select! {
-        biased;
-        () = gen.token.cancelled() => return,
-        charge = timeout_at(deadline, shared.egress_budget.charge(frame_bytes)) => match charge {
-            Ok(charge) => charge,
-            Err(_) => {
-                gen.token.cancel();
-                return;
-            }
-        },
+    let frame_bytes = u32::try_from(body.len() + HEADER_LEN).expect("fixed-size body");
+    let Some(charge) =
+        charge_frame_or_cancel(&shared.egress_budget, gen, frame_bytes, deadline, None).await
+    else {
+        return;
     };
     let Ok(bytes) = encode_owned_frame(
         FrameType::Response,

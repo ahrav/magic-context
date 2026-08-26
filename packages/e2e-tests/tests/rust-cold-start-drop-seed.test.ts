@@ -53,10 +53,6 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
         h = await RustTestHarness.create({
             modelContextLimit: 30_000,
             startInTsMode: true,
-            // This drill must reach the first Rust transform with only the TS
-            // frozen reduction; a historian publication would legitimately replace
-            // that sentinel with m0 before the cold-start seed can be observed.
-            startHistorianProducer: false,
             magicContextConfig: {
                 execute_threshold_percentage: 25,
                 protected_tags: 1,

@@ -51,7 +51,7 @@ impl FakeProvider {
         )
     }
 
-    /// Registry containing only this provider beside implicit TCP.
+    /// The registry includes this provider and built-in TCP only.
     pub fn registry(provider: &Arc<Self>) -> TransportProviders {
         TransportProviders::with_injected(vec![Arc::clone(provider) as Arc<dyn InjectedProvider>])
     }

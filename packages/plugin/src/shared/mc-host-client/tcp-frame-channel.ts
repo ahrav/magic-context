@@ -14,7 +14,7 @@
 import { Socket } from "node:net";
 import { type AuthByteIo, AuthError, type AuthResult, authenticateClient } from "./auth";
 import type { Deadline } from "./deadline";
-import { SocketClosedError, SocketTimeoutError, SubcCallError } from "./errors";
+import { McHostCallError, SocketClosedError, SocketTimeoutError } from "./errors";
 import {
     BoundedFrameProducer,
     type ByteBudget,
@@ -316,7 +316,7 @@ export class TcpFrameChannel implements FrameChannel {
         hooks?: FrameSendHooks,
     ): BoundedFrameProducer {
         if (this.closed) {
-            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+            throw new McHostCallError("not_sent", "frame channel is closed", "channel_closed");
         }
         if (!Number.isSafeInteger(capacity) || capacity < 0 || capacity > this.maxBodyLen) {
             throw new RangeError("producer capacity is outside frame bounds");
@@ -327,10 +327,10 @@ export class TcpFrameChannel implements FrameChannel {
             this.dataFramesQueued + this.reservedDataFrames + 1 > this.maxQueuedFrames ||
             this.dataBytesQueued + this.reservedDataBytes + reservedBytes > this.maxQueuedBytes
         ) {
-            throw new SubcCallError("not_sent", "writer queue is full", "writer_queue_full");
+            throw new McHostCallError("not_sent", "writer queue is full", "writer_queue_full");
         }
         if (this.budget.wouldExceed(reservedBytes)) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "aggregate connection memory cap would be exceeded",
                 "memory_cap",
@@ -415,7 +415,7 @@ export class TcpFrameChannel implements FrameChannel {
                                 // release() also returns the copy charge
                                 // still owned by the reservation.
                                 release();
-                                throw new SubcCallError(
+                                throw new McHostCallError(
                                     "not_sent",
                                     "producer reservation was released",
                                     "channel_closed",
@@ -448,7 +448,7 @@ export class TcpFrameChannel implements FrameChannel {
 
     send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
         if (this.closed) {
-            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+            throw new McHostCallError("not_sent", "frame channel is closed", "channel_closed");
         }
         if (frame.header.len !== frame.body.length) {
             // A mismatched declaration would desynchronize the peer's frame
@@ -474,7 +474,7 @@ export class TcpFrameChannel implements FrameChannel {
         totalBytes: number;
     } {
         if (this.closed) {
-            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+            throw new McHostCallError("not_sent", "frame channel is closed", "channel_closed");
         }
         if (!Number.isSafeInteger(header.len) || header.len < 0 || header.len > this.maxBodyLen) {
             throw new RangeError("frame body length is outside transport bounds");
@@ -487,10 +487,10 @@ export class TcpFrameChannel implements FrameChannel {
             this.dataFramesQueued + this.reservedDataFrames + 1 > this.maxQueuedFrames ||
             this.dataBytesQueued + this.reservedDataBytes + totalBytes > this.maxQueuedBytes
         ) {
-            throw new SubcCallError("not_sent", "writer queue is full", "writer_queue_full");
+            throw new McHostCallError("not_sent", "writer queue is full", "writer_queue_full");
         }
         if (this.budget.wouldExceed(totalBytes)) {
-            throw new SubcCallError(
+            throw new McHostCallError(
                 "not_sent",
                 "aggregate connection memory cap would be exceeded",
                 "memory_cap",
@@ -525,7 +525,7 @@ export class TcpFrameChannel implements FrameChannel {
         if (this.controlFramesQueued >= this.controlReserveFrames) {
             this.fail(
                 "control_capacity_exhausted",
-                new SubcCallError(
+                new McHostCallError(
                     "terminal",
                     "reserved control-frame capacity exhausted; required cleanup cannot queue safely",
                     "control_capacity_exhausted",

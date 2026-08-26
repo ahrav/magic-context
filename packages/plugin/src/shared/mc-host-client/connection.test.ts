@@ -8,7 +8,7 @@ import { adversarialScenarios, runAdversarialScenario } from "./test-support/adv
 import { encodePeerFrame, type FakePeerConnection, PeerFrameType } from "./test-support/fake-peer";
 import {
     createTrackedHarness,
-    expectSubcCallError as expectCallError,
+    expectMcHostCallError as expectCallError,
     rejection,
     type TrackedHarness,
     waitUntil,
@@ -467,6 +467,14 @@ describe("ingress fencing", () => {
         ],
         ["Goodbye with nonzero corr", { ty: PeerFrameType.Goodbye, corr: 5n }],
         ["terminal with corr 0", { ty: PeerFrameType.Response, channel: 1, epoch: 1, corr: 0n }],
+        [
+            "terminal with epoch 0 on a routed channel",
+            { ty: PeerFrameType.Response, channel: 1, epoch: 0, corr: 1n },
+        ],
+        [
+            "Push with a nonzero corr",
+            { ty: PeerFrameType.Push, channel: CHANNEL, epoch: EPOCH, corr: 1n },
+        ],
         [
             "reserved flag bits",
             { ty: PeerFrameType.Response, channel: 1, epoch: 1, corr: 1n, flags: 0b1100_0000 },
