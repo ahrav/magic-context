@@ -311,7 +311,11 @@ jobs:
         with:
           bun-version: latest
 
+      # rustfmt and clippy are not in the action's default minimal profile, and
+      # the adapter gate below runs both.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
