@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readdirSync, realpathSync, symlinkSync, writeFil
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
 
 export const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 export const PI_PLUGIN_ROOT = join(REPO_ROOT, "packages/pi-plugin");
@@ -74,6 +75,8 @@ export interface PiRunnerOptions {
   modelContextLimit?: number;
   /** Compatibility option from the old spawn-per-turn runner. RPC sessions persist naturally. */
   continueSession?: boolean;
+  /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+  releaseRoot?: VerifiedReleaseRoot;
 }
 
 export type PiSpawnOptions = PiRunnerOptions;
@@ -105,18 +108,21 @@ export function createPiIsolatedEnv(sharedDataDir?: string): PiIsolatedEnv {
   };
 }
 
-export function ensurePluginAvailable(env: PiIsolatedEnv): void {
-  const distEntry = join(PI_PLUGIN_ROOT, "dist", "index.js");
-  if (!existsSync(distEntry)) {
-    throw new Error(`${distEntry} is missing. Run: cd packages/pi-plugin && bun run build`);
+export function ensurePluginAvailable(env: PiIsolatedEnv, releaseRoot?: VerifiedReleaseRoot): void {
+  const plugin = releaseRoot
+    ? releaseRootPath(releaseRoot, "piPlugin")
+    : PI_PLUGIN_ROOT;
+  const required = releaseRoot ? plugin : join(plugin, "dist", "index.js");
+  if (!existsSync(required)) {
+    throw new Error("Pi plugin artifact is missing");
   }
   if (!existsSync(env.pluginDir)) {
-    symlinkSync(PI_PLUGIN_ROOT, env.pluginDir, "dir");
+    symlinkSync(plugin, env.pluginDir, releaseRoot ? "file" : "dir");
   }
 }
 
 export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
-  ensurePluginAvailable(env);
+  ensurePluginAvailable(env, opts.releaseRoot);
 
   const settings = {
     packages: [env.pluginDir],

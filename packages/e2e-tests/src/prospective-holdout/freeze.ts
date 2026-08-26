@@ -1,0 +1,264 @@
+import {
+    existsSync,
+    lstatSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    readdirSync,
+    renameSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import {
+    canonicalFingerprint,
+    canonicalJson,
+    readCanonicalJsonFile,
+} from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
+import type { LifecycleEvent } from "./lifecycle";
+import {
+    type CohortCloseManifest,
+    type PolicyOwnerDocument,
+    type ReleaseFreezeManifest,
+    type TrustedManifestEntry,
+    HoldoutContractError,
+    parseCloseManifest,
+    parseFreezeManifest,
+    parsePolicyOwnerDocument,
+    parseTrustedManifestEntry,
+} from "./contract";
+
+const MANIFEST_FILE = "manifest.json";
+
+function privacyFirst(raw: unknown, options: PrivacyOptions): void {
+    const violations = scanForSensitiveContent(raw, options);
+    if (violations.length > 0) {
+        throw new HoldoutContractError(
+            violations.map((entry) => `privacy.${entry.category}:${entry.path}`),
+        );
+    }
+}
+
+export interface PrivacyOptions {
+    forbiddenTokens?: readonly string[];
+    forbiddenIdentifiers?: readonly string[];
+}
+
+function assertArtifactDirectory(path: string): void {
+    let entries: string[];
+    try {
+        entries = readdirSync(path);
+    } catch {
+        throw new HoldoutContractError(["artifact: unreadable"]);
+    }
+    if (entries.length !== 1 || entries[0] !== MANIFEST_FILE) {
+        throw new HoldoutContractError(["artifact: entries-invalid"]);
+    }
+    if (!lstatSync(join(path, MANIFEST_FILE)).isFile()) {
+        throw new HoldoutContractError(["artifact: manifest-not-regular"]);
+    }
+}
+
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+function readManifest(path: string): JsonValue {
+    assertArtifactDirectory(path);
+    return readCanonicalJsonFile(join(path, MANIFEST_FILE), (code) =>
+        new HoldoutContractError([`artifact.manifest:${code}`]),
+    ) as JsonValue;
+}
+
+export interface PolicyDocuments {
+    analysis: PolicyOwnerDocument;
+    scorecard: PolicyOwnerDocument;
+}
+
+export function loadPolicyDocuments(analysisPath: string, scorecardPath: string): PolicyDocuments {
+    const analysisRaw = readCanonicalJsonFile(analysisPath, (code) =>
+        new HoldoutContractError([`policy.analysis:${code}`]),
+    );
+    const scorecardRaw = readCanonicalJsonFile(scorecardPath, (code) =>
+        new HoldoutContractError([`policy.scorecard:${code}`]),
+    );
+    privacyFirst({ analysis: analysisRaw, scorecard: scorecardRaw }, {});
+    return {
+        analysis: parsePolicyOwnerDocument(analysisRaw, "magic-context-x4l.14"),
+        scorecard: parsePolicyOwnerDocument(scorecardRaw, "magic-context-x4l.15"),
+    };
+}
+
+export function validateFreezePolicies(freeze: ReleaseFreezeManifest, policies: PolicyDocuments): void {
+    if (policies.analysis.status !== "ready" || policies.scorecard.status !== "ready") {
+        throw new HoldoutContractError(["freeze.policies: sibling-policy-pending"]);
+    }
+    if (freeze.body.policies.analysis.policyFingerprint !== policies.analysis.policyFingerprint) {
+        throw new HoldoutContractError(["freeze.policies.analysis: fingerprint-mismatch"]);
+    }
+    if (freeze.body.policies.scorecard.policyFingerprint !== policies.scorecard.policyFingerprint) {
+        throw new HoldoutContractError(["freeze.policies.scorecard: fingerprint-mismatch"]);
+    }
+}
+
+function writeArtifactAtomically(value: unknown, destination: string): void {
+    if (existsSync(destination)) throw new HoldoutContractError(["artifact: destination-exists"]);
+    const parent = dirname(destination);
+    mkdirSync(parent, { recursive: true });
+    const staging = mkdtempSync(join(parent, ".staging-"));
+    try {
+        writeFileSync(join(staging, MANIFEST_FILE), `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
+        readCanonicalJsonFile(join(staging, MANIFEST_FILE), (code) =>
+            new HoldoutContractError([`artifact.staging:${code}`]),
+        );
+        renameSync(staging, destination);
+    } catch (error) {
+        rmSync(staging, { recursive: true, force: true });
+        if (existsSync(destination)) throw new HoldoutContractError(["artifact: destination-exists"]);
+        throw error;
+    }
+}
+
+export function publishFreeze(
+    raw: unknown,
+    destination: string,
+    policies: PolicyDocuments,
+    privacy: PrivacyOptions = {},
+): { manifest: ReleaseFreezeManifest; manifestFingerprint: string } {
+    privacyFirst(raw, privacy);
+    const manifest = parseFreezeManifest(raw);
+    validateFreezePolicies(manifest, policies);
+    writeArtifactAtomically(manifest, destination);
+    return loadFreeze(destination, canonicalFingerprint(manifest), policies, privacy);
+}
+
+export function loadFreeze(
+    artifactDir: string,
+    expectedManifestFingerprint: string,
+    policies: PolicyDocuments,
+    privacy: PrivacyOptions = {},
+): { manifest: ReleaseFreezeManifest; manifestFingerprint: string } {
+    const raw = readManifest(artifactDir);
+    privacyFirst(raw, privacy);
+    const manifestFingerprint = canonicalFingerprint(raw);
+    if (manifestFingerprint !== expectedManifestFingerprint) {
+        throw new HoldoutContractError(["freeze.manifest: untrusted"]);
+    }
+    const manifest = parseFreezeManifest(raw);
+    validateFreezePolicies(manifest, policies);
+    return { manifest, manifestFingerprint };
+}
+
+export function publishClose(
+    raw: unknown,
+    destination: string,
+    trustedFreeze: { manifest: ReleaseFreezeManifest; manifestFingerprint: string },
+    privacy: PrivacyOptions = {},
+): { manifest: CohortCloseManifest; manifestFingerprint: string } {
+    privacyFirst(raw, privacy);
+    const manifest = parseCloseManifest(raw);
+    if (manifest.body.epochId !== trustedFreeze.manifest.body.epochId) {
+        throw new HoldoutContractError(["close.epochId: freeze-mismatch"]);
+    }
+    if (manifest.body.freezeManifestFingerprint !== trustedFreeze.manifestFingerprint) {
+        throw new HoldoutContractError(["close.freezeManifestFingerprint: mismatch"]);
+    }
+    if (Date.parse(manifest.body.closedAt) < Date.parse(trustedFreeze.manifest.body.intakeWindow.closesAt)) {
+        throw new HoldoutContractError(["close.closedAt: before-cutoff"]);
+    }
+    writeArtifactAtomically(manifest, destination);
+    return loadClose(destination, canonicalFingerprint(manifest), trustedFreeze, privacy);
+}
+
+export function loadClose(
+    artifactDir: string,
+    expectedManifestFingerprint: string,
+    trustedFreeze: { manifest: ReleaseFreezeManifest; manifestFingerprint: string },
+    privacy: PrivacyOptions = {},
+): { manifest: CohortCloseManifest; manifestFingerprint: string } {
+    const raw = readManifest(artifactDir);
+    privacyFirst(raw, privacy);
+    const manifestFingerprint = canonicalFingerprint(raw);
+    if (manifestFingerprint !== expectedManifestFingerprint) {
+        throw new HoldoutContractError(["close.manifest: untrusted"]);
+    }
+    const manifest = parseCloseManifest(raw);
+    if (
+        manifest.body.epochId !== trustedFreeze.manifest.body.epochId ||
+        manifest.body.freezeManifestFingerprint !== trustedFreeze.manifestFingerprint
+    ) {
+        throw new HoldoutContractError(["close: freeze-link-invalid"]);
+    }
+    return { manifest, manifestFingerprint };
+}
+
+export function readTrustedManifestRegistry(path: string): TrustedManifestEntry[] {
+    let text: string;
+    try {
+        text = readFileSync(path, "utf8");
+    } catch {
+        throw new HoldoutContractError(["trust-registry: unreadable"]);
+    }
+    if (text.length === 0) return [];
+    if (!text.endsWith("\n")) throw new HoldoutContractError(["trust-registry: newline-required"]);
+    const entries = text.slice(0, -1).split("\n").map((line, index) => {
+        let raw: unknown;
+        try {
+            raw = JSON.parse(line);
+        } catch {
+            throw new HoldoutContractError([`trust-registry[${index}]: invalid-json`]);
+        }
+        const entry = parseTrustedManifestEntry(raw, `trust-registry[${index}]`);
+        if (canonicalJson(entry) !== line) {
+            throw new HoldoutContractError([`trust-registry[${index}]: non-canonical`]);
+        }
+        return entry;
+    });
+    const identities = entries.map((entry) => `${entry.epochId}:${entry.kind}:${entry.sequence ?? "manifest"}`);
+    if (new Set(identities).size !== identities.length) {
+        throw new HoldoutContractError(["trust-registry: duplicate-identity"]);
+    }
+    const lastLifecycleSequence = new Map<string, number>();
+    for (const entry of entries) {
+        if (entry.kind !== "lifecycle") continue;
+        const previous = lastLifecycleSequence.get(entry.epochId) ?? 0;
+        if (entry.sequence! <= previous) {
+            throw new HoldoutContractError(["trust-registry: lifecycle-order-invalid"]);
+        }
+        lastLifecycleSequence.set(entry.epochId, entry.sequence!);
+    }
+    return entries;
+}
+
+export function trustedFingerprint(
+    entries: readonly TrustedManifestEntry[],
+    epochId: string,
+    kind: TrustedManifestEntry["kind"],
+): string {
+    const entry = entries.find((candidate) =>
+        candidate.epochId === epochId && candidate.kind === kind && candidate.sequence === null,
+    );
+    if (!entry) throw new HoldoutContractError([`trust-registry:${kind}-missing`]);
+    return entry.manifestFingerprint;
+}
+
+export function validateTrustedLifecycle(
+    entries: readonly TrustedManifestEntry[],
+    epochId: string,
+    events: readonly LifecycleEvent[],
+): void {
+    const lifecycleEntries = entries.filter((entry) => entry.epochId === epochId && entry.kind === "lifecycle");
+    if (lifecycleEntries.length === 0) throw new HoldoutContractError(["trust-registry:lifecycle-missing"]);
+    for (const [index, entry] of lifecycleEntries.entries()) {
+        const sequence = index + 1;
+        if (
+            entry.sequence !== sequence ||
+            sequence > events.length ||
+            canonicalFingerprint(events.slice(0, sequence)) !== entry.manifestFingerprint
+        ) {
+            throw new HoldoutContractError(["lifecycle: trusted-prefix-mismatch"]);
+        }
+    }
+    if (lifecycleEntries.length !== events.length) {
+        throw new HoldoutContractError(["lifecycle: untrusted-suffix"]);
+    }
+}

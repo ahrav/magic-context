@@ -3,9 +3,11 @@
 import { describe, expect, it } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { verifyReleaseRoot } from "../prospective-holdout/release-root";
+import { releaseRootFixture } from "../prospective-holdout/test-fixtures";
 import type { HermeticMcHostStack } from "../rust-runner/hermetic-mc-host";
 import { __spawnOpencodeTest, type IsolatedEnv } from "./spawn";
 
@@ -32,6 +34,40 @@ function childProcess(fake: FakeChild): ChildProcess {
 }
 
 describe("opencode child lifecycle", () => {
+    it("uses selected plugin and database bytes only when release root is supplied", () => {
+        const release = mkdtempSync(join(tmpdir(), "opencode-release-root-"));
+        const active = mkdtempSync(join(tmpdir(), "opencode-active-root-"));
+        const root = mkdtempSync(join(tmpdir(), "opencode-selected-root-"));
+        const env: IsolatedEnv = {
+            configDir: join(root, "config"),
+            dataDir: join(root, "data"),
+            cacheDir: join(root, "cache"),
+            workdir: join(root, "work"),
+        };
+        try {
+            for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
+            const manifest = releaseRootFixture(release);
+            const verified = verifyReleaseRoot(release, manifest, {
+                expectedRootFingerprint: manifest.rootFingerprint,
+                activeCheckout: active,
+            });
+            __spawnOpencodeTest.initializeIsolatedContextDb(env.dataDir, verified);
+            __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:1", {
+                mockProviderURL: "http://127.0.0.1:1",
+                releaseRoot: verified,
+            });
+            const config = JSON.parse(readFileSync(join(env.configDir, "opencode.json"), "utf8")) as { plugin: string[] };
+            expect(config.plugin).toEqual([`file://${join(release, "packages/plugin/dist/index.js")}`]);
+            const database = join(env.dataDir, "cortexkit/magic-context/context.db");
+            expect(readFileSync(database, "utf8")).toBe("db");
+            expect(() => accessSync(database, constants.W_OK)).not.toThrow();
+        } finally {
+            rmSync(release, { recursive: true, force: true });
+            rmSync(active, { recursive: true, force: true });
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("rejects startup on child spawn error", async () => {
         const child = new FakeChild();
         const startup = __spawnOpencodeTest.rejectOnSpawnError(childProcess(child));

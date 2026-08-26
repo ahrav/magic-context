@@ -21,6 +21,7 @@ import {
     type BindIdentity,
 } from "@magic-context/core/shared/mc-host-client";
 import { waitForChildExit } from "../process-exit";
+import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const FIXTURE_BINARY = join(
@@ -222,7 +223,11 @@ function reapRecordedRustProcesses(): void {
     }
 }
 
-export function detectRustModePrereqs(): RustModePrereqs {
+export function detectRustModePrereqs(releaseRoot?: VerifiedReleaseRoot): RustModePrereqs {
+    if (releaseRoot) {
+        releaseRootPath(releaseRoot, "rustHost");
+        return { ok: true };
+    }
     if (process.platform === "win32") {
         return {
             ok: false,
@@ -324,7 +329,8 @@ function runCargo(args: string[]): Promise<{ ok: boolean; stderr: string }> {
 }
 
 /** Build U5 fixture once per Bun process. Cargo handles cross-process incremental caching. */
-export function buildDirectHostFixture(): Promise<string> {
+export function buildDirectHostFixture(releaseRoot?: VerifiedReleaseRoot): Promise<string> {
+    if (releaseRoot) return Promise.resolve(releaseRootPath(releaseRoot, "rustHost"));
     if (fixtureBuild) return fixtureBuild;
     fixtureBuild = (async () => {
         const configured = process.env.MC_E2E_DIRECT_HOST_FIXTURE_BIN;

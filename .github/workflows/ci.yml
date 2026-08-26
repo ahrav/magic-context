@@ -276,6 +276,30 @@ jobs:
       - name: Test
         run: bun run --cwd packages/pi-plugin test
 
+  prospective-release-holdout:
+    name: Prospective release holdout contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Prospective holdout unit contracts
+        run: bun run test:prospective-unit
+
+      - name: Authenticate lifecycle-appropriate epoch artifacts
+        run: bun run validate:prospective-holdout
+
+      - name: E2E harness typecheck
+        run: bun run --cwd packages/e2e-tests typecheck
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest

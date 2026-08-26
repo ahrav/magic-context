@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { mkdtempSync, writeFileSync, cpSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { parseIncidentCatalog, parseSourceInventory } from "./contract";
+import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { closeManifest } from "../prospective-holdout/test-fixtures";
+import { parseIncidentCatalog, parseProspectiveIncidentSource, parseSourceInventory } from "./contract";
 import {
     splitLedgerLines,
     validateIncidentHistory,
@@ -23,6 +25,7 @@ import {
     scanSources,
     validateEvidenceAndSources,
     verifyOwnershipMatrix,
+    verifyProspectiveSourceEvidence,
     verifySourceCompleteness,
     type EvidenceView,
 } from "./evidence";
@@ -611,6 +614,38 @@ describe("committed repository state", () => {
                 }
             }
         }
+    });
+
+    it("validates prospective source evidence against trusted close and privacy approval", () => {
+        const close = closeManifest();
+        const trustedCloseFingerprint = canonicalFingerprint(close);
+        const admitted = close.body.cases[0]!;
+        const incidentBytesFingerprint = "4".repeat(64);
+        const subjectFingerprint = canonicalFingerprint({
+            epochId: close.body.epochId,
+            caseId: admitted.caseId,
+            closeManifestFingerprint: trustedCloseFingerprint,
+            incidentBytesFingerprint,
+        });
+        const source = parseProspectiveIncidentSource({
+            schema: "incident-prospective-source/v1",
+            epoch_id: close.body.epochId,
+            case_id: admitted.caseId,
+            family_id: admitted.familyId,
+            close_manifest_fingerprint: trustedCloseFingerprint,
+            case_commitment: admitted.caseCommitment,
+            semantic_revision_id: "rev-first",
+            incident_bytes_fingerprint: incidentBytesFingerprint,
+            second_privacy_approval: {
+                approver: "privacy-reviewer",
+                subject_fingerprint: subjectFingerprint,
+            },
+        });
+        expect(() => verifyProspectiveSourceEvidence(source, close, trustedCloseFingerprint)).not.toThrow();
+        source.case_commitment = "f".repeat(64);
+        expect(() => verifyProspectiveSourceEvidence(source, close, trustedCloseFingerprint)).toThrow(
+            /admitted cohort case/,
+        );
     });
 
     it("fails when the catalog references an orphan source claim", () => {
