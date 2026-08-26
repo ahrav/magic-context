@@ -147,6 +147,43 @@ export function attestationMatchesWorkflowSource(
     return attestationCertificateMatches(value, source, artifactSha256);
 }
 
+function verifyAttestationWithGitHub(
+    rootDir: string,
+    path: string,
+    source: WorkflowSource,
+): unknown {
+    const result = spawnSync(
+        "gh",
+        [
+            "attestation",
+            "verify",
+            path,
+            "--repo",
+            source.repository,
+            "--source-digest",
+            source.headSha,
+            "--signer-workflow",
+            `${source.repository}/${source.workflow}`,
+            "--format",
+            "json",
+        ],
+        { cwd: rootDir, encoding: "utf8" },
+    );
+    if (result.status !== 0) return null;
+    try {
+        return JSON.parse(result.stdout) as unknown;
+    } catch {
+        return null;
+    }
+}
+
+export function resolveAttestationVerification(
+    injected: (() => unknown) | undefined,
+    fallback: () => unknown,
+): unknown {
+    return injected === undefined ? fallback() : injected();
+}
+
 export interface InstalledReleaseEvidence {
     schema: "magic-context.mc-host-installed-release-evidence/v1";
     release: {
@@ -253,6 +290,37 @@ function isSafeRelativePath(path: string): boolean {
         !path.includes("\\") &&
         !path.split("/").some((part) => part.length === 0 || part === "." || part === "..")
     );
+}
+
+function validateTargetTestReport(
+    rootDir: string,
+    observations: Record<string, unknown>,
+    target: string,
+): { path: string; sha256: string } {
+    const path = stringField(observations, "test_report_path", "target observations");
+    const sha256 = stringField(observations, "test_report_sha256", "target observations");
+    if (!isSafeRelativePath(path) || !SHA256_RE.test(sha256)) {
+        fail("target test report path or digest is invalid");
+    }
+    let report: Record<string, unknown>;
+    try {
+        report = record(
+            JSON.parse(readFileSync(join(rootDir, path), "utf8")),
+            "target test report",
+        );
+    } catch {
+        fail("target test report is missing or malformed");
+    }
+    exactKeys(report, ["schema", "target", "passed"], "target test report");
+    if (
+        report.schema !== "magic-context.mc-host-test-report/v1" ||
+        report.target !== target ||
+        report.passed !== true ||
+        sha256File(rootDir, path) !== sha256
+    ) {
+        fail("target test report does not prove a passing run for its target");
+    }
+    return { path, sha256 };
 }
 
 function exactIdentitySet(
@@ -670,6 +738,10 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         const flow = evidence.product_flows.find(
             (entry) => entry.package === proof.subject,
         );
+        const targetTestReport =
+            proof.kind === "target" && target
+                ? validateTargetTestReport(rootDir, observations, target.target)
+                : null;
         const expectedObservations =
             proof.kind === "registry_package" && registry
                 ? {
@@ -698,20 +770,8 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                             : "linux",
                         self_fd_verified: target.self_fd_verified,
                         target: target.target,
-                        test_report_path:
-                            typeof observations.test_report_path === "string" &&
-                            isSafeRelativePath(observations.test_report_path)
-                                ? observations.test_report_path
-                                : null,
-                        test_report_sha256:
-                            typeof observations.test_report_path === "string" &&
-                            isSafeRelativePath(observations.test_report_path) &&
-                            typeof observations.test_report_sha256 === "string" &&
-                            SHA256_RE.test(observations.test_report_sha256) &&
-                            sha256File(rootDir, observations.test_report_path) ===
-                                observations.test_report_sha256
-                                ? observations.test_report_sha256
-                                : null,
+                        test_report_path: targetTestReport?.path ?? null,
+                        test_report_sha256: targetTestReport?.sha256 ?? null,
                     }
                   : proof.kind === "product_flow" && flow
                     ? {
@@ -784,33 +844,12 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             if (!workflowVerified) {
                 fail(`proof artifact ${proof.kind}:${proof.subject} workflow run is unverified`);
             }
-            const attestationResult =
-                options.verifyAttestation?.(proofPath, proof, workflowSource) ??
-                (() => {
-                    const result = spawnSync(
-                        "gh",
-                        [
-                            "attestation",
-                            "verify",
-                            proofPath,
-                            "--repo",
-                            repository,
-                            "--source-digest",
-                            headSha,
-                            "--signer-workflow",
-                            `${repository}/${workflow}`,
-                            "--format",
-                            "json",
-                        ],
-                        { cwd: rootDir, encoding: "utf8" },
-                    );
-                    if (result.status !== 0) return null;
-                    try {
-                        return JSON.parse(result.stdout) as unknown;
-                    } catch {
-                        return null;
-                    }
-                })();
+            const attestationResult = resolveAttestationVerification(
+                options.verifyAttestation === undefined
+                    ? undefined
+                    : () => options.verifyAttestation?.(proofPath, proof, workflowSource),
+                () => verifyAttestationWithGitHub(rootDir, proofPath, workflowSource),
+            );
             const verified = attestationCertificateMatches(
                 attestationResult,
                 workflowSource,
@@ -836,37 +875,22 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         const installedEvidenceSha256 = createHash("sha256")
             .update(installedEvidenceBytes)
             .digest("hex");
-        const attestationResult =
-            options.verifyInstalledEvidenceAttestation?.(
-                installedEvidencePath,
-                qualifiedSource,
-                installedEvidenceSha256,
-            ) ??
-            (() => {
-                const result = spawnSync(
-                    "gh",
-                    [
-                        "attestation",
-                        "verify",
-                        installedEvidencePath,
-                        "--repo",
-                        qualifiedSource.repository,
-                        "--source-digest",
-                        qualifiedSource.headSha,
-                        "--signer-workflow",
-                        `${qualifiedSource.repository}/${qualifiedSource.workflow}`,
-                        "--format",
-                        "json",
-                    ],
-                    { cwd: rootDir, encoding: "utf8" },
-                );
-                if (result.status !== 0) return null;
-                try {
-                    return JSON.parse(result.stdout) as unknown;
-                } catch {
-                    return null;
-                }
-            })();
+        const attestationResult = resolveAttestationVerification(
+            options.verifyInstalledEvidenceAttestation === undefined
+                ? undefined
+                : () =>
+                      options.verifyInstalledEvidenceAttestation?.(
+                          installedEvidencePath,
+                          qualifiedSource,
+                          installedEvidenceSha256,
+                      ),
+            () =>
+                verifyAttestationWithGitHub(
+                    rootDir,
+                    installedEvidencePath,
+                    qualifiedSource,
+                ),
+        );
         if (
             !attestationCertificateMatches(
                 attestationResult,
