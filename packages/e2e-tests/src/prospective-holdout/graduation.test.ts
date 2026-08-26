@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -167,6 +167,31 @@ describe("prospective incident graduation", () => {
             expect(() => registerProspectiveIncidentCase(new Map(), initiallyVerified, registration)).toThrow(
                 /requires verified source evidence/,
             );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("stages a candidate outside the scanned graduation directory", () => {
+        const context = fixtures();
+        const candidate = candidateFor(context, [context.pair]);
+        const root = mkdtempSync(join(tmpdir(), "graduation-staging-"));
+        try {
+            const graduation = join(root, "graduation");
+            const file = `${candidate.source.case_id}.json`;
+            mkdirSync(graduation, { recursive: true });
+            // Creating and removing an entry updates the holding directory's modification time,
+            // so a staging entry that lives beside the graduation directory rather than inside it
+            // is observable on the parent. Backdating the parent first makes the comparison exact
+            // instead of dependent on timestamp resolution.
+            const backdated = new Date(Date.now() - 600_000);
+            utimesSync(root, backdated, backdated);
+            appendGraduationCandidate(candidate, join(graduation, file));
+            expect(statSync(root).mtimeMs).toBeGreaterThan(backdated.getTime());
+            // Readers require every name here to be a candidate, so a staging entry a killed
+            // publisher left inside this directory reads as a malformed candidate and wedges
+            // every later scan.
+            expect(readdirSync(graduation)).toEqual([file]);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

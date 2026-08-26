@@ -77,6 +77,32 @@ function terminal(
     };
 }
 
+/**
+ * Marks a wait whose bound elapsed before the work settled. Neither a driver
+ * result nor a cleanup outcome is a string, so the sentinel cannot collide with a
+ * value a bounded wait carries.
+ */
+const UNSETTLED = "unsettled";
+
+/**
+ * Awaits `work` for at most `ms`, reporting `UNSETTLED` once the bound elapses.
+ * The timer is cleared in a `finally`, so a bound never outlives the wait it
+ * guards, whether that wait yields a value, reports the bound, or throws.
+ */
+async function bounded<T>(work: Promise<T>, ms: number): Promise<T | typeof UNSETTLED> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            work,
+            new Promise<typeof UNSETTLED>((resolve) => {
+                timer = setTimeout(() => resolve(UNSETTLED), ms);
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 export async function runProspectiveCase(input: {
     scenario: ProspectiveScenario;
     releaseRole: ReleaseRole;
@@ -167,113 +193,105 @@ export async function runProspectiveCase(input: {
         }
         return terminal(input.scenario, input.releaseRole, root, expected, coordinate, fields);
     };
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-        timer = setTimeout(() => resolve("timeout"), input.timeoutMs);
-    });
     const execution = Promise.resolve()
         .then(() => input.scenario.driver(context))
         .then((raw) => ({ status: "ok" as const, raw }))
         .catch((error: unknown) => ({ status: "error" as const, error }));
-    try {
-        const raced = await Promise.race([execution, timeout]);
-        if (raced === "timeout") {
-            controller.abort();
-            const cleanupSucceeded = await cleanup();
-            // A driver that ignores the abort signal, and that cleanup cannot terminate, would
-            // otherwise make this await outlive timeoutMs entirely and hang the suite until the
-            // CI job timeout. Draining is best effort and bounded by a second timeoutMs.
-            let drainTimer: ReturnType<typeof setTimeout> | undefined;
-            let drained: unknown;
-            try {
-                drained = await Promise.race([
-                    execution,
-                    new Promise<"abandoned">((resolve) => {
-                        drainTimer = setTimeout(() => resolve("abandoned"), input.timeoutMs);
-                    }),
-                ]);
-            } finally {
-                if (drainTimer) clearTimeout(drainTimer);
-            }
-            // The bound above trades a hang for a driver that may still hold child processes and
-            // still write the workspace. A returned timeout cell leaves the pair short of
-            // "completed", which `buildPairedFacts` accepts as grounds for another attempt, so
-            // that attempt would run against the abandoned driver's writes and observe them as its
-            // own. Isolation is unprovable once the driver survives the drain, so the breach stops
-            // the run instead of emitting a cell any retry could build on.
-            if (drained === "abandoned") {
-                throw new HoldoutContractError(["prospective-runner: driver-abandoned"]);
-            }
-            return terminal(input.scenario, input.releaseRole, root, expected, coordinate, cleanupSucceeded ? {
-                runHealth: "timeout",
-                productOutcome: "not-evaluated",
-                failedChecks: [],
-                reasonCode: "deadline-exceeded",
-            } : {
-                runHealth: "crash",
-                productOutcome: "not-evaluated",
-                failedChecks: [],
-                reasonCode: "runner-crash",
-            });
+    const raced = await bounded(execution, input.timeoutMs);
+    if (raced === UNSETTLED) {
+        controller.abort();
+        // Cleanup is scenario code, so it can hang exactly the way a driver can. An unbounded
+        // wait here outlives timeoutMs before the drain below bounds anything, which is the
+        // hang the deadline exists to prevent, so this wait carries the same bound. An
+        // elapsed bound leaves the workspace in the state a throwing cleanup leaves it in,
+        // unproven either way, so both report the crash terminal rather than splitting into a
+        // third outcome no committed row can carry.
+        const cleanupSucceeded = (await bounded(cleanup(), input.timeoutMs)) === true;
+        // A driver that ignores the abort signal, and that cleanup cannot terminate, would
+        // otherwise make this await outlive timeoutMs entirely and hang the suite until the
+        // CI job timeout. Draining is best effort and bounded by another timeoutMs.
+        const drained = await bounded(execution, input.timeoutMs);
+        // The bound above trades a hang for a driver that may still hold child processes and
+        // still write the workspace. A returned timeout cell leaves the pair short of
+        // "completed", which `buildPairedFacts` accepts as grounds for another attempt, so
+        // that attempt would run against the abandoned driver's writes and observe them as its
+        // own. Isolation is unprovable once the driver survives the drain, so the breach stops
+        // the run instead of emitting a cell any retry could build on.
+        if (drained === UNSETTLED) {
+            throw new HoldoutContractError(["prospective-runner: driver-abandoned"]);
         }
-        if (raced.status === "error") {
-            if (raced.error instanceof ProspectiveProductFailure) {
-                return finish({
-                    runHealth: "completed",
-                    productOutcome: "fail",
-                    failedChecks: [],
-                    reasonCode: "product-crash",
-                });
-            }
-            if (raced.error instanceof ProspectivePrerequisiteUnavailable) {
-                return finish({
-                    runHealth: "unavailable",
-                    productOutcome: "not-evaluated",
-                    failedChecks: [],
-                    reasonCode: "prerequisite-unavailable",
-                });
-            }
-            return finish({
-                runHealth: "crash",
-                productOutcome: "not-evaluated",
-                failedChecks: [],
-                reasonCode: "runner-crash",
-            });
-        }
-        let checks: ReturnType<ProspectiveScenario["verifier"]>;
-        try {
-            canonicalJson(raced.raw as JsonValue);
-            checks = input.scenario.verifier(input.scenario.normalizer(raced.raw));
-        } catch {
+        return terminal(input.scenario, input.releaseRole, root, expected, coordinate, cleanupSucceeded ? {
+            runHealth: "timeout",
+            productOutcome: "not-evaluated",
+            failedChecks: [],
+            reasonCode: "deadline-exceeded",
+        } : {
+            runHealth: "crash",
+            productOutcome: "not-evaluated",
+            failedChecks: [],
+            reasonCode: "runner-crash",
+        });
+    }
+    if (raced.status === "error") {
+        if (raced.error instanceof ProspectiveProductFailure) {
             return finish({
                 runHealth: "completed",
                 productOutcome: "fail",
                 failedChecks: [],
-                reasonCode: "invalid-result",
+                reasonCode: "product-crash",
             });
         }
-        const failedChecks = checks.filter((check) => !check.passed).map((check) => check.id).sort();
-        if (
-            checks.length === 0 ||
-            new Set(checks.map((check) => check.id)).size !== checks.length ||
-            checks.some((check) => !/^check-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(check.id))
-        ) {
+        if (raced.error instanceof ProspectivePrerequisiteUnavailable) {
             return finish({
-                runHealth: "completed",
-                productOutcome: "fail",
+                runHealth: "unavailable",
+                productOutcome: "not-evaluated",
                 failedChecks: [],
-                reasonCode: "invalid-result",
+                reasonCode: "prerequisite-unavailable",
             });
         }
         return finish({
-            runHealth: "completed",
-            productOutcome: failedChecks.length === 0 ? "pass" : "fail",
-            failedChecks,
-            reasonCode: null,
+            runHealth: "crash",
+            productOutcome: "not-evaluated",
+            failedChecks: [],
+            reasonCode: "runner-crash",
         });
-    } finally {
-        if (timer) clearTimeout(timer);
     }
+    let checks: ReturnType<ProspectiveScenario["verifier"]>;
+    try {
+        canonicalJson(raced.raw as JsonValue);
+        checks = input.scenario.verifier(input.scenario.normalizer(raced.raw));
+    } catch {
+        return finish({
+            runHealth: "completed",
+            productOutcome: "fail",
+            failedChecks: [],
+            reasonCode: "invalid-result",
+        });
+    }
+    // A verifier is scenario code and its return value reaches here unvalidated, so the
+    // declared `boolean` is no evidence about `passed`. A truthy non-boolean such as the
+    // string "false" satisfies the failure filter below and would record a pass, so the
+    // gate proves the type before any outcome is derived from it.
+    if (
+        checks.length === 0 ||
+        new Set(checks.map((check) => check.id)).size !== checks.length ||
+        checks.some((check) => !/^check-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(check.id)) ||
+        checks.some((check) => typeof check.passed !== "boolean")
+    ) {
+        return finish({
+            runHealth: "completed",
+            productOutcome: "fail",
+            failedChecks: [],
+            reasonCode: "invalid-result",
+        });
+    }
+    const failedChecks = checks.filter((check) => !check.passed).map((check) => check.id).sort();
+    return finish({
+        runHealth: "completed",
+        productOutcome: failedChecks.length === 0 ? "pass" : "fail",
+        failedChecks,
+        reasonCode: null,
+    });
 }
 
 /**

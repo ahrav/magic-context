@@ -40,4 +40,32 @@ describe("prospective scenario registry", () => {
         expect(() => validateProspectiveRegistry(closeManifest(), registry, REPO_ROOT)).toThrow(/implementation-drift/);
         expect(() => validateProspectiveRegistry(closeManifest(), new Map(), REPO_ROOT)).toThrow(/cardinality-mismatch/);
     });
+
+    it("separates an implementation path that escapes the root from one merely absent", () => {
+        const escaping: ProspectiveRegistry = new Map();
+        const outside = scenario();
+        outside.implementationFiles = ["../../../../etc/passwd"];
+        registerProspectiveScenario(escaping, outside);
+        expect(() => validateProspectiveRegistry(closeManifest(), escaping, REPO_ROOT)).toThrow(
+            /implementation-escapes-root/,
+        );
+
+        const absoluteRegistry: ProspectiveRegistry = new Map();
+        const absolute = scenario();
+        absolute.implementationFiles = ["/etc/passwd"];
+        registerProspectiveScenario(absoluteRegistry, absolute);
+        expect(() => validateProspectiveRegistry(closeManifest(), absoluteRegistry, REPO_ROOT)).toThrow(
+            /implementation-escapes-root/,
+        );
+
+        // A path the root contains but the tree does not hold is an ordinary missing file, so it
+        // keeps the diagnostic that names availability rather than containment.
+        const missingRegistry: ProspectiveRegistry = new Map();
+        const missing = scenario();
+        missing.implementationFiles = ["packages/e2e-tests/src/prospective-holdout/absent-file.ts"];
+        registerProspectiveScenario(missingRegistry, missing);
+        expect(() => validateProspectiveRegistry(closeManifest(), missingRegistry, REPO_ROOT)).toThrow(
+            /implementation-unavailable/,
+        );
+    });
 });

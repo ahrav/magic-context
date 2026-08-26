@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { lstatSync, mkdtempSync, readlinkSync, realpathSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyReleaseRoot } from "../prospective-holdout/release-root";
@@ -18,8 +18,18 @@ describe("Pi release root selection", () => {
                 activeCheckout: active,
             });
             ensurePluginAvailable(env, verified);
-            expect(lstatSync(env.pluginDir).isSymbolicLink()).toBe(true);
-            expect(readlinkSync(env.pluginDir)).toBe(join(release, "packages/pi-plugin/dist/index.js"));
+            // Pi loads an extension through the `package.json` inside each configured
+            // package, so the entry has to be a directory whose manifest names the link
+            // to the release root's frozen entrypoint.
+            expect(lstatSync(env.pluginDir).isDirectory()).toBe(true);
+            expect(readlinkSync(join(env.pluginDir, "index.js"))).toBe(
+                join(release, "packages/pi-plugin/dist/index.js"),
+            );
+            const manifestPath = join(env.pluginDir, "package.json");
+            expect(JSON.parse(readFileSync(manifestPath, "utf8")).pi).toEqual({
+                extensions: ["./index.js"],
+            });
+            expect(readFileSync(join(env.pluginDir, "index.js"), "utf8")).toBe("pi");
         } finally {
             rmSync(release, { recursive: true, force: true });
             rmSync(active, { recursive: true, force: true });

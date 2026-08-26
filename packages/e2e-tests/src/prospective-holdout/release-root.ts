@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { isWithin } from "../../../plugin/src/features/magic-context/memory/verification-paths";
 import { HoldoutContractError, array, exact, fail, hex64, record, staticId } from "./contract";
 
 export const RELEASE_ROOT_SCHEMA = "prospective-release-root/v1";
@@ -145,11 +146,6 @@ function listFiles(root: string, current = root): string[] {
     return found.sort();
 }
 
-function inside(candidate: string, parent: string): boolean {
-    const relation = relative(parent, candidate);
-    return relation === "" || (!relation.startsWith("..") && !isAbsolute(relation));
-}
-
 export function verifyReleaseRoot(
     rootPath: string,
     rawManifest: unknown,
@@ -157,7 +153,7 @@ export function verifyReleaseRoot(
 ): VerifiedReleaseRoot {
     const root = realpathSync(rootPath);
     const activeCheckout = realpathSync(options.activeCheckout);
-    if (inside(root, activeCheckout)) throw new HoldoutContractError(["release-root: active-checkout-forbidden"]);
+    if (isWithin(activeCheckout, root)) throw new HoldoutContractError(["release-root: active-checkout-forbidden"]);
     const manifest = parseReleaseRootManifest(rawManifest);
     if (manifest.rootFingerprint !== options.expectedRootFingerprint) {
         throw new HoldoutContractError(["release-root: untrusted-root-fingerprint"]);
@@ -169,7 +165,7 @@ export function verifyReleaseRoot(
     }
     for (const file of manifest.files) {
         const absolute = resolve(root, file.path);
-        if (!inside(absolute, root) || fileDigest(absolute) !== file.digest) {
+        if (!isWithin(root, absolute) || fileDigest(absolute) !== file.digest) {
             throw new HoldoutContractError(["release-root: byte-mismatch"]);
         }
     }

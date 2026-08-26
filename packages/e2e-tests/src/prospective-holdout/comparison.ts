@@ -203,7 +203,12 @@ export function assertAaSymmetry(left: ProspectiveCellResult, right: Prospective
         platform: cell.platform,
         health: cell.runHealth,
         outcome: cell.productOutcome,
-        checks: cell.failedChecks,
+        // The projection is compared as serialized text, so listing order would decide symmetry.
+        // A runner emits this list sorted, but a committed `outcomes.json` row is hand-authorable
+        // and the parser only rejects duplicates, so two rows naming one failure set in different
+        // orders reach here as legitimate evidence. Sorting a copy compares the set the row states
+        // without reordering the caller's cell.
+        checks: [...cell.failedChecks].sort(),
         reason: cell.reasonCode,
     });
     if (JSON.stringify(projection(left)) !== JSON.stringify(projection(right))) {

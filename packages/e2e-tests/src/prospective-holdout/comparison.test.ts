@@ -33,6 +33,27 @@ describe("paired prospective comparison", () => {
         )).toThrow(/aa-asymmetry/);
     });
 
+    it("accepts A/A rows that list one failure set in a different order", () => {
+        const failedChecks = ["check-alpha", "check-beta"];
+        const failing = (order: readonly string[]): ProspectiveCellResult =>
+            cell("release-n-minus-1", { productOutcome: "fail", failedChecks: [...order] });
+        const left = failing(failedChecks);
+        const right = failing([...failedChecks].reverse());
+        expect(() => assertAaSymmetry(left, right)).not.toThrow();
+        // The projection reports the set, so a row naming a different set stays asymmetric.
+        expect(() => assertAaSymmetry(left, failing(["check-alpha", "check-gamma"]))).toThrow(
+            /aa-asymmetry/,
+        );
+        // Committed rows are read as evidence, so the comparison leaves the caller's order alone.
+        expect(left.failedChecks).toEqual(failedChecks);
+        // The committed path reaches the comparison through the paired build, which is where a
+        // hand-authored order would otherwise reject the epoch.
+        expect(() => buildPairedFacts(closeManifest(), [
+            { attempt: 0, cell: cell("release-n") },
+            { attempt: 0, cell: cell("release-n-minus-1") },
+        ], [{ left, right }], 0, freezeManifest())).not.toThrow();
+    });
+
     it("preserves product failures and infrastructure failures as incomplete pairs", () => {
         const product = buildPairedFacts(closeManifest(), [
             { attempt: 0, cell: cell("release-n", { productOutcome: "fail", reasonCode: "product-crash" }) },

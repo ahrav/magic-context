@@ -1,6 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
 import {
@@ -176,19 +175,37 @@ export function parseGraduationCandidate(raw: unknown): GraduationCandidate {
     return candidate;
 }
 
+/**
+ * Installs one candidate under its own name in the graduation directory.
+ *
+ * Every entry in that directory is a candidate: readers scan it and require each filename to
+ * be `case-<32 hex>.json`, so a name staged there and left behind is read as a malformed
+ * candidate rather than as work in progress. Staging therefore lives in the directory's parent,
+ * the epoch root, under the `.staging-` prefix `mkdtempSync` completes — the same shape the
+ * artifact publishers stage under there, which readers of an epoch root already recognise as
+ * runtime state and skip. A publisher killed before its cleanup leaves that directory holding
+ * the bytes it had written, beside the graduation directory instead of inside it, so the scan
+ * still sees only candidates and the identical retry below republishes.
+ *
+ * `linkSync` is what installs the destination, and it fails rather than replacing an existing
+ * name, so a retry lands on the byte comparison and an unequal candidate is reported instead of
+ * overwriting the installed one.
+ */
 export function appendGraduationCandidate(candidate: GraduationCandidate, destination: string): void {
     const bytes = `${JSON.stringify(candidate, null, 2)}\n`;
-    mkdirSync(dirname(destination), { recursive: true });
-    const staging = `${destination}.staging-${randomBytes(8).toString("hex")}`;
+    const directory = dirname(destination);
+    mkdirSync(directory, { recursive: true });
+    const staging = mkdtempSync(join(dirname(directory), ".staging-"));
+    const staged = join(staging, basename(destination));
     try {
-        writeFileSync(staging, bytes, { flag: "wx" });
-        linkSync(staging, destination);
+        writeFileSync(staged, bytes, { flag: "wx" });
+        linkSync(staged, destination);
     } catch {
         if (!existsSync(destination) || readFileSync(destination, "utf8") !== bytes) {
             throw new HoldoutContractError(["graduation: append-conflict"]);
         }
     } finally {
-        rmSync(staging, { force: true });
+        rmSync(staging, { recursive: true, force: true });
     }
 }
 

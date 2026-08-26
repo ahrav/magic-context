@@ -259,6 +259,22 @@ describe("prospective runner", () => {
         });
     });
 
+    it("refuses verifier evidence whose passed field is not a boolean", async () => {
+        await withRoots(async (root, paired, active) => {
+            const result = await runProspectiveCase({
+                ...baseInput(root, paired, active),
+                scenario: scenario(async () => ({ state: "stale" }), {
+                    // A non-empty string is truthy, so the failure filter alone reads this check
+                    // as passed and the cell it records claims a pass the verifier never reported.
+                    verifier: () => [{ id: "check-current", passed: "false" as unknown as boolean }],
+                }),
+            });
+            expect([result.runHealth, result.productOutcome, result.failedChecks, result.reasonCode]).toEqual([
+                "completed", "fail", [], "invalid-result",
+            ]);
+        });
+    });
+
     it("aborts and awaits cleanup before returning a timeout", async () => {
         await withRoots(async (root, paired, active) => {
             let resolveDriver: ((value: { state: string }) => void) | undefined;
@@ -299,6 +315,26 @@ describe("prospective runner", () => {
             expect(cleaned).toBe(true);
         });
     });
+
+    it("bounds a cleanup that never settles and records it as a crash", async () => {
+        await withRoots(async (root, paired, active) => {
+            const result = await runProspectiveCase({
+                ...baseInput(root, paired, active),
+                timeoutMs: 5,
+                scenario: scenario(
+                    // The driver ends on the abort, so the drain settles at once and the cleanup
+                    // wait is the only thing that can hold the call open past the deadline.
+                    (context) => new Promise<{ state: string }>((resolve) => {
+                        context.signal.addEventListener("abort", () => resolve({ state: "late" }));
+                    }),
+                    { cleanup: () => new Promise<void>(() => {}) },
+                ),
+            });
+            expect([result.runHealth, result.productOutcome, result.reasonCode]).toEqual([
+                "crash", "not-evaluated", "runner-crash",
+            ]);
+        });
+    }, 1_000);
 
     it("keeps product crashes as failures and infrastructure errors incomplete", async () => {
         await withRoots(async (root, paired, active) => {

@@ -109,20 +109,32 @@ export function createPiIsolatedEnv(sharedDataDir?: string): PiIsolatedEnv {
 }
 
 export function ensurePluginAvailable(env: PiIsolatedEnv, releaseRoot?: VerifiedReleaseRoot): void {
-  const plugin = releaseRoot
-    ? releaseRootPath(releaseRoot, "piPlugin")
-    : PI_PLUGIN_ROOT;
-  const required = releaseRoot ? plugin : join(plugin, "dist", "index.js");
-  if (!existsSync(required)) {
-    throw new Error(
-      releaseRoot
-        ? `Pi plugin artifact is missing: ${required}`
-        : `${required} is missing. Run: cd packages/pi-plugin && bun run build`,
-    );
+  if (!releaseRoot) {
+    if (!existsSync(join(PI_PLUGIN_ROOT, "dist", "index.js"))) {
+      throw new Error(
+        `${join(PI_PLUGIN_ROOT, "dist", "index.js")} is missing. Run: cd packages/pi-plugin && bun run build`,
+      );
+    }
+    if (!existsSync(env.pluginDir)) symlinkSync(PI_PLUGIN_ROOT, env.pluginDir, "dir");
+    return;
   }
-  if (!existsSync(env.pluginDir)) {
-    symlinkSync(plugin, env.pluginDir, releaseRoot ? "file" : "dir");
+  // Pi resolves an extension by reading `pi.extensions` from the `package.json`
+  // inside each `settings.packages` entry, so an entry has to be a package
+  // directory. The release root declares the built entrypoint, not the package
+  // that wraps it, so the entry is a directory built here: the frozen file is
+  // linked in and a manifest points at the link. The bytes Pi loads are still the
+  // release root's; only the wrapper naming them is local.
+  const entrypoint = releaseRootPath(releaseRoot, "piPlugin");
+  if (!existsSync(entrypoint)) {
+    throw new Error(`Pi plugin artifact is missing: ${entrypoint}`);
   }
+  if (existsSync(env.pluginDir)) return;
+  mkdirSync(env.pluginDir, { recursive: true });
+  symlinkSync(entrypoint, join(env.pluginDir, "index.js"), "file");
+  writeFileSync(
+    join(env.pluginDir, "package.json"),
+    `${JSON.stringify({ name: "pi-magic-context", version: "0.0.0", pi: { extensions: ["./index.js"] } }, null, 2)}\n`,
+  );
 }
 
 export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {

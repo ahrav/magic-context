@@ -31,6 +31,11 @@ const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
  * the resource the lock guards.
  */
 export const LOCK_LEASE_MS = 60_000;
+/**
+ * Slot `Atomics.wait` parks on between attempts. Nothing stores to it or notifies
+ * on it, so every wait sleeps its full timeout and one slot serves every waiter.
+ */
+const LOCK_WAIT_SLOT = new Int32Array(new SharedArrayBuffer(4));
 
 function errorCode(error: unknown): string | undefined {
     return typeof error === "object" && error !== null && "code" in error
@@ -260,7 +265,7 @@ export function withRecoverableLock<T>(
         // lock. So the deadline alone ends the wait: reading absence as a failure here
         // would report busy for a lock that is already free.
         if (Date.now() >= deadline) throw new HoldoutContractError([options.busyCode]);
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        Atomics.wait(LOCK_WAIT_SLOT, 0, 0, 5);
     }
     try {
         return operation();
