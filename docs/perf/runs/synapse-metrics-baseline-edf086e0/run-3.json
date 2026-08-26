@@ -1,1 +1,0 @@
-{"completed":4683,"engine":"inline_zero_delay","in_flight":0,"kind":"synapse_perf_result","loop":"open","offered":5000,"p50_ns":1354239,"p95_ns":1811186,"p99_ns":1845729,"rate_per_sec":1000,"rejected":317,"seconds":5,"throughput_per_sec":936.6,"timed_out":0}
