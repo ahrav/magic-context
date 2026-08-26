@@ -300,15 +300,6 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         .rate
         .checked_mul(opts.seconds)
         .ok_or_else(|| "offered request count overflows".to_owned())?;
-    let start = Instant::now() + Duration::from_millis(25);
-    let mut pending = HashMap::with_capacity(offered as usize);
-    for slot in 0..offered {
-        pending.insert(
-            1_000_000 + slot,
-            start + Duration::from_nanos(slot * interval_ns),
-        );
-    }
-
     let request = serde_json::to_vec(&serde_json::json!({
         "method": "embed.query",
         "params": {
@@ -322,6 +313,22 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     }))
     .map_err(|error| format!("serialize request: {error}"))?;
     let request_len = u32::try_from(request.len()).map_err(|_| "request too large".to_owned())?;
+    let expected_sha256 = perf_measurement::sha256_hex(QUERY_TEXT.as_bytes());
+    // Every count-proportional allocation precedes schedule selection: an
+    // O(offered) map population after `start` is fixed would eat the 25 ms
+    // lead-in on large runs and turn the first deadlines into a catch-up
+    // burst that measures client setup instead of the configured arrival
+    // process. The map stores slot indexes; absolute deadlines derive from
+    // `start` at resolution time.
+    let mut pending = HashMap::with_capacity(offered as usize);
+    for slot in 0..offered {
+        pending.insert(1_000_000 + slot, slot);
+    }
+    let mut responses: Vec<Vec<u8>> = Vec::with_capacity(offered as usize);
+    let mut errors: Vec<Vec<u8>> = Vec::new();
+    let mut latencies_ns = Vec::with_capacity(offered as usize);
+
+    let start = Instant::now() + Duration::from_millis(25);
     let mut sender = tokio::spawn(async move {
         for slot in 0..offered {
             let scheduled = start + Duration::from_nanos(slot * interval_ns);
@@ -345,12 +352,7 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     });
 
     let drain_deadline = start + Duration::from_secs(opts.seconds) + DRAIN_BUDGET;
-    let expected_sha256 = perf_measurement::sha256_hex(QUERY_TEXT.as_bytes());
-    let mut completed = 0u64;
-    let mut rejected = 0u64;
-    let mut timed_out = 0u64;
     let mut unresolved = 0u64;
-    let mut latencies_ns = Vec::with_capacity(offered as usize);
     while !pending.is_empty() {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -364,10 +366,12 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
                 break;
             }
         };
-        // Completion is the arrival of the terminal's last byte. Capturing
-        // the timestamp before JSON parsing keeps client-side validation
-        // cost — and the serial parser backlog it creates under bursts —
-        // out of the reported scheduled-to-completion latency.
+        // Completion is the arrival of the terminal's last byte, so the
+        // timestamp is captured before any body work. The loop performs
+        // header checks only; JSON parsing between consecutive reads would
+        // delay frames already buffered by TCP and book that delay against
+        // their requests, so body validation is deferred past the drain
+        // loop.
         let received = Instant::now();
         if matches!(
             frame.ty,
@@ -399,67 +403,29 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
                 frame.channel, frame.epoch, frame.ver
             ));
         }
-        let scheduled = pending
+        let slot = pending
             .remove(&frame.corr)
             .ok_or_else(|| format!("terminal for unknown correlation {}", frame.corr))?;
+        // Both terminal kinds carry JSON bodies the host emits with its
+        // terminal flag shape (non-binary, last, Interactive priority); any
+        // other flags are a wire regression that must not produce
+        // publishable accounting.
+        if frame.flags != raw_client::FLAGS_RESPONSE_TEXT_LAST {
+            return Err(format!(
+                "terminal frame type {} with unexpected flags {:#04x}",
+                frame.ty, frame.flags
+            ));
+        }
         match frame.ty {
             raw_client::TY_RESPONSE => {
-                let body: serde_json::Value = serde_json::from_slice(&frame.body)
-                    .map_err(|error| format!("response JSON: {error}"))?;
-                // The full embed.query contract, not just `done`: a
-                // regression in any echoed lane field or in the vector
-                // payload must fail the run rather than publish latency
-                // numbers for incorrect work.
-                let result = &body["result"];
-                let vector_ok = result["vectors"][0]["vector"]
-                    .as_array()
-                    .is_some_and(|values| {
-                        values.len() == 8
-                            && values[0].as_f64() == Some(1.0)
-                            && values[1..].iter().all(|value| value.as_f64() == Some(0.0))
-                    });
-                if result["done"] != true
-                    || result["model"] != "synapse-perf-zero-delay"
-                    || result["fingerprint"] != FINGERPRINT
-                    || result["table_epoch"] != 1
-                    || result["dims"] != 8
-                    || result["vectors"].as_array().map(Vec::len) != Some(1)
-                    || result["vectors"][0]["id"] != "query"
-                    || result["vectors"][0]["content_sha256"].as_str()
-                        != Some(expected_sha256.as_str())
-                    || !vector_ok
-                {
-                    return Err(format!("invalid embed.query response: {body}"));
-                }
-                completed += 1;
+                let scheduled = start + Duration::from_nanos(slot * interval_ns);
                 latencies_ns.push(
                     u64::try_from(received.duration_since(scheduled).as_nanos())
                         .unwrap_or(u64::MAX),
                 );
+                responses.push(frame.body);
             }
-            raw_client::TY_ERROR => {
-                // The error body is network input: a malformed one must
-                // fail the run gracefully (keeping the evidence trail),
-                // never panic the process.
-                let code = serde_json::from_slice::<serde_json::Value>(&frame.body)
-                    .ok()
-                    .and_then(|value| value["code"].as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "unparsable".to_owned());
-                match code.as_str() {
-                    "timeout" => timed_out += 1,
-                    // Admission rejection is the one expected shedding
-                    // outcome; any other code is a functional failure, and
-                    // counting it as `rejected` would let a broken host
-                    // keep a publishable baseline.
-                    "queue_full" => rejected += 1,
-                    _ => {
-                        return Err(format!(
-                            "unexpected error terminal (code {code}): {}",
-                            String::from_utf8_lossy(&frame.body)
-                        ))
-                    }
-                }
-            }
+            raw_client::TY_ERROR => errors.push(frame.body),
             other => return Err(format!("unexpected terminal frame type {other}")),
         }
     }
@@ -478,6 +444,60 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
             ));
         }
     };
+    let completed = responses.len() as u64;
+    // The full embed.query contract for every completion, checked after the
+    // drain loop so validation cost stays out of the recorded latencies: a
+    // regression in any echoed lane field or in the vector payload fails
+    // the run rather than publishing latency numbers for incorrect work.
+    for body in &responses {
+        let body: serde_json::Value =
+            serde_json::from_slice(body).map_err(|error| format!("response JSON: {error}"))?;
+        let result = &body["result"];
+        let vector_ok = result["vectors"][0]["vector"]
+            .as_array()
+            .is_some_and(|values| {
+                values.len() == 8
+                    && values[0].as_f64() == Some(1.0)
+                    && values[1..].iter().all(|value| value.as_f64() == Some(0.0))
+            });
+        if result["done"] != true
+            || result["model"] != "synapse-perf-zero-delay"
+            || result["fingerprint"] != FINGERPRINT
+            || result["table_epoch"] != 1
+            || result["dims"] != 8
+            || result["vectors"].as_array().map(Vec::len) != Some(1)
+            || result["vectors"][0]["id"] != "query"
+            || result["vectors"][0]["content_sha256"].as_str() != Some(expected_sha256.as_str())
+            || !vector_ok
+        {
+            return Err(format!("invalid embed.query response: {body}"));
+        }
+    }
+    let mut rejected = 0u64;
+    let mut timed_out = 0u64;
+    for body in &errors {
+        // The error body is network input: a malformed one must fail the
+        // run gracefully (keeping the evidence trail), never panic the
+        // process.
+        let code = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value["code"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unparsable".to_owned());
+        match code.as_str() {
+            "timeout" => timed_out += 1,
+            // Admission rejection is the one expected shedding outcome; any
+            // other code is a functional failure, and counting it as
+            // `rejected` would let a broken host keep a publishable
+            // baseline.
+            "queue_full" => rejected += 1,
+            _ => {
+                return Err(format!(
+                    "unexpected error terminal (code {code}): {}",
+                    String::from_utf8_lossy(body)
+                ))
+            }
+        }
+    }
     if unresolved != 0 {
         // No host terminal arrived for these requests — the cause is a
         // dropped response, a transport failure, or a request the lagging
