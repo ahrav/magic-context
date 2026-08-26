@@ -444,6 +444,14 @@ export class McHostClient {
     private readonly routes = new Map<string, CachedManagedRoute>();
     /** In-flight route.open attempts, drained bounded during owner close. */
     private readonly pendingRouteOpens = new Set<Promise<void>>();
+    /**
+     * In-flight route.open attempts per connection. A route.open terminal
+     * empties the pending set BEFORE its awaiting continuation inserts the
+     * new handle into `liveRoutes`, so a pending-zero retirement check
+     * alone would retire a draining predecessor between those two steps
+     * and hand the caller an immediately-stale handle.
+     */
+    private readonly routeOpenCounts = new Map<ActiveConnection, number>();
     private closeStarted = false;
     private closePromise: Promise<void> | null = null;
 
@@ -1212,10 +1220,24 @@ export class McHostClient {
             snapshot = await readConnectionFile(this.connectionFile, {
                 deadline: stage,
             });
-        } catch {
-            // A daemon rewriting its connection file mid-restart is a
-            // discovery transient; the loop's deadline check bounds it.
-            return { kind: "retry" };
+        } catch (error) {
+            // Only discovery churn retries: a daemon rewriting its
+            // connection file mid-restart surfaces as a briefly missing
+            // file, a replaced-during-read race, or an expired stage (the
+            // loop's episode deadline bounds repeats). Every other
+            // connection-file failure — permissions, ownership, malformed
+            // content — is permanent validation evidence and stops the
+            // episode, matching the reconnect path's terminal
+            // classification (KTD6).
+            if (
+                error instanceof ConnectionFileError &&
+                (error.code === "open_failed" ||
+                    error.code === "replaced_during_read" ||
+                    error.code === "deadline_expired")
+            ) {
+                return { kind: "retry" };
+            }
+            return { kind: "stop" };
         }
         const generation = new ConnectionGeneration({
             host: snapshot.endpoint.host,
@@ -1322,6 +1344,10 @@ export class McHostClient {
             return;
         }
         if (pred.generation.stats().pendingRequests > 0) return;
+        // A route.open whose terminal already settled but whose awaiting
+        // continuation has not yet recorded the handle keeps the drain
+        // open; the continuation's completion re-invokes this check.
+        if ((this.routeOpenCounts.get(pred) ?? 0) > 0) return;
         for (const [channel, handle] of [...pred.liveRoutes]) {
             if (!this.managedHandles.has(handle)) continue;
             pred.liveRoutes.delete(channel);
@@ -1466,7 +1492,17 @@ export class McHostClient {
             () => undefined,
         );
         this.pendingRouteOpens.add(tracked);
-        void tracked.finally(() => this.pendingRouteOpens.delete(tracked));
+        this.routeOpenCounts.set(active, (this.routeOpenCounts.get(active) ?? 0) + 1);
+        void tracked.finally(() => {
+            this.pendingRouteOpens.delete(tracked);
+            const remaining = (this.routeOpenCounts.get(active) ?? 1) - 1;
+            if (remaining <= 0) this.routeOpenCounts.delete(active);
+            else this.routeOpenCounts.set(active, remaining);
+            // The settled continuation may have been the last obligation
+            // holding a draining predecessor open (its handle is in
+            // `liveRoutes` now, or the attempt failed): re-evaluate.
+            if (this.predecessor === active) this.maybeRetirePredecessor();
+        });
         return run;
     }
 

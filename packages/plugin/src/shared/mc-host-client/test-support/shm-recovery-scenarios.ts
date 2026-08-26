@@ -10,7 +10,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -54,6 +54,8 @@ export interface RecoveryScenario {
 export interface RecoveryContext {
     startPeer(options?: Parameters<typeof FakePeer.start>[0]): Promise<FakePeer>;
     connect(peer: FakePeer, overrides?: Partial<McHostClientOptions>): Promise<McHostClient>;
+    /** Path of the connection file written by the most recent `connect`. */
+    lastConnectionFile: string;
 }
 
 export async function runRecoveryScenario(scenario: RecoveryScenario): Promise<void> {
@@ -62,6 +64,7 @@ export async function runRecoveryScenario(scenario: RecoveryScenario): Promise<v
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), "mc-shm-recovery-"));
     let fileCounter = 0;
     const ctx: RecoveryContext = {
+        lastConnectionFile: "",
         async startPeer(options = {}) {
             const peer = await FakePeer.start(options);
             peers.push(peer);
@@ -71,6 +74,7 @@ export async function runRecoveryScenario(scenario: RecoveryScenario): Promise<v
             fileCounter += 1;
             const filePath = path.join(tmpDir, `conn-${fileCounter}.json`);
             await writeConnectionFile(filePath, peer);
+            ctx.lastConnectionFile = filePath;
             const client = await McHostClient.connect({
                 connectionFile: filePath,
                 shutdownDeadlineMs: 1_000,
@@ -298,6 +302,89 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
+        // Seeded-defect detector for the pending-zero/continuation race: a
+        // route.open terminal empties the predecessor's pending set BEFORE
+        // the awaiting continuation records the handle in `liveRoutes`, so
+        // retirement must defer until the continuation completes and the
+        // caller's raw handle serves until its explicit close (R10).
+        name: "a route.open resolving during predecessor drain keeps the handle usable",
+        async run(ctx) {
+            const provider = recoveryProvider();
+            const peer = await ctx.startPeer();
+            let allowGrant = false;
+            scriptNegotiations(peer, (index) => {
+                if (index === 0) return tcpSelectionBody("unavailable");
+                return allowGrant ? grantSelectionBody() : tcpSelectionBody("unavailable");
+            });
+            const events: McHostDiagnosticsEvent[] = [];
+            const client = await ctx.connect(peer, {
+                transportProviders: [provider],
+                diagnostics: (event) => events.push(event),
+            });
+            const conn1 = peer.connections[0] as FakePeerConnection;
+
+            // Withhold the route.open response so the open is still
+            // in flight when promotion turns conn1 into the predecessor.
+            const pendingOpen = client.routeOpen(TOOL_TARGET, IDENTITY);
+            await conn1.waitFor(() =>
+                conn1.frames.some((frame) => isControlOp(frame, "route.open")),
+            );
+            const openFrame = conn1.frames.find((frame) =>
+                isControlOp(frame, "route.open"),
+            ) as PeerFrame;
+
+            allowGrant = true;
+            await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
+
+            // Serve later routed requests on the granted channel.
+            const answered = new Set<bigint>();
+            const serveChannel = (): void => {
+                for (const frame of conn1.frames) {
+                    if (
+                        frame.ty !== PeerFrameType.Request ||
+                        frame.channel !== 7 ||
+                        answered.has(frame.corr)
+                    ) {
+                        continue;
+                    }
+                    answered.add(frame.corr);
+                    conn1.socket.write(
+                        encodePeerFrame({
+                            ty: PeerFrameType.Response,
+                            channel: 7,
+                            epoch: 1,
+                            corr: frame.corr,
+                            body: Buffer.from(JSON.stringify({ served: "tcp" }), "utf8"),
+                        }),
+                    );
+                }
+            };
+            conn1.socket.on("data", () => setImmediate(serveChannel));
+
+            // The terminal lands while conn1 is the draining predecessor:
+            // its arrival reaches pending-zero before the routeOpen
+            // continuation resumes, which must not retire the generation
+            // out from under the handle.
+            respondJson(conn1, openFrame.corr, {
+                op: "route.open",
+                route_channel: 7,
+                route_epoch: 1,
+            });
+            const rawHandle = await pendingOpen;
+            await settle();
+
+            assert.equal(conn1.socket.destroyed, false, "predecessor retired early");
+            assert.deepEqual(await client.request(rawHandle, { n: 1 }), { served: "tcp" });
+
+            // The explicit close releases the last drain obligation.
+            await client.closeRoute(rawHandle);
+            await waitUntil(
+                () => conn1.frames.some((f) => f.ty === PeerFrameType.Goodbye && f.channel === 0),
+                10_000,
+            );
+        },
+    },
+    {
         // AE9/AE15: daemon restart retires old pending work with its
         // existing outcome classification, reconnects over exact
         // `unavailable`, and a fresh commit serves only later managed calls.
@@ -445,6 +532,47 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             assert.equal(peer.connections.length, settledCount);
             assert.ok(settledCount <= 25, `unbounded attempts: ${settledCount}`);
             assert.equal(provider.connectCount, 0);
+        },
+    },
+    {
+        // KTD6 seeded-defect detector: a permanent connection-file failure
+        // (malformed content) stops the recovery episode instead of
+        // rereading the invalid file until the 30-second deadline.
+        name: "a permanently invalid connection file stops the recovery episode",
+        async run(ctx) {
+            let now = 0;
+            const clock = (): number => now;
+            const sleep = async (ms: number): Promise<void> => {
+                now += Math.max(1, ms);
+                await delay(1);
+            };
+            const provider = recoveryProvider();
+            const peer = await ctx.startPeer();
+            scriptNegotiations(peer, () => tcpSelectionBody("unavailable"));
+            const client = await ctx.connect(peer, {
+                transportProviders: [provider],
+                clock,
+                sleep,
+            });
+            serveTcpRoutes(peer.connections[0] as FakePeerConnection, 7);
+            assert.deepEqual(await client.call("magic-context", "m1"), { served: "tcp" });
+
+            // Permanent validation evidence, not discovery churn: probe
+            // attempts must stop instead of pacing to the full deadline.
+            await writeFile(ctx.lastConnectionFile, "{ not json", { mode: 0o600 });
+            let pacedToDeadline = true;
+            try {
+                await waitUntil(() => now >= DEFAULT_RECOVERY_DEADLINE_MS, 1_000);
+            } catch {
+                pacedToDeadline = false;
+            }
+            assert.equal(
+                pacedToDeadline,
+                false,
+                "recovery kept rereading a permanently invalid connection file",
+            );
+            // The committed TCP primary is untouched by the stopped episode.
+            assert.deepEqual(await client.call("magic-context", "m2"), { served: "tcp" });
         },
     },
 ];

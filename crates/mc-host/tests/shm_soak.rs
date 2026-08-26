@@ -602,10 +602,19 @@ mod soak {
     #[ignore = "opt-in full resource soak; run via the shm-soak nextest profile"]
     fn full_soak_cycles_conserve_resources() {
         let _serial = serial_soak_lock();
-        let measured = std::env::var("MC_SHM_SOAK_CYCLES")
-            .ok()
-            .and_then(|raw| raw.parse().ok())
-            .unwrap_or(1000);
+        // A present-but-malformed or zero override must fail loudly: a
+        // silent fallback or an empty `1..=0` measured loop would run the
+        // warmup and report success without the requested measurement.
+        let measured: u64 = match std::env::var("MC_SHM_SOAK_CYCLES") {
+            Ok(raw) => raw
+                .parse()
+                .expect("MC_SHM_SOAK_CYCLES must be an unsigned integer"),
+            Err(_) => 1000,
+        };
+        assert!(
+            measured > 0,
+            "MC_SHM_SOAK_CYCLES must be a positive cycle count"
+        );
         soak_runtime().block_on(async {
             run_soak(SoakConfig {
                 measured_cycles: measured,
