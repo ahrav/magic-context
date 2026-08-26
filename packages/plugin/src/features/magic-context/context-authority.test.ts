@@ -32,7 +32,7 @@ import {
 } from "./memory/storage-memory-claims";
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
 import { runMigrations } from "./migrations";
-import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
+import { unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
 
 function db(): Database {
@@ -2685,16 +2685,6 @@ describe("memory authority protocol", () => {
         );
         const contents = rows.map((row) => row.content).sort();
         expect(contents).toEqual(["foreign visible", "own archived"]);
-        const idPath = resolveMemoriesByIdsForSearch({
-            db: database,
-            projectPath: "/own",
-            ids: [1, 2, 3, 4, 5],
-            limit: 10,
-        });
-        expect(idPath?.map((hit) => hit.content).sort()).toEqual([
-            "foreign visible",
-            "own archived",
-        ]);
     });
 
     test("note evaluation bridges are scoped per project", async () => {
@@ -2762,7 +2752,8 @@ describe("memory authority protocol", () => {
             embeddingEnabled: false,
             countRetrievals: true,
         });
-        expect(results.some((result) => result.source === "memory")).toBe(true);
+        // The project-memory search lane is gone; nothing may bump telemetry.
+        expect(results.some((result) => result.source === "memory")).toBe(false);
         const after = database
             .prepare("SELECT retrieval_count AS c FROM memories WHERE id = 1")
             .get() as { c: number };

@@ -56,17 +56,28 @@ export function hasClaimApplicabilitySchema(db: Database): boolean {
  * Recursively key-sorted clone so the digest is independent of object-key
  * insertion order: semantically identical sources always hash to one value.
  */
-function sortKeysDeep(value: unknown): unknown {
+interface DigestArray extends Array<DigestValue> {}
+interface DigestObject {
+    [key: string]: DigestValue | undefined;
+}
+type DigestValue = null | boolean | number | string | DigestArray | DigestObject | undefined;
+
+function sortKeysDeep(value: unknown): DigestValue {
     if (Array.isArray(value)) return value.map(sortKeysDeep);
     if (value !== null && typeof value === "object") {
         const record = value as Record<string, unknown>;
         return Object.fromEntries(
             Object.keys(record)
-                .sort()
+                .sort((left, right) => left.localeCompare(right))
                 .map((key) => [key, sortKeysDeep(record[key])]),
         );
     }
-    return value;
+    if (value === null || ["boolean", "number", "string", "undefined"].includes(typeof value)) {
+        return value as null | boolean | number | string | undefined;
+    }
+    if (typeof value === "bigint")
+        throw new TypeError("Cannot serialize bigint applicability source");
+    return undefined;
 }
 
 /** Canonical SHA-256 digest over a JSON-serializable source description. */
@@ -636,22 +647,23 @@ function pathsStateEquals(
 }
 
 /**
- * Append a successor assertion carrying the memory's current side-table path
- * knowledge onto the revision's legacy-memory source stream — only when that
- * knowledge differs from the stream head, so a replayed or no-op mapping
- * write appends nothing. Every non-path head field carries into the
- * successor unchanged: readers treat the head as the whole current snapshot,
- * so a path-only update must not erase anchors, dependency or verifier
- * metadata, or symbol selectors. Callers supply the desired path state and
- * knowledge time explicitly; a regressing knowledge time is clamped forward
- * to the stream maximum.
+ * Append a successor assertion carrying new path knowledge onto one of a
+ * revision's source streams — only when that knowledge differs from the
+ * stream head, so a replayed or no-op mapping write appends nothing. Every
+ * non-path head field carries into the successor unchanged: readers treat
+ * the head as the whole current snapshot, so a path-only update must not
+ * erase anchors, dependency or verifier metadata, or symbol selectors.
+ * Callers supply the desired path state and knowledge time explicitly; a
+ * regressing knowledge time is clamped forward to the stream maximum.
  */
-export function syncMemoryApplicabilityPathsInCurrentTransaction(
+export function syncRevisionApplicabilityPathsInCurrentTransaction(
     db: Database,
     args: {
         revisionId: number;
         projectId: number;
-        memoryId: number;
+        streamKey: string;
+        keyProtocol: string;
+        sourceDigest: string;
         paths: ApplicabilityPathsInput;
         knownFrom: number;
     },
@@ -660,12 +672,9 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
         revisionId: args.revisionId,
         projectId: args.projectId,
         ownerKind: "source",
-        streamKey: legacyMemoryApplicabilityStreamKey(args.memoryId),
-        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
-        sourceDigest: computeApplicabilitySourceDigest({
-            kind: "legacy-memory",
-            memoryId: args.memoryId,
-        }),
+        streamKey: args.streamKey,
+        keyProtocol: args.keyProtocol,
+        sourceDigest: args.sourceDigest,
     });
     const heads = readCurrentApplicabilityAssertions(db, args.revisionId);
     const head = heads.find((candidate) => candidate.streamId === stream.streamId);
@@ -687,4 +696,33 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
         verifierSpec: head?.verifierSpec ?? null,
     });
     return { appended: true };
+}
+
+/**
+ * Append a successor assertion carrying the memory's current side-table path
+ * knowledge onto the revision's legacy-memory source stream. Legacy-keyed
+ * wrapper over syncRevisionApplicabilityPathsInCurrentTransaction.
+ */
+export function syncMemoryApplicabilityPathsInCurrentTransaction(
+    db: Database,
+    args: {
+        revisionId: number;
+        projectId: number;
+        memoryId: number;
+        paths: ApplicabilityPathsInput;
+        knownFrom: number;
+    },
+): { appended: boolean } {
+    return syncRevisionApplicabilityPathsInCurrentTransaction(db, {
+        revisionId: args.revisionId,
+        projectId: args.projectId,
+        streamKey: legacyMemoryApplicabilityStreamKey(args.memoryId),
+        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
+        sourceDigest: computeApplicabilitySourceDigest({
+            kind: "legacy-memory",
+            memoryId: args.memoryId,
+        }),
+        paths: args.paths,
+        knownFrom: args.knownFrom,
+    });
 }

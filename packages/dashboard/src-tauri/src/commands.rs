@@ -3,7 +3,7 @@ use crate::embedding_probe::{
     TokenExpandError,
 };
 use crate::process_ext::NoWindowExtTokio;
-use crate::{config, db, log_parser, AppState};
+use crate::{claim_adapter, config, db, log_parser, AppState};
 use std::path::{Path, PathBuf};
 use tauri::State;
 
@@ -26,37 +26,33 @@ pub fn get_projects(state: State<'_, AppState>) -> Result<Vec<db::ProjectInfo>, 
 pub fn get_memories(
     state: State<'_, AppState>,
     project: Option<String>,
-    workspace_id: Option<i64>,
-    status: Option<String>,
+    lifecycle: Option<String>,
     category: Option<String>,
     search: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<Vec<db::Memory>, String> {
+) -> Result<claim_adapter::ClaimMemoryReadResult, String> {
     let path = state.get_db_path()?;
     let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_memories(
+    claim_adapter::read_claim_memories(
         &conn,
         project.as_deref(),
-        workspace_id,
-        status.as_deref(),
+        lifecycle.as_deref(),
         category.as_deref(),
         search.as_deref(),
         limit.unwrap_or(100),
         offset.unwrap_or(0),
     )
-    .map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
 pub fn get_memory_stats(
     state: State<'_, AppState>,
     project: Option<String>,
-    workspace_id: Option<i64>,
-) -> Result<db::MemoryStats, String> {
+) -> Result<claim_adapter::ClaimMemoryStats, String> {
     let path = state.get_db_path()?;
     let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_memory_stats(&conn, project.as_deref(), workspace_id).map_err(|e| e.to_string())
+    claim_adapter::read_claim_memory_stats(&conn, project.as_deref())
 }
 
 #[tauri::command(async)]
@@ -164,64 +160,83 @@ pub fn apply_workspace_changes(
 }
 
 #[tauri::command(async)]
-pub fn update_memory_status(
+pub fn set_memory_lifecycle(
     state: State<'_, AppState>,
-    memory_id: i64,
-    status: String,
-) -> Result<(), String> {
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
+    lifecycle_state: String,
+) -> Result<claim_adapter::ClaimMutationResponse, String> {
     let path = state.get_db_path()?;
     let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_status(&mut conn, memory_id, &status).map_err(|e| e.to_string())
+    claim_adapter::set_claim_lifecycle(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::SetLifecycleInput {
+            target,
+            operation_key,
+            lifecycle_state,
+        },
+    )
 }
 
 #[tauri::command(async)]
-pub fn update_memory_content(
+pub fn revise_memory_content(
     state: State<'_, AppState>,
-    memory_id: i64,
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
     content: String,
-) -> Result<(), String> {
+) -> Result<claim_adapter::ClaimMutationResponse, String> {
     let path = state.get_db_path()?;
     let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_content(&mut conn, memory_id, &content).map_err(|e| e.to_string())
+    claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::ReviseClaimInput {
+            target,
+            operation_key,
+            content: Some(content),
+            category: None,
+        },
+    )
 }
 
 #[tauri::command(async)]
-pub fn update_memory_category(
+pub fn revise_memory_category(
     state: State<'_, AppState>,
-    memory_id: i64,
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
     category: String,
-) -> Result<(), String> {
+) -> Result<claim_adapter::ClaimMutationResponse, String> {
     let path = state.get_db_path()?;
     let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_category(&mut conn, memory_id, &category).map_err(|e| e.to_string())
+    claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::ReviseClaimInput {
+            target,
+            operation_key,
+            content: None,
+            category: Some(category),
+        },
+    )
 }
 
 #[tauri::command(async)]
-pub fn delete_memory(state: State<'_, AppState>, memory_id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::delete_memory(&mut conn, memory_id).map_err(|e| e.to_string())
-}
-
-#[tauri::command(async)]
-pub fn bulk_update_memory_status(
+pub fn bulk_archive_memories(
     state: State<'_, AppState>,
-    memory_ids: Vec<i64>,
-    status: String,
-) -> Result<usize, String> {
+    targets: Vec<claim_adapter::ClaimMutationTarget>,
+    operation_key: String,
+) -> Result<claim_adapter::ClaimMutationResponse, String> {
     let path = state.get_db_path()?;
     let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::bulk_update_memory_status(&mut conn, &memory_ids, &status).map_err(|e| e.to_string())
-}
-
-#[tauri::command(async)]
-pub fn bulk_delete_memory(
-    state: State<'_, AppState>,
-    memory_ids: Vec<i64>,
-) -> Result<usize, String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::bulk_delete_memory(&mut conn, &memory_ids).map_err(|e| e.to_string())
+    claim_adapter::bulk_archive_claims(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::BulkArchiveInput {
+            targets,
+            operation_key,
+        },
+    )
 }
 
 // ── Session commands ────────────────────────────────────────
@@ -325,10 +340,10 @@ pub fn enumerate_projects() -> Vec<db::ProjectRow> {
 #[tauri::command(async)]
 pub fn enumerate_memory_projects(
     state: State<'_, AppState>,
-) -> Result<Vec<db::ProjectRow>, String> {
+) -> Result<Vec<claim_adapter::ClaimProjectRow>, String> {
     let path = state.get_db_path()?;
     let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::enumerate_memory_projects(&conn).map_err(|e| e.to_string())
+    claim_adapter::enumerate_claim_projects(&conn)
 }
 
 #[tauri::command(async)]

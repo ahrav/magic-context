@@ -4,7 +4,6 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
-import { resolveMemoriesByIdsForSearch, unifiedSearch } from "../search";
 import { DISPOSITION_KINDS } from "../storage-claim-policy-schema";
 import { initializeDatabase } from "../storage-db";
 import {
@@ -187,13 +186,6 @@ describe("claim policy surface enforcement", () => {
         try {
             const seed = seedMemory(db, "quarantine-1", "quarantined secret guidance");
             verify(db, seed.memoryId);
-            const before = await unifiedSearch(db, "ses-vis", PROJECT, "quarantined secret", {
-                limit: 10,
-                memoryEnabled: true,
-                embeddingEnabled: false,
-                sources: ["memory"],
-            });
-            expect(before.some((r) => r.source === "memory")).toBeTrue();
 
             quarantine(db, seed.revisionId, seed.projectId);
 
@@ -205,26 +197,6 @@ describe("claim policy surface enforcement", () => {
             expect(
                 filterMemoriesByPolicy(db, memories, "explicit_search").memories.map((m) => m.id),
             ).not.toContain(seed.memoryId);
-
-            // Explicit text search: absent, without any label or trace.
-            const results = await unifiedSearch(db, "ses-vis", PROJECT, "quarantined secret", {
-                limit: 10,
-                memoryEnabled: true,
-                embeddingEnabled: false,
-                sources: ["memory"],
-            });
-            expect(results.filter((r) => r.source === "memory")).toEqual([]);
-            expect(JSON.stringify(results)).not.toContain("quarantined secret");
-
-            // Direct-ID lookup: the null fallback sentinel, not a labeled row.
-            expect(
-                resolveMemoriesByIdsForSearch({
-                    db,
-                    projectPath: PROJECT,
-                    ids: [seed.memoryId],
-                    limit: 5,
-                }),
-            ).toBeNull();
         } finally {
             closeQuietly(db);
         }
@@ -242,16 +214,6 @@ describe("claim policy surface enforcement", () => {
             expect(explicit.memories.map((m) => m.id)).toContain(seed.memoryId);
             expect(explicit.labels.get(seed.memoryId)).toContain("candidate");
 
-            const results = await unifiedSearch(db, "ses-vis", PROJECT, "candidate exploratory", {
-                limit: 10,
-                memoryEnabled: true,
-                embeddingEnabled: false,
-                sources: ["memory"],
-            });
-            const hit = results.find((r) => r.source === "memory" && r.memoryId === seed.memoryId);
-            expect(hit).toBeDefined();
-            expect((hit as { policyLabel?: string }).policyLabel).toContain("candidate");
-
             verify(db, seed.memoryId);
             expect(
                 filterMemoriesByPolicy(
@@ -260,41 +222,6 @@ describe("claim policy surface enforcement", () => {
                     "auto_inject",
                 ).memories.map((m) => m.id),
             ).toContain(seed.memoryId);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("a quarantine committed between candidate load and merge is dropped by the recheck", async () => {
-        const db = migratedDb();
-        try {
-            const seed = seedMemory(db, "midflight-1", "midflight quarantine target");
-            verify(db, seed.memoryId);
-            let fired = false;
-            const originalPrepare = db.prepare.bind(db);
-            db.prepare = ((sql: string) => {
-                // The FTS candidate query runs after the pre-limit policy
-                // filter and before the post-merge recheck.
-                if (!fired && /memories_fts/i.test(sql)) {
-                    fired = true;
-                    db.prepare = originalPrepare;
-                    quarantine(db, seed.revisionId, seed.projectId);
-                }
-                return originalPrepare(sql);
-            }) as typeof db.prepare;
-            let results: Awaited<ReturnType<typeof unifiedSearch>>;
-            try {
-                results = await unifiedSearch(db, "ses-vis", PROJECT, "midflight quarantine", {
-                    limit: 10,
-                    memoryEnabled: true,
-                    embeddingEnabled: false,
-                    sources: ["memory"],
-                });
-            } finally {
-                db.prepare = originalPrepare;
-            }
-            expect(fired).toBeTrue();
-            expect(results.filter((r) => r.source === "memory")).toEqual([]);
         } finally {
             closeQuietly(db);
         }

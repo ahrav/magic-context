@@ -27,12 +27,20 @@ import {
     parseRpcPortFile,
     readProcessCommand,
 } from "../../shared/rpc-utils";
-import { Database } from "../../shared/sqlite";
+import {
+    collectSqliteRuntimeGateInput,
+    Database,
+    evaluateSqliteRuntimeGate,
+    type SqliteConnectionContractExpectations,
+    type SqliteRuntimeGateInput,
+    verifySqliteConnectionContract,
+} from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
 import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
+import { listDatabaseFamilyArtifacts } from "./storage-format-epoch";
 import {
     ensureColumn,
     healAllNullColumns,
@@ -64,6 +72,14 @@ const pathByDatabase = new WeakMap<Database, string>();
 // disables ALL of Magic Context until it too updates. The null openDatabase()
 // return has no Database handle to key a WeakMap on, so we stash the detail in
 // a module global the plugin entrypoint reads after a failed/empty open.
+/** Most recent runtime-gate refusal, for diagnostics; mirrors the fence/migration
+ *  refusal records below so `doctor` can explain a null open. */
+let lastRuntimeGateRefusal: SqliteRuntimeGateReport | null = null;
+
+export function consumeLastRuntimeGateRefusal(): SqliteRuntimeGateReport | null {
+    return lastRuntimeGateRefusal;
+}
+
 let lastSchemaFenceRejection: { persistedVersion: number; supportedVersion: number } | null = null;
 
 // A fresh CLI/Pi/OpenCode process must not be the process that advances the
@@ -182,6 +198,20 @@ export function resolveDatabasePath(dbPathOverride?: string): { dbDir: string; d
 
 export function getDatabasePath(db: Database): string | null {
     return pathByDatabase.get(db) ?? null;
+}
+
+function refuseUnsafePristineBootstrap(dbPath: string): void {
+    const artifacts = listDatabaseFamilyArtifacts(dbPath);
+    if (artifacts.includes("reset-marker")) {
+        throw new Error(
+            `refusing database initialization while reset marker ${dbPath}.mc-reset is pending`,
+        );
+    }
+    if (!existsSync(dbPath) && artifacts.length > 0) {
+        throw new Error(
+            `refusing database initialization with orphan family artifacts: ${artifacts.join(", ")}`,
+        );
+    }
 }
 
 /**
@@ -722,6 +752,34 @@ export function runSqliteOptimize(db: Database): void {
     } catch {
         // Best-effort maintenance; never fail a caller over stats refresh.
     }
+}
+
+export interface SqliteRuntimeGateReport {
+    readonly input: SqliteRuntimeGateInput;
+    readonly ok: boolean;
+    readonly reasons: readonly string[];
+}
+
+export function probeSqliteRuntimeGate(): SqliteRuntimeGateReport {
+    const input = collectSqliteRuntimeGateInput();
+    const { ok, reasons } = evaluateSqliteRuntimeGate(input);
+    if (!ok) {
+        log(
+            `[magic-context] storage fatal: this ${input.runtime} ${input.runtimeVersion} runtime's SQLite source (version ${input.sqliteVersion}, source ${input.sqliteSourceId}) failed the WAL-reset-safety gate: ${reasons.join("; ")}. Upgrade the runtime before this process may write context.db.`,
+        );
+    }
+    return { input, ok, reasons };
+}
+
+export function assertSqliteConnectionContract(
+    db: Database,
+    expectations: SqliteConnectionContractExpectations,
+): void {
+    const violations = verifySqliteConnectionContract(db, expectations);
+    if (violations.length === 0) return;
+    const message = `[magic-context] storage fatal: connection contract violated before application writes: ${violations.join("; ")}`;
+    log(message);
+    throw new Error(message);
 }
 
 function finishDatabaseOpen(
@@ -1420,6 +1478,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       -- healAllNullColumns fallback list.
       deferred_execute_state TEXT,
       cached_m0_bytes BLOB,
+      cached_m0_claim_format_epoch INTEGER,
+      cached_m0_claim_snapshot_vector TEXT,
+      cached_m0_rendered_revision_locators TEXT,
       cached_m0_project_memory_epoch INTEGER,
       cached_m0_workspace_fingerprint TEXT,
       cached_m0_project_user_profile_version INTEGER,
@@ -1850,6 +1911,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
     ensureColumn(db, "memory_verifications", "mapped_at", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
+    ensureColumn(db, "session_meta", "cached_m0_claim_format_epoch", "INTEGER");
+    ensureColumn(db, "session_meta", "cached_m0_claim_snapshot_vector", "TEXT");
+    ensureColumn(db, "session_meta", "cached_m0_rendered_revision_locators", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_workspace_fingerprint", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_user_profile_version", "INTEGER");
@@ -2133,6 +2197,18 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     }
 
     try {
+        // The WAL-reset-safety gate has to run BEFORE a connection exists: the
+        // corruption mode it blocks happens when this runtime's SQLite enables
+        // WAL and writes migrations, so reporting it afterwards is too late. It
+        // was previously only reachable from tests, which left the fail-closed
+        // gate with no production effect at all.
+        const runtimeGate = probeSqliteRuntimeGate();
+        if (!runtimeGate.ok) {
+            lastRuntimeGateRefusal = runtimeGate;
+            return null;
+        }
+        lastRuntimeGateRefusal = null;
+        refuseUnsafePristineBootstrap(dbPath);
         if (!explicitDbPath) {
             migrateLegacyStorageIfNeeded(dbPath, dbDir);
         }
@@ -2191,6 +2267,7 @@ export async function openDatabaseAsync(
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
         try {
+            refuseUnsafePristineBootstrap(dbPath);
             if (!explicitDbPath) migrateLegacyStorageIfNeeded(dbPath, dbDir);
             ensureSecureStorageDir(dbDir);
 

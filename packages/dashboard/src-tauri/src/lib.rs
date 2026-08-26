@@ -1,3 +1,4 @@
+pub mod claim_adapter;
 pub mod commands;
 pub mod config;
 pub mod db;
@@ -9,6 +10,7 @@ pub mod pi_sessions;
 pub mod process_ext;
 pub mod project_identity;
 pub mod serve;
+pub mod sqlite_runtime;
 pub mod workspaces;
 
 use std::path::PathBuf;

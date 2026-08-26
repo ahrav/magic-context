@@ -1,35 +1,137 @@
 // Types matching Rust backend structs
 
-export interface Memory {
-  id: number;
-  project_path: string;
-  category: MemoryCategory;
+export interface ClaimMutationToken {
+  tokenVersion: number;
+  publicClaimId: string;
+  revision: number;
+  contentDigest: string;
+  lifecycleSeq: number;
+  applicabilityHeadsDigest: string;
+  policyHeadsDigest: string;
+}
+
+export interface ClaimMutationTarget {
+  revisionLocator: string;
+  mutationToken: ClaimMutationToken;
+}
+
+export interface EvidenceLabel {
+  independenceKey: string;
+  sourceTrustClass: string;
+  extractor: string;
+}
+
+export interface ApplicabilityPath {
+  kind: string;
+  value: string;
+}
+
+export interface ApplicabilitySymbol {
+  protocol: string;
+  value: string;
+}
+
+export interface ApplicabilityState {
+  streamKey: string;
+  ownerKind: string;
+  branchSelector: string | null;
+  contextFingerprint: string | null;
+  sequence: number;
+  state: string;
+  knownFrom: number | null;
+  recordedAt: number;
+  pathsState: string;
+  dependencyFingerprint: string | null;
+  dependencyProtocol: string | null;
+  verifierSpec: string | null;
+  paths: ApplicabilityPath[];
+  symbols: ApplicabilitySymbol[];
+}
+
+export interface ClaimDispositions {
+  stale: boolean;
+  disputed: boolean;
+  superseded: boolean;
+  rejected: boolean;
+  contradicted: boolean;
+  quarantined: boolean;
+}
+
+export interface ClaimPolicyView {
+  effectiveMaturity: string;
+  originTaint: string;
+  autoEligible: boolean;
+  explicitEligible: boolean;
+  hardHidden: boolean;
+  policyVersion: number;
+  generation: number;
+  dispositions: ClaimDispositions;
+  explicitLabel: string | null;
+}
+
+export interface ClaimTelemetry {
+  seenCount: number;
+  retrievalCount: number;
+}
+
+export interface ClaimMemory {
+  publicClaimId: string;
+  revisionLocator: string;
+  revision: number;
   content: string;
-  normalized_hash: string;
-  source_session_id: string | null;
-  source_type: MemorySourceType;
-  seen_count: number;
-  retrieval_count: number;
-  first_seen_at: number;
-  created_at: number;
-  updated_at: number;
-  last_seen_at: number;
-  last_retrieved_at: number | null;
-  status: MemoryStatus;
-  expires_at: number | null;
-  verification_status: string;
-  verified_at: number | null;
-  superseded_by_memory_id: number | null;
-  merged_from: string | null;
-  metadata_json: string | null;
-  /** Dreamer classify-memories outputs (v44). importance (1-100) drives
-   *  budget-trim ordering; scope/shareable are advisory. Defaults 50/"project"/
-   *  false on pre-v44 plugin DBs (the dashboard never migrates). */
+  contentDigest: string;
+  revisionCreatedAt: number;
+  projectIdentity: string;
+  category: MemoryCategory;
+  normalizedHash: string;
   importance: number;
-  scope: MemoryScope;
-  shareable: boolean;
-  has_embedding: boolean;
-  source_display_name?: string | null;
+  memoryScope: MemoryScope;
+  sharing: string;
+  expiresAt: number | null;
+  lifecycleState: ClaimLifecycleState;
+  evidenceLabels: EvidenceLabel[];
+  applicability: ApplicabilityState[];
+  policy: ClaimPolicyView;
+  telemetry: ClaimTelemetry;
+  mutationToken: ClaimMutationToken;
+}
+
+export interface SnapshotVector {
+  vectorVersion: number;
+  databaseIncarnationId: string;
+  workspaceEpoch: string;
+  projectGenerations: Record<string, number>;
+  policyGenerations: Record<string, number>;
+}
+
+export interface ClaimMemoryReadResult {
+  outcome: "ok" | "stale";
+  claims: ClaimMemory[];
+  snapshotVector: SnapshotVector | null;
+  staleReasons: string[];
+}
+
+export interface ClaimMemoryStats {
+  total: number;
+  active: number;
+  archived: number;
+  retired: number;
+  categories: CategoryCount[];
+}
+
+export interface ClaimProjectRow {
+  identity: string;
+  displayName: string;
+}
+
+export interface ClaimMutationResponse {
+  outcome: "applied" | "stale" | "noop";
+  replayed: boolean;
+  requestDigest: string;
+  resultJson: string;
+  result: unknown;
+  refreshedClaims: ClaimMemory[];
+  snapshotVector: SnapshotVector;
 }
 
 export type MemoryScope = "project" | "ecosystem" | "universe";
@@ -45,17 +147,7 @@ export type MemoryCategory =
   | "WORKFLOW_RULES"
   | "KNOWN_ISSUES";
 
-export type MemoryStatus = "active" | "permanent" | "archived";
-export type MemorySourceType = "historian" | "agent" | "dreamer" | "user";
-
-export interface MemoryStats {
-  total: number;
-  active: number;
-  permanent: number;
-  archived: number;
-  with_embeddings: number;
-  categories: CategoryCount[];
-}
+export type ClaimLifecycleState = "active" | "archived" | "retired";
 
 export interface Primer {
   id: number;

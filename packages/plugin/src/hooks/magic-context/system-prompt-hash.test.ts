@@ -653,6 +653,15 @@ describe("system-prompt-hash skips Magic Context internal child agents", () => {
         }
     });
 
+    it("does not forbid the project promotion its own verdict schema requests", () => {
+        // The reviewer's task text and output schema define `promote_project`.
+        // A system role that also says it must not touch project memories makes
+        // a compliant model omit the action, so promotion becomes
+        // provider-dependent or inert.
+        expect(REVIEW_USER_MEMORIES_SYSTEM_PROMPT).not.toMatch(/do NOT touch project memories/i);
+        expect(REVIEW_USER_MEMORIES_SYSTEM_PROMPT).toContain("promote_project");
+    });
+
     it("detects every dedicated Magic Context child prompt constant", () => {
         const prompts = [
             ["dreamer-base", DREAMER_SYSTEM_PROMPT],

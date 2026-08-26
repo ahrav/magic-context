@@ -174,7 +174,7 @@ describe("recordShadowMeasurement", () => {
         registerProjectShadowEmbedding(db, "git:shadow-measure", synapseConfig, "/tmp/shadow");
 
         const primaryResults = [
-            { source: "memory", memoryId: 42 },
+            { source: "memory", publicClaimId: "mcm_42" },
             { source: "compartment", compartmentId: 7 },
             { source: "git_commit", sha: "abc123" },
         ] as unknown as UnifiedSearchResult[];
@@ -192,7 +192,7 @@ describe("recordShadowMeasurement", () => {
 
         const rows = listEmbeddingMeasurements(db, "ses-shadow");
         expect(rows).toHaveLength(1);
-        const primaryIds = ["memory:42", "chunk:7", "commit:abc123"];
+        const primaryIds = ["memory:mcm_42", "chunk:7", "commit:abc123"];
         const shadowIds = ["message:msg_1", "primer:3", "note:11"];
         expect(rows[0].primary_result_ids_json).toBe(JSON.stringify(primaryIds));
         expect(rows[0].shadow_result_ids_json).toBe(JSON.stringify(shadowIds));

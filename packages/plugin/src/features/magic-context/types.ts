@@ -82,6 +82,9 @@ export interface SessionMeta {
     cachedM0MuralDataUrl: string | null;
     cachedM0MuralHash: string | null;
     cachedM1Bytes: Buffer | null;
+    cachedM0ClaimFormatEpoch: number | null;
+    cachedM0ClaimSnapshotVector: string | null;
+    cachedM0RenderedRevisionLocators: string | null;
     cachedM0ProjectMemoryEpoch: number | null;
     cachedM0WorkspaceFingerprint: string | null;
     cachedM0ProjectUserProfileVersion: number | null;

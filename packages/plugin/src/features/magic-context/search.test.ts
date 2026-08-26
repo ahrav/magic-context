@@ -15,20 +15,15 @@ import {
     chunkCanonicalText,
     replaceCompartmentChunkEmbeddings,
 } from "./compartment-chunk-embedding";
-import { appendCompartments, getCompartments, replaceSessionFacts } from "./compartment-storage";
+import { appendCompartments, getCompartments } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
-import {
-    getMemoryById,
-    insertMemory,
-    insertMemoryIdempotent,
-    resetEmbeddingCacheForTests,
-    saveEmbedding,
-} from "./memory";
+import { insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
 import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
+import * as claimCurrentState from "./memory/storage-claim-current-state";
 import {
-    getCurrentMemoryClaimByLegacyMemoryId,
-    runInMemoryClaimsWriteTransaction,
-} from "./memory/storage-memory-claims";
+    computeProjectMemoryMutationToken,
+    setProjectMemoryClaimLifecycle,
+} from "./memory/storage-claim-operations";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
 import {
@@ -41,11 +36,12 @@ import {
     type MessageSearchResult,
     mergeMessageAndCompartmentResults,
     parseIdShapedQuery,
-    resolveMemoriesByIdsForSearch,
+    parseLocatorShapedQuery,
+    resolveClaimsByLocatorsForSearch,
     type UnifiedSearchResult,
     unifiedSearch,
 } from "./search";
-import { MAX_LANE_CANDIDATES, QueryBoundsError } from "./search-bounds";
+import { QueryBoundsError } from "./search-bounds";
 import type { SearchTraceSpan } from "./search-trace";
 import { countingDatabase } from "./sql-counters";
 import { initializeDatabase } from "./storage-db";
@@ -57,6 +53,11 @@ import {
     updateNote,
 } from "./storage-notes";
 import { createPrimer } from "./storage-primers";
+import {
+    createClaimReaderTestDatabase,
+    type SeededProjectMemoryClaim,
+    seedProjectMemoryClaim,
+} from "./test-claim-database";
 
 const readMessages = (sessionId: string) => rawMessagesBySession.get(sessionId) ?? [];
 const embedQuery = async (text: string) => {
@@ -116,14 +117,7 @@ function registerEmbeddingProject(db: Database, projectPath: string) {
 }
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    // runMigrations adds the git_commits + git_commits_fts tables that the
-    // dedup regression test exercises. Production code calls both functions
-    // back-to-back inside openDatabase(); the test path historically only
-    // called initializeDatabase() because no test needed the v4 schema.
-    runMigrations(db);
-    return db;
+    return createClaimReaderTestDatabase();
 }
 
 afterEach(() => {
@@ -171,22 +165,14 @@ describe("unifiedSearch", () => {
         }
     });
 
-    it("keeps exact-hash claim-backed facts on the legacy memory reader once", async () => {
-        const project = "git:u6-search-reader";
-        const content = "u6 exact hash fact preserves UTF-8 bytes: café";
-        const first = insertMemory(db, {
-            projectPath: project,
-            category: "CONSTRAINTS",
+    it("resolves exact claim locators through the provider with no legacy memory read", () => {
+        const project = "git:u3-search-reader";
+        const content = "u3 exact locator fact preserves UTF-8 bytes: café";
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: project,
             content,
-        });
-        const duplicate = insertMemoryIdempotent(db, {
-            projectPath: project,
             category: "CONSTRAINTS",
-            content,
         });
-        expect(duplicate.inserted).toBeFalse();
-        expect(duplicate.memory.id).toBe(first.id);
-        expect(getCurrentMemoryClaimByLegacyMemoryId(db, first.id)?.content).toBe(content);
 
         const statements: string[] = [];
         const originalPrepare = db.prepare.bind(db);
@@ -194,58 +180,48 @@ describe("unifiedSearch", () => {
             statements.push(sql);
             return originalPrepare(sql);
         }) as typeof db.prepare;
-        let results: UnifiedSearchResult[];
+        let results: ReturnType<typeof resolveClaimsByLocatorsForSearch>;
         try {
-            results = await unifiedSearch(db, "ses-u6-search", project, "u6 exact hash fact", {
+            results = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: project,
+                locators: [claim.revisionLocator],
                 limit: 10,
-                memoryEnabled: true,
-                embeddingEnabled: false,
-                sources: ["memory"],
             });
         } finally {
             db.prepare = originalPrepare;
         }
 
-        const memories = results.filter(
-            (result): result is Extract<UnifiedSearchResult, { source: "memory" }> =>
-                result.source === "memory",
-        );
-        expect(memories).toHaveLength(1);
-        expect(Buffer.from(memories[0].content)).toEqual(Buffer.from(content));
-        expect(Object.keys(memories[0]).sort()).toEqual([
-            "category",
-            "content",
-            "contentDigest",
-            "matchType",
-            "memoryId",
-            "policyLabel",
-            "score",
-            "source",
-            "sourceName",
-        ]);
-        expect(statements.some((sql) => /\bmemories(?:_fts)?\b/i.test(sql))).toBeTrue();
-        expect(statements.some((sql) => /claim_effective_policy/i.test(sql))).toBeTrue();
-        expect(statements.some((sql) => /claim_revisions\.content\b/i.test(sql))).toBeFalse();
+        expect(results).not.toBeNull();
+        if (results === null) throw new Error("unreachable");
+        expect(results).toHaveLength(1);
+        const hit = results[0];
+        expect(Buffer.from(hit.content)).toEqual(Buffer.from(content));
+        expect(hit.publicClaimId).toBe(claim.publicClaimId);
+        expect(hit.revisionLocator).toBe(claim.revisionLocator);
+        expect(hit.matchType).toBe("exact");
+        expect(hit.contentDigest).toBe(claim.contentDigest);
+        expect(Object.keys(hit)).not.toContain("memoryId");
+        expect(
+            statements.some((sql) =>
+                /\bmemories(?:_fts)?\b|\bmemory_stats\b|\bmemory_verifications\b/i.test(sql),
+            ),
+        ).toBeFalse();
     });
 
-    it("returns ranked results across memories and messages (no facts)", async () => {
+    it("suppresses the project-memory lane in unified search until retrieval activates", async () => {
+        seedProjectMemoryClaim(db, {
+            projectIdentity: "git:repo-project",
+            content: "Magic context stores ranked search data in SQLite.",
+            category: "ARCHITECTURE",
+        });
         const memory = insertMemory(db, {
-            projectPath: "/repo/project",
+            projectPath: "git:repo-project",
             category: "ARCHITECTURE_DECISIONS",
             content: "Magic context stores ranked search data in SQLite.",
         });
         saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
-
-        // Facts are inserted but should NEVER appear in ctx_search results —
-        // they're always rendered in <session-history> so returning them from
-        // search is redundant.
-        replaceSessionFacts(db, "ses-1", [
-            {
-                category: "WORKFLOW_RULES",
-                content: "ranked search flow.",
-            },
-        ]);
 
         rawMessagesBySession.set("ses-1", [
             {
@@ -268,7 +244,7 @@ describe("unifiedSearch", () => {
         ]);
         ensureMessagesIndexed(db, "ses-1", readMessages);
 
-        const results = await unifiedSearch(db, "ses-1", "/repo/project", "ranked search", {
+        const results = await unifiedSearch(db, "ses-1", "git:repo-project", "ranked search", {
             limit: 5,
             memoryEnabled: true,
             embeddingEnabled: true,
@@ -279,90 +255,85 @@ describe("unifiedSearch", () => {
 
         expect(results.length).toBeGreaterThan(0);
         const sources = results.map((r) => r.source);
-        expect(sources).toContain("memory");
+        // No broad claim scan and no memory-table lane exists on this path.
+        expect(sources).not.toContain("memory");
         expect(sources).toContain("message");
-        // Facts are NOT a ctx_search source — they're always visible in message[0].
         expect(sources).not.toContain("fact");
-        const messageResults = results.filter((r) => r.source === "message");
-        expect(messageResults.length).toBeGreaterThan(0);
-        expect(embeddingQueries).toEqual(["ranked search"]);
-        expect(getMemoryById(db, memory.id)?.retrievalCount).toBe(1);
     });
 
-    it("filters ctx_search workspace memory candidates and FTS hits by shared categories", async () => {
+    it("authorizes locator lookups by workspace shared categories", () => {
         db.exec(`
             INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
             VALUES (1, 'ws', '["CONSTRAINTS"]', 1, 1);
             INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
             VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
         `);
-        const own = insertMemory(db, {
-            projectPath: "git:own",
-            category: "NAMING",
+        const own = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:own",
             content: "own naming needle",
-        });
-        const foreignShared = insertMemory(db, {
-            projectPath: "git:foreign",
-            category: "CONSTRAINTS",
-            content: "foreign constraint needle",
-        });
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id);
-        });
-        const foreignHidden = insertMemory(db, {
-            projectPath: "git:foreign",
             category: "NAMING",
+        });
+        const foreignShared = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:foreign",
+            content: "foreign constraint needle",
+            category: "CONSTRAINTS",
+            sharing: "shareable",
+        });
+        const foreignHidden = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:foreign",
             content: "foreign naming needle",
+            category: "NAMING",
+            sharing: "shareable",
         });
 
-        const results = await unifiedSearch(db, "ses-1", "git:own", "needle", {
+        const results = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: "git:own",
+            locators: [own.publicClaimId, foreignShared.publicClaimId, foreignHidden.publicClaimId],
             limit: 10,
-            memoryEnabled: true,
-            embeddingEnabled: false,
-            sources: ["memory"],
         });
 
-        const memoryIds = results
-            .filter((result) => result.source === "memory")
-            .map((result) => result.memoryId)
-            .sort((left, right) => left - right);
-        expect(memoryIds).toEqual([own.id, foreignShared.id]);
-        expect(memoryIds).not.toContain(foreignHidden.id);
+        const ids = (results ?? []).map((result) => result.publicClaimId).sort();
+        expect(ids).toEqual([own.publicClaimId, foreignShared.publicClaimId].sort());
+        expect(ids).not.toContain(foreignHidden.publicClaimId);
+        const foreignHit = (results ?? []).find(
+            (result) => result.publicClaimId === foreignShared.publicClaimId,
+        );
+        expect(foreignHit?.sourceName).toBe("Foreign");
     });
 
-    it("fails closed for malformed workspace share categories during memory search", async () => {
+    it("fails closed for malformed workspace share categories on locator lookup", () => {
         db.exec(`
             INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
             VALUES (1, 'ws', 'not-json', 1, 1);
             INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
             VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
         `);
-        const own = insertMemory(db, {
-            projectPath: "git:own",
-            category: "CONSTRAINTS",
+        const own = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:own",
             content: "own malformed-policy needle",
-        });
-        const foreign = insertMemory(db, {
-            projectPath: "git:foreign",
             category: "CONSTRAINTS",
+        });
+        const foreign = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:foreign",
             content: "foreign malformed-policy needle",
+            category: "CONSTRAINTS",
+            sharing: "shareable",
         });
 
-        const results = await unifiedSearch(db, "ses-1", "git:own", "malformed-policy", {
+        const results = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: "git:own",
+            locators: [own.publicClaimId, foreign.publicClaimId],
             limit: 10,
-            memoryEnabled: true,
-            embeddingEnabled: false,
-            sources: ["memory"],
         });
 
-        const memoryIds = results
-            .filter((result) => result.source === "memory")
-            .map((result) => result.memoryId);
-        expect(memoryIds).toContain(own.id);
-        expect(memoryIds).not.toContain(foreign.id);
+        const ids = (results ?? []).map((result) => result.publicClaimId);
+        expect(ids).toContain(own.publicClaimId);
+        expect(ids).not.toContain(foreign.publicClaimId);
     });
 
-    it("uses the designed CONSTRAINTS default for legacy NULL workspace share categories", async () => {
+    it("uses the designed CONSTRAINTS default for legacy NULL workspace share categories", () => {
         db.exec(`
             DROP TABLE workspace_members;
             DROP TABLE workspaces;
@@ -386,71 +357,29 @@ describe("unifiedSearch", () => {
             INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
             VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
         `);
-        const foreignConstraint = insertMemory(db, {
-            projectPath: "git:foreign",
-            category: "CONSTRAINTS",
+        const foreignConstraint = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:foreign",
             content: "foreign legacy-null constraint needle",
+            category: "CONSTRAINTS",
+            sharing: "shareable",
         });
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignConstraint.id);
-        });
-        const foreignNaming = insertMemory(db, {
-            projectPath: "git:foreign",
-            category: "NAMING",
+        const foreignNaming = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:foreign",
             content: "foreign legacy-null naming needle",
+            category: "NAMING",
+            sharing: "shareable",
         });
 
-        const results = await unifiedSearch(db, "ses-1", "git:own", "legacy-null", {
-            limit: 10,
-            memoryEnabled: true,
-            embeddingEnabled: false,
-            sources: ["memory"],
-        });
-
-        const memoryIds = results
-            .filter((result) => result.source === "memory")
-            .map((result) => result.memoryId);
-        expect(memoryIds).toContain(foreignConstraint.id);
-        expect(memoryIds).not.toContain(foreignNaming.id);
-    });
-
-    it("ignores workspace memory vectors from inactive embedding models", async () => {
-        const snapshot = registerEmbeddingProject(db, "git:own");
-        db.exec(`
-            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
-            VALUES (1, 'ws', '["NAMING"]', 1, 1);
-            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
-            VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
-        `);
-        const own = insertMemory(db, {
+        const results = resolveClaimsByLocatorsForSearch({
+            db,
             projectPath: "git:own",
-            category: "NAMING",
-            content: "own semantic-only memory",
-        });
-        const foreign = insertMemory(db, {
-            projectPath: "git:foreign",
-            category: "NAMING",
-            content: "foreign stale-model memory",
-        });
-        saveEmbedding(db, own.id, new Float32Array([1, 0]), snapshot.modelId);
-        saveEmbedding(db, foreign.id, new Float32Array([1, 0]), "stale:model");
-        queryEmbedding = new Float32Array([1, 0]);
-
-        const results = await unifiedSearch(db, "ses-1", "git:own", "vector-only", {
+            locators: [foreignConstraint.publicClaimId, foreignNaming.publicClaimId],
             limit: 10,
-            memoryEnabled: true,
-            embeddingEnabled: true,
-            readMessages,
-            embedQuery,
-            isEmbeddingRuntimeEnabled,
-            sources: ["memory"],
         });
 
-        const memoryIds = results
-            .filter((result) => result.source === "memory")
-            .map((result) => result.memoryId);
-        expect(memoryIds).toContain(own.id);
-        expect(memoryIds).not.toContain(foreign.id);
+        const ids = (results ?? []).map((result) => result.publicClaimId);
+        expect(ids).toContain(foreignConstraint.publicClaimId);
+        expect(ids).not.toContain(foreignNaming.publicClaimId);
     });
 
     it("maxMessageOrdinal=0 excludes every message (no compartment yet → whole tail is live)", async () => {
@@ -494,8 +423,6 @@ describe("unifiedSearch", () => {
 
         // No message results — the current prompt must NOT come back.
         expect(results.filter((r) => r.source === "message")).toHaveLength(0);
-        // Memory results are unaffected by the message-ordinal cutoff.
-        expect(results.some((r) => r.source === "memory")).toBe(true);
     });
 
     it("returns note hits with id, status, anchor, and ready_reason text", async () => {
@@ -643,7 +570,7 @@ describe("unifiedSearch", () => {
     });
 
     it("restricts note results to the note source and includes them in broad searches", async () => {
-        const memory = insertMemory(db, {
+        insertMemory(db, {
             projectPath: "/repo/project",
             category: "ARCHITECTURE_DECISIONS",
             content: "broad recall marker from memory",
@@ -680,11 +607,8 @@ describe("unifiedSearch", () => {
             },
         );
         const broadSources = broad.map((result) => result.source);
-        expect(broadSources).toContain("memory");
         expect(broadSources).toContain("note");
-        expect(
-            broad.some((result) => result.source === "memory" && result.memoryId === memory.id),
-        ).toBe(true);
+        expect(broadSources).not.toContain("memory");
     });
 
     it("restricts results to the sources filter", async () => {
@@ -721,8 +645,9 @@ describe("unifiedSearch", () => {
                 sources: ["memory"],
             },
         );
-        expect(memoryOnly.every((r) => r.source === "memory")).toBe(true);
-        expect(memoryOnly.length).toBeGreaterThan(0);
+        // The memory source stays selectable but serves nothing until the
+        // retrieval projection activates.
+        expect(memoryOnly).toHaveLength(0);
 
         // Message-only filter — memory hit must be excluded.
         const messageOnly = await unifiedSearch(
@@ -743,38 +668,29 @@ describe("unifiedSearch", () => {
         expect(messageOnly.length).toBeGreaterThan(0);
     });
 
-    it("hard-filters memories listed in visibleMemoryIds", async () => {
-        const visible = insertMemory(db, {
-            projectPath: "/repo/visible",
-            category: "ARCHITECTURE_DECISIONS",
+    it("hard-filters claims whose revision locators are already visible", () => {
+        const visible = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:repo-visible",
             content: "Keep historian subagent hidden via mode=subagent plus hidden=true.",
+            category: "ARCHITECTURE",
         });
-        const hidden = insertMemory(db, {
-            projectPath: "/repo/visible",
-            category: "ARCHITECTURE_DECISIONS",
+        const hidden = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:repo-visible",
             content: "Historian child sessions inherit parent variant for cache stability.",
-        });
-        saveEmbedding(db, visible.id, new Float32Array([1, 0]), "mock:model");
-        saveEmbedding(db, hidden.id, new Float32Array([1, 0]), "mock:model");
-        queryEmbedding = new Float32Array([1, 0]);
-
-        const results = await unifiedSearch(db, "ses-vis", "/repo/visible", "historian", {
-            memoryEnabled: true,
-            embeddingEnabled: true,
-            readMessages,
-            embedQuery,
-            isEmbeddingRuntimeEnabled,
-            visibleMemoryIds: new Set([visible.id]),
-            sources: ["memory"],
+            category: "ARCHITECTURE",
         });
 
-        // The already-visible memory must not be returned even though it
-        // would otherwise rank identically with the other candidate.
-        const ids = results
-            .filter((r) => r.source === "memory")
-            .map((r) => (r as { memoryId: number }).memoryId);
-        expect(ids).not.toContain(visible.id);
-        expect(ids).toContain(hidden.id);
+        const results = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: "git:repo-visible",
+            locators: [visible.publicClaimId, hidden.publicClaimId],
+            limit: 10,
+            visibleRevisionLocators: new Set([visible.revisionLocator]),
+        });
+
+        const ids = (results ?? []).map((result) => result.publicClaimId);
+        expect(ids).not.toContain(visible.publicClaimId);
+        expect(ids).toContain(hidden.publicClaimId);
     });
 
     it("uses linear decay for message scoring so secondary hits keep signal", async () => {
@@ -1106,91 +1022,8 @@ describe("unifiedSearch", () => {
         ).toEqual([]);
     });
 
-    it("falls back to full semantic search when FTS finds no matches", async () => {
-        const snapshot = registerEmbeddingProject(db, "/repo/project");
-        const memory = insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "alpha beta gamma",
-        });
-        saveEmbedding(db, memory.id, new Float32Array([0, 1]), snapshot.modelId);
-        queryEmbedding = new Float32Array([0, 1]);
-
-        const results = await unifiedSearch(
-            db,
-            "ses-semantic",
-            "/repo/project",
-            "vector-only query",
-            {
-                limit: 5,
-                memoryEnabled: true,
-                embeddingEnabled: true,
-                readMessages,
-                embedQuery,
-                isEmbeddingRuntimeEnabled,
-            },
-        );
-
-        const memoryResults = results.filter(
-            (result): result is Extract<(typeof results)[number], { source: "memory" }> =>
-                result.source === "memory",
-        );
-
-        expect(memoryResults).toHaveLength(1);
-        expect(memoryResults[0]?.memoryId).toBe(memory.id);
-        expect(memoryResults[0]?.matchType).toBe("semantic");
-    });
-
-    it("excludes visible memories before the semantic lane ceiling", async () => {
-        // Visible memories are dropped at merge, so letting them occupy the
-        // pruned lane slots would evict every eligible lower-id match: with
-        // the ceiling filled by visible ids, nothing could be returned.
-        const snapshot = registerEmbeddingProject(db, "/repo/lane-visible");
-        const visibleIds = new Set<number>();
-        let survivor: number | undefined;
-        for (let index = 0; index < MAX_LANE_CANDIDATES + 10; index += 1) {
-            const memory = insertMemory(db, {
-                projectPath: "/repo/lane-visible",
-                category: "ARCHITECTURE_DECISIONS",
-                content: `semantic corpus entry ${index}`,
-            });
-            saveEmbedding(db, memory.id, new Float32Array([0, 1]), snapshot.modelId);
-            if (index < MAX_LANE_CANDIDATES) {
-                visibleIds.add(memory.id);
-            } else {
-                survivor ??= memory.id;
-            }
-        }
-        queryEmbedding = new Float32Array([0, 1]);
-
-        const results = await unifiedSearch(
-            db,
-            "ses-lane-visible",
-            "/repo/lane-visible",
-            "vector-only query",
-            {
-                limit: 5,
-                memoryEnabled: true,
-                embeddingEnabled: true,
-                readMessages,
-                embedQuery,
-                isEmbeddingRuntimeEnabled,
-                visibleMemoryIds: visibleIds,
-                sources: ["memory"],
-            },
-        );
-
-        const ids = results
-            .filter((result) => result.source === "memory")
-            .map((result) => (result as { memoryId: number }).memoryId);
-        if (survivor === undefined) throw new Error("no survivor memory seeded");
-        expect(ids).toContain(survivor);
-        for (const id of ids) {
-            expect(visibleIds.has(id)).toBe(false);
-        }
-    });
-
     /**
+     * Regression for the duplicate-embed bug observed in production LMStudio    /**
      * Regression for the duplicate-embed bug observed in production LMStudio
      * logs: when both memory and git-commit search ran in parallel, EACH
      * branch independently called `embedQuery(trimmedQuery)`, producing two
@@ -1591,7 +1424,7 @@ describe("query-purpose provider boundary (U30)", () => {
         fetchSpy.mockImplementation((async () => {
             throw new Error("embedding endpoint down");
         }) as unknown as typeof fetch);
-        const memory = insertMemory(db, {
+        insertMemory(db, {
             projectPath: "/repo/project",
             category: "ARCHITECTURE_DECISIONS",
             content: "queue saturation design notes",
@@ -1609,11 +1442,8 @@ describe("query-purpose provider boundary (U30)", () => {
             },
         );
 
-        const memoryHits = results.filter(
-            (result): result is Extract<UnifiedSearchResult, { source: "memory" }> =>
-                result.source === "memory",
-        );
-        expect(memoryHits.map((hit) => hit.memoryId)).toEqual([memory.id]);
+        // No exception surfaced and no memory-lane hit exists on this path.
+        expect(results.filter((result) => result.source === "memory")).toHaveLength(0);
     });
 });
 
@@ -1660,7 +1490,7 @@ describe("parseIdShapedQuery", () => {
 
 const FIXTURE_PROJECT = "git:projection-fixture";
 const FIXTURE_SESSION = "ses-projection-fixture";
-const FIXTURE_MODEL = "mock:model";
+const _FIXTURE_MODEL = "mock:model";
 /** Fixed clock so note createdAt ties (and their id tie-break) are deterministic. */
 const FIXTURE_NOTE_CREATED_AT = Date.UTC(2026, 1, 1);
 
@@ -1686,7 +1516,7 @@ function projectionOf(results: readonly UnifiedSearchResult[]): ProjectionRow[] 
 function stableResultId(result: UnifiedSearchResult): string {
     switch (result.source) {
         case "memory":
-            return `memory:${result.memoryId}`;
+            return `memory:${result.publicClaimId}`;
         case "message":
             return `message:${result.messageId}`;
         case "compartment":
@@ -1701,19 +1531,10 @@ function stableResultId(result: UnifiedSearchResult): string {
 }
 
 function seedProjectionCorpus(db: Database): {
-    memoryId: number;
     primerId: number;
     noteIds: number[];
     sha: string;
 } {
-    const memory = insertMemory(db, {
-        projectPath: FIXTURE_PROJECT,
-        category: "ARCHITECTURE_DECISIONS",
-        content:
-            "The queue drain path applies backpressure through applyBackpressure() before the retry budget resets.",
-    });
-    saveEmbedding(db, memory.id, new Float32Array([1, 0]), FIXTURE_MODEL);
-
     const primerId = createPrimer(db, {
         projectPath: FIXTURE_PROJECT,
         question: "How does the queue drain handle backpressure?",
@@ -1793,7 +1614,6 @@ function seedProjectionCorpus(db: Database): {
     );
 
     return {
-        memoryId: memory.id,
         primerId,
         noteIds: [firstNote.id, secondNote.id],
         sha: commits[0].sha,
@@ -1838,7 +1658,6 @@ describe("search ranking projection (KTD1 characterization)", () => {
         expect(projectionOf(results)).toEqual([
             { source: "primer", id: `primer:${seeded.primerId}`, score: 1, matchType: "fts" },
             { source: "message", id: "message:fx-m2", score: 1 },
-            { source: "memory", id: `memory:${seeded.memoryId}`, score: 0.8, matchType: "fts" },
             { source: "note", id: `note:${seeded.noteIds[0]}`, score: 1 },
             { source: "git_commit", id: `git_commit:${seeded.sha}`, score: 0.8, matchType: "fts" },
             { source: "message", id: "message:fx-m1", score: 0.5 },
@@ -1860,7 +1679,6 @@ describe("search ranking projection (KTD1 characterization)", () => {
         expect(projectionOf(results)).toEqual([
             { source: "primer", id: `primer:${seeded.primerId}`, score: 1, matchType: "fts" },
             { source: "message", id: "message:fx-m2", score: 1 },
-            { source: "memory", id: `memory:${seeded.memoryId}`, score: 0.8, matchType: "fts" },
             { source: "note", id: `note:${seeded.noteIds[0]}`, score: 1 },
             { source: "git_commit", id: `git_commit:${seeded.sha}`, score: 0.8, matchType: "fts" },
             { source: "message", id: "message:fx-m1", score: 0.5 },
@@ -2333,7 +2151,7 @@ describe("compartment interval sweep (R37)", () => {
 // U3 — exact memory-ID resolution through an indexed visibility query (R35).
 // ---------------------------------------------------------------------------
 
-describe("resolveMemoriesByIdsForSearch (R35)", () => {
+describe("resolveClaimsByLocatorsForSearch", () => {
     let db: Database;
 
     beforeEach(() => {
@@ -2344,111 +2162,364 @@ describe("resolveMemoriesByIdsForSearch (R35)", () => {
         closeQuietly(db);
     });
 
-    function seedWorkspace() {
+    function seedWorkspace(): {
+        allowedForeign: SeededProjectMemoryClaim;
+        ownArchived: SeededProjectMemoryClaim;
+    } {
         db.exec(`
             INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
             VALUES (1, 'ws', '["CONSTRAINTS"]', 1, 1);
             INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
             VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
         `);
-        const allowedForeign = insertMemory(db, {
-            projectPath: "git:foreign",
-            category: "CONSTRAINTS",
+        const allowedForeign = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:foreign",
             content: "allowed foreign row",
-        });
-        const ownArchived = insertMemory(db, {
-            projectPath: "git:own",
             category: "CONSTRAINTS",
+            sharing: "shareable",
+        });
+        const ownArchived = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:own",
             content: "own archived row",
+            category: "CONSTRAINTS",
         });
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(allowedForeign.id);
-            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(ownArchived.id);
-        });
-        return { allowedForeign: allowedForeign.id, ownArchived: ownArchived.id };
+        const lifecycle = setProjectMemoryClaimLifecycle(
+            db,
+            { producer: "test", operationKey: `archive-${ownArchived.publicClaimId}` },
+            {
+                token: computeProjectMemoryMutationToken(db, ownArchived.publicClaimId),
+                state: "archived",
+                actor: "user:test",
+            },
+        );
+        expect(lifecycle.outcome).toBe("applied");
+        return { allowedForeign, ownArchived };
     }
 
-    it("returns the three visible occurrences in caller order (AE3)", () => {
+    it("returns visible claims with workspace source attribution", () => {
         const seeded = seedWorkspace();
 
-        const resolved = resolveMemoriesByIdsForSearch({
+        const resolved = resolveClaimsByLocatorsForSearch({
             db,
             projectPath: "git:own",
-            ids: [seeded.allowedForeign, 999999, seeded.ownArchived, seeded.allowedForeign],
+            locators: [
+                seeded.allowedForeign.publicClaimId,
+                `mcm_${"9".repeat(32)}`,
+                seeded.ownArchived.publicClaimId,
+                seeded.allowedForeign.publicClaimId,
+            ],
             limit: 10,
         });
 
-        expect(resolved?.map((result) => result.memoryId)).toEqual([
-            seeded.allowedForeign,
-            seeded.ownArchived,
-            seeded.allowedForeign,
-        ]);
-        expect(resolved?.map((result) => result.sourceName)).toEqual([
-            "Foreign",
-            undefined,
-            "Foreign",
-        ]);
+        expect(resolved).not.toBeNull();
+        const byId = new Map((resolved ?? []).map((result) => [result.publicClaimId, result]));
+        expect([...byId.keys()].sort()).toEqual(
+            [seeded.allowedForeign.publicClaimId, seeded.ownArchived.publicClaimId].sort(),
+        );
+        expect(byId.get(seeded.allowedForeign.publicClaimId)?.sourceName).toBe("Foreign");
+        expect(byId.get(seeded.ownArchived.publicClaimId)?.sourceName).toBeUndefined();
     });
 
-    it("returns the null fallback sentinel when every id is missing or hidden", () => {
-        const seeded = seedWorkspace();
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(seeded.allowedForeign);
+    it("returns the null fallback sentinel when every locator is missing or hidden", () => {
+        seedProjectMemoryClaim(db, {
+            projectIdentity: "git:elsewhere",
+            content: "row in an unrelated project",
+            category: "CONSTRAINTS",
         });
-
         expect(
-            resolveMemoriesByIdsForSearch({
+            resolveClaimsByLocatorsForSearch({
                 db,
-                projectPath: "git:own",
-                ids: [999999, seeded.allowedForeign],
+                projectPath: "git:own-empty",
+                locators: [`mcm_${"9".repeat(32)}`],
                 limit: 10,
             }),
         ).toBeNull();
         expect(
-            resolveMemoriesByIdsForSearch({ db, projectPath: "git:own", ids: [], limit: 10 }),
+            resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:own-empty",
+                locators: [],
+                limit: 10,
+            }),
         ).toBeNull();
     });
 
-    it("applies visibleMemoryIds before the limit without widening scope", () => {
-        const seeded = seedWorkspace();
-
-        const resolved = resolveMemoriesByIdsForSearch({
-            db,
-            projectPath: "git:own",
-            ids: [seeded.allowedForeign, seeded.ownArchived],
-            limit: 1,
-            visibleMemoryIds: new Set([seeded.allowedForeign]),
+    it("a nonmember cannot distinguish hidden from missing by locator", () => {
+        const foreign = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:foreign-solo",
+            content: "private foreign fact",
+            category: "CONSTRAINTS",
         });
-
-        expect(resolved?.map((result) => result.memoryId)).toEqual([seeded.ownArchived]);
+        const forReal = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: "git:nonmember",
+            locators: [foreign.publicClaimId],
+            limit: 10,
+        });
+        const forMissing = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: "git:nonmember",
+            locators: [`mcm_${"9".repeat(32)}`],
+            limit: 10,
+        });
+        expect(forReal).toBeNull();
+        expect(forMissing).toBeNull();
     });
 
-    it("no longer executes the broad project or workspace memory query", () => {
+    it("applies visibleRevisionLocators before the limit without widening scope", () => {
+        const seeded = seedWorkspace();
+
+        const resolved = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: "git:own",
+            locators: [seeded.allowedForeign.publicClaimId, seeded.ownArchived.publicClaimId],
+            limit: 1,
+            visibleRevisionLocators: new Set([seeded.allowedForeign.revisionLocator]),
+        });
+
+        expect(resolved?.map((result) => result.publicClaimId)).toEqual([
+            seeded.ownArchived.publicClaimId,
+        ]);
+    });
+
+    it("carries the sanitized evidence label for labeled explicit rows", () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:labels",
+            content: "disputed fact",
+            category: "CONSTRAINTS",
+        });
+        const ref = db
+            .prepare(
+                `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                   FROM claim_public_ids
+                   JOIN claims ON claims.id = claim_public_ids.claim_id
+                  WHERE claim_public_ids.public_id = ?`,
+            )
+            .get(claim.publicClaimId) as { revisionId: number; projectId: number };
+        db.prepare(
+            `INSERT INTO claim_disposition_events
+                (revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
+             VALUES (?, ?, 'disputed', 'assert', 'user:test', 1, ?)`,
+        ).run(ref.revisionId, ref.projectId, Date.now());
+
+        const resolved = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: "git:labels",
+            locators: [claim.publicClaimId],
+            limit: 10,
+        });
+        expect(resolved).toHaveLength(1);
+        expect(resolved?.[0]?.policyLabel).toContain("disputed");
+    });
+
+    /**
+     * Hide a claim the way a concurrent writer would: append the quarantine
+     * disposition the visibility reducer treats as uniform absence. Written
+     * directly, like the neighbouring evidence-label test, so the simulated
+     * transition lands at an exact point in this lane rather than depending on
+     * an operations-layer schedule.
+     */
+    function quarantineClaim(database: Database, publicClaimId: string): void {
+        const ref = database
+            .prepare(
+                `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                   FROM claim_public_ids
+                   JOIN claims ON claims.id = claim_public_ids.claim_id
+                  WHERE claim_public_ids.public_id = ?`,
+            )
+            .get(publicClaimId) as { revisionId: number; projectId: number };
+        database
+            .prepare(
+                `INSERT INTO claim_disposition_events
+                    (revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
+                 VALUES (?, ?, 'quarantined', 'assert', 'user:test', 1, ?)`,
+            )
+            .run(ref.revisionId, ref.projectId, Date.now());
+    }
+
+    /**
+     * Drive the cross-process interleave deterministically: let the provider's
+     * first read complete and close its snapshot, then commit the transition
+     * before this lane returns. This stands in for another process taking the
+     * writer lock while this one waits on the telemetry `BEGIN IMMEDIATE`; it
+     * does NOT prove anything about real lock scheduling or `busy_timeout`
+     * behaviour, only that a transition committed after the provider's
+     * snapshot closed cannot be published.
+     */
+    function hideAfterFirstProviderRead(publicClaimIds: readonly string[]): {
+        restore: () => void;
+        reads: () => number;
+    } {
+        const realRead = claimCurrentState.readProjectMemoryCurrentState;
+        let reads = 0;
+        const spy = spyOn(claimCurrentState, "readProjectMemoryCurrentState").mockImplementation(
+            (database, request) => {
+                const result = realRead(database, request);
+                reads += 1;
+                if (reads === 1) {
+                    for (const publicClaimId of publicClaimIds) {
+                        quarantineClaim(db, publicClaimId);
+                    }
+                }
+                return result;
+            },
+        );
+        return { restore: () => spy.mockRestore(), reads: () => reads };
+    }
+
+    it("does not publish a claim hidden after the provider snapshot closed", () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck",
+            content: "content that must not survive a mid-flight quarantine",
+            category: "CONSTRAINTS",
+        });
+        const hook = hideAfterFirstProviderRead([claim.publicClaimId]);
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck",
+                locators: [claim.publicClaimId],
+                limit: 10,
+            });
+
+            // Indistinguishable from "no such locator": the same null fallback
+            // a missing or foreign-hidden claim returns.
+            expect(resolved).toBeNull();
+            // Two provider reads: the hydration read plus the pre-publication
+            // recheck. One read would mean the recheck was skipped.
+            expect(hook.reads()).toBe(2);
+        } finally {
+            hook.restore();
+        }
+    });
+
+    it("rechecks visibility even when retrieval counting is disabled", () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-no-telemetry",
+            content: "hidden mid-flight with telemetry off",
+            category: "CONSTRAINTS",
+        });
+        const hook = hideAfterFirstProviderRead([claim.publicClaimId]);
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck-no-telemetry",
+                locators: [claim.publicClaimId],
+                limit: 10,
+                countRetrievals: false,
+            });
+
+            expect(resolved).toBeNull();
+            expect(hook.reads()).toBe(2);
+        } finally {
+            hook.restore();
+        }
+    });
+
+    it("drops only the claims that lost visibility mid-flight", () => {
+        const hidden = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-partial",
+            content: "quarantined between the read and the return",
+            category: "CONSTRAINTS",
+        });
+        const survivor = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-partial",
+            content: "still visible at publication time",
+            category: "CONSTRAINTS",
+        });
+        const hook = hideAfterFirstProviderRead([hidden.publicClaimId]);
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck-partial",
+                locators: [hidden.publicClaimId, survivor.publicClaimId],
+                limit: 10,
+            });
+
+            expect(resolved?.map((result) => result.publicClaimId)).toEqual([
+                survivor.publicClaimId,
+            ]);
+        } finally {
+            hook.restore();
+        }
+    });
+
+    it("publishes unchanged claims through the recheck", () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-stable",
+            content: "nothing moves under this lookup",
+            category: "CONSTRAINTS",
+        });
+        const realRead = claimCurrentState.readProjectMemoryCurrentState;
+        let reads = 0;
+        const spy = spyOn(claimCurrentState, "readProjectMemoryCurrentState").mockImplementation(
+            (database, request) => {
+                reads += 1;
+                return realRead(database, request);
+            },
+        );
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck-stable",
+                locators: [claim.publicClaimId],
+                limit: 10,
+            });
+
+            expect(resolved?.map((result) => result.publicClaimId)).toEqual([claim.publicClaimId]);
+            expect(resolved?.[0]?.content).toBe("nothing moves under this lookup");
+            expect(reads).toBe(2);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("never queries legacy memory tables", () => {
         const seeded = seedWorkspace();
         const counter = countingDatabase(db);
 
-        resolveMemoriesByIdsForSearch({
+        resolveClaimsByLocatorsForSearch({
             db: counter.db,
             projectPath: "git:own",
-            ids: [seeded.allowedForeign, seeded.ownArchived],
+            locators: [seeded.allowedForeign.publicClaimId, seeded.ownArchived.publicClaimId],
             limit: 10,
         });
 
-        const memoryReads = counter.matching(/(FROM|JOIN) memories\b/);
-        // Exactly two id-bounded reads: the CROSS JOIN id fetch and the
-        // exact-digest binding check. Neither may widen to a project or
-        // workspace scan.
-        expect(memoryReads.length).toBe(2);
-        expect(memoryReads[0].sql).toContain("json_each");
-        expect(memoryReads[0].sql).toContain(
-            "CROSS JOIN memories ON memories.id = requested.value",
-        );
-        expect(memoryReads[1].sql).toContain("WHERE m.id IN");
-        expect(counter.matching(/FROM memories\s+WHERE project_path/).length).toBe(0);
+        expect(counter.matching(/(FROM|JOIN) memories\b/).length).toBe(0);
+        expect(counter.matching(/memory_stats|memory_verifications/).length).toBe(0);
+    });
+});
+
+describe("parseLocatorShapedQuery", () => {
+    const id = `mcm_${"a".repeat(32)}`;
+
+    it("recognizes a bare public claim id", () => {
+        expect(parseLocatorShapedQuery(id)).toEqual([id]);
+    });
+
+    it("recognizes a full revision locator", () => {
+        expect(parseLocatorShapedQuery(`${id}/r3/${"b".repeat(64)}`)).toEqual([id]);
+    });
+
+    it("recognizes a mixed whitespace/comma-separated locator list", () => {
+        const other = `mcm_${"c".repeat(32)}`;
+        expect(parseLocatorShapedQuery(`${id}, ${other}/r1/${"d".repeat(64)}`)).toEqual([
+            id,
+            other,
+        ]);
+    });
+
+    it("rejects ordinary text and numeric id queries", () => {
+        expect(parseLocatorShapedQuery("fix bug 1234")).toBeNull();
+        expect(parseLocatorShapedQuery("#123")).toBeNull();
+        expect(parseLocatorShapedQuery("123")).toBeNull();
+        expect(parseLocatorShapedQuery(`${id} plus prose`)).toBeNull();
+        expect(parseLocatorShapedQuery("   ")).toBeNull();
     });
 });
 
 // ---------------------------------------------------------------------------
+// U4 — note candidate pruning// ---------------------------------------------------------------------------
 // U4 — note candidate pruning through the FTS projection (R36).
 // ---------------------------------------------------------------------------
 
