@@ -473,3 +473,86 @@ pub fn next_poll_delay_ms(previous_ms: f64, served_cap_ms: u64) -> f64 {
         .max(10.0)
         .min(served_cap_ms.max(10) as f64)
 }
+
+/// Frozen treatment arm. Policy methods keep the benchmark's client behavior
+/// in one place so a host hint cannot accidentally leak into control arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SynapseVariant {
+    #[serde(rename = "baseline")]
+    Baseline,
+    #[serde(rename = "hygiene-only")]
+    HygieneOnly,
+    #[serde(rename = "a")]
+    A,
+    #[serde(rename = "b")]
+    B,
+    #[serde(rename = "c")]
+    C,
+    #[serde(rename = "a+c")]
+    APlusC,
+}
+
+impl SynapseVariant {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "hygiene-only" => Ok(Self::HygieneOnly),
+            "a" => Ok(Self::A),
+            "b" => Ok(Self::B),
+            "c" => Ok(Self::C),
+            "a+c" => Ok(Self::APlusC),
+            _ => Err("variant must be baseline, hygiene-only, a, b, c, or a+c".to_owned()),
+        }
+    }
+
+    pub fn needs_waiting_queries(self) -> bool {
+        matches!(self, Self::A | Self::APlusC)
+    }
+
+    /// `None` is the historical query-only admission loop: retry until the
+    /// single absolute deadline. Every treatment/hygiene arm has four total
+    /// attempts.
+    pub fn query_attempt_limit(self) -> Option<u32> {
+        (!matches!(self, Self::Baseline)).then_some(4)
+    }
+
+    pub fn uses_served_query_hint(self) -> bool {
+        matches!(self, Self::B | Self::APlusC)
+    }
+
+    pub fn fast_polls(self) -> bool {
+        matches!(self, Self::C | Self::APlusC)
+    }
+
+    pub fn initial_poll_delay_ms(self, rng: &mut DeterministicRng) -> Option<f64> {
+        self.fast_polls().then(|| rng.first_poll_delay_ms())
+    }
+
+    pub fn pending_poll_delay_ms(self, previous_ms: f64, served_ms: u64) -> f64 {
+        if self.fast_polls() {
+            next_poll_delay_ms(previous_ms, served_ms)
+        } else {
+            served_ms.max(10) as f64
+        }
+    }
+
+    /// Query admission delay in milliseconds. Baseline reproduces the fixed,
+    /// unjittered 100 ms loop. Other arms jitter either the fallback or the
+    /// served hint over `[base, 3base)`.
+    pub fn query_retry_delay_ms(
+        self,
+        served_hint_ms: Option<u64>,
+        rng: &mut DeterministicRng,
+    ) -> f64 {
+        if matches!(self, Self::Baseline) {
+            100.0
+        } else {
+            let base = if self.uses_served_query_hint() {
+                served_hint_ms.unwrap_or(100)
+            } else {
+                100
+            };
+            rng.retry_delay_ms(base)
+        }
+    }
+}

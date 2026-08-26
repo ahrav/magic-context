@@ -29,7 +29,7 @@ use mc_host::{
 };
 use perf_measurement::{
     AttemptDisposition, AttemptRecord, DeterministicRng, LatencySummary, LogicalDisposition,
-    LogicalRecord, SynapseMethod,
+    LogicalRecord, SynapseMethod, SynapseVariant,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -96,6 +96,7 @@ enum Load {
 
 #[derive(Clone, Copy, Debug)]
 struct Opts {
+    variant: SynapseVariant,
     arm: Arm,
     load: Load,
     seconds: u64,
@@ -107,6 +108,11 @@ struct Opts {
 }
 
 fn parse_opts() -> Result<Opts, String> {
+    parse_opts_from(std::env::args().skip(1))
+}
+
+fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, String> {
+    let mut variant = None;
     let mut arm = None;
     let mut batch_shape = None;
     let mut rate = None;
@@ -117,12 +123,13 @@ fn parse_opts() -> Result<Opts, String> {
     let mut query_retry_after_ms = 50;
     let mut seed = 1;
     let mut transport_floor_ns = 0;
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
+            "--variant" => variant = Some(SynapseVariant::parse(&value)?),
             "--arm" => arm = Some(value),
             "--batch-shape" => batch_shape = Some(BatchShape::parse(&value)?),
             "--rate" => rate = Some(parse(&value, "rate")?),
@@ -144,6 +151,7 @@ fn parse_opts() -> Result<Opts, String> {
         (Some(other), _) => return Err(format!("arm must be query or batch, got {other}")),
         (None, _) => return Err("--arm query|batch is required".to_owned()),
     };
+    let variant = variant.ok_or_else(|| "--variant is required".to_owned())?;
     let load = match (rate, concurrency) {
         (Some(rate), None) => Load::Open {
             rate,
@@ -160,12 +168,25 @@ fn parse_opts() -> Result<Opts, String> {
     if query_retry_after_ms == 0 {
         return Err("query retry after must be nonzero".to_owned());
     }
+    if variant.needs_waiting_queries() && max_waiting_queries == 0 {
+        return Err(format!(
+            "variant {} requires --max-waiting-queries greater than zero",
+            variant_name(variant)
+        ));
+    }
+    if !variant.needs_waiting_queries() && max_waiting_queries != 0 {
+        return Err(format!(
+            "variant {} requires --max-waiting-queries 0",
+            variant_name(variant)
+        ));
+    }
     if let Load::Open { rate, .. } = load {
         rate.checked_mul(seconds)
             .filter(|count| *count > 0)
             .ok_or_else(|| "offered request count is zero or overflows".to_owned())?;
     }
     Ok(Opts {
+        variant,
         arm,
         load,
         seconds,
@@ -175,6 +196,17 @@ fn parse_opts() -> Result<Opts, String> {
         seed,
         transport_floor_ns,
     })
+}
+
+fn variant_name(variant: SynapseVariant) -> &'static str {
+    match variant {
+        SynapseVariant::Baseline => "baseline",
+        SynapseVariant::HygieneOnly => "hygiene-only",
+        SynapseVariant::A => "a",
+        SynapseVariant::B => "b",
+        SynapseVariant::C => "c",
+        SynapseVariant::APlusC => "a+c",
+    }
 }
 
 fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
@@ -647,7 +679,9 @@ async fn execute_query(
     let deadline = Instant::now() + QUERY_DEADLINE;
     let mut rng = DeterministicRng::new(ctx.opts.seed ^ logical_id);
     let mut first_send = None;
-    for attempt in 0..MAX_TOTAL_ATTEMPTS {
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
         let mut params = constraints();
         params["text"] = QUERY_TEXT.into();
         params["deadline_ms"] = u64::try_from(
@@ -668,8 +702,15 @@ async fn execute_query(
         {
             Ok(value) => value,
             Err(error) if error == "attempt timeout" => {
-                if attempt + 1 < MAX_TOTAL_ATTEMPTS {
-                    let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
+                let may_retry = ctx
+                    .opts
+                    .variant
+                    .query_attempt_limit()
+                    .is_none_or(|limit| attempts < limit);
+                if may_retry {
+                    let delay = Duration::from_secs_f64(
+                        ctx.opts.variant.query_retry_delay_ms(None, &mut rng) / 1_000.0,
+                    );
                     if Instant::now() + delay < deadline {
                         tokio::time::sleep(delay).await;
                         continue;
@@ -683,7 +724,7 @@ async fn execute_query(
                     now,
                     LogicalDisposition::TimedOut,
                     Some("attempt_timeout".to_owned()),
-                    u64::from(attempt + 1),
+                    u64::from(attempts),
                     0,
                 ));
             }
@@ -699,7 +740,7 @@ async fn execute_query(
                 reply.received_ns,
                 LogicalDisposition::Completed,
                 None,
-                u64::from(attempt + 1),
+                u64::from(attempts),
                 0,
             ));
         }
@@ -712,14 +753,19 @@ async fn execute_query(
                 reply.received_ns,
                 LogicalDisposition::TimedOut,
                 Some(code.to_owned()),
-                u64::from(attempt + 1),
+                u64::from(attempts),
                 0,
             ));
         }
         if code != "queue_full" {
             return Err(format!("unexpected embed.query error: {json}"));
         }
-        if attempt + 1 == MAX_TOTAL_ATTEMPTS {
+        if ctx
+            .opts
+            .variant
+            .query_attempt_limit()
+            .is_some_and(|limit| attempts >= limit)
+        {
             return Ok(terminal_record(
                 logical_id,
                 scheduled_start_ns,
@@ -727,12 +773,16 @@ async fn execute_query(
                 reply.received_ns,
                 LogicalDisposition::Rejected,
                 Some(code.to_owned()),
-                u64::from(MAX_TOTAL_ATTEMPTS),
+                u64::from(attempts),
                 0,
             ));
         }
-        let base = json["retry_after_ms"].as_u64().unwrap_or(100);
-        let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
+        let delay = Duration::from_secs_f64(
+            ctx.opts
+                .variant
+                .query_retry_delay_ms(json["retry_after_ms"].as_u64(), &mut rng)
+                / 1_000.0,
+        );
         if Instant::now() + delay >= deadline {
             return Ok(terminal_record(
                 logical_id,
@@ -741,13 +791,12 @@ async fn execute_query(
                 reply.received_ns,
                 LogicalDisposition::Rejected,
                 Some(code.to_owned()),
-                u64::from(attempt + 1),
+                u64::from(attempts),
                 0,
             ));
         }
         tokio::time::sleep(delay).await;
     }
-    unreachable!("finite retry loop always returns")
 }
 
 fn batch_items(logical_id: u64, shape: BatchShape) -> Vec<BatchItem> {
@@ -863,8 +912,12 @@ async fn execute_batch(
     let mut cursor = serde_json::Value::Null;
     let mut polls = 0u64;
     let mut collected = Vec::with_capacity(items.len());
-    let mut poll_delay_ms = rng.first_poll_delay_ms();
-    tokio::time::sleep(Duration::from_secs_f64(poll_delay_ms / 1_000.0)).await;
+    let mut poll_delay_ms = if let Some(delay) = ctx.opts.variant.initial_poll_delay_ms(&mut rng) {
+        tokio::time::sleep(Duration::from_secs_f64(delay / 1_000.0)).await;
+        delay
+    } else {
+        0.0
+    };
     loop {
         let mut poll_attempt = 0u32;
         let (reply, json) = loop {
@@ -972,10 +1025,11 @@ async fn execute_batch(
             }
             continue;
         }
-        poll_delay_ms = perf_measurement::next_poll_delay_ms(
-            poll_delay_ms,
-            result["retry_after_ms"].as_u64().unwrap_or(served_poll_cap),
-        );
+        let served_delay = result["retry_after_ms"].as_u64().unwrap_or(served_poll_cap);
+        poll_delay_ms = ctx
+            .opts
+            .variant
+            .pending_poll_delay_ms(poll_delay_ms, served_delay);
         tokio::time::sleep(Duration::from_secs_f64(poll_delay_ms / 1_000.0)).await;
     }
 }
@@ -1126,6 +1180,7 @@ async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
 #[derive(serde::Serialize)]
 struct Summary {
     kind: &'static str,
+    variant: SynapseVariant,
     arm: Arm,
     load: Load,
     seconds: u64,
@@ -1283,6 +1338,7 @@ async fn run(opts: Opts) -> Result<(Vec<LogicalRecord>, Vec<AttemptRecord>, Summ
     };
     let summary = Summary {
         kind: "synapse_perf_summary",
+        variant: opts.variant,
         arm: opts.arm,
         load: opts.load,
         seconds: opts.seconds,
@@ -1334,6 +1390,7 @@ fn emit(
             "{}",
             serde_json::to_string(&serde_json::json!({
                 "kind": "synapse_perf_logical",
+                "variant": summary.variant,
                 "arm": summary.arm,
                 "load": summary.load,
                 "seed": summary.seed,
@@ -1347,6 +1404,7 @@ fn emit(
             "{}",
             serde_json::to_string(&serde_json::json!({
                 "kind": "synapse_perf_attempt",
+                "variant": summary.variant,
                 "arm": summary.arm,
                 "load": summary.load,
                 "seed": summary.seed,
@@ -1413,5 +1471,59 @@ fn main() {
             eprintln!("synapse_perf failed: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn variant_is_required_and_waiter_combinations_are_typed() {
+        assert_eq!(
+            parse_opts_from(args(&["--arm", "query", "--concurrency", "1"]))
+                .expect_err("missing variant"),
+            "--variant is required"
+        );
+        assert!(parse_opts_from(args(&[
+            "--variant",
+            "a",
+            "--arm",
+            "query",
+            "--concurrency",
+            "1"
+        ]))
+        .expect_err("A needs K")
+        .contains("greater than zero"));
+        assert!(parse_opts_from(args(&[
+            "--variant",
+            "b",
+            "--arm",
+            "query",
+            "--concurrency",
+            "1",
+            "--max-waiting-queries",
+            "1"
+        ]))
+        .expect_err("B is a loss arm")
+        .contains("requires --max-waiting-queries 0"));
+
+        let a = parse_opts_from(args(&[
+            "--variant",
+            "a+c",
+            "--arm",
+            "query",
+            "--concurrency",
+            "1",
+            "--max-waiting-queries",
+            "2",
+        ]))
+        .expect("A+C with finite K");
+        assert_eq!(a.variant, SynapseVariant::APlusC);
+        assert_eq!(a.max_waiting_queries, 2);
     }
 }

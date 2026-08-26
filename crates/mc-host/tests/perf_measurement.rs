@@ -288,3 +288,55 @@ fn overload_and_closed_singleton_ledgers_keep_expected_amplification() {
         4
     );
 }
+
+#[test]
+fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
+    use perf_measurement::SynapseVariant;
+    let mut baseline_rng = perf_measurement::DeterministicRng::new(1);
+    assert_eq!(
+        SynapseVariant::Baseline.query_retry_delay_ms(Some(7), &mut baseline_rng),
+        100.0
+    );
+    assert_eq!(SynapseVariant::Baseline.query_attempt_limit(), None);
+    assert!(!SynapseVariant::Baseline.fast_polls());
+
+    for variant in [
+        SynapseVariant::HygieneOnly,
+        SynapseVariant::A,
+        SynapseVariant::C,
+    ] {
+        let mut rng = perf_measurement::DeterministicRng::new(9);
+        let delay = variant.query_retry_delay_ms(Some(7), &mut rng);
+        assert!((100.0..300.0).contains(&delay));
+        assert_eq!(variant.query_attempt_limit(), Some(4));
+        assert!(!variant.uses_served_query_hint());
+    }
+
+    for variant in [SynapseVariant::B, SynapseVariant::APlusC] {
+        let mut rng = perf_measurement::DeterministicRng::new(9);
+        let delay = variant.query_retry_delay_ms(Some(7), &mut rng);
+        assert!((7.0..21.0).contains(&delay));
+        assert!(variant.uses_served_query_hint());
+    }
+    assert!(SynapseVariant::A.needs_waiting_queries());
+    assert!(SynapseVariant::APlusC.needs_waiting_queries());
+    assert!(SynapseVariant::C.fast_polls());
+    assert!(SynapseVariant::APlusC.fast_polls());
+
+    let mut poll_rng = perf_measurement::DeterministicRng::new(17);
+    assert_eq!(
+        SynapseVariant::Baseline.initial_poll_delay_ms(&mut poll_rng),
+        None,
+        "baseline polls immediately"
+    );
+    assert_eq!(
+        SynapseVariant::HygieneOnly.pending_poll_delay_ms(0.0, 73),
+        73.0,
+        "control polling stays at the served constant"
+    );
+    let first = SynapseVariant::C
+        .initial_poll_delay_ms(&mut poll_rng)
+        .expect("C has fast-first polling");
+    assert!((1.0..2.0).contains(&first));
+    assert_eq!(SynapseVariant::C.pending_poll_delay_ms(first, 73), 10.0);
+}
