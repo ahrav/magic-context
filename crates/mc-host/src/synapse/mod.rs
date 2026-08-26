@@ -100,6 +100,7 @@ pub struct LaneInfo {
     pub fingerprint: String,
     pub table_epoch: u64,
     pub dims: usize,
+    pub execution_provider: &'static str,
     /// Token window inference truncates at; published so clients chunk to
     /// the real boundary instead of a hardcoded guess.
     pub max_tokens: u32,
@@ -119,6 +120,7 @@ impl LaneInfo {
             fingerprint: manifest.fingerprint.clone(),
             table_epoch: manifest.table_epoch,
             dims: manifest.dims as usize,
+            execution_provider: "cpu",
             // Bounded by the manifest schema (at most 1_048_576), so the
             // narrowing cast is lossless.
             max_tokens: manifest.max_tokens as u32,
@@ -171,6 +173,7 @@ enum LaneState {
 
 struct SynapseInner {
     config: Option<SynapseConfig>,
+    unsupported_reason: Option<&'static str>,
     limits: SynapseLimits,
     state: Mutex<LaneState>,
     jobs: JobTable,
@@ -199,10 +202,30 @@ impl SynapseComponent {
         Self {
             inner: Arc::new(SynapseInner {
                 config,
+                unsupported_reason: None,
                 jobs: JobTable::new(limits.clone()),
                 limits,
                 state: Mutex::new(LaneState::Disabled {
                     reason: "not initialized".to_owned(),
+                }),
+                cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                tracker: TaskTracker::new(),
+                closing: CancellationToken::new(),
+            }),
+        }
+    }
+
+    pub fn unsupported(reason: &'static str) -> Self {
+        let limits = SynapseLimits::default();
+        Self {
+            inner: Arc::new(SynapseInner {
+                config: None,
+                unsupported_reason: Some(reason),
+                jobs: JobTable::new(limits.clone()),
+                limits,
+                state: Mutex::new(LaneState::Disabled {
+                    reason: reason.to_owned(),
                 }),
                 cpu: Arc::new(tokio::sync::Semaphore::new(1)),
                 query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -223,6 +246,7 @@ impl SynapseComponent {
         Self {
             inner: Arc::new(SynapseInner {
                 config: None,
+                unsupported_reason: None,
                 jobs: JobTable::new(limits.clone()),
                 limits,
                 state: Mutex::new(LaneState::Ready(Arc::new(ReadyLane {
@@ -920,21 +944,31 @@ impl CompositeComponent for SynapseComponent {
 
     async fn health(&self) -> HealthReport {
         match self.status() {
-            SynapseStatus::Ready(_) => HealthReport::ok(),
+            SynapseStatus::Ready(_) => HealthReport {
+                status: HealthStatus::Ok,
+                detail: None,
+                metrics: Some(serde_json::json!({"synapse_state": "ready"})),
+            },
             SynapseStatus::Starting => HealthReport {
                 status: HealthStatus::Degraded,
                 detail: Some(STARTING_REASON.to_owned()),
-                metrics: None,
+                metrics: Some(serde_json::json!({"synapse_state": "starting"})),
             },
             SynapseStatus::Disabled { reason } => HealthReport {
                 status: HealthStatus::Degraded,
+                metrics: Some(serde_json::json!({
+                    "synapse_state": if reason == "synapse_unsupported" {
+                        "unsupported"
+                    } else {
+                        "degraded"
+                    }
+                })),
                 detail: Some(reason),
-                metrics: None,
             },
             SynapseStatus::Failing { reason } => HealthReport {
                 status: HealthStatus::Failing,
                 detail: Some(reason),
-                metrics: None,
+                metrics: Some(serde_json::json!({"synapse_state": "degraded"})),
             },
         }
     }
@@ -967,6 +1001,10 @@ impl SecondaryComponent for SynapseComponent {
             // behind them, so pre-publication bootstrap only records that
             // the lane is still starting.
             LaneState::Starting
+        } else if let Some(reason) = self.inner.unsupported_reason {
+            LaneState::Disabled {
+                reason: reason.to_owned(),
+            }
         } else {
             LaneState::Disabled {
                 reason: "no bundle configured".to_owned(),

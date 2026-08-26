@@ -726,6 +726,30 @@ async fn handle_control<H: McHostHandler>(
                 crate::dispatch::handle_host_shutdown(&shared_task, &gen_task, corr).await;
             }));
         }
+        ControlAction::HostStatus => {
+            let shared_task = Arc::clone(shared);
+            let gen_task = Arc::clone(gen);
+            shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                let _pending_permit = pending_permit;
+                let report = shared_task
+                    .health_snapshot
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let body = crate::control::host_status_response_json(&report);
+                if emit_catalog_response(
+                    &shared_task.egress_budget,
+                    &gen_task,
+                    FrameId::control(corr),
+                    &body,
+                )
+                .await
+                .is_err()
+                {
+                    gen_task.token.cancel();
+                }
+            }));
+        }
         ControlAction::RouteOpen { target, identity } => {
             // Bind callbacks may be slow; never stall the read loop on them.
             // Abort-exempt: this wrapper owns its route's cleanup (rejected

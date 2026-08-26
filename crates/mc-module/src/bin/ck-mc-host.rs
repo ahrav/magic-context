@@ -15,6 +15,8 @@ mod serve;
 mod spawn;
 
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -35,9 +37,7 @@ const OUTER_AGGREGATE: Duration = Duration::from_secs(60);
 /// Spawn/publication/auth phase (hard).
 const SPAWN_PUBLICATION_AUTH: Duration = Duration::from_secs(3);
 /// Stop teardown: committed shutdown until publication removal plus both
-/// fences acquirable. ponytail: the plan budget table has no stop-teardown
-/// row; 10s comfortably covers the runtime's own shutdown deadline — tune
-/// when U5 pins the CLI budget.
+/// fences acquirable, bounded above the runtime's own shutdown deadline.
 const STOP_TEARDOWN: Duration = Duration::from_secs(10);
 /// Bounded settle window for an observed `starting`/`stopping` transition
 /// before reporting `lifecycle_busy`.
@@ -230,14 +230,21 @@ impl DaemonResult {
 enum Command {
     Version,
     ReleaseInfo,
+    InputLockDigest,
     Probe,
-    Start { payload_dir: Option<PathBuf> },
+    Start {
+        payload_dir: Option<PathBuf>,
+        payload_manifest_digest: Option<String>,
+    },
     Stop,
-    Restart { payload_dir: Option<PathBuf> },
+    Restart {
+        payload_dir: Option<PathBuf>,
+        payload_manifest_digest: Option<String>,
+    },
     Serve,
 }
 
-const USAGE: &str = "usage: ck-mc-host <serve|start|stop|restart|probe|release-info> [--payload-dir <dir>] | --version";
+const USAGE: &str = "usage: ck-mc-host <serve|start|stop|restart|probe|release-info|input-lock-digest> [--payload-dir <dir> --payload-manifest-digest <sha256>] | --version";
 
 fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
     let mut iter = args.iter();
@@ -248,6 +255,7 @@ fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
         return Err("command is not valid UTF-8".to_owned());
     };
     let mut payload_dir: Option<PathBuf> = None;
+    let mut payload_manifest_digest: Option<String> = None;
     let takes_payload = matches!(first, "start" | "restart");
     while let Some(arg) = iter.next() {
         let Some(arg) = arg.to_str() else {
@@ -264,6 +272,21 @@ fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
                 return Err("--payload-dir requires a nonempty value".to_owned());
             }
             payload_dir = Some(PathBuf::from(value));
+        } else if takes_payload && arg == "--payload-manifest-digest" {
+            if payload_manifest_digest.is_some() {
+                return Err("duplicate --payload-manifest-digest".to_owned());
+            }
+            let Some(value) = iter.next().and_then(|value| value.to_str()) else {
+                return Err("--payload-manifest-digest requires a UTF-8 value".to_owned());
+            };
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err("--payload-manifest-digest requires lowercase SHA-256".to_owned());
+            }
+            payload_manifest_digest = Some(value.to_owned());
         } else {
             return Err(format!("unexpected argument: {arg}"));
         }
@@ -271,10 +294,17 @@ fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
     match first {
         "--version" => Ok(Command::Version),
         "release-info" => Ok(Command::ReleaseInfo),
+        "input-lock-digest" => Ok(Command::InputLockDigest),
         "probe" => Ok(Command::Probe),
-        "start" => Ok(Command::Start { payload_dir }),
+        "start" => Ok(Command::Start {
+            payload_dir,
+            payload_manifest_digest,
+        }),
         "stop" => Ok(Command::Stop),
-        "restart" => Ok(Command::Restart { payload_dir }),
+        "restart" => Ok(Command::Restart {
+            payload_dir,
+            payload_manifest_digest,
+        }),
         "serve" => Ok(Command::Serve),
         other => Err(format!("unknown command: {other}")),
     }
@@ -398,9 +428,8 @@ impl Runtime {
     }
 }
 
-/// Untrusted publication diagnostics (daemon_ver) for the versions block.
-/// Authenticated version propagation is U3's client work; until then the
-/// discovery-validated publication value is reported as a diagnostic only.
+/// Untrusted publication daemon version for observational output only.
+/// Authorization and compatibility never consume this value.
 fn publication_daemon_ver(observed: &LifecycleProbe) -> Option<String> {
     observed
         .publication
@@ -491,8 +520,10 @@ struct StartOutcome {
 fn start_phase(
     runtime: &Runtime,
     payload_dir: Option<&Path>,
+    payload_manifest_digest: Option<&str>,
     anchor: &NamespaceAnchor,
     outer: Instant,
+    launcher_envelope: serve::LauncherEnvelope,
 ) -> StartOutcome {
     let fail = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
@@ -503,36 +534,32 @@ fn start_phase(
     };
 
     // Validate or stage the requested generation (KTD9).
-    let digest = match resolve_generation(payload_dir) {
-        Ok(digest) => digest,
-        Err((state, reason)) => return fail(state, reason),
-    };
+    let (digest, generation_launcher) =
+        match resolve_generation(payload_dir, payload_manifest_digest) {
+            Ok(generation) => generation,
+            Err((state, reason)) => return fail(state, reason),
+        };
 
     // Namespace identity must still hold before the spawn commit (KTD2).
     if anchor.verify().is_err() {
         return fail("wedged", "wedged");
     }
 
-    let envelope = serve::StartupEnvelope {
-        schema: 1,
-        data_dir: match mc_host::runtime_dir_path(None) {
-            Ok(run_dir) => run_dir
-                .parent()
-                .and_then(Path::parent)
-                .expect("runtime dir has data-root ancestors")
-                .to_path_buf(),
-            Err(_) => return fail("stopped", "internal_error"),
-        },
-        payload_manifest_digest: digest,
-        opencode: None,
-        pi: None,
+    let data_dir = match mc_host::runtime_dir_path(None) {
+        Ok(run_dir) => run_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("runtime dir has data-root ancestors")
+            .to_path_buf(),
+        Err(_) => return fail("stopped", "internal_error"),
     };
+    let envelope = launcher_envelope.materialize_into_startup(data_dir, digest);
     let envelope_bytes = serde_json::to_vec(&envelope).expect("envelope serializes");
     let log_path = match daemon_log_path() {
         Ok(path) => path,
         Err(_) => return fail("stopped", "internal_error"),
     };
-    if spawn::spawn_detached(&log_path, &envelope_bytes).is_err() {
+    if spawn::spawn_detached(&log_path, &envelope_bytes, generation_launcher).is_err() {
         return fail("stopped", "internal_error");
     }
 
@@ -583,11 +610,13 @@ fn start_phase(
     }
 }
 
-/// Dev/test mode stages the explicit payload directory; production mode
-/// requires an existing fully valid current generation and otherwise fails
-/// closed — U9 records `production_qualified:false`, so no supported flow
-/// can stage a production payload today.
-fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static str, &'static str)> {
+/// An explicit verified payload root stages a candidate. Without one, only a
+/// fully valid retained current generation may start.
+fn resolve_generation(
+    payload_dir: Option<&Path>,
+    payload_manifest_digest: Option<&str>,
+) -> Result<(String, Option<std::os::fd::OwnedFd>), (&'static str, &'static str)> {
+    const PRODUCTION_LAUNCHER: &str = "payload/bin/ck-mc-host";
     match payload_dir {
         Some(dir) => {
             let store = GenerationStore::open(None).map_err(|e| generation_failure(&e))?;
@@ -601,23 +630,27 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
             store
                 .prune(&protected)
                 .map_err(|e| generation_failure(&e))?;
-            let sources = payload_sources(dir)?;
+            let payload = payload_sources(dir, payload_manifest_digest)?;
             let meta = StageMeta {
-                target: "linux-x64-gnu".to_owned(),
+                target: host_target().to_owned(),
                 release_contract_sha256: release_contract::RELEASE_CONTRACT_SHA256.to_owned(),
                 // Dev/test staging is explicitly unqualified (U9): the value
                 // is a self-describing marker, not a placeholder hash in a
                 // production payload.
-                inputs_lock_sha256: "unqualified-dev-inputs".to_owned(),
+                inputs_lock_sha256: payload.inputs_lock_sha256,
+                source_payload_manifest_sha256: payload_manifest_digest
+                    .unwrap_or("unqualified-dev-manifest")
+                    .to_owned(),
             };
             let digest = store
-                .stage_and_promote(&sources, &meta, &protected)
+                .stage_and_promote(&payload.sources, &meta, &protected)
                 .map_err(|e| generation_failure(&e))?;
             // Complete revalidation of the promoted generation before spawn.
-            store
+            let validated = store
                 .validate(&digest)
                 .map_err(|e| generation_failure(&e))?;
-            Ok(digest)
+            let launcher = validated.open_verified_file(PRODUCTION_LAUNCHER).ok();
+            Ok((digest, launcher))
         }
         None => {
             let store = GenerationStore::open_probe(None)
@@ -625,10 +658,16 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
                 .ok_or(("stopped", "native_payload_missing"))?;
             match store.read_current().map_err(|e| generation_failure(&e))? {
                 mc_host::generation::CurrentProfile::Current(digest) => {
-                    store
+                    let validated = store
                         .validate(&digest)
                         .map_err(|e| generation_failure(&e))?;
-                    Ok(digest)
+                    if payload_manifest_digest.is_some_and(|expected| {
+                        validated.manifest.source_payload_manifest_sha256 != expected
+                    }) {
+                        return Err(("stopped", "native_payload_invalid"));
+                    }
+                    let launcher = validated.open_verified_file(PRODUCTION_LAUNCHER).ok();
+                    Ok((digest, launcher))
                 }
                 mc_host::generation::CurrentProfile::Absent => {
                     Err(("stopped", "native_payload_missing"))
@@ -641,9 +680,193 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
     }
 }
 
+fn host_target() -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "linux-x64-gnu"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "darwin-arm64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "darwin-x64"
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64")
+    )))]
+    {
+        "unsupported"
+    }
+}
+
+struct PayloadSources {
+    sources: Vec<SourceSpec>,
+    inputs_lock_sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedPayloadManifest {
+    schema: String,
+    release: TrustedReleaseIdentity,
+    release_contract_sha256: String,
+    production_inputs_lock_sha256: String,
+    mode: String,
+    package: TrustedPackageIdentity,
+    platform_floor: serde_json::Value,
+    synapse: String,
+    launcher: String,
+    files: Vec<TrustedPayloadFile>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedReleaseIdentity {
+    id: String,
+    version: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedPackageIdentity {
+    name: String,
+    version: String,
+    target: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedPayloadFile {
+    path: String,
+    #[serde(rename = "type")]
+    file_type: String,
+    size: u64,
+    mode: String,
+    sha256: String,
+}
+
+fn payload_sources(
+    dir: &Path,
+    expected_manifest_digest: Option<&str>,
+) -> Result<PayloadSources, (&'static str, &'static str)> {
+    if let Some(expected) = expected_manifest_digest {
+        return trusted_payload_sources(dir, expected);
+    }
+    Ok(PayloadSources {
+        sources: unqualified_payload_sources(dir)?,
+        inputs_lock_sha256: "unqualified-dev-inputs".to_owned(),
+    })
+}
+
+fn trusted_payload_sources(
+    dir: &Path,
+    expected_manifest_digest: &str,
+) -> Result<PayloadSources, (&'static str, &'static str)> {
+    use sha2::Digest;
+
+    let invalid = ("stopped", "native_payload_invalid");
+    let manifest_path = dir.join("payload-manifest.json");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&manifest_path)
+        .map_err(|_| invalid)?;
+    let meta = file.metadata().map_err(|_| invalid)?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 1024 * 1024 {
+        return Err(invalid);
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut bytes).map_err(|_| invalid)?;
+    let canonical = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    if canonical.contains(&b'\n')
+        || format!("{:x}", sha2::Sha256::digest(canonical)) != expected_manifest_digest
+    {
+        return Err(invalid);
+    }
+    let manifest: TrustedPayloadManifest =
+        serde_json::from_slice(canonical).map_err(|_| invalid)?;
+    let expected_package = match host_target() {
+        "linux-x64-gnu" => "@cortexkit/mc-host-linux-x64-gnu",
+        "darwin-arm64" => "@cortexkit/mc-host-darwin-arm64",
+        "darwin-x64" => "@cortexkit/mc-host-darwin-x64",
+        _ => return Err(invalid),
+    };
+    let _ = (&manifest.platform_floor, &manifest.synapse);
+    if manifest.schema != "magic-context.mc-host-payload-manifest/v1"
+        || manifest.release.id != "mc-host-release"
+        || manifest.release.version != release_contract::RELEASE_VERSION
+        || manifest.release_contract_sha256 != release_contract::RELEASE_CONTRACT_SHA256
+        || manifest.mode != "production"
+        || manifest.package.name != expected_package
+        || manifest.package.version != release_contract::RELEASE_VERSION
+        || manifest.package.target != host_target()
+        || manifest.launcher != "payload/bin/ck-mc-host"
+        || manifest.production_inputs_lock_sha256.len() != 64
+        || !manifest
+            .production_inputs_lock_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(invalid);
+    }
+    let mut sources = Vec::with_capacity(manifest.files.len());
+    let mut previous: Option<&str> = None;
+    let mut launcher_seen = false;
+    for entry in &manifest.files {
+        if entry.file_type != "file"
+            || entry.size == 0
+            || entry.sha256.len() != 64
+            || !entry
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || !entry.path.starts_with("payload/")
+            || entry
+                .path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || previous.is_some_and(|value| value >= entry.path.as_str())
+        {
+            return Err(invalid);
+        }
+        previous = Some(&entry.path);
+        let executable = match entry.mode.as_str() {
+            "755" => true,
+            "644" => false,
+            _ => return Err(invalid),
+        };
+        if entry.path == manifest.launcher {
+            launcher_seen = true;
+            if !executable {
+                return Err(invalid);
+            }
+        }
+        sources.push(SourceSpec {
+            rel_path: entry.path.clone(),
+            source: dir.join(&entry.path),
+            executable,
+            expected_size: Some(entry.size),
+            expected_sha256: Some(entry.sha256.clone()),
+        });
+    }
+    if !launcher_seen || sources.is_empty() {
+        return Err(invalid);
+    }
+    Ok(PayloadSources {
+        sources,
+        inputs_lock_sha256: manifest.production_inputs_lock_sha256,
+    })
+}
+
 /// Enumerates a dev payload directory into sorted staging sources. Only
 /// regular files are accepted; symlinks and special files are rejected.
-fn payload_sources(dir: &Path) -> Result<Vec<SourceSpec>, (&'static str, &'static str)> {
+fn unqualified_payload_sources(
+    dir: &Path,
+) -> Result<Vec<SourceSpec>, (&'static str, &'static str)> {
     use std::os::unix::fs::PermissionsExt;
     fn walk(
         base: &Path,
@@ -665,17 +888,20 @@ fn payload_sources(dir: &Path) -> Result<Vec<SourceSpec>, (&'static str, &'stati
             } else {
                 format!("{rel}/{name}")
             };
-            let meta = entry.metadata().map_err(|_| invalid)?;
-            if meta.file_type().is_symlink() {
+            let meta = entry.file_type().map_err(|_| invalid)?;
+            if meta.is_symlink() {
                 return Err(invalid);
             }
             if meta.is_dir() {
                 walk(base, &child_rel, out)?;
             } else if meta.is_file() {
+                let metadata = entry.metadata().map_err(|_| invalid)?;
                 out.push(SourceSpec {
                     rel_path: child_rel,
                     source: base.join(rel).join(entry.file_name()),
-                    executable: meta.permissions().mode() & 0o111 != 0,
+                    executable: metadata.permissions().mode() & 0o111 != 0,
+                    expected_size: None,
+                    expected_sha256: None,
                 });
             } else {
                 return Err(invalid);
@@ -692,7 +918,11 @@ fn payload_sources(dir: &Path) -> Result<Vec<SourceSpec>, (&'static str, &'stati
     Ok(sources)
 }
 
-fn cmd_start(payload_dir: Option<&Path>) -> DaemonResult {
+fn cmd_start(
+    payload_dir: Option<&Path>,
+    payload_manifest_digest: Option<&str>,
+    launcher_envelope: serve::LauncherEnvelope,
+) -> DaemonResult {
     let command = "start";
     let outer = Instant::now() + OUTER_AGGREGATE;
     let runtime = match Runtime::new() {
@@ -766,7 +996,14 @@ fn cmd_start(payload_dir: Option<&Path>) -> DaemonResult {
             DaemonResult::new(command, false, "wedged", reason)
         }
         LifecycleState::Stopped => {
-            let outcome = start_phase(&runtime, payload_dir, &anchor, outer);
+            let outcome = start_phase(
+                &runtime,
+                payload_dir,
+                payload_manifest_digest,
+                &anchor,
+                outer,
+                launcher_envelope,
+            );
             start_outcome_result(command, outcome, None)
         }
     }
@@ -890,7 +1127,11 @@ fn cmd_stop() -> DaemonResult {
 // restart
 // -------------------------------------------------------------------------
 
-fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
+fn cmd_restart(
+    payload_dir: Option<&Path>,
+    payload_manifest_digest: Option<&str>,
+    launcher_envelope: serve::LauncherEnvelope,
+) -> DaemonResult {
     let command = "restart";
     let effects = |stop: bool, start: bool| Effects {
         stop_committed: stop,
@@ -965,7 +1206,14 @@ fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
             }
         },
     };
-    let outcome = start_phase(&runtime, payload_dir, &anchor, outer);
+    let outcome = start_phase(
+        &runtime,
+        payload_dir,
+        payload_manifest_digest,
+        &anchor,
+        outer,
+        launcher_envelope,
+    );
     let start_committed = outcome.ok;
     start_outcome_result(
         command,
@@ -1020,15 +1268,54 @@ fn real_main() -> i32 {
             println!("{}", release_contract::RELEASE_CONTRACT_JSON);
             0
         }
+        Command::InputLockDigest => {
+            println!(
+                "{}",
+                mc_module::production_inputs::PRODUCTION_INPUTS_LOCK_SHA256
+            );
+            0
+        }
         Command::Probe => emit(cmd_probe()),
-        Command::Start { payload_dir } => {
+        Command::Start {
+            payload_dir,
+            payload_manifest_digest,
+        } => {
             spawn::ignore_sigpipe();
-            emit(cmd_start(payload_dir.as_deref()))
+            match serve::read_launcher_envelope() {
+                Ok(envelope) => emit(cmd_start(
+                    payload_dir.as_deref(),
+                    payload_manifest_digest.as_deref(),
+                    envelope,
+                )),
+                Err(_) => emit(DaemonResult::new(
+                    "start",
+                    false,
+                    "stopped",
+                    "internal_error",
+                )),
+            }
         }
         Command::Stop => emit(cmd_stop()),
-        Command::Restart { payload_dir } => {
+        Command::Restart {
+            payload_dir,
+            payload_manifest_digest,
+        } => {
             spawn::ignore_sigpipe();
-            emit(cmd_restart(payload_dir.as_deref()))
+            match serve::read_launcher_envelope() {
+                Ok(envelope) => emit(cmd_restart(
+                    payload_dir.as_deref(),
+                    payload_manifest_digest.as_deref(),
+                    envelope,
+                )),
+                Err(_) => emit(
+                    DaemonResult::new("restart", false, "stopped", "internal_error").with_effects(
+                        Effects {
+                            stop_committed: false,
+                            start_committed: false,
+                        },
+                    ),
+                ),
+            }
         }
         Command::Serve => match serve::run() {
             Ok(()) => 0,
@@ -1047,6 +1334,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
 
     /// Every reason/remediation pair this binary can emit must match the
     /// embedded release contract's precedence table exactly.
@@ -1098,7 +1386,32 @@ mod tests {
         assert!(matches!(
             parse_args(&os(&["start", "--payload-dir", "a"])),
             Ok(Command::Start {
-                payload_dir: Some(_)
+                payload_dir: Some(_),
+                payload_manifest_digest: None,
+            })
+        ));
+        assert!(matches!(
+            parse_args(&os(&[
+                "start",
+                "--payload-dir",
+                "a",
+                "--payload-manifest-digest",
+                &"a".repeat(64),
+            ])),
+            Ok(Command::Start {
+                payload_manifest_digest: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_args(&os(&[
+                "start",
+                "--payload-manifest-digest",
+                &"a".repeat(64),
+            ])),
+            Ok(Command::Start {
+                payload_dir: None,
+                payload_manifest_digest: Some(_),
             })
         ));
         assert!(matches!(parse_args(&os(&["probe"])), Ok(Command::Probe)));
@@ -1106,6 +1419,156 @@ mod tests {
             parse_args(&os(&["--version"])),
             Ok(Command::Version)
         ));
+    }
+
+    #[test]
+    fn launcher_envelope_accepts_only_bounded_descriptors_and_credentials() {
+        let mut envelope = serve::LauncherEnvelope::empty();
+        envelope.opencode = Some(serve::HarnessCandidate {
+            manifest_sha256: "ab".repeat(32),
+            source_roots: std::collections::BTreeMap::from([(
+                "opencode-install".to_owned(),
+                PathBuf::from("/opt/opencode"),
+            )]),
+        });
+        envelope
+            .credentials
+            .insert("ANTHROPIC_API_KEY".to_owned(), "secret".to_owned());
+        assert_eq!(envelope.validate(), Ok(()));
+
+        envelope
+            .credentials
+            .insert("AWS_ACCESS_KEY_ID".to_owned(), "ambient".to_owned());
+        assert_eq!(
+            envelope.validate(),
+            Err("credential source contains an unsupported variable")
+        );
+        envelope.credentials.remove("AWS_ACCESS_KEY_ID");
+        envelope
+            .credentials
+            .insert("ANTHROPIC_API_KEY".to_owned(), "x".repeat(16 * 1024 + 1));
+        assert_eq!(
+            envelope.validate(),
+            Err("credential value exceeds its size cap")
+        );
+    }
+
+    #[test]
+    fn trusted_payload_manifest_binds_every_staged_file() {
+        let payload = tempfile::tempdir().expect("payload");
+        let store_root = tempfile::tempdir().expect("store");
+        let launcher_path = payload.path().join("payload/bin/ck-mc-host");
+        let model_path = payload.path().join("payload/model/model.onnx");
+        std::fs::create_dir_all(launcher_path.parent().expect("launcher parent")).expect("mkdir");
+        std::fs::create_dir_all(model_path.parent().expect("model parent")).expect("mkdir");
+        std::fs::write(&launcher_path, b"launcher").expect("launcher");
+        std::fs::write(&model_path, b"model-v1").expect("model");
+        let hash = |bytes: &[u8]| format!("{:x}", sha2::Sha256::digest(bytes));
+        let package_name = match host_target() {
+            "linux-x64-gnu" => "@cortexkit/mc-host-linux-x64-gnu",
+            "darwin-arm64" => "@cortexkit/mc-host-darwin-arm64",
+            "darwin-x64" => "@cortexkit/mc-host-darwin-x64",
+            _ => return,
+        };
+        let manifest = serde_json::json!({
+            "schema": "magic-context.mc-host-payload-manifest/v1",
+            "release": {"id": "mc-host-release", "version": release_contract::RELEASE_VERSION},
+            "release_contract_sha256": release_contract::RELEASE_CONTRACT_SHA256,
+            "production_inputs_lock_sha256": "b".repeat(64),
+            "mode": "production",
+            "package": {
+                "name": package_name,
+                "version": release_contract::RELEASE_VERSION,
+                "target": host_target()
+            },
+            "platform_floor": {"kernel_min": "4.18", "glibc_min": "2.28"},
+            "synapse": "certified_cpu",
+            "launcher": "payload/bin/ck-mc-host",
+            "files": [
+                {
+                    "path": "payload/bin/ck-mc-host",
+                    "type": "file",
+                    "size": 8,
+                    "mode": "755",
+                    "sha256": hash(b"launcher")
+                },
+                {
+                    "path": "payload/model/model.onnx",
+                    "type": "file",
+                    "size": 8,
+                    "mode": "644",
+                    "sha256": hash(b"model-v1")
+                }
+            ]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest");
+        let manifest_digest = hash(&manifest_bytes);
+        std::fs::write(
+            payload.path().join("payload-manifest.json"),
+            &manifest_bytes,
+        )
+        .expect("manifest write");
+        let sources =
+            trusted_payload_sources(payload.path(), &manifest_digest).expect("trusted sources");
+        std::fs::write(&model_path, b"model-v2").expect("mutate model");
+        let store = GenerationStore::open(Some(store_root.path())).expect("store");
+        let result = store.stage_and_promote(
+            &sources.sources,
+            &StageMeta {
+                target: "linux-x64-gnu".to_owned(),
+                release_contract_sha256: release_contract::RELEASE_CONTRACT_SHA256.to_owned(),
+                inputs_lock_sha256: sources.inputs_lock_sha256,
+                source_payload_manifest_sha256: manifest_digest,
+            },
+            &BTreeSet::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(GenerationError::NativePayloadInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn launcher_materialization_removes_source_paths_from_serve_envelope() {
+        let root = tempfile::tempdir().expect("data root");
+        let secret_source = "/private/package-cache/opencode";
+        let mut envelope = serve::LauncherEnvelope::empty();
+        envelope.opencode = Some(serve::HarnessCandidate {
+            manifest_sha256: "ab".repeat(32),
+            source_roots: std::collections::BTreeMap::from([(
+                "runtime".to_owned(),
+                PathBuf::from(secret_source),
+            )]),
+        });
+        let startup = envelope.materialize_into_startup(root.path().to_path_buf(), "cd".repeat(32));
+        assert!(matches!(
+            startup.opencode,
+            Some(serve::HarnessSnapshot::Unavailable { ref reason })
+                if reason == "descriptor_invalid"
+        ));
+        let serialized = serde_json::to_string(&startup).expect("serialize startup");
+        assert!(!serialized.contains(secret_source));
+        assert!(!serialized.contains("source_roots"));
+
+        let ready = serve::StartupEnvelope {
+            schema: 1,
+            data_dir: root.path().to_path_buf(),
+            payload_manifest_digest: "cd".repeat(32),
+            opencode: Some(serve::HarnessSnapshot::Ready {
+                manifest_sha256: "ef".repeat(32),
+            }),
+            pi: None,
+            credentials: std::collections::BTreeMap::new(),
+        };
+        let ready_json = serde_json::to_value(ready).expect("serialize ready startup");
+        assert_eq!(
+            ready_json["opencode"],
+            serde_json::json!({
+                "state": "ready",
+                "manifest_sha256": "ef".repeat(32),
+            })
+        );
+        assert!(ready_json.get("source_roots").is_none());
     }
 
     #[test]

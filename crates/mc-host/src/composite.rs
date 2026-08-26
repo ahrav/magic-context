@@ -46,6 +46,8 @@ impl std::error::Error for ShutdownError {}
 pub trait CompositeComponent: Send + Sync + 'static {
     fn manifest(&self) -> ManifestSnapshot;
 
+    fn install_connection_key(&self, _key: [u8; 32]) {}
+
     /// Immutable pre-initialization resource declaration (plan KTD2). The
     /// default reserves nothing, which keeps existing components on the
     /// general single-pool admission path unchanged.
@@ -188,6 +190,12 @@ fn shutdown_failure_note(
 impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHandler
     for StaticComposite<P, S, B>
 {
+    fn install_connection_key(&self, key: [u8; 32]) {
+        self.primary.install_connection_key(key);
+        self.secondary.install_connection_key(key);
+        self.tertiary.install_connection_key(key);
+    }
+
     fn manifests(&self) -> Vec<ManifestSnapshot> {
         vec![
             self.primary.manifest(),
@@ -318,12 +326,33 @@ impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHa
         // mandatory primary's detail is never masked by an optional
         // component and equal optional severities always report the same
         // child.
+        let component_status = |report: &HealthReport| match report.status {
+            HealthStatus::Ok => "ok",
+            HealthStatus::Degraded => "degraded",
+            HealthStatus::Failing => "failing",
+        };
+        let mut components = serde_json::Map::new();
+        for (id, report) in [
+            (self.primary_id.as_ref(), &primary),
+            (self.secondary_id.as_ref(), &secondary),
+            (self.tertiary_id.as_ref(), &tertiary),
+        ] {
+            components.insert(
+                id.to_owned(),
+                serde_json::json!({
+                    "status": component_status(report),
+                    "metrics": report.metrics.clone(),
+                }),
+            );
+        }
+        let metrics = serde_json::json!({"components": components});
         let mut winner = primary;
         for candidate in [secondary, tertiary] {
             if severity(candidate.status) > severity(winner.status) {
                 winner = candidate;
             }
         }
+        winner.metrics = Some(metrics);
         winner
     }
 

@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mc_host::broca::backend::{
@@ -35,7 +35,11 @@ use mc_host::broca::subprocess::{
     merge_cleanup, CleanupFailure, EnvSnapshot, PrivateDir, SubprocessLimits,
 };
 use mc_host::broca::supervisor::{SessionKey, Supervisor};
+use mc_host::harness_closure::{
+    ClosureCandidate, ClosureManifest, ClosureNode, HarnessClosureStore, NodeKind,
+};
 use mc_host::CancellationToken;
+use sha2::{Digest, Sha256};
 
 const FIXTURE_MODE_ENV: &str = "MC_BROCA_FIXTURE_MODE";
 const OUT_ENV: &str = "MC_FIXTURE_OUT";
@@ -56,6 +60,13 @@ const CREDENTIAL_SENTINEL: &str = "credential-sentinel-value";
 fn main() {
     if let Ok(mode) = std::env::var(FIXTURE_MODE_ENV) {
         fixture::run(&mode);
+        return;
+    }
+    if std::env::var_os(MAGIC_CONTEXT_BROCA_CHILD_ENV).is_some()
+        || std::env::var_os(MAGIC_CONTEXT_PI_SUBAGENT_ENV).is_some()
+    {
+        install_fixture_controls();
+        fixture::run("harness");
         return;
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -174,6 +185,10 @@ fn main() {
             "env_snapshot_admission_charges_per_entry_overhead",
             env_snapshot_admission_charges_per_entry_overhead,
         ),
+        (
+            "provider_rows_exclude_ambient_credentials_and_enforce_caps",
+            provider_rows_exclude_ambient_credentials_and_enforce_caps,
+        ),
         ("merge_cleanup_contract", merge_cleanup_contract),
         (
             "crash_orphaned_run_dirs_swept_only_for_dead_owners",
@@ -234,6 +249,28 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+fn install_fixture_controls() {
+    #[derive(serde::Deserialize)]
+    struct FixtureControls {
+        credential: String,
+        vars: BTreeMap<String, String>,
+    }
+    for credential_name in ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"] {
+        let Ok(encoded) = std::env::var(credential_name) else {
+            continue;
+        };
+        let controls: FixtureControls =
+            serde_json::from_str(&encoded).expect("fixture credential controls");
+        assert_eq!(controls.credential, CREDENTIAL_SENTINEL);
+        for (name, value) in controls.vars {
+            std::env::set_var(name, value);
+        }
+        std::env::set_var(credential_name, CREDENTIAL_SENTINEL);
+        return;
+    }
+    panic!("fixture child received no provider credential row");
 }
 
 // ---------------------------------------------------------------------------
@@ -663,19 +700,183 @@ fn fixture_exe() -> PathBuf {
     std::env::current_exe().expect("test executable")
 }
 
+fn closure_node(
+    path: &str,
+    source_root: &str,
+    source_path: &str,
+    kind: NodeKind,
+    source: &Path,
+) -> ClosureNode {
+    let bytes = fs::read(source).expect("closure source");
+    ClosureNode {
+        path: path.to_owned(),
+        source_root: source_root.to_owned(),
+        source_path: source_path.to_owned(),
+        kind,
+        mode: if matches!(kind, NodeKind::Executable | NodeKind::Interpreter) {
+            0o700
+        } else {
+            0o600
+        },
+        size_bytes: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        dependencies: Vec::new(),
+    }
+}
+
+fn fixture_closure(
+    setup: &RunSetup,
+    harness: &str,
+    provider_extensions: &[PathBuf],
+) -> Arc<mc_host::harness_closure::ValidatedHarnessClosure> {
+    static OPENCODE: OnceLock<Arc<mc_host::harness_closure::ValidatedHarnessClosure>> =
+        OnceLock::new();
+    static PI: OnceLock<Arc<mc_host::harness_closure::ValidatedHarnessClosure>> = OnceLock::new();
+
+    if provider_extensions.is_empty() {
+        let cache = match harness {
+            "opencode" => &OPENCODE,
+            "pi" => &PI,
+            other => panic!("unsupported fixture harness {other}"),
+        };
+        return Arc::clone(
+            cache.get_or_init(|| fixture_closure_uncached(setup, harness, provider_extensions)),
+        );
+    }
+    fixture_closure_uncached(setup, harness, provider_extensions)
+}
+
+fn fixture_closure_uncached(
+    setup: &RunSetup,
+    harness: &str,
+    provider_extensions: &[PathBuf],
+) -> Arc<mc_host::harness_closure::ValidatedHarnessClosure> {
+    struct SharedFixture {
+        source: PathBuf,
+        store: PathBuf,
+    }
+    static SHARED: OnceLock<SharedFixture> = OnceLock::new();
+    let shared = provider_extensions.is_empty().then(|| {
+        SHARED.get_or_init(|| {
+            let root = tempfile::tempdir().expect("shared closure fixture").keep();
+            let source = root.join("source");
+            fs::create_dir(&source).expect("shared closure source");
+            fs::write(source.join("pi-entry.mjs"), b"// fixture entrypoint")
+                .expect("shared fixture entrypoint");
+            SharedFixture {
+                source,
+                store: root.join("store"),
+            }
+        })
+    });
+    let executable = fixture_exe();
+    let executable_root = executable.parent().expect("fixture parent").to_path_buf();
+    let executable_name = executable
+        .file_name()
+        .expect("fixture file name")
+        .to_string_lossy()
+        .into_owned();
+    let mut source_roots = BTreeMap::from([("runtime".to_owned(), executable_root.clone())]);
+    let mut nodes = vec![closure_node(
+        "bin/runtime",
+        "runtime",
+        &executable_name,
+        if harness == "opencode" {
+            NodeKind::Executable
+        } else {
+            NodeKind::Interpreter
+        },
+        &executable,
+    )];
+    let (executable_node, interpreter_node, entrypoint_node) = if harness == "opencode" {
+        (Some("bin/runtime".to_owned()), None, None)
+    } else {
+        let pi_source = shared
+            .map(|fixture| fixture.source.clone())
+            .unwrap_or_else(|| setup.scratch.path().to_path_buf());
+        let entrypoint = pi_source.join("pi-entry.mjs");
+        if shared.is_none() {
+            fs::write(&entrypoint, b"// fixture entrypoint").expect("fixture entrypoint");
+        }
+        source_roots.insert("pi".to_owned(), pi_source);
+        nodes.push(closure_node(
+            "node_modules/pi/entry.mjs",
+            "pi",
+            "pi-entry.mjs",
+            NodeKind::Module,
+            &entrypoint,
+        ));
+        (
+            None,
+            Some("bin/runtime".to_owned()),
+            Some("node_modules/pi/entry.mjs".to_owned()),
+        )
+    };
+    let mut extensions = Vec::new();
+    for (index, extension) in provider_extensions.iter().enumerate() {
+        let root = format!("extension-{index}");
+        let path = format!("node_modules/provider/{index}.mjs");
+        source_roots.insert(
+            root.clone(),
+            extension.parent().expect("extension parent").to_path_buf(),
+        );
+        nodes.push(closure_node(
+            &path,
+            &root,
+            &extension
+                .file_name()
+                .expect("extension file name")
+                .to_string_lossy(),
+            NodeKind::Extension,
+            extension,
+        ));
+        extensions.push(path);
+    }
+    nodes.sort_by(|left, right| left.path.cmp(&right.path));
+    let source_root_names = source_roots.keys().cloned().collect();
+    let manifest = ClosureManifest {
+        schema: "magic-context.mc-host-harness-closure/v1".to_owned(),
+        harness: harness.to_owned(),
+        package: format!("fixture-{harness}"),
+        version: "1.0.0".to_owned(),
+        argument_variant: "run_prompt".to_owned(),
+        source_roots: source_root_names,
+        executable: executable_node,
+        interpreter: interpreter_node,
+        entrypoint: entrypoint_node,
+        extensions,
+        nodes,
+    };
+    let store_root = shared
+        .map(|fixture| fixture.store.clone())
+        .unwrap_or_else(|| setup.out.path().join("closure-store"));
+    let store = HarnessClosureStore::open(&store_root).expect("closure store");
+    Arc::new(
+        store
+            .materialize(&ClosureCandidate {
+                manifest,
+                source_roots,
+            })
+            .expect("fixture closure"),
+    )
+}
+
 /// A daemon-startup snapshot carrying a fake provider credential (must
 /// reach the child) and host launch-identity variables (must not), plus the
 /// fixture control variables for this run.
 fn fixture_snapshot(extra: &[(&str, &str)]) -> EnvSnapshot {
-    let mut vars = vec![
-        (os(FIXTURE_MODE_ENV), os("harness")),
-        (os("FAKE_PROVIDER_KEY"), os(CREDENTIAL_SENTINEL)),
+    let controls = serde_json::to_string(&serde_json::json!({
+        "credential": CREDENTIAL_SENTINEL,
+        "vars": extra.iter().copied().collect::<BTreeMap<_, _>>(),
+    }))
+    .expect("fixture controls serialize");
+    let vars = vec![
+        (os("ANTHROPIC_API_KEY"), os(&controls)),
+        (os("GEMINI_API_KEY"), os(&controls)),
+        (os("OPENAI_API_KEY"), os(&controls)),
         (os("SUBC_MODULE_ID"), os("host-identity")),
         (os("SUBC_LAUNCH_NONCE"), os("host-nonce")),
     ];
-    for (name, value) in extra {
-        vars.push((os(name), os(value)));
-    }
     EnvSnapshot::from_vars(vars)
 }
 
@@ -769,11 +970,16 @@ struct RunSetup {
 
 impl RunSetup {
     fn new() -> Self {
-        Self {
+        let setup = Self {
             out: tempfile::tempdir().expect("out dir"),
             project: tempfile::tempdir().expect("project dir"),
             scratch: tempfile::tempdir().expect("scratch dir"),
+        };
+        for dir in [&setup.out, &setup.project, &setup.scratch] {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+                .expect("private test directory");
         }
+        setup
     }
 
     fn base_vars(&self) -> Vec<(String, String)> {
@@ -813,15 +1019,12 @@ impl RunSetup {
     }
 }
 
-fn opencode_backend(
-    setup: &RunSetup,
-    extra: &[(&str, &str)],
-    variant_args: Vec<String>,
-) -> OpenCodeBackend {
+fn opencode_backend(setup: &RunSetup, extra: &[(&str, &str)]) -> OpenCodeBackend {
+    let closure = fixture_closure(setup, "opencode", &[]);
     OpenCodeBackend::with_limits(
         OpenCodeRuntime {
-            executable: fixture_exe(),
-            variant_args,
+            closure,
+            executable_node: "bin/runtime".to_owned(),
         },
         setup.snapshot(extra),
         quick_limits(),
@@ -844,10 +1047,17 @@ fn pi_backend_with_limits(
     thinking: Option<&str>,
     limits: SubprocessLimits,
 ) -> PiBackend {
+    let closure = fixture_closure(setup, "pi", &provider_extensions);
     PiBackend::with_limits(
         PiRuntimeDescriptor {
-            executable: fixture_exe(),
-            provider_extensions,
+            closure,
+            interpreter_node: "bin/runtime".to_owned(),
+            entrypoint_node: "node_modules/pi/entry.mjs".to_owned(),
+            provider_extension_nodes: provider_extensions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("node_modules/provider/{index}.mjs"))
+                .collect(),
         },
         setup.snapshot(extra),
         thinking.map(ToOwned::to_owned),
@@ -980,7 +1190,6 @@ fn opencode_argv_env_stdin_contract() {
     let backend = opencode_backend(
         &setup,
         &[(TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy())],
-        vec!["--variant".to_owned(), "fast".to_owned()],
     );
     let request = request(
         setup.project.path(),
@@ -1003,7 +1212,7 @@ fn opencode_argv_env_stdin_contract() {
         }]
     );
 
-    // Exact argv: fixed flags first, configured variant args appended.
+    // Exact argv: the host owns the complete fixed argument surface.
     assert_eq!(
         setup.argv(),
         vec![
@@ -1014,8 +1223,6 @@ fn opencode_argv_env_stdin_contract() {
             OPENCODE_BROCA_AGENT,
             "--format",
             "json",
-            "--variant",
-            "fast",
         ]
     );
 
@@ -1045,7 +1252,7 @@ fn opencode_argv_env_stdin_contract() {
         Some("1")
     );
     assert_eq!(
-        env.get("FAKE_PROVIDER_KEY").map(String::as_str),
+        env.get("ANTHROPIC_API_KEY").map(String::as_str),
         Some(CREDENTIAL_SENTINEL),
         "provider credentials from the startup snapshot must reach the child"
     );
@@ -1067,7 +1274,11 @@ fn opencode_argv_env_stdin_contract() {
 
     assert_eq!(setup.stdin(), PROMPT_SENTINEL.as_bytes());
     let cwd = fs::read_to_string(setup.out.path().join("cwd.txt")).expect("cwd");
-    assert_eq!(PathBuf::from(cwd), setup.project.path());
+    assert_eq!(PathBuf::from(cwd), private_dir);
+    assert_eq!(
+        env.get("HOME").map(PathBuf::from).as_deref(),
+        Some(private_dir)
+    );
 }
 
 fn opencode_hostile_project_untouched() {
@@ -1089,7 +1300,6 @@ fn opencode_hostile_project_untouched() {
     let backend = opencode_backend(
         &setup,
         &[(TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy())],
-        Vec::new(),
     );
     let request = request(
         setup.project.path(),
@@ -1169,7 +1379,7 @@ fn pi_argv_privacy_contract() {
 
     let args = setup.argv();
     assert_eq!(
-        args[..9],
+        args[1..10],
         [
             "--print",
             "--mode",
@@ -1182,7 +1392,8 @@ fn pi_argv_privacy_contract() {
             "--no-approve",
         ]
     );
-    assert_eq!(args[9], "--no-extensions");
+    assert!(args[0].ends_with("node_modules/pi/entry.mjs"));
+    assert_eq!(args[10], "--no-extensions");
     // Descriptor extensions in order, bundled hook LAST (R16, KTD8).
     let extensions: Vec<&String> = args
         .iter()
@@ -1191,8 +1402,8 @@ fn pi_argv_privacy_contract() {
         .filter_map(|(index, _)| args.get(index + 1))
         .collect();
     assert_eq!(extensions.len(), 3);
-    assert_eq!(extensions[0], &provider_a.to_string_lossy());
-    assert_eq!(extensions[1], &provider_b.to_string_lossy());
+    assert!(extensions[0].ends_with("node_modules/provider/0.mjs"));
+    assert!(extensions[1].ends_with("node_modules/provider/1.mjs"));
     assert!(extensions[2].ends_with(PI_BROCA_EXTENSION_FILE));
     // Known provider alias translation happens at the argv edge (openai ->
     // openai-codex), never in the canonical request.
@@ -1243,7 +1454,7 @@ fn pi_argv_privacy_contract() {
         Some("0.25")
     );
     assert_eq!(
-        env.get("FAKE_PROVIDER_KEY").map(String::as_str),
+        env.get("OPENAI_API_KEY").map(String::as_str),
         Some(CREDENTIAL_SENTINEL)
     );
     assert!(!env.contains_key("SUBC_MODULE_ID"));
@@ -1254,6 +1465,12 @@ fn pi_argv_privacy_contract() {
         .parent()
         .expect("dir")
         .to_path_buf();
+    let cwd = fs::read_to_string(setup.out.path().join("cwd.txt")).expect("cwd");
+    assert_eq!(PathBuf::from(cwd), private_dir);
+    assert_eq!(
+        env.get("HOME").map(PathBuf::from).as_deref(),
+        Some(private_dir.as_path())
+    );
     assert!(!private_dir.exists());
 }
 
@@ -1271,7 +1488,7 @@ fn pi_provider_alias_mapping() {
     // pure mapping helper.
     for (model, expected) in [
         ("google/gemini-x", "google-antigravity/gemini-x"),
-        ("acme/foo", "acme/foo"),
+        ("anthropic/claude", "anthropic/claude"),
     ] {
         let setup = RunSetup::new();
         let transcript = write_transcript(
@@ -1318,7 +1535,7 @@ fn pi_project_pi_resources_ignored() {
         Vec::new(),
         None,
     );
-    let request = request(setup.project.path(), Harness::Pi, "acme/foo", None);
+    let request = request(setup.project.path(), Harness::Pi, "anthropic/foo", None);
     let (terminal, _) = execute(&backend, request);
     assert!(matches!(terminal, BackendTerminal::Completed { .. }));
 
@@ -1453,7 +1670,6 @@ fn success_transcripts_align_across_harnesses() {
     let oc_backend = opencode_backend(
         &oc_setup,
         &[(TRANSCRIPT_FILE_ENV, &oc_transcript.to_string_lossy())],
-        Vec::new(),
     );
     let (oc_terminal, oc_events) = execute(
         &oc_backend,
@@ -1506,7 +1722,6 @@ fn run_opencode_transcript(lines: &[serde_json::Value]) -> (BackendTerminal, Vec
     let backend = opencode_backend(
         &setup,
         &[(TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy())],
-        Vec::new(),
     );
     execute(
         &backend,
@@ -1694,7 +1909,6 @@ fn opencode_oversized_inline_config_rejected_before_spawn() {
     let backend = opencode_backend(
         &setup,
         &[(TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy())],
-        Vec::new(),
     );
     let oversized_system = "s".repeat(mc_host::broca::config::MAX_OPENCODE_CONFIG_BYTES + 1);
     let request = request(
@@ -1754,11 +1968,7 @@ fn malformed_outputs_one_bounded_failure() {
         ),
     )
     .expect("transcript");
-    let backend = opencode_backend(
-        &setup,
-        &[(TRANSCRIPT_FILE_ENV, &path.to_string_lossy())],
-        Vec::new(),
-    );
+    let backend = opencode_backend(&setup, &[(TRANSCRIPT_FILE_ENV, &path.to_string_lossy())]);
     let (terminal, _) = execute(
         &backend,
         request(setup.project.path(), Harness::OpenCode, "anthropic/m", None),
@@ -1769,11 +1979,7 @@ fn malformed_outputs_one_bounded_failure() {
     let setup = RunSetup::new();
     let path = setup.scratch.path().join("binary.ndjson");
     fs::write(&path, [0xFF, 0xFE, 0x00, b'\n']).expect("transcript");
-    let backend = opencode_backend(
-        &setup,
-        &[(TRANSCRIPT_FILE_ENV, &path.to_string_lossy())],
-        Vec::new(),
-    );
+    let backend = opencode_backend(&setup, &[(TRANSCRIPT_FILE_ENV, &path.to_string_lossy())]);
     let (terminal, _) = execute(
         &backend,
         request(setup.project.path(), Harness::OpenCode, "anthropic/m", None),
@@ -1797,7 +2003,6 @@ fn malformed_outputs_one_bounded_failure() {
             (TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy()),
             (EXIT_ENV, "3"),
         ],
-        Vec::new(),
     );
     let (terminal, _) = execute(
         &backend,
@@ -2651,6 +2856,61 @@ fn env_snapshot_admission_charges_per_entry_overhead() {
         .collect();
     let snapshot = EnvSnapshot::capture_from(ordinary).expect("a real environment admits");
     assert_eq!(snapshot.vars().len(), 100);
+}
+
+fn provider_rows_exclude_ambient_credentials_and_enforce_caps() {
+    let snapshot = EnvSnapshot::capture_from(vec![
+        (os("ANTHROPIC_API_KEY"), os("anthropic-secret")),
+        (os("OPENAI_API_KEY"), os("openai-secret")),
+        (os("AWS_ACCESS_KEY_ID"), os("ambient-aws")),
+        (os("HTTPS_PROXY"), os("ambient-proxy")),
+        (os("PATH"), os("/attacker/bin")),
+        (os("LD_PRELOAD"), os("/attacker/lib.so")),
+    ])
+    .expect("bounded startup source");
+
+    assert_eq!(
+        snapshot
+            .provider_row("opencode", "anthropic")
+            .expect("qualified direct-api row"),
+        vec![(os("ANTHROPIC_API_KEY"), os("anthropic-secret"))]
+    );
+    assert_eq!(
+        snapshot
+            .provider_row("pi", "openai-codex")
+            .expect("Pi alias selects canonical row"),
+        vec![(os("OPENAI_API_KEY"), os("openai-secret"))]
+    );
+    assert_eq!(
+        snapshot
+            .provider_row("opencode", "custom")
+            .expect_err("custom providers are closed")
+            .subreason(),
+        "provider_unsupported"
+    );
+
+    let oversize = EnvSnapshot::capture_from(vec![(
+        os("ANTHROPIC_API_KEY"),
+        OsString::from("x".repeat(16 * 1024 + 1)),
+    )])
+    .expect("startup source admission is independent");
+    assert_eq!(
+        oversize
+            .provider_row("opencode", "anthropic")
+            .expect_err("individual cap wins")
+            .subreason(),
+        "credential_value_too_large"
+    );
+
+    let key = std::array::from_fn(|index| index as u8);
+    let vector = EnvSnapshot::capture_from(vec![(os("ANTHROPIC_API_KEY"), os("secret"))])
+        .expect("vector snapshot")
+        .credential_fingerprint(&key, "opencode", "anthropic")
+        .expect("fingerprint");
+    assert_eq!(
+        vector,
+        "7433149b20d0453ae0014a4ddd46e06c6f445af63528ab1c9f6faa1c508ab100"
+    );
 }
 
 /// A harness line's JSON node count is bounded before any DOM is built: an

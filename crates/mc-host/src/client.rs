@@ -261,6 +261,12 @@ pub struct Response {
     pub binary: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostStatusSnapshot {
+    pub health: String,
+    pub metrics: serde_json::Value,
+}
+
 /// One ordered streaming response item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamItem {
@@ -613,6 +619,59 @@ impl Client {
             ));
         }
         Ok(())
+    }
+
+    /// Reads the host-owned component readiness snapshot without opening a
+    /// route or sending an application body.
+    pub async fn host_status(&self) -> Result<HostStatusSnapshot, CallError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireStatus {
+            op: String,
+            health: String,
+            metrics: serde_json::Value,
+        }
+
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(CallError::local(
+                SendOutcome::NotSent,
+                "client_closed",
+                "client is closed",
+            ));
+        }
+        let deadline = Instant::now() + CLIENT_REQUEST_TIMEOUT;
+        let response = self
+            .inner
+            .unary(
+                RouteHandle {
+                    channel: 0,
+                    epoch: 0,
+                },
+                br#"{"op":"host.status"}"#.to_vec(),
+                deadline,
+                None,
+            )
+            .await?;
+        let decoded = serde_json::from_slice::<WireStatus>(&response.body).map_err(|_| {
+            CallError::local(
+                SendOutcome::Terminal,
+                "invalid_host_status_response",
+                "host.status response is malformed",
+            )
+        })?;
+        if decoded.op != "host.status"
+            || !matches!(decoded.health.as_str(), "ok" | "degraded" | "failing")
+        {
+            return Err(CallError::local(
+                SendOutcome::Terminal,
+                "invalid_host_status_response",
+                "host.status response has an invalid identity",
+            ));
+        }
+        Ok(HostStatusSnapshot {
+            health: decoded.health,
+            metrics: decoded.metrics,
+        })
     }
 
     /// Rejects new work, closes routes, settles pending calls, and joins I/O tasks.
@@ -3166,6 +3225,7 @@ mod tests {
             consumer_launch_nonce: None,
             consumer_capabilities: Vec::new(),
             admission_facts: None,
+            credential_fingerprints: std::collections::BTreeMap::new(),
         }
     }
 

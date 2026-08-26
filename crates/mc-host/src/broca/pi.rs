@@ -10,7 +10,7 @@
 //! plugin startup in the child.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +21,7 @@ use super::backend::{
 use super::subprocess::{
     self, EnvSnapshot, HarnessName, PrivateDir, ProbeSignal, SubprocessLimits, SubprocessSpec,
 };
+use crate::harness_closure::ValidatedHarnessClosure;
 
 /// The existing Magic Context Pi recursion guard
 /// (`packages/pi-plugin/src/index.ts` checks it and returns before full
@@ -40,17 +41,15 @@ pub const PI_BROCA_EXTENSION_BYTES: &[u8] = include_bytes!("../../assets/pi-broc
 /// File name the hook is materialized under inside the run's private dir.
 pub const PI_BROCA_EXTENSION_FILE: &str = "pi-broca-extension.mjs";
 
-/// Trusted Pi runtime descriptor: the installed absolute executable plus
-/// the ordered daemon-owner provider-extension paths. `magic-context-c50.8`
-/// resolves the real installed paths; this crate defines and fixture-tests
-/// the contract (plan assumption).
+/// Trusted Pi runtime closure retained by the daemon. Node names resolve
+/// only inside the content-addressed closure, and extension order is frozen
+/// by its U9 manifest.
 #[derive(Clone, Debug)]
 pub struct PiRuntimeDescriptor {
-    /// Trusted absolute path to the Pi CLI entry.
-    pub executable: PathBuf,
-    /// Ordered daemon-owner provider extensions, loaded explicitly in this
-    /// order BEFORE the bundled Broca hook (R16).
-    pub provider_extensions: Vec<PathBuf>,
+    pub closure: Arc<ValidatedHarnessClosure>,
+    pub interpreter_node: String,
+    pub entrypoint_node: String,
+    pub provider_extension_nodes: Vec<String>,
 }
 
 /// [`LlmExecutionBackend`] adapter that runs Pi print-mode JSON under the
@@ -220,6 +219,12 @@ async fn run_pi(
     cancel: CancellationToken,
     model_ref: String,
 ) -> BackendTerminal {
+    let mut child_env = match env.provider_row("pi", &request.provider) {
+        Ok(row) => row,
+        Err(error) => {
+            return subprocess::credential_failure(HarnessName::Pi, error);
+        }
+    };
     let dir = match PrivateDir::create("mc-broca-pi") {
         Ok(dir) => dir,
         Err(err) => return subprocess::spawn_failure(HarnessName::Pi, &err),
@@ -275,7 +280,32 @@ async fn run_pi(
         "--no-approve".to_owned(),
         "--no-extensions".to_owned(),
     ];
-    for extension in &descriptor.provider_extensions {
+    let executable = match descriptor
+        .closure
+        .resolve_node(&descriptor.interpreter_node)
+    {
+        Ok(path) => path,
+        Err(_) => {
+            return subprocess::harness_unavailable_failure(HarnessName::Pi, "closure_incomplete")
+        }
+    };
+    let entrypoint = match descriptor.closure.resolve_node(&descriptor.entrypoint_node) {
+        Ok(path) => path,
+        Err(_) => {
+            return subprocess::harness_unavailable_failure(HarnessName::Pi, "closure_incomplete")
+        }
+    };
+    args.insert(0, entrypoint.to_string_lossy().into_owned());
+    for extension_node in &descriptor.provider_extension_nodes {
+        let extension = match descriptor.closure.resolve_node(extension_node) {
+            Ok(path) => path,
+            Err(_) => {
+                return subprocess::harness_unavailable_failure(
+                    HarnessName::Pi,
+                    "closure_incomplete",
+                )
+            }
+        };
         args.push("--extension".to_owned());
         args.push(extension.to_string_lossy().into_owned());
     }
@@ -292,7 +322,6 @@ async fn run_pi(
         args.push(level.clone());
     }
 
-    let mut child_env: Vec<(OsString, OsString)> = env.vars().to_vec();
     child_env.push((
         OsString::from(MAGIC_CONTEXT_PI_SUBAGENT_ENV),
         OsString::from("1"),
@@ -305,12 +334,13 @@ async fn run_pi(
         OsString::from(BROCA_TEMPERATURE_ENV),
         OsString::from(request.temperature.to_string()),
     ));
+    child_env.push((OsString::from("HOME"), dir.path().as_os_str().to_owned()));
 
     let spec = SubprocessSpec {
-        executable: descriptor.executable,
+        executable,
         args,
         env: child_env,
-        working_dir: request.project_root,
+        working_dir: dir.path().to_path_buf(),
         // Moved, not cloned: the prompt is the request's dominant byte cost
         // and nothing after spec construction reads it.
         stdin: request.prompt.into_bytes(),

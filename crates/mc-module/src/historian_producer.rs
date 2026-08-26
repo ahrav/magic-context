@@ -4,6 +4,7 @@
 //! [`mc_host::Client`]. This module interprets only Broca request and stream payloads.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     path::PathBuf,
@@ -208,6 +209,7 @@ pub struct HistorianProducerConfig {
     pub request_timeout: Duration,
     pub await_timeout: Duration,
     pub cancellation: Option<CancellationToken>,
+    pub credential_fingerprints: BTreeMap<String, String>,
 }
 
 impl HistorianProducerConfig {
@@ -224,6 +226,7 @@ impl HistorianProducerConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             await_timeout: DEFAULT_AWAIT_TIMEOUT,
             cancellation: None,
+            credential_fingerprints: BTreeMap::new(),
         }
     }
 }
@@ -1054,6 +1057,7 @@ impl HistorianProducer {
                 consumer_launch_nonce: nonempty_env(SUBC_LAUNCH_NONCE_ENV),
                 consumer_capabilities: Vec::new(),
                 admission_facts: None,
+                credential_fingerprints: self.config.credential_fingerprints.clone(),
             },
         );
         let Some(cancellation) = self.config.cancellation.clone() else {

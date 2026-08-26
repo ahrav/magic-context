@@ -1,48 +1,144 @@
 {
   "schema": "magic-context.mc-host-production-input-sources/v1",
   "mode": "production",
-  "note": "Operator-populated source manifest for U9 production-input qualification (KTD23). Release engineering must qualify every byte-level artifact here with its exact immutable source, byte size, SHA-256, provenance, approved license, and a local verify path holding the real bytes, plus the recorded offline semantic-oracle evidence and the exact opencode-ai version. Real production bytes are not in this repository, so those entries are explicitly unqualified; scripts/qualify-mc-host-production-inputs.ts propagates them into non-production evidence that requireQualificationEvidence (the U2/U6 build gate) rejects. The committed tiny synapse fixture, developer caches, mutable URLs, and placeholder hashes can never qualify.",
+  "note": "U9 production-input qualification source manifest. Each external model/runtime/harness artifact is pinned by immutable source identity, byte size, SHA-256, provenance, approved SPDX policy, and an absolute release-workspace verification path. Project-authored manifest/corpus bytes use matching urn:sha256 identities. The offline oracle was captured through the exact Rust FastEmbed path and rerun with networking disabled on glibc 2.28. Linux closure profiles are qualified; macOS descriptors remain optional/absent until target canaries qualify native profiles.",
   "release_version": "0.38.0",
   "inputs": {
+    "bundle_manifest": {
+      "qualified": true,
+      "source": "urn:sha256:244695047270ee5ea711f2c27a5ae4366b09c0b3dd3736f5b2b95e456b9414a1",
+      "size_bytes": 1296,
+      "sha256": "244695047270ee5ea711f2c27a5ae4366b09c0b3dd3736f5b2b95e456b9414a1",
+      "provenance": "Project-authored schema-1 manifest for the pinned gte-modernbert-base-f16 conversion, corpus, and tokenizer artifacts",
+      "license": {
+        "spdx": "MIT",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/model-converted/manifest.json"
+    },
     "ort_runtime": {
-      "qualified": false,
-      "reason": "exact CPU-only ONNX Runtime shared-library bytes (loaded via ort 2.0.0-rc.13 dynamic loading) not yet qualified by release engineering"
+      "qualified": true,
+      "source": "urn:sha256:ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad",
+      "size_bytes": 22065056,
+      "sha256": "ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad",
+      "provenance": "lib/libonnxruntime.so.1.24.2 extracted from Microsoft ONNX Runtime v1.24.2 official CPU linux-x64 release archive SHA-256 43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+      "license": {
+        "spdx": "MIT",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/ort/onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2"
     },
     "model_onnx": {
-      "qualified": false,
-      "reason": "production gte-modernbert-base-f16 ONNX bytes not yet qualified by release engineering"
+      "qualified": true,
+      "source": "https://huggingface.co/keisuke-miyako/gte-modernbert-base-onnx-f16/resolve/3d5fc87c1790e6846bad06013655b0703da47be9/model.onnx",
+      "size_bytes": 298453643,
+      "sha256": "827ecb0606014f0ee953626661a9b5d76a8cc11e5bf17377892e081878c82eb3",
+      "provenance": "Mechanical FP16 ONNX derivative of Apache-2.0 Alibaba-NLP/gte-modernbert-base commit e7f32e3c00f91d699e8c43b53106206bcc72bb22; pinned conversion bytes are independently hash-locked and semantic-oracle certified",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/model-converted/model.onnx"
     },
     "tokenizer": {
-      "qualified": false,
-      "reason": "production tokenizer.json bytes not yet qualified by release engineering"
+      "qualified": true,
+      "source": "https://huggingface.co/keisuke-miyako/gte-modernbert-base-onnx-f16/resolve/3d5fc87c1790e6846bad06013655b0703da47be9/tokenizer.json",
+      "size_bytes": 3583228,
+      "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
+      "provenance": "Tokenizer from pinned gte-modernbert-base-onnx-f16 conversion rooted in Alibaba-NLP/gte-modernbert-base",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/model-converted/tokenizer.json"
     },
     "config": {
-      "qualified": false,
-      "reason": "production config.json bytes not yet qualified by release engineering"
+      "qualified": true,
+      "source": "https://huggingface.co/keisuke-miyako/gte-modernbert-base-onnx-f16/resolve/3d5fc87c1790e6846bad06013655b0703da47be9/config.json",
+      "size_bytes": 1208,
+      "sha256": "f295786e36cabd2023fd17bbf048f355926bb80a9ced63d22826f3310f70a9dd",
+      "provenance": "Model config from pinned gte-modernbert-base-onnx-f16 conversion rooted in Alibaba-NLP/gte-modernbert-base",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/model-converted/config.json"
     },
     "special_tokens_map": {
-      "qualified": false,
-      "reason": "production special_tokens_map.json bytes not yet qualified by release engineering"
+      "qualified": true,
+      "source": "https://huggingface.co/keisuke-miyako/gte-modernbert-base-onnx-f16/resolve/3d5fc87c1790e6846bad06013655b0703da47be9/special_tokens_map.json",
+      "size_bytes": 694,
+      "sha256": "ea97ecdbcc73713039d8d64dbb05e3689495c96657fbd9a18f5bed381be81049",
+      "provenance": "Special-token map from pinned gte-modernbert-base-onnx-f16 conversion rooted in Alibaba-NLP/gte-modernbert-base",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/model-converted/special_tokens_map.json"
     },
     "tokenizer_config": {
-      "qualified": false,
-      "reason": "production tokenizer_config.json bytes not yet qualified by release engineering"
+      "qualified": true,
+      "source": "https://huggingface.co/keisuke-miyako/gte-modernbert-base-onnx-f16/resolve/3d5fc87c1790e6846bad06013655b0703da47be9/tokenizer_config.json",
+      "size_bytes": 20867,
+      "sha256": "9654072f7c873161814043cf08cb5ed72f71d0b935abcd4e267935cb34352c21",
+      "provenance": "Tokenizer config from pinned gte-modernbert-base-onnx-f16 conversion rooted in Alibaba-NLP/gte-modernbert-base",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/model-converted/tokenizer_config.json"
     },
     "corpus": {
-      "qualified": false,
-      "reason": "production semantic-certification corpus bytes not yet qualified by release engineering"
+      "qualified": true,
+      "source": "urn:sha256:df864f8a8ab3c914b9be5dbd340f9a1f83061b75a0a735845babdeb9db5e266d",
+      "size_bytes": 49056,
+      "sha256": "df864f8a8ab3c914b9be5dbd340f9a1f83061b75a0a735845babdeb9db5e266d",
+      "provenance": "Project-authored offline semantic corpus generated by the exact Rust FastEmbed 6.0.0 CLS and L2-normalization path against the pinned model and ORT",
+      "license": {
+        "spdx": "MIT",
+        "redistribution_approved": true,
+        "approved_by": "mc-host U9 SPDX allowlist"
+      },
+      "verify_local_path": "/local/home/ahrav/scratch/magic-context-production-inputs/model-converted/corpus.json"
     }
   },
   "oracle": null,
   "harnesses": {
     "opencode": {
       "package": "opencode-ai",
-      "version": null,
-      "unqualified_reason": "exact opencode-ai harness version (independent of the @opencode-ai SDK/plugin pins) not yet qualified by release engineering"
+      "version": "1.18.22",
+      "closure_manifest": {
+        "path": "release/mc-host-harness-closures/opencode-linux-x64-1.18.22.json",
+      "sha256": "03076f14ffe186bb94054e1809c6ba67cc2b5d4ac86baef5f2a75208638c027d"
+      },
+      "closure_platforms": [
+        "linux-x64-gnu"
+      ],
+      "closure_verify_roots": {
+        "runtime": "/local/home/ahrav/.local/share/mise/installs/node/24.18.0/lib/node_modules/opencode-ai/bin"
+      }
     },
     "pi": {
       "package": "@earendil-works/pi-coding-agent",
-      "version": "0.80.2"
+      "version": "0.80.2",
+      "closure_manifest": {
+        "path": "release/mc-host-harness-closures/pi-linux-x64-node-24.18.0.json",
+      "sha256": "cb3335613914781c8e96e6c18eb7f7eead390f3ff813a4d4904286d512fb0704"
+      },
+      "closure_platforms": [
+        "linux-x64-gnu"
+      ],
+      "closure_verify_roots": {
+        "pi-install": "/local/home/ahrav/scratch/magic-context-production-inputs/harnesses/pi-install",
+        "runtime": "/local/home/ahrav/.local/share/mise/installs/node/24.18.0/bin"
+      }
     }
   }
 }

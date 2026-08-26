@@ -47,6 +47,14 @@ pub mod release_contract {
     ));
 }
 
+/// U9 closure manifests and the lock digest embedded into the native binary.
+pub mod production_inputs {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../release/generated/mc-host-harness-closures.rs"
+    ));
+}
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
@@ -148,6 +156,7 @@ pub struct SessionBinding {
     /// The fallback history budget (tokens) frozen at bind. A transform request may carry
     /// a newer harness-resolved value because config can change while the route remains open.
     pub history_budget_tokens: f64,
+    pub credential_fingerprints: std::collections::BTreeMap<String, String>,
 }
 
 fn apply_claude_code_config_controls(
@@ -3178,6 +3187,15 @@ pub trait HistorianProducerFactory: Send + Sync {
         project_root: &Path,
         harness: &str,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
+
+    async fn connect_with_credentials(
+        &self,
+        project_root: &Path,
+        harness: &str,
+        _credential_fingerprints: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        self.connect(project_root, harness).await
+    }
 }
 
 struct RealHistorianProducerFactory {
@@ -3192,9 +3210,20 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
         project_root: &Path,
         harness: &str,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        self.connect_with_credentials(project_root, harness, &std::collections::BTreeMap::new())
+            .await
+    }
+
+    async fn connect_with_credentials(
+        &self,
+        project_root: &Path,
+        harness: &str,
+        credential_fingerprints: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Ok(Box::new(
             HistorianProducer::connect(HistorianProducerConfig {
                 cancellation: Some(self.cancellation.clone()),
+                credential_fingerprints: credential_fingerprints.clone(),
                 ..HistorianProducerConfig::new(self.connection_file.clone(), project_root, harness)
             })
             .await?,
@@ -3518,6 +3547,7 @@ struct HistorianFiringTask {
     live_guard: SessionSetGuard,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
+    credential_fingerprints: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4800,6 +4830,7 @@ impl McHandler {
         drop(latch);
 
         let session_id = parsed.session_id.clone();
+        let credential_fingerprints = binding.credential_fingerprints.clone();
         let latch = Arc::clone(&self.reattaching_sessions);
         let guard = StringSetGuard {
             sessions: Arc::clone(&latch),
@@ -4891,7 +4922,13 @@ impl McHandler {
                             }
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
-                        let mut producer = factory.connect(&project_root, &harness).await?;
+                        let mut producer = factory
+                            .connect_with_credentials(
+                                &project_root,
+                                &harness,
+                                &credential_fingerprints,
+                            )
+                            .await?;
                         reattach_historian_producer(
                             &mut *producer,
                             historian::HistorianReattachRequest {
@@ -5316,6 +5353,7 @@ impl McHandler {
                 firing,
                 live_guard,
                 connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
+                credential_fingerprints: binding.credential_fingerprints.clone(),
                 // Organic pressure firings assemble and publish in one continuous drive
                 // while the live-session guard is held. They do not depend on a cached raw
                 // snapshot, so a transform-snapshot generation fence would reject valid work.
@@ -5433,6 +5471,7 @@ impl McHandler {
             firing,
             live_guard,
             connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
+            credential_fingerprints: binding.credential_fingerprints.clone(),
             publication_fence: None,
         }))
     }
@@ -5485,11 +5524,15 @@ impl McHandler {
             live_guard,
             connect_failure_commit_hook,
             publication_fence,
+            credential_fingerprints,
         } = task;
         let _guard = live_guard;
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
-        match factory.connect(&project_root, &harness).await {
+        match factory
+            .connect_with_credentials(&project_root, &harness, &credential_fingerprints)
+            .await
+        {
             Ok(mut producer) => {
                 let mut request = firing.as_fire_request(
                     &store,
@@ -10047,7 +10090,11 @@ impl McHandler {
             let _dreamer_run_guard = self.register_dreamer_run(&child_session);
             let mut producer = match self
                 .producer_factory
-                .connect(&binding.project_root, &binding.harness)
+                .connect_with_credentials(
+                    &binding.project_root,
+                    &binding.harness,
+                    &binding.credential_fingerprints,
+                )
                 .await
             {
                 Ok(producer) => producer,
@@ -12488,6 +12535,7 @@ impl CompositeComponent for McHandler {
                 model_key: None,
                 config,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                credential_fingerprints: identity.credential_fingerprints,
             },
         );
         BindOutcome::Accept
@@ -12535,9 +12583,42 @@ impl CompositeComponent for McHandler {
 
     async fn health(&self) -> HealthReport {
         let now = now_ms().max(0) as u64;
-        self.store_open
-            .waiting_report(now)
-            .unwrap_or_else(|| DISPATCH_HEALTH.report(now))
+        let phase = self.store_open.phase.load(Ordering::Acquire);
+        let mut report = match phase {
+            STORE_OPENING => HealthReport {
+                status: HealthStatus::Degraded,
+                detail: Some("storage is opening".to_owned()),
+                metrics: None,
+            },
+            STORE_OPEN_WAITING => self
+                .store_open
+                .waiting_report(now)
+                .expect("waiting phase has a waiting report"),
+            STORE_OPENED => DISPATCH_HEALTH.report(now),
+            _ if self.store().is_some() => DISPATCH_HEALTH.report(now),
+            _ => HealthReport {
+                status: HealthStatus::Degraded,
+                detail: Some("storage is unavailable".to_owned()),
+                metrics: None,
+            },
+        };
+        let storage_state = match phase {
+            STORE_OPENING | STORE_OPEN_WAITING => "starting",
+            STORE_OPENED => "ready",
+            _ if self.store().is_some() => "ready",
+            _ => "unavailable",
+        };
+        let mut metrics = report
+            .metrics
+            .take()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        metrics.insert(
+            "storage_state".to_owned(),
+            serde_json::Value::String(storage_state.to_owned()),
+        );
+        report.metrics = Some(serde_json::Value::Object(metrics));
+        report
     }
 
     async fn shutdown(&self) -> Result<(), ShutdownError> {
@@ -17792,6 +17873,7 @@ mod tests {
             model_key: None,
             config: default_test_config(),
             history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+            credential_fingerprints: std::collections::BTreeMap::new(),
         }
     }
 

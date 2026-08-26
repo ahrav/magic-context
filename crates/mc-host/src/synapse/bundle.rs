@@ -703,13 +703,24 @@ fn validate_tokenizer_config(bytes: &[u8], max_tokens: u64) -> Result<(), Bundle
         serde_json::from_slice(bytes).map_err(|_| err("tokenizer_config is not JSON"))?;
     let declared = value
         .get("model_max_length")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(serde_json::Value::as_number)
         .ok_or_else(|| err("tokenizer_config lacks model_max_length"))?;
-    // Two competing maximum lengths would make the truncation boundary
-    // depend on which one a code path consults.
-    if declared != max_tokens {
+    // The manifest is the serving boundary. Hugging Face uses a very large
+    // model_max_length sentinel for tokenizers without a smaller tokenizer
+    // limit; that does not compete with a stricter manifest limit. A lower
+    // tokenizer ceiling would make truncation depend on which path wins.
+    let below_manifest = declared
+        .as_u64()
+        .map(|declared| declared < max_tokens)
+        .or_else(|| {
+            declared
+                .as_f64()
+                .map(|declared| !declared.is_finite() || declared < max_tokens as f64)
+        })
+        .unwrap_or(true);
+    if below_manifest {
         return Err(err(
-            "tokenizer_config model_max_length disagrees with manifest max_tokens",
+            "tokenizer_config model_max_length is below manifest max_tokens",
         ));
     }
     if value
@@ -765,6 +776,21 @@ fn parse_corpus(bytes: &[u8], dims: usize) -> Result<Corpus, BundleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenizer_ceiling_may_exceed_the_manifest_limit() {
+        let unlimited =
+            br#"{"model_max_length":1000000000000000019884624838656,"pad_token":"[PAD]"}"#;
+        assert!(validate_tokenizer_config(unlimited, 8192).is_ok());
+
+        let lower = br#"{"model_max_length":4096,"pad_token":"[PAD]"}"#;
+        assert_eq!(
+            validate_tokenizer_config(lower, 8192)
+                .expect_err("a lower tokenizer ceiling must fail")
+                .0,
+            "tokenizer_config model_max_length is below manifest max_tokens"
+        );
+    }
 
     fn manifest() -> BundleManifest {
         let artifact = |name: &str| ArtifactRef {

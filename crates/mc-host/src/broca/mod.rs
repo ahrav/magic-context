@@ -17,17 +17,19 @@ pub mod protocol;
 pub mod subprocess;
 pub mod supervisor;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::composite::{CompositeComponent, SecondaryComponent, ShutdownError};
 use crate::handler::{
-    BindOutcome, HealthReport, InitError, ManifestSnapshot, RequestCtx, RequestOutcome,
-    ResourceDeclaration, RouteClass, RouteHandle, RouteIdentity,
+    BindOutcome, HealthReport, HealthStatus, InitError, ManifestSnapshot, RequestCtx,
+    RequestOutcome, ResourceDeclaration, RouteClass, RouteHandle, RouteIdentity,
 };
+use subtle::ConstantTimeEq;
 
 use backend::{Harness, LlmExecutionBackend};
 use protocol::{Request, RequestError};
+use subprocess::EnvSnapshot;
 use supervisor::{SessionKey, Supervisor};
 
 pub const BROCA_MODULE_ID: &str = "broca";
@@ -38,6 +40,45 @@ pub struct BrocaComponent {
     /// handle, so this map is how a body-less identity (subscribe, delete)
     /// resolves its session scope.
     routes: Arc<Mutex<HashMap<RouteHandle, SessionKey>>>,
+    route_fingerprints: Arc<Mutex<HashMap<RouteHandle, BTreeMap<String, String>>>>,
+    credential_verifier: Option<Arc<CredentialVerifier>>,
+}
+
+struct CredentialVerifier {
+    env: EnvSnapshot,
+    key: OnceLock<[u8; 32]>,
+}
+
+impl CredentialVerifier {
+    fn verify(
+        &self,
+        harness: Harness,
+        provider: &str,
+        presented: &BTreeMap<String, String>,
+    ) -> Result<(), &'static str> {
+        let key = self.key.get().ok_or("credential_snapshot_mismatch")?;
+        let harness_name = match harness {
+            Harness::OpenCode => "opencode",
+            Harness::Pi => "pi",
+        };
+        let expected = self
+            .env
+            .credential_fingerprint(key, harness_name, provider)
+            .map_err(|error| error.subreason())?;
+        let canonical_provider = match (harness, provider) {
+            (Harness::Pi, "google-antigravity") => "google",
+            (Harness::Pi, "openai-codex") => "openai",
+            _ => provider,
+        };
+        let actual = presented
+            .get(canonical_provider)
+            .ok_or("credential_snapshot_mismatch")?;
+        if expected.as_bytes().ct_eq(actual.as_bytes()).into() {
+            Ok(())
+        } else {
+            Err("credential_snapshot_mismatch")
+        }
+    }
 }
 
 impl BrocaComponent {
@@ -45,6 +86,20 @@ impl BrocaComponent {
         Self {
             supervisor: Arc::new(Supervisor::new(backend)),
             routes: Arc::new(Mutex::new(HashMap::new())),
+            route_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            credential_verifier: None,
+        }
+    }
+
+    pub fn new_with_credentials(backend: Arc<dyn LlmExecutionBackend>, env: EnvSnapshot) -> Self {
+        Self {
+            supervisor: Arc::new(Supervisor::new(backend)),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            route_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            credential_verifier: Some(Arc::new(CredentialVerifier {
+                env,
+                key: OnceLock::new(),
+            })),
         }
     }
 
@@ -97,6 +152,12 @@ async fn respond(ctx: &RequestCtx, body: Vec<u8>) -> RequestOutcome {
 }
 
 impl CompositeComponent for BrocaComponent {
+    fn install_connection_key(&self, key: [u8; 32]) {
+        if let Some(verifier) = &self.credential_verifier {
+            let _ = verifier.key.set(key);
+        }
+    }
+
     fn manifest(&self) -> ManifestSnapshot {
         ManifestSnapshot {
             module_id: BROCA_MODULE_ID.to_owned(),
@@ -148,6 +209,7 @@ impl CompositeComponent for BrocaComponent {
             harness,
             session: identity.session,
         };
+        let credential_fingerprints = identity.credential_fingerprints;
         let mut routes = self
             .routes
             .lock()
@@ -163,6 +225,10 @@ impl CompositeComponent for BrocaComponent {
             };
         }
         routes.insert(route, key);
+        self.route_fingerprints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(route, credential_fingerprints);
         BindOutcome::Accept
     }
 
@@ -188,10 +254,25 @@ impl CompositeComponent for BrocaComponent {
             Err(error) => return request_error(error),
         };
         match request {
-            Request::Send(send) => match self.supervisor.send(&key, send, &ctx.body) {
-                Ok(run_id) => respond(&ctx, protocol::send_response_body(&run_id)).await,
-                Err(error) => request_error(error),
-            },
+            Request::Send(send) => {
+                if let Some(verifier) = &self.credential_verifier {
+                    let fingerprints = self
+                        .route_fingerprints
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&ctx.route)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(reason) = verifier.verify(key.harness, &send.provider, &fingerprints)
+                    {
+                        return app_error("harness_unavailable", reason);
+                    }
+                }
+                match self.supervisor.send(&key, send, &ctx.body) {
+                    Ok(run_id) => respond(&ctx, protocol::send_response_body(&run_id)).await,
+                    Err(error) => request_error(error),
+                }
+            }
             Request::Status { run_id } => match self.supervisor.status(&key, &run_id) {
                 Ok(state) => respond(&ctx, protocol::status_response_body(&run_id, state)).await,
                 Err(error) => request_error(error),
@@ -244,15 +325,27 @@ impl CompositeComponent for BrocaComponent {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&route);
+        self.route_fingerprints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&route);
     }
 
     async fn health(&self) -> HealthReport {
-        HealthReport::ok()
+        HealthReport {
+            status: HealthStatus::Ok,
+            detail: None,
+            metrics: Some(serde_json::json!({"broca_state": "ready"})),
+        }
     }
 
     async fn shutdown(&self) -> Result<(), ShutdownError> {
         let unresolved = self.supervisor.shutdown().await;
         self.routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.route_fingerprints
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();

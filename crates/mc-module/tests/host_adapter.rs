@@ -20,6 +20,7 @@ fn identity(root: &Path, session: &str) -> RouteIdentity {
         consumer_launch_nonce: None,
         consumer_capabilities: Vec::new(),
         admission_facts: None,
+        credential_fingerprints: std::collections::BTreeMap::new(),
     }
 }
 

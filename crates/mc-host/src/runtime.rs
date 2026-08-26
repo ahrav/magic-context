@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -20,7 +21,9 @@ use crate::connection::{run_connection, GenerationCore};
 use crate::dispatch::{
     finish_route_close, force_close_all_routes, send_connection_goodbye, settle_route,
 };
-use crate::handler::{McHostHandler, ResourceDeclaration, RouteClass, TargetKind};
+use crate::handler::{
+    HealthReport, HealthStatus, McHostHandler, ResourceDeclaration, RouteClass, TargetKind,
+};
 use crate::instance::{ConnectionKey, InstanceError, InstanceGuard};
 use crate::routing::RouteRegistry;
 use crate::wire::ByteBudget;
@@ -95,6 +98,9 @@ pub struct HostShared<H> {
     pub liveness: Option<LivenessPolicy>,
     pub targets: crate::control::TargetIndex,
     pub catalog: crate::control::CatalogCache,
+    /// Last completed sanitized component health snapshot. Authenticated
+    /// `host.status` reads this without invoking a lifecycle callback.
+    pub health_snapshot: RwLock<HealthReport>,
     pub providers: crate::transport_provider::TransportProviders,
     pub registry: RouteRegistry,
     /// Admits inbound frame bodies. The only budget with a blocking
@@ -653,6 +659,7 @@ pub async fn run<H: McHostHandler>(
         .map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
+    handler.install_connection_key(*guard.key().bytes());
     let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
     let declarations = crate::panic_boundary::redact_sync(|| handler.resource_declarations());
     let (targets, reservations) = build_target_index(&manifests, &declarations)?;
@@ -831,6 +838,11 @@ pub async fn run<H: McHostHandler>(
         liveness: config.liveness.clone(),
         targets,
         catalog,
+        health_snapshot: RwLock::new(HealthReport {
+            status: HealthStatus::Degraded,
+            detail: None,
+            metrics: Some(serde_json::json!({"components": {}})),
+        }),
         providers: config.transport_providers.clone(),
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
@@ -987,13 +999,37 @@ async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: Tc
 /// Dedicated internal health probe: never a routed request, never a client
 /// JSON operation (protocol §9.3). Callback failure is host-fatal.
 fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
+    fn activation_in_progress(report: &HealthReport) -> bool {
+        let components = report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("components"))
+            .and_then(serde_json::Value::as_object);
+        components.is_some_and(|components| {
+            components.values().any(|component| {
+                let metrics = component
+                    .get("metrics")
+                    .and_then(serde_json::Value::as_object);
+                metrics.is_some_and(|metrics| {
+                    metrics
+                        .get("storage_state")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("starting")
+                        || metrics
+                            .get("synapse_state")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("starting")
+                })
+            })
+        })
+    }
+
     let shared = Arc::clone(shared);
     let shared_outer = Arc::clone(&shared);
     shared_outer.spawn_tracked(async move {
         loop {
-            tokio::select! {
-                () = shared.shutdown.cancelled() => return,
-                () = tokio::time::sleep(shared.timing.health_interval) => {}
+            if shared.shutdown.is_cancelled() {
+                return;
             }
             let handler = Arc::clone(&shared.handler);
             let deadline = shared.timing.lifecycle_callback_deadline;
@@ -1012,21 +1048,43 @@ fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
                     // not a lifecycle failure — an abort-exempt probe that
                     // ignored shutdown would hold the tracker past the whole
                     // shutdown budget.
-                    () = watchdog.shutdown.cancelled() => {}
+                    () = watchdog.shutdown.cancelled() => None,
                     result = timeout(deadline, crate::panic_boundary::redact(callback)) => {
-                        if result.is_err() {
-                            watchdog.fatal.trip(
-                                &watchdog.shutdown,
-                                "health callback deadline expired".to_owned(),
-                            );
+                        match result {
+                            Ok(report) => Some(report),
+                            Err(_) => {
+                                watchdog.fatal.trip(
+                                    &watchdog.shutdown,
+                                    "health callback deadline expired".to_owned(),
+                                );
+                                None
+                            }
                         }
                     }
                 }
             });
             // The report itself is informational; degraded storage must not
             // make transport unready (protocol §8.1, AE9).
-            if shared.lifecycle_join("health", probe).await.is_err() {
-                return;
+            let activation_in_progress = match shared.lifecycle_join("health", probe).await {
+                Ok(Some(report)) => {
+                    let activation_in_progress = activation_in_progress(&report);
+                    *shared
+                        .health_snapshot
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
+                    activation_in_progress
+                }
+                Ok(None) => return,
+                Err(_) => return,
+            };
+            let interval = if activation_in_progress {
+                Duration::from_millis(50)
+            } else {
+                shared.timing.health_interval
+            };
+            tokio::select! {
+                () = shared.shutdown.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
             }
         }
     });

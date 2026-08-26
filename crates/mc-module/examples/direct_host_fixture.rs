@@ -300,6 +300,7 @@ mod unix {
                     .to_owned(),
                 table_epoch: 1,
                 dims: 8,
+                execution_provider: "cpu",
                 max_tokens: 512,
                 max_text_bytes: limits.max_text_bytes,
                 provenance: serde_json::json!({"source": "direct host fixture"}),

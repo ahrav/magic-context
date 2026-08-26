@@ -41,6 +41,23 @@ fn ort_library() -> Option<(PathBuf, String)> {
     Some((path, hash))
 }
 
+#[tokio::test]
+async fn host_only_platform_reports_exact_synapse_unsupported_state() {
+    let component = SynapseComponent::unsupported("synapse_unsupported");
+    SecondaryComponent::initialize(&component)
+        .await
+        .expect("unsupported lane initializes");
+    assert!(matches!(
+        component.status(),
+        SynapseStatus::Disabled { reason } if reason == "synapse_unsupported"
+    ));
+    let health = CompositeComponent::health(&component).await;
+    assert_eq!(
+        health.metrics.expect("metrics")["synapse_state"],
+        "unsupported"
+    );
+}
+
 fn copy_fixture_to(dir: &Path) {
     for entry in std::fs::read_dir(fixture_dir()).expect("fixture dir") {
         let entry = entry.expect("fixture entry");
@@ -170,6 +187,7 @@ fn identity() -> mc_host::RouteIdentity {
         consumer_launch_nonce: None,
         consumer_capabilities: Vec::new(),
         admission_facts: None,
+        credential_fingerprints: std::collections::BTreeMap::new(),
     }
 }
 
@@ -513,6 +531,53 @@ async fn certified_bundle_loads_and_serves_expected_vectors() {
         }
     }
     assert!(matches!(component.status(), SynapseStatus::Ready(_)));
+}
+
+#[tokio::test]
+async fn production_bundle_from_environment_certifies_offline() {
+    let Some(bundle_dir) = std::env::var_os("MC_SYNAPSE_PRODUCTION_BUNDLE").map(PathBuf::from)
+    else {
+        eprintln!("skipping: MC_SYNAPSE_PRODUCTION_BUNDLE is unset");
+        return;
+    };
+    let Some(ort) = ort_library() else { return };
+    let component = initialize(config_for(&bundle_dir, &ort)).await;
+    let lane = match component.status() {
+        SynapseStatus::Ready(lane) => lane,
+        other => panic!("production bundle did not certify: {other:?}"),
+    };
+    assert_eq!(lane.model, "gte-modernbert-base-f16");
+    assert_eq!(lane.dims, 768);
+    assert_eq!(lane.table_epoch, 1);
+
+    let corpus: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir.join("corpus.json")).expect("production corpus"),
+    )
+    .expect("production corpus json");
+    let tolerance = corpus["tolerance"].as_f64().expect("tolerance") as f32;
+    let mut captured = Vec::new();
+    for item in corpus["items"].as_array().expect("items") {
+        let text = item["text"].as_str().expect("text");
+        let expected: Vec<f32> = item["expected"]
+            .as_array()
+            .expect("expected")
+            .iter()
+            .map(|value| value.as_f64().expect("component") as f32)
+            .collect();
+        let vectors = component.embed_blocking(&[text]).expect("embed");
+        captured.push(serde_json::json!({"text": text, "expected": vectors[0]}));
+        for (got, expected) in vectors[0].iter().zip(expected) {
+            assert!((got - expected).abs() <= tolerance);
+        }
+    }
+    if let Some(path) = std::env::var_os("MC_SYNAPSE_CAPTURE_CORPUS") {
+        let output = serde_json::json!({"tolerance": 0.0001, "items": captured});
+        std::fs::write(
+            path,
+            serde_json::to_vec(&output).expect("serialize captured corpus"),
+        )
+        .expect("write captured corpus");
+    }
 }
 
 #[tokio::test]

@@ -19,6 +19,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -48,6 +50,28 @@ pub struct EnvSnapshot {
     vars: Arc<[(OsString, OsString)]>,
 }
 
+const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
+const CREDENTIAL_ROW_CAP_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRowError {
+    ProviderUnsupported,
+    CredentialMissing,
+    CredentialValueTooLarge,
+    CredentialRowTooLarge,
+}
+
+impl CredentialRowError {
+    pub fn subreason(self) -> &'static str {
+        match self {
+            Self::ProviderUnsupported => "provider_unsupported",
+            Self::CredentialMissing => "credential_missing",
+            Self::CredentialValueTooLarge => "credential_value_too_large",
+            Self::CredentialRowTooLarge => "credential_row_too_large",
+        }
+    }
+}
+
 impl EnvSnapshot {
     /// Captures the current process environment once — call at daemon
     /// startup, not per run, so request handling can never observe
@@ -61,8 +85,8 @@ impl EnvSnapshot {
         Self::capture_from(std::env::vars_os())
     }
 
-    /// The admission behind [`EnvSnapshot::capture`], on explicit variables
-    /// (test seam). Each variable is charged its string bytes plus
+    /// The admission behind [`EnvSnapshot::capture`], on explicit variables.
+    /// Each variable is charged its string bytes plus
     /// [`ENV_ENTRY_OVERHEAD_BYTES`], so an environment of many short
     /// variables cannot pass the ceiling while its per-entry container
     /// costs push each spawn representation past the declared headroom.
@@ -92,8 +116,8 @@ impl EnvSnapshot {
         Ok(snapshot)
     }
 
-    /// Builds a snapshot from explicit variables (test seam). The identity
-    /// strip applies here too, so a snapshot can never carry
+    /// Builds a snapshot from explicit startup variables. The identity strip
+    /// applies here too, so a snapshot can never carry
     /// `SUBC_MODULE_ID`/`SUBC_LAUNCH_NONCE` regardless of construction path.
     pub fn from_vars(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         let vars = vars
@@ -110,6 +134,89 @@ impl EnvSnapshot {
 
     pub fn vars(&self) -> &[(OsString, OsString)] {
         &self.vars
+    }
+
+    /// Selects exactly the release-qualified direct API-key row for one
+    /// canonical provider. No ambient loader, proxy, cloud-chain, package
+    /// manager, HOME/XDG, PATH, or unrelated provider variable survives.
+    pub fn provider_row(
+        &self,
+        harness: &str,
+        provider: &str,
+    ) -> Result<Vec<(OsString, OsString)>, CredentialRowError> {
+        let canonical = match (harness, provider) {
+            ("pi", "google-antigravity") => "google",
+            ("pi", "openai-codex") => "openai",
+            ("opencode" | "pi", "anthropic" | "google" | "openai") => provider,
+            _ => return Err(CredentialRowError::ProviderUnsupported),
+        };
+        let variable = match canonical {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "google" => "GEMINI_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            _ => return Err(CredentialRowError::ProviderUnsupported),
+        };
+        let Some((name, value)) = self
+            .vars
+            .iter()
+            .find(|(name, _)| name.as_os_str() == OsStr::new(variable))
+        else {
+            return Err(CredentialRowError::CredentialMissing);
+        };
+        if value.is_empty() {
+            return Err(CredentialRowError::CredentialMissing);
+        }
+        if value.len() > CREDENTIAL_VALUE_CAP_BYTES {
+            return Err(CredentialRowError::CredentialValueTooLarge);
+        }
+        let row_bytes = name
+            .len()
+            .checked_add(value.len())
+            .ok_or(CredentialRowError::CredentialRowTooLarge)?;
+        if row_bytes > CREDENTIAL_ROW_CAP_BYTES {
+            return Err(CredentialRowError::CredentialRowTooLarge);
+        }
+        Ok(vec![(name.clone(), value.clone())])
+    }
+
+    pub fn credential_fingerprint(
+        &self,
+        connection_key: &[u8; 32],
+        harness: &str,
+        provider: &str,
+    ) -> Result<String, CredentialRowError> {
+        const DOMAIN: &str = "subc-broca-credential-v1";
+        const CANONICALIZATION: &str = "harness-provider-name-length-value/1";
+        let canonical_provider = match (harness, provider) {
+            ("pi", "google-antigravity") => "google",
+            ("pi", "openai-codex") => "openai",
+            ("opencode" | "pi", "anthropic" | "google" | "openai") => provider,
+            _ => return Err(CredentialRowError::ProviderUnsupported),
+        };
+        let row = self.provider_row(harness, canonical_provider)?;
+        let encoded = |field: &str| format!("{}:{field}", field.len());
+        let mut message =
+            encoded(CANONICALIZATION) + &encoded(harness) + &encoded(canonical_provider);
+        for (name, value) in row {
+            let name = name.to_string_lossy();
+            let value = value.to_string_lossy();
+            message.push_str(&encoded(&name));
+            message.push_str(&encoded(&value.len().to_string()));
+            message.push_str(&encoded(&value));
+        }
+        let mut derive =
+            Hmac::<Sha256>::new_from_slice(connection_key).expect("HMAC accepts any key length");
+        derive.update(DOMAIN.as_bytes());
+        let derived = derive.finalize().into_bytes();
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&derived).expect("HMAC accepts any key length");
+        mac.update(message.as_bytes());
+        Ok(mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
     }
 }
 
@@ -957,6 +1064,25 @@ pub(crate) fn spawn_failure(harness: HarnessName, err: &io::Error) -> BackendTer
             harness.name(),
             err.kind()
         ),
+        retry_after_secs: None,
+        provider_code: None,
+    })
+}
+
+pub(crate) fn credential_failure(
+    harness: HarnessName,
+    error: CredentialRowError,
+) -> BackendTerminal {
+    harness_unavailable_failure(harness, error.subreason())
+}
+
+pub(crate) fn harness_unavailable_failure(
+    harness: HarnessName,
+    reason: &'static str,
+) -> BackendTerminal {
+    BackendTerminal::Failed(BackendError {
+        class: ErrorClass::Permanent,
+        message: format!("{} harness_unavailable: {}", harness.name(), reason),
         retry_after_secs: None,
         provider_code: None,
     })

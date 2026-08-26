@@ -1,0 +1,32 @@
+{
+  "schema": "magic-context.mc-host-synapse-smoke/v1",
+  "mode": "production",
+  "model_fingerprint": "8a15e208a378722a889c2c37972e29846a307843d529ad91a4033770a30a97dc",
+  "table_epoch": 1,
+  "execution_provider": "cpu",
+  "host": {
+    "target": "linux-x64-gnu",
+    "kernel": "4.18",
+    "glibc": "2.28",
+    "exact_floor": true
+  },
+  "inputs": {
+    "ort_runtime": "7163d84f017b03efe91688c775f817bc86598f094361cab70066a5f601f3f262",
+    "model_onnx": "7b76162eb214679b69ada2511b7bcbc4a3a10e5a4f6975b63151d9e70228fbb9",
+    "bundle_manifest": "de6e83b74343b47ec7de02f58c01e76fd58c28afee636271976dc46ff3cbb3e6",
+    "semantic_corpus": "9e0acccc7df8aa48992d86aa72b07014b86e74e2dd563ca8873788e92fc9d4cc"
+  },
+  "observed_vectors": 8,
+  "max_abs_error": 0.001,
+  "tolerance": 0.01,
+  "operations": [
+    "embed.batch",
+    "embed.query",
+    "embed.result",
+    "models.list"
+  ],
+  "restart_fenced": true,
+  "degraded_isolated": true,
+  "durable_receipts": true,
+  "network_access": "none"
+}

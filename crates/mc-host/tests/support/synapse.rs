@@ -28,6 +28,7 @@ pub fn test_lane() -> LaneInfo {
         fingerprint: "a2b4c6d8e0f01234a2b4c6d8e0f01234a2b4c6d8e0f01234a2b4c6d8e0f01234".to_owned(),
         table_epoch: 1,
         dims: 8,
+        execution_provider: "cpu",
         max_tokens: 512,
         max_text_bytes: 1024 * 1024,
         provenance: serde_json::json!({"source": "deterministic test engine"}),

@@ -61,6 +61,7 @@ async fn catalog_is_truthful_and_filters_exactly() {
             "route.open",
             "catalog.list",
             "host.shutdown",
+            "host.status",
             "transport.negotiate"
         ])
     );

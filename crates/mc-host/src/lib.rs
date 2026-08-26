@@ -15,6 +15,7 @@ pub mod config;
 pub mod connection_file;
 pub mod generation;
 pub mod handler;
+pub mod harness_closure;
 pub mod lifecycle;
 #[doc(hidden)]
 pub mod provider_recovery;
@@ -51,11 +52,12 @@ pub use auth::{
     DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
 };
 pub use client::{
-    CallError, Client, ClientError, RequestOptions, Response, ResponseStream, SendOutcome,
-    StreamItem, CLIENT_CONTROL_QUEUE_FRAMES, CLIENT_DATA_QUEUE_FRAMES, CLIENT_FRAME_TIMEOUT,
-    CLIENT_HANDSHAKE_TIMEOUT, CLIENT_MAX_LIVE_STREAMS, CLIENT_MAX_PENDING_REQUESTS,
-    CLIENT_QUEUED_BYTES, CLIENT_REQUEST_TIMEOUT, CLIENT_RETAINED_RESPONSE_BYTES,
-    CLIENT_ROUTE_OPEN_TIMEOUT, CLIENT_SHUTDOWN_TIMEOUT, CLIENT_STREAM_QUEUE_ITEMS,
+    CallError, Client, ClientError, HostStatusSnapshot, RequestOptions, Response, ResponseStream,
+    SendOutcome, StreamItem, CLIENT_CONTROL_QUEUE_FRAMES, CLIENT_DATA_QUEUE_FRAMES,
+    CLIENT_FRAME_TIMEOUT, CLIENT_HANDSHAKE_TIMEOUT, CLIENT_MAX_LIVE_STREAMS,
+    CLIENT_MAX_PENDING_REQUESTS, CLIENT_QUEUED_BYTES, CLIENT_REQUEST_TIMEOUT,
+    CLIENT_RETAINED_RESPONSE_BYTES, CLIENT_ROUTE_OPEN_TIMEOUT, CLIENT_SHUTDOWN_TIMEOUT,
+    CLIENT_STREAM_QUEUE_ITEMS,
 };
 pub use composite::{
     CompositeComponent, PrimaryComponent, SecondaryComponent, ShutdownError, StaticComposite,

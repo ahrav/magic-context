@@ -5,14 +5,9 @@
 //! `fexecve` re-exec all live here so `mc-host` itself keeps
 //! `#![deny(unsafe_code)]`.
 //!
-//! ponytail: KTD18's full flow fexecve's the STAGED GENERATION's launcher
-//! binary. Dev/test payloads staged today are not executables (production
-//! payloads are unqualified, U9 `production_qualified:false`), so this spawn
-//! boundary re-execs the already-running launcher through a retained,
-//! descriptor-validated `/proc/self/exe` fd — same fd-exec mechanism, no
-//! pathname fallback. Switch the retained fd to
-//! `ValidatedGeneration::open_verified_file("bin/ck-mc-host")` when U6/U9
-//! qualify real payloads.
+//! Production re-execs the selected staged generation's retained verified
+//! launcher descriptor. Dev fixtures that intentionally contain no launcher
+//! fall back to the already-running test executable.
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
@@ -69,24 +64,33 @@ fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
 ///
 /// Success here proves only that the spawn was issued; the caller must wait
 /// on publication evidence, never on the child PID.
-pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError> {
+pub fn spawn_detached(
+    log_path: &Path,
+    envelope: &[u8],
+    generation_launcher: Option<OwnedFd>,
+) -> Result<(), SpawnError> {
     if envelope.len() > MAX_ENVELOPE_BYTES {
         return Err(SpawnError("startup envelope exceeds size bound"));
     }
     let log_fd = open_log(log_path)?;
-    // Retained executable identity: the fd is validated (regular, owned)
-    // and execution uses only this open file description.
-    let exe = std::fs::File::open("/proc/self/exe")
-        .map_err(|_| SpawnError("executable self-descriptor open failed"))?;
-    let exe_meta = exe
-        .metadata()
-        .map_err(|_| SpawnError("executable stat failed"))?;
-    // SAFETY: geteuid never fails and has no memory effects.
-    let euid = unsafe { libc::geteuid() };
-    if !exe_meta.is_file() || exe_meta.uid() != euid {
-        return Err(SpawnError("executable failed identity checks"));
-    }
-    let exe_fd = OwnedFd::from(exe);
+    let exe_fd = match generation_launcher {
+        Some(fd) => fd,
+        None => {
+            let path = std::env::current_exe()
+                .map_err(|_| SpawnError("test executable path unavailable"))?;
+            let exe =
+                std::fs::File::open(path).map_err(|_| SpawnError("test executable open failed"))?;
+            let exe_meta = exe
+                .metadata()
+                .map_err(|_| SpawnError("test executable stat failed"))?;
+            // SAFETY: geteuid never fails and has no memory effects.
+            let euid = unsafe { libc::geteuid() };
+            if !exe_meta.is_file() || exe_meta.uid() != euid {
+                return Err(SpawnError("test executable failed identity checks"));
+            }
+            OwnedFd::from(exe)
+        }
+    };
 
     let mut pipe_fds = [0 as libc::c_int; 2];
     // SAFETY: pipe2 writes exactly two descriptors into the array.
@@ -108,6 +112,8 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
     let argv0 = CString::new("ck-mc-host").expect("static argv");
     let argv1 = CString::new("serve").expect("static argv");
     let argv: [*const libc::c_char; 3] = [argv0.as_ptr(), argv1.as_ptr(), std::ptr::null()];
+    #[cfg(target_os = "macos")]
+    let retained_path = CString::new("/dev/fd/3").expect("static retained path");
     // Minimal environment: serve takes every input from the envelope.
     let envp: [*const libc::c_char; 1] = [std::ptr::null()];
     let root = CString::new("/").expect("static path");
@@ -147,15 +153,16 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
             }
             // Close every other inherited descriptor. close_range needs
             // kernel >= 5.9; the plan floor is 4.18, so fall back to a
-            // bounded close loop. ponytail: 8192 covers any descriptor this
-            // short-lived CLI can have open; raise if the CLI ever holds
-            // more.
+            // bounded loop above the CLI's descriptor ceiling.
             if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0 {
                 for fd in 4..8192 {
                     libc::close(fd);
                 }
             }
+            #[cfg(target_os = "linux")]
             libc::fexecve(3, argv.as_ptr(), envp.as_ptr());
+            #[cfg(target_os = "macos")]
+            libc::execve(retained_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
     }

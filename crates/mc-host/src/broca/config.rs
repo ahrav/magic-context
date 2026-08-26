@@ -47,11 +47,13 @@ pub const MAX_BOUND_ROUTES: usize = 1024;
 
 /// Worst case for the component's route-identity map, which lives outside
 /// the supervisor's budget: [`MAX_BOUND_ROUTES`] bound identities, each a
-/// project root of up to 4096 bytes plus a session of up to 256 bytes, with
-/// 128 bytes of key overhead. Declared to the host on top of
+/// project root of up to 4096 bytes plus a session of up to 256 bytes, three
+/// provider fingerprints (bounded provider name + 64 hex bytes), and map/key
+/// overhead. Declared to the host on top of
 /// [`MAX_RETAINED_BYTES`] so the published reservation remains an actual
 /// ceiling on resident bytes.
-pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = (MAX_BOUND_ROUTES as u64) * (4096 + 256 + 128);
+pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 =
+    (MAX_BOUND_ROUTES as u64) * (4096 + 256 + 3 * (16 + 64) + 256);
 
 /// Worst case for live backend transcript capture, also outside the
 /// supervisor's budget: each of the [`MAX_BACKEND_PROCESSES`] concurrent
