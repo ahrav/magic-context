@@ -169,6 +169,12 @@ mod libproc {
     }
 }
 
+/// Entries to size the first buffer for when no size hint is available.
+/// The growth loop below still proves completeness, so this only decides
+/// how many retries a wide process costs.
+#[cfg(target_os = "macos")]
+const LIST_ENTRY_HINT: usize = 64;
+
 /// Counts fixed-size list entries returned by one `proc_pidinfo` list
 /// selector, growing the buffer until the result provably fits. Short or
 /// non-multiple results FAIL instead of dropping entries (R13).
@@ -181,11 +187,18 @@ fn count_list_entries(
 ) -> Result<u64, ObserveError> {
     use libproc::proc_pidinfo;
     let pid = i32::try_from(pid).map_err(|_| fail(counter))?;
-    let needed = unsafe { proc_pidinfo(pid, flavor, 0, std::ptr::null_mut(), 0) };
-    if needed <= 0 {
-        return Err(fail(counter));
-    }
-    let mut capacity = (needed as usize).saturating_add(16 * entry_size);
+    // A NULL buffer is a size query for PROC_PIDLISTFDS alone: XNU zeroes
+    // the required size for that flavor only, so every other list
+    // selector takes the `buffersize < size` path and returns ENOMEM.
+    // A refused probe is therefore a missing hint, not a failed
+    // observation — only a sized call below can fail the counter.
+    let probed = unsafe { proc_pidinfo(pid, flavor, 0, std::ptr::null_mut(), 0) };
+    let hint = if probed > 0 {
+        probed as usize
+    } else {
+        LIST_ENTRY_HINT.saturating_mul(entry_size)
+    };
+    let mut capacity = hint.saturating_add(16 * entry_size);
     for _ in 0..8 {
         let buffer_size = std::os::raw::c_int::try_from(capacity).map_err(|_| fail(counter))?;
         let mut buffer = vec![0u8; capacity];
