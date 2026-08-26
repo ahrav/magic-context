@@ -90,7 +90,7 @@ enum Arm {
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Load {
-    Open { rate: u64, interval_ns: u64 },
+    Open { rate: u64 },
     Closed { concurrency: usize },
 }
 
@@ -153,10 +153,10 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
     };
     let variant = variant.ok_or_else(|| "--variant is required".to_owned())?;
     let load = match (rate, concurrency) {
-        (Some(rate), None) => Load::Open {
-            rate,
-            interval_ns: perf_measurement::open_loop_interval_ns(rate)?,
-        },
+        (Some(rate), None) => {
+            perf_measurement::validate_open_loop_rate(rate)?;
+            Load::Open { rate }
+        }
         (None, Some(concurrency)) if concurrency > 0 => Load::Closed { concurrency },
         (None, Some(_)) => return Err("concurrency must be nonzero".to_owned()),
         (Some(_), Some(_)) => return Err("--rate and --concurrency are contradictory".to_owned()),
@@ -1106,14 +1106,15 @@ async fn warm(ctx: &RunContext) -> Result<(), String> {
 
 async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
     match ctx.opts.load {
-        Load::Open { rate, interval_ns } => {
+        Load::Open { rate } => {
             let offered = rate * ctx.opts.seconds;
             let start = Instant::now() + Duration::from_millis(25);
             let mut tasks = tokio::task::JoinSet::new();
             let mut send_lag_max_ns = 0;
             let mut missed_slots = 0;
             for slot in 0..offered {
-                let scheduled = start + Duration::from_nanos(slot * interval_ns);
+                let scheduled =
+                    start + Duration::from_nanos(perf_measurement::open_loop_offset_ns(slot, rate));
                 tokio::time::sleep_until((scheduled - PACING_SLACK).into()).await;
                 let mut now = Instant::now();
                 while now < scheduled {
@@ -1123,7 +1124,12 @@ async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
                 let lag =
                     u64::try_from(now.duration_since(scheduled).as_nanos()).unwrap_or(u64::MAX);
                 send_lag_max_ns = send_lag_max_ns.max(lag);
-                if lag >= interval_ns {
+                // A slot is missed when its send lag reaches the next
+                // scheduled slot; the threshold is this slot's own gap,
+                // exact for every rate rather than a global constant.
+                let slot_gap_ns = perf_measurement::open_loop_offset_ns(slot + 1, rate)
+                    - perf_measurement::open_loop_offset_ns(slot, rate);
+                if lag >= slot_gap_ns {
                     missed_slots += 1;
                 }
                 let scheduled_ns = ctx.wire.elapsed_ns().saturating_sub(lag);

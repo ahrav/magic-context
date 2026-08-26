@@ -9,8 +9,8 @@ mod perf_measurement;
 mod raw_client;
 
 use perf_measurement::{
-    fixture_workload, nearest_rank, open_loop_interval_ns, tail_publishable, LatencySummary,
-    Outcome, OutcomeCounts, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
+    fixture_workload, nearest_rank, open_loop_offset_ns, tail_publishable, validate_open_loop_rate,
+    LatencySummary, Outcome, OutcomeCounts, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
 };
 
 #[test]
@@ -112,13 +112,45 @@ fn outcome_merge_preserves_totals() {
 
 #[test]
 fn unrepresentable_offered_rate_fails_validation() {
-    assert!(open_loop_interval_ns(0).is_err(), "zero rate");
-    // A rate above 1e9/s has a sub-nanosecond interval: unrepresentable,
-    // and silently becoming unrestricted closed-loop traffic is the
-    // failure mode this guards against.
-    assert!(open_loop_interval_ns(2_000_000_000).is_err());
-    assert_eq!(open_loop_interval_ns(1_000_000_000).unwrap(), 1);
-    assert_eq!(open_loop_interval_ns(20_000).unwrap(), 50_000);
+    assert!(validate_open_loop_rate(0).is_err(), "zero rate");
+    // A rate above 1e9/s has a sub-nanosecond interval: consecutive slots
+    // would share a timestamp, and silently becoming unrestricted
+    // closed-loop traffic is the failure mode this guards against.
+    assert!(validate_open_loop_rate(2_000_000_000).is_err());
+    assert!(validate_open_loop_rate(1_000_000_000).is_ok());
+    assert!(validate_open_loop_rate(20_000).is_ok());
+    // Rates that do not divide 1e9 are representable through the exact
+    // per-slot offset schedule.
+    assert!(validate_open_loop_rate(49).is_ok());
+    assert!(validate_open_loop_rate(3000).is_ok());
+}
+
+#[test]
+fn open_loop_offsets_are_exact_and_drift_free() {
+    // Divisor rates reproduce the old fixed-interval schedule.
+    assert_eq!(open_loop_offset_ns(0, 20_000), 0);
+    assert_eq!(open_loop_offset_ns(1, 20_000), 50_000);
+    assert_eq!(open_loop_offset_ns(7, 20_000), 350_000);
+    assert_eq!(open_loop_offset_ns(1, 1_000_000_000), 1);
+
+    for rate in [49u64, 99, 148, 3000, 6000, 20_000] {
+        // The mean rate over each whole second is exact: slot `rate`
+        // lands on the second boundary with zero accumulated drift.
+        assert_eq!(open_loop_offset_ns(rate, rate), 1_000_000_000);
+        assert_eq!(open_loop_offset_ns(rate * 5, rate), 5_000_000_000);
+
+        let mut prev = 0u64;
+        for slot in 0..=rate.min(10_000) {
+            let got = open_loop_offset_ns(slot, rate);
+            // Exactly floor(slot * 1e9 / rate) against the u128 ideal:
+            // below the real-valued schedule by strictly less than 1 ns.
+            let numerator = u128::from(slot) * 1_000_000_000u128;
+            assert_eq!(u128::from(got), numerator / u128::from(rate));
+            assert!(numerator - u128::from(got) * u128::from(rate) < u128::from(rate));
+            assert!(got >= prev, "offsets must be monotonic nondecreasing");
+            prev = got;
+        }
+    }
 }
 
 #[test]

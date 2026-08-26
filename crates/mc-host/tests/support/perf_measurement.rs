@@ -150,28 +150,39 @@ impl OutcomeCounts {
     }
 }
 
-/// Validates an open-loop offered rate: the per-request interval must be a
-/// representable nonzero nanosecond count, otherwise the arm would silently
-/// degrade into unrestricted closed-loop traffic.
-pub fn open_loop_interval_ns(rate_per_sec: u64) -> Result<u64, String> {
+/// Validates an open-loop offered rate. Rejects a zero rate (no arrival
+/// process at all) and rates above 1e9/s, whose per-request spacing
+/// truncates to 0 ns: consecutive slots would share a timestamp and the
+/// arm would silently degrade into unrestricted closed-loop traffic.
+pub fn validate_open_loop_rate(rate_per_sec: u64) -> Result<(), String> {
     if rate_per_sec == 0 {
         return Err("offered rate must be nonzero".to_owned());
     }
-    // A truncated interval silently raises the actual arrival rate while
-    // every manifest retains the requested label; only exactly
-    // representable rates are honest.
-    if !1_000_000_000u64.is_multiple_of(rate_per_sec) {
+    if rate_per_sec > 1_000_000_000 {
         return Err(format!(
-            "offered rate {rate_per_sec}/s has no exact nanosecond interval; \
-             choose a rate that divides 1e9"
+            "offered rate {rate_per_sec}/s has a sub-nanosecond interval; \
+             the nanosecond schedule cannot separate consecutive slots"
         ));
     }
-    match 1_000_000_000u64.checked_div(rate_per_sec) {
-        Some(interval) if interval > 0 => Ok(interval),
-        _ => Err(format!(
-            "offered rate {rate_per_sec}/s has no representable nanosecond interval"
-        )),
-    }
+    Ok(())
+}
+
+/// Absolute nanosecond offset of `slot` in an open-loop arrival schedule
+/// at `rate_per_sec`: `floor(slot * 1e9 / rate)` computed in `u128`.
+///
+/// Each slot is placed independently against the ideal real-valued
+/// schedule, so the floor error is strictly below 1 ns per slot and never
+/// accumulates. In particular `open_loop_offset_ns(rate, rate)` is exactly
+/// 1_000_000_000: the mean offered rate over every whole second is exact
+/// for any rate, not only for divisors of 1e9. A slot's own spacing is the
+/// gap to the next slot, `offset_ns(slot + 1) - offset_ns(slot)`, which
+/// varies by at most 1 ns around the nominal interval.
+///
+/// Callers must gate the rate through [`validate_open_loop_rate`] first;
+/// a zero rate divides by zero here.
+pub fn open_loop_offset_ns(slot: u64, rate_per_sec: u64) -> u64 {
+    u64::try_from(u128::from(slot) * 1_000_000_000u128 / u128::from(rate_per_sec))
+        .expect("scheduled offset exceeds u64 nanoseconds")
 }
 
 /// True when a run has enough successful post-warmup observations to
