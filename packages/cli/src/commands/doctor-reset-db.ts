@@ -10,6 +10,11 @@
  * are on the same filesystem, so an interruption at any point leaves either
  * the original family plus a pending marker (resumable) or a complete
  * quarantine.
+ *
+ * The format classification this command acts on — and reports to the operator
+ * for confirmation — is the one taken after the first holder inspection finds
+ * no live holder. An earlier reading can be torn by a writer checkpointing
+ * mid-probe, which would otherwise quarantine a supported database.
  */
 import { chmodSync, lstatSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -48,6 +53,7 @@ type ResetDbExitCode = (typeof RESET_DB_EXIT)[keyof typeof RESET_DB_EXIT];
 interface ResetDbDeps {
     now: () => Date;
     inspectHolders: (storageDir: string) => DatabaseHolderInspection;
+    inspectFamilyState: (dbPath: string) => DirectDatabaseFamilyState;
     renameFile: typeof renameSync;
 }
 
@@ -63,6 +69,7 @@ export interface RunResetDbOptions {
 const DEFAULT_DEPS: ResetDbDeps = {
     now: () => new Date(),
     inspectHolders: defaultInspectHolders,
+    inspectFamilyState: inspectDirectDatabaseFamilyState,
     renameFile: renameSync,
 };
 
@@ -200,6 +207,7 @@ function reportSafetyRefusal(
 
 function refuseQuarantine(
     prompts: PromptIO,
+    deps: ResetDbDeps,
     dbPath: string,
     marker: DatabaseResetMarker,
     verification: ResetMarkerFamilyVerification,
@@ -236,7 +244,7 @@ function refuseQuarantine(
     prompts.log.info(
         "No file had been quarantined; the reset marker was rolled back and the family is unchanged.",
     );
-    const now = inspectDirectDatabaseFamilyState(dbPath);
+    const now = deps.inspectFamilyState(dbPath);
     if (now.state === "current") {
         prompts.log.info(
             "The database family is now the current supported format and was preserved unchanged.",
@@ -285,10 +293,10 @@ function executeQuarantine(
         const holders = inspectHoldersSafely(deps, storageDir);
         const verification = verifyResetMarkerFamily(marker);
         if (!holders.safe) {
-            return refuseQuarantine(prompts, dbPath, marker, verification, { holders });
+            return refuseQuarantine(prompts, deps, dbPath, marker, verification, { holders });
         }
         if (verification.problems.length > 0) {
-            return refuseQuarantine(prompts, dbPath, marker, verification, {
+            return refuseQuarantine(prompts, deps, dbPath, marker, verification, {
                 problems: verification.problems,
             });
         }
@@ -323,10 +331,10 @@ function executeQuarantine(
     const holders = inspectHoldersSafely(deps, storageDir);
     const verification = verifyResetMarkerFamily(marker);
     if (!holders.safe) {
-        return refuseQuarantine(prompts, dbPath, marker, verification, { holders });
+        return refuseQuarantine(prompts, deps, dbPath, marker, verification, { holders });
     }
     if (verification.problems.length > 0) {
-        return refuseQuarantine(prompts, dbPath, marker, verification, {
+        return refuseQuarantine(prompts, deps, dbPath, marker, verification, {
             problems: verification.problems,
         });
     }
@@ -368,6 +376,113 @@ async function confirmReset(
 ): Promise<boolean> {
     if (options.yes) return true;
     return prompts.confirm(message, false);
+}
+
+/** The two family states reset may abandon; every other state exits early. */
+type ResettableFamilyState = Extract<
+    DirectDatabaseFamilyState,
+    { state: "unsupported" } | { state: "corrupt" }
+>;
+
+interface ResetPlan {
+    readonly identities: DatabaseFileIdentity[];
+    readonly quarantineDirPath: string;
+}
+
+function familyIncarnation(state: ResettableFamilyState): string | null {
+    return state.state === "unsupported" ? state.databaseIncarnationId : null;
+}
+
+/** Null once the failure has been reported; the caller exits `failed`. */
+function captureResetPlan(prompts: PromptIO, deps: ResetDbDeps, dbPath: string): ResetPlan | null {
+    try {
+        return {
+            identities: captureDatabaseFamilyIdentities(dbPath),
+            quarantineDirPath: allocateQuarantineDirPath(dbPath, timestamp(deps.now())),
+        };
+    } catch (error) {
+        prompts.log.error(
+            `Could not inspect the database family safely: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        prompts.outro("Database reset failed before any file was changed");
+        return null;
+    }
+}
+
+function reportResetPlan(
+    prompts: PromptIO,
+    dbPath: string,
+    state: ResettableFamilyState,
+    plan: ResetPlan,
+): void {
+    reportPlan(
+        prompts,
+        dbPath,
+        describeFamilyState(state),
+        state.state === "unsupported" ? state.reasons : [],
+        familyIncarnation(state),
+        plan.identities,
+        plan.quarantineDirPath,
+    );
+}
+
+type ExclusivityRecheck =
+    | { readonly outcome: "resettable"; readonly state: ResettableFamilyState }
+    | { readonly outcome: "stop"; readonly code: ResetDbExitCode };
+
+/**
+ * Re-classify the family now that the holder inspection found no live holder.
+ *
+ * The first classification can be taken while a writer is still active, and it
+ * reads a probe copy whose main file and sidecars are copied as separate
+ * operations — so a checkpoint landing between those copies makes a supported
+ * family read as unsupported or corrupt. That reading is inherently racy; one
+ * taken after the holder inspection is not. The later reading is therefore the
+ * one this command acts on, and the plan reported to the operator below (the
+ * text the confirmation prompt refers to) is built from it, so confirmation
+ * and quarantine can never describe different classifications.
+ *
+ * The re-check itself cannot damage the family: classification only reads
+ * pragmas and schema from a private throwaway copy.
+ */
+function recheckUnderExclusivity(
+    prompts: PromptIO,
+    deps: ResetDbDeps,
+    dbPath: string,
+    reported: ResettableFamilyState,
+): ExclusivityRecheck {
+    const state = deps.inspectFamilyState(dbPath);
+    if (state.state === "current") {
+        prompts.log.error(
+            `Refusing to reset: re-checked with no database holder present, this family is the current supported format (database incarnation ${state.databaseIncarnationId}). The earlier "${describeFamilyState(reported)}" reading was taken while the family could still change.`,
+        );
+        prompts.log.info("Nothing was changed and no reset marker was published.");
+        prompts.outro("Database reset refused");
+        return { outcome: "stop", code: RESET_DB_EXIT.refused };
+    }
+    if (state.state === "pristine") {
+        prompts.log.info(
+            "Nothing to reset: re-checked with no database holder present, no database family exists at this path.",
+        );
+        prompts.outro("Database reset not needed");
+        return { outcome: "stop", code: RESET_DB_EXIT.ok };
+    }
+    if (state.state === "reset-pending") {
+        prompts.log.error(
+            "Refusing to reset: another reset published a marker for this family while this one was preparing.",
+        );
+        prompts.log.info(
+            `Marker: ${databaseResetMarkerPath(dbPath)}. Nothing was changed. Re-run \`${DATABASE_RESET_COMMAND}\` to inspect that reset and complete or roll it back.`,
+        );
+        prompts.outro("Database reset refused");
+        return { outcome: "stop", code: RESET_DB_EXIT.refused };
+    }
+    if (describeFamilyState(state) !== describeFamilyState(reported)) {
+        prompts.log.warn(
+            `Re-checked with no database holder present: ${describeFamilyState(state)}. Acting on this reading, not the earlier one.`,
+        );
+    }
+    return { outcome: "resettable", state };
 }
 
 async function recoverPendingReset(
@@ -442,7 +557,7 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
     prompts.intro("Magic Context — Reset unsupported database");
     prompts.log.info(`Database: ${dbPath}`);
 
-    const state = inspectDirectDatabaseFamilyState(dbPath);
+    const state = deps.inspectFamilyState(dbPath);
     prompts.log.info(`State: ${describeFamilyState(state)}`);
 
     if (state.state === "reset-pending") {
@@ -461,31 +576,10 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
         return RESET_DB_EXIT.refused;
     }
 
-    let identities: DatabaseFileIdentity[];
-    let quarantineDirPath: string;
-    try {
-        identities = captureDatabaseFamilyIdentities(dbPath);
-        quarantineDirPath = allocateQuarantineDirPath(dbPath, timestamp(deps.now()));
-    } catch (error) {
-        prompts.log.error(
-            `Could not inspect the database family safely: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        prompts.outro("Database reset failed before any file was changed");
-        return RESET_DB_EXIT.failed;
-    }
-    const databaseIncarnationId =
-        state.state === "unsupported" ? state.databaseIncarnationId : null;
-    reportPlan(
-        prompts,
-        dbPath,
-        describeFamilyState(state),
-        state.state === "unsupported" ? state.reasons : [],
-        databaseIncarnationId,
-        identities,
-        quarantineDirPath,
-    );
-
     if (options.dryRun) {
+        const preview = captureResetPlan(prompts, deps, dbPath);
+        if (preview === null) return RESET_DB_EXIT.failed;
+        reportResetPlan(prompts, dbPath, state, preview);
         prompts.log.info("Dry run: no file was changed and no reset marker was published.");
         prompts.outro("Database reset preview complete");
         return RESET_DB_EXIT.ok;
@@ -497,6 +591,14 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
         prompts.outro("Database reset refused; the database family was not modified");
         return RESET_DB_EXIT.refused;
     }
+
+    const recheck = recheckUnderExclusivity(prompts, deps, dbPath, state);
+    if (recheck.outcome === "stop") return recheck.code;
+    const confirmedState = recheck.state;
+
+    const plan = captureResetPlan(prompts, deps, dbPath);
+    if (plan === null) return RESET_DB_EXIT.failed;
+    reportResetPlan(prompts, dbPath, confirmedState, plan);
 
     const confirmed = await confirmReset(
         prompts,
@@ -512,9 +614,9 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
     const marker = buildDatabaseResetMarker({
         dbPath,
         createdAtMs: deps.now().getTime(),
-        databaseIncarnationId,
-        quarantineDirPath,
-        fileIdentities: identities,
+        databaseIncarnationId: familyIncarnation(confirmedState),
+        quarantineDirPath: plan.quarantineDirPath,
+        fileIdentities: plan.identities,
     });
     try {
         writeDatabaseResetMarker(marker);

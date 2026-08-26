@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
+    copyFileSync,
     existsSync,
     mkdtempSync,
     readdirSync,
@@ -99,6 +100,19 @@ function seedUnsupportedDirect(dbPath: string): string {
         nowMs: 42,
     });
     db.close();
+    return marker.databaseIncarnationId;
+}
+
+/** Same family, checkpointed so the main file alone carries the whole schema. */
+function seedCheckpointedUnsupportedDirect(dbPath: string): string {
+    const { db, marker } = createDirectTestDatabase({
+        path: dbPath,
+        components: [CURRENT_SCHEMA_COMPONENTS[0]],
+        nowMs: 42,
+    });
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.close();
+    for (const suffix of ["-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
     return marker.databaseIncarnationId;
 }
 
@@ -464,5 +478,203 @@ describe("doctor reset-db U11 scenarios", () => {
         } finally {
             fresh.db.close();
         }
+    });
+
+    it("scenario 10: a family that only looks unsupported before exclusivity is preserved", async () => {
+        // Classification probes a copy of the family whose main file and
+        // sidecars are copied separately, so a live writer checkpointing between
+        // those copies makes a supported family read as unsupported. Once the
+        // holder inspection reports no holder, the family must be re-checked:
+        // acting on the earlier reading would quarantine a supported database.
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "context.db");
+        const stash = tempStorage();
+        const seeded = createDirectTestDatabase({ path: dbPath });
+        const incarnation = seeded.marker.databaseIncarnationId;
+        seeded.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        seeded.db.close();
+        const familyBytes = new Map<string, Buffer>();
+        for (const suffix of ["", "-wal", "-shm"]) {
+            if (existsSync(`${dbPath}${suffix}`)) {
+                familyBytes.set(suffix, readFileSync(`${dbPath}${suffix}`));
+                copyFileSync(`${dbPath}${suffix}`, join(stash, `context.db${suffix}`));
+            }
+        }
+        // Leave the torn shape a mid-copy checkpoint produces: a main file with
+        // no schema plus the sidecars the probe copied after the checkpoint.
+        writeFileSync(dbPath, Buffer.alloc(0));
+        writeFileSync(`${dbPath}-wal`, Buffer.alloc(0));
+        expect(inspectDirectDatabaseFamilyState(dbPath)).toMatchObject({ state: "unsupported" });
+
+        let holderInspections = 0;
+        const prompts = new MockPrompts([true]);
+        const code = await runResetDb({
+            dbPath,
+            storageDir,
+            prompts,
+            deps: {
+                inspectHolders: () => {
+                    holderInspections += 1;
+                    // The writer exits: its committed contents are back in the
+                    // family before exclusivity is reported.
+                    if (holderInspections === 1) {
+                        for (const suffix of ["", "-wal", "-shm"]) {
+                            const source = join(stash, `context.db${suffix}`);
+                            if (existsSync(source)) copyFileSync(source, `${dbPath}${suffix}`);
+                        }
+                    }
+                    return safeHolders();
+                },
+            },
+        });
+
+        expect(code).toBe(RESET_DB_EXIT.refused);
+        expect(inspectDirectDatabaseFamilyState(dbPath)).toEqual({
+            state: "current",
+            databaseIncarnationId: incarnation,
+        });
+        for (const [suffix, bytes] of familyBytes) {
+            expect(readFileSync(`${dbPath}${suffix}`)).toEqual(bytes);
+        }
+        // Aborted before publication, so FINDING 1's cleanup has nothing to do:
+        // no marker may remain to block the next open, and nothing was moved.
+        expect(existsSync(databaseResetMarkerPath(dbPath))).toBe(false);
+        expect(readdirSync(storageDir).some((name) => name.includes(".mc-quarantine-"))).toBe(
+            false,
+        );
+        const output = prompts.messages.join("\n");
+        expect(output).toContain("current supported format");
+        expect(output).toContain("no reset marker was published");
+        // The operator is never asked to confirm a classification the command
+        // does not act on.
+        expect(output).not.toContain("confirm:");
+        expect(holderInspections).toBe(1);
+    });
+
+    it("scenario 11: the confirmation describes the re-checked classification", async () => {
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "context.db");
+        seedFullCorruptFamily(dbPath);
+        const incarnation = seedCheckpointedUnsupportedDirect(join(storageDir, "swapped.db"));
+        const prompts = new MockPrompts([true]);
+        let holderInspections = 0;
+        let swapped = { dev: 0, ino: 0 };
+
+        const code = await runResetDb({
+            dbPath,
+            storageDir,
+            prompts,
+            deps: {
+                inspectHolders: () => {
+                    holderInspections += 1;
+                    // Between the first reading and exclusivity the family is
+                    // replaced by a different unsupported family: still
+                    // resettable, but a different verdict and incarnation.
+                    if (holderInspections === 1) {
+                        for (const suffix of ["-wal", "-shm", "-journal"]) {
+                            rmSync(`${dbPath}${suffix}`, { force: true });
+                        }
+                        renameSync(join(storageDir, "swapped.db"), dbPath);
+                        swapped = statSync(dbPath);
+                    }
+                    return safeHolders();
+                },
+            },
+        });
+
+        expect(code).toBe(RESET_DB_EXIT.ok);
+        const output = prompts.messages.join("\n");
+        const confirmAt = output.indexOf("confirm:");
+        expect(confirmAt).toBeGreaterThan(-1);
+        const beforeConfirmation = output.slice(0, confirmAt);
+        // The earlier reading is logged as what it was, then explicitly
+        // superseded -- never silently swapped for a different verdict.
+        expect(beforeConfirmation).toContain("State: corrupt unknown format");
+        const supersededAt = beforeConfirmation.indexOf(
+            "Re-checked with no database holder present: unsupported (unsupported). Acting on this reading, not the earlier one.",
+        );
+        const planAt = beforeConfirmation.indexOf("Database family:");
+        expect(supersededAt).toBeGreaterThan(beforeConfirmation.indexOf("State: corrupt"));
+        expect(planAt).toBeGreaterThan(supersededAt);
+        // Exactly one plan is reported, and it is the re-checked classification
+        // the command goes on to act upon.
+        expect(beforeConfirmation.split("Database family:").length - 1).toBe(1);
+        expect(beforeConfirmation).toContain("Database family: unsupported (unsupported)");
+        expect(beforeConfirmation).toContain(`Database incarnation: ${incarnation}`);
+        // File identities are re-captured with the classification, so the plan
+        // describes the family that is actually about to move.
+        expect(beforeConfirmation).toContain(
+            `main: ${dbPath} (dev=${swapped.dev} inode=${swapped.ino}`,
+        );
+        // What was quarantined is what the confirmed plan described.
+        const quarantined = readdirSync(quarantineDir(storageDir)).sort();
+        expect(quarantined).toEqual(["context.db", "context.db.mc-reset"]);
+    });
+
+    it("scenario 12: a reset marker published by a rival reset is never disturbed", async () => {
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "context.db");
+        seedUnsupportedDirect(dbPath);
+        const rivalQuarantine = `${dbPath}.mc-quarantine-rival`;
+
+        // A rival publishes its marker between the first reading and exclusivity.
+        const beforeExclusivity = await runResetDb({
+            dbPath,
+            storageDir,
+            prompts: new MockPrompts([true]),
+            deps: {
+                inspectHolders: () => {
+                    if (!existsSync(databaseResetMarkerPath(dbPath))) {
+                        writeDatabaseResetMarker(
+                            buildDatabaseResetMarker({
+                                dbPath,
+                                createdAtMs: 5,
+                                databaseIncarnationId: null,
+                                quarantineDirPath: rivalQuarantine,
+                                fileIdentities: [],
+                            }),
+                        );
+                    }
+                    return safeHolders();
+                },
+            },
+        });
+        expect(beforeExclusivity).toBe(RESET_DB_EXIT.refused);
+        const rivalBytes = readFileSync(databaseResetMarkerPath(dbPath));
+        rmSync(databaseResetMarkerPath(dbPath));
+
+        // A rival publishes after exclusivity, while this run builds its marker:
+        // `wx` fails, so publication touches nothing it did not create.
+        let clocks = 0;
+        const prompts = new MockPrompts([true]);
+        const afterExclusivity = await runResetDb({
+            dbPath,
+            storageDir,
+            prompts,
+            deps: {
+                inspectHolders: safeHolders,
+                now: () => {
+                    clocks += 1;
+                    if (clocks === 2) {
+                        writeDatabaseResetMarker(
+                            buildDatabaseResetMarker({
+                                dbPath,
+                                createdAtMs: 5,
+                                databaseIncarnationId: null,
+                                quarantineDirPath: rivalQuarantine,
+                                fileIdentities: [],
+                            }),
+                        );
+                    }
+                    return new Date("2026-08-23T07:40:00.000Z");
+                },
+            },
+        });
+        expect(afterExclusivity).toBe(RESET_DB_EXIT.failed);
+        expect(prompts.messages.join("\n")).toContain("Could not publish the reset marker");
+        expect(readFileSync(databaseResetMarkerPath(dbPath))).toEqual(rivalBytes);
+        expect(readdirSync(storageDir).some((name) => name.includes(".mc-quarantine-2026"))).toBe(
+            false,
+        );
     });
 });

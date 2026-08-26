@@ -28,6 +28,7 @@ import {
     openSync,
     readFileSync,
     type Stats,
+    unlinkSync,
     writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -509,22 +510,106 @@ export function buildDatabaseResetMarker(input: {
 }
 
 /**
- * `wx` prevents concurrent overwrite. fsync makes successful publication the
- * crash boundary after which recovery may trust marker presence.
+ * The filesystem calls marker publication makes, injectable so tests can drive
+ * the partial-publication cleanup path (a short write, a failed fsync, a failed
+ * chmod) that is otherwise unreachable from a healthy filesystem.
  */
-export function writeDatabaseResetMarker(marker: DatabaseResetMarker): void {
-    const path = databaseResetMarkerPath(marker.dbPath);
-    let fd: number | null = null;
-    try {
-        fd = openSync(path, "wx", 0o600);
-        writeSync(fd, `${JSON.stringify(marker)}\n`, undefined, "utf8");
-        fsyncSync(fd);
-        chmodSync(path, 0o600);
-    } catch (error) {
-        if (fd !== null) closeSync(fd);
-        throw error;
+export interface ResetMarkerPublicationFs {
+    readonly openSync: (path: string, flags: string, mode: number) => number;
+    readonly writeSync: (fd: number, buffer: Buffer, offset: number, length: number) => number;
+    readonly fsyncSync: (fd: number) => void;
+    readonly closeSync: (fd: number) => void;
+    readonly chmodSync: (path: string, mode: number) => void;
+    readonly unlinkSync: (path: string) => void;
+}
+
+const defaultResetMarkerPublicationFs: ResetMarkerPublicationFs = {
+    openSync,
+    writeSync,
+    fsyncSync,
+    closeSync,
+    chmodSync,
+    unlinkSync,
+};
+
+/**
+ * `writeSync` may report fewer bytes than requested, so one call is not a
+ * write. Resume from the reported count until the whole marker has landed, and
+ * fail closed if a call reports no progress rather than spinning.
+ */
+function writeAllResetMarkerBytes(fs: ResetMarkerPublicationFs, fd: number, bytes: Buffer): void {
+    let written = 0;
+    while (written < bytes.length) {
+        const count = fs.writeSync(fd, bytes, written, bytes.length - written);
+        if (!Number.isInteger(count) || count <= 0) {
+            throw new Error(
+                `reset marker write made no progress after ${written} of ${bytes.length} bytes`,
+            );
+        }
+        written += count;
     }
-    closeSync(fd);
+}
+
+/** Returns null once no marker file remains, else why cleanup could not finish. */
+function discardPartialResetMarker(
+    fs: ResetMarkerPublicationFs,
+    fd: number,
+    path: string,
+): string | null {
+    try {
+        fs.closeSync(fd);
+    } catch {
+        // Retrying a failed close is unsafe — the descriptor number may already
+        // be recycled — and its error is not the cause the caller needs. The
+        // file removal below is the cleanup that decides whether the family
+        // stays openable.
+    }
+    try {
+        fs.unlinkSync(path);
+        return null;
+    } catch (error) {
+        if (isMissingPathError(error)) return null;
+        return error instanceof Error ? error.message : String(error);
+    }
+}
+
+/**
+ * Publish the reset marker as an all-or-nothing artifact.
+ *
+ * `wx` is O_CREAT|O_EXCL, so a successful open proves THIS call created the
+ * file: an existing marker belongs to a concurrent or prior reset and the open
+ * fails without touching it. That is what makes the failure path safe to
+ * unlink — it can only remove a file this call brought into existence and
+ * never published. A failed open is left strictly alone.
+ *
+ * Publication is complete only once every byte is written and fsynced. Mere
+ * presence of the path refuses database initialization, and a truncated marker
+ * reads as malformed, which recovery treats as blocking rather than resumable,
+ * so a half-written marker must leave no file at all. Successful fsync is the
+ * crash boundary after which recovery may trust marker presence; a close
+ * failure past that point leaves a valid, resumable pending marker.
+ */
+export function writeDatabaseResetMarker(
+    marker: DatabaseResetMarker,
+    fs: ResetMarkerPublicationFs = defaultResetMarkerPublicationFs,
+): void {
+    const path = databaseResetMarkerPath(marker.dbPath);
+    const fd = fs.openSync(path, "wx", 0o600);
+    try {
+        writeAllResetMarkerBytes(fs, fd, Buffer.from(`${JSON.stringify(marker)}\n`, "utf8"));
+        fs.fsyncSync(fd);
+        fs.chmodSync(path, 0o600);
+    } catch (error) {
+        const cleanupProblem = discardPartialResetMarker(fs, fd, path);
+        if (cleanupProblem === null) throw error;
+        // Cleanup failed as well, so a partial marker really does remain and
+        // only the operator can clear it. Surface that without losing the cause.
+        throw new Error(
+            `${error instanceof Error ? error.message : String(error)} (the partial reset marker ${path} could not be removed: ${cleanupProblem}; remove it manually before reopening the database)`,
+            { cause: error },
+        );
+    }
+    fs.closeSync(fd);
 }
 
 export type DatabaseResetMarkerRead =

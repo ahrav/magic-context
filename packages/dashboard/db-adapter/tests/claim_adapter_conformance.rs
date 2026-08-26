@@ -1276,3 +1276,295 @@ fn direct_format_verification_covers_every_registered_object_type() {
         "a dropped index must be refused by name"
     );
 }
+
+/// Every way a claim can be hard-hidden from the read path, so the differential
+/// assertions below exercise each clause of the visibility predicate rather than
+/// whichever one happens to be cheapest to construct.
+const HIDDEN_CLAIMS: [(&str, &str, &str, HiddenBy); 6] = [
+    (
+        "mcm_aaaa000000000000000000000000000a",
+        "FACT",
+        "active",
+        HiddenBy::Quarantined,
+    ),
+    (
+        "mcm_aaaa000000000000000000000000000b",
+        "RULE",
+        "archived",
+        HiddenBy::Rejected,
+    ),
+    (
+        "mcm_aaaa000000000000000000000000000c",
+        "FACT",
+        "active",
+        HiddenBy::Contradicted,
+    ),
+    (
+        "mcm_aaaa000000000000000000000000000d",
+        "FACT",
+        "retired",
+        HiddenBy::Expired,
+    ),
+    (
+        // The only claim in its category, so a leaked count would advertise a
+        // filter whose every member the list withholds.
+        "mcm_aaaa000000000000000000000000000e",
+        "PREFERENCE",
+        "active",
+        HiddenBy::HardHidden,
+    ),
+    (
+        "mcm_aaaa000000000000000000000000000f",
+        "FACT",
+        "active",
+        HiddenBy::PolicyMissing,
+    ),
+];
+
+#[derive(Copy, Clone)]
+enum HiddenBy {
+    Quarantined,
+    Rejected,
+    Contradicted,
+    Expired,
+    HardHidden,
+    PolicyMissing,
+}
+
+fn current_revision(conn: &Connection, public_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT claim.current_revision_id FROM claims claim \
+         JOIN claim_public_ids public ON public.claim_id = claim.id \
+         WHERE public.public_id = ?1",
+        [public_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// Seeds a claim the read path refuses to disclose, hidden by exactly one clause
+/// of `claim_is_explicitly_visible`.
+fn seed_hidden_claim(
+    conn: &Connection,
+    public_id: &str,
+    category: &str,
+    lifecycle: &str,
+    hidden_by: HiddenBy,
+) {
+    seed_claim(
+        conn,
+        public_id,
+        &format!("hidden {public_id}"),
+        category,
+        lifecycle,
+    );
+    let revision_id = current_revision(conn, public_id);
+    let disposition = |disposition: &str| {
+        conn.execute(
+            "INSERT INTO claim_disposition_events \
+             (revision_id, project_id, disposition, action, reason, actor, policy_version, recorded_at) \
+             VALUES (?1, 1, ?2, 'assert', 'test', 'test', 1, 1)",
+            params![revision_id, disposition],
+        )
+        .unwrap();
+    };
+    match hidden_by {
+        HiddenBy::Quarantined => disposition("quarantined"),
+        HiddenBy::Rejected => disposition("rejected"),
+        HiddenBy::Contradicted => {
+            conn.execute(
+                "INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at) \
+                 VALUES ('contradicts', ?1, ?1, 1)",
+                [revision_id],
+            )
+            .unwrap();
+        }
+        HiddenBy::Expired => {
+            conn.execute(
+                "UPDATE claim_memory_revision_attributes SET expires_at = 1 WHERE revision_id = ?1",
+                [revision_id],
+            )
+            .unwrap();
+        }
+        HiddenBy::HardHidden => {
+            conn.execute(
+                "UPDATE claim_effective_policy SET hard_hidden = 1 WHERE revision_id = ?1",
+                [revision_id],
+            )
+            .unwrap();
+        }
+        // No effective-policy row at all: the read path fails closed, and a
+        // summary that joins optimistically would count the claim as eligible.
+        HiddenBy::PolicyMissing => {
+            conn.execute(
+                "DELETE FROM claim_effective_policy WHERE revision_id = ?1",
+                [revision_id],
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// The differential gate over the two implementations that must agree: the
+/// summary `read_claim_memory_stats` publishes and the list
+/// `read_claim_memories` actually returns. Asserted for the total, for each
+/// lifecycle bucket the filter offers, and for every category count, under both
+/// the project-scoped and the global (`None`) forms. Any future divergence in
+/// how one of them decides visibility fails here rather than leaking a
+/// hidden-claim count into the Memories header.
+fn assert_stats_match_visible_claims(conn: &Connection, project: Option<&str>) {
+    let listed = |lifecycle: Option<&str>| {
+        claim_adapter::read_claim_memories(conn, project, lifecycle, None, None, 1_000_000, 0)
+            .expect("read claims")
+            .claims
+    };
+    let stats = claim_adapter::read_claim_memory_stats(conn, project).expect("read stats");
+    let visible = listed(None);
+    let scope = project.unwrap_or("<global>");
+    assert_eq!(
+        stats.total,
+        visible.len() as i64,
+        "{scope}: stats.total must count exactly the claims the read path returns"
+    );
+    for (bucket, count) in [
+        ("active", stats.active),
+        ("archived", stats.archived),
+        ("retired", stats.retired),
+    ] {
+        assert_eq!(
+            count,
+            listed(Some(bucket)).len() as i64,
+            "{scope}: stats.{bucket} must match the {bucket} claims the read path returns"
+        );
+    }
+    assert_eq!(
+        stats.active + stats.archived + stats.retired,
+        stats.total,
+        "{scope}: the lifecycle buckets must partition the total"
+    );
+
+    let mut expected: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+    for claim in &visible {
+        *expected.entry(claim.category.as_str()).or_default() += 1;
+    }
+    let reported: std::collections::BTreeMap<&str, i64> = stats
+        .categories
+        .iter()
+        .map(|entry| (entry.category.as_str(), entry.count))
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "{scope}: every category count must be reconcilable with the visible list"
+    );
+    // Ordering the category filter renders in: descending count, then category.
+    let mut ordered = stats.categories.clone();
+    ordered.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.category.cmp(&right.category))
+    });
+    assert_eq!(
+        stats
+            .categories
+            .iter()
+            .map(|entry| (entry.category.clone(), entry.count))
+            .collect::<Vec<_>>(),
+        ordered
+            .iter()
+            .map(|entry| (entry.category.clone(), entry.count))
+            .collect::<Vec<_>>(),
+        "{scope}: categories must stay ordered by descending count then category"
+    );
+}
+
+#[test]
+fn memory_statistics_count_only_claims_the_read_path_discloses() {
+    let conn = test_db();
+    seed_claim(&conn, CLAIM_A, "visible active fact", "FACT", "active");
+    seed_claim(&conn, CLAIM_B, "visible archived rule", "RULE", "archived");
+    for (public_id, category, lifecycle, hidden_by) in HIDDEN_CLAIMS {
+        seed_hidden_claim(&conn, public_id, category, lifecycle, hidden_by);
+    }
+
+    // Eight heads exist; the read path discloses the two visible ones.
+    assert_eq!(
+        scalar(&conn, "SELECT COUNT(*) FROM claim_memory_current_heads"),
+        8
+    );
+    let stats = claim_adapter::read_claim_memory_stats(&conn, Some(PROJECT)).unwrap();
+    assert_eq!(
+        (stats.total, stats.active, stats.archived, stats.retired),
+        (2, 1, 1, 0),
+        "a head row is not a disclosable claim"
+    );
+    // `PREFERENCE` exists only as a hard-hidden claim, so it must not be offered
+    // as a filter at all.
+    assert_eq!(
+        stats
+            .categories
+            .iter()
+            .map(|entry| (entry.category.as_str(), entry.count))
+            .collect::<Vec<_>>(),
+        vec![("FACT", 1), ("RULE", 1)]
+    );
+
+    assert_stats_match_visible_claims(&conn, Some(PROJECT));
+    assert_stats_match_visible_claims(&conn, None);
+
+    // An unresolvable project filter still summarizes nothing, and the global
+    // form still spans every project.
+    let missing =
+        claim_adapter::read_claim_memory_stats(&conn, Some("git:no-such-project")).unwrap();
+    assert_eq!(
+        (
+            missing.total,
+            missing.active,
+            missing.archived,
+            missing.retired
+        ),
+        (0, 0, 0, 0)
+    );
+    assert!(missing.categories.is_empty());
+    conn.execute(
+        "INSERT INTO projects (id, canonical_identity, created_at) VALUES (2, 'git:second', 1)",
+        [],
+    )
+    .unwrap();
+    let elsewhere = "mcm_bbbb0000000000000000000000000001";
+    seed_claim(&conn, elsewhere, "other project fact", "IDIOM", "active");
+    conn.execute(
+        "UPDATE claims SET project_id = 2 WHERE id = \
+         (SELECT claim_id FROM claim_public_ids WHERE public_id = ?1)",
+        [elsewhere],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE claim_memory_current_heads SET project_id = 2 WHERE claim_id = \
+         (SELECT claim_id FROM claim_public_ids WHERE public_id = ?1)",
+        [elsewhere],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE claim_memory_revision_attributes SET project_id = 2 WHERE claim_id = \
+         (SELECT claim_id FROM claim_public_ids WHERE public_id = ?1)",
+        [elsewhere],
+    )
+    .unwrap();
+    assert_eq!(
+        claim_adapter::read_claim_memory_stats(&conn, Some(PROJECT))
+            .unwrap()
+            .total,
+        2,
+        "a project-scoped summary must not reach across projects"
+    );
+    assert_eq!(
+        claim_adapter::read_claim_memory_stats(&conn, None)
+            .unwrap()
+            .total,
+        3,
+        "the global summary must span every project"
+    );
+    assert_stats_match_visible_claims(&conn, Some(PROJECT));
+    assert_stats_match_visible_claims(&conn, None);
+}

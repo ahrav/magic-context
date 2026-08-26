@@ -838,25 +838,72 @@ fn hydrate_claim(conn: &Connection, public_claim_id: &str) -> AdapterResult<Clai
     })
 }
 
-fn claim_is_explicitly_visible(claim: &ClaimMemory, now_ms: i64) -> bool {
-    let dispositions = &claim.policy.dispositions;
-    claim
-        .expires_at
-        .is_none_or(|expires_at| expires_at > now_ms)
-        && claim.policy.explicit_eligible
-        && !claim.policy.hard_hidden
+/// The single authority on whether a claim may be disclosed to an explicit
+/// reader. It takes the facts it decides on rather than a whole `ClaimMemory`,
+/// so a caller that only needs the verdict — the statistics aggregation — can
+/// reach it without paying for evidence, applicability, telemetry and tokens.
+/// Every surface that exposes a claim, or a number derived from one, routes
+/// through here; a second implementation of these clauses is how hidden claims
+/// leak into a count that no visible row explains.
+fn claim_is_explicitly_visible(
+    expires_at: Option<i64>,
+    policy: &ClaimPolicyView,
+    now_ms: i64,
+) -> bool {
+    let dispositions = &policy.dispositions;
+    expires_at.is_none_or(|expires_at| expires_at > now_ms)
+        && policy.explicit_eligible
+        && !policy.hard_hidden
         && !dispositions.contradicted
         && !dispositions.quarantined
         && !dispositions.rejected
 }
 
-fn candidate_public_ids(
+/// Projects a hydrated claim onto the facts above. Used by every path that
+/// returns claims rather than a summary of them.
+fn claim_memory_is_explicitly_visible(claim: &ClaimMemory, now_ms: i64) -> bool {
+    claim_is_explicitly_visible(claim.expires_at, &claim.policy, now_ms)
+}
+
+/// Decides visibility for one revision without hydrating it. `read_policy`
+/// supplies five of the six facts, so the fail-closed default for a missing
+/// policy row and the latest-event-wins disposition rules stay in one place;
+/// `expires_at` is read from the same attributes row `hydrate_claim` reads, and
+/// like that path a revision with no attributes row is an error, not a hidden
+/// claim.
+fn revision_is_explicitly_visible(
+    conn: &Connection,
+    revision_id: i64,
+    now_ms: i64,
+) -> AdapterResult<bool> {
+    let expires_at: Option<i64> = sql(conn.query_row(
+        "SELECT expires_at FROM claim_memory_revision_attributes WHERE revision_id = ?1",
+        [revision_id],
+        |row| row.get(0),
+    ))?;
+    let policy = read_policy(conn, revision_id)?;
+    Ok(claim_is_explicitly_visible(expires_at, &policy, now_ms))
+}
+
+/// One candidate head row. The read and statistics paths share this shape so
+/// they provably enumerate the same rows before visibility is decided: the
+/// lifecycle state and category are the head columns the filters above match
+/// on, which is what makes a count reconcile with the list a filter produces.
+struct ClaimCandidate {
+    public_id: String,
+    project_id: i64,
+    revision_id: i64,
+    lifecycle_state: String,
+    category: String,
+}
+
+fn claim_candidates(
     conn: &Connection,
     project: Option<&str>,
     lifecycle: Option<&str>,
     category: Option<&str>,
     search: Option<&str>,
-) -> AdapterResult<Vec<(String, i64)>> {
+) -> AdapterResult<Vec<ClaimCandidate>> {
     let mut conditions = Vec::new();
     let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(project) = project {
@@ -894,7 +941,8 @@ fn candidate_public_ids(
         format!("WHERE {}", conditions.join(" AND "))
     };
     let query = format!(
-        "SELECT public.public_id, claim.project_id \
+        "SELECT public.public_id, claim.project_id, claim.current_revision_id, \
+                head.lifecycle_state, head.category \
          FROM claim_memory_current_heads head \
          JOIN claims claim ON claim.id = head.claim_id \
          JOIN claim_public_ids public ON public.claim_id = claim.id \
@@ -905,7 +953,15 @@ fn candidate_public_ids(
     let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(Box::as_ref).collect();
     let mut statement = sql(conn.prepare(&query))?;
     sql(statement
-        .query_map(refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map(refs.as_slice(), |row| {
+            Ok(ClaimCandidate {
+                public_id: row.get(0)?,
+                project_id: row.get(1)?,
+                revision_id: row.get(2)?,
+                lifecycle_state: row.get(3)?,
+                category: row.get(4)?,
+            })
+        })
         .and_then(|rows| rows.collect()))
 }
 
@@ -924,13 +980,13 @@ pub fn read_claim_memories(
     }
     sql(conn.execute_batch("BEGIN DEFERRED"))?;
     let hydrated = (|| {
-        let candidates = candidate_public_ids(conn, project, lifecycle, category, search)?;
+        let candidates = claim_candidates(conn, project, lifecycle, category, search)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let claims = candidates
             .iter()
-            .map(|(public_id, _)| hydrate_claim(conn, public_id))
+            .map(|candidate| hydrate_claim(conn, &candidate.public_id))
             .filter_map(|claim| match claim {
-                Ok(claim) if claim_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
+                Ok(claim) if claim_memory_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
@@ -939,7 +995,7 @@ pub fn read_claim_memories(
             .collect::<AdapterResult<Vec<_>>>()?;
         let project_ids = candidates
             .iter()
-            .map(|(_, project_id)| *project_id)
+            .map(|candidate| candidate.project_id)
             .collect::<Vec<_>>();
         let vector = read_snapshot_vector(conn, &project_ids)?;
         Ok((claims, project_ids, vector))
@@ -971,82 +1027,89 @@ pub fn read_claim_memories(
     })
 }
 
+/// Summarizes exactly the claims `read_claim_memories` would disclose.
+///
+/// The counts drive a header and a category filter, so they aggregate over the
+/// same candidate rows the read path enumerates and admit a row only if
+/// `claim_is_explicitly_visible` accepts it. Counting head rows directly would
+/// publish expired, rejected, quarantined, contradicted and hard-hidden claims
+/// as totals no visible row explains, and would offer a category filter whose
+/// only members the list withholds.
+///
+/// Deciding visibility costs a handful of point lookups per candidate rather
+/// than one aggregate, so the pass runs inside a deferred read transaction: the
+/// four counts and the histogram then describe one snapshot instead of drifting
+/// against concurrent writers across many more statements than before.
 pub fn read_claim_memory_stats(
     conn: &Connection,
     project: Option<&str>,
 ) -> AdapterResult<ClaimMemoryStats> {
-    let project_id = match project {
-        Some(identity) => sql(conn
+    let zeros = || ClaimMemoryStats {
+        total: 0,
+        active: 0,
+        archived: 0,
+        retired: 0,
+        categories: Vec::new(),
+    };
+    // A project filter that names no project summarizes nothing, and resolving
+    // it up front keeps that answer free of any candidate scan.
+    if let Some(identity) = project {
+        let resolved: Option<i64> = sql(conn
             .query_row(
                 "SELECT id FROM projects WHERE canonical_identity = ?1",
                 [identity],
-                |row| row.get::<_, i64>(0),
+                |row| row.get(0),
             )
-            .optional())?,
-        None => None,
-    };
-    if project.is_some() && project_id.is_none() {
-        return Ok(ClaimMemoryStats {
-            total: 0,
-            active: 0,
-            archived: 0,
-            retired: 0,
-            categories: Vec::new(),
-        });
-    }
-    let predicate = if project_id.is_some() {
-        " WHERE project_id = ?1"
-    } else {
-        ""
-    };
-    let count = |state: Option<&str>| -> AdapterResult<i64> {
-        let state_predicate = match (project_id, state) {
-            (Some(_), Some(_)) => " AND lifecycle_state = ?2",
-            (None, Some(_)) => " WHERE lifecycle_state = ?1",
-            _ => "",
-        };
-        let query =
-            format!("SELECT COUNT(*) FROM claim_memory_current_heads{predicate}{state_predicate}");
-        match (project_id, state) {
-            (Some(project_id), Some(state)) => {
-                sql(conn.query_row(&query, params![project_id, state], |row| row.get(0)))
-            }
-            (Some(project_id), None) => sql(conn.query_row(&query, [project_id], |row| row.get(0))),
-            (None, Some(state)) => sql(conn.query_row(&query, [state], |row| row.get(0))),
-            (None, None) => sql(conn.query_row(&query, [], |row| row.get(0))),
+            .optional())?;
+        if resolved.is_none() {
+            return Ok(zeros());
         }
-    };
-    let category_query = format!(
-        "SELECT category, COUNT(*) FROM claim_memory_current_heads{predicate} \
-         GROUP BY category ORDER BY COUNT(*) DESC, category"
-    );
-    let mut statement = sql(conn.prepare(&category_query))?;
-    let categories = if let Some(project_id) = project_id {
-        sql(statement
-            .query_map([project_id], |row| {
-                Ok(ClaimCategoryCount {
-                    category: row.get(0)?,
-                    count: row.get(1)?,
-                })
-            })
-            .and_then(|rows| rows.collect()))?
-    } else {
-        sql(statement
-            .query_map([], |row| {
-                Ok(ClaimCategoryCount {
-                    category: row.get(0)?,
-                    count: row.get(1)?,
-                })
-            })
-            .and_then(|rows| rows.collect()))?
-    };
-    Ok(ClaimMemoryStats {
-        total: count(None)?,
-        active: count(Some("active"))?,
-        archived: count(Some("archived"))?,
-        retired: count(Some("retired"))?,
-        categories,
-    })
+    }
+    sql(conn.execute_batch("BEGIN DEFERRED"))?;
+    let aggregated = (|| {
+        let candidates = claim_candidates(conn, project, None, None, None)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut stats = zeros();
+        let mut per_category: BTreeMap<String, i64> = BTreeMap::new();
+        for candidate in &candidates {
+            if !revision_is_explicitly_visible(conn, candidate.revision_id, now_ms)? {
+                continue;
+            }
+            stats.total += 1;
+            match candidate.lifecycle_state.as_str() {
+                "active" => stats.active += 1,
+                "archived" => stats.archived += 1,
+                "retired" => stats.retired += 1,
+                // The schema constrains head states to those three, so this arm
+                // is unreachable in a conforming store and the buckets partition
+                // the total. It counts toward the total only, as the replaced
+                // per-state `COUNT(*)` queries did.
+                _ => {}
+            }
+            *per_category.entry(candidate.category.clone()).or_default() += 1;
+        }
+        // `BTreeMap` yields categories in ascending order and `sort_by_key` is
+        // stable, so this reproduces the order the replaced
+        // `GROUP BY ... ORDER BY COUNT(*) DESC, category` handed the filter.
+        stats.categories = per_category
+            .into_iter()
+            .map(|(category, count)| ClaimCategoryCount { category, count })
+            .collect();
+        stats
+            .categories
+            .sort_by_key(|entry| std::cmp::Reverse(entry.count));
+        Ok(stats)
+    })();
+    match aggregated {
+        Ok(stats) => {
+            sql(conn.execute_batch("COMMIT"))?;
+            Ok(stats)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub fn enumerate_claim_projects(conn: &Connection) -> AdapterResult<Vec<ClaimProjectRow>> {
@@ -1954,7 +2017,7 @@ fn response(
         // A mutation response never discloses more than a read would: a hidden
         // claim is omitted, and the outcome still reports what happened.
         .filter_map(|claim| match claim {
-            Ok(claim) if claim_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
+            Ok(claim) if claim_memory_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
             Ok(_) => None,
             Err(error) => Some(Err(error)),
         })

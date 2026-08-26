@@ -3,13 +3,20 @@
 import { describe, expect, it } from "bun:test";
 import {
     appendFileSync,
+    chmodSync,
+    closeSync,
+    existsSync,
+    fsyncSync,
     mkdirSync,
     mkdtempSync,
+    openSync,
     readFileSync,
     renameSync,
     rmSync,
     statSync,
+    unlinkSync,
     writeFileSync,
+    writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -45,6 +52,7 @@ import {
     inspectDatabaseForClassification,
     listDatabaseFamilyArtifacts,
     MC_APPLICATION_ID,
+    type ResetMarkerPublicationFs,
     readDatabaseResetMarker,
     readDirectFormatMarker,
     verifyResetMarkerFamily,
@@ -384,6 +392,209 @@ describe("reset marker and interrupted quarantine", () => {
         ).toEqual({
             family: "orphan-artifacts",
             reasons: ["orphan reset-marker artifact without a current main database"],
+        });
+    });
+
+    describe("marker publication is all-or-nothing", () => {
+        const realPublicationFs: ResetMarkerPublicationFs = {
+            openSync,
+            writeSync,
+            fsyncSync,
+            closeSync,
+            chmodSync,
+            unlinkSync,
+        };
+
+        function failWith(code: string, call: string): never {
+            throw Object.assign(new Error(`injected ${code} on ${call}`), { code });
+        }
+
+        /** Cap every write at `limit` bytes, so the marker needs several calls. */
+        function cappedWrite(limit: number): ResetMarkerPublicationFs["writeSync"] {
+            return ((fd: number, buffer: Buffer, offset: number, _length: number) =>
+                writeSync(
+                    fd,
+                    buffer,
+                    offset,
+                    Math.min(limit, buffer.length - offset),
+                )) as ResetMarkerPublicationFs["writeSync"];
+        }
+
+        function seedCurrentFamily(dir: string): { dbPath: string; incarnation: string } {
+            const dbPath = join(dir, "context.db");
+            const seeded = createDirectTestDatabase({ path: dbPath });
+            seeded.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+            seeded.db.close();
+            return { dbPath, incarnation: seeded.marker.databaseIncarnationId };
+        }
+
+        function markerFor(dbPath: string) {
+            return buildDatabaseResetMarker({
+                dbPath,
+                createdAtMs: 7,
+                databaseIncarnationId: null,
+                quarantineDirPath: `${dbPath}.mc-quarantine-test`,
+                fileIdentities: captureDatabaseFamilyIdentities(dbPath),
+            });
+        }
+
+        /**
+         * The bootstrap refusal in storage-db keys on the `reset-marker`
+         * artifact, so this is the exact predicate a leftover marker trips.
+         */
+        function familyOpensAsCurrent(dbPath: string, incarnation: string): void {
+            expect(listDatabaseFamilyArtifacts(dbPath)).not.toContain("reset-marker");
+            expect(readDatabaseResetMarker(dbPath)).toEqual({ status: "absent" });
+            const db = new Database(dbPath, { readonly: true });
+            try {
+                expect(readDirectFormatMarker(db)).toMatchObject({
+                    status: "present",
+                    marker: { databaseIncarnationId: incarnation },
+                });
+                expect(
+                    classifyDatabaseFormatFamily(
+                        inspectDatabaseForClassification(db, dbPath),
+                        EXPECTED,
+                    ),
+                ).toEqual({ family: "current", reasons: [] });
+            } finally {
+                db.close();
+            }
+        }
+
+        it("removes the file it created when publication fails, leaving the database openable", () => {
+            const failures: Array<[string, Partial<ResetMarkerPublicationFs>, RegExp]> = [
+                // A short write plus a failed fsync is the finding's exact shape:
+                // without cleanup the fsynced prefix reads back as malformed.
+                [
+                    "short write then fsync failure",
+                    {
+                        writeSync: cappedWrite(40),
+                        fsyncSync: () => failWith("EIO", "fsync"),
+                    },
+                    /injected EIO on fsync/,
+                ],
+                ["fsync failure", { fsyncSync: () => failWith("EIO", "fsync") }, /EIO on fsync/],
+                [
+                    "chmod failure",
+                    { chmodSync: () => failWith("EPERM", "chmod") },
+                    /EPERM on chmod/,
+                ],
+                // A write that stops making progress must fail closed rather
+                // than spin, and must not leave the written prefix behind.
+                [
+                    "write that stops making progress",
+                    { writeSync: (() => 0) as ResetMarkerPublicationFs["writeSync"] },
+                    /made no progress after 0 of \d+ bytes/,
+                ],
+            ];
+
+            for (const [label, overrides, expectedError] of failures) {
+                const dir = mkdtempSync(join(tmpdir(), "mc-reset-publish-fail-"));
+                try {
+                    const { dbPath, incarnation } = seedCurrentFamily(dir);
+                    expect(() =>
+                        writeDatabaseResetMarker(markerFor(dbPath), {
+                            ...realPublicationFs,
+                            ...overrides,
+                        }),
+                    ).toThrow(expectedError);
+                    expect({
+                        label,
+                        markerLeftBehind: existsSync(databaseResetMarkerPath(dbPath)),
+                    }).toEqual({ label, markerLeftBehind: false });
+                    familyOpensAsCurrent(dbPath, incarnation);
+                } finally {
+                    rmSync(dir, { recursive: true, force: true });
+                }
+            }
+        });
+
+        it("blocks the database once publication actually succeeds", () => {
+            // Control for the test above: the assertions there only mean
+            // something because a published marker does refuse the family.
+            const dir = mkdtempSync(join(tmpdir(), "mc-reset-publish-ok-"));
+            try {
+                const { dbPath } = seedCurrentFamily(dir);
+                // Short writes that keep making progress still publish in full.
+                writeDatabaseResetMarker(markerFor(dbPath), {
+                    ...realPublicationFs,
+                    writeSync: cappedWrite(7),
+                });
+                expect(readDatabaseResetMarker(dbPath)).toEqual({
+                    status: "present",
+                    marker: markerFor(dbPath),
+                });
+                expect(listDatabaseFamilyArtifacts(dbPath)).toContain("reset-marker");
+                const db = new Database(dbPath, { readonly: true });
+                try {
+                    expect(
+                        classifyDatabaseFormatFamily(
+                            inspectDatabaseForClassification(db, dbPath),
+                            EXPECTED,
+                        ),
+                    ).toEqual({
+                        family: "unsupported",
+                        reasons: ["a pending reset marker exists for this database family"],
+                    });
+                } finally {
+                    db.close();
+                }
+                if (process.platform !== "win32") {
+                    expect(statSync(databaseResetMarkerPath(dbPath)).mode & 0o777).toBe(0o600);
+                }
+            } finally {
+                rmSync(dir, { recursive: true, force: true });
+            }
+        });
+
+        it("never touches a marker this call did not create", () => {
+            const dir = mkdtempSync(join(tmpdir(), "mc-reset-publish-excl-"));
+            try {
+                const { dbPath } = seedCurrentFamily(dir);
+                const path = databaseResetMarkerPath(dbPath);
+                // O_EXCL: the marker below belongs to a concurrent or prior
+                // reset, so the open fails and cleanup must never run.
+                writeFileSync(path, "another reset's marker\n", { mode: 0o600 });
+                expect(() =>
+                    writeDatabaseResetMarker(markerFor(dbPath), {
+                        ...realPublicationFs,
+                        unlinkSync: () => failWith("EACCES", "unlink"),
+                    }),
+                ).toThrow(/EEXIST/);
+                expect(readFileSync(path, "utf8")).toBe("another reset's marker\n");
+            } finally {
+                rmSync(dir, { recursive: true, force: true });
+            }
+        });
+
+        it("reports the leftover path when cleanup itself fails, without losing the cause", () => {
+            const dir = mkdtempSync(join(tmpdir(), "mc-reset-publish-stuck-"));
+            try {
+                const { dbPath } = seedCurrentFamily(dir);
+                let thrown: unknown = null;
+                try {
+                    writeDatabaseResetMarker(markerFor(dbPath), {
+                        ...realPublicationFs,
+                        writeSync: cappedWrite(40),
+                        fsyncSync: () => failWith("EIO", "fsync"),
+                        unlinkSync: () => failWith("EACCES", "unlink"),
+                    });
+                } catch (error) {
+                    thrown = error;
+                }
+                expect(thrown).toBeInstanceOf(Error);
+                const message = (thrown as Error).message;
+                expect(message).toContain("injected EIO on fsync");
+                expect(message).toContain(databaseResetMarkerPath(dbPath));
+                expect(message).toContain("injected EACCES on unlink");
+                expect(message).toContain("remove it manually");
+                expect((thrown as Error).cause).toMatchObject({ code: "EIO" });
+                // The marker really does remain, which is what the message says.
+                expect(existsSync(databaseResetMarkerPath(dbPath))).toBe(true);
+            } finally {
+                rmSync(dir, { recursive: true, force: true });
+            }
         });
     });
 });

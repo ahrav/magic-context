@@ -90,9 +90,16 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
     setSelected((previous) => reconcileClaimSelection(previous, result.claims));
     setFocusedClaim((previous) => {
       if (!previous) return null;
-      return (
-        result.claims.find((claim) => claim.publicClaimId === previous.publicClaimId) ?? previous
-      );
+      // A settled non-stale snapshot is authoritative about what the current
+      // project, search, and filter scope contains. When it omits the focused
+      // claim the claim has left that scope (archiving it under the Active
+      // filter, or switching project/search), so keeping the old snapshot
+      // would leave the detail panel's edit and Restore controls live against
+      // a claim the list no longer shows. Drafts are keyed by publicClaimId in
+      // a separate signal and reconcile to themselves when the claim is
+      // absent, so an unsaved edit survives and returns if the claim is
+      // focused again.
+      return result.claims.find((claim) => claim.publicClaimId === previous.publicClaimId) ?? null;
     });
     setDrafts((previous) => {
       const next = new Map(previous);
