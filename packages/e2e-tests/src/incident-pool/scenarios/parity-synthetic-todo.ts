@@ -321,6 +321,39 @@ export function pairTodoInput(pair: SyntheticPair | null): unknown {
 }
 
 /**
+ * The todos the pair's tool RESULT reports back.
+ *
+ * Validating only the assistant-side input leaves the half the agent actually
+ * reads unchecked: a correct input and call id beside a stale or fabricated
+ * result is a contradictory pair that still satisfies every existence and id
+ * assertion.
+ */
+export function pairToolResultTodos(pair: SyntheticPair | null): unknown {
+    if (pair === null) return null;
+    const parsed = JSON.parse(pair.bytes) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    const content = (parsed[1] as { content?: unknown } | undefined)?.content;
+    const text =
+        typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                    .map((block) =>
+                        block && typeof block === "object"
+                            ? ((block as { text?: unknown }).text ?? "")
+                            : "",
+                    )
+                    .join("")
+              : null;
+    if (typeof text !== "string" || text.length === 0) return null;
+    try {
+        return JSON.parse(text) as unknown;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Do the wire todos carry exactly the expected items, with priorities already
  * defaulted? Compared field by field on purpose: running the wire side through
  * `normalizedTodoJson` would default a MISSING priority to `medium` and mask the
@@ -923,6 +956,20 @@ export async function runOpenCodeTodoScenario(
         return [
             t0Bytes === null ? "replay-t0-present" : null,
             t1Bytes === t0Bytes ? null : "replay-byte-identity",
+            // Anchor T0 to the EXPECTED values before comparing T1 to it. The
+            // four sibling scenarios all cross-check persisted meta against
+            // expected values; this one compared the two reads only to each
+            // other, which two nulls satisfy — so a replay that persists no
+            // anchor at all read as a stable frozen identity.
+            metaT0?.todo_synthetic_call_id === prepared.callId
+                ? null
+                : "replay-frozen-call-id",
+            (metaT0?.todo_synthetic_anchor_message_id ?? "") !== ""
+                ? null
+                : "replay-frozen-anchor",
+            metaT0?.todo_synthetic_state_json === prepared.stateJson
+                ? null
+                : "replay-frozen-state",
             metaT1?.todo_synthetic_call_id === metaT0?.todo_synthetic_call_id
                 ? null
                 : "replay-call-id",
@@ -1227,16 +1274,25 @@ async function driveRustRoot(context: CaseDriverContext): Promise<{
                 pressureUsedRealBytes,
                 providerRequestCaptured: body !== null,
                 moduleTodoStateCaptured,
-                providerSyntheticPairPresent: pair !== null,
+                providerSyntheticPairPresent:
+                    pair !== null &&
+                    // A correct pair beside another injected one still satisfies
+                    // an existence check, and the durable assertion is blind to
+                    // the extra pair, so duplicate or conflicting synthetic
+                    // todos could reach the agent unnoticed.
+                    body !== null &&
+                    injectedTodoPairs(body).length === 1,
                 // The call id is a hash of the normalized state, so an id match
                 // alone says the injector DERIVED the id from the right state,
-                // not that it shipped that state. Stale or fabricated argument
-                // bytes under the expected id would otherwise read as correct
-                // while the agent sees the wrong todos, and
+                // not that it shipped that state. Both halves of the pair are
+                // compared: stale or fabricated argument bytes under the
+                // expected id, or a result contradicting its own input, would
+                // otherwise read as correct while the agent sees wrong todos.
                 // `moduleTodoStateCaptured` only proves the durable side.
                 deterministicCallIdMatched:
                     pair?.callId === callId &&
-                    wireTodosMatch(pairTodoInput(pair), STATE_X_TODOS),
+                    wireTodosMatch(pairTodoInput(pair), STATE_X_TODOS) &&
+                    wireTodosMatch(pairToolResultTodos(pair), STATE_X_TODOS),
             },
         };
     } catch (error) {

@@ -773,6 +773,12 @@ const ISOLATION_ENV_KEYS = new Set([
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
+    // `buildCaseEnv` relocates this into the case-owned home precisely so a real
+    // one's `credentials.toml` never reaches a child. `extraEnv` is spread AFTER
+    // that relocation, so leaving it out here would let a caller hand the
+    // developer's Cargo directory straight back.
+    "CARGO_HOME",
+    "RUSTUP_HOME",
 ]);
 
 export function assertSafeExtraEnv(extraEnv: Record<string, string>): void {

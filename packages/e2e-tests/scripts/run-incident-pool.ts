@@ -207,6 +207,11 @@ async function runHarness(
 
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
+    // Invalidate any previous report BEFORE the run can fail. Validation, digest
+    // construction, and harness setup all abort before either publication call,
+    // and a stale successful report left at `--report` would be collected by an
+    // always-run artifact step or read by local automation as this run's result.
+    rmSync(args.reportPath, { force: true });
     const files = loadHistorySnapshot(INCIDENTS_DIR, "working");
     const state = validateIncidentHistory(files);
     const registry = builtinIncidentCaseRegistry();

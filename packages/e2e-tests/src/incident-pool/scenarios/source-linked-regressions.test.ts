@@ -86,6 +86,7 @@ function imageObservation(
         droppedTextAbsent: true,
         coveredByRustHistory: false,
         imageBlockCount: 1,
+        imagePayloadPreserved: true,
         placeholderPresent: true,
         userWithImagePresent: true,
         ...overrides,

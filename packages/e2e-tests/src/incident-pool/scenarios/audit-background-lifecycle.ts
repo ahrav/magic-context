@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { Database } from "../../../../plugin/src/shared/sqlite";
 import type { PluginContext } from "../../../../plugin/src/plugin/types";
@@ -162,9 +162,26 @@ export function verifyHistorianFailureDump(
     ];
 }
 
+/**
+ * Containment against the CANONICAL form of both paths.
+ *
+ * `resolve` does not follow symlinks, so a workspace reached through one (a
+ * symlinked home or temp dir) compares unequal to the same directory named by its
+ * real path, and containment fails on a path that is genuinely inside. The
+ * sibling check in `support/tool-loop.ts` canonicalizes for the same reason. A
+ * path that cannot be canonicalized (it does not exist yet) falls back to
+ * `resolve`, so a missing dump is judged as not contained rather than throwing.
+ */
 function pathInside(root: string, path: string): boolean {
-    const resolvedRoot = resolve(root);
-    const resolvedPath = resolve(path);
+    const canonical = (value: string): string => {
+        try {
+            return realpathSync(value);
+        } catch {
+            return resolve(value);
+        }
+    };
+    const resolvedRoot = canonical(root);
+    const resolvedPath = canonical(path);
     return (
         resolvedPath === resolvedRoot ||
         resolvedPath.startsWith(`${resolvedRoot}${sep}`)

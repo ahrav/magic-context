@@ -825,6 +825,7 @@ export interface ThinkingImageSurvivalObservation
     droppedTextAbsent: boolean;
     coveredByRustHistory: boolean;
     imageBlockCount: number;
+    imagePayloadPreserved: boolean;
     placeholderPresent: boolean;
     userWithImagePresent: boolean;
 }
@@ -903,6 +904,21 @@ export async function driveThinkingImageSurvival(
 
     const allUserBlocks = blocksOfRole(body, "user");
     const imageBlocks = allUserBlocks.filter((b) => b.type === "image");
+    // Counting surviving blocks accepts a REPLACED image: corrupted media data,
+    // a rewritten MIME type, or a re-encoded source all leave one image block
+    // behind. Compare the surviving payload with the one that was sent.
+    const expectedImageBase64 = imageDataUrl.slice(
+        imageDataUrl.indexOf(",") + 1,
+    );
+    const imagePayloadPreserved = imageBlocks.some((block) => {
+        const source = (block as { source?: unknown }).source;
+        if (!source || typeof source !== "object") return false;
+        const value = source as { media_type?: unknown; data?: unknown };
+        return (
+            value.media_type === "image/png" &&
+            value.data === expectedImageBase64
+        );
+    });
     const allUserText = allUserBlocks
         .filter((block) => block.type === "text")
         .map((block) => block.text ?? "")
@@ -917,6 +933,7 @@ export async function driveThinkingImageSurvival(
         coveredByRustHistory:
             options.rustMode && allUserText.includes("<session-history>"),
         imageBlockCount: imageBlocks.length,
+        imagePayloadPreserved,
         placeholderPresent: /\[dropped \u00a7\d+\u00a7\]/.test(allUserText),
         userWithImagePresent: messagesOf(body).some(
             (m) =>
@@ -951,7 +968,8 @@ export function verifyThinkingImageSurvival(
             passed: covered
                 ? observation.imageBlockCount === 0
                 : observation.imageBlockCount > 0 &&
-                  observation.userWithImagePresent,
+                  observation.userWithImagePresent &&
+                  observation.imagePayloadPreserved,
         },
     ]);
 }
@@ -970,6 +988,11 @@ const SOURCE_LINKED_IMPLEMENTATION_FILES = [
     "packages/plugin/src/hooks/magic-context/transform.ts",
     "packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts",
     "packages/plugin/src/hooks/magic-context/strip-content.ts",
+    // The bust oracle itself: `mainAgentRequests`, `findBusts`, and
+    // `formatBustReport` produce mainRequestCount and bustCount directly, so a
+    // change to bust detection alters these verdicts with both digests
+    // unchanged.
+    "packages/e2e-tests/src/cache-analysis.ts",
 ];
 
 // A1 and A3 declare `applicability.harness: "rust"`, so the prefix they judge is
@@ -1154,6 +1177,7 @@ function normalizeThinkingImage(
         droppedTextAbsent: "boolean",
         coveredByRustHistory: "boolean",
         imageBlockCount: "number",
+        imagePayloadPreserved: "boolean",
         placeholderPresent: "boolean",
         userWithImagePresent: "boolean",
     });
@@ -1163,6 +1187,7 @@ function normalizeThinkingImage(
         droppedTextAbsent: booleanField(value, "droppedTextAbsent"),
         coveredByRustHistory: booleanField(value, "coveredByRustHistory"),
         imageBlockCount: numberField(value, "imageBlockCount"),
+        imagePayloadPreserved: booleanField(value, "imagePayloadPreserved"),
         placeholderPresent: booleanField(value, "placeholderPresent"),
         userWithImagePresent: booleanField(value, "userWithImagePresent"),
     };

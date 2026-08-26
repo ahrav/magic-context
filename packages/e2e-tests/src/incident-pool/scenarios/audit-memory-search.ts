@@ -284,6 +284,11 @@ const MEMORY_SEARCH_PRODUCT_FILES = [
     "packages/plugin/src/features/magic-context/memory/storage-memory-projection.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-fts.ts",
     "packages/plugin/src/features/magic-context/memory/normalize-hash.ts",
+    // ctx-search/tools.ts only assembles arguments and packs results: candidate
+    // retrieval, semantic and FTS fusion, source boosts, and the cross-source
+    // ordering A44 judges all live in the unified search implementation, so a
+    // change there flips delivery and ranking with both digests unchanged.
+    "packages/plugin/src/features/magic-context/search.ts",
     // Recall is only observable through the injected compartment blocks: this
     // module decides which memories reach m[0], renders the m[1] memory-update
     // delta, and performs the hard fold. A5 and A54 read ordinary-turn m[0]
@@ -1128,8 +1133,18 @@ export async function driveEmbeddingFreshness(
                     input.includes(fixture.freshQuery),
                 ),
         );
-        const passageReembedObserved = embeds.some((request) =>
-            request.inputs.some((input) => input.includes(fixture.newContent)),
+        // Matching the input text alone accepts a re-embedding issued in QUERY
+        // mode. The deterministic mock returns the same vector either way, so
+        // the final-vector comparison below would also pass while a real
+        // provider produced a vector from the wrong space. Require the
+        // configured passage mode and model.
+        const passageReembedObserved = embeds.some(
+            (request) =>
+                request.inputType === "passage" &&
+                request.model === fixture.embeddingModel &&
+                request.inputs.some((input) =>
+                    input.includes(fixture.newContent),
+                ),
         );
         const finalVector = readStoredVector();
         // "Different from the stale vector" is not "correct": any corrupted
