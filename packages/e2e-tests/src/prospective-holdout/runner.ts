@@ -122,6 +122,16 @@ export async function runProspectiveCase(input: {
     ) {
         throw new HoldoutContractError(["prospective-runner: execution-coordinate-invalid"]);
     }
+    // The agreement above only proves the three declared platforms match each other. A worker
+    // handed roots and a coordinate that all name a foreign platform satisfies it, and the cell it
+    // records counts as frozen coverage of that platform while the driver ran here. Comparing the
+    // coordinate against the running host keeps the recorded platform the one that executed the
+    // driver. The code is separate from `execution-coordinate-invalid` because the coordinate is
+    // well formed: it names a host this worker is not, so it is rerouted to a matching worker
+    // rather than repaired.
+    if (input.platform !== `${process.platform}-${process.arch}`) {
+        throw new HoldoutContractError(["prospective-runner: platform-not-host"]);
+    }
     if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
         throw new HoldoutContractError(["prospective-runner: timeout-invalid"]);
     }
@@ -174,8 +184,9 @@ export async function runProspectiveCase(input: {
             // otherwise make this await outlive timeoutMs entirely and hang the suite until the
             // CI job timeout. Draining is best effort and bounded by a second timeoutMs.
             let drainTimer: ReturnType<typeof setTimeout> | undefined;
+            let drained: unknown;
             try {
-                await Promise.race([
+                drained = await Promise.race([
                     execution,
                     new Promise<"abandoned">((resolve) => {
                         drainTimer = setTimeout(() => resolve("abandoned"), input.timeoutMs);
@@ -183,6 +194,15 @@ export async function runProspectiveCase(input: {
                 ]);
             } finally {
                 if (drainTimer) clearTimeout(drainTimer);
+            }
+            // The bound above trades a hang for a driver that may still hold child processes and
+            // still write the workspace. A returned timeout cell leaves the pair short of
+            // "completed", which `buildPairedFacts` accepts as grounds for another attempt, so
+            // that attempt would run against the abandoned driver's writes and observe them as its
+            // own. Isolation is unprovable once the driver survives the drain, so the breach stops
+            // the run instead of emitting a cell any retry could build on.
+            if (drained === "abandoned") {
+                throw new HoldoutContractError(["prospective-runner: driver-abandoned"]);
             }
             return terminal(input.scenario, input.releaseRole, root, expected, coordinate, cleanupSucceeded ? {
                 runHealth: "timeout",

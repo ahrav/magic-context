@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +7,7 @@ import { appendLifecycleEvent, parseLifecycleLedger } from "../src/prospective-h
 import { LOCK_LEASE_MS, LOCK_OWNER_FILE } from "../src/prospective-holdout/lock";
 import { buildProspectiveReport, type ReportRecomputers } from "../src/prospective-holdout/report";
 import { publishClose, publishFreeze } from "../src/prospective-holdout/freeze";
-import { cellResultFixture, closeManifest, freezeManifest, H1, H2, readyPolicies } from "../src/prospective-holdout/test-fixtures";
+import { cellResultFixture, closeManifest, deadPid, freezeManifest, H1, H2, readyPolicies } from "../src/prospective-holdout/test-fixtures";
 import { runProspectiveHoldoutCli } from "./prospective-holdout";
 
 function writeJson(path: string, value: unknown): void {
@@ -326,26 +325,6 @@ function existsSyncSafe(path: string): boolean {
     } catch {
         return false;
     }
-}
-
-/**
- * Yields a pid that is not running: a child is spawned and reaped so the kernel
- * releases its pid, then each candidate is confirmed dead so a recycled pid cannot
- * make an abandoned-lock fixture look live. Returns null when nothing can be
- * proven dead. The cohort store's lock suite keeps an identical probe; the two
- * suites live in different directories with no fixture module in common.
- */
-function deadPid(): number | null {
-    const reaped = spawnSync(process.execPath, ["--version"], { stdio: "ignore" }).pid;
-    for (const candidate of [reaped, 4_194_301, 4_194_302, 4_194_303]) {
-        if (typeof candidate !== "number" || !Number.isInteger(candidate) || candidate <= 1) continue;
-        try {
-            process.kill(candidate, 0);
-        } catch (error) {
-            if ((error as { code?: string }).code === "ESRCH") return candidate;
-        }
-    }
-    return null;
 }
 
 /** Installs the lock a lifecycle append acquires, in the shape a killed holder leaves behind. */

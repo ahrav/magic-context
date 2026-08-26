@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -261,4 +262,23 @@ export function closeManifest(freeze = freezeManifest()): CohortCloseManifest {
             { kind: "admission-reviewer", approver: "reviewer-two", subjectFingerprint },
         ],
     };
+}
+
+/**
+ * Yields a pid that is not running: a child is spawned and reaped so the kernel
+ * releases its pid, then each candidate is confirmed dead so a recycled pid cannot
+ * make an abandoned-lock fixture look live. Returns null when nothing can be
+ * proven dead, which lets a caller skip rather than assert against a live process.
+ */
+export function deadPid(): number | null {
+    const reaped = spawnSync(process.execPath, ["--version"], { stdio: "ignore" }).pid;
+    for (const candidate of [reaped, 4_194_301, 4_194_302, 4_194_303]) {
+        if (typeof candidate !== "number" || !Number.isInteger(candidate) || candidate <= 1) continue;
+        try {
+            process.kill(candidate, 0);
+        } catch (error) {
+            if ((error as { code?: string }).code === "ESRCH") return candidate;
+        }
+    }
+    return null;
 }

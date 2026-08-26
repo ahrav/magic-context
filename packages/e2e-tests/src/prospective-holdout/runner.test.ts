@@ -54,19 +54,35 @@ function expectedRelease(root: VerifiedReleaseRoot): FrozenReleaseIdentity {
     };
 }
 
+/**
+ * `runProspectiveCase` binds the coordinate to the running host, so roots and
+ * inputs are built at this host's platform rather than a fixed literal. A
+ * literal would pass only on the machine it names and would otherwise report
+ * the binding as broken.
+ */
+const HOST_PLATFORM = `${process.platform}-${process.arch}`;
+/** Well formed, and never this host, so only the host binding rejects it. */
+const FOREIGN_PLATFORM = HOST_PLATFORM === "linux-x64" ? "darwin-arm64" : "linux-x64";
+
 async function withRoots(
     run: (root: VerifiedReleaseRoot, paired: VerifiedReleaseRoot, active: string) => Promise<void>,
+    platform: string = HOST_PLATFORM,
 ): Promise<void> {
     const release = mkdtempSync(join(tmpdir(), "runner-release-"));
     const pairedRelease = mkdtempSync(join(tmpdir(), "runner-paired-release-"));
     const active = mkdtempSync(join(tmpdir(), "runner-active-"));
     try {
-        const manifest = releaseRootFixture(release);
-        const pairedManifest = releaseRootFixture(pairedRelease, {
-            releaseId: "v1.9.0",
-            sourceBytes: "previous-source",
-            immutableReference: `sha256:${"b".repeat(64)}`,
-        });
+        // `releaseRootFixture` declares a fixed `linux-x64`, and `platform` is outside the bytes
+        // `rootFingerprint` covers, so restating it leaves every digest and fingerprint check intact.
+        const manifest = { ...releaseRootFixture(release), platform };
+        const pairedManifest = {
+            ...releaseRootFixture(pairedRelease, {
+                releaseId: "v1.9.0",
+                sourceBytes: "previous-source",
+                immutableReference: `sha256:${"b".repeat(64)}`,
+            }),
+            platform,
+        };
         await run(
             verifyReleaseRoot(release, manifest, {
                 expectedRootFingerprint: manifest.rootFingerprint,
@@ -95,7 +111,7 @@ function baseInput(root: VerifiedReleaseRoot, paired: VerifiedReleaseRoot, activ
         workspaceRoot: active,
         model: "fixture/model",
         seed: 7,
-        platform: "linux-x64",
+        platform: root.manifest.platform,
         timeoutMs: 100,
     };
 }
@@ -113,6 +129,17 @@ function terminalKey(cell: ProspectiveCellResult): string {
 function diagnostics(run: () => unknown): readonly string[] {
     try {
         run();
+    } catch (error) {
+        if (error instanceof HoldoutContractError) return error.diagnostics;
+        throw error;
+    }
+    throw new Error("expected a contract error");
+}
+
+/** The rejecting counterpart of `diagnostics`, for breaches `runProspectiveCase` raises. */
+async function rejectionDiagnostics(run: Promise<unknown>): Promise<readonly string[]> {
+    try {
+        await run;
     } catch (error) {
         if (error instanceof HoldoutContractError) return error.diagnostics;
         throw error;
@@ -197,8 +224,23 @@ describe("prospective runner", () => {
             });
             expect(result.productOutcome).toBe("pass");
             expect(result.expectedRootFingerprint).toBe(result.observedRootFingerprint);
-            expect([result.model, result.seed, result.platform]).toEqual(["fixture/model", 7, "linux-x64"]);
+            expect([result.model, result.seed, result.platform]).toEqual(["fixture/model", 7, HOST_PLATFORM]);
         });
+    });
+
+    it("rejects a coordinate whose platform is not this host", async () => {
+        await withRoots(async (root, paired, active) => {
+            const input = baseInput(root, paired, active);
+            // Both manifests and the input agree on the foreign platform, so the agreement checks
+            // pass and only the host binding can be the code that fires.
+            expect([input.platform, root.manifest.platform, paired.manifest.platform]).toEqual([
+                FOREIGN_PLATFORM, FOREIGN_PLATFORM, FOREIGN_PLATFORM,
+            ]);
+            expect(await rejectionDiagnostics(runProspectiveCase({
+                ...input,
+                scenario: scenario(async () => ({ state: "current" })),
+            }))).toEqual(["prospective-runner: platform-not-host"]);
+        }, FOREIGN_PLATFORM);
     });
 
     it("catches synchronous driver throws and rejects empty verifier evidence", async () => {
@@ -237,6 +279,24 @@ describe("prospective runner", () => {
             });
             expect(cleaned).toBe(true);
             expect([result.runHealth, result.reasonCode]).toEqual(["timeout", "deadline-exceeded"]);
+        });
+    });
+
+    it("refuses a cell when the driver outlives the bounded drain", async () => {
+        await withRoots(async (root, paired, active) => {
+            let cleaned = false;
+            // Cleanup reports success and still leaves the driver running, which is the case a
+            // returned timeout cell would hand to a retry while the driver can still write.
+            const breach = rejectionDiagnostics(runProspectiveCase({
+                ...baseInput(root, paired, active),
+                timeoutMs: 5,
+                scenario: scenario(
+                    () => new Promise<{ state: string }>(() => {}),
+                    { cleanup: async () => { cleaned = true; } },
+                ),
+            }));
+            expect(await breach).toEqual(["prospective-runner: driver-abandoned"]);
+            expect(cleaned).toBe(true);
         });
     });
 

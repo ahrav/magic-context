@@ -1,6 +1,7 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { HoldoutContractError, array, enumeration, exact, fail, hex64, integer, record, staticId } from "./contract";
 import type { PairedCaseFact } from "./comparison";
+import type { LifecycleState } from "./lifecycle";
 
 export const PROSPECTIVE_REPORT_SCHEMA = "prospective-release-report/v1";
 export type Direction = "improvement" | "no-change" | "regression";
@@ -301,6 +302,29 @@ export function validateProspectiveReportEvidence(
     }
 }
 
-export function releasePromotionAllowed(report: ProspectiveReport, trustVerified: boolean): boolean {
-    return trustVerified && report.body.decision === "promote";
+// A report is a snapshot of the analysis at the instant it was written, and the lifecycle
+// permits `reported -> invalidated` after that instant. An epoch invalidated later keeps the
+// promoting report artifact verbatim and repository validation still reports it, so
+// `decision` alone cannot witness that nothing has superseded it. Only these terminal states
+// carry a promoting report: `reported` is the state the report itself records, and
+// `graduated` is the one transition that follows it along the promoting path.
+// `insufficient-evidence` names a report whose decision cannot be `promote`, and every other
+// state either precedes the report or, like `invalidated`, supersedes it.
+const PROMOTABLE_LIFECYCLE_STATES: ReadonlySet<string> = new Set<LifecycleState>([
+    "reported",
+    "graduated",
+]);
+
+export function releasePromotionAllowed(
+    report: ProspectiveReport,
+    trustVerified: boolean,
+    terminalLifecycleState: string,
+): boolean {
+    // The state arrives as a plain string because repository validation surfaces it as
+    // `Record<string, string>`. Membership is checked against a closed allowlist so an
+    // unrecognized value - including a lifecycle state added later - refuses promotion
+    // instead of widening the gate.
+    return trustVerified
+        && report.body.decision === "promote"
+        && PROMOTABLE_LIFECYCLE_STATES.has(terminalLifecycleState);
 }

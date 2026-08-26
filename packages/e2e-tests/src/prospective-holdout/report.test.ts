@@ -131,8 +131,28 @@ describe("prospective report", () => {
         expect(report({ sufficient: false }).body.decision).toBe("insufficient-evidence");
         const promotable = report({ allowed: true });
         expect(promotable.body.decision).toBe("promote");
-        expect(releasePromotionAllowed(promotable, false)).toBe(false);
-        expect(releasePromotionAllowed(promotable, true)).toBe(true);
+        expect(releasePromotionAllowed(promotable, false, "reported")).toBe(false);
+        expect(releasePromotionAllowed(promotable, true, "reported")).toBe(true);
+    });
+
+    it("refuses promotion when a later legal transition supersedes the reported state", () => {
+        const promotable = report({ allowed: true });
+        expect(promotable.body.decision).toBe("promote");
+        expect(releasePromotionAllowed(promotable, true, "invalidated")).toBe(false);
+        expect(releasePromotionAllowed(promotable, true, "insufficient-evidence")).toBe(false);
+        expect(releasePromotionAllowed(promotable, true, "running")).toBe(false);
+        expect(releasePromotionAllowed(promotable, true, "state-added-later")).toBe(false);
+        expect(releasePromotionAllowed(promotable, true, "reported")).toBe(true);
+        expect(releasePromotionAllowed(promotable, true, "graduated")).toBe(true);
+    });
+
+    it("refuses promotion for a non-promote decision from every promotable state", () => {
+        for (const state of ["reported", "graduated"]) {
+            expect(releasePromotionAllowed(report(), true, state)).toBe(false);
+            expect(releasePromotionAllowed(report({}, true), true, state)).toBe(false);
+            expect(releasePromotionAllowed(report({ sufficient: false }), true, state)).toBe(false);
+            expect(releasePromotionAllowed(report({ failures: ["gate-safety"] }), true, state)).toBe(false);
+        }
     });
 
     it("names one incomplete case once while counting every coordinate", () => {

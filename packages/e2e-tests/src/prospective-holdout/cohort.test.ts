@@ -1,11 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildCohortClose, ProspectiveIntakeStore } from "./cohort";
 import { reviewSanitizedIntake, staticPrivacyRejection } from "./intake";
-import { H1, H2, H3, sanitizedIntakeFixture } from "./test-fixtures";
+import { deadPid, H1, H2, H3, sanitizedIntakeFixture } from "./test-fixtures";
 
 const key = new TextEncoder().encode("c".repeat(32));
 const reviewOptions = {
@@ -121,24 +120,6 @@ describe("cohort close", () => {
     });
 });
 
-/**
- * Yields a pid that is not running: a child is spawned and reaped so the kernel
- * releases its pid, then each candidate is confirmed dead so a recycled pid cannot
- * make an abandoned-lock fixture look live. Returns null when nothing can be
- * proven dead.
- */
-function deadPid(): number | null {
-    const reaped = spawnSync(process.execPath, ["--version"], { stdio: "ignore" }).pid;
-    for (const candidate of [reaped, 4_194_301, 4_194_302, 4_194_303]) {
-        if (typeof candidate !== "number" || !Number.isInteger(candidate) || candidate <= 1) continue;
-        try {
-            process.kill(candidate, 0);
-        } catch (error) {
-            if ((error as { code?: string }).code === "ESRCH") return candidate;
-        }
-    }
-    return null;
-}
 
 function seedLock(root: string, owner: { pid: number; nonce: string; acquiredAt: number } | null): string {
     const lock = join(root, ".lock");
