@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use super::raw_client::{self, Discovered, RawFrame};
@@ -93,6 +93,72 @@ impl EmbeddingEngine for DeterministicEngine {
         }
         self.texts_embedded.fetch_add(texts.len(), Ordering::SeqCst);
         Ok(texts.iter().map(|text| self.vector_for(text)).collect())
+    }
+}
+
+pub struct GatedEngine {
+    inner: Arc<DeterministicEngine>,
+    started: tokio::sync::mpsc::UnboundedSender<usize>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+pub struct EngineGate {
+    started: tokio::sync::mpsc::UnboundedReceiver<usize>,
+    release: mpsc::Sender<()>,
+}
+
+impl GatedEngine {
+    pub fn new() -> (Arc<Self>, EngineGate) {
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        (
+            Arc::new(Self {
+                inner: DeterministicEngine::new(),
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            }),
+            EngineGate {
+                started: started_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    pub fn calls(&self) -> usize {
+        self.inner.calls.load(Ordering::SeqCst)
+    }
+
+    pub fn fail_next(&self, error: InferenceError) {
+        self.inner.fail_next(error);
+    }
+}
+
+impl EmbeddingEngine for GatedEngine {
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.started
+            .send(texts.len())
+            .expect("engine gate controller remains alive");
+        self.release
+            .lock()
+            .expect("engine release lock")
+            .recv()
+            .expect("engine gate controller releases every call");
+        self.inner.embed(texts)
+    }
+}
+
+impl EngineGate {
+    pub async fn started(&mut self) -> usize {
+        tokio::time::timeout(BUDGET, self.started.recv())
+            .await
+            .expect("inference starts within budget")
+            .expect("gated engine remains alive")
+    }
+
+    pub fn release(&self) {
+        self.release
+            .send(())
+            .expect("gated engine waits for release");
     }
 }
 
@@ -334,7 +400,7 @@ pub fn items(specs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 pub fn ready_component(
-    engine: Arc<DeterministicEngine>,
+    engine: Arc<dyn EmbeddingEngine>,
     limits: SynapseLimits,
 ) -> SynapseComponent {
     SynapseComponent::ready_with_engine(test_lane(), engine, limits)

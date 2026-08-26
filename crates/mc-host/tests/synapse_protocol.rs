@@ -5,10 +5,10 @@ mod support;
 
 use support::synapse::{
     batch_params, call, constraints, items, open_synapse_route, ready_component, request_key,
-    sha256_hex, test_lane, DeterministicEngine, SynapseHost, BUDGET,
+    sha256_hex, test_lane, DeterministicEngine, GatedEngine, SynapseHost, BUDGET,
 };
 
-use mc_host::synapse::{protocol, SynapseLimits};
+use mc_host::synapse::{protocol, QueueFullReason, SynapseLimits};
 
 const TY_ERROR: u8 = 5;
 
@@ -88,13 +88,11 @@ async fn embed_query_returns_a_bound_vector() {
 
 #[tokio::test]
 async fn query_overload_preserves_tool_provider_capacity() {
-    let engine = DeterministicEngine::new();
-    engine.set_delay(std::time::Duration::from_secs(2));
-    let host = SynapseHost::start_with(
-        ready_component(engine.clone(), SynapseLimits::default()),
-        |config| config.limits.max_handler_tasks = 2,
-    )
-    .await;
+    let (engine, mut gate) = GatedEngine::new();
+    let component = ready_component(engine.clone(), SynapseLimits::default());
+    let metrics = component.metrics_handle();
+    let host =
+        SynapseHost::start_with(component, |config| config.limits.max_handler_tasks = 2).await;
     let lane = test_lane();
 
     let mut first_client = host.client().await;
@@ -113,14 +111,7 @@ async fn query_overload_preserves_tool_provider_capacity() {
         .await
     });
 
-    let started_by = tokio::time::Instant::now() + BUDGET;
-    while engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < started_by,
-            "first query never reached inference"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    assert_eq!(gate.started().await, 1);
 
     let mut overload_client = host.client().await;
     let (overload_channel, overload_epoch) = open_synapse_route(&mut overload_client).await;
@@ -140,11 +131,13 @@ async fn query_overload_preserves_tool_provider_capacity() {
     .await
     .expect("query overload must reject promptly");
     assert_eq!(overloaded.error_code(), "queue_full");
+    let snapshot = metrics.snapshot();
     assert_eq!(
-        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "an overloaded query must not reach inference"
+        snapshot.queue_full[QueueFullReason::QueryAdmission as usize],
+        1
     );
+    assert_eq!(snapshot.queue_full.iter().sum::<u64>(), 1);
+    assert_eq!(snapshot.jobs_active, 0, "query overload creates no job");
 
     let mut tool_client = host.client().await;
     let (tool_channel, tool_epoch) = tool_client
@@ -173,8 +166,14 @@ async fn query_overload_preserves_tool_provider_capacity() {
     assert_eq!(tool_frame.ty, support::raw_client::TY_RESPONSE);
     assert_eq!(tool_frame.body, b"tool request");
 
+    gate.release();
     let first = first.await.expect("first query task");
     assert_eq!(first.ty, support::raw_client::TY_RESPONSE);
+    assert_eq!(
+        engine.calls(),
+        1,
+        "only the admitted query reaches inference"
+    );
     host.shutdown().await.expect("graceful shutdown");
 }
 
