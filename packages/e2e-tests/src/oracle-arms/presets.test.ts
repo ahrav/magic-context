@@ -89,7 +89,16 @@ describe("oracle arm presets", () => {
         });
 
         expect(recipe.extraEnv).toEqual({ ANTHROPIC_API_KEY: "live-test-key" });
-        const opencode = await spawnOpencode({ mockProviderURL: baseURL, ...recipe });
+        expect(recipe.hostname).toBe("127.0.0.1");
+        // The recipe pins loopback for real-credential runs; this CI spawn uses
+        // a fake key and overrides back to the all-interfaces default because
+        // GitHub-hosted runners sometimes time out Bun's fetch() against a
+        // 127.0.0.1-bound server.
+        const opencode = await spawnOpencode({
+            mockProviderURL: baseURL,
+            ...recipe,
+            hostname: "0.0.0.0",
+        });
         spawned.push(opencode);
         const config = JSON.parse(
             readFileSync(join(opencode.env.configDir, "opencode.json"), "utf8"),

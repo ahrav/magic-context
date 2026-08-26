@@ -22,13 +22,19 @@ export interface LiveModelOptions {
  * the mock provider must include `mock-anthropic` beside the live provider.
  * `RustTestHarness.restart()` also drops `openCodeConfigExtra`, so callers must
  * not expect this recipe to survive a restart.
+ *
+ * The recipe pins `hostname` to loopback: the serve HTTP API is
+ * unauthenticated, and this is the one spawn path that places a real
+ * `ANTHROPIC_API_KEY` in the child env. Binding all interfaces here would let
+ * anyone who can reach the port drive sessions against the live credential.
  */
 export function liveModelSpawnOptions({
     apiKey,
     providerBlock,
-}: LiveModelOptions): Pick<SpawnOptions, "extraEnv" | "openCodeConfigExtra"> {
+}: LiveModelOptions): Pick<SpawnOptions, "extraEnv" | "openCodeConfigExtra" | "hostname"> {
     return {
         extraEnv: { ANTHROPIC_API_KEY: apiKey },
         openCodeConfigExtra: { provider: providerBlock },
+        hostname: "127.0.0.1",
     };
 }

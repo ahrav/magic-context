@@ -74,6 +74,14 @@ export interface SpawnOptions {
      * per-suite file). Merged last, overriding inherited values.
      */
     extraEnv?: Record<string, string>;
+    /**
+     * Listen address for `opencode serve`. Defaults to "0.0.0.0" because
+     * GitHub-hosted runners sometimes time out Bun's `fetch()` against a
+     * 127.0.0.1-bound server. The serve HTTP API is unauthenticated, so any
+     * spawn that places a real credential in the child env must pass
+     * "127.0.0.1" to keep the API off non-loopback interfaces.
+     */
+    hostname?: string;
     /** Verified immutable release root. Omitted keeps active-checkout behavior. */
     releaseRoot?: VerifiedReleaseRoot;
 }
@@ -465,16 +473,25 @@ async function spawnOpencodeWithProvision(
             childEnv[key] = value;
         }
 
-        // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
-        // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results
-        // in Bun's `fetch()` timing out even though `curl` succeeds. Binding all
-        // interfaces removes any loopback-specific stack-resolution edge case
-        // (IPv4-only AF_INET vs IPv4-mapped IPv6, AF_UNSPEC name resolution, etc.).
-        // Clients still connect to `127.0.0.1:${port}` — only the listen socket
-        // changes. Safe locally too: process is short-lived, port is random.
+        // Bind to 0.0.0.0 (all interfaces) by default instead of 127.0.0.1 —
+        // empirically on GitHub-hosted runners, opencode binding to 127.0.0.1
+        // sometimes results in Bun's `fetch()` timing out even though `curl`
+        // succeeds. Binding all interfaces removes any loopback-specific
+        // stack-resolution edge case (IPv4-only AF_INET vs IPv4-mapped IPv6,
+        // AF_UNSPEC name resolution, etc.). Clients still connect to
+        // `127.0.0.1:${port}` — only the listen socket changes. Safe for the
+        // default fake-credential spawns: process is short-lived, port is
+        // random. Spawns carrying a real credential pass `hostname` to pin the
+        // unauthenticated API to loopback.
         child = spawn(
             "opencode",
-            ["serve", "--port", String(port), "--hostname", "0.0.0.0"],
+            [
+                "serve",
+                "--port",
+                String(port),
+                "--hostname",
+                resolvedOpts.hostname ?? "0.0.0.0",
+            ],
             {
                 cwd: env.workdir,
                 env: childEnv,

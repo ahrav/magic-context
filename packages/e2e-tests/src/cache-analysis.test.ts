@@ -5,7 +5,7 @@ import {
     analyzePasses,
     buildSegments,
     findBusts,
-    isInternalOpenCodeAgentRequest,
+    isInternalAgentRequest,
     mainAgentRequests,
 } from "./cache-analysis";
 
@@ -243,22 +243,25 @@ describe("cache-bust oracle", () => {
         });
     });
 
-    describe("#given OpenCode agent request signatures", () => {
-        it("rejects title, summary, and compaction requests from body.system only", () => {
+    describe("#given internal agent request signatures", () => {
+        it("rejects title, summary, compaction, and MC-child requests from body.system only", () => {
             const signatures = [
                 "You are a title generator. You output ONLY a thread title.",
                 "Summarize what was done in this conversation. Write like a pull request description.",
                 "You are an anchored context summarization assistant for coding sessions.",
+                "You are Historian — the hippocampus of a long-running coding agent.",
+                "You are a dreamer curate agent for the magic-context system.",
+                "You are Sidekick, a focused memory-retrieval subagent for an AI coding assistant.",
             ];
             for (const signature of signatures) {
                 expect(
-                    isInternalOpenCodeAgentRequest({
+                    isInternalAgentRequest({
                         body: { system: signature, messages: [MC_SYSTEM] },
                     }),
                 ).toBe(true);
             }
             expect(
-                isInternalOpenCodeAgentRequest({
+                isInternalAgentRequest({
                     body: {
                         system: MC_SYSTEM,
                         messages: signatures,
@@ -269,7 +272,7 @@ describe("cache-bust oracle", () => {
 
         it("accepts a main-agent request", () => {
             expect(
-                isInternalOpenCodeAgentRequest({
+                isInternalAgentRequest({
                     body: { system: MC_SYSTEM, messages: [] },
                 }),
             ).toBe(false);

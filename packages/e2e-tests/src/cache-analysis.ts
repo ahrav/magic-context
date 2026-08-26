@@ -27,6 +27,10 @@
  */
 
 import { createHash } from "node:crypto";
+import {
+    INTERNAL_OPENCODE_AGENT_SIGNATURES,
+    MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
+} from "../../plugin/src/hooks/magic-context/internal-agent-signatures";
 
 type Json = Record<string, unknown>;
 
@@ -65,20 +69,23 @@ interface MinimalRequest {
     body: { system?: unknown; messages?: unknown; [k: string]: unknown };
 }
 
-const INTERNAL_OPENCODE_AGENT_SIGNATURES = [
-    "You are a title generator. You output ONLY a thread title.",
-    "Summarize what was done in this conversation. Write like a pull request description.",
-    "You are an anchored context summarization assistant for coding sessions.",
-] as const;
+const HIDDEN_AGENT_SIGNATURES: readonly string[] = [
+    ...INTERNAL_OPENCODE_AGENT_SIGNATURES,
+    ...MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
+];
 
-/** Detect OpenCode's native title, summary, and compaction requests. */
-export function isInternalOpenCodeAgentRequest(request: MinimalRequest): boolean {
+/**
+ * Detect internal (non-main-agent) requests by their system-prompt openers:
+ * OpenCode's native title/summary/compaction agents plus Magic Context's own
+ * hidden children (historian/dreamer/sidekick/memory-migration). The signature
+ * literals are imported from the plugin's production classifier so the oracle
+ * cannot drift from what production actually skips.
+ */
+export function isInternalAgentRequest(request: MinimalRequest): boolean {
     const system = request.body.system;
     if (system === undefined || system === null) return false;
     const systemText = typeof system === "string" ? system : JSON.stringify(system);
-    return INTERNAL_OPENCODE_AGENT_SIGNATURES.some((signature) =>
-        systemText.includes(signature),
-    );
+    return HIDDEN_AGENT_SIGNATURES.some((signature) => systemText.includes(signature));
 }
 
 function sha(s: string): string {

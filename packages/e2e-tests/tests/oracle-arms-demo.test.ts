@@ -3,7 +3,7 @@
 import { describe, expect, it } from "bun:test";
 import {
     extractMessageText,
-    isInternalOpenCodeAgentRequest,
+    isInternalAgentRequest,
 } from "../src/cache-analysis";
 import type { CapturedRequest } from "../src/mock-provider/server";
 import { TestHarness, type TestHarnessOptions } from "../src/harness";
@@ -30,7 +30,7 @@ function allStrings(value: unknown): string[] {
 function isMainAgentRequest(request: CapturedRequest, marker: string): boolean {
     return (
         JSON.stringify(request.body.messages).includes(marker) &&
-        !isInternalOpenCodeAgentRequest(request)
+        !isInternalAgentRequest(request)
     );
 }
 
