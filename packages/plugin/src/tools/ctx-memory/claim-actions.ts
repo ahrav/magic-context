@@ -13,7 +13,6 @@ import {
 import {
     ClaimOperationInputError,
     type ClaimOperationRunResult,
-    computeProjectMemoryMutationToken,
     createProjectMemoryClaim,
     mergeProjectMemoryClaims,
     type ProducerIdentity,

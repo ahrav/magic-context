@@ -470,6 +470,14 @@ fn validate_target(
     }
     let claim = get_claim(conn, &token.public_claim_id)?
         .ok_or_else(|| format!("unknown project-memory claim: {}", token.public_claim_id))?;
+    // Retirement is terminal: a retired claim is outside every dashboard
+    // mutation, so refuse it before any destination is considered.
+    if lifecycle_head(conn, claim.claim_id)?.2 == "retired" {
+        return Err(format!(
+            "retired project-memory claim cannot be modified: {}",
+            claim.public_claim_id
+        ));
+    }
     if token.revision != claim.revision || token.content_digest != claim.content_digest {
         return Ok(Err(format!(
             "revision: revision head moved from r{} to r{}",
@@ -1053,13 +1061,11 @@ pub fn enumerate_claim_projects(conn: &Connection) -> AdapterResult<Vec<ClaimPro
             let identity: String = row.get(0)?;
             let display_name = identity
                 .split_once(':')
-                .map(|(prefix, rest)| {
-                    format!(
-                        "{}:{}{}",
-                        prefix,
-                        &rest[..rest.len().min(10)],
-                        if rest.len() > 10 { "…" } else { "" }
-                    )
+                // Canonical identities carry filesystem names, so truncate by
+                // characters: byte slicing splits multi-byte sequences.
+                .map(|(prefix, rest)| match rest.char_indices().nth(10) {
+                    Some((cut, _)) => format!("{prefix}:{}…", &rest[..cut]),
+                    None => format!("{prefix}:{rest}"),
                 })
                 .unwrap_or_else(|| identity.clone());
             Ok(ClaimProjectRow {
@@ -1937,6 +1943,7 @@ fn response(
     run: RunResult,
     public_ids: &[String],
 ) -> AdapterResult<ClaimMutationResponse> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let refreshed_claims = public_ids
         .iter()
         .filter_map(|public_id| match hydrate_claim(conn, public_id) {
@@ -1944,10 +1951,17 @@ fn response(
             Err(error) if error.starts_with("unknown project-memory claim") => None,
             Err(error) => Some(Err(error)),
         })
+        // A mutation response never discloses more than a read would: a hidden
+        // claim is omitted, and the outcome still reports what happened.
+        .filter_map(|claim| match claim {
+            Ok(claim) if claim_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect::<AdapterResult<Vec<_>>>()?;
-    let project_ids = refreshed_claims
+    let project_ids = public_ids
         .iter()
-        .filter_map(|claim| get_claim(conn, &claim.public_claim_id).ok().flatten())
+        .filter_map(|public_id| get_claim(conn, public_id).ok().flatten())
         .map(|claim| claim.project_id)
         .collect::<Vec<_>>();
     Ok(ClaimMutationResponse {

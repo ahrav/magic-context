@@ -680,11 +680,22 @@ export interface ResetMarkerFamilyVerification {
 /**
  * Compare the on-disk family against the published marker. Identity is
  * dev/inode only: a rename is atomic, so every recorded file is either still
- * at its source (identity must match) or already inside quarantine. Size is
- * deliberately not compared — a live writer is the holder inspection's job.
+ * at its source (identity must match) or already inside quarantine.
  * "Became current" is covered by the same check: only a pristine family can
  * bootstrap to current, so a current database at this path necessarily has a
  * new inode.
+ *
+ * Size is deliberately not compared, for any role and at either location. The
+ * marker records identities before the final holder inspection, so a recorded
+ * size is a pre-exclusivity observation: a holder still writing in that window
+ * grows or truncates the main file, WAL, shared-memory index, or rollback
+ * journal in place while dev/inode stay fixed, and a WAL checkpoint truncates
+ * to zero the same way. A file moved after the inspection carries whatever
+ * size that window left it at, so the destination is no safer than the source.
+ * Refusal is expensive — a pending marker blocks database initialization — so
+ * size equality would trade a narrow inode-reuse gap for spurious refusals
+ * that abandon a live family. Closing that gap needs content identity, which
+ * this marker does not record.
  */
 export function verifyResetMarkerFamily(
     marker: DatabaseResetMarker,

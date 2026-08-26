@@ -16,6 +16,7 @@ import { createDirectTestDatabase } from "../test-database";
 import { readDreamerProjectClaims } from "./claim-manifest";
 import { applyClassifications, type ClassifyArgs, runClassify } from "./classify";
 import { acquireLease } from "./lease";
+import { buildClassifyModelChain } from "./task-config";
 
 function freshDb(): Database {
     const db = createDirectTestDatabase().db;
@@ -185,6 +186,101 @@ describe("claim-native classification", () => {
             expect(result.complete).toBe(false);
             expect(result.remaining).toBe(10);
             expect(count(db, "claim_operation_effects")).toBe(effectsBefore);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+/** `dreamer.run_task` rejects a classify payload whose `model_chain` is missing
+ *  or empty, and the chain is the only path by which the dreamer-level default
+ *  model reaches classify. */
+describe("module-route classify model chain", () => {
+    function moduleArgs(db: Database, projectIdentity: string): ClassifyArgs {
+        const args = classifyArgs(db, projectIdentity);
+        args.moduleSessionId = "module-session";
+        args.moduleProjectRoot = process.cwd();
+        args.moduleContextStoreUuid = "context-store-uuid";
+        args.moduleAuthorityGeneration = 1;
+        return args;
+    }
+
+    test("sends the resolved chain verbatim, including the dreamer-level default", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-module-chain";
+            for (let index = 0; index < 10; index += 1) seedClaim(db, projectIdentity, index);
+            const args = moduleArgs(db, projectIdentity);
+            const payloads: { items: { public_claim_id: string }[]; model_chain?: unknown }[] = [];
+            args.moduleClient = {
+                call: async ({ body }) => {
+                    const { payload } = body as {
+                        payload: { items: { public_claim_id: string }[]; model_chain?: unknown };
+                    };
+                    payloads.push(payload);
+                    return {
+                        result: {
+                            manifest_text: `<classify>${payload.items
+                                .map(
+                                    (item) =>
+                                        `<memory claim="${item.public_claim_id}" importance="80"/>`,
+                                )
+                                .join("")}</classify>`,
+                        },
+                    };
+                },
+            };
+            // Exactly the production wiring: task override → dreamer default → fallbacks.
+            args.modelChain = buildClassifyModelChain("prov/task", "prov/dreamer", [
+                "prov/fallback",
+            ]);
+
+            const result = await runClassify(args);
+            expect(result.complete).toBe(true);
+            expect(payloads).toHaveLength(1);
+            expect(payloads[0]?.model_chain).toEqual([
+                "prov/task",
+                "prov/dreamer",
+                "prov/fallback",
+            ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("an unresolvable chain fails permanently before any module call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-module-no-chain";
+            for (let index = 0; index < 10; index += 1) seedClaim(db, projectIdentity, index);
+            const args = moduleArgs(db, projectIdentity);
+            let called = false;
+            args.moduleClient = {
+                call: async () => {
+                    called = true;
+                    return {};
+                },
+            };
+            // Every model key unset or malformed resolves to an empty chain.
+            args.modelChain = buildClassifyModelChain(undefined, "flat-model", undefined);
+            expect(args.modelChain).toEqual([]);
+
+            const error = await runClassify(args).then(
+                () => null,
+                (caught: unknown) => caught,
+            );
+            expect((error as Error | null)?.message).toMatch(/no effective model chain/);
+            // Pre-flighted: no session is spawned and no module call is attempted.
+            expect(called).toBe(false);
+            // Permanent, not transient. It is thrown outside the per-chunk catch, so
+            // it is never wrapped in DreamerModuleFailureError (transient = true), and
+            // its wording avoids classifyFailure's transient vocabulary — the task
+            // advances to its next cron slot instead of hot-retrying a config error.
+            expect((error as { transient?: unknown } | null)?.transient).toBeUndefined();
+            expect((error as Error | null)?.name).not.toBe("DreamerModuleFailureError");
+            expect((error as Error | null)?.message ?? "").not.toMatch(
+                /abort|lease|timeout|timed out|econn|socket|network|rate.?limit|429|503|overloaded|sqlite_busy|database is locked/i,
+            );
         } finally {
             closeQuietly(db);
         }

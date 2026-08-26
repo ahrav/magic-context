@@ -12,6 +12,11 @@ const CLAIM_B: &str = "mcm_ffeeddccbbaa99887766554433221100";
 const CONTRACT_FIXTURE: &str = include_str!(
     "../../../plugin/src/features/magic-context/memory/fixtures/claim-operation-contract-v1.json"
 );
+/// The same cross-runtime vocabulary `sqlite_runtime` embeds, so this suite
+/// asserts against the exact golden inventory the verifier reads.
+const DIRECT_FORMAT_FIXTURE: &str = include_str!(
+    "../../../plugin/src/features/magic-context/fixtures/direct-format-vocabulary-v1.json"
+);
 
 fn test_db() -> Connection {
     let conn = Connection::open_in_memory().expect("open test database");
@@ -931,4 +936,335 @@ fn adapter_runtime_and_format_checks_refuse_unsafe_inputs() {
     assert!(reasons
         .iter()
         .any(|reason| reason == "unregistered schema object: legacy_memories"));
+}
+
+#[test]
+fn project_enumeration_truncates_display_names_by_character() {
+    let conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+    seed_claim(&conn, CLAIM_B, "beta", "FACT", "active");
+    // A canonical identity carrying a non-ASCII filesystem name: truncating by
+    // bytes would split a multi-byte sequence and panic inside the row callback.
+    let unicode_identity = "git:\u{30d7}\u{30ed}\u{30b8}\u{30a7}\u{30af}\u{30c8}\u{65e5}\u{672c}\u{8a9e}\u{30d5}\u{30a9}\u{30eb}\u{30c0}";
+    conn.execute(
+        "INSERT INTO projects (id, canonical_identity, created_at) VALUES (2, ?1, 1), (3, 'git:short', 1)",
+        [unicode_identity],
+    )
+    .unwrap();
+    let repoint = |public_id: &str, project_id: i64| {
+        conn.execute(
+            "UPDATE claim_memory_current_heads SET project_id = ?1 WHERE claim_id = \
+             (SELECT claim_id FROM claim_public_ids WHERE public_id = ?2)",
+            params![project_id, public_id],
+        )
+        .unwrap();
+    };
+    repoint(CLAIM_A, 2);
+    repoint(CLAIM_B, 3);
+
+    let rows = claim_adapter::enumerate_claim_projects(&conn).expect("enumerate projects");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].identity, "git:short");
+    assert_eq!(rows[0].display_name, "git:short");
+    assert_eq!(rows[1].identity, unicode_identity);
+    assert_eq!(
+        rows[1].display_name,
+        "git:\u{30d7}\u{30ed}\u{30b8}\u{30a7}\u{30af}\u{30c8}\u{65e5}\u{672c}\u{8a9e}\u{30d5}\u{2026}"
+    );
+}
+
+#[test]
+fn retired_claims_are_terminal_for_every_mutation_entry_point() {
+    let mut conn = test_db();
+    seed_claim(&conn, CLAIM_A, "retired fact", "FACT", "retired");
+    seed_claim(&conn, CLAIM_B, "active fact", "RULE", "active");
+    let retired = read_claim(&conn, CLAIM_A);
+    let active = read_claim(&conn, CLAIM_B);
+    assert_eq!(retired.lifecycle_state, "retired");
+
+    let revised = claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::ReviseClaimInput {
+            target: target(&retired),
+            operation_key: "revise-retired".to_string(),
+            content: Some("resurrected".to_string()),
+            category: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        revised == format!("retired project-memory claim cannot be modified: {CLAIM_A}"),
+        "{revised}"
+    );
+
+    for (key, state) in [
+        ("restore-retired", "active"),
+        ("archive-retired", "archived"),
+    ] {
+        let error = claim_adapter::set_claim_lifecycle(
+            &mut conn,
+            claim_adapter::MutationChannel::TauriExplicitUser,
+            claim_adapter::SetLifecycleInput {
+                target: target(&retired),
+                operation_key: key.to_string(),
+                lifecycle_state: state.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error == format!("retired project-memory claim cannot be modified: {CLAIM_A}"),
+            "{error}"
+        );
+    }
+
+    let bulk = claim_adapter::bulk_archive_claims(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::BulkArchiveInput {
+            targets: vec![target(&active), target(&retired)],
+            operation_key: "bulk-retired".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        bulk == format!("retired project-memory claim cannot be modified: {CLAIM_A}"),
+        "{bulk}"
+    );
+
+    // Every refusal is terminal: no lifecycle event, receipt, or head moved.
+    assert_eq!(
+        scalar(&conn, "SELECT COUNT(*) FROM claim_memory_lifecycle_events"),
+        2
+    );
+    assert_eq!(
+        scalar(&conn, "SELECT COUNT(*) FROM claim_operation_receipts"),
+        0
+    );
+    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM claim_revisions"), 2);
+    let states = conn
+        .prepare(
+            "SELECT public.public_id, head.lifecycle_state FROM claim_memory_current_heads head \
+             JOIN claim_public_ids public ON public.claim_id = head.claim_id \
+             ORDER BY public.public_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            (CLAIM_A.to_string(), "retired".to_string()),
+            (CLAIM_B.to_string(), "active".to_string())
+        ]
+    );
+}
+
+#[test]
+fn hidden_claims_are_omitted_from_stale_mutation_responses() {
+    let mut conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+    let stale = read_claim(&conn, CLAIM_A);
+
+    let applied = claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::ReviseClaimInput {
+            target: target(&stale),
+            operation_key: "advance-head".to_string(),
+            content: Some("alpha revised".to_string()),
+            category: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(applied.outcome, "applied");
+    assert_eq!(applied.refreshed_claims.len(), 1);
+
+    // Quarantine the new head, so the read path hides the claim entirely.
+    let revision_id = scalar(&conn, "SELECT current_revision_id FROM claims");
+    conn.execute(
+        "INSERT INTO claim_disposition_events \
+         (revision_id, project_id, disposition, action, reason, actor, policy_version, recorded_at) \
+         VALUES (?1, 1, 'quarantined', 'assert', 'quarantine', 'test', 1, 1)",
+        [revision_id],
+    )
+    .unwrap();
+    assert!(
+        claim_adapter::read_claim_memories(&conn, Some(PROJECT), None, None, None, 100, 0)
+            .unwrap()
+            .claims
+            .is_empty()
+    );
+
+    // The concurrent caller's stale token still reports its outcome, but the
+    // response discloses no bytes the read path would have withheld.
+    let response = claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::ReviseClaimInput {
+            target: target(&stale),
+            operation_key: "stale-hidden".to_string(),
+            content: None,
+            category: Some("RULE".to_string()),
+        },
+    )
+    .unwrap();
+    assert_eq!(response.outcome, "stale");
+    assert!(response.refreshed_claims.is_empty());
+    assert_eq!(
+        response.snapshot_vector.project_generations.len(),
+        1,
+        "the snapshot vector still covers the requested project"
+    );
+}
+
+#[test]
+fn runtime_gate_fails_closed_on_non_ascii_source_ids() {
+    // A multi-byte sequence straddling the stamp/hash boundary must be refused,
+    // never split: `split_at` on a byte inside a UTF-8 sequence panics.
+    let straddling = format!("2026-01-01 00:00:00\u{e9}{}", "0".repeat(45));
+    assert!(!straddling.is_char_boundary(20));
+    assert_eq!(
+        sqlite_runtime::evaluate_sqlite_runtime_gate(&sqlite_runtime::SqliteEngineIdentity {
+            sqlite_version: "3.53.2".to_string(),
+            sqlite_source_id: straddling.clone(),
+        }),
+        vec![format!(
+            "sqlite_source_id() '{straddling}' is not a recognized SQLite source identity"
+        )]
+    );
+}
+
+/// Builds a database whose non-internal object inventory is exactly the golden
+/// `goldens.schemaObjectNames` the verifier reads, carrying a marker that
+/// satisfies every marker check, so the only thing under test is the inventory
+/// comparison.
+///
+/// The objects this suite tampers with are created with their real types (a
+/// trigger and an index over a real table); the remaining names stand in as
+/// bare tables because the verifier compares NAMES, and composing the
+/// TypeScript components from Rust would fork the schema into a second source
+/// of truth. That the golden equals what composition actually creates is
+/// proven on the TypeScript side by `storage-format-epoch.test.ts`, which
+/// regenerates the inventory from `computeExpectedDirectFormat()`.
+fn golden_inventory_db(path: &std::path::Path) -> Connection {
+    let fixture: Value = serde_json::from_str(DIRECT_FORMAT_FIXTURE).expect("fixture parses");
+    let application_id = fixture["applicationId"].as_i64().expect("applicationId");
+    let format_epoch = fixture["formatEpoch"].as_i64().expect("formatEpoch");
+    let manifest = fixture["goldens"]["manifestDigest"]
+        .as_str()
+        .expect("manifestDigest");
+    let incarnation = "0123456789abcdef0123456789abcdef";
+    let created_at = 1_755_900_000_000i64;
+    let marker_digest = sha256_hex_utf8(&format!(
+        "mc-direct-format-marker-v1\napplication_id={application_id}\nformat_epoch={format_epoch}\ndatabase_incarnation_id={incarnation}\ncomponent_manifest_digest={manifest}\ncreated_at_ms={created_at}"
+    ));
+
+    let conn = Connection::open(path).expect("open golden inventory database");
+    conn.execute_batch(&format!(
+        "PRAGMA application_id = {application_id};
+         PRAGMA user_version = {format_epoch};
+         CREATE TABLE \"mc_format_marker\" (
+             id INTEGER PRIMARY KEY,
+             format_epoch INTEGER NOT NULL,
+             database_incarnation_id TEXT NOT NULL,
+             component_manifest_digest TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             marker_digest TEXT NOT NULL
+         );
+         CREATE TABLE \"claim_memory_lifecycle_events\" (
+             id INTEGER PRIMARY KEY,
+             predecessor_seq INTEGER
+         );
+         CREATE TRIGGER \"claim_memory_lifecycle_events_chain_guard\"
+             BEFORE INSERT ON \"claim_memory_lifecycle_events\"
+             BEGIN SELECT RAISE(ABORT, 'lifecycle chain guard'); END;
+         CREATE INDEX \"idx_claim_memory_lifecycle_events_predecessor\"
+             ON \"claim_memory_lifecycle_events\"(predecessor_seq);"
+    ))
+    .expect("create marker and tampering targets");
+    conn.execute(
+        "INSERT INTO mc_format_marker VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![format_epoch, incarnation, manifest, created_at, marker_digest],
+    )
+    .expect("insert marker row");
+    conn.execute_batch(
+        "CREATE TRIGGER \"mc_format_marker_no_delete\" BEFORE DELETE ON \"mc_format_marker\"
+             BEGIN SELECT RAISE(ABORT, 'marker is immutable'); END;
+         CREATE TRIGGER \"mc_format_marker_no_update\" BEFORE UPDATE ON \"mc_format_marker\"
+             BEGIN SELECT RAISE(ABORT, 'marker is immutable'); END;",
+    )
+    .expect("create marker guards");
+
+    let already_created = [
+        "mc_format_marker",
+        "mc_format_marker_no_delete",
+        "mc_format_marker_no_update",
+        "claim_memory_lifecycle_events",
+        "claim_memory_lifecycle_events_chain_guard",
+        "idx_claim_memory_lifecycle_events_predecessor",
+    ];
+    for name in fixture["goldens"]["schemaObjectNames"]
+        .as_array()
+        .expect("golden inventory")
+    {
+        let name = name.as_str().expect("golden object name");
+        if already_created.contains(&name) {
+            continue;
+        }
+        conn.execute_batch(&format!("CREATE TABLE \"{name}\" (id INTEGER PRIMARY KEY);"))
+            .unwrap_or_else(|error| panic!("create {name}: {error}"));
+    }
+    conn
+}
+
+/// Before the golden inventory, the expected set was derived from component
+/// `provides` (owning tables only) and the actual set was filtered to
+/// `type IN ('table','view')`, which left all 32 indexes and 126 triggers
+/// outside BOTH sides: a database missing an invariant-enforcing trigger
+/// verified clean and was then opened read-write for claim mutations.
+#[test]
+fn direct_format_verification_covers_every_registered_object_type() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let path = dir.path().join("valid.db");
+    let conn = golden_inventory_db(&path);
+    assert_eq!(
+        sqlite_runtime::verify_direct_format(&conn, &path).unwrap(),
+        Vec::<String>::new(),
+        "the exact golden inventory must verify clean: a false refusal here \
+         refuses every valid database"
+    );
+
+    let trigger_path = dir.path().join("missing-trigger.db");
+    let trigger_conn = golden_inventory_db(&trigger_path);
+    trigger_conn
+        .execute_batch("DROP TRIGGER claim_memory_lifecycle_events_chain_guard")
+        .unwrap();
+    assert_eq!(
+        sqlite_runtime::verify_direct_format(&trigger_conn, &trigger_path).unwrap(),
+        vec![
+            "missing registered schema object: claim_memory_lifecycle_events_chain_guard"
+                .to_string()
+        ],
+        "a dropped invariant trigger must be refused by name"
+    );
+
+    let index_path = dir.path().join("missing-index.db");
+    let index_conn = golden_inventory_db(&index_path);
+    index_conn
+        .execute_batch("DROP INDEX idx_claim_memory_lifecycle_events_predecessor")
+        .unwrap();
+    assert_eq!(
+        sqlite_runtime::verify_direct_format(&index_conn, &index_path).unwrap(),
+        vec![
+            "missing registered schema object: idx_claim_memory_lifecycle_events_predecessor"
+                .to_string()
+        ],
+        "a dropped index must be refused by name"
+    );
 }

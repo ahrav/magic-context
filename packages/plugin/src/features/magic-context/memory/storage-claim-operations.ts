@@ -1526,12 +1526,19 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         claimId: target.claimId,
     });
 
+    // Both evidence relations carry lineage, so both flow into the merged
+    // revision: `supports` covers create/revise/split-produced sources, and
+    // `merged_from` covers a source that is itself merge-produced and so holds
+    // no `supports` row of its own. Naming the relations rather than reading
+    // every row keeps a future non-lineage relation (a refutation, say) from
+    // being silently re-asserted here as merge support; a source carrying only
+    // such a relation instead trips the zero-evidence guard below.
     const sourceObservations = sources.flatMap((source) =>
         (
             db
                 .prepare(
                     `SELECT observation_id AS observationId FROM claim_evidence
-                      WHERE revision_id = ? AND relation = 'supports'
+                      WHERE revision_id = ? AND relation IN ('supports', 'merged_from')
                       ORDER BY observation_id`,
                 )
                 .all(source.currentRevisionId) as Array<{ observationId: number }>
@@ -1652,9 +1659,11 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
 
 /**
  * Same-project merge (R8): appends one target revision whose evidence links
- * the sources' supporting observations as `merged_from`, records supersedes
- * conflicts, and retires the sources. Trust and approval never transfer —
- * the new target revision opens its own conservative policy subject.
+ * every observation the sources carry as `merged_from` — including the ones a
+ * merge-produced source itself carries as `merged_from`, so lineage survives
+ * repeated merges — records supersedes conflicts, and retires the sources.
+ * Trust and approval never transfer — the new target revision opens its own
+ * conservative policy subject.
  */
 export function mergeProjectMemoryClaims(
     db: Database,

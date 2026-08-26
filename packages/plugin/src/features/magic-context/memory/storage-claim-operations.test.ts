@@ -900,6 +900,65 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
     });
 });
 
+/** Observation IDs linked to one revision, optionally narrowed to one relation. */
+function evidenceObservationIds(
+    db: Database,
+    revisionId: number,
+    relation?: "supports" | "merged_from",
+): number[] {
+    return (
+        db
+            .prepare(
+                `SELECT observation_id AS observationId FROM claim_evidence
+                  WHERE revision_id = ? AND (? IS NULL OR relation = ?)
+                  ORDER BY observation_id`,
+            )
+            .all(revisionId, relation ?? null, relation ?? null) as Array<{
+            observationId: number;
+        }>
+    ).map((row) => row.observationId);
+}
+
+function currentRevisionIdOf(ctx: Ctx, publicClaimId: string): number {
+    const claim = getProjectMemoryClaimByPublicId(ctx.db, publicClaimId);
+    if (!claim) throw new Error(`unknown claim ${publicClaimId}`);
+    return claim.currentRevisionId;
+}
+
+/** The single observation a freshly created claim's revision 1 carries. */
+function soleObservationIdOf(ctx: Ctx, publicClaimId: string): number {
+    const ids = evidenceObservationIds(ctx.db, currentRevisionIdOf(ctx, publicClaimId));
+    if (ids.length !== 1) {
+        throw new Error(`expected one observation for ${publicClaimId}, found ${ids.length}`);
+    }
+    return ids[0];
+}
+
+function mergeOp(
+    ctx: Ctx,
+    key: string,
+    targetPublicId: string,
+    sourcePublicIds: readonly string[],
+    mergedContent: string,
+) {
+    return mergeProjectMemoryClaims(
+        ctx.db,
+        { producer: "test", operationKey: key },
+        {
+            targetToken: computeProjectMemoryMutationToken(ctx.db, targetPublicId),
+            sourceTokens: sourcePublicIds.map((publicId) =>
+                computeProjectMemoryMutationToken(ctx.db, publicId),
+            ),
+            mergedContent,
+            actor: "user:test",
+        },
+    );
+}
+
+function ascending(ids: readonly number[]): number[] {
+    return [...ids].sort((left, right) => left - right);
+}
+
 describe("claim operations: same-project merge (R8, AE6)", () => {
     test("merge appends one target revision, preserves source evidence, and retires sources without trust transfer", () => {
         const ctx = setup();
@@ -983,6 +1042,96 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
                         .get(targetRef?.currentRevisionId as number) as { count: number }
                 ).count,
             ).toBe(0);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("a merge-produced source carries its merged_from lineage into the next merge", () => {
+        const ctx = setup();
+        try {
+            const sourceA = publicIdOf(createClaimOp(ctx, "op-a", "Source A content."));
+            const sourceB = publicIdOf(createClaimOp(ctx, "op-b", "Source B content."));
+            const firstTarget = publicIdOf(createClaimOp(ctx, "op-c", "First target content."));
+            const plainSource = publicIdOf(createClaimOp(ctx, "op-d", "Plain source content."));
+            const secondTarget = publicIdOf(createClaimOp(ctx, "op-e", "Second target content."));
+            const observationA = soleObservationIdOf(ctx, sourceA);
+            const observationB = soleObservationIdOf(ctx, sourceB);
+            const observationD = soleObservationIdOf(ctx, plainSource);
+
+            const first = mergeOp(
+                ctx,
+                "op-merge-1",
+                firstTarget,
+                [sourceA, sourceB],
+                "Merged once content.",
+            );
+            expect(first.outcome).toBe("applied");
+            const firstRevisionId = currentRevisionIdOf(ctx, firstTarget);
+            // A merge-produced revision records its lineage exclusively as
+            // merged_from, so a supports-only lookup finds nothing here.
+            expect(evidenceObservationIds(ctx.db, firstRevisionId, "supports")).toEqual([]);
+            expect(evidenceObservationIds(ctx.db, firstRevisionId, "merged_from")).toEqual(
+                ascending([observationA, observationB]),
+            );
+
+            // Mixed sources: the merge-produced source's transitive lineage
+            // survives alongside the plain source's own observation.
+            const second = mergeOp(
+                ctx,
+                "op-merge-2",
+                secondTarget,
+                [firstTarget, plainSource],
+                "Merged twice content.",
+            );
+            expect(second.outcome).toBe("applied");
+            expect(
+                evidenceObservationIds(
+                    ctx.db,
+                    currentRevisionIdOf(ctx, secondTarget),
+                    "merged_from",
+                ),
+            ).toEqual(ascending([observationA, observationB, observationD]));
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("a merge whose every source is merge-produced unions their lineage", () => {
+        const ctx = setup();
+        try {
+            const leafA = publicIdOf(createClaimOp(ctx, "op-leaf-a", "Leaf A content."));
+            const leafB = publicIdOf(createClaimOp(ctx, "op-leaf-b", "Leaf B content."));
+            const mergedA = publicIdOf(createClaimOp(ctx, "op-mid-a", "Mid A content."));
+            const mergedB = publicIdOf(createClaimOp(ctx, "op-mid-b", "Mid B content."));
+            const finalTarget = publicIdOf(createClaimOp(ctx, "op-final", "Final target content."));
+            const observationA = soleObservationIdOf(ctx, leafA);
+            const observationB = soleObservationIdOf(ctx, leafB);
+
+            expect(mergeOp(ctx, "op-mid-merge-a", mergedA, [leafA], "Mid A merged.").outcome).toBe(
+                "applied",
+            );
+            expect(mergeOp(ctx, "op-mid-merge-b", mergedB, [leafB], "Mid B merged.").outcome).toBe(
+                "applied",
+            );
+
+            // Neither source holds a supports row, so a supports-only evidence
+            // read would leave this merge with nothing to carry forward.
+            const final = mergeOp(
+                ctx,
+                "op-final-merge",
+                finalTarget,
+                [mergedA, mergedB],
+                "Final merged content.",
+            );
+            expect(final.outcome).toBe("applied");
+            expect(
+                evidenceObservationIds(
+                    ctx.db,
+                    currentRevisionIdOf(ctx, finalTarget),
+                    "merged_from",
+                ),
+            ).toEqual(ascending([observationA, observationB]));
         } finally {
             closeQuietly(ctx.db);
         }

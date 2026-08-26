@@ -57,14 +57,14 @@ const ctxSearchArgsShape = {
         .string()
         .optional()
         .describe(
-            "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+            "Search query. Matches against Primers, git commit messages, notes, and raw user/assistant message text. Project-memory claims are NOT text-searchable; a query that is only opaque public claim ids (mcm_<32hex>) or full revision locators resolves those claims directly.",
         ),
     limit: tool.schema.number().optional().describe("Maximum results to return (default: 10)"),
     sources: tool.schema
         .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
         .optional()
         .describe(
-            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
+            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] is accepted but returns nothing: broad project-memory retrieval is disabled until the claim retrieval projection is active. Omit for a broad search across all enabled sources; pass [] to search no sources.',
         ),
 };
 // The tool definition exposes only the documented argument shape to the model

@@ -69,9 +69,14 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
     offset: 0,
   });
   const [memories, { refetch: refetchMemories }] = createResource(fetchParams, getMemories);
+  // The source stays an OBJECT so it is never nullish: Solid treats a
+  // `undefined`/`null`/`false` source as a disabled resource and skips the
+  // fetcher entirely, which would leave stats unloaded on a project-less mount
+  // while the claim list above still fetches. An absent project is a `project:
+  // undefined` field, which `getMemoryStats` sends as `null` for global stats.
   const [stats, { refetch: refetchStats }] = createResource(
-    () => props.project?.identity ?? (projectFilter() || undefined),
-    (project) => getMemoryStats({ project }),
+    () => ({ project: props.project?.identity ?? (projectFilter() || undefined) }),
+    getMemoryStats,
   );
 
   createEffect(() => {

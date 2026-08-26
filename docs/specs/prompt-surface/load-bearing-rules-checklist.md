@@ -1218,7 +1218,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Scope:** ctx_search tool users
 - **Polarity:** contract
 - **Operative condition:** The agent needs project recall.
-- **Mechanism:** Search memories, compacted messages, git commits, and notes while filtering memories already rendered in project-memory and the live conversation tail.
+- **Mechanism:** Search compacted messages, git commits, and notes while filtering claims already rendered in project-memory and the live conversation tail; broad project-memory retrieval stays disabled until the claim retrieval projection is active.
 - **Consequence:** Search fills missing context rather than duplicating visible context.
 - **Source evidence:** `Results only contain things you CANNOT currently see`
 
@@ -1260,14 +1260,14 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **compressed** |
 | `tool-memory-disabled` | **not-present** |
 
-### T-017 — ctx_search source routing and ID lookup
+### T-017 — ctx_search source routing and locator lookup
 
 - **Source fragment:** `tool-ctx-search`
 - **Scope:** ctx_search tool users
 - **Polarity:** contract
-- **Operative condition:** A recall query needs a source boundary or direct memory lookup.
-- **Mechanism:** Omit sources for broad search, select memory/message/git_commit/note sources for targeted retrieval, or pass memory IDs to bypass text search; message hits continue through ctx_expand.
-- **Consequence:** Search scope and exact-memory lookup are explicit rather than guessed.
+- **Operative condition:** A recall query needs a source boundary or a direct claim lookup.
+- **Mechanism:** Omit sources for broad search, select message/git_commit/note sources for targeted retrieval, or pass opaque public claim ids or full revision locators to bypass text search; the memory source is accepted but returns nothing, and message hits continue through ctx_expand.
+- **Consequence:** Search scope and exact-claim lookup are explicit rather than guessed.
 - **Source evidence:** `Sources (omit for a broad search across all):`
 
 | Variant | Applicability status |

@@ -70,7 +70,11 @@ import {
     type RetrospectiveRawProvider,
     readRetrospectiveScanWindow,
 } from "./retrospective-raw-provider";
-import { type DreamRunMemoryChanges, insertDreamRun } from "./storage-dream-runs";
+import {
+    claimEffectMemoryChanges,
+    type DreamRunMemoryChanges,
+    insertDreamRun,
+} from "./storage-dream-runs";
 import {
     getTaskScheduleState,
     isRetrospectiveWindowProcessed,
@@ -1232,12 +1236,7 @@ async function runAgenticTask(
             status: "completed" | "failed",
             error: string | null,
             extra?: {
-                memoryChanges?: {
-                    written: number;
-                    deleted: number;
-                    archived: number;
-                    merged: number;
-                } | null;
+                memoryChanges?: DreamRunMemoryChanges | null;
             },
         ) => void;
         computeMemoryDelta: (
@@ -1290,6 +1289,7 @@ async function runAgenticTask(
     let childSessionId: string | null = null;
     let rawCurateManifest = "";
     let curateIdentity: AutonomousManifestIdentity | undefined;
+    let curateMemoryChanges: DreamRunMemoryChanges | null = null;
     try {
         const createResponse = await createChildSessionWithFence({
             client: deps.client,
@@ -1423,6 +1423,11 @@ async function runAgenticTask(
                     `Curate manifest became stale: ${applied.operation.result.staleReason}`,
                 );
             }
+            // Curate's revisions/archives/merges/splits are claim-native, so they
+            // never touch the legacy `memories` table that computeMemoryDelta
+            // diffs. Carry the applied effects to recordRun instead, or the run
+            // records no change at all.
+            curateMemoryChanges = claimEffectMemoryChanges(applied.operation.result.effects);
         }
 
         if (parent) {
@@ -1446,7 +1451,7 @@ async function runAgenticTask(
             }
         }
 
-        helpers.recordRun("completed", null);
+        helpers.recordRun("completed", null, { memoryChanges: curateMemoryChanges });
         return { status: "completed" };
     } catch (error) {
         if (task === "curate" && curateIdentity) {

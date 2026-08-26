@@ -128,3 +128,32 @@ fn sqlite_runtime_connection_contract() {
         ]
     );
 }
+
+#[test]
+fn sqlite_runtime_source_id_gate_fails_closed_on_non_ascii_stamps() {
+    // A multi-byte sequence straddling the stamp/hash boundary must be refused,
+    // never split: `split_at` on a byte inside a UTF-8 sequence panics.
+    let straddling = format!("2026-01-01 00:00:00\u{e9}{}", "0".repeat(45));
+    assert!(!straddling.is_char_boundary(20));
+    assert_eq!(
+        evaluate_sqlite_runtime_gate(&SqliteEngineIdentity {
+            sqlite_version: "3.53.2".to_string(),
+            sqlite_source_id: straddling.clone(),
+        }),
+        vec![format!(
+            "sqlite_source_id() '{straddling}' is not a recognized SQLite source identity"
+        )]
+    );
+
+    // Multi-byte content anywhere else in a long-enough identity is refused too.
+    let padded = format!("\u{4e16}\u{754c}\u{4e16}\u{754c}{}", "0".repeat(60));
+    assert_eq!(
+        evaluate_sqlite_runtime_gate(&SqliteEngineIdentity {
+            sqlite_version: "3.53.2".to_string(),
+            sqlite_source_id: padded.clone(),
+        }),
+        vec![format!(
+            "sqlite_source_id() '{padded}' is not a recognized SQLite source identity"
+        )]
+    );
+}

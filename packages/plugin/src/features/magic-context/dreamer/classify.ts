@@ -73,6 +73,11 @@ export interface ClassifyArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
+    /** Ordered classify model chain (task override → dreamer default → fallbacks)
+     *  the module route sends verbatim; the TypeScript provider path keeps using
+     *  model/fallbackModels instead. The dreamer-level default reaches classify
+     *  only through this chain, so dropping it silently removes that rung. */
+    modelChain?: readonly string[];
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
     moduleProjectRoot?: string;
@@ -99,6 +104,30 @@ function isModuleRoute(args: ClassifyArgs): boolean {
         args.moduleContextStoreUuid !== undefined &&
         args.moduleAuthorityGeneration !== undefined
     );
+}
+
+/**
+ * The module route's model selection, resolved from `modelChain` alone.
+ *
+ * Module-backed classify cannot inherit the session's model the way the
+ * non-module path does: `dreamer.run_task` requires an explicit canonical
+ * `provider/model` chain and rejects a payload without one, and no canonical
+ * string for the session default exists on this side of the boundary. So an
+ * empty chain is a permanent configuration failure, and the message names every
+ * key that can supply one. The wording stays outside `classifyFailure`'s
+ * transient-retry vocabulary so the task advances to its next cron slot instead
+ * of hot-retrying a config error.
+ */
+function moduleClassifyModelChain(args: ClassifyArgs): readonly string[] {
+    const modelChain = args.modelChain ?? [];
+    if (modelChain.length === 0) {
+        throw new Error(
+            "classify has no effective model chain: set dreamer.model, " +
+                "dreamer.tasks.classify-memories.model, or dreamer.fallback_models " +
+                "(all are unset or malformed, and module-backed classify has no session default to fall back on)",
+        );
+    }
+    return modelChain;
 }
 
 function toPromptMemory(claim: ProjectMemoryClaimSnapshot): ClassifyPromptMemory {
@@ -172,6 +201,12 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         complete: toClassify.length === 0,
     };
     if (toClassify.length === 0) return result;
+
+    // Pre-flight the module route's model chain before any child session or
+    // module call. Thrown here it stays a permanent failure; thrown from inside
+    // the per-chunk try below it would be wrapped in DreamerModuleFailureError,
+    // whose transient=true would hot-retry a configuration error forever.
+    if (isModuleRoute(args)) moduleClassifyModelChain(args);
 
     const chunks: ProjectMemoryClaimSnapshot[][] = [];
     for (let index = 0; index < toClassify.length; index += CLASSIFY_CHUNK_SIZE) {
@@ -377,6 +412,7 @@ async function runClassifyThroughModule(
     signal: AbortSignal,
 ): Promise<string> {
     const membership = chunk.map((claim) => claim.publicClaimId).join(",");
+    const modelChain = moduleClassifyModelChain(args);
     const response = await args.moduleClient?.call({
         sessionId: args.moduleSessionId as string,
         projectRoot: args.moduleProjectRoot as string,
@@ -390,6 +426,11 @@ async function runClassifyThroughModule(
             authority_generation: args.moduleAuthorityGeneration,
             payload: {
                 prompt_body: prompt,
+                // `dreamer.run_task` rejects a classify payload without a
+                // non-empty canonical chain, so this is a required field, not a
+                // hint. It is the only path by which the dreamer-level default
+                // model reaches classify.
+                model_chain: [...modelChain],
                 items: chunk.map((claim) => ({
                     public_claim_id: claim.publicClaimId,
                     revision_locator: claim.revisionLocator,

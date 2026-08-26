@@ -2,6 +2,7 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+    appendFileSync,
     mkdirSync,
     mkdtempSync,
     readFileSync,
@@ -80,6 +81,18 @@ describe("cross-runtime direct-format vocabulary", () => {
         const manifest = buildSchemaComponentManifest(CURRENT_SCHEMA_COMPONENTS);
         expect(manifest).toEqual(vocabulary.componentManifest as typeof manifest);
         expect(computeSchemaManifestDigest(manifest)).toBe(vocabulary.goldens.manifestDigest);
+    });
+
+    // The Rust dashboard verifier cannot compose TypeScript components, so it
+    // reads this golden inventory as its expected object set. `provides` lists
+    // owning tables only, which leaves indexes, triggers, and views outside the
+    // manifest digest above — so nothing else here would notice an index or
+    // trigger being added, renamed, or dropped. Without this assertion the
+    // golden silently rots and the dashboard eventually refuses every valid
+    // database. Regenerate the fixture's `goldens.schemaObjectNames` from
+    // `computeExpectedDirectFormat()` whenever the registered schema changes.
+    it("pins the golden schema-object inventory the Rust verifier consumes", () => {
+        expect(vocabulary.goldens.schemaObjectNames).toEqual([...EXPECTED.schemaObjectNames]);
     });
 
     it("reproduces the golden marker digest", () => {
@@ -301,6 +314,62 @@ describe("reset marker and interrupted quarantine", () => {
             const replaced = verifyResetMarkerFamily(marker);
             expect(replaced.files).toContainEqual({ role: "wal", status: "mismatch" });
             expect(replaced.problems.join("\n")).toContain("changed identity");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps a same-identity family file whose size drifted from the record", () => {
+        // The marker records sizes before the final holder inspection, so a
+        // holder writing in that window changes any family file's size in place
+        // while dev/inode stay fixed. Size is therefore not an identity input:
+        // comparing it would refuse a genuine family, and a pending marker
+        // blocks database initialization. A same-dev/same-inode replacement can
+        // only be caught by content identity, which this marker does not record.
+        const dir = mkdtempSync(join(tmpdir(), "mc-reset-size-drift-"));
+        try {
+            const dbPath = join(dir, "context.db");
+            for (const role of DATABASE_FAMILY_MOVE_ORDER) {
+                writeFileSync(databaseFamilyFilePath(dbPath, role), role);
+            }
+            const quarantineDirPath = `${dbPath}.mc-quarantine-test`;
+            const marker = buildDatabaseResetMarker({
+                dbPath,
+                createdAtMs: 2,
+                databaseIncarnationId: null,
+                quarantineDirPath,
+                fileIdentities: captureDatabaseFamilyIdentities(dbPath),
+            });
+            mkdirSync(quarantineDirPath);
+            const walSource = databaseFamilyFilePath(dbPath, "wal");
+            const walDestination = join(quarantineDirPath, basename(walSource));
+            renameSync(walSource, walDestination);
+
+            // Grow at the source, grow at the quarantine destination, and
+            // truncate at the source: all three keep dev/inode.
+            appendFileSync(databaseFamilyFilePath(dbPath, "main"), " appended by a live holder");
+            appendFileSync(walDestination, " appended through a pre-rename descriptor");
+            writeFileSync(databaseFamilyFilePath(dbPath, "shm"), "");
+            for (const role of ["main", "wal", "shm"] as const) {
+                const recorded = marker.fileIdentities.find((file) => file.role === role);
+                const path = role === "wal" ? walDestination : databaseFamilyFilePath(dbPath, role);
+                const current = statSync(path);
+                expect(current.size).not.toBe(recorded?.sizeBytes);
+                expect({ dev: current.dev, ino: current.ino }).toEqual({
+                    dev: recorded?.dev,
+                    ino: recorded?.ino,
+                });
+            }
+
+            const verification = verifyResetMarkerFamily(marker);
+            expect(verification.problems).toEqual([]);
+            expect(verification.inspectionComplete).toBe(true);
+            expect(verification.files).toEqual([
+                { role: "rollback-journal", status: "at-source" },
+                { role: "wal", status: "moved" },
+                { role: "shm", status: "at-source" },
+                { role: "main", status: "at-source" },
+            ]);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

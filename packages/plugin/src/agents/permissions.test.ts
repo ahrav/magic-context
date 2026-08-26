@@ -126,14 +126,20 @@ describe("applyDisallowedTools", () => {
 });
 
 describe("DREAMER_CURATE_ALLOWED_TOOLS (base dreamer = curate only)", () => {
-    it("is ctx_memory ONLY — curate edits the memory store and reads no code", () => {
-        // A separate verify task owns memory-vs-code correctness; curate is
-        // pure pool hygiene, so it has no read/grep/bash/write/edit surface.
-        expect([...DREAMER_CURATE_ALLOWED_TOOLS]).toEqual(["ctx_memory"]);
+    it("is EMPTY — curate calls no tools; the host applies its manifest", () => {
+        // Curate emits one XML manifest and the host validates it and applies
+        // every claim write inside a single guarded transaction, which is
+        // curate's only write path. Granting ctx_memory would expose
+        // list/create/revise/archive/restore/merge to the model and let a run
+        // mutate claims outside that transaction. A separate verify task owns
+        // memory-vs-code correctness, so curate needs no read/grep/bash/
+        // write/edit surface either.
+        expect([...DREAMER_CURATE_ALLOWED_TOOLS]).toEqual([]);
     });
 
-    it("does NOT include any codebase / shell / file-write tool", () => {
+    it("does NOT include the memory-mutation tool or any codebase / shell / file-write tool", () => {
         for (const denied of [
+            "ctx_memory",
             "read",
             "grep",
             "glob",
@@ -216,12 +222,13 @@ describe("integration: full hidden-agent permission shape", () => {
         });
     });
 
-    it("base dreamer (curate) permission object: `*` denied + ctx_memory only", () => {
+    it("base dreamer (curate) permission object: `*` denied with no allow entry at all", () => {
+        // An empty allow-list contributes no keys, so the object is the bare
+        // wildcard deny: the curate session inherits none of the primary-agent
+        // tool surface, ctx_memory included.
         const perm = buildAllowOnlyPermission(DREAMER_CURATE_ALLOWED_TOOLS);
-        expect(perm).toEqual({
-            "*": "deny",
-            ctx_memory: "allow",
-        });
+        expect(perm).toEqual({ "*": "deny" });
+        expect(Object.keys(perm)).toEqual(["*"]);
     });
 
     it("dreamer-docs permission object: `*` denied + repo-exploration + write/edit + aft_* (no memory)", () => {
