@@ -18,6 +18,8 @@
         "validate:shm-hardening-matrix": "bun scripts/validate-shm-hardening-matrix.ts",
         "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
         "test:incident-unit": "bun scripts/run-test-selection.ts --incident-unit --timeout 120000",
+        "test:prospective-unit": "bun scripts/run-test-selection.ts --prospective-unit --timeout 120000",
+        "validate:prospective-holdout": "bun scripts/prospective-holdout.ts validate",
         "test:incidents": "bun scripts/run-incident-pool.ts --mode ts --report artifacts/incident-pool-ts-report.json",
         "test:incidents:pi": "bun scripts/run-incident-pool.ts --harness pi --lane known-red --report artifacts/incident-pool-pi-report.json",
         "test:incidents:rust": "bun scripts/run-incident-pool.ts --mode rust --report artifacts/incident-pool-rust-report.json",

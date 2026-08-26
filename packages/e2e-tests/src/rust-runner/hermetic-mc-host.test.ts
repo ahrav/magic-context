@@ -8,12 +8,15 @@ import {
     lstatSync,
     mkdtempSync,
     readFileSync,
+    realpathSync,
     rmSync,
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McHostClient } from "@magic-context/core/shared/mc-host-client";
+import { verifyReleaseRoot } from "../prospective-holdout/release-root";
+import { releaseRootFixture } from "../prospective-holdout/test-fixtures";
 import {
     __hermeticMcHostTest,
     buildDirectHostFixture,
@@ -99,6 +102,18 @@ afterEach(() => {
 });
 
 describe("direct mc-host fixture contract", () => {
+    it("selects frozen host artifact without a workspace build", async () => {
+        const release = realpathSync(mkdtempSync(join(tmpdir(), "rust-release-root-")));
+        const active = mkdtempSync(join(tmpdir(), "rust-active-root-"));
+        temporaryRoots.push(release, active);
+        const manifest = releaseRootFixture(release);
+        const verified = verifyReleaseRoot(release, manifest, {
+            expectedRootFingerprint: manifest.rootFingerprint,
+            activeCheckout: active,
+        });
+        expect(await buildDirectHostFixture(verified)).toBe(join(release, "bin/mc-host"));
+    });
+
     it("parses only the bounded readiness schema and reaps only stale PID records", () => {
         const valid = Buffer.from(
             JSON.stringify({

@@ -102,3 +102,22 @@ static dependency exactly matches reviewed `blocked_by` data may leave the
 incident command successful. Every other unhealthy or incomplete result returns
 nonzero. A passing known-red case is a `resolution_candidate`; it stays in the
 pool until reviewed adjudication changes its baseline.
+
+## Prospective cohort sources
+
+A prospective source is admissible only after its cohort has a trusted close
+manifest and its comparison has a terminal report. The source contract binds
+epoch ID, opaque case ID, family, close fingerprint, keyed case commitment,
+semantic revision, exact incident-bytes fingerprint, and a second privacy
+approval over those bytes.
+
+Graduate every admitted case, including cases both releases pass and cases from
+invalidated or insufficient-evidence reports. Build candidates in temporary
+ledgers first. `verifyProspectiveSourceEvidence` must authenticate the close and
+case commitment before any source-inventory or catalog append.
+
+Retries are idempotent. A matching candidate is accepted; a conflicting
+candidate fails. Never rewrite an accepted source row or semantic revision.
+Existing audit, parity, bead, and mutation scans remain authoritative and do not
+scan quarantine data. Real source-inventory, catalog, adjudication, registry,
+and scenario changes wait for a real closed cohort. Do not add placeholder rows.
