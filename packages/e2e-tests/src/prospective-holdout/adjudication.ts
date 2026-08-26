@@ -298,10 +298,12 @@ export function unblindAfterClose(input: {
         mapCommitment: input.cohortClose.body.subjectiveMapCommitment,
     });
     if (expectedApproval !== input.approvalFingerprint) fail("unblind: approval-invalid");
-    verifyConcealedMap(
+    return verifyConcealedMap(
         input.concealedMap,
         input.commitmentSecret,
         input.cohortClose.body.subjectiveMapCommitment,
+        input.cohortClose.body.cases
+            .filter((entry) => entry.subjective)
+            .map((entry) => entry.caseId),
     );
-    return input.concealedMap;
 }

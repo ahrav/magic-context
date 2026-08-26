@@ -926,6 +926,7 @@ export function verifyProspectiveSourceEvidence(
     source: ProspectiveIncidentSource,
     close: CohortCloseManifest,
     trustedCloseFingerprint: string,
+    incidentBytes: unknown,
 ): VerifiedProspectiveIncidentSource {
     if (
         source.epoch_id !== close.body.epochId ||
@@ -941,6 +942,9 @@ export function verifyProspectiveSourceEvidence(
         admitted.caseCommitment !== source.case_commitment
     ) {
         throw new Error("prospective source does not bind an admitted cohort case");
+    }
+    if (canonicalFingerprint(incidentBytes) !== source.incident_bytes_fingerprint) {
+        throw new Error("prospective source incident bytes fingerprint mismatch");
     }
     const approvalSubject = canonicalFingerprint({
         epochId: source.epoch_id,

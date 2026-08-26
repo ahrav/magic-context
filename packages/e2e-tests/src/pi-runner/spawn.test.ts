@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { lstatSync, mkdtempSync, readlinkSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyReleaseRoot } from "../prospective-holdout/release-root";
@@ -8,7 +8,7 @@ import { createPiIsolatedEnv, ensurePluginAvailable } from "./spawn";
 
 describe("Pi release root selection", () => {
     it("links selected plugin bytes without changing default option shape", () => {
-        const release = mkdtempSync(join(tmpdir(), "pi-release-root-"));
+        const release = realpathSync(mkdtempSync(join(tmpdir(), "pi-release-root-")));
         const active = mkdtempSync(join(tmpdir(), "pi-active-root-"));
         const env = createPiIsolatedEnv();
         try {

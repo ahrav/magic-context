@@ -13,6 +13,29 @@ function writeJson(path: string, value: unknown): void {
     writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+/** Mirrors the constant outcomes `completeRepository` reports, so recomputation matches. */
+function adapterModuleSource(estimatorOwner: string, scorecardOwner: string): string {
+    return `export const estimator = {
+    owner: ${JSON.stringify(estimatorOwner)},
+    analyze: () => ({
+        direction: "no-change",
+        evidenceSufficient: true,
+        completeFamilyCount: 1,
+        resultFingerprint: ${JSON.stringify(H1)},
+    }),
+};
+export const scorecard = {
+    owner: ${JSON.stringify(scorecardOwner)},
+    evaluate: () => ({
+        hardGateFailures: [],
+        mandatoryEvidenceComplete: true,
+        promotionAllowed: true,
+        resultFingerprint: ${JSON.stringify(H2)},
+    }),
+};
+`;
+}
+
 function completeRepository(
     root: string,
     options: { sufficient?: boolean; lifecycleState?: "reported" | "insufficient-evidence" } = {},
@@ -34,12 +57,18 @@ function completeRepository(
             { attempt: 0, cell: releaseN },
             { attempt: 0, cell: releaseNMinus1 },
         ],
+        // One same-build control per frozen coordinate, which is what the comparison gate
+        // requires before it accepts the release-N versus release-N-1 cells.
+        aa: [{ left: releaseNMinus1, right: structuredClone(releaseNMinus1) }],
     };
     writeJson(join(epoch, "outcomes.json"), outcomes);
     const pair = {
         caseId: releaseN.caseId,
         familyId: releaseN.familyId,
         implementationFingerprint: releaseN.implementationFingerprint,
+        model: "fixture/model",
+        seed: 7,
+        platform: "linux-x64",
         releaseN,
         releaseNMinus1,
         status: "complete" as const,
@@ -199,6 +228,89 @@ describe("prospective holdout CLI", () => {
             expect(errors.join(" ")).toContain("event-state-invalid");
             expect(existsSyncSafe(ledger)).toBe(false);
             expect(readFileSync(event, "utf8")).not.toContain("approval-created");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("routes a prototype-property command name to usage instead of a TypeError", async () => {
+        const messages: string[] = [];
+        expect(await runProspectiveHoldoutCli(["toString", "a", "b"], {
+            out: (message) => messages.push(message),
+            err: (message) => messages.push(message),
+        })).toBe(1);
+        expect(messages.join(" ")).toContain("usage:");
+        expect(messages.join(" ")).not.toContain("is not a function");
+    });
+
+    it("keeps validate without --recomputers unchanged", async () => {
+        const messages: string[] = [];
+        expect(await runProspectiveHoldoutCli(["validate"], {
+            out: (message) => messages.push(message),
+            err: (message) => messages.push(message),
+        })).toBe(0);
+        expect(messages.join(" ")).toContain("epochs=0");
+    });
+
+    it("loads sibling recomputers from --recomputers for a reported epoch", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-recomputers-flag-"));
+        const adapters = mkdtempSync(join(tmpdir(), "holdout-cli-adapters-"));
+        try {
+            completeRepository(root);
+            const specifier = join(adapters, "recomputers.ts");
+            writeFileSync(specifier, adapterModuleSource("magic-context-x4l.14", "magic-context-x4l.15"));
+            const messages: string[] = [];
+            const code = await runProspectiveHoldoutCli(["validate", root, "--recomputers", specifier], {
+                out: (message) => messages.push(message),
+                err: (message) => messages.push(message),
+            });
+            expect({ code, messages }).toEqual({ code: 0, messages: ["prospective-holdout valid epochs=1"] });
+        } finally {
+            rmSync(adapters, { recursive: true, force: true });
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects malformed and unloadable --recomputers modules with stable codes", async () => {
+        const adapters = mkdtempSync(join(tmpdir(), "holdout-cli-adapters-invalid-"));
+        try {
+            const missingExport = join(adapters, "missing-export.ts");
+            writeFileSync(missingExport, `export const estimator = { owner: "magic-context-x4l.14", analyze: () => ({}) };\n`);
+            const wrongOwner = join(adapters, "wrong-owner.ts");
+            writeFileSync(wrongOwner, adapterModuleSource("magic-context-x4l.99", "magic-context-x4l.15"));
+            for (const specifier of [missingExport, wrongOwner]) {
+                const messages: string[] = [];
+                expect(await runProspectiveHoldoutCli(["validate", "--recomputers", specifier], {
+                    out: (message) => messages.push(message),
+                    err: (message) => messages.push(message),
+                })).toBe(1);
+                expect(messages.join(" ")).toContain("recomputers: adapter-invalid");
+            }
+            const messages: string[] = [];
+            expect(await runProspectiveHoldoutCli(["validate", "--recomputers", join(adapters, "absent.ts")], {
+                out: (message) => messages.push(message),
+                err: (message) => messages.push(message),
+            })).toBe(1);
+            expect(messages.join(" ")).toContain("recomputers: unloadable");
+        } finally {
+            rmSync(adapters, { recursive: true, force: true });
+        }
+    });
+
+    it("prefers an explicitly passed recomputers argument over --recomputers", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-recomputers-precedence-"));
+        try {
+            const recomputers = completeRepository(root);
+            const messages: string[] = [];
+            const code = await runProspectiveHoldoutCli(
+                ["validate", root, "--recomputers", join(root, "absent.ts")],
+                {
+                    out: (message) => messages.push(message),
+                    err: (message) => messages.push(message),
+                },
+                recomputers,
+            );
+            expect({ code, messages }).toEqual({ code: 0, messages: ["prospective-holdout valid epochs=1"] });
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

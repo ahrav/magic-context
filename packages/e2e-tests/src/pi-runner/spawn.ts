@@ -114,7 +114,11 @@ export function ensurePluginAvailable(env: PiIsolatedEnv, releaseRoot?: Verified
     : PI_PLUGIN_ROOT;
   const required = releaseRoot ? plugin : join(plugin, "dist", "index.js");
   if (!existsSync(required)) {
-    throw new Error("Pi plugin artifact is missing");
+    throw new Error(
+      releaseRoot
+        ? `Pi plugin artifact is missing: ${required}`
+        : `${required} is missing. Run: cd packages/pi-plugin && bun run build`,
+    );
   }
   if (!existsSync(env.pluginDir)) {
     symlinkSync(plugin, env.pluginDir, releaseRoot ? "file" : "dir");

@@ -70,7 +70,11 @@ function summarizePairs(pairs: readonly PairedCaseFact[]): {
     pairCount: number;
     completePairCount: number;
 } {
-    const sortedPairs = [...pairs].sort((left, right) => left.caseId.localeCompare(right.caseId));
+    const sortedPairs = [...pairs].sort((left, right) =>
+        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
+            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
+        )
+    );
     const incompleteCaseIds = sortedPairs.filter((pair) => pair.status === "incomplete").map((pair) => pair.caseId);
     const families = [...new Set(sortedPairs.map((pair) => pair.familyId))];
     return {

@@ -31,6 +31,7 @@ export interface GraduationCandidate {
     disposition: "executable-accepted-behavior" | "executable-regression";
     source: ProspectiveIncidentSource;
     sourceFingerprint: string;
+    incidentBytes: unknown;
     implementationFingerprint: string;
 }
 
@@ -88,7 +89,7 @@ export function buildGraduationCandidate(input: {
             subject_fingerprint: input.secondPrivacyApproval.subjectFingerprint,
         },
     });
-    verifyProspectiveSourceEvidence(source, input.close, input.trustedCloseFingerprint);
+    verifyProspectiveSourceEvidence(source, input.close, input.trustedCloseFingerprint, input.incidentBytes);
     const suffix = closed.caseId.slice("case-".length, "case-".length + 16);
     const sourceItemId = `src-prospective-${suffix}`;
     const sourceClaimId = `claim-prospective-${suffix}`;
@@ -105,6 +106,7 @@ export function buildGraduationCandidate(input: {
         disposition: bothPass ? "executable-accepted-behavior" : "executable-regression",
         source,
         sourceFingerprint: rowDigest(source),
+        incidentBytes: input.incidentBytes,
         implementationFingerprint: input.pair.implementationFingerprint,
     };
     const metadataViolations = scanForSensitiveContent(candidate, input);
@@ -120,7 +122,7 @@ export function parseGraduationCandidate(raw: unknown): GraduationCandidate {
     const value = record(raw, "graduation");
     exact(value, [
         "schema", "sourceItemId", "sourceClaimId", "familyId", "variantId",
-        "disposition", "source", "sourceFingerprint", "implementationFingerprint",
+        "disposition", "source", "sourceFingerprint", "incidentBytes", "implementationFingerprint",
     ], "graduation");
     if (value.schema !== "prospective-graduation-candidate/v1") fail("graduation.schema: version-invalid");
     const source = parseProspectiveIncidentSource(value.source);
@@ -133,9 +135,14 @@ export function parseGraduationCandidate(raw: unknown): GraduationCandidate {
         disposition: enumeration(value.disposition, ["executable-accepted-behavior", "executable-regression"] as const, "graduation.disposition"),
         source,
         sourceFingerprint: hex64(value.sourceFingerprint, "graduation.sourceFingerprint"),
+        incidentBytes: value.incidentBytes,
         implementationFingerprint: hex64(value.implementationFingerprint, "graduation.implementationFingerprint"),
     };
-    if (candidate.familyId !== source.family_id || candidate.sourceFingerprint !== rowDigest(source)) {
+    if (
+        candidate.familyId !== source.family_id ||
+        candidate.sourceFingerprint !== rowDigest(source) ||
+        canonicalFingerprint(candidate.incidentBytes) !== source.incident_bytes_fingerprint
+    ) {
         fail("graduation: source-binding-mismatch");
     }
     return candidate;

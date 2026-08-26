@@ -10,6 +10,15 @@ export interface ProspectiveCheck {
     passed: boolean;
 }
 
+export interface ProspectiveExecutionContext {
+    workspaceRoot: string;
+    releaseRoot: string;
+    model: string;
+    seed: number;
+    platform: string;
+    signal: AbortSignal;
+}
+
 export interface ProspectiveScenario {
     caseId: string;
     familyId: string;
@@ -19,7 +28,8 @@ export interface ProspectiveScenario {
     implementationFiles: string[];
     harness: ProspectiveHarness;
     subjective: boolean;
-    driver(context: { workspaceRoot: string; releaseRoot: string }): Promise<JsonValue>;
+    driver(context: ProspectiveExecutionContext): Promise<JsonValue>;
+    cleanup(context: ProspectiveExecutionContext): Promise<void>;
     normalizer(raw: JsonValue): JsonValue;
     verifier(observation: JsonValue): ProspectiveCheck[];
 }

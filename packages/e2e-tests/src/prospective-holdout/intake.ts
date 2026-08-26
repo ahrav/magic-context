@@ -206,6 +206,7 @@ export function reviewSanitizedIntake(
         commitmentKey: Uint8Array;
         expectedRubricFingerprint: string;
         freezePublishedAt: string;
+        intakeClosesAt: string;
         forbiddenTokens?: readonly string[];
         forbiddenIdentifiers?: readonly string[];
     },
@@ -218,6 +219,9 @@ export function reviewSanitizedIntake(
     }
     if (Date.parse(intake.submittedAt) <= Date.parse(input.freezePublishedAt)) {
         fail("intake.submittedAt: not-prospective");
+    }
+    if (Date.parse(intake.submittedAt) > Date.parse(input.intakeClosesAt)) {
+        fail("intake.submittedAt: after-frozen-cutoff");
     }
     if (!intake.admission.accepted) {
         return {

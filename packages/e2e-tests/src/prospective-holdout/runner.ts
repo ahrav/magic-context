@@ -7,11 +7,12 @@ import {
     exact,
     fail,
     hex64,
+    integer,
     record,
     staticId,
     string,
 } from "./contract";
-import { verifyReleaseRoot, type VerifiedReleaseRoot } from "./release-root";
+import { assertDistinctReleaseRoots, verifyReleaseRoot, type VerifiedReleaseRoot } from "./release-root";
 import type { JsonValue, ProspectiveScenario } from "./registry";
 import type { ReleaseRole } from "./blinding";
 
@@ -38,6 +39,9 @@ export interface ProspectiveCellResult {
     releaseIdentityFingerprint: string;
     implementationFingerprint: string;
     harness: "opencode" | "pi" | "rust";
+    model: string;
+    seed: number;
+    platform: string;
     runHealth: CellHealth;
     productOutcome: ProductOutcome;
     failedChecks: string[];
@@ -52,6 +56,7 @@ function terminal(
     role: ReleaseRole,
     root: VerifiedReleaseRoot,
     expectedRelease: FrozenReleaseIdentity,
+    coordinate: Pick<ProspectiveCellResult, "model" | "seed" | "platform">,
     fields: Pick<ProspectiveCellResult, "runHealth" | "productOutcome" | "failedChecks" | "reasonCode">,
 ): ProspectiveCellResult {
     return {
@@ -67,6 +72,7 @@ function terminal(
         releaseIdentityFingerprint: canonicalFingerprint(expectedRelease),
         implementationFingerprint: scenario.implementationFingerprint,
         harness: scenario.harness,
+        ...coordinate,
         ...fields,
     };
 }
@@ -75,15 +81,24 @@ export async function runProspectiveCase(input: {
     scenario: ProspectiveScenario;
     releaseRole: ReleaseRole;
     releaseRoot: VerifiedReleaseRoot;
+    pairedReleaseRoot: VerifiedReleaseRoot;
     expectedRelease: FrozenReleaseIdentity;
     activeCheckout: string;
     workspaceRoot: string;
+    model: string;
+    seed: number;
+    platform: string;
     timeoutMs: number;
 }): Promise<ProspectiveCellResult> {
     const root = verifyReleaseRoot(input.releaseRoot.root, input.releaseRoot.manifest, {
         expectedRootFingerprint: input.releaseRoot.observedRootFingerprint,
         activeCheckout: input.activeCheckout,
     });
+    const pairedRoot = verifyReleaseRoot(input.pairedReleaseRoot.root, input.pairedReleaseRoot.manifest, {
+        expectedRootFingerprint: input.pairedReleaseRoot.observedRootFingerprint,
+        activeCheckout: input.activeCheckout,
+    });
+    assertDistinctReleaseRoots(root, pairedRoot);
     const expected = input.expectedRelease;
     if (
         input.releaseRole !== expected.role ||
@@ -100,30 +115,77 @@ export async function runProspectiveCase(input: {
     ) {
         throw new HoldoutContractError(["prospective-runner: release-identity-mismatch"]);
     }
+    if (
+        !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(input.model) ||
+        !Number.isSafeInteger(input.seed) || input.seed < 0 ||
+        input.platform !== root.manifest.platform || input.platform !== pairedRoot.manifest.platform
+    ) {
+        throw new HoldoutContractError(["prospective-runner: execution-coordinate-invalid"]);
+    }
     if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
         throw new HoldoutContractError(["prospective-runner: timeout-invalid"]);
     }
+    const coordinate = { model: input.model, seed: input.seed, platform: input.platform };
+    const controller = new AbortController();
+    const context = {
+        workspaceRoot: input.workspaceRoot,
+        releaseRoot: root.root,
+        ...coordinate,
+        signal: controller.signal,
+    };
+    let cleaned = false;
+    const cleanup = async (): Promise<boolean> => {
+        if (cleaned) return true;
+        cleaned = true;
+        try {
+            await input.scenario.cleanup(context);
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const finish = async (
+        fields: Pick<ProspectiveCellResult, "runHealth" | "productOutcome" | "failedChecks" | "reasonCode">,
+    ): Promise<ProspectiveCellResult> => {
+        if (!await cleanup()) {
+            return terminal(input.scenario, input.releaseRole, root, expected, coordinate, {
+                runHealth: "crash",
+                productOutcome: "not-evaluated",
+                failedChecks: [],
+                reasonCode: "runner-crash",
+            });
+        }
+        return terminal(input.scenario, input.releaseRole, root, expected, coordinate, fields);
+    };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<"timeout">((resolve) => {
         timer = setTimeout(() => resolve("timeout"), input.timeoutMs);
     });
+    const execution = Promise.resolve()
+        .then(() => input.scenario.driver(context))
+        .then((raw) => ({ status: "ok" as const, raw }))
+        .catch((error: unknown) => ({ status: "error" as const, error }));
     try {
-        const execution = input.scenario
-            .driver({ workspaceRoot: input.workspaceRoot, releaseRoot: root.root })
-            .then((raw) => ({ status: "ok" as const, raw }))
-            .catch((error: unknown) => ({ status: "error" as const, error }));
         const raced = await Promise.race([execution, timeout]);
         if (raced === "timeout") {
-            return terminal(input.scenario, input.releaseRole, root, expected, {
+            controller.abort();
+            const cleanupSucceeded = await cleanup();
+            await execution;
+            return terminal(input.scenario, input.releaseRole, root, expected, coordinate, cleanupSucceeded ? {
                 runHealth: "timeout",
                 productOutcome: "not-evaluated",
                 failedChecks: [],
                 reasonCode: "deadline-exceeded",
+            } : {
+                runHealth: "crash",
+                productOutcome: "not-evaluated",
+                failedChecks: [],
+                reasonCode: "runner-crash",
             });
         }
         if (raced.status === "error") {
             if (raced.error instanceof ProspectiveProductFailure) {
-                return terminal(input.scenario, input.releaseRole, root, expected, {
+                return finish({
                     runHealth: "completed",
                     productOutcome: "fail",
                     failedChecks: [],
@@ -131,14 +193,14 @@ export async function runProspectiveCase(input: {
                 });
             }
             if (raced.error instanceof ProspectivePrerequisiteUnavailable) {
-                return terminal(input.scenario, input.releaseRole, root, expected, {
+                return finish({
                     runHealth: "unavailable",
                     productOutcome: "not-evaluated",
                     failedChecks: [],
                     reasonCode: "prerequisite-unavailable",
                 });
             }
-            return terminal(input.scenario, input.releaseRole, root, expected, {
+            return finish({
                 runHealth: "crash",
                 productOutcome: "not-evaluated",
                 failedChecks: [],
@@ -150,7 +212,7 @@ export async function runProspectiveCase(input: {
             canonicalJson(raced.raw as JsonValue);
             checks = input.scenario.verifier(input.scenario.normalizer(raced.raw));
         } catch {
-            return terminal(input.scenario, input.releaseRole, root, expected, {
+            return finish({
                 runHealth: "completed",
                 productOutcome: "fail",
                 failedChecks: [],
@@ -158,15 +220,19 @@ export async function runProspectiveCase(input: {
             });
         }
         const failedChecks = checks.filter((check) => !check.passed).map((check) => check.id).sort();
-        if (new Set(checks.map((check) => check.id)).size !== checks.length || checks.some((check) => !/^check-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(check.id))) {
-            return terminal(input.scenario, input.releaseRole, root, expected, {
+        if (
+            checks.length === 0 ||
+            new Set(checks.map((check) => check.id)).size !== checks.length ||
+            checks.some((check) => !/^check-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(check.id))
+        ) {
+            return finish({
                 runHealth: "completed",
                 productOutcome: "fail",
                 failedChecks: [],
                 reasonCode: "invalid-result",
             });
         }
-        return terminal(input.scenario, input.releaseRole, root, expected, {
+        return finish({
             runHealth: "completed",
             productOutcome: failedChecks.length === 0 ? "pass" : "fail",
             failedChecks,
@@ -177,12 +243,30 @@ export async function runProspectiveCase(input: {
     }
 }
 
+/**
+ * Terminal `(runHealth, productOutcome, reasonCode)` triples that
+ * `runProspectiveCase` returns, joined by `|` with an absent reason spelled
+ * `null`. Committed `outcomes.json` rows are hand-authorable, so the parser
+ * refuses triples no runner path emits instead of trusting a row's provenance;
+ * otherwise a tampered cell reaches missingness and scorecard adapters as
+ * self-contradictory evidence.
+ */
+const ALLOWED_CELL_TERMINALS: ReadonlySet<string> = new Set([
+    "completed|pass|null",
+    "completed|fail|null",
+    "completed|fail|product-crash",
+    "completed|fail|invalid-result",
+    "timeout|not-evaluated|deadline-exceeded",
+    "crash|not-evaluated|runner-crash",
+    "unavailable|not-evaluated|prerequisite-unavailable",
+]);
+
 export function parseProspectiveCellResult(raw: unknown): ProspectiveCellResult {
     const value = record(raw, "cell");
     exact(value, [
         "schema", "caseId", "familyId", "releaseRole", "expectedReleaseId", "observedReleaseId",
         "expectedRootFingerprint", "observedRootFingerprint", "releaseRootManifestFingerprint", "releaseIdentityFingerprint",
-        "implementationFingerprint", "harness",
+        "implementationFingerprint", "harness", "model", "seed", "platform",
         "runHealth", "productOutcome", "failedChecks", "reasonCode",
     ], "cell");
     if (value.schema !== PROSPECTIVE_CELL_SCHEMA) fail("cell.schema: version-invalid");
@@ -199,6 +283,9 @@ export function parseProspectiveCellResult(raw: unknown): ProspectiveCellResult 
         releaseIdentityFingerprint: hex64(value.releaseIdentityFingerprint, "cell.releaseIdentityFingerprint"),
         implementationFingerprint: hex64(value.implementationFingerprint, "cell.implementationFingerprint"),
         harness: enumeration(value.harness, ["opencode", "pi", "rust"] as const, "cell.harness"),
+        model: staticId(value.model, "cell.model", /^[A-Za-z0-9][A-Za-z0-9._/-]*$/),
+        seed: integer(value.seed, "cell.seed"),
+        platform: staticId(value.platform, "cell.platform"),
         runHealth: enumeration(value.runHealth, ["completed", "timeout", "crash", "malformed", "unavailable"] as const, "cell.runHealth"),
         productOutcome: enumeration(value.productOutcome, ["pass", "fail", "not-evaluated"] as const, "cell.productOutcome"),
         failedChecks: array(value.failedChecks, "cell.failedChecks").map((entry, index) =>
@@ -208,6 +295,9 @@ export function parseProspectiveCellResult(raw: unknown): ProspectiveCellResult 
             ? null
             : enumeration(value.reasonCode, ["deadline-exceeded", "runner-crash", "invalid-result", "prerequisite-unavailable", "product-crash"] as const, "cell.reasonCode"),
     };
+    if (new Set(result.failedChecks).size !== result.failedChecks.length) {
+        fail("cell.failedChecks: duplicate");
+    }
     if (result.expectedReleaseId !== result.observedReleaseId || result.expectedRootFingerprint !== result.observedRootFingerprint) {
         fail("cell: observed-identity-mismatch");
     }
@@ -221,6 +311,16 @@ export function parseProspectiveCellResult(raw: unknown): ProspectiveCellResult 
         }
     } else if (result.productOutcome !== "not-evaluated" || result.failedChecks.length > 0 || result.reasonCode === null) {
         fail("cell: incomplete-fields-invalid");
+    }
+    if (!ALLOWED_CELL_TERMINALS.has(`${result.runHealth}|${result.productOutcome}|${result.reasonCode ?? "null"}`)) {
+        fail("cell: health-reason-mismatch");
+    }
+    // Refines an otherwise-permitted terminal: a reason code names a path the runner reaches
+    // before, or instead of, per-check evaluation, and every such call site emits an empty
+    // list. A row carrying both would let check-counting consumers weigh failures the run
+    // never recorded.
+    if (result.reasonCode !== null && result.failedChecks.length > 0) {
+        fail("cell: reason-code-checks-invalid");
     }
     return result;
 }

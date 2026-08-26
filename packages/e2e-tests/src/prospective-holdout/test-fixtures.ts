@@ -155,13 +155,16 @@ export function sanitizedIntakeFixture(overrides: { accepted?: boolean; subjecti
     };
 }
 
-export function releaseRootFixture(root: string): ReleaseRootManifest {
+export function releaseRootFixture(
+    root: string,
+    options: { releaseId?: string; sourceBytes?: string; immutableReference?: string } = {},
+): ReleaseRootManifest {
     const entries: Array<[string, string, ReleaseFileKind]> = [
         ["packages/plugin/dist/index.js", "opencode", "artifact"],
         ["packages/pi-plugin/dist/index.js", "pi", "artifact"],
         ["bin/mc-host", "rust", "runtime"],
         ["database/context.db", "db", "artifact"],
-        ["src/revision.txt", "source", "source"],
+        ["src/revision.txt", options.sourceBytes ?? "source", "source"],
         ["bun.lock", "lock", "lockfile"],
         ["harness/version.txt", "harness", "harness"],
     ];
@@ -179,10 +182,10 @@ export function releaseRootFixture(root: string): ReleaseRootManifest {
     );
     return {
         schema: "prospective-release-root/v1",
-        releaseId: "v2.0.0",
+        releaseId: options.releaseId ?? "v2.0.0",
         channel: "stable",
         platform: "linux-x64",
-        immutableReference: `sha256:${"a".repeat(64)}`,
+        immutableReference: options.immutableReference ?? `sha256:${"a".repeat(64)}`,
         files,
         sourceFingerprint: byKind("source"),
         lockfileFingerprint: byKind("lockfile"),
@@ -218,6 +221,9 @@ export function cellResultFixture(
         releaseIdentityFingerprint: canonicalFingerprint(release),
         implementationFingerprint: H2,
         harness: "opencode",
+        model: "fixture/model",
+        seed: 7,
+        platform: "linux-x64",
         runHealth: "completed",
         productOutcome: "pass",
         failedChecks: [],

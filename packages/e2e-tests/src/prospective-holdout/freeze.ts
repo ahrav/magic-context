@@ -48,8 +48,13 @@ export interface PrivacyOptions {
 function assertArtifactDirectory(path: string): void {
     let entries: string[];
     try {
+        const stat = lstatSync(path);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+            throw new HoldoutContractError(["artifact: directory-not-regular"]);
+        }
         entries = readdirSync(path);
-    } catch {
+    } catch (error) {
+        if (error instanceof HoldoutContractError) throw error;
         throw new HoldoutContractError(["artifact: unreadable"]);
     }
     if (entries.length !== 1 || entries[0] !== MANIFEST_FILE) {
@@ -88,6 +93,13 @@ export function loadPolicyDocuments(analysisPath: string, scorecardPath: string)
     };
 }
 
+function readyPolicySchema(policy: unknown, label: string): string {
+    if (!policy || typeof policy !== "object" || Array.isArray(policy) || typeof (policy as { schema?: unknown }).schema !== "string") {
+        throw new HoldoutContractError([`${label}: schema-missing`]);
+    }
+    return (policy as { schema: string }).schema;
+}
+
 export function validateFreezePolicies(freeze: ReleaseFreezeManifest, policies: PolicyDocuments): void {
     if (policies.analysis.status !== "ready" || policies.scorecard.status !== "ready") {
         throw new HoldoutContractError(["freeze.policies: sibling-policy-pending"]);
@@ -98,22 +110,37 @@ export function validateFreezePolicies(freeze: ReleaseFreezeManifest, policies: 
     if (freeze.body.policies.scorecard.policyFingerprint !== policies.scorecard.policyFingerprint) {
         throw new HoldoutContractError(["freeze.policies.scorecard: fingerprint-mismatch"]);
     }
+    if (freeze.body.policies.analysis.schemaVersion !== readyPolicySchema(policies.analysis.policy, "freeze.policies.analysis")) {
+        throw new HoldoutContractError(["freeze.policies.analysis: schema-version-mismatch"]);
+    }
+    if (freeze.body.policies.scorecard.schemaVersion !== readyPolicySchema(policies.scorecard.policy, "freeze.policies.scorecard")) {
+        throw new HoldoutContractError(["freeze.policies.scorecard: schema-version-mismatch"]);
+    }
 }
 
 function writeArtifactAtomically(value: unknown, destination: string): void {
-    if (existsSync(destination)) throw new HoldoutContractError(["artifact: destination-exists"]);
+    const bytes = `${JSON.stringify(value, null, 2)}\n`;
+    const acceptExisting = (): boolean => {
+        if (!existsSync(destination)) return false;
+        assertArtifactDirectory(destination);
+        if (readFileSync(join(destination, MANIFEST_FILE), "utf8") !== bytes) {
+            throw new HoldoutContractError(["artifact: destination-conflict"]);
+        }
+        return true;
+    };
+    if (acceptExisting()) return;
     const parent = dirname(destination);
     mkdirSync(parent, { recursive: true });
     const staging = mkdtempSync(join(parent, ".staging-"));
     try {
-        writeFileSync(join(staging, MANIFEST_FILE), `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
+        writeFileSync(join(staging, MANIFEST_FILE), bytes, { flag: "wx" });
         readCanonicalJsonFile(join(staging, MANIFEST_FILE), (code) =>
             new HoldoutContractError([`artifact.staging:${code}`]),
         );
         renameSync(staging, destination);
     } catch (error) {
         rmSync(staging, { recursive: true, force: true });
-        if (existsSync(destination)) throw new HoldoutContractError(["artifact: destination-exists"]);
+        if (acceptExisting()) return;
         throw error;
     }
 }
@@ -148,23 +175,53 @@ export function loadFreeze(
     return { manifest, manifestFingerprint };
 }
 
+type TrustedFreeze = { manifest: ReleaseFreezeManifest; manifestFingerprint: string };
+
+/**
+ * The complete set of close-versus-freeze binding invariants, enforced
+ * identically by every entry point.
+ *
+ * Repository validation reads an installed close through `loadClose` and never
+ * calls `publishClose`, so an invariant checked only while publishing is not
+ * enforced at all against a close artifact written directly into a repository.
+ * Holding the comparisons in one body is what keeps the two paths from admitting
+ * different manifests.
+ *
+ * `linkMismatch` is the only sanctioned difference between callers: the publish
+ * path names the diverging link field for the operator authoring the manifest,
+ * while the load path reports a single code for either field. The cutoff code is
+ * shared because both paths reject the same condition for the same reason.
+ */
+function assertCloseBoundToFreeze(
+    manifest: CohortCloseManifest,
+    trustedFreeze: TrustedFreeze,
+    linkMismatch: { epochId: string; freezeManifestFingerprint: string },
+): void {
+    if (manifest.body.epochId !== trustedFreeze.manifest.body.epochId) {
+        throw new HoldoutContractError([linkMismatch.epochId]);
+    }
+    if (manifest.body.freezeManifestFingerprint !== trustedFreeze.manifestFingerprint) {
+        throw new HoldoutContractError([linkMismatch.freezeManifestFingerprint]);
+    }
+    // The frozen intake window bounds admission: a close stamped before that
+    // window ends discards reports the epoch is still obliged to admit.
+    if (Date.parse(manifest.body.closedAt) < Date.parse(trustedFreeze.manifest.body.intakeWindow.closesAt)) {
+        throw new HoldoutContractError(["close.closedAt: before-cutoff"]);
+    }
+}
+
 export function publishClose(
     raw: unknown,
     destination: string,
-    trustedFreeze: { manifest: ReleaseFreezeManifest; manifestFingerprint: string },
+    trustedFreeze: TrustedFreeze,
     privacy: PrivacyOptions = {},
 ): { manifest: CohortCloseManifest; manifestFingerprint: string } {
     privacyFirst(raw, privacy);
     const manifest = parseCloseManifest(raw);
-    if (manifest.body.epochId !== trustedFreeze.manifest.body.epochId) {
-        throw new HoldoutContractError(["close.epochId: freeze-mismatch"]);
-    }
-    if (manifest.body.freezeManifestFingerprint !== trustedFreeze.manifestFingerprint) {
-        throw new HoldoutContractError(["close.freezeManifestFingerprint: mismatch"]);
-    }
-    if (Date.parse(manifest.body.closedAt) < Date.parse(trustedFreeze.manifest.body.intakeWindow.closesAt)) {
-        throw new HoldoutContractError(["close.closedAt: before-cutoff"]);
-    }
+    assertCloseBoundToFreeze(manifest, trustedFreeze, {
+        epochId: "close.epochId: freeze-mismatch",
+        freezeManifestFingerprint: "close.freezeManifestFingerprint: mismatch",
+    });
     writeArtifactAtomically(manifest, destination);
     return loadClose(destination, canonicalFingerprint(manifest), trustedFreeze, privacy);
 }
@@ -172,7 +229,7 @@ export function publishClose(
 export function loadClose(
     artifactDir: string,
     expectedManifestFingerprint: string,
-    trustedFreeze: { manifest: ReleaseFreezeManifest; manifestFingerprint: string },
+    trustedFreeze: TrustedFreeze,
     privacy: PrivacyOptions = {},
 ): { manifest: CohortCloseManifest; manifestFingerprint: string } {
     const raw = readManifest(artifactDir);
@@ -182,12 +239,12 @@ export function loadClose(
         throw new HoldoutContractError(["close.manifest: untrusted"]);
     }
     const manifest = parseCloseManifest(raw);
-    if (
-        manifest.body.epochId !== trustedFreeze.manifest.body.epochId ||
-        manifest.body.freezeManifestFingerprint !== trustedFreeze.manifestFingerprint
-    ) {
-        throw new HoldoutContractError(["close: freeze-link-invalid"]);
-    }
+    // One code covers either link field on this path.
+    const linkInvalid = "close: freeze-link-invalid";
+    assertCloseBoundToFreeze(manifest, trustedFreeze, {
+        epochId: linkInvalid,
+        freezeManifestFingerprint: linkInvalid,
+    });
     return { manifest, manifestFingerprint };
 }
 

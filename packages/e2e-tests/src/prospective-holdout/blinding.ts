@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { canonicalFingerprint, canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { CASE_ID_RE, HoldoutContractError, array, enumeration, exact, fail, record, staticId } from "./contract";
 
 export type ReleaseRole = "release-n" | "release-n-minus-1";
@@ -54,10 +54,54 @@ export function createConcealedMap(caseIds: readonly string[], secret: Uint8Arra
     };
 }
 
-export function verifyConcealedMap(map: ConcealedMap, secret: Uint8Array, expectedCommitment: string): void {
+export function parseConcealedMap(raw: unknown): ConcealedMap {
+    const value = record(raw, "blinding.map");
+    exact(value, ["schema", "salt", "assignments", "commitment"], "blinding.map");
+    if (value.schema !== "prospective-concealed-map/v1") fail("blinding.map.schema: version-invalid");
+    const assignments = array(value.assignments, "blinding.map.assignments").map((entry, index) => {
+        const label = `blinding.map.assignments[${index}]`;
+        const assignment = record(entry, label);
+        exact(assignment, ["caseId", "buildA", "buildB"], label);
+        const buildA = enumeration(assignment.buildA, ["release-n", "release-n-minus-1"] as const, `${label}.buildA`);
+        const buildB = enumeration(assignment.buildB, ["release-n", "release-n-minus-1"] as const, `${label}.buildB`);
+        if (buildA === buildB) fail(`${label}: roles-not-complementary`);
+        return {
+            caseId: staticId(assignment.caseId, `${label}.caseId`, CASE_ID_RE),
+            buildA,
+            buildB,
+        };
+    });
+    if (new Set(assignments.map((assignment) => assignment.caseId)).size !== assignments.length) {
+        fail("blinding.map.assignments: duplicate-case");
+    }
+    return {
+        schema: "prospective-concealed-map/v1",
+        salt: staticId(value.salt, "blinding.map.salt", /^[0-9a-f]{32}$/),
+        assignments,
+        commitment: staticId(value.commitment, "blinding.map.commitment", /^[0-9a-f]{64}$/),
+    };
+}
+
+export function verifyConcealedMap(
+    raw: unknown,
+    secret: Uint8Array,
+    expectedCommitment: string,
+    expectedCaseIds: readonly string[],
+): ConcealedMap {
+    if (secret.byteLength < 32) fail("blinding.secret: too-short");
+    const map = parseConcealedMap(raw);
+    const actualCaseIds = map.assignments.map((assignment) => assignment.caseId).sort();
+    const expected = [...expectedCaseIds].sort();
+    if (
+        new Set(expected).size !== expected.length ||
+        JSON.stringify(actualCaseIds) !== JSON.stringify(expected)
+    ) {
+        throw new HoldoutContractError(["blinding.map: subjective-cases-mismatch"]);
+    }
     if (commitment(secret, map.salt, map.assignments) !== expectedCommitment || map.commitment !== expectedCommitment) {
         throw new HoldoutContractError(["blinding.map: commitment-mismatch"]);
     }
+    return map;
 }
 
 function parseObservation(raw: unknown, label: string): BoundedObservation {
@@ -93,12 +137,15 @@ export function buildBlindedPacket(input: {
     assignment: ConcealedAssignment;
     observations: Record<ReleaseRole, BoundedObservation>;
     allowedCheckIds: readonly string[];
+    secret: Uint8Array;
 }): BlindedPacket {
     if (input.assignment.caseId !== input.caseId) fail("packet: assignment-case-mismatch");
+    if (input.assignment.buildA === input.assignment.buildB) fail("packet: assignment-role-duplicate");
+    if (input.secret.byteLength < 32) fail("packet.secret: too-short");
     const raw = {
         schema: "prospective-blinded-packet/v1",
         caseId: input.caseId,
-        packetId: `packet-${canonicalFingerprint([input.caseId, input.assignment]).slice(0, 32)}`,
+        packetId: `packet-${createHmac("sha256", input.secret).update(input.caseId).digest("hex").slice(0, 32)}`,
         buildA: input.observations[input.assignment.buildA],
         buildB: input.observations[input.assignment.buildB],
     };

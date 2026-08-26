@@ -57,7 +57,7 @@ describe("opencode child lifecycle", () => {
                 releaseRoot: verified,
             });
             const config = JSON.parse(readFileSync(join(env.configDir, "opencode.json"), "utf8")) as { plugin: string[] };
-            expect(config.plugin).toEqual([`file://${join(release, "packages/plugin/dist/index.js")}`]);
+            expect(config.plugin).toEqual([`file://${join(verified.root, "packages/plugin/dist/index.js")}`]);
             const database = join(env.dataDir, "cortexkit/magic-context/context.db");
             expect(readFileSync(database, "utf8")).toBe("db");
             expect(() => accessSync(database, constants.W_OK)).not.toThrow();

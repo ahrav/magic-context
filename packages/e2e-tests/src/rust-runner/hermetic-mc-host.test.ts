@@ -8,6 +8,7 @@ import {
     lstatSync,
     mkdtempSync,
     readFileSync,
+    realpathSync,
     rmSync,
     writeFileSync,
 } from "node:fs";
@@ -102,7 +103,7 @@ afterEach(() => {
 
 describe("direct mc-host fixture contract", () => {
     it("selects frozen host artifact without a workspace build", async () => {
-        const release = mkdtempSync(join(tmpdir(), "rust-release-root-"));
+        const release = realpathSync(mkdtempSync(join(tmpdir(), "rust-release-root-")));
         const active = mkdtempSync(join(tmpdir(), "rust-active-root-"));
         temporaryRoots.push(release, active);
         const manifest = releaseRootFixture(release);

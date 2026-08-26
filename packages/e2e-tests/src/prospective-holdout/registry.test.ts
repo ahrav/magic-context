@@ -18,6 +18,7 @@ function scenario(): ProspectiveScenario {
         harness: "opencode",
         subjective: false,
         async driver() { return { state: "current" }; },
+        async cleanup() {},
         normalizer(raw) { return raw; },
         verifier() { return [{ id: "check-current", passed: true }]; },
     };

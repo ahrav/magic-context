@@ -26,6 +26,7 @@ function packetFixture(caseId = `case-${"a".repeat(32)}`) {
             "release-n-minus-1": { status: "fail", checkIds: ["check-current"] },
         },
         allowedCheckIds: ["check-current"],
+        secret: authKey,
     });
 }
 

@@ -8,6 +8,9 @@ export interface PairedCaseFact {
     caseId: string;
     familyId: string;
     implementationFingerprint: string;
+    model: string;
+    seed: number;
+    platform: string;
     releaseN: ProspectiveCellResult;
     releaseNMinus1: ProspectiveCellResult;
     status: PairStatus;
@@ -18,13 +21,49 @@ export interface CellAttempt {
     cell: ProspectiveCellResult;
 }
 
+export interface AaPair {
+    left: ProspectiveCellResult;
+    right: ProspectiveCellResult;
+}
+
+function coordinate(cell: ProspectiveCellResult): string {
+    return `${cell.caseId}:${cell.model}:${cell.seed}:${cell.platform}`;
+}
+
 function identity(cell: ProspectiveCellResult): string {
-    return `${cell.caseId}:${cell.releaseRole}`;
+    return `${coordinate(cell)}:${cell.releaseRole}`;
+}
+
+function expectedCoordinates(close: CohortCloseManifest, freeze: ReleaseFreezeManifest): string[] {
+    return close.body.cases.flatMap((entry) =>
+        freeze.body.executionMatrix.models.flatMap((model) =>
+            freeze.body.executionMatrix.seeds.flatMap((seed) =>
+                freeze.body.executionMatrix.platforms.map((platform) =>
+                    `${entry.caseId}:${model}:${seed}:${platform}`
+                )
+            )
+        )
+    );
+}
+
+function assertFrozenCell(cell: ProspectiveCellResult, freeze: ReleaseFreezeManifest): void {
+    const frozenRelease = freeze.body.releases.find((release) => release.role === cell.releaseRole)!;
+    if (
+        cell.expectedReleaseId !== frozenRelease.releaseId ||
+        cell.releaseRootManifestFingerprint !== frozenRelease.releaseRootManifestFingerprint ||
+        cell.releaseIdentityFingerprint !== canonicalFingerprint(frozenRelease) ||
+        !freeze.body.executionMatrix.models.includes(cell.model) ||
+        !freeze.body.executionMatrix.seeds.includes(cell.seed) ||
+        !freeze.body.executionMatrix.platforms.includes(cell.platform)
+    ) {
+        throw new HoldoutContractError(["comparison: frozen-release-binding-mismatch"]);
+    }
 }
 
 export function buildPairedFacts(
     close: CohortCloseManifest,
     attempts: readonly CellAttempt[],
+    aaPairs: readonly AaPair[],
     pairedRetryLimit: number,
     freeze: ReleaseFreezeManifest,
 ): PairedCaseFact[] {
@@ -38,54 +77,68 @@ export function buildPairedFacts(
         throw new HoldoutContractError(["comparison: retry-limit-invalid"]);
     }
     const admitted = new Map(close.body.cases.map((entry) => [entry.caseId, entry]));
+    const expectedAa = new Set(expectedCoordinates(close, freeze));
+    for (const pair of aaPairs) {
+        if (!admitted.has(pair.left.caseId)) throw new HoldoutContractError(["comparison: unadmitted-aa-cell"]);
+        assertFrozenCell(pair.left, freeze);
+        assertFrozenCell(pair.right, freeze);
+        const key = coordinate(pair.left);
+        if (
+            coordinate(pair.right) !== key ||
+            pair.left.releaseRole !== pair.right.releaseRole ||
+            !expectedAa.delete(key)
+        ) {
+            throw new HoldoutContractError(["comparison: aa-binding-mismatch"]);
+        }
+        assertAaSymmetry(pair.left, pair.right);
+    }
+    if (expectedAa.size > 0) throw new HoldoutContractError(["comparison: aa-evidence-incomplete"]);
+
     const byAttempt = new Map<number, Map<string, ProspectiveCellResult>>();
     for (const item of attempts) {
         if (!Number.isSafeInteger(item.attempt) || item.attempt < 0 || item.attempt > pairedRetryLimit) {
             throw new HoldoutContractError(["comparison: attempt-invalid"]);
         }
         if (!admitted.has(item.cell.caseId)) throw new HoldoutContractError(["comparison: unadmitted-cell"]);
-        const frozenRelease = freeze.body.releases.find((release) => release.role === item.cell.releaseRole)!;
-        if (
-            item.cell.expectedReleaseId !== frozenRelease.releaseId ||
-            item.cell.releaseRootManifestFingerprint !== frozenRelease.releaseRootManifestFingerprint ||
-            item.cell.releaseIdentityFingerprint !== canonicalFingerprint(frozenRelease)
-        ) {
-            throw new HoldoutContractError(["comparison: frozen-release-binding-mismatch"]);
-        }
+        assertFrozenCell(item.cell, freeze);
         const cells = byAttempt.get(item.attempt) ?? new Map<string, ProspectiveCellResult>();
         const key = identity(item.cell);
         if (cells.has(key)) throw new HoldoutContractError(["comparison: duplicate-cell"]);
         cells.set(key, item.cell);
         byAttempt.set(item.attempt, cells);
     }
+    const coordinates = expectedCoordinates(close, freeze);
     for (const [attempt, cells] of byAttempt) {
-        for (const caseId of admitted.keys()) {
-            const left = cells.has(`${caseId}:release-n`);
-            const right = cells.has(`${caseId}:release-n-minus-1`);
+        for (const key of coordinates) {
+            const left = cells.has(`${key}:release-n`);
+            const right = cells.has(`${key}:release-n-minus-1`);
             if (left !== right) {
                 throw new HoldoutContractError([`comparison: unpaired-retry-${attempt}`]);
             }
         }
     }
     const facts: PairedCaseFact[] = [];
-    for (const [caseId, closed] of admitted) {
+    for (const key of coordinates) {
+        const [caseId] = key.split(":", 1);
+        const closed = admitted.get(caseId)!;
         let chosen: Map<string, ProspectiveCellResult> | undefined;
         for (let attempt = 0; attempt <= pairedRetryLimit; attempt += 1) {
             const candidate = byAttempt.get(attempt);
-            if (candidate?.has(`${caseId}:release-n`) && candidate.has(`${caseId}:release-n-minus-1`)) {
+            if (candidate?.has(`${key}:release-n`) && candidate.has(`${key}:release-n-minus-1`)) {
                 chosen = candidate;
-                const n = candidate.get(`${caseId}:release-n`)!;
-                const previous = candidate.get(`${caseId}:release-n-minus-1`)!;
+                const n = candidate.get(`${key}:release-n`)!;
+                const previous = candidate.get(`${key}:release-n-minus-1`)!;
                 if (n.runHealth === "completed" && previous.runHealth === "completed") break;
             }
         }
         if (!chosen) throw new HoldoutContractError(["comparison: missing-pair"]);
-        const releaseN = chosen.get(`${caseId}:release-n`)!;
-        const releaseNMinus1 = chosen.get(`${caseId}:release-n-minus-1`)!;
+        const releaseN = chosen.get(`${key}:release-n`)!;
+        const releaseNMinus1 = chosen.get(`${key}:release-n-minus-1`)!;
         if (
             releaseN.familyId !== closed.familyId ||
             releaseNMinus1.familyId !== closed.familyId ||
-            releaseN.implementationFingerprint !== releaseNMinus1.implementationFingerprint
+            releaseN.implementationFingerprint !== releaseNMinus1.implementationFingerprint ||
+            releaseN.harness !== releaseNMinus1.harness
         ) {
             throw new HoldoutContractError(["comparison: pair-binding-mismatch"]);
         }
@@ -93,6 +146,9 @@ export function buildPairedFacts(
             caseId,
             familyId: closed.familyId,
             implementationFingerprint: releaseN.implementationFingerprint,
+            model: releaseN.model,
+            seed: releaseN.seed,
+            platform: releaseN.platform,
             releaseN,
             releaseNMinus1,
             status: releaseN.runHealth === "completed" && releaseNMinus1.runHealth === "completed"
@@ -100,16 +156,26 @@ export function buildPairedFacts(
                 : "incomplete",
         });
     }
-    return facts.sort((left, right) => left.caseId.localeCompare(right.caseId));
+    return facts.sort((left, right) =>
+        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
+            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
+        )
+    );
 }
 
 export function assertAaSymmetry(left: ProspectiveCellResult, right: ProspectiveCellResult): void {
     const projection = (cell: ProspectiveCellResult) => ({
         caseId: cell.caseId,
         familyId: cell.familyId,
+        releaseRole: cell.releaseRole,
+        expectedReleaseId: cell.expectedReleaseId,
         root: cell.observedRootFingerprint,
+        releaseRootManifestFingerprint: cell.releaseRootManifestFingerprint,
         implementation: cell.implementationFingerprint,
         harness: cell.harness,
+        model: cell.model,
+        seed: cell.seed,
+        platform: cell.platform,
         health: cell.runHealth,
         outcome: cell.productOutcome,
         checks: cell.failedChecks,

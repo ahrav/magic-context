@@ -224,10 +224,6 @@ function reapRecordedRustProcesses(): void {
 }
 
 export function detectRustModePrereqs(releaseRoot?: VerifiedReleaseRoot): RustModePrereqs {
-    if (releaseRoot) {
-        releaseRootPath(releaseRoot, "rustHost");
-        return { ok: true };
-    }
     if (process.platform === "win32") {
         return {
             ok: false,
@@ -245,6 +241,16 @@ export function detectRustModePrereqs(releaseRoot?: VerifiedReleaseRoot): RustMo
             skipReason:
                 "direct mc-host fixture requires Linux: broca crash-ownership records depend on /proc process identity",
         };
+    }
+    if (releaseRoot) {
+        releaseRootPath(releaseRoot, "rustHost");
+        if (releaseRoot.manifest.platform !== `${process.platform}-${process.arch}`) {
+            return {
+                ok: false,
+                skipReason: `release root platform ${releaseRoot.manifest.platform} does not match this host`,
+            };
+        }
+        return { ok: true };
     }
     if (!existsSync(join(REPO_ROOT, "Cargo.toml"))) {
         return {

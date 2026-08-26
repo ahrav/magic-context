@@ -17,7 +17,7 @@ import {
 import { parseLifecycleLedger, validateLifecycle, type LifecycleEvent } from "./lifecycle";
 import { parseProspectiveCellResult, type ProspectiveCellResult } from "./runner";
 import { parseAdjudicationClose } from "./adjudication";
-import { buildPairedFacts, type PairedCaseFact } from "./comparison";
+import { buildPairedFacts, type AaPair, type PairedCaseFact } from "./comparison";
 import {
     parseProspectiveReport,
     validateProspectiveReportEvidence,
@@ -64,13 +64,18 @@ function lifecycleFile(path: string): LifecycleEvent[] {
     }
 }
 
-function parseOutcomes(raw: unknown): Array<{ attempt: number; cell: ProspectiveCellResult }> {
+interface ProspectiveOutcomes {
+    attempts: Array<{ attempt: number; cell: ProspectiveCellResult }>;
+    aa: AaPair[];
+}
+
+function parseOutcomes(raw: unknown): ProspectiveOutcomes {
     const value = record(raw, "outcomes");
-    exact(value, ["schema", "attempts"], "outcomes");
-    if (value.schema !== "prospective-outcomes/v1" || !Array.isArray(value.attempts)) {
+    exact(value, ["schema", "attempts", "aa"], "outcomes");
+    if (value.schema !== "prospective-outcomes/v1" || !Array.isArray(value.attempts) || !Array.isArray(value.aa)) {
         throw new HoldoutContractError(["outcomes: schema-invalid"]);
     }
-    return value.attempts.map((entry, index) => {
+    const attempts = value.attempts.map((entry, index) => {
         const item = record(entry, `outcomes.attempts[${index}]`);
         exact(item, ["attempt", "cell"], `outcomes.attempts[${index}]`);
         if (!Number.isSafeInteger(item.attempt) || (item.attempt as number) < 0) {
@@ -78,6 +83,15 @@ function parseOutcomes(raw: unknown): Array<{ attempt: number; cell: Prospective
         }
         return { attempt: item.attempt as number, cell: parseProspectiveCellResult(item.cell) };
     });
+    const aa = value.aa.map((entry, index) => {
+        const item = record(entry, `outcomes.aa[${index}]`);
+        exact(item, ["left", "right"], `outcomes.aa[${index}]`);
+        return {
+            left: parseProspectiveCellResult(item.left),
+            right: parseProspectiveCellResult(item.right),
+        };
+    });
+    return { attempts, aa };
 }
 
 function requiredEvent(events: readonly LifecycleEvent[], state: LifecycleEvent["state"]): LifecycleEvent | undefined {
@@ -147,7 +161,7 @@ export function validateHoldoutRepository(
             }
         }
         const runningEvent = requiredEvent(events, "running");
-        let outcomes: Array<{ attempt: number; cell: ProspectiveCellResult }> = [];
+        let outcomes: ProspectiveOutcomes = { attempts: [], aa: [] };
         if (runningEvent || requiredEvent(events, "reported") || requiredEvent(events, "insufficient-evidence") || requiredEvent(events, "graduated")) {
             expectedEntries.add("outcomes.json");
             const raw = canonicalFile(join(epochRoot, "outcomes.json"), "outcomes");
@@ -182,7 +196,8 @@ export function validateHoldoutRepository(
             }
             pairs = buildPairedFacts(
                 close.manifest,
-                outcomes,
+                outcomes.attempts,
+                outcomes.aa,
                 pairedRetryLimit(policies.analysis.policy),
                 freeze.manifest,
             );
@@ -217,13 +232,23 @@ export function validateHoldoutRepository(
             if (!close || !report) throw new HoldoutContractError(["graduation: prior-artifacts-missing"]);
             expectedEntries.add("graduation");
             const directory = join(epochRoot, "graduation");
+            // Every other failure here carries a stable diagnostic code, so a ledger that
+            // claims graduation without the directory must not surface as a raw ENOENT.
+            if (!existsSync(directory)) {
+                throw new HoldoutContractError(["graduation: directory-missing"]);
+            }
             const files = readdirSync(directory).sort();
             const candidates = files.map((file) => {
                 if (!/^case-[0-9a-f]{32}\.json$/.test(file)) {
                     throw new HoldoutContractError(["graduation: filename-invalid"]);
                 }
                 const candidate = parseGraduationCandidate(canonicalFile(join(directory, file), "graduation"));
-                verifyProspectiveSourceEvidence(candidate.source, close!.manifest, close!.manifestFingerprint);
+                verifyProspectiveSourceEvidence(
+                    candidate.source,
+                    close!.manifest,
+                    close!.manifestFingerprint,
+                    candidate.incidentBytes,
+                );
                 return candidate;
             });
             validateGraduationCompleteness(close.manifest, candidates);
@@ -247,20 +272,39 @@ export function validateHoldoutRepository(
             throw new HoldoutContractError(["epoch: artifact-set-invalid"]);
         }
         if (close) {
-            const selectedCells = new Set(close.manifest.body.cases.flatMap((entry) => [
-                `${entry.caseId}:release-n`, `${entry.caseId}:release-n-minus-1`,
+            // A freeze may declare several models, seeds, and platforms. Keying selection on
+            // case and release role alone would let one pair satisfy the whole matrix and
+            // drive a promotion while every other frozen configuration stayed unexecuted, so
+            // the expected set is the full cross product the freeze committed to.
+            const matrix = freeze.manifest.body.executionMatrix;
+            const coordinates = close.manifest.body.cases.flatMap((entry) =>
+                matrix.models.flatMap((model) =>
+                    matrix.seeds.flatMap((seed) =>
+                        matrix.platforms.map((platform) => `${entry.caseId}:${model}:${seed}:${platform}`)
+                    )
+                )
+            );
+            const selectedCells = new Set(coordinates.flatMap((coordinate) => [
+                `${coordinate}:release-n`, `${coordinate}:release-n-minus-1`,
             ]));
             const expectedCells = new Set(selectedCells);
             const seenAttempts = new Set<string>();
-            for (const attempt of outcomes) {
-                const cell = `${attempt.cell.caseId}:${attempt.cell.releaseRole}`;
+            const cellKey = (cell: ProspectiveCellResult): string =>
+                `${cell.caseId}:${cell.model}:${cell.seed}:${cell.platform}:${cell.releaseRole}`;
+            for (const attempt of outcomes.attempts) {
+                const cell = cellKey(attempt.cell);
                 if (!selectedCells.has(cell)) throw new HoldoutContractError(["outcomes: unselected-cell"]);
                 const attemptCell = `${attempt.attempt}:${cell}`;
                 if (seenAttempts.has(attemptCell)) throw new HoldoutContractError(["outcomes: duplicate-cell"]);
                 seenAttempts.add(attemptCell);
                 expectedCells.delete(cell);
             }
-            if (outcomes.length > 0 && expectedCells.size > 0) {
+            for (const pair of outcomes.aa) {
+                if (!selectedCells.has(cellKey(pair.left)) || !selectedCells.has(cellKey(pair.right))) {
+                    throw new HoldoutContractError(["outcomes: unselected-aa-cell"]);
+                }
+            }
+            if (outcomes.attempts.length > 0 && expectedCells.size > 0) {
                 throw new HoldoutContractError(["outcomes: selected-matrix-incomplete"]);
             }
         }

@@ -620,7 +620,8 @@ describe("committed repository state", () => {
         const close = closeManifest();
         const trustedCloseFingerprint = canonicalFingerprint(close);
         const admitted = close.body.cases[0]!;
-        const incidentBytesFingerprint = "4".repeat(64);
+        const incidentBytes = { scenario: "synthetic-current-state", expected: "pass" };
+        const incidentBytesFingerprint = canonicalFingerprint(incidentBytes);
         const subjectFingerprint = canonicalFingerprint({
             epochId: close.body.epochId,
             caseId: admitted.caseId,
@@ -641,9 +642,12 @@ describe("committed repository state", () => {
                 subject_fingerprint: subjectFingerprint,
             },
         });
-        expect(() => verifyProspectiveSourceEvidence(source, close, trustedCloseFingerprint)).not.toThrow();
+        expect(() => verifyProspectiveSourceEvidence(source, close, trustedCloseFingerprint, incidentBytes)).not.toThrow();
+        expect(() => verifyProspectiveSourceEvidence(source, close, trustedCloseFingerprint, { changed: true })).toThrow(
+            /incident bytes fingerprint mismatch/,
+        );
         source.case_commitment = "f".repeat(64);
-        expect(() => verifyProspectiveSourceEvidence(source, close, trustedCloseFingerprint)).toThrow(
+        expect(() => verifyProspectiveSourceEvidence(source, close, trustedCloseFingerprint, incidentBytes)).toThrow(
             /admitted cohort case/,
         );
     });

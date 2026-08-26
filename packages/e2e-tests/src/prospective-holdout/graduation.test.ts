@@ -30,6 +30,9 @@ function fixtures() {
         caseId: close.body.cases[0]!.caseId,
         familyId: close.body.cases[0]!.familyId,
         implementationFingerprint: H2,
+        model: "fixture/model",
+        seed: 7,
+        platform: "linux-x64",
         releaseN: cell("release-n"),
         releaseNMinus1: cell("release-n-minus-1"),
         status: "complete",
@@ -79,7 +82,12 @@ describe("prospective incident graduation", () => {
         expect(() => validateGraduationCompleteness(close, [candidate])).not.toThrow();
 
         const registry: IncidentCaseRegistry = new Map();
-        const verifiedSource = verifyProspectiveSourceEvidence(candidate.source, close, trustedCloseFingerprint);
+        const verifiedSource = verifyProspectiveSourceEvidence(
+            candidate.source,
+            close,
+            trustedCloseFingerprint,
+            candidate.incidentBytes,
+        );
         const registration: RegisteredIncidentCase = {
             variantId: candidate.variantId,
             implementationFiles: ["scenario.ts"],
@@ -101,7 +109,12 @@ describe("prospective incident graduation", () => {
             expect(() => appendGraduationCandidate({ ...candidate, disposition: "executable-regression" }, path)).toThrow(/append-conflict/);
 
             const mutableSource = structuredClone(candidate.source);
-            const initiallyVerified = verifyProspectiveSourceEvidence(mutableSource, close, trustedCloseFingerprint);
+            const initiallyVerified = verifyProspectiveSourceEvidence(
+                mutableSource,
+                close,
+                trustedCloseFingerprint,
+                candidate.incidentBytes,
+            );
             mutableSource.case_commitment = H3;
             expect(() => registerProspectiveIncidentCase(new Map(), initiallyVerified, registration)).toThrow(
                 /requires verified source evidence/,
