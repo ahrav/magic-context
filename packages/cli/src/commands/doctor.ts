@@ -47,10 +47,20 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     if (options.clear) return runClear();
 
     const sharedDbPath = join(getMagicContextStorageDir(), "context.db");
+    // A published marker means a reset crashed between publishing its intent and
+    // moving the family, and it promises that initialization stays blocked until
+    // the reset is completed or rolled back. Warning and continuing broke that
+    // promise: the migration sweep and the backfills below both open
+    // `context.db` read-write, and those writes can change or recreate the
+    // artifacts the marker binds, after which `verifyResetMarkerFamily` refuses
+    // the recovery the marker exists to enable. So stop before any database is
+    // opened. `doctor reset-db` is routed ahead of this function, so the
+    // recovery path itself is unaffected.
     if (existsSync(databaseResetMarkerPath(sharedDbPath))) {
-        log.warn(
-            `A database reset is pending for ${sharedDbPath}. Run \`${DATABASE_RESET_COMMAND}\` to complete or roll it back.`,
+        log.error(
+            `A database reset is pending for ${sharedDbPath}. Run \`${DATABASE_RESET_COMMAND}\` to complete or roll it back; doctor cannot run until then.`,
         );
+        return 1;
     }
 
     let sharedCommandExitCode: number | null = null;

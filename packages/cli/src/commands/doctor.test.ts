@@ -3,6 +3,33 @@ import { readFileSync } from "node:fs";
 
 const source = readFileSync(new URL("./doctor.ts", import.meta.url), "utf8");
 
+describe("pending reset marker blocks doctor", () => {
+    test("returns before any database is opened", () => {
+        // The marker promises initialization stays blocked until the reset is
+        // completed or rolled back. Warning and continuing let the migration
+        // sweep and the backfills open context.db read-write, and those writes
+        // can rebind the artifacts the marker covers, after which the recovery
+        // it exists to enable is refused.
+        const marker = source.indexOf("databaseResetMarkerPath(sharedDbPath)");
+        expect(marker).toBeGreaterThan(-1);
+
+        // The guard returns rather than warning and falling through.
+        const guardBody = source.slice(marker, marker + 600);
+        expect(guardBody).toContain("return 1");
+
+        for (const opener of [
+            "runV22BackfillCommands(",
+            "runClaimsBackfillCommands(",
+            "openExistingContextDatabaseForMutation(",
+            "resolveAdaptersForCommand(",
+        ]) {
+            const at = source.indexOf(opener);
+            expect(at).toBeGreaterThan(-1);
+            expect(marker).toBeLessThan(at);
+        }
+    });
+});
+
 describe("unified doctor claims backfill dispatch", () => {
     test("owns one shared-database dispatch before the per-harness loop", () => {
         expect(source.match(/runClaimsBackfillCommands\s*\(/g)).toHaveLength(1);

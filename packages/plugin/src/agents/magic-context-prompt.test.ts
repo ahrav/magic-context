@@ -131,7 +131,7 @@ describe("buildMagicContextSection: memory gating", () => {
         );
         expect(memOn).toBe(legacy);
         expect(memOn).toContain("Use `ctx_memory`");
-        expect(memOn).toContain("**Save to memory proactively**");
+        expect(memOn).toContain("**Save durable knowledge proactively**");
     });
 
     it("memory OFF drops ALL ctx_memory guidance but keeps ctx_search", () => {
@@ -147,7 +147,7 @@ describe("buildMagicContextSection: memory gating", () => {
             false,
         );
         expect(off).not.toContain("ctx_memory");
-        expect(off).not.toContain("Save to memory proactively");
+        expect(off).not.toContain("Save durable knowledge proactively");
         expect(off).toContain("Use `ctx_search`");
         // no dangling blank line where the block was removed
         expect(off).not.toContain("\n\nUse `ctx_search`");

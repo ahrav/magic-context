@@ -72,6 +72,14 @@ const pathByDatabase = new WeakMap<Database, string>();
 // disables ALL of Magic Context until it too updates. The null openDatabase()
 // return has no Database handle to key a WeakMap on, so we stash the detail in
 // a module global the plugin entrypoint reads after a failed/empty open.
+/** Most recent runtime-gate refusal, for diagnostics; mirrors the fence/migration
+ *  refusal records below so `doctor` can explain a null open. */
+let lastRuntimeGateRefusal: SqliteRuntimeGateReport | null = null;
+
+export function consumeLastRuntimeGateRefusal(): SqliteRuntimeGateReport | null {
+    return lastRuntimeGateRefusal;
+}
+
 let lastSchemaFenceRejection: { persistedVersion: number; supportedVersion: number } | null = null;
 
 // A fresh CLI/Pi/OpenCode process must not be the process that advances the
@@ -2189,6 +2197,17 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     }
 
     try {
+        // The WAL-reset-safety gate has to run BEFORE a connection exists: the
+        // corruption mode it blocks happens when this runtime's SQLite enables
+        // WAL and writes migrations, so reporting it afterwards is too late. It
+        // was previously only reachable from tests, which left the fail-closed
+        // gate with no production effect at all.
+        const runtimeGate = probeSqliteRuntimeGate();
+        if (!runtimeGate.ok) {
+            lastRuntimeGateRefusal = runtimeGate;
+            return null;
+        }
+        lastRuntimeGateRefusal = null;
         refuseUnsafePristineBootstrap(dbPath);
         if (!explicitDbPath) {
             migrateLegacyStorageIfNeeded(dbPath, dbDir);

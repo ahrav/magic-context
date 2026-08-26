@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseIncidentCatalog } from "../src/incident-pool/contract";
-import { incidentUnitFiles } from "./run-test-selection";
+import {
+    assertSrcTestsClassified,
+    incidentUnitFiles,
+    prospectiveUnitFiles,
+} from "./run-test-selection";
 import {
     E2E_ROOT,
     filesForMode,
@@ -162,6 +166,17 @@ describe("mode manifest validator", () => {
                 "scripts/validate-mode-manifest.test.ts",
             ]),
         );
+    });
+
+    it("selects every prospective unit and classifies every src test", () => {
+        expect(prospectiveUnitFiles()).toEqual(
+            expect.arrayContaining([
+                "src/prospective-holdout/contract.test.ts",
+                "src/prospective-holdout/graduation.test.ts",
+                "scripts/prospective-holdout.test.ts",
+            ]),
+        );
+        expect(() => assertSrcTestsClassified()).not.toThrow();
     });
 
     it("rejects broad-glob green package scripts", () => {

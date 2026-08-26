@@ -19,6 +19,14 @@ const TAINT_CLASSIFIER_METHOD: &str = "mc-taint-classifier-v1";
 
 pub type AdapterResult<T> = Result<T, String>;
 
+/// The only producer whose explicit-user observation may grant explicit-user
+/// credit to a revision that changes content. Mirrored by
+/// `EXPLICIT_USER_REVISION_PRODUCER` in
+/// `packages/plugin/src/features/magic-context/memory/storage-claim-policy.ts`;
+/// the conformance suite compares the two policies' verdicts, so a drift here
+/// shows up as a maturity disagreement rather than passing silently.
+pub const EXPLICIT_USER_REVISION_PRODUCER: &str = "dashboard:tauri";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationChannel {
     TauriExplicitUser,
@@ -28,7 +36,7 @@ pub enum MutationChannel {
 impl MutationChannel {
     fn producer(self) -> &'static str {
         match self {
-            Self::TauriExplicitUser => "dashboard:tauri",
+            Self::TauriExplicitUser => EXPLICIT_USER_REVISION_PRODUCER,
             Self::BearerHttp => "dashboard:http",
         }
     }
@@ -331,6 +339,54 @@ fn read_generations(
     Ok(generations)
 }
 
+/// Which projects a snapshot vector must account for.
+///
+/// A project-scoped read compares a known id set. A global read cannot: a
+/// project absent from the candidate rows — because nothing matched the filter,
+/// or because it holds no claims at all yet — would never enter a fixed list, so
+/// its first matching claim appearing mid-hydration would leave both vectors
+/// equal and publish a settled result that omits it. Global reads therefore
+/// compare every generation row that exists at each read, which makes a newly
+/// created project's row a difference.
+enum SnapshotScope<'a> {
+    Global,
+    Projects(&'a [i64]),
+}
+
+fn read_all_generations(conn: &Connection) -> AdapterResult<BTreeMap<String, i64>> {
+    let mut statement =
+        sql(conn.prepare("SELECT project_id, generation FROM claim_project_generations"))?;
+    let rows: Vec<(i64, i64)> = sql(statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|rows| rows.collect()))?;
+    Ok(rows
+        .into_iter()
+        .map(|(project_id, generation)| (project_id.to_string(), generation))
+        .collect())
+}
+
+fn read_snapshot_vector_for(
+    conn: &Connection,
+    scope: &SnapshotScope<'_>,
+) -> AdapterResult<SnapshotVector> {
+    let generations = match scope {
+        SnapshotScope::Global => read_all_generations(conn)?,
+        SnapshotScope::Projects(project_ids) => {
+            let mut ids = project_ids.to_vec();
+            ids.sort_unstable();
+            ids.dedup();
+            read_generations(conn, &ids)?
+        }
+    };
+    Ok(SnapshotVector {
+        vector_version: 1,
+        database_incarnation_id: marker_incarnation(conn)?,
+        workspace_epoch: String::new(),
+        project_generations: generations.clone(),
+        policy_generations: generations,
+    })
+}
+
 fn read_snapshot_vector(conn: &Connection, project_ids: &[i64]) -> AdapterResult<SnapshotVector> {
     let mut ids = project_ids.to_vec();
     ids.sort_unstable();
@@ -470,6 +526,14 @@ fn validate_target(
     }
     let claim = get_claim(conn, &token.public_claim_id)?
         .ok_or_else(|| format!("unknown project-memory claim: {}", token.public_claim_id))?;
+    // Retirement is terminal: a retired claim is outside every dashboard
+    // mutation, so refuse it before any destination is considered.
+    if lifecycle_head(conn, claim.claim_id)?.2 == "retired" {
+        return Err(format!(
+            "retired project-memory claim cannot be modified: {}",
+            claim.public_claim_id
+        ));
+    }
     if token.revision != claim.revision || token.content_digest != claim.content_digest {
         return Ok(Err(format!(
             "revision: revision head moved from r{} to r{}",
@@ -564,6 +628,23 @@ fn read_policy(conn: &Connection, revision_id: i64) -> AdapterResult<ClaimPolicy
         .optional())?;
     let active = dispositions(conn, revision_id)?;
     let (maturity, taint, auto, explicit, hidden, version, generation, missing) = match row {
+        // A projection written with a newer policy version records decisions
+        // under semantics this build cannot interpret, so its stored maturity,
+        // taint, and eligibility bits are not a trustworthy answer. Treat it
+        // exactly as a missing row — the adapter's existing "no trustworthy
+        // stored decision" case, which fails closed — rather than showing or
+        // hiding content on unknown semantics and omitting `policy:unknown`.
+        // Authoritative dispositions are read separately and still apply.
+        Some((_, _, _, _, _, version, generation)) if version > POLICY_VERSION => (
+            "CANDIDATE".to_string(),
+            "unknown".to_string(),
+            false,
+            false,
+            true,
+            version,
+            generation,
+            true,
+        ),
         Some((maturity, taint, auto, explicit, hidden, version, generation)) => (
             maturity,
             taint,
@@ -830,25 +911,72 @@ fn hydrate_claim(conn: &Connection, public_claim_id: &str) -> AdapterResult<Clai
     })
 }
 
-fn claim_is_explicitly_visible(claim: &ClaimMemory, now_ms: i64) -> bool {
-    let dispositions = &claim.policy.dispositions;
-    claim
-        .expires_at
-        .is_none_or(|expires_at| expires_at > now_ms)
-        && claim.policy.explicit_eligible
-        && !claim.policy.hard_hidden
+/// The single authority on whether a claim may be disclosed to an explicit
+/// reader. It takes the facts it decides on rather than a whole `ClaimMemory`,
+/// so a caller that only needs the verdict — the statistics aggregation — can
+/// reach it without paying for evidence, applicability, telemetry and tokens.
+/// Every surface that exposes a claim, or a number derived from one, routes
+/// through here; a second implementation of these clauses is how hidden claims
+/// leak into a count that no visible row explains.
+fn claim_is_explicitly_visible(
+    expires_at: Option<i64>,
+    policy: &ClaimPolicyView,
+    now_ms: i64,
+) -> bool {
+    let dispositions = &policy.dispositions;
+    expires_at.is_none_or(|expires_at| expires_at > now_ms)
+        && policy.explicit_eligible
+        && !policy.hard_hidden
         && !dispositions.contradicted
         && !dispositions.quarantined
         && !dispositions.rejected
 }
 
-fn candidate_public_ids(
+/// Projects a hydrated claim onto the facts above. Used by every path that
+/// returns claims rather than a summary of them.
+fn claim_memory_is_explicitly_visible(claim: &ClaimMemory, now_ms: i64) -> bool {
+    claim_is_explicitly_visible(claim.expires_at, &claim.policy, now_ms)
+}
+
+/// Decides visibility for one revision without hydrating it. `read_policy`
+/// supplies five of the six facts, so the fail-closed default for a missing
+/// policy row and the latest-event-wins disposition rules stay in one place;
+/// `expires_at` is read from the same attributes row `hydrate_claim` reads, and
+/// like that path a revision with no attributes row is an error, not a hidden
+/// claim.
+fn revision_is_explicitly_visible(
+    conn: &Connection,
+    revision_id: i64,
+    now_ms: i64,
+) -> AdapterResult<bool> {
+    let expires_at: Option<i64> = sql(conn.query_row(
+        "SELECT expires_at FROM claim_memory_revision_attributes WHERE revision_id = ?1",
+        [revision_id],
+        |row| row.get(0),
+    ))?;
+    let policy = read_policy(conn, revision_id)?;
+    Ok(claim_is_explicitly_visible(expires_at, &policy, now_ms))
+}
+
+/// One candidate head row. The read and statistics paths share this shape so
+/// they provably enumerate the same rows before visibility is decided: the
+/// lifecycle state and category are the head columns the filters above match
+/// on, which is what makes a count reconcile with the list a filter produces.
+struct ClaimCandidate {
+    public_id: String,
+    project_id: i64,
+    revision_id: i64,
+    lifecycle_state: String,
+    category: String,
+}
+
+fn claim_candidates(
     conn: &Connection,
     project: Option<&str>,
     lifecycle: Option<&str>,
     category: Option<&str>,
     search: Option<&str>,
-) -> AdapterResult<Vec<(String, i64)>> {
+) -> AdapterResult<Vec<ClaimCandidate>> {
     let mut conditions = Vec::new();
     let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(project) = project {
@@ -886,7 +1014,8 @@ fn candidate_public_ids(
         format!("WHERE {}", conditions.join(" AND "))
     };
     let query = format!(
-        "SELECT public.public_id, claim.project_id \
+        "SELECT public.public_id, claim.project_id, claim.current_revision_id, \
+                head.lifecycle_state, head.category \
          FROM claim_memory_current_heads head \
          JOIN claims claim ON claim.id = head.claim_id \
          JOIN claim_public_ids public ON public.claim_id = claim.id \
@@ -897,7 +1026,15 @@ fn candidate_public_ids(
     let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(Box::as_ref).collect();
     let mut statement = sql(conn.prepare(&query))?;
     sql(statement
-        .query_map(refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map(refs.as_slice(), |row| {
+            Ok(ClaimCandidate {
+                public_id: row.get(0)?,
+                project_id: row.get(1)?,
+                revision_id: row.get(2)?,
+                lifecycle_state: row.get(3)?,
+                category: row.get(4)?,
+            })
+        })
         .and_then(|rows| rows.collect()))
 }
 
@@ -916,24 +1053,48 @@ pub fn read_claim_memories(
     }
     sql(conn.execute_batch("BEGIN DEFERRED"))?;
     let hydrated = (|| {
-        let candidates = candidate_public_ids(conn, project, lifecycle, category, search)?;
+        let candidates = claim_candidates(conn, project, lifecycle, category, search)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let claims = candidates
             .iter()
-            .map(|(public_id, _)| hydrate_claim(conn, public_id))
+            .map(|candidate| hydrate_claim(conn, &candidate.public_id))
             .filter_map(|claim| match claim {
-                Ok(claim) if claim_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
+                Ok(claim) if claim_memory_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
             .skip(offset as usize)
             .take(limit as usize)
             .collect::<AdapterResult<Vec<_>>>()?;
-        let project_ids = candidates
+        let mut project_ids = candidates
             .iter()
-            .map(|(_, project_id)| *project_id)
+            .map(|candidate| candidate.project_id)
             .collect::<Vec<_>>();
-        let vector = read_snapshot_vector(conn, &project_ids)?;
+        // A project-scoped query with no matching candidates yields an empty id
+        // list, so neither snapshot vector carries that project's generation and
+        // the two compare equal no matter what happened during hydration. The
+        // first claim inserted concurrently would then be missed and the empty
+        // result published as authoritative. Seed the requested project so its
+        // generation is always part of the comparison.
+        if let Some(identity) = project {
+            let requested: Option<i64> = sql(conn
+                .query_row(
+                    "SELECT id FROM projects WHERE canonical_identity = ?1",
+                    [identity],
+                    |row| row.get(0),
+                )
+                .optional())?;
+            if let Some(requested) = requested {
+                if !project_ids.contains(&requested) {
+                    project_ids.push(requested);
+                }
+            }
+        }
+        let scope = match project {
+            Some(_) => SnapshotScope::Projects(&project_ids),
+            None => SnapshotScope::Global,
+        };
+        let vector = read_snapshot_vector_for(conn, &scope)?;
         Ok((claims, project_ids, vector))
     })();
     let (claims, project_ids, vector) = match hydrated {
@@ -946,7 +1107,13 @@ pub fn read_claim_memories(
             return Err(error);
         }
     };
-    let fresh = read_snapshot_vector(conn, &project_ids)?;
+    let fresh = read_snapshot_vector_for(
+        conn,
+        &match project {
+            Some(_) => SnapshotScope::Projects(&project_ids),
+            None => SnapshotScope::Global,
+        },
+    )?;
     if fresh != vector {
         return Ok(ClaimMemoryReadResult {
             outcome: "stale".to_string(),
@@ -963,111 +1130,134 @@ pub fn read_claim_memories(
     })
 }
 
+/// Summarizes exactly the claims `read_claim_memories` would disclose.
+///
+/// The counts drive a header and a category filter, so they aggregate over the
+/// same candidate rows the read path enumerates and admit a row only if
+/// `claim_is_explicitly_visible` accepts it. Counting head rows directly would
+/// publish expired, rejected, quarantined, contradicted and hard-hidden claims
+/// as totals no visible row explains, and would offer a category filter whose
+/// only members the list withholds.
+///
+/// Deciding visibility costs a handful of point lookups per candidate rather
+/// than one aggregate, so the pass runs inside a deferred read transaction: the
+/// four counts and the histogram then describe one snapshot instead of drifting
+/// against concurrent writers across many more statements than before.
 pub fn read_claim_memory_stats(
     conn: &Connection,
     project: Option<&str>,
 ) -> AdapterResult<ClaimMemoryStats> {
-    let project_id = match project {
-        Some(identity) => sql(conn
+    let zeros = || ClaimMemoryStats {
+        total: 0,
+        active: 0,
+        archived: 0,
+        retired: 0,
+        categories: Vec::new(),
+    };
+    // A project filter that names no project summarizes nothing, and resolving
+    // it up front keeps that answer free of any candidate scan.
+    if let Some(identity) = project {
+        let resolved: Option<i64> = sql(conn
             .query_row(
                 "SELECT id FROM projects WHERE canonical_identity = ?1",
                 [identity],
-                |row| row.get::<_, i64>(0),
+                |row| row.get(0),
             )
-            .optional())?,
-        None => None,
-    };
-    if project.is_some() && project_id.is_none() {
-        return Ok(ClaimMemoryStats {
-            total: 0,
-            active: 0,
-            archived: 0,
-            retired: 0,
-            categories: Vec::new(),
-        });
-    }
-    let predicate = if project_id.is_some() {
-        " WHERE project_id = ?1"
-    } else {
-        ""
-    };
-    let count = |state: Option<&str>| -> AdapterResult<i64> {
-        let state_predicate = match (project_id, state) {
-            (Some(_), Some(_)) => " AND lifecycle_state = ?2",
-            (None, Some(_)) => " WHERE lifecycle_state = ?1",
-            _ => "",
-        };
-        let query =
-            format!("SELECT COUNT(*) FROM claim_memory_current_heads{predicate}{state_predicate}");
-        match (project_id, state) {
-            (Some(project_id), Some(state)) => {
-                sql(conn.query_row(&query, params![project_id, state], |row| row.get(0)))
-            }
-            (Some(project_id), None) => sql(conn.query_row(&query, [project_id], |row| row.get(0))),
-            (None, Some(state)) => sql(conn.query_row(&query, [state], |row| row.get(0))),
-            (None, None) => sql(conn.query_row(&query, [], |row| row.get(0))),
+            .optional())?;
+        if resolved.is_none() {
+            return Ok(zeros());
         }
-    };
-    let category_query = format!(
-        "SELECT category, COUNT(*) FROM claim_memory_current_heads{predicate} \
-         GROUP BY category ORDER BY COUNT(*) DESC, category"
-    );
-    let mut statement = sql(conn.prepare(&category_query))?;
-    let categories = if let Some(project_id) = project_id {
-        sql(statement
-            .query_map([project_id], |row| {
-                Ok(ClaimCategoryCount {
-                    category: row.get(0)?,
-                    count: row.get(1)?,
-                })
-            })
-            .and_then(|rows| rows.collect()))?
-    } else {
-        sql(statement
-            .query_map([], |row| {
-                Ok(ClaimCategoryCount {
-                    category: row.get(0)?,
-                    count: row.get(1)?,
-                })
-            })
-            .and_then(|rows| rows.collect()))?
-    };
-    Ok(ClaimMemoryStats {
-        total: count(None)?,
-        active: count(Some("active"))?,
-        archived: count(Some("archived"))?,
-        retired: count(Some("retired"))?,
-        categories,
-    })
+    }
+    sql(conn.execute_batch("BEGIN DEFERRED"))?;
+    let aggregated = (|| {
+        let candidates = claim_candidates(conn, project, None, None, None)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut stats = zeros();
+        let mut per_category: BTreeMap<String, i64> = BTreeMap::new();
+        for candidate in &candidates {
+            if !revision_is_explicitly_visible(conn, candidate.revision_id, now_ms)? {
+                continue;
+            }
+            stats.total += 1;
+            match candidate.lifecycle_state.as_str() {
+                "active" => stats.active += 1,
+                "archived" => stats.archived += 1,
+                "retired" => stats.retired += 1,
+                // The schema constrains head states to those three, so this arm
+                // is unreachable in a conforming store and the buckets partition
+                // the total. It counts toward the total only, as the replaced
+                // per-state `COUNT(*)` queries did.
+                _ => {}
+            }
+            *per_category.entry(candidate.category.clone()).or_default() += 1;
+        }
+        // `BTreeMap` yields categories in ascending order and `sort_by_key` is
+        // stable, so this reproduces the order the replaced
+        // `GROUP BY ... ORDER BY COUNT(*) DESC, category` handed the filter.
+        stats.categories = per_category
+            .into_iter()
+            .map(|(category, count)| ClaimCategoryCount { category, count })
+            .collect();
+        stats
+            .categories
+            .sort_by_key(|entry| std::cmp::Reverse(entry.count));
+        Ok(stats)
+    })();
+    match aggregated {
+        Ok(stats) => {
+            sql(conn.execute_batch("COMMIT"))?;
+            Ok(stats)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub fn enumerate_claim_projects(conn: &Connection) -> AdapterResult<Vec<ClaimProjectRow>> {
+    // Enumerating every current-head row lists a project whose claims are all
+    // hard-hidden, expired, or rejected — the picker offers it, then
+    // `read_claim_memories` withholds every row and the user lands on an
+    // inexplicably empty filter. The picker has to apply the same
+    // explicit-visibility predicate the list and statistics paths use.
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut statement = sql(conn.prepare(
-        "SELECT DISTINCT project.canonical_identity \
+        "SELECT DISTINCT project.canonical_identity, head.revision_id \
          FROM claim_memory_current_heads head \
          JOIN projects project ON project.id = head.project_id \
          ORDER BY project.canonical_identity",
     ))?;
-    sql(statement
-        .query_map([], |row| {
-            let identity: String = row.get(0)?;
-            let display_name = identity
-                .split_once(':')
-                .map(|(prefix, rest)| {
-                    format!(
-                        "{}:{}{}",
-                        prefix,
-                        &rest[..rest.len().min(10)],
-                        if rest.len() > 10 { "…" } else { "" }
-                    )
-                })
-                .unwrap_or_else(|| identity.clone());
-            Ok(ClaimProjectRow {
-                identity,
-                display_name,
+    // Collected before filtering: `revision_is_explicitly_visible` needs the
+    // connection, which `statement` borrows for the life of the row iterator.
+    let heads: Vec<(String, i64)> = sql(statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|rows| rows.collect()))?;
+    drop(statement);
+
+    let mut projects: Vec<ClaimProjectRow> = Vec::new();
+    for (identity, revision_id) in heads {
+        if projects.iter().any(|row| row.identity == identity) {
+            continue;
+        }
+        if !revision_is_explicitly_visible(conn, revision_id, now_ms)? {
+            continue;
+        }
+        let display_name = identity
+            .split_once(':')
+            // Canonical identities carry filesystem names, so truncate by
+            // characters: byte slicing splits multi-byte sequences.
+            .map(|(prefix, rest)| match rest.char_indices().nth(10) {
+                Some((cut, _)) => format!("{prefix}:{}…", &rest[..cut]),
+                None => format!("{prefix}:{rest}"),
             })
-        })
-        .and_then(|rows| rows.collect()))
+            .unwrap_or_else(|| identity.clone());
+        projects.push(ClaimProjectRow {
+            identity,
+            display_name,
+        });
+    }
+    Ok(projects)
 }
 
 fn provenance_shape(channel: MutationChannel, operation_key: &str) -> Value {
@@ -1253,6 +1443,16 @@ fn insert_policy_subject(
     Ok(())
 }
 
+/// The direct memory taxonomy. Mirrors the tool schema's five categories and
+/// the set the pre-cutover dashboard path validated against.
+const MEMORY_CATEGORIES: [&str; 5] = [
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+];
+
 fn maturity_rank(value: &str) -> i64 {
     match value {
         "CANDIDATE" => 0,
@@ -1262,6 +1462,74 @@ fn maturity_rank(value: &str) -> i64 {
         "ENFORCED" => 4,
         _ => -1,
     }
+}
+
+fn maturity_for_rank(rank: i64) -> &'static str {
+    match rank {
+        1 => "CORROBORATED",
+        2 => "VERIFIED",
+        3 => "APPROVED",
+        4 => "ENFORCED",
+        _ => "CANDIDATE",
+    }
+}
+
+/// The rung the revision's CURRENT support justifies, mirroring
+/// `supportedMaturity` in `claim-visibility-policy.ts`.
+///
+/// Every input is a present-tense fact, never history: an approval that was
+/// later revoked does not count, and neither does a revoked enforcement
+/// artifact.
+fn supported_maturity(
+    approved: bool,
+    enforced_artifact: bool,
+    verified: bool,
+    explicit_user: bool,
+    independent_groups: i64,
+) -> &'static str {
+    if approved && enforced_artifact {
+        return "ENFORCED";
+    }
+    if approved {
+        return "APPROVED";
+    }
+    if verified || explicit_user {
+        return "VERIFIED";
+    }
+    if independent_groups >= 2 {
+        return "CORROBORATED";
+    }
+    "CANDIDATE"
+}
+
+/// Latest approval action for the revision, counted only while it is an
+/// `approve`. Mirrors `currentApprovalActionId`: the table is append-only, so a
+/// later `revoke` supersedes an earlier `approve` rather than deleting it.
+fn currently_approved(conn: &Connection, revision_id: i64) -> AdapterResult<bool> {
+    let action: Option<String> = sql(conn
+        .query_row(
+            "SELECT action FROM claim_approval_actions \
+             WHERE revision_id = ?1 ORDER BY id DESC LIMIT 1",
+            [revision_id],
+            |row| row.get(0),
+        )
+        .optional())?;
+    Ok(action.as_deref() == Some("approve"))
+}
+
+/// Whether a passing, unrevoked enforcement artifact currently exists.
+/// Mirrors `currentValidArtifactId`.
+fn currently_enforced(conn: &Connection, revision_id: i64) -> AdapterResult<bool> {
+    let exists = sql(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM claim_enforcement_artifacts artifact \
+         WHERE artifact.revision_id = ?1 AND artifact.evaluator_result = 'pass' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM claim_enforcement_artifact_events event \
+               WHERE event.artifact_id = artifact.id AND event.action = 'revoked'))",
+        [revision_id],
+        |row| row.get::<_, i64>(0),
+    ))? != 0;
+    Ok(exists)
 }
 
 fn append_maturity(
@@ -1336,16 +1604,36 @@ fn finalize_policy(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ))?;
     append_maturity(conn, revision_id, project_id, "CANDIDATE", now_ms)?;
+    // Explicit-user credit for a later revision needs a witness that the stamp
+    // was authored FOR this revision, not inherited. Two of the three branches
+    // predate this adapter: revision 1 carries its own stated provenance, and a
+    // later revision whose bytes still equal revision 1's is the classification
+    // path re-observing unchanged content. Neither admits a rewrite that
+    // changes content.
+    //
+    // The third branch is this adapter's own write path. `write_evidence`
+    // records the NEW content as the observation's `extracted_text`, so an
+    // observation authored here has `content_sha256` equal to the revision it
+    // supports. Requiring the producer as well as that digest match keeps the
+    // defense the other branches provide: the hazard those branches guard is a
+    // held-open pre-v86 writer copying a retained `user` trust class onto a
+    // model-authored successor, and such a writer predates this producer string
+    // entirely, so it cannot mint one. Without this branch a genuine dashboard
+    // content edit — revision 2 with a new digest — silently loses explicit-user
+    // credit and drops out of automatic injection.
     let explicit_user = sql(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM claim_evidence evidence \
          JOIN observations observation ON observation.id = evidence.observation_id \
          JOIN claim_revisions revision ON revision.id = evidence.revision_id \
          WHERE evidence.revision_id = ?1 AND evidence.relation = 'supports' \
            AND observation.source_trust_class = 'explicit_user' \
-           AND (revision.revision = 1 OR revision.content_sha256 = ( \
-               SELECT first.content_sha256 FROM claim_revisions first \
-               WHERE first.claim_id = revision.claim_id AND first.revision = 1)))",
-        [revision_id],
+           AND (revision.revision = 1 \
+                OR revision.content_sha256 = ( \
+                    SELECT first.content_sha256 FROM claim_revisions first \
+                    WHERE first.claim_id = revision.claim_id AND first.revision = 1) \
+                OR (observation.extractor = ?2 \
+                    AND observation.content_sha256 = revision.content_sha256)))",
+        rusqlite::params![revision_id, EXPLICIT_USER_REVISION_PRODUCER],
         |row| row.get::<_, i64>(0),
     ))? != 0;
     let verified = sql(conn.query_row(
@@ -1367,13 +1655,34 @@ fn finalize_policy(
     if explicit_user || verified {
         append_maturity(conn, revision_id, project_id, "VERIFIED", now_ms)?;
     }
-    let maturity: String = sql(conn.query_row(
+    // The maturity stream is APPEND-ONLY, so its head is the highest rung ever
+    // asserted and never falls. Reading it as the effective rung makes a
+    // historical `APPROVED` permanent: after the user revokes that approval, any
+    // later policy pass — attaching evidence to an unchanged claim, say — would
+    // still see `APPROVED` at the head and restore `auto_eligible`, putting a
+    // claim the user explicitly downgraded back into automatic injection.
+    //
+    // So the head is a CAP, not the value, exactly as `effectiveMaturity` in
+    // `claim-visibility-policy.ts` defines it: take the rung the CURRENT support
+    // justifies and clamp it to history, which keeps the append-only stream's
+    // guarantee (a rung is never claimed that history never reached) without
+    // resurrecting support that has since been withdrawn.
+    let historical: String = sql(conn.query_row(
         "SELECT assertion.maturity FROM claim_maturity_streams stream \
          JOIN claim_maturity_assertions assertion ON assertion.stream_id = stream.id \
          WHERE stream.revision_id = ?1 ORDER BY assertion.seq DESC LIMIT 1",
         [revision_id],
         |row| row.get(0),
     ))?;
+    let supported = supported_maturity(
+        currently_approved(conn, revision_id)?,
+        currently_enforced(conn, revision_id)?,
+        verified,
+        explicit_user,
+        independent_groups,
+    );
+    let maturity =
+        maturity_for_rank(maturity_rank(&historical).min(maturity_rank(supported))).to_string();
     let active = dispositions(conn, revision_id)?;
     let hard_hidden = active.contradicted || active.quarantined;
     let soft_hidden = active.stale || active.disputed || active.superseded;
@@ -1694,6 +2003,20 @@ fn revise_stage(
     {
         return Err("claim category must not be empty".to_string());
     }
+    // Neither `claim_memory_revision_attributes` nor the current-head projection
+    // constrains the category, so a nonempty-only check persists an
+    // out-of-taxonomy value permanently, where category filters and prompts no
+    // longer recognize it. The five-category contract is enforced by the tool
+    // schema and was enforced by the previous dashboard path
+    // (`update_memory_category`); the adapter has to keep enforcing it.
+    if let Some(category) = input.category.as_deref() {
+        if !MEMORY_CATEGORIES.contains(&category) {
+            return Err(format!(
+                "invalid claim category: {category}. Must be one of {}.",
+                MEMORY_CATEGORIES.join(", ")
+            ));
+        }
+    }
     let (current_category, importance, memory_scope, sharing, expires_at): (
         String,
         i64,
@@ -1790,6 +2113,27 @@ fn revise_stage(
          VALUES (?1, ?2, 'supports', ?3)",
         params![revision_id, observation_id, now_ms],
     ))?;
+    // A category-only revision replaces no bytes, so every observation that
+    // supported the previous revision still attests to exactly this content.
+    // Binding only the fresh observation would strand that support on the old
+    // revision and silently drop the claim to CANDIDATE — an explicit-user
+    // memory would lose its standing merely by being recategorized.
+    //
+    // Only `supports` is named forward, never copied wholesale, so a future
+    // non-supporting relation (a refutation, say) is not re-asserted as
+    // support. This cannot manufacture trust on its own: explicit-user standing
+    // additionally requires the revision to still hold the claim's
+    // first-revision bytes, which a content edit breaks by construction.
+    if next_content == claim.content {
+        sql(conn.execute(
+            "INSERT OR IGNORE INTO claim_evidence (revision_id, observation_id, relation, created_at) \
+             SELECT ?1, prior.observation_id, 'supports', ?2 FROM claim_evidence prior \
+             WHERE prior.revision_id = ?3 AND prior.relation = 'supports' \
+               AND prior.observation_id <> ?4 \
+             ORDER BY prior.observation_id",
+            params![revision_id, now_ms, claim.current_revision_id, observation_id],
+        ))?;
+    }
     ensure_baseline_applicability(conn, revision_id, claim.project_id, &content_digest, now_ms)?;
     sql(conn.execute(
         "INSERT INTO claim_memory_revision_attributes \
@@ -1932,22 +2276,40 @@ fn lifecycle_stage(
     })
 }
 
+/// Build the response for an already-committed mutation.
+///
+/// Every hydrate failure here is post-commit, so none of them may fail the
+/// mutation: the write is durable, and returning `Err` would invite the caller
+/// to retry or report failure for an operation that succeeded. A claim that
+/// cannot be hydrated is omitted from `refreshed_claims` — the same treatment
+/// an unknown or hidden claim already gets — and the reason goes to stderr so
+/// an invariant violation stays diagnosable instead of vanishing. `outcome`
+/// still reports what happened.
 fn response(
     conn: &Connection,
     run: RunResult,
     public_ids: &[String],
 ) -> AdapterResult<ClaimMutationResponse> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let refreshed_claims = public_ids
         .iter()
         .filter_map(|public_id| match hydrate_claim(conn, public_id) {
-            Ok(claim) => Some(Ok(claim)),
+            Ok(claim) => Some(claim),
             Err(error) if error.starts_with("unknown project-memory claim") => None,
-            Err(error) => Some(Err(error)),
+            Err(error) => {
+                eprintln!(
+                    "claim adapter: post-commit hydrate of {public_id} failed, omitting it from the response: {error}"
+                );
+                None
+            }
         })
-        .collect::<AdapterResult<Vec<_>>>()?;
-    let project_ids = refreshed_claims
+        // A mutation response never discloses more than a read would: a hidden
+        // claim is omitted, and the outcome still reports what happened.
+        .filter(|claim| claim_memory_is_explicitly_visible(claim, now_ms))
+        .collect::<Vec<_>>();
+    let project_ids = public_ids
         .iter()
-        .filter_map(|claim| get_claim(conn, &claim.public_claim_id).ok().flatten())
+        .filter_map(|public_id| get_claim(conn, public_id).ok().flatten())
         .map(|claim| claim.project_id)
         .collect::<Vec<_>>();
     Ok(ClaimMutationResponse {

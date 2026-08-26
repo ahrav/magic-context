@@ -1,3 +1,5 @@
+import type { ImitatedArgRule } from "../unwrap-imitated-reduced-args";
+
 export const CTX_MEMORY_TOOL_NAME = "ctx_memory";
 export const CTX_MEMORY_DESCRIPTION = `Durable project claims shared across sessions.
 
@@ -14,3 +16,25 @@ Actions:
 Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands. Agent calls to approve/enforce are rejected.`;
 export const DEFAULT_SEARCH_LIMIT = 10;
 export const GET_MAX_CLAIMS = 20;
+
+/**
+ * Shape of a claim-local mutation token for reduced-argument decoding, shared by
+ * every adapter so no adapter's decode schema can drift from the token contract.
+ * Revise, archive, restore, and merge all require a token, so a decode schema that
+ * omits it rejects the whole imitated call and loses the action.
+ *
+ * Shape only: value-level checks (public-ID format, tokenVersion) already fail
+ * closed in storage-claim-operations and surface as ClaimOperationInputError.
+ */
+export const CTX_MEMORY_MUTATION_TOKEN_RULE: ImitatedArgRule = {
+    type: "object",
+    fields: {
+        tokenVersion: "number",
+        publicClaimId: "string",
+        revision: "number",
+        contentDigest: "string",
+        lifecycleSeq: "number",
+        applicabilityHeadsDigest: "string",
+        policyHeadsDigest: "string",
+    },
+};

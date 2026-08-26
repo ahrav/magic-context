@@ -28,6 +28,7 @@ import {
     openSync,
     readFileSync,
     type Stats,
+    unlinkSync,
     writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -509,22 +510,106 @@ export function buildDatabaseResetMarker(input: {
 }
 
 /**
- * `wx` prevents concurrent overwrite. fsync makes successful publication the
- * crash boundary after which recovery may trust marker presence.
+ * The filesystem calls marker publication makes, injectable so tests can drive
+ * the partial-publication cleanup path (a short write, a failed fsync, a failed
+ * chmod) that is otherwise unreachable from a healthy filesystem.
  */
-export function writeDatabaseResetMarker(marker: DatabaseResetMarker): void {
-    const path = databaseResetMarkerPath(marker.dbPath);
-    let fd: number | null = null;
-    try {
-        fd = openSync(path, "wx", 0o600);
-        writeSync(fd, `${JSON.stringify(marker)}\n`, undefined, "utf8");
-        fsyncSync(fd);
-        chmodSync(path, 0o600);
-    } catch (error) {
-        if (fd !== null) closeSync(fd);
-        throw error;
+export interface ResetMarkerPublicationFs {
+    readonly openSync: (path: string, flags: string, mode: number) => number;
+    readonly writeSync: (fd: number, buffer: Buffer, offset: number, length: number) => number;
+    readonly fsyncSync: (fd: number) => void;
+    readonly closeSync: (fd: number) => void;
+    readonly chmodSync: (path: string, mode: number) => void;
+    readonly unlinkSync: (path: string) => void;
+}
+
+const defaultResetMarkerPublicationFs: ResetMarkerPublicationFs = {
+    openSync,
+    writeSync,
+    fsyncSync,
+    closeSync,
+    chmodSync,
+    unlinkSync,
+};
+
+/**
+ * `writeSync` may report fewer bytes than requested, so one call is not a
+ * write. Resume from the reported count until the whole marker has landed, and
+ * fail closed if a call reports no progress rather than spinning.
+ */
+function writeAllResetMarkerBytes(fs: ResetMarkerPublicationFs, fd: number, bytes: Buffer): void {
+    let written = 0;
+    while (written < bytes.length) {
+        const count = fs.writeSync(fd, bytes, written, bytes.length - written);
+        if (!Number.isInteger(count) || count <= 0) {
+            throw new Error(
+                `reset marker write made no progress after ${written} of ${bytes.length} bytes`,
+            );
+        }
+        written += count;
     }
-    closeSync(fd);
+}
+
+/** Returns null once no marker file remains, else why cleanup could not finish. */
+function discardPartialResetMarker(
+    fs: ResetMarkerPublicationFs,
+    fd: number,
+    path: string,
+): string | null {
+    try {
+        fs.closeSync(fd);
+    } catch {
+        // Retrying a failed close is unsafe — the descriptor number may already
+        // be recycled — and its error is not the cause the caller needs. The
+        // file removal below is the cleanup that decides whether the family
+        // stays openable.
+    }
+    try {
+        fs.unlinkSync(path);
+        return null;
+    } catch (error) {
+        if (isMissingPathError(error)) return null;
+        return error instanceof Error ? error.message : String(error);
+    }
+}
+
+/**
+ * Publish the reset marker as an all-or-nothing artifact.
+ *
+ * `wx` is O_CREAT|O_EXCL, so a successful open proves THIS call created the
+ * file: an existing marker belongs to a concurrent or prior reset and the open
+ * fails without touching it. That is what makes the failure path safe to
+ * unlink — it can only remove a file this call brought into existence and
+ * never published. A failed open is left strictly alone.
+ *
+ * Publication is complete only once every byte is written and fsynced. Mere
+ * presence of the path refuses database initialization, and a truncated marker
+ * reads as malformed, which recovery treats as blocking rather than resumable,
+ * so a half-written marker must leave no file at all. Successful fsync is the
+ * crash boundary after which recovery may trust marker presence; a close
+ * failure past that point leaves a valid, resumable pending marker.
+ */
+export function writeDatabaseResetMarker(
+    marker: DatabaseResetMarker,
+    fs: ResetMarkerPublicationFs = defaultResetMarkerPublicationFs,
+): void {
+    const path = databaseResetMarkerPath(marker.dbPath);
+    const fd = fs.openSync(path, "wx", 0o600);
+    try {
+        writeAllResetMarkerBytes(fs, fd, Buffer.from(`${JSON.stringify(marker)}\n`, "utf8"));
+        fs.fsyncSync(fd);
+        fs.chmodSync(path, 0o600);
+    } catch (error) {
+        const cleanupProblem = discardPartialResetMarker(fs, fd, path);
+        if (cleanupProblem === null) throw error;
+        // Cleanup failed as well, so a partial marker really does remain and
+        // only the operator can clear it. Surface that without losing the cause.
+        throw new Error(
+            `${error instanceof Error ? error.message : String(error)} (the partial reset marker ${path} could not be removed: ${cleanupProblem}; remove it manually before reopening the database)`,
+            { cause: error },
+        );
+    }
+    fs.closeSync(fd);
 }
 
 export type DatabaseResetMarkerRead =
@@ -680,11 +765,22 @@ export interface ResetMarkerFamilyVerification {
 /**
  * Compare the on-disk family against the published marker. Identity is
  * dev/inode only: a rename is atomic, so every recorded file is either still
- * at its source (identity must match) or already inside quarantine. Size is
- * deliberately not compared — a live writer is the holder inspection's job.
+ * at its source (identity must match) or already inside quarantine.
  * "Became current" is covered by the same check: only a pristine family can
  * bootstrap to current, so a current database at this path necessarily has a
  * new inode.
+ *
+ * Size is deliberately not compared, for any role and at either location. The
+ * marker records identities before the final holder inspection, so a recorded
+ * size is a pre-exclusivity observation: a holder still writing in that window
+ * grows or truncates the main file, WAL, shared-memory index, or rollback
+ * journal in place while dev/inode stay fixed, and a WAL checkpoint truncates
+ * to zero the same way. A file moved after the inspection carries whatever
+ * size that window left it at, so the destination is no safer than the source.
+ * Refusal is expensive — a pending marker blocks database initialization — so
+ * size equality would trade a narrow inode-reuse gap for spurious refusals
+ * that abandon a live family. Closing that gap needs content identity, which
+ * this marker does not record.
  */
 export function verifyResetMarkerFamily(
     marker: DatabaseResetMarker,

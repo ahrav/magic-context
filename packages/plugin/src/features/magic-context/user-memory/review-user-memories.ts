@@ -16,6 +16,7 @@ import {
     startLeaseHeartbeat,
 } from "../dreamer/lease";
 import { REVIEW_USER_MEMORIES_SYSTEM_PROMPT } from "../dreamer/task-prompts";
+import type { ClaimOperationResultEffect } from "../memory/claim-operation-contract";
 import { canonicalJsonEncode } from "../memory/claim-operation-contract";
 import {
     type AutonomousManifestIdentity,
@@ -66,6 +67,13 @@ export interface ReviewResult {
     merged: number;
     dismissed: number;
     candidatesConsumed: number;
+    /**
+     * Effects of the claim-native project promotions. Reducing the outcome to
+     * counts left the dream-run audit with no claim IDs at all while the log
+     * reported `project_promoted > 0`; the curate and retrospective paths feed
+     * these through `claimEffectMemoryChanges` for the same reason.
+     */
+    effects: readonly ClaimOperationResultEffect[];
 }
 
 interface ReviewCandidateSnapshot extends UserMemoryCandidate {
@@ -131,12 +139,40 @@ class StaleUserMemoryReviewError extends Error {
     }
 }
 
+/**
+ * Candidates a review running for `projectIdentity` is permitted to act on:
+ * unbound candidates (no session→project mapping, so they can only ever feed the
+ * global user profile) plus candidates bound to this project.
+ *
+ * Candidates bound exclusively to OTHER projects are excluded because the two
+ * halves of the contract disagree about them: `validateManifestReferences`
+ * rejects `promote_project` for a candidate not bound to the run's project,
+ * while `consume_candidate_ids` would still hard-delete it
+ * (`deleteUserMemoryCandidates`). Since every project runs its own review over
+ * one shared candidate table, leaving foreign candidates in the snapshot lets
+ * whichever project reviews first delete another project's project-bound
+ * observation without promoting it anywhere, and the owning project then finds
+ * nothing to review. Keeping them out of the snapshot means the model cannot see
+ * them and so can never name them in `consume_candidate_ids`.
+ */
+function isReviewableInProject(
+    projectIdentities: readonly string[],
+    projectIdentity: string,
+): boolean {
+    return projectIdentities.length === 0 || projectIdentities.includes(projectIdentity);
+}
+
 function reviewSnapshotDigest(
     candidates: readonly ReviewCandidateSnapshot[],
     stableMemories: readonly UserMemory[],
+    projectIdentity: string,
 ): string {
     return sha256Utf8Hex(
         canonicalJsonEncode({
+            // The digest covers the review scope, not just its contents: a
+            // snapshot captured for one project must not validate as fresh when
+            // applied under another.
+            projectIdentity,
             candidates: candidates.map((candidate) => ({
                 content: candidate.content,
                 createdAt: candidate.createdAt,
@@ -160,25 +196,26 @@ function reviewSnapshotDigest(
 
 export function captureUserMemoryReviewSnapshot(
     db: Database,
+    projectIdentity: string,
     now: number = Date.now(),
 ): UserMemoryReviewSnapshot {
     const cutoff = now - USER_MEMORY_CANDIDATE_TTL_MS;
-    const candidates = getUserMemoryCandidates(db).filter(
-        (candidate) => candidate.createdAt >= cutoff,
-    );
+    const fresh = getUserMemoryCandidates(db).filter((candidate) => candidate.createdAt >= cutoff);
     const projectsByCandidate = getUserMemoryCandidateProjectIdentities(
         db,
-        candidates.map((candidate) => candidate.id),
+        fresh.map((candidate) => candidate.id),
     );
-    const enriched = candidates.map((candidate) => ({
-        ...candidate,
-        projectIdentities: projectsByCandidate.get(candidate.id) ?? [],
-    }));
+    const enriched = fresh
+        .map((candidate) => ({
+            ...candidate,
+            projectIdentities: projectsByCandidate.get(candidate.id) ?? [],
+        }))
+        .filter((candidate) => isReviewableInProject(candidate.projectIdentities, projectIdentity));
     const stableMemories = getActiveUserMemories(db);
     return {
         candidates: enriched,
         stableMemories,
-        digest: reviewSnapshotDigest(enriched, stableMemories),
+        digest: reviewSnapshotDigest(enriched, stableMemories, projectIdentity),
     };
 }
 
@@ -280,6 +317,8 @@ function validateManifestReferences(args: {
     manifest: UserMemoryReviewManifest;
     snapshot: UserMemoryReviewSnapshot;
     projectIdentity: string;
+    /** Minimum corroborating candidates a project promotion must carry. */
+    promotionThreshold: number;
 }): void {
     const candidateById = new Map(
         args.snapshot.candidates.map((candidate) => [candidate.id, candidate]),
@@ -306,6 +345,26 @@ function validateManifestReferences(args: {
     }
     for (const [index, promotion] of args.manifest.projectPromotions.entries()) {
         useCandidates(promotion.candidateIds, `promote_project[${index}]`);
+        // The threshold gates whether the review runs at all and is otherwise
+        // stated only in the prompt, so a model that returns a single candidate
+        // out of a qualifying snapshot would turn one uncorroborated observation
+        // into a durable project claim. A project promotion has to carry its own
+        // corroboration.
+        //
+        // Reject an unusable threshold rather than comparing against it: test
+        // files are excluded from typecheck, so a caller that omits the field
+        // would otherwise compare against `undefined` — always false — and lose
+        // this guard silently, which is the failure mode it exists to prevent.
+        if (!Number.isInteger(args.promotionThreshold) || args.promotionThreshold < 1) {
+            throw new Error(
+                `promote_project[${index}] cannot be validated: promotionThreshold is ${args.promotionThreshold}`,
+            );
+        }
+        if (promotion.candidateIds.length < args.promotionThreshold) {
+            throw new Error(
+                `promote_project[${index}] carries ${promotion.candidateIds.length} candidate(s); ${args.promotionThreshold} are required for a project claim`,
+            );
+        }
         for (const id of promotion.candidateIds) {
             const projects = candidateById.get(id)?.projectIdentities ?? [];
             if (projects.length !== 1 || projects[0] !== args.projectIdentity) {
@@ -376,6 +435,8 @@ export function applyUserMemoryReviewManifest(args: {
     identity: AutonomousManifestIdentity;
     snapshot: UserMemoryReviewSnapshot;
     manifest: UserMemoryReviewManifest;
+    /** Minimum corroborating candidates a project promotion must carry. */
+    promotionThreshold: number;
     nowMs?: number;
 }): ReviewApplyResult {
     validateManifestReferences(args);
@@ -390,7 +451,11 @@ export function applyUserMemoryReviewManifest(args: {
             let projectId: number | undefined;
             const checkSnapshot = () => {
                 if (!checkedSnapshot) {
-                    const current = captureUserMemoryReviewSnapshot(args.db, nowMs);
+                    const current = captureUserMemoryReviewSnapshot(
+                        args.db,
+                        args.projectIdentity,
+                        nowMs,
+                    );
                     staleReason =
                         current.digest === args.snapshot.digest
                             ? null
@@ -485,6 +550,7 @@ export function applyUserMemoryReviewManifest(args: {
                         merged: 0,
                         dismissed: 0,
                         candidatesConsumed: 0,
+                        effects: [],
                     },
                     replayed: operation.operation.replayed,
                     staleReason:
@@ -524,6 +590,7 @@ export function applyUserMemoryReviewManifest(args: {
                     merged: args.manifest.updates.length,
                     dismissed: args.manifest.dismissals.length,
                     candidatesConsumed: args.manifest.consumeCandidateIds.length,
+                    effects: operation.operation.result.effects,
                 },
                 replayed: operation.operation.replayed,
                 staleReason: null,
@@ -540,10 +607,11 @@ export async function reviewUserMemories(args: ReviewUserMemoriesArgs): Promise<
         merged: 0,
         dismissed: 0,
         candidatesConsumed: 0,
+        effects: [],
     };
     const leaseKey = args.leaseKey ?? DREAMING_LEASE_KEY;
     const snapshotNow = Date.now();
-    const snapshot = captureUserMemoryReviewSnapshot(args.db, snapshotNow);
+    const snapshot = captureUserMemoryReviewSnapshot(args.db, args.projectIdentity, snapshotNow);
     if (snapshot.candidates.length < args.promotionThreshold) {
         const prunedExpired = runLeaseGuardedWrite(
             args.db,
@@ -755,6 +823,7 @@ If no promotions are warranted, return empty arrays. Consume reviewed candidates
                         manifest,
                         snapshot,
                         projectIdentity: args.projectIdentity,
+                        promotionThreshold: args.promotionThreshold,
                     });
                     return manifest;
                 },
@@ -770,6 +839,7 @@ If no promotions are warranted, return empty arrays. Consume reviewed candidates
             identity,
             snapshot,
             manifest: reviewRun.validated,
+            promotionThreshold: args.promotionThreshold,
         });
         manifestFinalized = true;
         if (applied.staleReason) throw new StaleUserMemoryReviewError(applied.staleReason);

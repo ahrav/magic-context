@@ -4,6 +4,7 @@ import {
     hasClaimMemoryFragment,
     resolveProjectIdsForIdentities,
 } from "../memory/storage-claim-current-state";
+import { uniformlyAbsentClaimSql } from "../memory/storage-claim-visibility";
 import { MURAL_CUE_RENDERER_EPOCH } from "../mural/storage-mural-cues";
 import { getProjectEmbeddingSnapshot } from "../project-embedding-registry";
 import {
@@ -24,6 +25,15 @@ import {
     type DreamTaskBacklogMap,
     type DreamTaskName,
 } from "./task-registry";
+
+/**
+ * Prefix of the independence key a classify-memories pass stamps on the
+ * evidence it writes. `claim-manifest.ts` builds those keys as
+ * `<task>:<leaseGeneration>:<publicClaimId>`, so the task name typed against
+ * `DreamTaskName` is the whole coupling — a task rename fails to compile here
+ * rather than silently zeroing the backlog probe.
+ */
+const CLASSIFY_MEMORIES_TASK: DreamTaskName = "classify-memories";
 
 /**
  * Per-task activity gates (Dreamer v2 A+B). A due task runs ONLY if its gate
@@ -53,12 +63,18 @@ export function countActiveMemories(db: Database, projectPath: string): number {
     });
 }
 
+// Lifecycle-active is not the same as runnable. `surfaceDecision` drops
+// hard-hidden, contradicted, quarantined, rejected, and expired claims on every
+// surface — maintenance lanes included — so counting only the lifecycle head
+// reported work the runners cannot see: curate would open a child session over an
+// empty pool and the backlog telemetry would never drain.
 const ACTIVE_CLAIM_BASE_SQL = `
     FROM claim_public_ids cpi
     JOIN claims ON claims.id = cpi.claim_id
     JOIN claim_memory_lifecycle_heads heads
       ON heads.claim_id = claims.id AND heads.state = 'active'
-   WHERE claims.project_id = ?`;
+   WHERE claims.project_id = ?
+     AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`;
 
 /** Latest baseline assertion with `paths_state = 'known'` and at least one
  * path selector. */
@@ -81,7 +97,12 @@ const MAPPED_CLAIM_SQL = `
            )
     )`;
 
-function countActiveClaimsWhere(db: Database, projectPath: string, condition: string): number {
+function countActiveClaimsWhere(
+    db: Database,
+    projectPath: string,
+    condition: string,
+    conditionParams: readonly unknown[] = [],
+): number {
     if (!hasClaimMemoryFragment(db)) return 0;
     const projectIds = resolveProjectIdsForIdentities(db, [projectPath]);
     if (projectIds.length === 0) return 0;
@@ -91,7 +112,7 @@ function countActiveClaimsWhere(db: Database, projectPath: string, condition: st
             // pi-lens-ignore: sql-injection
             `SELECT COUNT(*) AS cnt ${ACTIVE_CLAIM_BASE_SQL} AND ${condition}`,
         )
-        .get(...projectIds) as { cnt: number } | undefined;
+        .get(...projectIds, ...conditionParams) as { cnt: number } | undefined;
     return row?.cnt ?? 0;
 }
 
@@ -224,9 +245,28 @@ function countStalePrimers(db: Database, projectPath: string): number {
     return row?.cnt ?? 0;
 }
 
+/**
+ * Active claims carrying no classify-memories evidence on their current
+ * revision — the same marker `classify.ts` reads to decide what a pass still
+ * has to do, so backlog telemetry falls to zero once a pass catches up.
+ *
+ * A revision is the unit: a revise supersedes the classified revision, and the
+ * new one is genuinely unclassified again. The task prefix is bound rather than
+ * inlined so the probe's SQL text names only claim tables.
+ */
 function countUnclassifiedActiveMemories(db: Database, projectPath: string): number {
-    // When gate status is uncertain, treat every active claim as pending.
-    return countActiveMemories(db, projectPath);
+    return countActiveClaimsWhere(
+        db,
+        projectPath,
+        `NOT EXISTS (
+            SELECT 1
+              FROM claim_evidence evidence
+              JOIN observations observation ON observation.id = evidence.observation_id
+             WHERE evidence.revision_id = claims.current_revision_id
+               AND observation.independence_key LIKE ?
+        )`,
+        [`${CLASSIFY_MEMORIES_TASK}:%`],
+    );
 }
 
 function countPendingSmartNotes(db: Database, projectPath: string): number {

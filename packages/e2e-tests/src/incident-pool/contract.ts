@@ -11,6 +11,7 @@ export const SOURCE_INVENTORY_SCHEMA = "incident-source-inventory/v1";
 export const INCIDENT_CATALOG_SCHEMA = "incident-catalog/v1";
 export const ADJUDICATION_EVENT_SCHEMA = "incident-adjudication/v1";
 export const EMERGENCY_REDACTION_SCHEMA = "incident-emergency-redaction/v1";
+export const PROSPECTIVE_SOURCE_SCHEMA = "incident-prospective-source/v1";
 
 /** Closed source-claim disposition vocabulary (R2). */
 export const SOURCE_DISPOSITIONS = [
@@ -165,6 +166,21 @@ export interface AdjudicationEvent {
     rationale: string;
     source_revision: string;
     supersedes: string | null;
+}
+
+export interface ProspectiveIncidentSource {
+    schema: typeof PROSPECTIVE_SOURCE_SCHEMA;
+    epoch_id: string;
+    case_id: string;
+    family_id: string;
+    close_manifest_fingerprint: string;
+    case_commitment: string;
+    semantic_revision_id: string;
+    incident_bytes_fingerprint: string;
+    second_privacy_approval: {
+        approver: string;
+        subject_fingerprint: string;
+    };
 }
 
 export interface EmergencyRedactionEvent {
@@ -763,6 +779,44 @@ export function parseAdjudicationEvent(
 
 /** Exact-key parse of one emergency-redaction event — the only authorized
  *  destructive-history input (KTD1). */
+export function parseProspectiveIncidentSource(
+    raw: unknown,
+    label = "prospective source",
+): ProspectiveIncidentSource {
+    const source = asRecord(raw, label);
+    requireExactKeys(source, [
+        "schema",
+        "epoch_id",
+        "case_id",
+        "family_id",
+        "close_manifest_fingerprint",
+        "case_commitment",
+        "semantic_revision_id",
+        "incident_bytes_fingerprint",
+        "second_privacy_approval",
+    ], label);
+    if (source.schema !== PROSPECTIVE_SOURCE_SCHEMA) {
+        fail(`${label}.schema`, `must be ${PROSPECTIVE_SOURCE_SCHEMA}`);
+    }
+    const approvalLabel = `${label}.second_privacy_approval`;
+    const approval = asRecord(source.second_privacy_approval, approvalLabel);
+    requireExactKeys(approval, ["approver", "subject_fingerprint"], approvalLabel);
+    return {
+        schema: PROSPECTIVE_SOURCE_SCHEMA,
+        epoch_id: asId(source.epoch_id, /^epoch-[a-z0-9]+(?:-[a-z0-9]+)*$/, `${label}.epoch_id`),
+        case_id: asId(source.case_id, /^case-[0-9a-f]{32}$/, `${label}.case_id`),
+        family_id: asId(source.family_id, FAMILY_ID_RE, `${label}.family_id`),
+        close_manifest_fingerprint: asHex64(source.close_manifest_fingerprint, `${label}.close_manifest_fingerprint`),
+        case_commitment: asHex64(source.case_commitment, `${label}.case_commitment`),
+        semantic_revision_id: asId(source.semantic_revision_id, SEMANTIC_REVISION_ID_RE, `${label}.semantic_revision_id`),
+        incident_bytes_fingerprint: asHex64(source.incident_bytes_fingerprint, `${label}.incident_bytes_fingerprint`),
+        second_privacy_approval: {
+            approver: asId(approval.approver, /^[a-z0-9]+(?:-[a-z0-9]+)*$/, `${approvalLabel}.approver`),
+            subject_fingerprint: asHex64(approval.subject_fingerprint, `${approvalLabel}.subject_fingerprint`),
+        },
+    };
+}
+
 export function parseEmergencyRedaction(
     raw: unknown,
     label: string,

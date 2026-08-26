@@ -844,9 +844,15 @@ export class McHostModuleTransport {
         projectRoot: string;
         request: ClaimEffectDeliveryRequest;
     }): Promise<ClaimEffectDeliveryResponse> {
-        const expectedEffectId = Math.max(
-            ...args.request.receipt.effects.map((effect) => effect.id),
-        );
+        // The last effect is the delivery checkpoint (same contract as the outbox drain
+        // and the mirror receipt decoder). An effects receipt must carry at least one
+        // effect, so an empty list is an upstream invariant violation, not a zero ack.
+        const expectedEffectId = args.request.receipt.effects.at(-1)?.id;
+        if (expectedEffectId === undefined) {
+            throw new Error(
+                `claim effect receipt ${args.request.receipt.receiptId} has no effects`,
+            );
+        }
         const response = await this.call({
             sessionId: args.sessionId,
             projectRoot: args.projectRoot,
@@ -983,13 +989,11 @@ export class McHostModuleTransport {
             this.routes.set(routeKey, { route, generation });
             return { client, route, routeKey, generation };
         })();
-        const newOpening: OpeningRoute = { client, generation, closed: false, promise };
-        routeOpening = newOpening;
-        this.routeOpenings.set(routeKey, newOpening);
+        this.routeOpenings.set(routeKey, routeOpening);
         try {
-            return await newOpening.promise;
+            return await routeOpening.promise;
         } finally {
-            if (this.routeOpenings.get(routeKey) === newOpening) {
+            if (this.routeOpenings.get(routeKey) === routeOpening) {
                 this.routeOpenings.delete(routeKey);
             }
         }

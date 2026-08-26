@@ -19,6 +19,7 @@ import { appendCompartments, getCompartments } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
 import { insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
 import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
+import * as claimCurrentState from "./memory/storage-claim-current-state";
 import {
     computeProjectMemoryMutationToken,
     setProjectMemoryClaimLifecycle,
@@ -2309,6 +2310,168 @@ describe("resolveClaimsByLocatorsForSearch", () => {
         });
         expect(resolved).toHaveLength(1);
         expect(resolved?.[0]?.policyLabel).toContain("disputed");
+    });
+
+    /**
+     * Hide a claim the way a concurrent writer would: append the quarantine
+     * disposition the visibility reducer treats as uniform absence. Written
+     * directly, like the neighbouring evidence-label test, so the simulated
+     * transition lands at an exact point in this lane rather than depending on
+     * an operations-layer schedule.
+     */
+    function quarantineClaim(database: Database, publicClaimId: string): void {
+        const ref = database
+            .prepare(
+                `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                   FROM claim_public_ids
+                   JOIN claims ON claims.id = claim_public_ids.claim_id
+                  WHERE claim_public_ids.public_id = ?`,
+            )
+            .get(publicClaimId) as { revisionId: number; projectId: number };
+        database
+            .prepare(
+                `INSERT INTO claim_disposition_events
+                    (revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
+                 VALUES (?, ?, 'quarantined', 'assert', 'user:test', 1, ?)`,
+            )
+            .run(ref.revisionId, ref.projectId, Date.now());
+    }
+
+    /**
+     * Drive the cross-process interleave deterministically: let the provider's
+     * first read complete and close its snapshot, then commit the transition
+     * before this lane returns. This stands in for another process taking the
+     * writer lock while this one waits on the telemetry `BEGIN IMMEDIATE`; it
+     * does NOT prove anything about real lock scheduling or `busy_timeout`
+     * behaviour, only that a transition committed after the provider's
+     * snapshot closed cannot be published.
+     */
+    function hideAfterFirstProviderRead(publicClaimIds: readonly string[]): {
+        restore: () => void;
+        reads: () => number;
+    } {
+        const realRead = claimCurrentState.readProjectMemoryCurrentState;
+        let reads = 0;
+        const spy = spyOn(claimCurrentState, "readProjectMemoryCurrentState").mockImplementation(
+            (database, request) => {
+                const result = realRead(database, request);
+                reads += 1;
+                if (reads === 1) {
+                    for (const publicClaimId of publicClaimIds) {
+                        quarantineClaim(db, publicClaimId);
+                    }
+                }
+                return result;
+            },
+        );
+        return { restore: () => spy.mockRestore(), reads: () => reads };
+    }
+
+    it("does not publish a claim hidden after the provider snapshot closed", () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck",
+            content: "content that must not survive a mid-flight quarantine",
+            category: "CONSTRAINTS",
+        });
+        const hook = hideAfterFirstProviderRead([claim.publicClaimId]);
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck",
+                locators: [claim.publicClaimId],
+                limit: 10,
+            });
+
+            // Indistinguishable from "no such locator": the same null fallback
+            // a missing or foreign-hidden claim returns.
+            expect(resolved).toBeNull();
+            // Two provider reads: the hydration read plus the pre-publication
+            // recheck. One read would mean the recheck was skipped.
+            expect(hook.reads()).toBe(2);
+        } finally {
+            hook.restore();
+        }
+    });
+
+    it("rechecks visibility even when retrieval counting is disabled", () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-no-telemetry",
+            content: "hidden mid-flight with telemetry off",
+            category: "CONSTRAINTS",
+        });
+        const hook = hideAfterFirstProviderRead([claim.publicClaimId]);
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck-no-telemetry",
+                locators: [claim.publicClaimId],
+                limit: 10,
+                countRetrievals: false,
+            });
+
+            expect(resolved).toBeNull();
+            expect(hook.reads()).toBe(2);
+        } finally {
+            hook.restore();
+        }
+    });
+
+    it("drops only the claims that lost visibility mid-flight", () => {
+        const hidden = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-partial",
+            content: "quarantined between the read and the return",
+            category: "CONSTRAINTS",
+        });
+        const survivor = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-partial",
+            content: "still visible at publication time",
+            category: "CONSTRAINTS",
+        });
+        const hook = hideAfterFirstProviderRead([hidden.publicClaimId]);
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck-partial",
+                locators: [hidden.publicClaimId, survivor.publicClaimId],
+                limit: 10,
+            });
+
+            expect(resolved?.map((result) => result.publicClaimId)).toEqual([
+                survivor.publicClaimId,
+            ]);
+        } finally {
+            hook.restore();
+        }
+    });
+
+    it("publishes unchanged claims through the recheck", () => {
+        const claim = seedProjectMemoryClaim(db, {
+            projectIdentity: "git:recheck-stable",
+            content: "nothing moves under this lookup",
+            category: "CONSTRAINTS",
+        });
+        const realRead = claimCurrentState.readProjectMemoryCurrentState;
+        let reads = 0;
+        const spy = spyOn(claimCurrentState, "readProjectMemoryCurrentState").mockImplementation(
+            (database, request) => {
+                reads += 1;
+                return realRead(database, request);
+            },
+        );
+        try {
+            const resolved = resolveClaimsByLocatorsForSearch({
+                db,
+                projectPath: "git:recheck-stable",
+                locators: [claim.publicClaimId],
+                limit: 10,
+            });
+
+            expect(resolved?.map((result) => result.publicClaimId)).toEqual([claim.publicClaimId]);
+            expect(resolved?.[0]?.content).toBe("nothing moves under this lookup");
+            expect(reads).toBe(2);
+        } finally {
+            spy.mockRestore();
+        }
     });
 
     it("never queries legacy memory tables", () => {

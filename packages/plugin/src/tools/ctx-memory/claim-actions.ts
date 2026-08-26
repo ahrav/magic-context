@@ -1,3 +1,4 @@
+import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory";
 import {
     type CanonicalJsonValue,
     type ClaimMutationToken,
@@ -75,6 +76,9 @@ interface WorkspaceReadScope {
     ownProjectIds: number[];
     sharedCategories: string[];
     workspaceEpoch: string;
+    /** Identities the epoch and authorization derive from, so the provider can
+     *  recompute the fingerprint at publication time. */
+    workspaceIdentities: string[];
 }
 
 function workspaceReadScope(db: Database, projectIdentity: string): WorkspaceReadScope {
@@ -96,6 +100,7 @@ function workspaceReadScope(db: Database, projectIdentity: string): WorkspaceRea
             ? (resolveWorkspaceShareCategories(db, projectIdentity) ?? [])
             : [],
         workspaceEpoch: computeWorkspaceEpochFingerprint(db, workspace.identities),
+        workspaceIdentities: [...workspace.identities],
     };
 }
 
@@ -160,6 +165,27 @@ function authorizeOwnClaims(
     if (visible.length !== new Set(publicClaimIds).size) {
         throw new ClaimOperationInputError("claim not found or not visible from this project");
     }
+}
+
+/**
+ * Enforce the claim category taxonomy at the action boundary.
+ *
+ * The tool schema already types `category` as an enum, but a parse failure in
+ * `createCtxMemoryTool` falls back to executing the raw argument object so that
+ * provider-shaped calls keep working. The schema is `passthrough`, so unknown
+ * compatibility fields never fail a parse — a failure means an ADVERTISED field
+ * is malformed, and the raw value then reaches here. Storage only checks that
+ * the category is non-empty, so without this an out-of-taxonomy string would be
+ * recorded permanently on a revision.
+ */
+function requireTaxonomyCategory(category: string | undefined): string | undefined {
+    if (category === undefined || category === "") return undefined;
+    if (!(V2_MEMORY_CATEGORIES as readonly string[]).includes(category)) {
+        throw new ClaimOperationInputError(
+            `unknown claim category: ${category} (expected one of ${V2_MEMORY_CATEGORIES.join(", ")})`,
+        );
+    }
+    return category;
 }
 
 function provenance(
@@ -322,6 +348,7 @@ function getClaims(
         surface: "explicit_search",
         lifecycleStates: ["active"],
         workspaceEpoch: scope.workspaceEpoch,
+        workspaceIdentities: scope.workspaceIdentities,
     });
     const byId = new Map(active.map((item) => [item.publicClaimId, item]));
     const ownMissing = requested.filter((publicClaimId) => !byId.has(publicClaimId));
@@ -336,6 +363,7 @@ function getClaims(
             surface: "explicit_search",
             lifecycleStates: ["archived", "retired"],
             workspaceEpoch: scope.workspaceEpoch,
+            workspaceIdentities: scope.workspaceIdentities,
         });
         for (const item of inactiveOwn) byId.set(item.publicClaimId, item);
     }
@@ -386,6 +414,7 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
             surface: "explicit_search",
             lifecycleStates: ["active"],
             workspaceEpoch: scope.workspaceEpoch,
+            workspaceIdentities: scope.workspaceIdentities,
         })
             .filter((item) => !category || item.category === category)
             .slice(0, normalizeLimit(args.limit));
@@ -395,7 +424,7 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
     const { requestScope, ...producer } = createCtxMemoryProducerIdentity(identity);
     if (action === "create") {
         const content = args.content?.trim();
-        const category = args.category?.trim();
+        const category = requireTaxonomyCategory(args.category?.trim());
         if (!content || !category) {
             throw new ClaimOperationInputError("create requires non-empty content and category");
         }
@@ -446,7 +475,7 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
 
     if (action === "revise") {
         const content = args.content?.trim();
-        const category = args.category?.trim();
+        const category = requireTaxonomyCategory(args.category?.trim());
         if (!content && !category) {
             throw new ClaimOperationInputError("revise requires content and/or category");
         }

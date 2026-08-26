@@ -43,7 +43,7 @@ const ParamsSchema = Type.Object(
 		query: Type.Optional(
 			Type.String({
 				description:
-					"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+					"Search query. Matches against Primers, git commit messages, notes, and raw user/assistant message text. Project-memory claims are NOT text-searchable; a query that is only opaque public claim ids (mcm_<32hex>) or full revision locators resolves those claims directly.",
 			}),
 		),
 		limit: Type.Optional(
@@ -62,7 +62,7 @@ const ParamsSchema = Type.Object(
 				]),
 				{
 					description:
-						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
+						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] is accepted but returns nothing: broad project-memory retrieval is disabled until the claim retrieval projection is active. Omit for a broad search across all enabled sources.',
 				},
 			),
 		),
@@ -184,16 +184,25 @@ export function createCtxSearchTool(
 			// bypass the lexical+semantic lanes and resolve them through the
 			// current-state provider. If nothing resolves we fall through to
 			// the normal lanes so ordinary text still searches the corpus.
+			//
+			// Source restriction binds here too: this path runs before
+			// `params.sources` reaches `unifiedSearch`, so without the check a
+			// locator-shaped query would return claim content under a
+			// restriction that names only non-memory sources, or under an
+			// explicit empty list.
+			const memorySourceAllowed =
+				params.sources === undefined || params.sources.includes("memory");
 			const locatorShape = parseLocatorShapedQuery(query);
-			if (locatorShape && memoryEnabled) {
+			if (locatorShape && memoryEnabled && memorySourceAllowed) {
 				const locatorResults = resolveClaimsByLocatorsForSearch({
 					db: deps.db,
 					projectPath: projectIdentity,
 					locators: locatorShape,
-					limit: Math.max(
-						normalizeSearchResultLimit(params.limit),
-						locatorShape.length,
-					),
+					// The requested limit applies here exactly as it does to
+					// every other search path. Raising the cap to the locator
+					// count let `limit: 1` with two ids return both, and a long
+					// enough locator list slip past the shared hard ceiling.
+					limit: normalizeSearchResultLimit(params.limit),
 					visibleRevisionLocators,
 				});
 				if (locatorResults !== null) {

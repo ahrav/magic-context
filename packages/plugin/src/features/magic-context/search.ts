@@ -1466,8 +1466,11 @@ export function parseLocatorShapedQuery(query: string): string[] | null {
  * projection is inactive. A revision locator resolves to the claim's CURRENT
  * visible revision. Workspace authorization applies before the limit: a
  * foreign member's claim is visible only when shareable in a shared
- * category, and a nonmember cannot distinguish hidden from missing. Returns
- * null when nothing resolved so callers fall through to the normal lanes.
+ * category, and a nonmember cannot distinguish hidden from missing. Results
+ * are revalidated through the same provider after telemetry and immediately
+ * before publication, so a claim hidden or revised once the provider's
+ * snapshot closed is dropped rather than served. Returns null when nothing
+ * resolved so callers fall through to the normal lanes.
  */
 export function resolveClaimsByLocatorsForSearch(args: {
     db: Database;
@@ -1503,21 +1506,34 @@ export function resolveClaimsByLocatorsForSearch(args: {
             workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
         ),
     );
-    let items: ProjectMemoryClaimSnapshot[] | null = null;
-    for (let attempt = 0; attempt < 2 && items === null; attempt += 1) {
-        const result = readProjectMemoryCurrentState(args.db, {
-            publicClaimIds: [...new Set(publicClaimIds)],
-            projectIds: [...authorizedProjectIds],
-            workspaceAuthorization: {
-                ownProjectIds: [...ownProjectIds],
-                sharedCategories: workspace.shareCategories ?? [],
-            },
-            workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
-            surface: "explicit_search",
-            lifecycleStates: ["active", "archived"],
-        });
-        if (result.status === "ok") items = result.items;
-    }
+    // One closure = one authorization/surface/lifecycle setting, used by both
+    // the hydration read and the pre-publication recheck below. The two reads
+    // must not be able to drift: the provider is the single authority that
+    // decides visibility, so the recheck asks it the same question rather than
+    // reimplementing the policy filter.
+    const readVisibleClaims = (): ProjectMemoryClaimSnapshot[] | null => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const result = readProjectMemoryCurrentState(args.db, {
+                publicClaimIds: [...new Set(publicClaimIds)],
+                projectIds: [...authorizedProjectIds],
+                workspaceAuthorization: {
+                    ownProjectIds: [...ownProjectIds],
+                    sharedCategories: workspace.shareCategories ?? [],
+                },
+                workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+                // Named so the provider recomputes the fingerprint at
+                // publication time; without them it echoes the value above into
+                // both snapshot vectors and a revocation in flight goes
+                // undetected.
+                workspaceIdentities: workspace.identities,
+                surface: "explicit_search",
+                lifecycleStates: ["active", "archived"],
+            });
+            if (result.status === "ok") return result.items;
+        }
+        return null;
+    };
+    const items = readVisibleClaims();
     if (items === null) return null;
     const visible = items;
     const identityByProjectId = readProjectIdentityMap(
@@ -1559,7 +1575,39 @@ export function resolveClaimsByLocatorsForSearch(args: {
             kind: "retrieved",
         });
     }
-    return ordered;
+    // Revalidate through the provider before publishing. The provider proves
+    // visibility inside its own snapshot and then CLOSES it, so every byte
+    // above was read from state that is already historical here: one
+    // connection is cached per path per process, and under WAL another process
+    // can take the writer lock, let this process read old committed state, and
+    // commit a quarantine, rejection, or revision before this call returns.
+    // The telemetry write widens that window — `BEGIN IMMEDIATE` blocks for up
+    // to `busy_timeout` behind that writer — but it does not create it, so the
+    // recheck runs even when `countRetrievals === false`: publication safety
+    // must not depend on whether a counter is enabled.
+    const current = readVisibleClaims();
+    if (current === null) return null;
+    const currentByClaimId = new Map(current.map((item) => [item.publicClaimId, item]));
+    // Publish a result only when every field copied out of the snapshot still
+    // matches. Absent means hidden or gone; a moved locator, digest, content,
+    // category, or evidence label means the claim transitioned under us and
+    // the copy above is pre-transition content.
+    const confirmed = ordered.filter((result) => {
+        const item = currentByClaimId.get(result.publicClaimId);
+        if (item === undefined) return false;
+        return (
+            item.revisionLocator === result.revisionLocator &&
+            item.contentDigest === result.contentDigest &&
+            item.content === result.content &&
+            item.category === result.category &&
+            (item.explicitLabel ?? undefined) === result.policyLabel
+        );
+    });
+    // Dropping is the same observable outcome as never resolving: `null` is
+    // exactly what a missing or foreign-hidden locator returns, so a caller
+    // cannot distinguish "this claim went hidden" from "no such claim".
+    if (confirmed.length === 0) return null;
+    return confirmed;
 }
 
 export async function unifiedSearch(

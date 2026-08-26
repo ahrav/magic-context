@@ -17,7 +17,11 @@ import {
     executeCtxMemoryClaimAction,
     executeCtxMemoryClaimActionWithCommit,
 } from "./claim-actions";
-import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME } from "./constants";
+import {
+    CTX_MEMORY_DESCRIPTION,
+    CTX_MEMORY_MUTATION_TOKEN_RULE,
+    CTX_MEMORY_TOOL_NAME,
+} from "./constants";
 import {
     CTX_MEMORY_ACTIONS,
     CTX_MEMORY_DREAMER_ACTIONS,
@@ -90,6 +94,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     category: { type: "enum", values: V2_MEMORY_CATEGORIES },
                     publicClaimId: "string",
                     publicClaimIds: { type: "array", items: "string", maxItems: 20 },
+                    mutationToken: CTX_MEMORY_MUTATION_TOKEN_RULE,
+                    mutationTokens: {
+                        type: "array",
+                        items: CTX_MEMORY_MUTATION_TOKEN_RULE,
+                        maxItems: 20,
+                    },
                     limit: "number",
                     reason: "string",
                 });

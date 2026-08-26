@@ -2,7 +2,9 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{claim_adapter, commands, config, db, embedding_probe, log_parser, workspaces, AppState};
+use crate::{
+    claim_adapter, commands, config, db, embedding_probe, log_parser, workspaces, AppState,
+};
 
 #[derive(Debug)]
 pub enum DispatchError {

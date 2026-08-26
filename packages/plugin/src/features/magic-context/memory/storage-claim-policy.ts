@@ -491,6 +491,17 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
     return row.hasAny ? 1 : 0;
 }
 
+/**
+ * The only producer whose explicit-user observation may grant explicit-user
+ * credit to a revision that changes content: the Tauri dashboard's explicit-user
+ * mutation channel, which records the new content as the observation's own
+ * `extracted_text`. Mirrored by `EXPLICIT_USER_REVISION_PRODUCER` in
+ * `packages/dashboard/src-tauri/src/claim_adapter.rs`; the adapter conformance
+ * suite compares both policies' verdicts, so a drift shows up as a maturity
+ * disagreement rather than passing silently.
+ */
+export const EXPLICIT_USER_REVISION_PRODUCER = "dashboard:tauri";
+
 /** Exact explicit-user evidence for this revision: a supports observation
  * with the explicit-user trust class, or — for revisions at or below the
  * recorded seed boundary only — retained raw `user` source provenance on the
@@ -498,19 +509,29 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
  * class on the observation itself, so retained legacy metadata cannot
  * qualify later rewrites.
  *
- * Both branches are restricted to the claim's FIRST revision — with one
- * carve-out. The pre-v86 rewrite path passed the retained `user` source
+ * Both branches are restricted to the claim's FIRST revision — with two
+ * carve-outs. The pre-v86 rewrite path passed the retained `user` source
  * type into the new observation and left the revision metadata untouched,
  * so a later revision's explicit-user stamp can be model-authored
  * replacement bytes; a held-open pre-v86 writer keeps producing such
  * observations AFTER the seed boundary too, so the boundary alone cannot
  * clear them. First revisions come from the original user write or legacy
- * adoption and keep their stated provenance. The carve-out: a post-boundary
- * later revision whose bytes still equal the first revision's bytes (the
- * v86 classification path re-observes unchanged content) keeps its
+ * adoption and keep their stated provenance. The first carve-out: a
+ * post-boundary later revision whose bytes still equal the first revision's
+ * bytes (the v86 classification path re-observes unchanged content) keeps its
  * evidence, because no writer can smuggle new content through it. A missing
  * boundary key reads as 0 (never seeded): every revision on such a database
- * was written by a build that classifies rewrites as model inference. */
+ * was written by a build that classifies rewrites as model inference.
+ *
+ * The second carve-out admits the one path that DOES author new user-content
+ * revisions: the dashboard's explicit-user channel. Its observation records the
+ * new content as its own `extracted_text`, so requiring the observation's
+ * digest to equal the revision's proves the stamp was authored for these exact
+ * bytes, and requiring `EXPLICIT_USER_REVISION_PRODUCER` as the extractor keeps
+ * the pre-v86 hazard closed — that writer predates the producer string and
+ * cannot mint one. Without this branch a user's own dashboard edit lands as
+ * revision 2 with a new digest, stays CANDIDATE, and silently drops out of
+ * automatic injection. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
     // Direct-format databases carry neither schema_migrations_meta nor the
     // v84 memory-metadata table; there the boundary reads as 0 (never
@@ -532,12 +553,14 @@ export function hasExplicitUserEvidence(db: Database, revisionId: number): boole
             // Post-boundary observations are NOT unconditionally trusted:
             // a held-open pre-v86 writer's rewrite path copies the retained
             // `user` trust class onto the model-authored successor's
-            // observation. A post-boundary later revision qualifies only
-            // while its bytes ARE still the claim's first-revision bytes
-            // (the v86 classification path re-observes unchanged content;
-            // no v86 path authors NEW user-content revisions), so a
-            // content-changing compatibility rewrite can never ride the
-            // copied stamp to VERIFIED.
+            // observation. Such a writer predates the dashboard producer
+            // string, so the two content-changing gates below are the only
+            // ways a later revision qualifies: its bytes ARE still the
+            // claim's first-revision bytes (the v86 classification path
+            // re-observes unchanged content), or the stamp was minted by the
+            // dashboard explicit-user channel FOR these exact bytes. A
+            // content-changing compatibility rewrite satisfies neither, so it
+            // can never ride the copied stamp to VERIFIED.
             // Interpolation is a compile-time boundary expression, not
             // caller input.
             // pi-lens-ignore: sql-injection
@@ -555,10 +578,14 @@ export function hasExplicitUserEvidence(db: Database, revisionId: number): boole
                            WHERE first.claim_id = cr.claim_id AND first.revision = 1
                        )
                    )
+                   OR (
+                       o.extractor = ?
+                       AND o.content_sha256 = cr.content_sha256
+                   )
                )
              LIMIT 1`,
         )
-        .get(revisionId);
+        .get(revisionId, EXPLICIT_USER_REVISION_PRODUCER);
     if (byObservation) return true;
     if (
         !hasLegacyMeta ||

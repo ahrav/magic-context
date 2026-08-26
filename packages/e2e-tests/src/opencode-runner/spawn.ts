@@ -11,10 +11,9 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
-import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
-import { Database } from "../../../plugin/src/shared/sqlite";
+import { initializeIsolatedContextDb } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
+import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
 import {
     buildDirectHostFixture,
     detectRustModePrereqs,
@@ -33,19 +32,6 @@ const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
 const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY)
     ? PLUGIN_DIST_ENTRY
     : PLUGIN_SRC_ENTRY;
-
-function initializeIsolatedContextDb(dataDir: string): void {
-    const path = join(dataDir, "cortexkit", "magic-context", "context.db");
-    if (existsSync(path)) return;
-    mkdirSync(dirname(path), { recursive: true });
-    const db = new Database(path);
-    try {
-        initializeDatabase(db);
-        runMigrations(db);
-    } finally {
-        db.close();
-    }
-}
 
 export interface IsolatedEnv {
     configDir: string;
@@ -88,6 +74,8 @@ export interface SpawnOptions {
      * per-suite file). Merged last, overriding inherited values.
      */
     extraEnv?: Record<string, string>;
+    /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+    releaseRoot?: VerifiedReleaseRoot;
 }
 
 /**
@@ -136,7 +124,10 @@ function writeConfigs(
     mockProviderURL: string,
     opts: SpawnOptions,
 ): void {
-    const pluginSpec = `file://${PLUGIN_ENTRY}`;
+    const pluginEntry = opts.releaseRoot
+        ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
+        : PLUGIN_ENTRY;
+    const pluginSpec = `file://${pluginEntry}`;
 
     const opencodeConfig: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
@@ -345,14 +336,14 @@ async function stopChild(child: ChildProcess, timeoutMs = 3_000): Promise<void> 
 }
 
 /** Provision direct host before OpenCode so it can publish its connection file. */
-async function provisionRustMode(): Promise<RustSpawnResources> {
-    const prereqs = detectRustModePrereqs();
+async function provisionRustMode(releaseRoot?: VerifiedReleaseRoot): Promise<RustSpawnResources> {
+    const prereqs = detectRustModePrereqs(releaseRoot);
     if (!prereqs.ok) {
         throw new Error(
             `MC_E2E_MODE=rust prerequisite failure: ${prereqs.skipReason ?? "unknown prerequisite"}`,
         );
     }
-    const fixtureBin = await buildDirectHostFixture();
+    const fixtureBin = await buildDirectHostFixture(releaseRoot);
     const env = createIsolatedEnv();
     try {
         const mcHost = await HermeticMcHostStack.start({ dataDir: env.dataDir, fixtureBin });
@@ -431,7 +422,7 @@ async function spawnOpencodeWithProvision(
         const compaction = resolvedOpts.openCodeConfigExtra?.compaction as
             | { auto?: unknown }
             | undefined;
-        if (compaction?.auto !== true) initializeIsolatedContextDb(env.dataDir);
+        if (compaction?.auto !== true) initializeIsolatedContextDb(env.dataDir, resolvedOpts.releaseRoot);
         writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
 
         // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
@@ -533,11 +524,13 @@ async function spawnOpencodeWithProvision(
 }
 
 export function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
-    return spawnOpencodeWithProvision(opts, provisionRustMode);
+    return spawnOpencodeWithProvision(opts, () => provisionRustMode(opts.releaseRoot));
 }
 
 export const __spawnOpencodeTest = {
+    initializeIsolatedContextDb,
     rejectOnSpawnError,
     stopChild,
     spawnOpencodeWithProvision,
+    writeConfigs,
 };

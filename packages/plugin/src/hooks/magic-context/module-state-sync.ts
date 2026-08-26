@@ -4,14 +4,14 @@ import {
     seedLateCompatibilityRevisions,
 } from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
+import { readAuthorizedClaimMemorySnapshot } from "../../features/magic-context/memory/claim-memory-render";
 import {
-    canonicalSnapshotVector,
     type ClaimOperationResult,
+    canonicalSnapshotVector,
     decodeClaimOperationResult,
     parseRevisionLocator,
     type SnapshotVector,
 } from "../../features/magic-context/memory/claim-operation-contract";
-import { readAuthorizedClaimMemorySnapshot } from "../../features/magic-context/memory/claim-memory-render";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemorySnapshotVector,
@@ -81,9 +81,9 @@ import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import {
-    type ClaimEffectDeliveryReceipt,
     CLAIM_MIRROR_PROTOCOL_VERSION,
     CLAIM_MIRROR_VERSION,
+    type ClaimEffectDeliveryReceipt,
     type ClaimMirrorChangeKind,
     type ClaimMirrorReceiptRequest,
     type ClaimMirrorReceiptResponse,

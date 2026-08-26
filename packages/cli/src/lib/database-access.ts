@@ -261,10 +261,41 @@ function readDirectFormatHeaderSignals(dbPath: string): string[] {
 }
 
 /**
+ * Open a throwaway family copy read-write so SQLite can roll back a hot journal
+ * before classification reads the image. Never used on a real family.
+ */
+function openProbeCopyForRecovery(probePath: string): DatabaseType {
+    if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
+        // SAFETY: create/readwrite are bun:sqlite-only options, absent from the
+        // shared better-sqlite3-shaped Options type the wrapper exports; the Bun
+        // branch above guarantees the bun:sqlite constructor receives them.
+        return new Database(probePath, { create: false, readwrite: true } as unknown as {
+            readonly: boolean;
+        });
+    }
+    // The better-sqlite3-shaped constructor opens read-write by default and
+    // throws rather than creating when the file is absent.
+    return new Database(probePath);
+}
+
+/**
  * Classify the on-disk database family for CLI diagnostics and reset. Never
- * initializes schema. Content is read from a private temp copy of the family
- * (main, WAL, SHM) because even a read-only SQLite open rewrites an existing
- * SHM file; artifact presence is still checked at the real path.
+ * initializes schema.
+ *
+ * Content is read from a private temp copy of the whole family — main, WAL,
+ * SHM, and rollback journal — because even a read-only SQLite open rewrites an
+ * existing SHM file; artifact presence is still checked at the real path.
+ *
+ * The copy is opened read-write, and both halves of that matter. A rollback
+ * journal left by a process that died mid-transaction is HOT: the main image is
+ * unrecovered until SQLite rolls it back, so classifying without the journal
+ * reads a pre-rollback image, and copying the journal while opening read-only
+ * makes it worse — SQLite sees the pending rollback, cannot perform it, and
+ * fails the open, so a recoverable family would classify as corrupt and
+ * `doctor reset-db` would offer to quarantine it. Read-write on a throwaway copy
+ * lets recovery run where it cannot harm the real family. `create: false` keeps
+ * a missing copy from opening as a fresh empty database, which would classify as
+ * pristine.
  */
 export function inspectDirectDatabaseFamilyState(dbPath: string): DirectDatabaseFamilyState {
     const markerRead = readDatabaseResetMarker(dbPath);
@@ -286,11 +317,11 @@ export function inspectDirectDatabaseFamilyState(dbPath: string): DirectDatabase
     try {
         probeDir = mkdtempSync(join(tmpdir(), "mc-family-probe-"));
         const probePath = join(probeDir, basename(dbPath));
-        for (const suffix of ["", "-wal", "-shm"]) {
+        for (const suffix of ["", "-wal", "-shm", "-journal"]) {
             const source = `${dbPath}${suffix}`;
             if (existsSync(source)) copyFileSync(source, `${probePath}${suffix}`);
         }
-        db = new Database(probePath, { readonly: true });
+        db = openProbeCopyForRecovery(probePath);
         // Content comes from the probe connection; existence and artifact
         // checks inside inspectDatabaseForClassification use the real path.
         const inspection = inspectDatabaseForClassification(db, dbPath);

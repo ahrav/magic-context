@@ -29,6 +29,7 @@ import {
     type SnapshotVector,
 } from "./claim-operation-contract";
 import contractFixture from "./fixtures/claim-operation-contract-v1.json";
+import { combineClaimOperationStageOutcomes } from "./storage-claim-autonomous";
 import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
     applyProjectMemoryMapping,
@@ -46,6 +47,7 @@ import {
     reviseProjectMemoryClaim,
     runClaimOperation,
     setProjectMemoryClaimLifecycle,
+    stageCreateProjectMemoryClaimInCurrentTransaction,
 } from "./storage-claim-operations";
 import { ensureProject } from "./storage-claims";
 
@@ -502,6 +504,47 @@ describe("claim operations: duplicate statements (scenarios 6-7, R7)", () => {
         }
     });
 
+    test("several attachments to one claim in one receipt carry distinct effect keys", () => {
+        // An autonomous manifest whose entries normalize onto the same live
+        // (project, category, hash) slot creates the claim once and attaches the
+        // rest. Those attachments share a claim AND a revision, so a key built
+        // from those alone repeats — and `claim_operation_effects` enforces
+        // UNIQUE (receipt_id, effect_key) with an append-only trigger, so the
+        // duplicate aborts the whole manifest including its unrelated entries.
+        const ctx = setup();
+        try {
+            const staged = ctx.db
+                .transaction(() => {
+                    const outcomes = ["ik-a", "ik-b", "ik-c"].map((key, index) =>
+                        stageCreateProjectMemoryClaimInCurrentTransaction(
+                            ctx.db,
+                            {
+                                projectId: ctx.projectId,
+                                content: "One slot, three manifest entries.",
+                                category: "ARCHITECTURE",
+                                provenance: provenance(key, `run-${index}`),
+                                actor: "historian:test",
+                            },
+                            1_000,
+                        ),
+                    );
+                    return combineClaimOperationStageOutcomes(outcomes, null);
+                })
+                .immediate();
+
+            if (staged.kind !== "effects") throw new Error(`unexpected stage kind ${staged.kind}`);
+            // One create plus two attachments.
+            expect(staged.effects).toHaveLength(3);
+            expect(
+                staged.effects.filter((effect) => effect.changeKind === "evidence"),
+            ).toHaveLength(2);
+            const keys = staged.effects.map((effect) => effect.effectKey);
+            expect(new Set(keys).size).toBe(keys.length);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("the unique current-head index converges concurrent duplicates and rebuilds from authoritative rows", () => {
         const ctx = setup();
         try {
@@ -792,6 +835,122 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
         }
     });
 
+    test("a project the consumer never checkpointed pins the boundary at zero", () => {
+        // Checkpoints are keyed (consumer, project_id) while the delete is
+        // global over effect ids, so a consumer caught up on one project must
+        // not license pruning another project's unprocessed effects.
+        const ctx = setup();
+        try {
+            const otherProjectId = ensureProject(ctx.db, "git:u2-ops-other");
+            createClaimOp({ db: ctx.db, projectId: otherProjectId }, "op-other", "Other project.");
+            const { maxEffectId } = seedOutbox(ctx);
+            const effectsBefore = rowCount(ctx.db, "claim_operation_effects");
+
+            ctx.db
+                .transaction(() => {
+                    advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                        consumer: "module-mirror",
+                        projectId: ctx.projectId,
+                        ackedEffectId: maxEffectId,
+                    });
+                })
+                .immediate();
+
+            const pruned = ctx.db
+                .transaction(() =>
+                    pruneClaimOperationEffectsInCurrentTransaction(ctx.db, ["module-mirror"]),
+                )
+                .immediate();
+            expect(pruned.boundary).toBe(0);
+            expect(pruned.prunedEffectRows).toBe(0);
+            expect(rowCount(ctx.db, "claim_operation_effects")).toBe(effectsBefore);
+
+            // Checkpointing the second project too releases the boundary.
+            ctx.db
+                .transaction(() => {
+                    advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                        consumer: "module-mirror",
+                        projectId: otherProjectId,
+                        ackedEffectId: maxEffectId,
+                    });
+                })
+                .immediate();
+            const after = ctx.db
+                .transaction(() =>
+                    pruneClaimOperationEffectsInCurrentTransaction(ctx.db, ["module-mirror"]),
+                )
+                .immediate();
+            expect(after.boundary).toBe(maxEffectId);
+            expect(after.prunedEffectRows).toBeGreaterThan(0);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("a checkpoint beyond the outbox tail is refused", () => {
+        // A cursor past the tail claims effects that do not exist. The
+        // receipt-split guard cannot see it — there is no pending row beyond
+        // such an id — and once every required consumer holds one, the prune
+        // boundary becomes that future id and later effects are deleted unread.
+        const ctx = setup();
+        try {
+            const { maxEffectId } = seedOutbox(ctx);
+            expect(() =>
+                ctx.db
+                    .transaction(() =>
+                        advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                            consumer: "module-mirror",
+                            projectId: ctx.projectId,
+                            ackedEffectId: maxEffectId + 1,
+                        }),
+                    )
+                    .immediate(),
+            ).toThrow("beyond the outbox tail");
+
+            // The tail itself is fine, and re-acknowledging it stays idempotent
+            // after pruning empties the table — those effects are gone because
+            // they were consumed.
+            ctx.db
+                .transaction(() => {
+                    for (const consumer of [
+                        "module-mirror",
+                        "policy-projector",
+                        "retrieval-projector",
+                    ]) {
+                        advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                            consumer,
+                            projectId: ctx.projectId,
+                            ackedEffectId: maxEffectId,
+                        });
+                    }
+                })
+                .immediate();
+            ctx.db
+                .transaction(() =>
+                    pruneClaimOperationEffectsInCurrentTransaction(ctx.db, [
+                        "module-mirror",
+                        "policy-projector",
+                        "retrieval-projector",
+                    ]),
+                )
+                .immediate();
+            expect(rowCount(ctx.db, "claim_operation_effects")).toBe(0);
+            expect(() =>
+                ctx.db
+                    .transaction(() =>
+                        advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                            consumer: "module-mirror",
+                            projectId: ctx.projectId,
+                            ackedEffectId: maxEffectId,
+                        }),
+                    )
+                    .immediate(),
+            ).not.toThrow();
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("a checkpoint cannot split a receipt group and cannot regress", () => {
         const ctx = setup();
         try {
@@ -900,6 +1059,65 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
     });
 });
 
+/** Observation IDs linked to one revision, optionally narrowed to one relation. */
+function evidenceObservationIds(
+    db: Database,
+    revisionId: number,
+    relation?: "supports" | "merged_from",
+): number[] {
+    return (
+        db
+            .prepare(
+                `SELECT observation_id AS observationId FROM claim_evidence
+                  WHERE revision_id = ? AND (? IS NULL OR relation = ?)
+                  ORDER BY observation_id`,
+            )
+            .all(revisionId, relation ?? null, relation ?? null) as Array<{
+            observationId: number;
+        }>
+    ).map((row) => row.observationId);
+}
+
+function currentRevisionIdOf(ctx: Ctx, publicClaimId: string): number {
+    const claim = getProjectMemoryClaimByPublicId(ctx.db, publicClaimId);
+    if (!claim) throw new Error(`unknown claim ${publicClaimId}`);
+    return claim.currentRevisionId;
+}
+
+/** The single observation a freshly created claim's revision 1 carries. */
+function soleObservationIdOf(ctx: Ctx, publicClaimId: string): number {
+    const ids = evidenceObservationIds(ctx.db, currentRevisionIdOf(ctx, publicClaimId));
+    if (ids.length !== 1) {
+        throw new Error(`expected one observation for ${publicClaimId}, found ${ids.length}`);
+    }
+    return ids[0];
+}
+
+function mergeOp(
+    ctx: Ctx,
+    key: string,
+    targetPublicId: string,
+    sourcePublicIds: readonly string[],
+    mergedContent: string,
+) {
+    return mergeProjectMemoryClaims(
+        ctx.db,
+        { producer: "test", operationKey: key },
+        {
+            targetToken: computeProjectMemoryMutationToken(ctx.db, targetPublicId),
+            sourceTokens: sourcePublicIds.map((publicId) =>
+                computeProjectMemoryMutationToken(ctx.db, publicId),
+            ),
+            mergedContent,
+            actor: "user:test",
+        },
+    );
+}
+
+function ascending(ids: readonly number[]): number[] {
+    return [...ids].sort((left, right) => left - right);
+}
+
 describe("claim operations: same-project merge (R8, AE6)", () => {
     test("merge appends one target revision, preserves source evidence, and retires sources without trust transfer", () => {
         const ctx = setup();
@@ -988,6 +1206,96 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
         }
     });
 
+    test("a merge-produced source carries its merged_from lineage into the next merge", () => {
+        const ctx = setup();
+        try {
+            const sourceA = publicIdOf(createClaimOp(ctx, "op-a", "Source A content."));
+            const sourceB = publicIdOf(createClaimOp(ctx, "op-b", "Source B content."));
+            const firstTarget = publicIdOf(createClaimOp(ctx, "op-c", "First target content."));
+            const plainSource = publicIdOf(createClaimOp(ctx, "op-d", "Plain source content."));
+            const secondTarget = publicIdOf(createClaimOp(ctx, "op-e", "Second target content."));
+            const observationA = soleObservationIdOf(ctx, sourceA);
+            const observationB = soleObservationIdOf(ctx, sourceB);
+            const observationD = soleObservationIdOf(ctx, plainSource);
+
+            const first = mergeOp(
+                ctx,
+                "op-merge-1",
+                firstTarget,
+                [sourceA, sourceB],
+                "Merged once content.",
+            );
+            expect(first.outcome).toBe("applied");
+            const firstRevisionId = currentRevisionIdOf(ctx, firstTarget);
+            // A merge-produced revision records its lineage exclusively as
+            // merged_from, so a supports-only lookup finds nothing here.
+            expect(evidenceObservationIds(ctx.db, firstRevisionId, "supports")).toEqual([]);
+            expect(evidenceObservationIds(ctx.db, firstRevisionId, "merged_from")).toEqual(
+                ascending([observationA, observationB]),
+            );
+
+            // Mixed sources: the merge-produced source's transitive lineage
+            // survives alongside the plain source's own observation.
+            const second = mergeOp(
+                ctx,
+                "op-merge-2",
+                secondTarget,
+                [firstTarget, plainSource],
+                "Merged twice content.",
+            );
+            expect(second.outcome).toBe("applied");
+            expect(
+                evidenceObservationIds(
+                    ctx.db,
+                    currentRevisionIdOf(ctx, secondTarget),
+                    "merged_from",
+                ),
+            ).toEqual(ascending([observationA, observationB, observationD]));
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("a merge whose every source is merge-produced unions their lineage", () => {
+        const ctx = setup();
+        try {
+            const leafA = publicIdOf(createClaimOp(ctx, "op-leaf-a", "Leaf A content."));
+            const leafB = publicIdOf(createClaimOp(ctx, "op-leaf-b", "Leaf B content."));
+            const mergedA = publicIdOf(createClaimOp(ctx, "op-mid-a", "Mid A content."));
+            const mergedB = publicIdOf(createClaimOp(ctx, "op-mid-b", "Mid B content."));
+            const finalTarget = publicIdOf(createClaimOp(ctx, "op-final", "Final target content."));
+            const observationA = soleObservationIdOf(ctx, leafA);
+            const observationB = soleObservationIdOf(ctx, leafB);
+
+            expect(mergeOp(ctx, "op-mid-merge-a", mergedA, [leafA], "Mid A merged.").outcome).toBe(
+                "applied",
+            );
+            expect(mergeOp(ctx, "op-mid-merge-b", mergedB, [leafB], "Mid B merged.").outcome).toBe(
+                "applied",
+            );
+
+            // Neither source holds a supports row, so a supports-only evidence
+            // read would leave this merge with nothing to carry forward.
+            const final = mergeOp(
+                ctx,
+                "op-final-merge",
+                finalTarget,
+                [mergedA, mergedB],
+                "Final merged content.",
+            );
+            expect(final.outcome).toBe("applied");
+            expect(
+                evidenceObservationIds(
+                    ctx.db,
+                    currentRevisionIdOf(ctx, finalTarget),
+                    "merged_from",
+                ),
+            ).toEqual(ascending([observationA, observationB]));
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("one stale source token aborts the whole merge with a zero-effect result", () => {
         const ctx = setup();
         try {
@@ -1017,6 +1325,141 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
             expect(merged.outcome).toBe("stale");
             expect(merged.result.effects).toHaveLength(0);
             expect(snapshotCounts(ctx.db)).toEqual(before);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("a merge that keeps the target content keeps the target's own evidence", () => {
+        // Built from source observations only, the merged revision dropped the
+        // target's attestation of bytes it still holds — invisible in evidence
+        // summaries, and gone from the chain once this claim is merged again.
+        const ctx = setup();
+        try {
+            const target = createClaimOp(ctx, "op-target", "Target claim content.");
+            const source = createClaimOp(ctx, "op-source", "Source claim content.");
+            const targetObservations = ctx.db
+                .prepare(
+                    `SELECT observation_id AS observationId FROM claim_evidence
+                      WHERE revision_id = (SELECT current_revision_id FROM claims
+                                            WHERE id = (SELECT claim_id FROM claim_public_ids
+                                                         WHERE public_id = ?))
+                        AND relation = 'supports'`,
+                )
+                .all(publicIdOf(target)) as Array<{ observationId: number }>;
+            expect(targetObservations.length).toBeGreaterThan(0);
+
+            // mergedContent omitted, so the target keeps its bytes.
+            const merged = mergeProjectMemoryClaims(
+                ctx.db,
+                { producer: "test", operationKey: "op-merge" },
+                {
+                    targetToken: computeProjectMemoryMutationToken(ctx.db, publicIdOf(target)),
+                    sourceTokens: [computeProjectMemoryMutationToken(ctx.db, publicIdOf(source))],
+                    actor: "user:test",
+                },
+            );
+            expect(merged.outcome).toBe("applied");
+
+            const carried = ctx.db
+                .prepare(
+                    `SELECT observation_id AS observationId FROM claim_evidence
+                      WHERE revision_id = (SELECT current_revision_id FROM claims
+                                            WHERE id = (SELECT claim_id FROM claim_public_ids
+                                                         WHERE public_id = ?))`,
+                )
+                .all(publicIdOf(target)) as Array<{ observationId: number }>;
+            const carriedIds = new Set(carried.map((row) => row.observationId));
+            for (const row of targetObservations) {
+                expect(carriedIds.has(row.observationId)).toBe(true);
+            }
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("a cross-category merge is refused before any claim is retired", () => {
+        // A merge keeps the target's category and terminally retires every
+        // source, so merging across categories destroys the source category's
+        // live fact. The pre-cutover `merge_memories` rejected this before any
+        // store mutation and the curator prompt still promises it.
+        const ctx = setup();
+        try {
+            const target = createClaimOp(ctx, "op-target", "Target claim content.");
+            const source = createClaimOp(ctx, "op-source", "Source claim content.", {
+                category: "CONSTRAINTS",
+            });
+            const before = snapshotCounts(ctx.db);
+            expect(() =>
+                mergeProjectMemoryClaims(
+                    ctx.db,
+                    { producer: "test", operationKey: "op-merge" },
+                    {
+                        targetToken: computeProjectMemoryMutationToken(ctx.db, publicIdOf(target)),
+                        sourceTokens: [
+                            computeProjectMemoryMutationToken(ctx.db, publicIdOf(source)),
+                        ],
+                        actor: "user:test",
+                    },
+                ),
+            ).toThrow(/cross-category merge is refused/);
+            // Nothing staged, so the source's distinct fact is still live.
+            expect(snapshotCounts(ctx.db)).toEqual(before);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("merged content may keep a source's exact wording", () => {
+        // The sources are still `active` when the duplicate-content guard runs
+        // and only retire later in the same transaction, so a merge that keeps
+        // one source's wording — the common outcome — must not read that source
+        // as the pre-existing owner of the coordinate.
+        const ctx = setup();
+        try {
+            const target = createClaimOp(ctx, "op-target", "Target claim content.");
+            const source = createClaimOp(ctx, "op-source", "Source claim content.");
+            const sourceRef = getProjectMemoryClaimByPublicId(ctx.db, publicIdOf(source));
+            if (!sourceRef) throw new Error("unreachable");
+
+            const merged = mergeProjectMemoryClaims(
+                ctx.db,
+                { producer: "test", operationKey: "op-merge" },
+                {
+                    targetToken: computeProjectMemoryMutationToken(ctx.db, publicIdOf(target)),
+                    sourceTokens: [computeProjectMemoryMutationToken(ctx.db, publicIdOf(source))],
+                    mergedContent: "Source claim content.",
+                    actor: "user:test",
+                },
+            );
+
+            expect(merged.outcome).toBe("applied");
+            const targetRef = getProjectMemoryClaimByPublicId(ctx.db, publicIdOf(target));
+            expect(targetRef?.revision).toBe(2);
+            expect(
+                (
+                    ctx.db
+                        .prepare(
+                            "SELECT state FROM claim_memory_lifecycle_heads WHERE claim_id = ?",
+                        )
+                        .get(sourceRef.claimId) as { state: string }
+                ).state,
+            ).toBe("retired");
+            // The retired source vacates the coordinate, so exactly one live
+            // claim owns the merged content afterwards.
+            expect(
+                (
+                    ctx.db
+                        .prepare(
+                            `SELECT COUNT(*) AS count FROM claim_memory_current_heads
+                              WHERE normalized_hash = (
+                                  SELECT normalized_hash FROM claim_memory_current_heads
+                                  WHERE claim_id = ?)
+                                AND lifecycle_state = 'active'`,
+                        )
+                        .get(targetRef?.claimId as number) as { count: number }
+                ).count,
+            ).toBe(1);
         } finally {
             closeQuietly(ctx.db);
         }

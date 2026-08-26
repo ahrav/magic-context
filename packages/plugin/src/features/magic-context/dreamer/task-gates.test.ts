@@ -50,6 +50,44 @@ function verifyClaim(database: Database, claim: SeededProjectMemoryClaim): void 
     expect(result.outcome).toBe("applied");
 }
 
+/** Stamp the evidence a completed classify-memories pass leaves behind. */
+function markClassified(database: Database, claim: SeededProjectMemoryClaim): void {
+    const revisionId = (
+        database
+            .prepare(
+                `SELECT claims.current_revision_id AS id FROM claims
+                  JOIN claim_public_ids cpi ON cpi.claim_id = claims.id
+                 WHERE cpi.public_id = ?`,
+            )
+            .get(claim.publicClaimId) as { id: number }
+    ).id;
+    const spanId = (
+        database
+            .prepare(
+                `SELECT observations.source_span_id AS id FROM claim_evidence
+                  JOIN observations ON observations.id = claim_evidence.observation_id
+                 WHERE claim_evidence.revision_id = ? LIMIT 1`,
+            )
+            .get(revisionId) as { id: number }
+    ).id;
+    const key = `classify-memories:1:${claim.publicClaimId}`;
+    database
+        .prepare(
+            `INSERT INTO observations (source_span_id, extracted_text, content_sha256, extractor,
+                extractor_version, extractor_run_id, independence_key, source_trust_class, created_at)
+             VALUES (?, 'classified', ?, 'dreamer', '1', ?, ?, 'model_inference', 2)`,
+        )
+        .run(spanId, "e".repeat(64), key, key);
+    const observationId = (
+        database.prepare("SELECT MAX(id) AS id FROM observations").get() as { id: number }
+    ).id;
+    database
+        .prepare(
+            "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
+        )
+        .run(revisionId, observationId);
+}
+
 describe("dream task backlog probes", () => {
     test("backlog probes read claims, never legacy memory tables", () => {
         const database = createClaimReaderTestDatabase();
@@ -83,6 +121,35 @@ describe("dream task backlog probes", () => {
                 ),
             ),
         ).toBeFalse();
+    });
+
+    test("classify backlog drops as claims gain classify evidence", () => {
+        // Reporting `pending == total` forever made classification look like it
+        // never caught up, even right after a pass completed.
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-classify-backlog";
+        const first = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "first classify target",
+            category: "PROJECT_RULES",
+        });
+        seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "second classify target",
+            category: "PROJECT_RULES",
+        });
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "classify-memories")).toEqual({
+            pending: 2,
+            total: 2,
+        });
+
+        markClassified(database, first);
+        expect(getDreamTaskBacklog(database, projectIdentity, "classify-memories")).toEqual({
+            pending: 1,
+            total: 2,
+        });
     });
 
     test("map probe counts claims without recorded path knowledge", () => {
@@ -168,6 +235,42 @@ describe("dream task backlog probes", () => {
     test("processed count is the start-to-end backlog reduction", () => {
         expect(processedDreamTaskItems(17, 5)).toBe(12);
         expect(processedDreamTaskItems(5, 7)).toBe(0);
+    });
+});
+
+describe("uniformly absent claims are not runnable work", () => {
+    test("a quarantined claim leaves the backlog empty", () => {
+        // Lifecycle-active is not runnable: surfaceDecision drops quarantined
+        // claims on every surface, so counting the lifecycle head alone had
+        // curate opening a child session over a pool its runner sees as empty,
+        // and the backlog never drained.
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-hidden-pool";
+        const claim = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "quarantined claim bytes",
+            category: "PROJECT_RULES",
+        });
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "curate").total).toBe(1);
+
+        database
+            .prepare(
+                `INSERT INTO claim_disposition_events
+                    (revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
+                 SELECT claims.current_revision_id, claims.project_id, 'quarantined', 'assert',
+                        'user:test', 1, ?
+                   FROM claims
+                   JOIN claim_public_ids cpi ON cpi.claim_id = claims.id
+                  WHERE cpi.public_id = ?`,
+            )
+            .run(Date.now(), claim.publicClaimId);
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "curate")).toEqual({
+            pending: 0,
+            total: 0,
+        });
     });
 });
 

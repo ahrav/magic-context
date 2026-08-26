@@ -19,7 +19,6 @@ import {
 	queueMemoryMutation,
 	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
-import { createClaimMemorySchema } from "@magic-context/core/features/magic-context/storage-claim-memory-schema";
 import {
 	type SeededProjectMemoryClaim,
 	seedProjectMemoryClaim,
@@ -42,17 +41,15 @@ import {
 } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
-const directSchemaDatabases = new WeakSet<ReturnType<typeof createTestDb>>();
 const seededClaims = new WeakMap<
 	ReturnType<typeof createTestDb>,
 	Map<number, SeededProjectMemoryClaim>
 >();
 
+// `createTestDb` already installs the claim-memory schema, so this wrapper only
+// seeds. Creating it a second time throws `table claim_public_ids already
+// exists` and fails the test before any assertion runs.
 const insertMemory: typeof insertMemoryRaw = (db, input, operationIdentity) => {
-	if (!directSchemaDatabases.has(db)) {
-		db.transaction(() => createClaimMemorySchema(db)).immediate();
-		directSchemaDatabases.add(db);
-	}
 	const memory = insertMemoryRaw(
 		db,
 		{ sourceType: "user", ...input },
@@ -434,7 +431,6 @@ describe("trimPiMessagesToBoundary", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-frozen-cp-profile-"));
 		try {
-			db.transaction(() => createClaimMemorySchema(db)).immediate();
 			const state = piState("ses-pi-frozen-cp-profile", cwd);
 			appendCompartments(db, state.sessionId, [
 				{

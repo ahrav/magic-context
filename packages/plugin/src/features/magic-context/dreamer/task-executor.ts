@@ -19,7 +19,10 @@ import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getCompartmentEvents } from "../compartment-events";
 import { getMemoryCountsByStatus } from "../memory";
-import type { CanonicalJsonValue } from "../memory/claim-operation-contract";
+import type {
+    CanonicalJsonValue,
+    ClaimOperationResultEffect,
+} from "../memory/claim-operation-contract";
 import {
     type AutonomousManifestIdentity,
     combineClaimOperationStageOutcomes,
@@ -70,7 +73,11 @@ import {
     type RetrospectiveRawProvider,
     readRetrospectiveScanWindow,
 } from "./retrospective-raw-provider";
-import { type DreamRunMemoryChanges, insertDreamRun } from "./storage-dream-runs";
+import {
+    claimEffectMemoryChanges,
+    type DreamRunMemoryChanges,
+    insertDreamRun,
+} from "./storage-dream-runs";
 import {
     getTaskScheduleState,
     isRetrospectiveWindowProcessed,
@@ -590,7 +597,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                 });
-                recordRun("completed", null);
+                // Project promotions are claim-native, so the legacy `memories`
+                // diff sees nothing and the run row would record no claim IDs
+                // while the line below reports project_promoted > 0.
+                recordRun("completed", null, {
+                    memoryChanges: claimEffectMemoryChanges(result.effects),
+                });
                 log(
                     `[dreamer] review-user-memories: promoted=${result.promoted} project_promoted=${result.projectPromoted} merged=${result.merged} dismissed=${result.dismissed}`,
                 );
@@ -811,8 +823,14 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     parent,
                     invocationStartedAt: startedAt,
                 });
+                // Route-`memory` learnings write only the claim tables, so
+                // computeMemoryDelta's legacy diff reports nothing and the run
+                // row would record NULL despite claims being created. Prefer the
+                // committed claim effects and fall back to the legacy diff for
+                // projects still writing that table.
                 recordRun("completed", null, {
-                    memoryChanges: computeMemoryDelta(memoryBefore),
+                    memoryChanges:
+                        claimEffectMemoryChanges(retro.effects) ?? computeMemoryDelta(memoryBefore),
                 });
                 // Advance the content watermark on completion (incl. clean "n"
                 // runs) so the next run only scans newer messages.
@@ -978,6 +996,16 @@ function retrospectiveEventsForSessions(
     return events.sort((a, b) => a.createdAt - b.createdAt).slice(-20);
 }
 
+/**
+ * Retrospective outcome: the content watermark plus the claim effects the pass
+ * committed. Route-`memory` learnings are claim-native, so the legacy
+ * `memories` diff cannot see them and run telemetry has to use these.
+ */
+interface RetrospectiveTaskOutcome {
+    retrospectiveWatermarkMs: number | null;
+    effects: readonly ClaimOperationResultEffect[];
+}
+
 async function runRetrospectiveTask(
     config: DreamTaskRuntimeConfig,
     ctx: TaskExecutorContext,
@@ -987,13 +1015,13 @@ async function runRetrospectiveTask(
         parent: string | undefined;
         invocationStartedAt: number;
     },
-): Promise<{ retrospectiveWatermarkMs: number | null }> {
+): Promise<RetrospectiveTaskOutcome> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
     const { deps, deadline, parent } = helpers;
     const provider = resolveRetrospectiveProvider(deps, db, projectIdentity);
     if (!provider) {
         log("[dreamer] retrospective: no raw provider available — clean no-op");
-        return { retrospectiveWatermarkMs: null };
+        return { retrospectiveWatermarkMs: null, effects: [] };
     }
 
     // Content watermark (max message ts actually scanned) — NOT lastRunAt, which
@@ -1011,7 +1039,7 @@ async function runRetrospectiveTask(
     const userMessages = messages.filter((message) => message.role === "user");
     if (userMessages.length === 0) {
         log("[dreamer] retrospective: no user messages in window");
-        return { retrospectiveWatermarkMs: scan.maxScannedTs };
+        return { retrospectiveWatermarkMs: scan.maxScannedTs, effects: [] };
     }
 
     // Only POST-watermark user lines are genuinely new; the rest are the overlap
@@ -1023,7 +1051,7 @@ async function runRetrospectiveTask(
     );
     if (postWatermarkOrdinals.size === 0) {
         log("[dreamer] retrospective: only overlap lines, nothing new");
-        return { retrospectiveWatermarkMs: scan.maxScannedTs };
+        return { retrospectiveWatermarkMs: scan.maxScannedTs, effects: [] };
     }
 
     const abortController = new AbortController();
@@ -1102,7 +1130,8 @@ async function runRetrospectiveTask(
         const finish = (
             run: { output: unknown[] } | null,
             watermark: number | null,
-        ): { retrospectiveWatermarkMs: number | null } => {
+            effects: readonly ClaimOperationResultEffect[] = [],
+        ): RetrospectiveTaskOutcome => {
             if (parent && run) {
                 recordChildInvocation({
                     db,
@@ -1115,7 +1144,7 @@ async function runRetrospectiveTask(
                     messages: run.output,
                 });
             }
-            return { retrospectiveWatermarkMs: watermark };
+            return { retrospectiveWatermarkMs: watermark, effects };
         };
 
         // ── Turn 1: cheap LLM gate over U: lines only ──────────────────────
@@ -1206,7 +1235,7 @@ async function runRetrospectiveTask(
         log(
             `[dreamer] retrospective: flagged=${flagged.length} learnings=${learnings.length} memory=${applied.memoryWritten} observations=${applied.observationsInserted} dropped=${applied.observationsDropped} rejected=${applied.rejected.length}`,
         );
-        return finish(deepenRun, scan.maxScannedTs);
+        return finish(deepenRun, scan.maxScannedTs, applied.effects);
     } finally {
         heartbeat.stop();
         // PRIVACY: a retrospective child's prompt embeds raw cross-session user
@@ -1232,12 +1261,7 @@ async function runAgenticTask(
             status: "completed" | "failed",
             error: string | null,
             extra?: {
-                memoryChanges?: {
-                    written: number;
-                    deleted: number;
-                    archived: number;
-                    merged: number;
-                } | null;
+                memoryChanges?: DreamRunMemoryChanges | null;
             },
         ) => void;
         computeMemoryDelta: (
@@ -1290,6 +1314,7 @@ async function runAgenticTask(
     let childSessionId: string | null = null;
     let rawCurateManifest = "";
     let curateIdentity: AutonomousManifestIdentity | undefined;
+    let curateMemoryChanges: DreamRunMemoryChanges | null = null;
     try {
         const createResponse = await createChildSessionWithFence({
             client: deps.client,
@@ -1423,6 +1448,11 @@ async function runAgenticTask(
                     `Curate manifest became stale: ${applied.operation.result.staleReason}`,
                 );
             }
+            // Curate's revisions/archives/merges/splits are claim-native, so they
+            // never touch the legacy `memories` table that computeMemoryDelta
+            // diffs. Carry the applied effects to recordRun instead, or the run
+            // records no change at all.
+            curateMemoryChanges = claimEffectMemoryChanges(applied.operation.result.effects);
         }
 
         if (parent) {
@@ -1446,7 +1476,7 @@ async function runAgenticTask(
             }
         }
 
-        helpers.recordRun("completed", null);
+        helpers.recordRun("completed", null, { memoryChanges: curateMemoryChanges });
         return { status: "completed" };
     } catch (error) {
         if (task === "curate" && curateIdentity) {

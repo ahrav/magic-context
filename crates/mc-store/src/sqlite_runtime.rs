@@ -66,7 +66,9 @@ fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
 fn is_well_formed_source_id(source_id: &str) -> bool {
     // `YYYY-MM-DD HH:MM:SS <40-64 hex chars>`
     let bytes = source_id.as_bytes();
-    if bytes.len() < 20 + 40 {
+    // A multi-byte sequence across the stamp boundary is not a timestamp, and
+    // splitting inside one would panic: fail closed instead.
+    if bytes.len() < 20 + 40 || !source_id.is_char_boundary(20) {
         return false;
     }
     let (stamp, hash) = source_id.split_at(20);

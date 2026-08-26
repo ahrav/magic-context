@@ -69,6 +69,14 @@ function createArgs(content: string) {
     return { action: "create", category: "ARCHITECTURE", content };
 }
 
+/**
+ * A model that saw a clamped tool call in reduced history imitates that wrapper.
+ * Mutations must survive the imitation, tokens included.
+ */
+function reduced(inner: Record<string, unknown>) {
+    return { reduced: true, summary: JSON.stringify(inner) };
+}
+
 describe("ctx_memory U4 scenario 1: create uses direct claims", () => {
     test("returns public identity, revision locator, generation, and mutation token", async () => {
         const db = createClaimReaderTestDatabase();
@@ -90,6 +98,31 @@ describe("ctx_memory U4 scenario 1: create uses direct claims", () => {
             expect(
                 db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get(),
             ).toEqual({ count: 1 });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+    test("an out-of-taxonomy category is refused instead of persisted", async () => {
+        // The schema types `category` as an enum, but a parse failure falls back
+        // to executing the raw argument object so provider-shaped calls keep
+        // working — and because the schema is `passthrough`, only a MALFORMED
+        // advertised field fails a parse. Storage checks non-empty only, so the
+        // action layer is what keeps the taxonomy closed.
+        const db = createClaimReaderTestDatabase();
+        try {
+            const tool = harness(db);
+            const created = await tool.execute(
+                { action: "create", category: "arbitrary", content: "Out of taxonomy." },
+                "call-bad-category",
+            );
+            expect(created).toContain("unknown claim category: arbitrary");
+            expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+
+            // A valid category on the same shape still applies.
+            const ok = parseResult(
+                await tool.execute(createArgs("In taxonomy."), "call-good-category"),
+            );
+            expect(ok).toMatchObject({ action: "create", outcome: "applied" });
         } finally {
             closeQuietly(db);
         }
@@ -354,6 +387,115 @@ describe("ctx_memory U4 scenario 7: human authority", () => {
             expect(
                 await tool.execute({ action: "delete" }, "call-delete", DREAMER_AGENT),
             ).toContain("not allowed");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("ctx_memory imitated reduced arguments carry mutation tokens", () => {
+    test("reduced revise decodes its single token and applies the revision", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const tool = harness(db);
+            const created = parseResult(
+                await tool.execute(createArgs("Reduced original."), "call-reduced-create"),
+            );
+            const first = created.affectedClaims?.[0];
+            if (!first) throw new Error("missing create result");
+
+            const revised = parseResult(
+                await tool.execute(
+                    reduced({
+                        action: "revise",
+                        publicClaimId: first.publicClaimId,
+                        mutationToken: first.mutationToken,
+                        content: "Reduced revised.",
+                    }),
+                    "call-reduced-revise",
+                ),
+            );
+            expect(revised).toMatchObject({ action: "revise", outcome: "applied" });
+            expect(revised.affectedClaims?.[0]?.revisionLocator).toContain("/r2/");
+            expect(getProjectMemoryClaimByPublicId(db, first.publicClaimId)?.revision).toBe(2);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reduced merge decodes its ordered token array and retires the source", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const target = seedProjectMemoryClaim(db, {
+                projectIdentity: PROJECT,
+                content: "Reduced merge target.",
+                operationKey: "u4-reduced-merge-target",
+            });
+            const source = seedProjectMemoryClaim(db, {
+                projectIdentity: PROJECT,
+                content: "Reduced merge source.",
+                operationKey: "u4-reduced-merge-source",
+            });
+            const tool = harness(db);
+            const merged = parseResult(
+                await tool.execute(
+                    reduced({
+                        action: "merge",
+                        mutationTokens: [target.token, source.token],
+                        content: "Reduced merged claim.",
+                    }),
+                    "call-reduced-merge",
+                ),
+            );
+            expect(merged.affectedClaims?.map((claim) => claim.publicClaimId).sort()).toEqual(
+                [target.publicClaimId, source.publicClaimId].sort(),
+            );
+            const sourceGet = parseResult(
+                await tool.execute(
+                    { action: "get", publicClaimIds: [source.publicClaimId] },
+                    "call-reduced-merge-get",
+                ),
+            );
+            expect(sourceGet.claims?.[0]?.lifecycleState).toBe("retired");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a malformed reduced token is rejected without reaching the mutation path", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const tool = harness(db);
+            const created = parseResult(
+                await tool.execute(createArgs("Reduced malformed base."), "call-reduced-create"),
+            );
+            const first = created.affectedClaims?.[0];
+            if (!first) throw new Error("missing create result");
+            const receiptsBefore = db
+                .prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts")
+                .get();
+
+            for (const [index, badToken] of [
+                { ...first.mutationToken, revision: String(first.mutationToken.revision) },
+                { ...first.mutationToken, extra: "smuggled" },
+                "not-an-object",
+            ].entries()) {
+                const rejected = await tool.execute(
+                    reduced({
+                        action: "revise",
+                        publicClaimId: first.publicClaimId,
+                        mutationToken: badToken,
+                        content: "Must not apply.",
+                    }),
+                    `call-reduced-bad-${index}`,
+                );
+                expect(rejected).toContain("not allowed");
+            }
+
+            expect(getProjectMemoryClaimByPublicId(db, first.publicClaimId)?.revision).toBe(1);
+            expect(
+                db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get(),
+            ).toEqual(receiptsBefore);
         } finally {
             closeQuietly(db);
         }

@@ -16,6 +16,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
+import type { VerifiedReleaseRoot } from "./prospective-holdout/release-root";
 import {
     createIsolatedEnv,
     type IsolatedEnv,
@@ -46,6 +47,8 @@ export interface RustTestHarnessOptions {
      * Default: false (boot straight into Rust mode).
      */
     startInTsMode?: boolean;
+    /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+    releaseRoot?: VerifiedReleaseRoot;
 }
 
 export interface SdkClient {
@@ -123,6 +126,7 @@ export class RustTestHarness {
     private contextDbCached: Database | null = null;
     private modelContextLimit: number | undefined;
     private readonly mockBaseURL: string;
+    private readonly releaseRoot: VerifiedReleaseRoot | undefined;
 
     private constructor(args: {
         mock: MockProvider;
@@ -133,6 +137,7 @@ export class RustTestHarness {
         client: SdkClient;
         logPath: string;
         modelContextLimit: number | undefined;
+        releaseRoot: VerifiedReleaseRoot | undefined;
     }) {
         this.mock = args.mock;
         this.mockBaseURL = args.mockBaseURL;
@@ -142,6 +147,7 @@ export class RustTestHarness {
         this.clientInstance = args.client;
         this.logPath = args.logPath;
         this.modelContextLimit = args.modelContextLimit;
+        this.releaseRoot = args.releaseRoot;
     }
 
     /** Preflight current repository and Cargo. */
@@ -152,7 +158,7 @@ export class RustTestHarness {
     static async create(
         options: RustTestHarnessOptions = {},
     ): Promise<RustTestHarness> {
-        const prereqs = detectRustModePrereqs();
+        const prereqs = detectRustModePrereqs(options.releaseRoot);
         if (!prereqs.ok) {
             throw new Error(
                 `RustTestHarness prerequisites unmet: ${prereqs.skipReason ?? "unknown"}. ` +
@@ -160,7 +166,7 @@ export class RustTestHarness {
             );
         }
 
-        const fixtureBin = await buildDirectHostFixture();
+        const fixtureBin = await buildDirectHostFixture(options.releaseRoot);
 
         const mock = new MockProvider();
         const { baseURL } = await mock.start();
@@ -217,6 +223,7 @@ export class RustTestHarness {
             client,
             logPath,
             modelContextLimit: options.modelContextLimit,
+            releaseRoot: options.releaseRoot,
         });
     }
 
@@ -239,6 +246,7 @@ export class RustTestHarness {
                 transform_mode: args.rustMode ? "rust" : "ts",
             },
             extraEnv: { MAGIC_CONTEXT_LOG_PATH: args.logPath },
+            releaseRoot: args.options.releaseRoot,
         });
     }
 
@@ -279,6 +287,7 @@ export class RustTestHarness {
             options: {
                 modelContextLimit: this.modelContextLimit,
                 magicContextConfig: opts.magicContextConfig,
+                releaseRoot: this.releaseRoot,
             },
             rustMode: opts.rust ?? true,
         });
