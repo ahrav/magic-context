@@ -72,7 +72,13 @@ export async function wakePlaneStatus(): Promise<WakePlaneStatus> {
 
     const startedAt = now();
     const probe = probeStatus().then((status) => {
-        cachedStatus = { status, expiresAt: startedAt + WAKE_PLANE_STATUS_TTL_MS };
+        // An affirmative answer is bound to the authenticated daemon that
+        // produced it. Re-probe instead of reusing it after the connection
+        // closes, so daemon replacement can never inherit the old capability.
+        cachedStatus =
+            status === "present"
+                ? null
+                : { status, expiresAt: startedAt + WAKE_PLANE_STATUS_TTL_MS };
         return status;
     });
     inFlightProbe = probe;

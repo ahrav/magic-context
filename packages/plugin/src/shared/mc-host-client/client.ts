@@ -30,6 +30,7 @@ import {
     type ConnectionSnapshot,
     readConnectionFile,
 } from "./connection-file";
+import { credentialFingerprints } from "./credential-fingerprint";
 import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
 import {
     isMcHostCallError,
@@ -72,6 +73,7 @@ import type {
     CatalogSnapshot,
     ConnectOptions,
     ConsumerIdentity,
+    HostStatusSnapshot,
     ManagedCallOptions,
     ManagedRouteKind,
     PublicationDiagnostics,
@@ -201,9 +203,8 @@ type ShadowOutcome =
     | { kind: "stop" };
 
 interface CachedManagedRoute {
-    readonly key: string;
     readonly target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
-    readonly identity: BindIdentity;
+    identity: BindIdentity;
     readonly consumerIdentity: ConsumerIdentity | undefined;
     handle: RouteHandle | null;
     opening: SetupFlight<RouteHandle> | null;
@@ -428,6 +429,7 @@ export class McHostClient {
     private readonly recoveryDeadlineMs = DEFAULT_RECOVERY_DEADLINE_MS;
     private readonly defaultIdentity: BindIdentity | undefined;
     private readonly defaultTargetKind: ManagedRouteKind;
+    private readonly credentialSource: Record<string, string | undefined> | undefined;
     private readonly clock: MonotonicClock | undefined;
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly connectionFileAfterOpen: (() => void | Promise<void>) | undefined;
@@ -469,6 +471,7 @@ export class McHostClient {
         this.shutdownDeadlineMs = options.shutdownDeadlineMs ?? DEFAULT_SHUTDOWN_DEADLINE_MS;
         this.defaultIdentity = options.identity;
         this.defaultTargetKind = options.targetKind ?? DEFAULT_MANAGED_TARGET_KIND;
+        this.credentialSource = options.credentialSource;
         this.clock = options.clock;
         this.sleep =
             options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -504,10 +507,11 @@ export class McHostClient {
         const active = this.active;
         if (!active || active.generation.isRetired()) return null;
         const daemonVer = active.generation.daemonVer;
-        if (daemonVer === null) return null;
+        const daemonId = active.generation.authenticatedDaemonId;
+        if (daemonVer === null || daemonId === null) return null;
         return {
             daemonVer,
-            daemonId: active.generation.authenticatedDaemonId,
+            daemonId: daemonId.slice(),
             proof: "current",
         };
     }
@@ -534,7 +538,7 @@ export class McHostClient {
         return this.controlRouteOpen(
             active,
             target,
-            identity,
+            this.identityForConnection(active, identity),
             this.envConsumerIdentity(),
             deadline,
         );
@@ -667,6 +671,15 @@ export class McHostClient {
         const active = await this.ensureConnection(deadline);
         const bodyText = JSON.stringify({ op: "host.shutdown" });
         await this.controlRequest(active, bodyText, "host.shutdown", deadline);
+    }
+
+    /** Read host-owned component readiness without opening a routed module. */
+    async hostStatus(options: { timeoutMs?: number } = {}): Promise<HostStatusSnapshot> {
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const active = await this.ensureConnection(deadline);
+        const bodyText = JSON.stringify({ op: "host.status" });
+        const parsed = await this.controlRequest(active, bodyText, "host.status", deadline);
+        return parseHostStatusResponse(parsed);
     }
 
     /**
@@ -1624,14 +1637,15 @@ export class McHostClient {
         options: ManagedCallOptions,
         deadline: Deadline,
     ): Promise<RouteHandle> {
-        const identity = options.identity ?? this.defaultIdentity;
-        if (!identity) {
+        const baseIdentity = options.identity ?? this.defaultIdentity;
+        if (!baseIdentity) {
             throw new McHostCallError(
                 "terminal",
                 "managed call requires a BindIdentity in McHostClient.connect({ identity }) or call(..., { identity })",
                 "missing_identity",
             );
         }
+        const identity = baseIdentity;
         const kind = options.targetKind ?? this.defaultTargetKind;
         const target = { kind, module_id: moduleId } as Extract<
             RouteTarget,
@@ -1647,7 +1661,6 @@ export class McHostClient {
             let cached = this.routes.get(key);
             if (!cached) {
                 cached = {
-                    key,
                     target,
                     identity,
                     consumerIdentity,
@@ -1658,7 +1671,23 @@ export class McHostClient {
                 this.routes.set(key, cached);
             }
             // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for NEW managed acquisitions even while raw callers still use it (R10). commentlint: allow(JUDGE)
-            if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) return cached.handle;
+            if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) {
+                const active = this.active;
+                const currentIdentity =
+                    active === null
+                        ? cached.identity
+                        : this.identityForConnection(active, baseIdentity);
+                if (
+                    JSON.stringify(currentIdentity.credential_fingerprints ?? {}) ===
+                    JSON.stringify(cached.identity.credential_fingerprints ?? {})
+                ) {
+                    return cached.handle;
+                }
+                this.liveRoutes.delete(cached.handle.channel);
+                active?.generation.enqueueRouteGoodbye(cached.handle.channel, cached.handle.epoch);
+                cached.handle = null;
+                cached.identity = currentIdentity;
+            }
             let flight = cached.opening;
             let owner = false;
             if (!flight) {
@@ -1761,6 +1790,7 @@ export class McHostClient {
                 );
             }
             if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) return cached.handle;
+            cached.identity = this.identityForConnection(active, cached.identity);
             try {
                 const handle = await this.controlRouteOpen(
                     active,
@@ -1886,6 +1916,23 @@ export class McHostClient {
         if (!moduleId || !launchNonce) return undefined;
         return { module_id: moduleId, launch_nonce: launchNonce };
     }
+
+    private identityForConnection(active: ActiveConnection, identity: BindIdentity): BindIdentity {
+        if (
+            this.credentialSource === undefined ||
+            (identity.harness !== "opencode" && identity.harness !== "pi")
+        ) {
+            return identity;
+        }
+        const fingerprints = credentialFingerprints(
+            active.snapshot.key,
+            identity.harness,
+            this.credentialSource,
+        );
+        return Object.keys(fingerprints).length === 0
+            ? identity
+            : { ...identity, credential_fingerprints: fingerprints };
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1913,6 +1960,9 @@ function routeOpenBody(
         project_root: identity.project_root,
         harness: identity.harness,
         session: identity.session,
+        ...(identity.credential_fingerprints === undefined
+            ? {}
+            : { credential_fingerprints: identity.credential_fingerprints }),
     };
     return JSON.stringify(
         consumerIdentity
@@ -1999,6 +2049,48 @@ function requireOpArray(value: unknown, field: string, allowEmpty: boolean): str
         seen.add(entry);
     }
     return value as string[];
+}
+
+function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSnapshot {
+    const keys = Object.keys(parsed).sort();
+    const expected = ["health", "metrics", "op"];
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: unexpected shape",
+            "malformed_control_response",
+        );
+    }
+    if (parsed.op !== "host.status") {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: operation mismatch",
+            "malformed_control_response",
+        );
+    }
+    const health = parsed.health;
+    if (health !== "ok" && health !== "degraded" && health !== "failing") {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: invalid health",
+            "malformed_control_response",
+        );
+    }
+    if (
+        parsed.metrics === null ||
+        typeof parsed.metrics !== "object" ||
+        Array.isArray(parsed.metrics)
+    ) {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: metrics are not an object",
+            "malformed_control_response",
+        );
+    }
+    return {
+        health,
+        metrics: parsed.metrics as Record<string, unknown>,
+    };
 }
 
 function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot {
@@ -2123,5 +2215,9 @@ function routeCacheKey(
     const consumerPart = consumerIdentity
         ? `${consumerIdentity.module_id}\0${consumerIdentity.launch_nonce}`
         : "";
-    return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}`;
+    const credentialPart = Object.entries(identity.credential_fingerprints ?? {})
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([provider, fingerprint]) => `${provider}:${fingerprint}`)
+        .join(",");
+    return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${credentialPart}\0${consumerPart}`;
 }

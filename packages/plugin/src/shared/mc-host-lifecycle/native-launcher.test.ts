@@ -1,8 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    closeSync,
+    constants,
+    mkdtempSync,
+    openSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { NativeLaunchError, runNativeLifecycle } from "./native-launcher";
+import { NativeLaunchError, retainedExecutablePath, runNativeLifecycle } from "./native-launcher";
 
 const SECRET = "hunter2-credential-canary";
 
@@ -41,6 +49,26 @@ function probeResultJson(ok: boolean): string {
 describe("native launcher output handling (U3 scenario 17)", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "mc-native-launcher-"));
     process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+
+    test("retained descriptor execution uses the certified platform namespace", () => {
+        expect(retainedExecutablePath("linux", 7)).toBe("/proc/self/fd/7");
+        expect(retainedExecutablePath("darwin", 7)).toBe("/dev/fd/7");
+        expect(() => retainedExecutablePath("win32", 7)).toThrow(/unsupported on this platform/);
+    });
+
+    test("a retained executable descriptor runs through the inherited child fd", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
+        const fd = openSync(binary, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+            const result = await runNativeLifecycle(
+                { kind: "retained-fd", fd },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+            expect(result.reason).toBe("not_running");
+        } finally {
+            closeSync(fd);
+        }
+    });
 
     test("a conforming single JSON object with agreeing exit parses", async () => {
         const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import type {
@@ -11,6 +12,9 @@ import {
     AdmissionClass,
     armExpiryTimer,
     type BindIdentity,
+    BROCA_CREDENTIAL_NAMES,
+    BROCA_CREDENTIAL_ROW_CAP_BYTES,
+    BROCA_CREDENTIAL_VALUE_CAP_BYTES,
     Deadline,
     isConsumerReconnectTransient,
     isMcHostCallError,
@@ -23,6 +27,14 @@ import {
     SocketTimeoutError,
     StaleRouteHandleError,
 } from "../../shared/mc-host-client";
+import {
+    type ConnectionOrigin,
+    createManagedLifecyclePolicy,
+    type NativeStartupEnvelope,
+    resolveConnectionOrigin,
+    type StorageReadiness,
+} from "../../shared/mc-host-lifecycle";
+import { qualifiedHarnessClosures } from "../../shared/mc-host-lifecycle/generated-production-inputs";
 import { isRecord } from "../../shared/record-type-guard";
 
 const DEFAULT_MODULE_ID = "magic-context";
@@ -40,6 +52,182 @@ const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
 function getDefaultConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+}
+
+export interface ManagedDemandResult {
+    ok: boolean;
+    reason: string;
+    storage: StorageReadiness | null;
+}
+
+export type ManagedDemandStart = (request: {
+    origin: ConnectionOrigin;
+    capability: "magic-context" | "synapse";
+    signal?: AbortSignal;
+    deadlineMs?: number;
+    startupEnvelope?: NativeStartupEnvelope;
+}) => Promise<ManagedDemandResult>;
+
+export interface McHostModuleTransportOptions {
+    connectionFile?: string;
+    connectionOrigin?: ConnectionOrigin;
+    moduleId?: string;
+    requestTimeoutMs?: number;
+    routeSessionPrefix?: string;
+    demandStart?: ManagedDemandStart;
+}
+
+export interface LazyManagedDemandStartOptions {
+    declaringModuleUrl: string;
+    parentPackageName: string;
+}
+
+let configuredManagedDemandStart: ManagedDemandStart | undefined;
+
+function managedCredentialSourceVersion(env: Record<string, string | undefined>): string {
+    const hash = createHash("sha256").update("mc-host-route-credentials-v1");
+    for (const name of BROCA_CREDENTIAL_NAMES) {
+        const value = env[name] ?? "";
+        hash.update(`${Buffer.byteLength(name)}:${name}`);
+        hash.update(`${Buffer.byteLength(value)}:${value}`);
+    }
+    return hash.digest("hex");
+}
+
+interface GeneratedHarnessClosure {
+    readonly manifest_sha256: string;
+    readonly source_roots: readonly string[];
+    readonly platforms: readonly string[];
+    readonly anchors: Record<
+        string,
+        {
+            readonly from: "executable" | "interpreter" | "entrypoint";
+            readonly source_path: string;
+        }
+    >;
+}
+
+function closureCandidate(
+    closure: GeneratedHarnessClosure,
+    executable: string,
+    entrypoint: string | undefined,
+    resolvePath: (path: string) => string,
+): { manifest_sha256: string; source_roots: Record<string, string> } | undefined {
+    const platform =
+        process.platform === "linux" && process.arch === "x64"
+            ? "linux-x64-gnu"
+            : process.platform === "darwin" && process.arch === "arm64"
+              ? "darwin-arm64"
+              : process.platform === "darwin" && process.arch === "x64"
+                ? "darwin-x64"
+                : undefined;
+    if (platform === undefined || !closure.platforms.includes(platform)) {
+        return undefined;
+    }
+    const sourceRoots: Record<string, string> = {};
+    for (const root of closure.source_roots) {
+        const anchor = closure.anchors[root];
+        if (anchor === undefined) return undefined;
+        const unresolved = anchor.from === "entrypoint" ? entrypoint : executable;
+        if (unresolved === undefined || !unresolved.startsWith("/")) {
+            return undefined;
+        }
+        let actual: string;
+        try {
+            actual = resolvePath(unresolved);
+        } catch {
+            return undefined;
+        }
+        const suffix = `/${anchor.source_path}`;
+        if (!actual.endsWith(suffix)) return undefined;
+        sourceRoots[root] = actual.slice(0, -suffix.length) || "/";
+    }
+    return {
+        manifest_sha256: closure.manifest_sha256,
+        source_roots: sourceRoots,
+    };
+}
+
+export function buildManagedStartupEnvelope(
+    parentPackageName: string,
+    env: Record<string, string | undefined> = process.env,
+    executable: string = process.execPath,
+    entrypoint: string | undefined = process.argv[1],
+    resolvePath: (path: string) => string = realpathSync.native,
+): NativeStartupEnvelope {
+    const credentials: Record<string, string> = {};
+    let rowBytes = 0;
+    for (const name of BROCA_CREDENTIAL_NAMES) {
+        const value = env[name];
+        if (value === undefined || value.length === 0) continue;
+        const valueBytes = Buffer.byteLength(value);
+        if (valueBytes > BROCA_CREDENTIAL_VALUE_CAP_BYTES) {
+            const error = new Error("managed credential value exceeds its size cap") as Error & {
+                code?: string;
+            };
+            error.code = "credential_value_too_large";
+            throw error;
+        }
+        rowBytes += Buffer.byteLength(name) + valueBytes;
+        if (rowBytes > BROCA_CREDENTIAL_ROW_CAP_BYTES) {
+            const error = new Error("managed credential row exceeds its size cap") as Error & {
+                code?: string;
+            };
+            error.code = "credential_row_too_large";
+            throw error;
+        }
+        credentials[name] = value;
+    }
+    const opencode =
+        parentPackageName === "@cortexkit/opencode-magic-context"
+            ? closureCandidate(
+                  qualifiedHarnessClosures.harnesses.opencode,
+                  executable,
+                  entrypoint,
+                  resolvePath,
+              )
+            : undefined;
+    const pi =
+        parentPackageName === "@cortexkit/pi-magic-context"
+            ? closureCandidate(
+                  qualifiedHarnessClosures.harnesses.pi,
+                  executable,
+                  entrypoint,
+                  resolvePath,
+              )
+            : undefined;
+    return {
+        schema: 1,
+        ...(opencode === undefined ? {} : { opencode }),
+        ...(pi === undefined ? {} : { pi }),
+        ...(Object.keys(credentials).length === 0 ? {} : { credentials }),
+    };
+}
+
+export function createLazyManagedDemandStart(
+    options: LazyManagedDemandStartOptions,
+): ManagedDemandStart {
+    let policy: ReturnType<typeof createManagedLifecyclePolicy> | undefined;
+    return async (request): Promise<ManagedDemandResult> => {
+        policy ??= createManagedLifecyclePolicy({
+            mode: "mutating",
+            declaringModuleUrl: options.declaringModuleUrl,
+            parentPackageName: options.parentPackageName,
+        });
+        const outcome = await policy.demandStart({
+            ...request,
+            startupEnvelope: buildManagedStartupEnvelope(options.parentPackageName),
+        });
+        return {
+            ok: outcome.result.ok,
+            reason: outcome.result.reason,
+            storage: outcome.storage,
+        };
+    };
+}
+
+export function configureManagedDemandStart(demandStart: ManagedDemandStart | undefined): void {
+    configuredManagedDemandStart = demandStart;
 }
 
 function errorChainSome(
@@ -145,6 +333,7 @@ function cleanupTicketOf(error: unknown): Promise<void> | null {
 interface CachedRoute {
     route: RouteHandle;
     generation: number;
+    credentialSourceVersion?: string;
 }
 
 interface EnsuredRoute {
@@ -196,6 +385,8 @@ interface OpeningRoute {
 
 export class McHostModuleTransport {
     private readonly connectionFile: string;
+    private readonly connectionOrigin: ConnectionOrigin;
+    private readonly demandStart: ManagedDemandStart | undefined;
     private readonly moduleId: string;
     private readonly requestTimeoutMs: number;
     private readonly routeSessionPrefix: string;
@@ -258,15 +449,28 @@ export class McHostModuleTransport {
     }
 
     constructor(
-        connectionFile?: string,
+        connectionFileOrOptions?: string | McHostModuleTransportOptions,
         moduleId = DEFAULT_MODULE_ID,
         requestTimeoutMs = MODULE_SEND_TIMEOUT_MS,
         routeSessionPrefix = "",
     ) {
-        this.connectionFile = connectionFile ?? getDefaultConnectionFile();
-        this.moduleId = moduleId;
-        this.requestTimeoutMs = requestTimeoutMs;
-        this.routeSessionPrefix = routeSessionPrefix;
+        const options =
+            typeof connectionFileOrOptions === "object"
+                ? connectionFileOrOptions
+                : {
+                      connectionFile: connectionFileOrOptions,
+                      moduleId,
+                      requestTimeoutMs,
+                      routeSessionPrefix,
+                  };
+        this.connectionOrigin =
+            options.connectionOrigin ??
+            resolveConnectionOrigin({ connectionFile: options.connectionFile });
+        this.connectionFile = options.connectionFile ?? getDefaultConnectionFile();
+        this.moduleId = options.moduleId ?? DEFAULT_MODULE_ID;
+        this.requestTimeoutMs = options.requestTimeoutMs ?? MODULE_SEND_TIMEOUT_MS;
+        this.routeSessionPrefix = options.routeSessionPrefix ?? "";
+        this.demandStart = options.demandStart ?? configuredManagedDemandStart;
     }
 
     private deadlineError(detail: string): Error & { code?: string } {
@@ -527,6 +731,7 @@ export class McHostModuleTransport {
                         args.sessionId,
                         args.projectRoot,
                         deadline,
+                        args.signal,
                     );
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
@@ -807,6 +1012,7 @@ export class McHostModuleTransport {
         sessionId: string,
         rawProjectRoot: string,
         deadline: Deadline = Deadline.start(this.requestTimeoutMs),
+        signal?: AbortSignal,
     ): Promise<EnsuredRoute> {
         // The transform and tool lanes can observe the same directory under different
         // spellings when the project is reached through a symlink (OpenCode reports the
@@ -818,15 +1024,28 @@ export class McHostModuleTransport {
         // One identity may legitimately have multiple filesystem routes (for example,
         // worktrees). Reusing a route across roots would bind authority to the wrong tree.
         const routeKey = `${sessionId}\0${projectRoot}`;
+        const credentialSourceVersion =
+            this.connectionOrigin === "managed-default"
+                ? managedCredentialSourceVersion(process.env)
+                : undefined;
         // Read the cached route only after the connection is settled. The generation check
         // makes a route from any earlier connection invisible even if a cache clear is missed.
-        const client = await this.ensureConnected(deadline);
+        const client = await this.ensureConnected(deadline, signal);
         const generation = this.connectionGeneration;
         const existing = this.routes.get(routeKey);
-        if (existing?.generation === generation) {
+        if (
+            existing?.generation === generation &&
+            (existing.credentialSourceVersion ?? "") === (credentialSourceVersion ?? "")
+        ) {
             return { client, route: existing.route, routeKey, generation };
         }
-        if (existing) this.routes.delete(routeKey);
+        if (existing) {
+            this.routes.delete(routeKey);
+            const closeRoute = (client as Partial<McHostClient>).closeRoute;
+            if (typeof closeRoute === "function") {
+                await closeRoute.call(client, existing.route).catch(() => undefined);
+            }
+        }
         const opening = this.routeOpenings.get(routeKey);
         if (opening?.client === client && opening.generation === generation) {
             return await opening.promise;
@@ -861,7 +1080,11 @@ export class McHostModuleTransport {
                     "subc connection changed while opening module route",
                 );
             }
-            this.routes.set(routeKey, { route, generation });
+            this.routes.set(routeKey, {
+                route,
+                generation,
+                ...(credentialSourceVersion === undefined ? {} : { credentialSourceVersion }),
+            });
             return { client, route, routeKey, generation };
         })();
         this.routeOpenings.set(routeKey, routeOpening);
@@ -913,11 +1136,54 @@ export class McHostModuleTransport {
         return McHostClient.connect({
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
+            ...(this.connectionOrigin === "managed-default"
+                ? { credentialSource: process.env }
+                : {}),
         });
     }
 
-    private async ensureConnected(deadline?: Deadline): Promise<McHostClient> {
+    private async demandManagedReadiness(deadline?: Deadline, signal?: AbortSignal): Promise<void> {
+        if (this.connectionOrigin !== "managed-default") return;
+        if (!this.demandStart) {
+            const error = new Error("managed mc-host lifecycle owner is unavailable") as Error & {
+                code?: string;
+            };
+            error.code = "MC_HOST_LIFECYCLE_OWNER_MISSING";
+            throw error;
+        }
+        const outcome = await this.demandStart({
+            origin: this.connectionOrigin,
+            capability: "magic-context",
+            ...(signal ? { signal } : {}),
+            ...(deadline ? { deadlineMs: Math.max(0, deadline.remainingMs()) } : {}),
+        });
+        if (!outcome.ok) {
+            const error = new Error(`managed mc-host demand failed: ${outcome.reason}`) as Error & {
+                code?: string;
+            };
+            error.code = outcome.reason;
+            throw error;
+        }
+        if (outcome.storage !== "ready") {
+            const code =
+                outcome.storage === "starting" ? "storage_starting" : "storage_unavailable";
+            const error = new Error(
+                `managed mc-host storage is ${outcome.storage ?? "unknown"}`,
+            ) as Error & { code?: string };
+            error.code = code;
+            throw error;
+        }
+    }
+
+    private async ensureConnected(
+        deadline?: Deadline,
+        signal?: AbortSignal,
+    ): Promise<McHostClient> {
         if (this.client) return this.client;
+        await this.demandManagedReadiness(deadline, signal);
+        if (signal?.aborted) {
+            throw signal.reason ?? new Error("module transport call aborted");
+        }
         if (this.connectionPromise) return await this.connectionPromise;
         const now = Date.now();
         if (now < this.nextProbeMs) {

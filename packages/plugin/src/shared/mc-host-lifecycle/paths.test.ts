@@ -86,7 +86,7 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test("remote filesystem types are unsupported_filesystem / set_data_directory", () => {
-        for (const fsType of ["nfs4", "cifs", "fuse.sshfs", "9p"]) {
+        for (const fsType of ["nfs4", "cifs", "fuse.sshfs", "fuse.rclone", "9p"]) {
             const verdict = admitLifecycleFilesystem(
                 "/home/user/.local/share",
                 mounts(`/dev/root / ext4 rw 0 0\nremote:/x /home ${fsType} rw 0 0\n`),
@@ -137,15 +137,27 @@ describe("filesystem admission (KTD11)", () => {
         ).toBe(false);
     });
 
-    test("darwin admission passes (release-qualified, not runtime-probed)", () => {
+    test("darwin admits only a local executable APFS mount", () => {
         expect(
             admitLifecycleFilesystem("/Users/dev/.local/share", {
                 platform: "darwin",
-                readMounts: () => {
-                    throw new Error("no proc");
-                },
+                readMounts: () =>
+                    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n" +
+                    "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)\n",
             }),
         ).toEqual({ ok: true });
+        for (const mount of [
+            "server:/home on /Users (nfs, nodev, nosuid)\n",
+            "rclone on /Users (osxfuse, local, nodev)\n",
+            "/dev/disk3s5 on /Users (apfs, local, noexec)\n",
+        ]) {
+            expect(
+                admitLifecycleFilesystem("/Users/dev/.local/share", {
+                    platform: "darwin",
+                    readMounts: () => mount,
+                }).ok,
+            ).toBe(false);
+        }
     });
 
     test("mount points with octal escapes decode before matching", () => {

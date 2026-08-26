@@ -13,6 +13,7 @@ export interface BindIdentity {
     project_root: string;
     harness: string;
     session: string;
+    credential_fingerprints?: Readonly<Record<string, string>>;
 }
 
 /** Serde-compatible route target (`tag = "kind"`, snake_case). */
@@ -45,6 +46,11 @@ export interface CatalogSnapshot {
     generation: number;
     subcOps: string[];
     modules: CatalogEntry[];
+}
+
+export interface HostStatusSnapshot {
+    health: "ok" | "degraded" | "failing";
+    metrics: Record<string, unknown>;
 }
 
 /**
@@ -90,6 +96,8 @@ export interface ConnectOptions {
     identity?: BindIdentity;
     /** Default managed route target kind; defaults to `management_surface`. */
     targetKind?: ManagedRouteKind;
+    /** Current provider rows; only connection-keyed fingerprints leave the client. */
+    credentialSource?: Record<string, string | undefined>;
 }
 
 /** Per-request options for the raw routed `request()` path. */

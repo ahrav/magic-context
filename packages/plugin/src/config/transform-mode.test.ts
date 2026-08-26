@@ -3,17 +3,14 @@ import { describe, expect, it } from "bun:test";
 import { RUST_COMPACTION_OFF_WARNING, resolveTransformMode } from "./transform-mode";
 
 describe("resolveTransformMode", () => {
-    it("falls back to ts and warns when rust lacks user-level subc", () => {
+    it("keeps rust when managed packaged-host support is available", () => {
         expect(
             resolveTransformMode({
                 configured: "rust",
                 userTierHasSubc: false,
                 compactionEnabled: true,
             }),
-        ).toEqual({
-            mode: "ts",
-            warnings: ["rust mode requires user-level subc configuration; running ts."],
-        });
+        ).toEqual({ mode: "rust", warnings: [] });
     });
 
     it("keeps rust when trusted user-level subc is present", () => {

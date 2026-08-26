@@ -15,9 +15,11 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
-import { checkPlatform, type PlatformReaders } from "./bootstrap";
+import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
     classifyPreNativeRoots,
+    type DaemonCheck,
+    type DaemonReadiness,
     type DaemonReason,
     type DaemonResultV1,
     type DaemonState,
@@ -30,6 +32,7 @@ import {
     NativeLaunchError,
     type NativeLaunchTarget,
     type NativeLifecycleCommand,
+    type NativeStartupEnvelope,
     runNativeLifecycle,
 } from "./native-launcher";
 import { type ConnectionOrigin, mayDemandStart } from "./ownership";
@@ -43,6 +46,11 @@ export const OUTER_AGGREGATE_MS = 60_000;
 export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor";
 
 export type StorageReadiness = "ready" | "starting" | "unavailable";
+
+export interface ObservationalHealth {
+    readiness: DaemonReadiness;
+    authenticatedDaemonVersion: string;
+}
 
 export class WaiterDetachedError extends Error {
     constructor(readonly cause_kind: "aborted" | "deadline") {
@@ -62,16 +70,23 @@ export interface LifecyclePolicyOptions {
      * the package-path reason.
      */
     launchTarget?: NativeLaunchTarget | null;
+    /** Pre-resolve failure for mutating commands, already reduced to a closed reason. */
+    bootstrapFailure?: LifecycleFailureReason;
     platformReaders?: PlatformReaders;
     admissionIo?: AdmissionIo;
     /**
      * Post-transport storage probe used by managed Magic Context demand.
-     * U4 wires the real Magic Context status call; the default reports
-     * `ready` so explicit CLI flows are unaffected.
+     * The default reports `ready` for explicit and test-only policy instances.
      */
     storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
+    /** Authenticated route-free component health for status and doctor. */
+    readinessProbe?: (budgetMs: number) => Promise<ObservationalHealth>;
     /** Dev/test payload directory forwarded to native start/restart. */
     payloadDir?: string;
+    /** Parent-trusted payload manifest digest paired with `payloadDir`. */
+    payloadManifestDigest?: string;
+    /** Deferred certified package lookup after native current validation says missing. */
+    payloadDirFallback?: () => string | null;
     outerAggregateMs?: number;
 }
 
@@ -107,6 +122,7 @@ export interface DemandStartRequest {
     capability: "magic-context" | "synapse";
     signal?: AbortSignal;
     deadlineMs?: number;
+    startupEnvelope?: NativeStartupEnvelope;
 }
 
 export interface DemandStartOutcome {
@@ -121,20 +137,30 @@ export interface DemandStartOutcome {
 export class McHostLifecyclePolicy {
     private readonly env: Record<string, string | undefined>;
     private readonly launchTarget: NativeLaunchTarget | null;
+    private readonly bootstrapFailure: LifecycleFailureReason | undefined;
     private readonly platformReaders: PlatformReaders | undefined;
     private readonly admissionIo: AdmissionIo | undefined;
     private readonly storageProbe: (budgetMs: number) => Promise<StorageReadiness>;
+    private readonly readinessProbe:
+        | ((budgetMs: number) => Promise<ObservationalHealth>)
+        | undefined;
     private readonly payloadDir: string | undefined;
+    private readonly payloadManifestDigest: string | undefined;
+    private readonly payloadDirFallback: (() => string | null) | undefined;
     private readonly outerAggregateMs: number;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
 
     constructor(options: LifecyclePolicyOptions = {}) {
         this.env = options.env ?? process.env;
         this.launchTarget = options.launchTarget ?? null;
+        this.bootstrapFailure = options.bootstrapFailure;
         this.platformReaders = options.platformReaders;
         this.admissionIo = options.admissionIo;
         this.storageProbe = options.storageProbe ?? (async () => "ready");
+        this.readinessProbe = options.readinessProbe;
         this.payloadDir = options.payloadDir;
+        this.payloadManifestDigest = options.payloadManifestDigest;
+        this.payloadDirFallback = options.payloadDirFallback;
         this.outerAggregateMs = options.outerAggregateMs ?? OUTER_AGGREGATE_MS;
     }
 
@@ -143,8 +169,8 @@ export class McHostLifecyclePolicy {
         return this.inflightStarts.size;
     }
 
-    async start(): Promise<DaemonResultV1> {
-        return this.mutatingCommand("start");
+    async start(startupEnvelope?: NativeStartupEnvelope): Promise<DaemonResultV1> {
+        return this.mutatingCommand("start", startupEnvelope);
     }
 
     async stop(): Promise<DaemonResultV1> {
@@ -176,11 +202,12 @@ export class McHostLifecyclePolicy {
         if (!mayDemandStart(request.origin)) {
             throw new Error(`connection origin ${request.origin} is lifecycle-neutral`);
         }
+        const waiterStartedAt = Date.now();
         const rootResolution = resolveLifecycleDataRoot(this.env);
         const key = `${rootResolution.ok ? rootResolution.root : "\u0000no-root"}\u0000${request.capability}`;
         let shared = this.inflightStarts.get(key);
         if (!shared) {
-            shared = this.start();
+            shared = this.start(request.startupEnvelope);
             this.inflightStarts.set(key, shared);
             void shared
                 .catch(() => {})
@@ -192,7 +219,20 @@ export class McHostLifecyclePolicy {
         if (request.capability !== "magic-context" || !result.ok) {
             return { result, storage: null };
         }
-        const storage = await this.storageProbe(STORAGE_HARD_BUDGET_MS);
+        const remainingMs =
+            request.deadlineMs === undefined
+                ? undefined
+                : Math.max(0, request.deadlineMs - (Date.now() - waiterStartedAt));
+        if (remainingMs === 0) throw new WaiterDetachedError("deadline");
+        const storageBudget =
+            remainingMs === undefined
+                ? STORAGE_HARD_BUDGET_MS
+                : Math.min(STORAGE_HARD_BUDGET_MS, remainingMs);
+        const storage = await this.raceDetached(
+            this.storageProbe(storageBudget),
+            request.signal,
+            remainingMs,
+        );
         return { result, storage };
     }
 
@@ -201,8 +241,16 @@ export class McHostLifecyclePolicy {
         request: DemandStartRequest,
     ): Promise<DaemonResultV1> {
         const { signal, deadlineMs } = request;
+        return this.raceDetached(shared, signal, deadlineMs);
+    }
+
+    private raceDetached<T>(
+        shared: Promise<T>,
+        signal: AbortSignal | undefined,
+        deadlineMs: number | undefined,
+    ): Promise<T> {
         if (!signal && deadlineMs === undefined) return shared;
-        return new Promise<DaemonResultV1>((resolve, reject) => {
+        return new Promise<T>((resolve, reject) => {
             let settled = false;
             let timer: ReturnType<typeof setTimeout> | null = null;
             const detach = (kind: "aborted" | "deadline"): void => {
@@ -267,7 +315,10 @@ export class McHostLifecyclePolicy {
         return { ok: true, root };
     }
 
-    private async mutatingCommand(command: "start" | "stop" | "restart"): Promise<DaemonResultV1> {
+    private async mutatingCommand(
+        command: "start" | "stop" | "restart",
+        startupEnvelope?: NativeStartupEnvelope,
+    ): Promise<DaemonResultV1> {
         const preflight = this.preflight(command);
         if (!preflight.ok) return preflight.result;
         const platform = checkPlatform(this.platformReaders);
@@ -275,19 +326,46 @@ export class McHostLifecyclePolicy {
             const state = preNativeState(classifyPreNativeRoots(preflight.root));
             return localResult(command, false, state, "unsupported_platform");
         }
+        if (this.bootstrapFailure !== undefined) {
+            const state = preNativeState(classifyPreNativeRoots(preflight.root));
+            return localResult(command, false, state, this.bootstrapFailure);
+        }
         if (this.launchTarget === null) {
             const state = preNativeState(classifyPreNativeRoots(preflight.root));
             return localResult(command, false, state, "native_payload_missing");
         }
         try {
-            const native = await runNativeLifecycle(this.launchTarget, {
-                command: command as NativeLifecycleCommand,
-                deadlineMs: this.outerAggregateMs,
-                env: this.nativeEnv(preflight.root),
-                ...(this.payloadDir !== undefined && command !== "stop"
-                    ? { payloadDir: this.payloadDir }
-                    : {}),
-            });
+            const invoke = (payloadDir: string | undefined) =>
+                runNativeLifecycle(this.launchTarget as NativeLaunchTarget, {
+                    command: command as NativeLifecycleCommand,
+                    deadlineMs: this.outerAggregateMs,
+                    env: this.nativeEnv(preflight.root),
+                    ...(payloadDir !== undefined && command !== "stop" ? { payloadDir } : {}),
+                    ...(command !== "stop" && this.payloadManifestDigest !== undefined
+                        ? { payloadManifestDigest: this.payloadManifestDigest }
+                        : {}),
+                    ...(startupEnvelope === undefined || command === "stop"
+                        ? {}
+                        : { envelope: startupEnvelope }),
+                });
+            let selectedPayloadDir = this.payloadDir;
+            if (
+                command === "restart" &&
+                selectedPayloadDir === undefined &&
+                this.payloadDirFallback !== undefined
+            ) {
+                selectedPayloadDir = this.payloadDirFallback() ?? undefined;
+            }
+            let native = await invoke(selectedPayloadDir);
+            if (
+                command === "start" &&
+                this.payloadDir === undefined &&
+                native.reason === "native_payload_missing" &&
+                this.payloadDirFallback !== undefined
+            ) {
+                const fallback = this.payloadDirFallback();
+                if (fallback !== null) native = await invoke(fallback);
+            }
             return { ...native, command };
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
@@ -305,12 +383,59 @@ export class McHostLifecyclePolicy {
             return localResult(command, ok, verdict.state, verdict.reason);
         }
         try {
+            const deadline = Date.now() + this.outerAggregateMs;
             const native = await runNativeLifecycle(this.launchTarget, {
                 command: "probe",
                 deadlineMs: this.outerAggregateMs,
                 env: this.nativeEnv(preflight.root),
             });
-            return { ...native, command };
+            if (!native.ok || native.state !== "running" || this.readinessProbe === undefined) {
+                return { ...native, command };
+            }
+            const observed = await this.readinessProbe(Math.max(1, deadline - Date.now()));
+            const checks: DaemonCheck[] = [...native.checks];
+            const addCheck = (
+                id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
+                record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
+            ): void => {
+                const status =
+                    record.state === "ready"
+                        ? "pass"
+                        : record.state === "unsupported"
+                          ? "skip"
+                          : "fail";
+                checks.push({
+                    id,
+                    status,
+                    reason: record.reason,
+                    remediation: remediationForReason(record.reason),
+                });
+            };
+            if (observed.readiness.transport) {
+                addCheck("readiness.transport", observed.readiness.transport);
+            }
+            if (observed.readiness.storage) {
+                addCheck("readiness.storage", observed.readiness.storage);
+            }
+            if (observed.readiness.synapse) {
+                addCheck("readiness.synapse", observed.readiness.synapse);
+            }
+            checks.sort((left, right) => left.id.localeCompare(right.id));
+            const failed = checks.find((check) => check.status === "fail");
+            return {
+                ...native,
+                command,
+                ok: failed === undefined,
+                reason: failed?.reason ?? "healthy",
+                remediation: failed?.remediation ?? null,
+                readiness: observed.readiness,
+                checks,
+                versions: {
+                    ...native.versions,
+                    proof: "current",
+                    daemon: observed.authenticatedDaemonVersion,
+                },
+            };
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
@@ -325,6 +450,26 @@ export class McHostLifecyclePolicy {
 
     private launchFailure(command: LifecycleCommand, root: string, error: unknown): DaemonResultV1 {
         const state = preNativeState(classifyPreNativeRoots(root));
+        if (
+            error !== null &&
+            typeof error === "object" &&
+            "reason" in error &&
+            [
+                "unsupported_platform",
+                "unsupported_install_layout",
+                "native_payload_missing",
+                "native_payload_invalid",
+                "insufficient_storage",
+                "internal_error",
+            ].includes(String((error as { reason?: unknown }).reason))
+        ) {
+            return localResult(
+                command,
+                false,
+                state,
+                (error as { reason: LifecycleFailureReason }).reason,
+            );
+        }
         if (error instanceof NativeLaunchError) {
             switch (error.code) {
                 case "timeout":

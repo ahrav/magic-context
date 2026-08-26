@@ -155,6 +155,18 @@ describe("wakePlaneStatus", () => {
         expect(probes).toBe(1);
     });
 
+    test("does not reuse an affirmative answer after its authenticated probe closes", async () => {
+        let probes = 0;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(true);
+        });
+
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(2);
+    });
+
     test("re-probes after the TTL instead of retaining a stale catalog answer", async () => {
         let clock = 10_000;
         let hasWakePlane = false;

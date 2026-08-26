@@ -15,6 +15,7 @@
  * honoring `MAGIC_CONTEXT_TEST_DATA_DIR` the same way `data-path.ts` does.
  */
 
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { releaseContract } from "./generated-contract";
@@ -172,8 +173,32 @@ export interface AdmissionIo {
 
 const defaultAdmissionIo: AdmissionIo = {
     platform: process.platform,
-    readMounts: () => readFileSync("/proc/self/mounts", "utf8"),
+    readMounts: () =>
+        process.platform === "darwin"
+            ? execFileSync("/sbin/mount", [], {
+                  encoding: "utf8",
+                  timeout: 2_000,
+                  maxBuffer: 1024 * 1024,
+              })
+            : readFileSync("/proc/self/mounts", "utf8"),
 };
+
+function parseDarwinMounts(text: string): MountEntry[] {
+    const entries: MountEntry[] = [];
+    for (const line of text.split("\n")) {
+        const match = /^.+ on (.+) \(([^,()]+),\s*([^)]*)\)$/.exec(line);
+        if (!match) continue;
+        entries.push({
+            mountPoint: match[1] as string,
+            fsType: (match[2] as string).trim(),
+            options: (match[3] as string)
+                .split(",")
+                .map((option) => option.trim())
+                .filter(Boolean),
+        });
+    }
+    return entries;
+}
 
 /**
  * Practical bounded admission of the selected data root: the root must be
@@ -194,20 +219,34 @@ export function admitLifecycleFilesystem(
         detail,
     });
     if (!path.isAbsolute(dataRoot)) return rejected("data root is not absolute");
-    if (io.platform === "darwin") return { ok: true };
-    if (io.platform !== "linux") return rejected("unqualified platform for lifecycle filesystems");
     let mounts: MountEntry[];
     try {
-        mounts = parseMounts(io.readMounts());
+        mounts =
+            io.platform === "darwin"
+                ? parseDarwinMounts(io.readMounts())
+                : io.platform === "linux"
+                  ? parseMounts(io.readMounts())
+                  : [];
     } catch {
         return rejected("mount table is unreadable");
+    }
+    if (io.platform !== "linux" && io.platform !== "darwin") {
+        return rejected("unqualified platform for lifecycle filesystems");
     }
     // The root may not exist yet on a first start; classify by the nearest
     // mount containing the would-be path, which is what the kernel will use.
     const mount = longestMountFor(dataRoot, mounts);
     if (!mount) return rejected("no mount contains the data root");
     const baseType = mount.fsType.toLowerCase();
-    if (UNSUPPORTED_FS_TYPES.has(baseType) || baseType.startsWith("nfs")) {
+    if (
+        UNSUPPORTED_FS_TYPES.has(baseType) ||
+        baseType.startsWith("nfs") ||
+        baseType.startsWith("fuse") ||
+        baseType.includes("osxfuse")
+    ) {
+        return rejected(`unsupported filesystem type ${baseType}`);
+    }
+    if (io.platform === "darwin" && (baseType !== "apfs" || !mount.options.includes("local"))) {
         return rejected(`unsupported filesystem type ${baseType}`);
     }
     if (mount.options.includes("noexec")) {

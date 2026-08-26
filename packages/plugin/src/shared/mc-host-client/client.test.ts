@@ -10,6 +10,7 @@ import {
     type McHostClientOptions,
     type McHostDiagnosticsEvent,
 } from "./client";
+import { credentialFingerprints } from "./credential-fingerprint";
 import { isMcHostCallError, McHostCallError, McHostClientError, SocketClosedError } from "./errors";
 import type { RouteHandle } from "./route-handle";
 import { StaleRouteHandleError } from "./route-handle";
@@ -270,6 +271,30 @@ const isRoutedFrame = (frame: PeerFrame): boolean =>
     frame.ty === PeerFrameType.Request && frame.channel !== 0;
 
 describe("McHostClient facade", () => {
+    test("route identity carries only bearer-keyed credential fingerprints", async () => {
+        const credentialSource = {
+            ANTHROPIC_API_KEY: "current-secret",
+            AWS_ACCESS_KEY_ID: "ambient-aws",
+            HTTPS_PROXY: "ambient-proxy",
+        };
+        const { peer, client, conn } = await connected({ credentialSource });
+        const cursor = frameCursor(conn);
+        const opening = client.routeOpen(TOOL_TARGET, IDENTITY);
+        const frame = await cursor.next(isRouteOpen);
+        const body = JSON.parse(frame.body.toString("utf8")) as {
+            identity: {
+                credential_fingerprints?: Record<string, string>;
+            };
+        };
+        expect(body.identity.credential_fingerprints).toEqual(
+            credentialFingerprints(peer.key, "opencode", credentialSource),
+        );
+        expect(JSON.stringify(body)).not.toContain("current-secret");
+        expect(JSON.stringify(body)).not.toContain("ambient");
+        await sendRouteOpenOk(conn, frame.corr, 7, 77);
+        await opening;
+    });
+
     test("completes tagged catalog, route open, opaque JSON request, and route Goodbye", async () => {
         const { client, conn } = await connected();
         const cursor = frameCursor(conn);
@@ -2237,6 +2262,8 @@ describe("authenticated state retention (U3/KTD6)", () => {
         expect(authenticated?.daemonVer).toBe("fake-peer/0.0.1");
         expect(authenticated?.proof).toBe("current");
         expect(Array.from(authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
+        (authenticated?.daemonId as Uint8Array)[0] ^= 0xff;
+        expect(Array.from(client.authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
         const publication = client.publication;
         expect(publication?.daemonVer).toBe("fake-peer/0.0.1");
         expect(typeof publication?.pid).toBe("number");
@@ -2275,7 +2302,13 @@ describe("strict catalog parsing (U3 scenario 10)", () => {
         op: "catalog.list",
         generation: 1,
         modules: [validEntry],
-        subc_ops: ["route.open", "catalog.list", "host.shutdown", "transport.negotiate"],
+        subc_ops: [
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "host.status",
+            "transport.negotiate",
+        ],
     };
 
     test("rejects every malformed catalog shape without casting", async () => {
@@ -2329,6 +2362,7 @@ describe("strict catalog parsing (U3 scenario 10)", () => {
             "route.open",
             "catalog.list",
             "host.shutdown",
+            "host.status",
             "transport.negotiate",
         ]);
         expect(snapshot.modules).toEqual([validEntry]);
@@ -2365,5 +2399,55 @@ describe("host.shutdown (U3 scenario 11)", () => {
         await client.closeAsync();
         const shutdownFrames = conn.frames.filter((f) => isControlOp(f, "host.shutdown"));
         expect(shutdownFrames).toEqual([]);
+    });
+});
+
+describe("host.status readiness", () => {
+    test("hostStatus reads one authenticated route-free component snapshot", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const statusPromise = client.hostStatus();
+        const frame = await cursor.next((f) => isControlOp(f, "host.status"));
+        expect(frame.body.toString("utf8")).toBe('{"op":"host.status"}');
+        await sendResponse(conn, frame.corr, {
+            op: "host.status",
+            health: "degraded",
+            metrics: {
+                components: {
+                    "magic-context": {
+                        status: "degraded",
+                        metrics: { storage_state: "starting" },
+                    },
+                },
+            },
+        });
+        await expect(statusPromise).resolves.toMatchObject({
+            health: "degraded",
+            metrics: {
+                components: {
+                    "magic-context": {
+                        metrics: { storage_state: "starting" },
+                    },
+                },
+            },
+        });
+    });
+
+    test("hostStatus rejects unknown fields and health states", async () => {
+        for (const body of [
+            { op: "host.status", health: "unknown", metrics: {} },
+            { op: "host.status", health: "ok", metrics: {}, extra: true },
+        ]) {
+            const { client, conn } = await connected();
+            const cursor = frameCursor(conn);
+            const statusPromise = client.hostStatus();
+            const frame = await cursor.next((f) => isControlOp(f, "host.status"));
+            await sendResponse(conn, frame.corr, body);
+            expectCallError(
+                await rejection(statusPromise),
+                "terminal",
+                "malformed_control_response",
+            );
+        }
     });
 });

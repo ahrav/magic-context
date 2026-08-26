@@ -53,9 +53,11 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { configureSynapseManagedDemandStart } from "@magic-context/core/features/magic-context/memory/embedding-synapse";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { createLazyManagedDemandStart } from "@magic-context/core/hooks/magic-context/module-transport";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
@@ -64,10 +66,15 @@ import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerMagicContextTools } from "./tools";
 
 const SUBAGENT_DREAMER_ACTIONS_FLAG = "magic-context-dreamer-actions";
+const managedDemandStart = createLazyManagedDemandStart({
+	declaringModuleUrl: import.meta.url,
+	parentPackageName: "@cortexkit/pi-magic-context",
+});
 
 let openedDb: ContextDatabase | undefined;
 
 export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
+	configureSynapseManagedDemandStart(managedDemandStart);
 	// Mark this Pi process as a Magic Context subagent in the shared
 	// harness state. session-scoped writes from any code path that
 	// reaches the shared core will tag rows with harness='pi' the same

@@ -1,7 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
 import { isMcHostCallError, McHostClient } from "../../../shared/mc-host-client";
+import {
+    type ConnectionOrigin,
+    resolveConnectionOrigin,
+    type StorageReadiness,
+} from "../../../shared/mc-host-lifecycle";
 import {
     createSynapseLedgerPage,
     findSynapseLedgerPage,
@@ -93,7 +100,8 @@ export interface SynapseClientLike {
 }
 
 export interface SynapseEmbeddingProviderOptions {
-    connectionFile: string;
+    connectionFile?: string;
+    connectionOrigin?: ConnectionOrigin;
     projectRoot: string;
     session: string;
     model?: string;
@@ -109,6 +117,46 @@ export interface SynapseEmbeddingProviderOptions {
     queryTimeoutMs?: number;
     batchTimeoutMs?: number;
     clientFactory?: () => Promise<SynapseClientLike>;
+    demandStart?: SynapseDemandStart;
+    onLaneReady?: (metadata: SynapseLaneMetadata) => void;
+}
+
+export type SynapseDemandStart = (request: {
+    origin: ConnectionOrigin;
+    capability: "synapse";
+    signal?: AbortSignal;
+    deadlineMs?: number;
+}) => Promise<{ ok: boolean; reason: string; storage: StorageReadiness | null }>;
+
+let configuredManagedDemandStart: SynapseDemandStart | undefined;
+
+export function configureSynapseManagedDemandStart(
+    demandStart: SynapseDemandStart | undefined,
+): void {
+    configuredManagedDemandStart = demandStart;
+}
+
+function defaultConnectionFile(): string {
+    return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+}
+
+async function raceSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) {
+        throw signal.reason ?? new Error("Synapse initialization aborted");
+    }
+    let onAbort: (() => void) | undefined;
+    try {
+        return await Promise.race([
+            operation,
+            new Promise<never>((_resolve, reject) => {
+                onAbort = () =>
+                    reject(signal.reason ?? new Error("Synapse initialization aborted"));
+                signal.addEventListener("abort", onAbort, { once: true });
+            }),
+        ]);
+    } finally {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
 }
 
 export class SynapseEmbeddingError extends Error {
@@ -459,10 +507,9 @@ async function getSharedClient(
         }
         return promise;
     }
-    if (sharedClient && sharedClientFile === options.connectionFile) return sharedClient;
-    if (sharedClientPromise && sharedClientFile === options.connectionFile)
-        return sharedClientPromise;
-    const file = options.connectionFile;
+    const file = options.connectionFile ?? defaultConnectionFile();
+    if (sharedClient && sharedClientFile === file) return sharedClient;
+    if (sharedClientPromise && sharedClientFile === file) return sharedClientPromise;
     const promise = McHostClient.connect({
         connectionFile: file,
         handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
@@ -502,15 +549,23 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     readonly pageTimeoutMs: number;
 
     private readonly options: SynapseEmbeddingProviderOptions;
+    private readonly connectionOrigin: ConnectionOrigin;
+    private readonly demandStart: SynapseDemandStart | undefined;
     private client: SynapseClientLike | null = null;
     private initialized = false;
     private initializing: Promise<boolean> | null = null;
+    private managedDemand: Promise<{ ok: boolean; reason: string }> | null = null;
     private permanentFailure = false;
     private batchLimit = 16;
     private tokenBudget: number | null = null;
 
     constructor(options: SynapseEmbeddingProviderOptions) {
         this.options = options;
+        this.connectionOrigin = options.clientFactory
+            ? "injected"
+            : (options.connectionOrigin ??
+              resolveConnectionOrigin({ connectionFile: options.connectionFile }));
+        this.demandStart = options.demandStart ?? configuredManagedDemandStart;
         this.pageTimeoutMs = options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
         const model = options.model || SYNAPSE_DEFAULT_MODEL;
         const fingerprint = options.fingerprint ?? "";
@@ -591,9 +646,44 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         return provider.metadata;
     }
 
-    async initialize(): Promise<boolean> {
+    async initialize(signal?: AbortSignal): Promise<boolean> {
         if (this.initialized) return true;
         if (this.permanentFailure) return false;
+        if (this.connectionOrigin === "managed-default") {
+            try {
+                if (!this.demandStart) {
+                    throw Object.assign(
+                        new Error("managed mc-host lifecycle owner is unavailable"),
+                        { code: "MC_HOST_LIFECYCLE_OWNER_MISSING" },
+                    );
+                }
+                let demand = this.managedDemand;
+                if (!demand) {
+                    demand = this.demandStart({
+                        origin: this.connectionOrigin,
+                        capability: "synapse",
+                        deadlineMs: this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS,
+                    });
+                    this.managedDemand = demand;
+                    const evict = (): void => {
+                        if (this.managedDemand === demand) this.managedDemand = null;
+                    };
+                    void demand.then(evict, evict);
+                }
+                const outcome = signal ? await raceSignal(demand, signal) : await demand;
+                if (!outcome.ok) {
+                    throw new SynapseEmbeddingError(
+                        "transport",
+                        `managed Synapse demand failed: ${outcome.reason}`,
+                    );
+                }
+            } catch (error) {
+                log(
+                    `[magic-context] Synapse lane unavailable: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                return false;
+            }
+        }
         if (this.initializing) return this.initializing;
         this.initializing = (async () => {
             try {
@@ -653,6 +743,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     this.maxInputTokens = metadata.max_input_tokens ?? this.maxInputTokens;
                     this.maxInputBytes = metadata.max_input_bytes ?? this.maxInputBytes;
                 }
+                if (this.metadata) this.options.onLaneReady?.(this.metadata);
                 this.initialized = true;
                 return true;
             } catch (error) {
@@ -671,11 +762,19 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 this.initializing = null;
             }
         })();
-        return this.initializing;
+        const initialization = this.initializing;
+        if (!signal) return initialization;
+        try {
+            return await raceSignal(initialization, signal);
+        } catch {
+            // Detach only. The shared initialization remains owned by the
+            // provider and can complete for another waiter.
+            return false;
+        }
     }
 
     async embed(text: string, signal?: AbortSignal): Promise<Float32Array | null> {
-        if (!(await this.initialize()) || signal?.aborted || !this.metadata) return null;
+        if (!(await this.initialize(signal)) || signal?.aborted || !this.metadata) return null;
         try {
             // retryEmbeddings=true permits a retry after an ambiguous send
             // even though embed.query carries no request_key: the operation
@@ -723,7 +822,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         signal?: AbortSignal,
     ): Promise<Map<string, Float32Array>> {
         const output = new Map<string, Float32Array>();
-        if (items.length === 0 || !(await this.initialize()) || !this.metadata || signal?.aborted) {
+        if (
+            items.length === 0 ||
+            !(await this.initialize(signal)) ||
+            !this.metadata ||
+            signal?.aborted
+        ) {
             return output;
         }
         for (let start = 0; start < items.length; ) {

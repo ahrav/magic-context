@@ -7,6 +7,7 @@
  * lifecycle reason.
  */
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
     closeSync,
@@ -96,7 +97,20 @@ export const defaultPlatformReaders: PlatformReaders = {
     kernelRelease: () => os.release(),
     glibcVersion: detectGlibcVersion,
     procSelfFdUsable: detectProcSelfFd,
-    macosProductVersion: () => null,
+    macosProductVersion: () => {
+        if (process.platform !== "darwin") return null;
+        try {
+            const value = execFileSync("/usr/bin/sw_vers", ["-productVersion"], {
+                encoding: "utf8",
+                timeout: 1_000,
+                maxBuffer: 1_024,
+                stdio: ["ignore", "pipe", "ignore"],
+            }).trim();
+            return /^\d+\.\d+(?:\.\d+)?$/.test(value) ? value : null;
+        } catch {
+            return null;
+        }
+    },
 };
 
 function parseVersionPair(value: string): [number, number] | null {
@@ -170,21 +184,21 @@ export function checkPlatform(readers: PlatformReaders = defaultPlatformReaders)
 }
 
 // ---------------------------------------------------------------------------
-// Parent-owned payload trust index (KTD7/KTD18; real values arrive with U6).
+// Parent-owned payload trust index (KTD7/KTD18).
 // ---------------------------------------------------------------------------
 
 export interface TrustIndexEntry {
     package: string;
     version: string;
     target: string;
-    payload_manifest_digest: string;
-    launcher_digest: string;
-    launcher_rel_path: string;
+    qualified: boolean;
+    payload_manifest_digest: string | null;
+    bootstrap_launcher_digest: string | null;
 }
 
 export interface TrustIndex {
     schema: "magic-context.mc-host-payload-index/v1";
-    release_version: string;
+    release: { id: string; version: string };
     entries: TrustIndexEntry[];
 }
 
@@ -209,16 +223,29 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
     } catch {
         throw new BootstrapError("native_payload_invalid", "trust index is not valid JSON");
     }
+    return parseTrustIndex(parsed);
+}
+
+export function parseTrustIndex(parsed: unknown): TrustIndex {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         throw new BootstrapError("native_payload_invalid", "trust index is not an object");
     }
     const record = parsed as Record<string, unknown>;
     if (
         record.schema !== "magic-context.mc-host-payload-index/v1" ||
-        record.release_version !== releaseContract.release.version ||
         !Array.isArray(record.entries)
     ) {
         throw new BootstrapError("native_payload_invalid", "trust index shape or release mismatch");
+    }
+    const release =
+        typeof record.release === "object" && record.release !== null
+            ? (record.release as Record<string, unknown>)
+            : null;
+    if (
+        release?.id !== releaseContract.release.id ||
+        release.version !== releaseContract.release.version
+    ) {
+        throw new BootstrapError("native_payload_invalid", "trust index release mismatch");
     }
     const entries: TrustIndexEntry[] = record.entries.map((raw) => {
         if (typeof raw !== "object" || raw === null) {
@@ -238,26 +265,48 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
             }
             return value;
         };
-        const payloadDigest = requireString("payload_manifest_digest");
-        const launcherDigest = requireString("launcher_digest");
-        if (!SHA256_HEX.test(payloadDigest) || !SHA256_HEX.test(launcherDigest)) {
+        const qualified = entry.qualified;
+        if (typeof qualified !== "boolean") {
             throw new BootstrapError(
                 "native_payload_invalid",
-                "trust index digest is noncanonical",
+                "trust index qualification is invalid",
+            );
+        }
+        const payloadDigest = entry.payload_manifest_digest;
+        const launcherDigest = entry.bootstrap_launcher_digest;
+        if (
+            qualified &&
+            (typeof payloadDigest !== "string" ||
+                !SHA256_HEX.test(payloadDigest) ||
+                typeof launcherDigest !== "string" ||
+                !SHA256_HEX.test(launcherDigest))
+        ) {
+            throw new BootstrapError(
+                "native_payload_invalid",
+                "qualified trust-index digest is noncanonical",
+            );
+        }
+        if (!qualified && (payloadDigest !== null || launcherDigest !== null)) {
+            throw new BootstrapError(
+                "native_payload_invalid",
+                "unqualified trust-index entry carries a digest",
             );
         }
         return {
             package: requireString("package"),
             version: requireString("version"),
             target: requireString("target"),
-            payload_manifest_digest: payloadDigest,
-            launcher_digest: launcherDigest,
-            launcher_rel_path: requireString("launcher_rel_path"),
+            qualified,
+            payload_manifest_digest: payloadDigest as string | null,
+            bootstrap_launcher_digest: launcherDigest as string | null,
         };
     });
     return {
         schema: "magic-context.mc-host-payload-index/v1",
-        release_version: record.release_version as string,
+        release: {
+            id: release.id as string,
+            version: release.version as string,
+        },
         entries,
     };
 }

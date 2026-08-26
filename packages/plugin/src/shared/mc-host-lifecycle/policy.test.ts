@@ -32,6 +32,36 @@ function startResultJson(command: string): string {
     });
 }
 
+function missingPayloadResultJson(): string {
+    return JSON.stringify({
+        schema: "magic-context.daemon/v1",
+        command: "start",
+        ok: false,
+        state: "stopped",
+        reason: "native_payload_missing",
+        remediation: "install_native_payload",
+        effects: null,
+        readiness: null,
+        checks: [],
+        versions: {
+            release: "0.38.0",
+            proof: null,
+            daemon: null,
+            magic_context: null,
+            synapse: null,
+            broca: null,
+        },
+    });
+}
+
+function restartResultJson(): string {
+    return JSON.stringify({
+        ...JSON.parse(startResultJson("restart")),
+        reason: "started",
+        effects: { stop_committed: true, start_committed: true },
+    });
+}
+
 /** A fake ck-mc-host recording each invocation and emitting one result. */
 function fakeBinary(
     dir: string,
@@ -173,6 +203,41 @@ describe("observational commands without a trusted bootstrap (U3 scenario 21)", 
 });
 
 describe("native invocation mapping", () => {
+    test("native current validation precedes one deferred certified package lookup", async () => {
+        const root = tempDir("mc-policy-fallback-");
+        const invocationLog = path.join(root, "fallback-invocations.log");
+        const binary = path.join(root, "fallback-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$*" >> ${invocationLog}\n` +
+                `if [ "$2" != "--payload-dir" ]; then echo '${missingPayloadResultJson()}'; exit 1; fi\n` +
+                `echo '${startResultJson("start")}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        let lookups = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                payloadDirFallback: () => {
+                    lookups += 1;
+                    return "/qualified/package";
+                },
+            });
+
+            const result = await policy.start();
+
+            expect(result.reason).toBe("started");
+            expect(lookups).toBe(1);
+            expect(readFileSync(invocationLog, "utf8").trim().split("\n")).toEqual([
+                "start",
+                "start --payload-dir /qualified/package",
+            ]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("status and doctor route through the native probe of the trusted target", async () => {
         const root = tempDir("mc-policy-native-");
         const { binary, invocationLog } = fakeBinary(root);
@@ -187,6 +252,73 @@ describe("native invocation mapping", () => {
             const doctor = await policy.doctor();
             expect(doctor.command).toBe("doctor");
             expect(invocations(invocationLog)).toEqual(["probe", "probe"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("status and doctor derive health from authenticated component readiness", async () => {
+        const root = tempDir("mc-policy-readiness-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => ({
+                    authenticatedDaemonVersion: "mc-host/0.1.0",
+                    readiness: {
+                        transport: { state: "ready", reason: "healthy" },
+                        storage: { state: "unavailable", reason: "storage_unavailable" },
+                        synapse: { state: "degraded", reason: "synapse_degraded" },
+                    },
+                }),
+            });
+
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(false);
+                expect(result.reason).toBe("storage_unavailable");
+                expect(result.readiness?.storage?.state).toBe("unavailable");
+                expect(result.readiness?.synapse?.state).toBe("degraded");
+                expect(result.versions.daemon).toBe("mc-host/0.1.0");
+                expect(result.checks.map((check) => [check.id, check.status])).toEqual([
+                    ["readiness.storage", "fail"],
+                    ["readiness.synapse", "fail"],
+                    ["readiness.transport", "pass"],
+                ]);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("restart resolves the certified payload before one native transaction", async () => {
+        const root = tempDir("mc-policy-restart-payload-");
+        const invocationLog = path.join(root, "restart-invocations.log");
+        const binary = path.join(root, "restart-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$*" >> ${invocationLog}\necho '${restartResultJson()}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        let lookups = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                payloadDirFallback: () => {
+                    lookups += 1;
+                    return "/qualified/package";
+                },
+            });
+            const result = await policy.restart();
+            expect(result.effects).toEqual({
+                stop_committed: true,
+                start_committed: true,
+            });
+            expect(lookups).toBe(1);
+            expect(readFileSync(invocationLog, "utf8").trim()).toBe(
+                "restart --payload-dir /qualified/package",
+            );
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -291,6 +423,34 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
             rmSync(root, { recursive: true, force: true });
         }
     }, 20_000);
+
+    test("the caller deadline and abort signal also bound storage readiness", async () => {
+        const root = tempDir("mc-policy-storage-deadline-");
+        const { binary } = fakeBinary(root);
+        const budgets: number[] = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                storageProbe: async (budgetMs) => {
+                    budgets.push(budgetMs);
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                    return "ready";
+                },
+            });
+            await expect(
+                policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs: 20,
+                }),
+            ).rejects.toMatchObject({ cause_kind: "deadline" });
+            expect(budgets).toHaveLength(1);
+            expect(budgets[0]).toBeLessThanOrEqual(20);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
 
     test("settled shared promises are evicted: a later demand starts again", async () => {
         const root = tempDir("mc-policy-evict-");

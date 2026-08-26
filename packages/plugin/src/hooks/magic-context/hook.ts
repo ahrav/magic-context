@@ -185,6 +185,7 @@ export interface MagicContextDeps {
             min_chars: number;
         };
         transform_mode?: ResolvedTransformMode;
+        subc?: { connection_file: string };
         /** Compaction-off mode gate (issue #266). Resolved ONCE here at the
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
@@ -744,7 +745,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
         (() => {
-            const transport = new McHostModuleTransport();
+            const transport = new McHostModuleTransport(deps.config.subc?.connection_file);
             const client: RustModeModuleClient = {
                 call: (args) => transport.call(args),
                 stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
@@ -946,7 +947,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // than the plugin's launch directory (a /cd switch, multi-project hosts).
     // Registration is therefore an idempotent ensure invoked for every project
     // that reaches rust-mode preparation, not a one-shot at construction.
-    const evaluatorTransport = rustModeModuleClient ? new McHostModuleTransport() : undefined;
+    const evaluatorTransport = rustModeModuleClient
+        ? new McHostModuleTransport(deps.config.subc?.connection_file)
+        : undefined;
     // Bridge keys this hook instance registered. Instance disposal must tear
     // down only these: the registry is process-global and Desktop hosts several
     // plugin instances in one process.

@@ -188,6 +188,30 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
     if (typeof reason !== "string" || !isDaemonReason(reason)) {
         fail(`readiness.${component}.reason is outside the closed reason union`);
     }
+    const allowed = {
+        transport: {
+            ready: ["healthy"],
+            starting: ["starting", "lifecycle_busy"],
+            unavailable: ["startup_timeout", "publication_missing", "authentication_failed"],
+        },
+        storage: {
+            ready: ["healthy"],
+            starting: ["storage_starting", "starting"],
+            unavailable: ["storage_unavailable"],
+        },
+        synapse: {
+            ready: ["healthy"],
+            starting: ["synapse_starting", "starting"],
+            degraded: ["synapse_degraded"],
+            unsupported: ["synapse_unsupported"],
+        },
+    } as const;
+    const componentAllowed = allowed[component as keyof typeof allowed] as
+        | Record<string, readonly string[]>
+        | undefined;
+    if (!componentAllowed?.[state]?.includes(reason)) {
+        fail(`readiness.${component} state contradicts its reason`);
+    }
     return { state, reason };
 }
 
@@ -246,6 +270,35 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     ) {
         fail("remediation is outside the closed union");
     }
+    const expectedOk = NON_FAILING_REASONS.has(reason);
+    if (record.ok !== expectedOk) {
+        fail("ok contradicts the selected reason");
+    }
+    const expectedRemediation = remediationForReason(reason);
+    const remediationMatches =
+        reason === "harness_unavailable"
+            ? remediation === null || remediation === "restart_with_supported_harness"
+            : remediation === expectedRemediation;
+    if (!remediationMatches) {
+        fail("remediation contradicts the selected reason");
+    }
+    const fixedReasonStates: Partial<Record<DaemonReason, DaemonState>> = {
+        healthy: "running",
+        started: "running",
+        already_running: "running",
+        stopped: "stopped",
+        already_stopped: "stopped",
+        not_running: "stopped",
+        no_data_dir: "unavailable",
+        starting: "starting",
+        stopping: "stopping",
+        wedged: "wedged",
+        shutdown_timeout: "stopping",
+    };
+    const expectedState = fixedReasonStates[reason];
+    if (expectedState !== undefined && state !== expectedState) {
+        fail("state contradicts the selected reason");
+    }
     let effects: RestartEffects | null = null;
     if (record.effects !== null) {
         if (command !== "restart") fail("effects are restart-only");
@@ -261,6 +314,15 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
             stop_committed: rawEffects.stop_committed,
             start_committed: rawEffects.start_committed,
         };
+    }
+    if (command === "restart" && effects === null) {
+        fail("restart requires effects");
+    }
+    if (
+        effects?.start_committed === true &&
+        (!record.ok || state !== "running" || reason !== "started")
+    ) {
+        fail("start_committed contradicts the restart outcome");
     }
     let readiness: DaemonReadiness | null = null;
     if (record.readiness !== null) {
@@ -298,6 +360,23 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         ) {
             fail("check remediation is outside the closed union");
         }
+        const checkReasonIsSuccess = NON_FAILING_REASONS.has(checkReason);
+        if (
+            (status === "pass" && !checkReasonIsSuccess) ||
+            (status === "fail" && checkReasonIsSuccess) ||
+            (status === "skip" &&
+                checkReason !== "healthy" &&
+                checkReason !== "synapse_unsupported")
+        ) {
+            fail("check status contradicts its reason");
+        }
+        const expectedCheckRemediation = remediationForReason(checkReason);
+        if (
+            checkReason !== "harness_unavailable" &&
+            checkRemediation !== expectedCheckRemediation
+        ) {
+            fail("check remediation contradicts its reason");
+        }
         return {
             id: id as CheckId,
             status: status as CheckStatus,
@@ -309,6 +388,9 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         const prev = checks[i - 1] as DaemonCheck;
         const current = checks[i] as DaemonCheck;
         if (prev.id >= current.id) fail("checks are not lexicographically sorted unique ids");
+    }
+    if (record.ok && checks.some((check) => check.status === "fail")) {
+        fail("successful result contains a failed check");
     }
     const rawVersions = requireObject(record.versions, "versions");
     requireExactKeys(

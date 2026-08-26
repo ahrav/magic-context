@@ -94,6 +94,46 @@ afterEach(() => {
 });
 
 describe("SynapseEmbeddingProvider", () => {
+    it("keeps injected factory providers lifecycle-neutral", async () => {
+        const client = new MockSynapseClient();
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "injected-synapse",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: true, reason: "started", storage: null };
+            },
+            clientFactory: async () => client,
+            connectionOrigin: "managed-default",
+        });
+
+        expect(demands).toBe(0);
+        await provider.initialize();
+        await provider.initialize();
+        expect(demands).toBe(0);
+    });
+
+    it("demands before a managed real connection and coalesces initialization", async () => {
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-synapse",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: false, reason: "startup_timeout", storage: null };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(demands).toBe(0);
+        await expect(Promise.all([provider.initialize(), provider.initialize()])).resolves.toEqual([
+            false,
+            false,
+        ]);
+        expect(demands).toBe(1);
+    });
+
     it("discovers a certified model and sends the required artifact constraints", async () => {
         const client = new MockSynapseClient();
         const provider = new SynapseEmbeddingProvider({

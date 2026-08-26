@@ -25,6 +25,18 @@ import {
 /** The fixed collision-free child descriptor for the retained launcher. */
 export const LAUNCHER_CHILD_FD = 3;
 
+export function retainedExecutablePath(
+    platform: NodeJS.Platform,
+    fd: number = LAUNCHER_CHILD_FD,
+): string {
+    if (platform === "linux") return `/proc/self/fd/${fd}`;
+    if (platform === "darwin") return `/dev/fd/${fd}`;
+    throw new NativeLaunchError(
+        "spawn_failed",
+        "retained descriptor execution is unsupported on this platform",
+    );
+}
+
 export type NativeLaunchTarget =
     | { kind: "retained-fd"; fd: number }
     | { kind: "test-binary"; path: string };
@@ -54,12 +66,26 @@ export interface NativeLaunchOptions {
     command: NativeLifecycleCommand;
     /** Dev/test staging source forwarded as `--payload-dir`. */
     payloadDir?: string;
+    /** Parent-trusted canonical manifest digest for a production payload directory. */
+    payloadManifestDigest?: string;
     /** JSON-serializable startup envelope written to stdin, or null. */
     envelope?: unknown;
     /** Absolute wall-clock budget; the child is killed at expiry. */
     deadlineMs: number;
     /** Explicit environment for the child; defaults to a minimal set. */
     env?: Record<string, string>;
+}
+
+export interface NativeHarnessCandidate {
+    manifest_sha256: string;
+    source_roots: Record<string, string>;
+}
+
+export interface NativeStartupEnvelope {
+    schema: 1;
+    opencode?: NativeHarnessCandidate;
+    pi?: NativeHarnessCandidate;
+    credentials?: Record<string, string>;
 }
 
 const MAX_STDOUT_BYTES = 256 * 1024;
@@ -145,13 +171,16 @@ export async function runNativeLifecycle(
     if (options.payloadDir !== undefined) {
         args.push("--payload-dir", options.payloadDir);
     }
+    if (options.payloadManifestDigest !== undefined) {
+        args.push("--payload-manifest-digest", options.payloadManifestDigest);
+    }
     const env = options.env ?? {};
     let child: ChildProcess;
     const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "pipe"];
     let executable: string;
     if (target.kind === "retained-fd") {
         stdio[LAUNCHER_CHILD_FD] = target.fd;
-        executable = `/proc/self/fd/${LAUNCHER_CHILD_FD}`;
+        executable = retainedExecutablePath(process.platform);
     } else {
         executable = target.path;
     }

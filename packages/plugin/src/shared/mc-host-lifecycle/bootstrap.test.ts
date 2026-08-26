@@ -287,15 +287,15 @@ describe("payload trust index", () => {
     const digest = "a".repeat(64);
     const validIndex = {
         schema: "magic-context.mc-host-payload-index/v1",
-        release_version: "0.38.0",
+        release: { id: "mc-host-release", version: "0.38.0" },
         entries: [
             {
                 package: "@cortexkit/mc-host-linux-x64-gnu",
                 version: "0.38.0",
                 target: "linux-x64-gnu",
+                qualified: true,
                 payload_manifest_digest: digest,
-                launcher_digest: digest,
-                launcher_rel_path: "bin/ck-mc-host",
+                bootstrap_launcher_digest: digest,
             },
         ],
     };
@@ -311,7 +311,7 @@ describe("payload trust index", () => {
             writeFileSync(indexPath, JSON.stringify(validIndex));
             const index = loadTrustIndex(indexPath);
             expect(index?.entries.length).toBe(1);
-            expect(index?.entries[0]?.launcher_digest).toBe(digest);
+            expect(index?.entries[0]?.bootstrap_launcher_digest).toBe(digest);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -322,10 +322,18 @@ describe("payload trust index", () => {
         try {
             const cases = [
                 { ...validIndex, schema: "other/v1" },
-                { ...validIndex, release_version: "0.37.0" },
                 {
                     ...validIndex,
-                    entries: [{ ...validIndex.entries[0], launcher_digest: "ZZ" }],
+                    release: { id: "mc-host-release", version: "0.37.0" },
+                },
+                {
+                    ...validIndex,
+                    entries: [
+                        {
+                            ...validIndex.entries[0],
+                            bootstrap_launcher_digest: "ZZ",
+                        },
+                    ],
                 },
                 "not-json{",
             ];
