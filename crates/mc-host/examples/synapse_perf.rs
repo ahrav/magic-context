@@ -26,18 +26,26 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 const ROOT: &str = "/workspace/synapse-perf";
 const DRAIN_BUDGET: Duration = Duration::from_secs(10);
-const MAX_RESPONSE_BYTES: u32 = 1 << 20;
+/// Lane fingerprint every request pins; responses must echo it exactly.
+const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// Text every measured request embeds; the response must carry its digest
+/// as `content_sha256`.
+const QUERY_TEXT: &str = "model-free benchmark query";
 
 #[derive(Clone, Copy)]
 struct Opts {
     rate: u64,
     seconds: u64,
+    /// Exact nanosecond arrival interval derived from `rate` during option
+    /// validation, so scheduling reuses the already-validated value.
+    interval_ns: u64,
 }
 
 fn parse_opts() -> Result<Opts, String> {
     let mut opts = Opts {
         rate: 100,
         seconds: 5,
+        interval_ns: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -55,7 +63,7 @@ fn parse_opts() -> Result<Opts, String> {
     if opts.seconds == 0 {
         return Err("seconds must be nonzero".to_owned());
     }
-    perf_measurement::open_loop_interval_ns(opts.rate)?;
+    opts.interval_ns = perf_measurement::open_loop_interval_ns(opts.rate)?;
     opts.rate
         .checked_mul(opts.seconds)
         .filter(|count| *count > 0)
@@ -77,7 +85,7 @@ impl EmbeddingEngine for ZeroDelayEngine {
 fn lane() -> LaneInfo {
     LaneInfo {
         model: "synapse-perf-zero-delay".to_owned(),
-        fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        fingerprint: FINGERPRINT.to_owned(),
         table_epoch: 1,
         dims: 8,
         max_tokens: 512,
@@ -186,7 +194,7 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<raw_client::
         .await
         .map_err(|error| format!("frame header: {error}"))?;
     let mut frame = raw_client::decode_header(&header);
-    if frame.len > MAX_RESPONSE_BYTES {
+    if frame.len > perf_measurement::MAX_BODY_LEN {
         return Err(format!("response body {} exceeds cap", frame.len));
     }
     frame.body.resize(frame.len as usize, 0);
@@ -255,7 +263,7 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         "method": "embed.query",
         "params": {
             "model": "synapse-perf-zero-delay",
-            "required_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "required_fingerprint": FINGERPRINT,
             "required_epoch": 1,
             "allow_equivalent": false,
             "accept_declared": false,
@@ -287,7 +295,7 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         .map_err(|error| format!("set TCP_NODELAY: {error}"))?;
     let (mut reader, mut writer) = stream.into_split();
 
-    let interval_ns = perf_measurement::open_loop_interval_ns(opts.rate)?;
+    let interval_ns = opts.interval_ns;
     let offered = opts
         .rate
         .checked_mul(opts.seconds)
@@ -305,15 +313,15 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
         "method": "embed.query",
         "params": {
             "model": "synapse-perf-zero-delay",
-            "required_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "required_fingerprint": FINGERPRINT,
             "required_epoch": 1,
             "allow_equivalent": false,
             "accept_declared": false,
-            "text": "model-free benchmark query"
+            "text": QUERY_TEXT
         }
     }))
     .map_err(|error| format!("serialize request: {error}"))?;
-    let sender = tokio::spawn(async move {
+    let mut sender = tokio::spawn(async move {
         for slot in 0..offered {
             let scheduled = start + Duration::from_nanos(slot * interval_ns);
             tokio::time::sleep_until(scheduled.into()).await;
@@ -336,28 +344,50 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
     });
 
     let drain_deadline = start + Duration::from_secs(opts.seconds) + DRAIN_BUDGET;
+    let expected_sha256 = perf_measurement::sha256_hex(QUERY_TEXT.as_bytes());
     let mut completed = 0u64;
     let mut rejected = 0u64;
     let mut timed_out = 0u64;
+    let mut unresolved = 0u64;
     let mut latencies_ns = Vec::with_capacity(offered as usize);
     while !pending.is_empty() {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            timed_out += pending.len() as u64;
-            pending.clear();
+            unresolved = pending.len() as u64;
             break;
         }
         let frame = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
             Ok(frame) => frame?,
             Err(_) => {
-                timed_out += pending.len() as u64;
-                pending.clear();
+                unresolved = pending.len() as u64;
                 break;
             }
         };
-        if matches!(frame.ty, raw_client::TY_PING | raw_client::TY_PUSH) {
+        // Completion is the arrival of the terminal's last byte. Capturing
+        // the timestamp before JSON parsing keeps client-side validation
+        // cost — and the serial parser backlog it creates under bursts —
+        // out of the reported scheduled-to-completion latency.
+        let received = Instant::now();
+        if matches!(
+            frame.ty,
+            raw_client::TY_PING | raw_client::TY_PUSH | raw_client::TY_GOODBYE
+        ) {
             if let Some(violation) = raw_client::connection_frame_violation(&frame) {
                 return Err(violation);
+            }
+            // A goodbye addressed to this route (or the whole connection)
+            // is the host tearing down while requests are outstanding:
+            // fail the run as connection loss instead of misreporting it
+            // as a route-identity violation. A goodbye for another route
+            // is skippable like ping and push.
+            if frame.ty == raw_client::TY_GOODBYE
+                && ((frame.channel, frame.epoch) == (channel, epoch)
+                    || (frame.channel == 0 && frame.epoch == 0))
+            {
+                return Err(format!(
+                    "host sent goodbye with {} requests unresolved",
+                    pending.len()
+                ));
             }
             continue;
         }
@@ -375,29 +405,88 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
             raw_client::TY_RESPONSE => {
                 let body: serde_json::Value = serde_json::from_slice(&frame.body)
                     .map_err(|error| format!("response JSON: {error}"))?;
-                if body["result"]["done"] != true {
+                // The full embed.query contract, not just `done`: a
+                // regression in any echoed lane field or in the vector
+                // payload must fail the run rather than publish latency
+                // numbers for incorrect work.
+                let result = &body["result"];
+                let vector_ok = result["vectors"][0]["vector"]
+                    .as_array()
+                    .is_some_and(|values| {
+                        values.len() == 8
+                            && values[0].as_f64() == Some(1.0)
+                            && values[1..].iter().all(|value| value.as_f64() == Some(0.0))
+                    });
+                if result["done"] != true
+                    || result["model"] != "synapse-perf-zero-delay"
+                    || result["fingerprint"] != FINGERPRINT
+                    || result["table_epoch"] != 1
+                    || result["dims"] != 8
+                    || result["vectors"].as_array().map(Vec::len) != Some(1)
+                    || result["vectors"][0]["id"] != "query"
+                    || result["vectors"][0]["content_sha256"].as_str()
+                        != Some(expected_sha256.as_str())
+                    || !vector_ok
+                {
                     return Err(format!("invalid embed.query response: {body}"));
                 }
                 completed += 1;
                 latencies_ns.push(
-                    u64::try_from(Instant::now().duration_since(scheduled).as_nanos())
+                    u64::try_from(received.duration_since(scheduled).as_nanos())
                         .unwrap_or(u64::MAX),
                 );
             }
             raw_client::TY_ERROR => {
-                let code = frame.error_code();
-                if code == "timeout" {
-                    timed_out += 1;
-                } else {
-                    rejected += 1;
+                // The error body is network input: a malformed one must
+                // fail the run gracefully (keeping the evidence trail),
+                // never panic the process.
+                let code = serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .ok()
+                    .and_then(|value| value["code"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unparsable".to_owned());
+                match code.as_str() {
+                    "timeout" => timed_out += 1,
+                    // Admission rejection is the one expected shedding
+                    // outcome; any other code is a functional failure, and
+                    // counting it as `rejected` would let a broken host
+                    // keep a publishable baseline.
+                    "queue_full" => rejected += 1,
+                    _ => {
+                        return Err(format!(
+                            "unexpected error terminal (code {code}): {}",
+                            String::from_utf8_lossy(&frame.body)
+                        ))
+                    }
                 }
             }
             other => return Err(format!("unexpected terminal frame type {other}")),
         }
     }
-    let _writer = sender
-        .await
-        .map_err(|error| format!("sender task: {error}"))??;
+    // The join is bounded: once the reader stops consuming, a sender parked
+    // in `write_all` against peer backpressure has nothing left to unblock
+    // it, and an unbounded await would keep an overload run alive
+    // indefinitely past the drain deadline.
+    let _writer = match tokio::time::timeout(DRAIN_BUDGET, &mut sender).await {
+        Ok(joined) => joined.map_err(|error| format!("sender task: {error}"))??,
+        Err(_) => {
+            sender.abort();
+            return Err(format!(
+                "sender still blocked {}s after the drain deadline with {} requests unresolved",
+                DRAIN_BUDGET.as_secs(),
+                pending.len()
+            ));
+        }
+    };
+    if unresolved != 0 {
+        // No host terminal arrived for these requests — the cause is a
+        // dropped response, a transport failure, or a request the lagging
+        // sender never wrote, never a host-reported timeout. Publishing a
+        // baseline from such a run would present broken accounting as exact.
+        return Err(format!(
+            "{unresolved} requests unresolved at the drain deadline: offered={offered} \
+             completed={completed} rejected={rejected} timed_out={timed_out}"
+        ));
+    }
 
     let in_flight = pending.len() as u64;
     if offered != completed + rejected + timed_out + in_flight || in_flight != 0 {
