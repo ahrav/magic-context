@@ -32,7 +32,8 @@ const MAX_OWNER_OUTPUT_BYTES = 1024 * 1024;
 
 interface OwnerResult {
     start: Awaited<ReturnType<typeof runNativeLifecycle>>;
-    restart?: Awaited<ReturnType<typeof runNativeLifecycle>>;
+    stop?: Awaited<ReturnType<typeof runNativeLifecycle>>;
+    demandStart?: Awaited<ReturnType<typeof runNativeLifecycle>>;
 }
 
 function required(name: string): string {
@@ -121,16 +122,25 @@ async function runOwner(mode: OwnerMode): Promise<void> {
                 env,
             },
         );
-        const restart = await runNativeLifecycle(
+        const stop = await runNativeLifecycle(
             { kind: "retained-fd", fd: retained.fd },
             {
-                command: "restart",
+                command: "stop",
+                deadlineMs: 60_000,
+                env,
+            },
+        );
+        assert.equal(stop.ok, true, JSON.stringify(stop));
+        const demandStart = await runNativeLifecycle(
+            { kind: "retained-fd", fd: retained.fd },
+            {
+                command: "start",
                 envelope: mergedEnvelope(opencodeEnvelope, piEnvelope),
                 deadlineMs: 60_000,
                 env,
             },
         );
-        console.log(JSON.stringify({ start, restart } satisfies OwnerResult));
+        console.log(JSON.stringify({ start, stop, demandStart } satisfies OwnerResult));
     } finally {
         closeSync(retained.fd);
     }
@@ -189,6 +199,11 @@ async function daemonIdentity(dataRoot: string): Promise<readonly number[]> {
 }
 
 async function verifyBrocaRoutes(dataRoot: string): Promise<void> {
+    const canonicalModel = required("MC_HOST_CANARY_BROCA_MODEL");
+    const separator = canonicalModel.indexOf("/");
+    assert.ok(separator > 0 && separator < canonicalModel.length - 1);
+    const provider = canonicalModel.slice(0, separator);
+    const model = canonicalModel.slice(separator + 1);
     const client = await McHostClient.connect({
         connectionFile: connectionFilePath(dataRoot),
         credentialSource: process.env,
@@ -206,6 +221,75 @@ async function verifyBrocaRoutes(dataRoot: string): Promise<void> {
             session: "cross-harness-pi",
         });
         assert.notEqual(opencode.channel, pi.channel);
+        for (const [harness, handle] of [
+            ["opencode", opencode],
+            ["pi", pi],
+        ] as const) {
+            const sent = (await client.request(
+                handle,
+                {
+                    method: "session.send",
+                    params: {
+                        prompt: "Reply with exactly OK.",
+                        model: { provider, model },
+                        tools: [],
+                        generation: {
+                            max_output_tokens: 16,
+                            temperature: 0,
+                        },
+                    },
+                },
+                { timeoutMs: 60_000 },
+            )) as { run_id?: unknown };
+            assert.equal(typeof sent.run_id, "string", `${harness} did not return a run id`);
+            const runId = sent.run_id as string;
+            const deadline = Date.now() + 60_000;
+            for (;;) {
+                const status = (await client.request(
+                    handle,
+                    {
+                        method: "run.status",
+                        params: { run_id: runId },
+                    },
+                    { timeoutMs: Math.max(1, deadline - Date.now()) },
+                )) as { state?: unknown };
+                if (status.state === "completed") break;
+                assert.ok(
+                    status.state === "queued" || status.state === "running",
+                    `${harness} terminated in state ${String(status.state)}`,
+                );
+                assert.ok(Date.now() < deadline, `${harness} did not complete before deadline`);
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            const replay = await client.requestStream(
+                handle,
+                {
+                    method: "session.subscribe",
+                    params: { from: "start" },
+                },
+                { timeoutMs: 60_000 },
+            );
+            assert.ok(
+                replay.some((item) => {
+                    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+                        return false;
+                    }
+                    const envelope = item as Record<string, unknown>;
+                    if (envelope.kind !== "control") return false;
+                    const unit = envelope.unit;
+                    if (unit === null || typeof unit !== "object" || Array.isArray(unit)) {
+                        return false;
+                    }
+                    const control = unit as Record<string, unknown>;
+                    return (
+                        control.type === "harness_dispatch" &&
+                        control.run_id === runId &&
+                        control.harness === harness
+                    );
+                }),
+                `${harness} replay did not prove concrete adapter dispatch`,
+            );
+        }
         await client.closeRoute(opencode);
         await client.closeRoute(pi);
     } finally {
@@ -271,17 +355,17 @@ async function main(): Promise<void> {
         assert.equal(second.start.ok, false, JSON.stringify(second.start));
         assert.equal(second.start.state, "running");
         assert.equal(second.start.reason, "harness_unavailable");
-        assert.ok(second.restart);
-        assert.equal(second.restart.ok, true, JSON.stringify(second.restart));
-        assert.equal(second.restart.reason, "started");
-        assert.deepEqual(second.restart.effects, {
-            stop_committed: true,
-            start_committed: true,
-        });
+        assert.ok(second.stop);
+        assert.equal(second.stop.ok, true, JSON.stringify(second.stop));
+        assert.equal(second.stop.reason, "stopped");
+        assert.ok(second.demandStart);
+        assert.equal(second.demandStart.ok, true, JSON.stringify(second.demandStart));
+        assert.equal(second.demandStart.reason, "started");
+        assert.equal(second.demandStart.effects, null);
         assert.notDeepEqual(
             await daemonIdentity(dataRoot),
             firstIdentity,
-            "explicit restart must rotate daemon identity",
+            "explicit stop plus later demand-start must rotate daemon identity",
         );
 
         const selectionText = readFileSync(
