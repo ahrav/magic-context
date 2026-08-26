@@ -399,11 +399,19 @@ Canonical error body:
 {"code":"unknown_module","message":"module magic-context-next is unavailable"}
 ```
 
+Errors may add an advisory retry delay:
+
+```json
+{"code":"queue_full","message":"query admission capacity is exhausted","retry_after_ms":50}
+```
+
+`retry_after_ms` is an optional unsigned integer. It tells the caller how long to wait before retrying; it is not a lease or an admission guarantee. Clients MUST accept error bodies without it and MUST ignore unknown error-body fields. A host omits it when no operation-specific delay applies.
+
 `Error` terminates only its matching correlation. It does not itself close a route or connection unless the error table below says so.
 
 ### 7.5 Synapse application protocol
 
-Routed requests on the `synapse/management_surface` route are UTF-8 JSON objects (`binary = 0`) of the shape `{"method": string, "params": object}`. Successful responses are JSON objects whose operation payload lives under a `result` object. Failures are transport `Error` terminals with the canonical `{code, message}` body. The service implements exactly four methods — `models.list`, `embed.query`, `embed.batch`, and `embed.result` — and MUST NOT add job-management, health, cancellation, or model-management methods. Legacy field aliases (`entries`, `items`, `results`, `embedding`, `complete`, `cursor` as a response field) are TypeScript read compatibility only; the Rust host MUST NOT emit them.
+Routed requests on the `synapse/management_surface` route are UTF-8 JSON objects (`binary = 0`) of the shape `{"method": string, "params": object}`. Successful responses are JSON objects whose operation payload lives under a `result` object. Failures are transport `Error` terminals with the canonical `{code, message,retry_after_ms?}` body. The service implements exactly four methods — `models.list`, `embed.query`, `embed.batch`, and `embed.result` — and MUST NOT add job-management, health, cancellation, or model-management methods. Legacy field aliases (`entries`, `items`, `results`, `embedding`, `complete`, `cursor` as a response field) are TypeScript read compatibility only; the Rust host MUST NOT emit them.
 
 #### 7.5.1 Validation, bounds, and error codes
 
@@ -411,7 +419,7 @@ Every request body is parsed strictly: duplicate object keys, non-object roots, 
 
 | Code | Meaning | Retry disposition |
 | --- | --- | --- |
-| `queue_full` | admission capacity (job count, aggregate queued request bytes, or query-lane slot) exhausted before admission, or the fail-fast resident-byte reservation for request parsing and input ownership could not be acquired; in every case no state was created | bounded client-side retry; the error body carries no `retry_after_ms` |
+| `queue_full` | admission capacity (job count, aggregate queued request bytes, or query-lane slot) exhausted before admission, or the fail-fast resident-byte reservation for request parsing and input ownership could not be acquired; in every case no state was created | bounded client-side retry; query-lane admission rejection carries the configured `query_retry_after_ms`, while other rejection sites omit the field |
 | `model_loading` | reserved; not emitted by the current host — initialization completes before publication, so loading faults surface as bind-time `artifact_invalid` | bounded retry |
 | `timeout` | request-scoped deadline expired host-side | caller policy |
 | `artifact_invalid` | bundle missing/invalid (bind rejection) or response identity guard failed | permanent; no retry |
@@ -425,7 +433,7 @@ Every request body is parsed strictly: duplicate object keys, non-object roots, 
 
 The host-generic `internal_error` (Section 7.4) additionally covers response construction or task failure on a routed synapse correlation, including a batch worker that exits without publishing: that is a host task failure, not a lane fault, so the lane keeps serving and the code stays retryable.
 
-Every capacity is finite and host-owned; request fields can never select capacities, models, or filesystem paths. Defaults: 1 concurrent CPU inference, 64 admitted jobs, 64 MiB aggregate queued request text, 64 retained completed jobs, 64 MiB retained vector bytes, 64 items and 8 MiB total text per batch, 1 MiB text per item or query, 16 vectors or 2 MiB encoded output per result page, 15-minute completed-job retention.
+Every capacity is finite and host-owned; request fields can never select capacities, models, or filesystem paths. Defaults: 1 concurrent CPU inference, 64 admitted jobs, 64 MiB aggregate queued request text, 64 retained completed jobs, 64 MiB retained vector bytes, 64 items and 8 MiB total text per batch, 1 MiB text per item or query, 16 vectors or 2 MiB encoded output per result page, 15-minute completed-job retention. Query-lane admission errors advise a 50 ms retry delay through `query_retry_after_ms`; this setting is independent of the 50 ms batch job and pending-result polling cadence.
 
 #### 7.5.2 `models.list`
 

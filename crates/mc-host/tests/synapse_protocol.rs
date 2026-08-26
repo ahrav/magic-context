@@ -90,10 +90,13 @@ async fn embed_query_returns_a_bound_vector() {
 async fn query_overload_preserves_tool_provider_capacity() {
     let engine = DeterministicEngine::new();
     engine.set_delay(std::time::Duration::from_secs(2));
-    let host = SynapseHost::start_with(
-        ready_component(engine.clone(), SynapseLimits::default()),
-        |config| config.limits.max_handler_tasks = 2,
-    )
+    let limits = SynapseLimits {
+        query_retry_after_ms: 73,
+        ..SynapseLimits::default()
+    };
+    let host = SynapseHost::start_with(ready_component(engine.clone(), limits), |config| {
+        config.limits.max_handler_tasks = 2
+    })
     .await;
     let lane = test_lane();
 
@@ -140,6 +143,7 @@ async fn query_overload_preserves_tool_provider_capacity() {
     .await
     .expect("query overload must reject promptly");
     assert_eq!(overloaded.error_code(), "queue_full");
+    assert_eq!(overloaded.json()["retry_after_ms"], 73);
     assert_eq!(
         engine.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,

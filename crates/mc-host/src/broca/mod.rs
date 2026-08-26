@@ -70,17 +70,11 @@ impl BrocaComponent {
 }
 
 fn request_error(error: RequestError) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: error.code.to_owned(),
-        message: error.message,
-    }
+    RequestOutcome::error(error.code, error.message)
 }
 
 fn app_error(code: &str, message: &str) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: code.to_owned(),
-        message: message.to_owned(),
-    }
+    RequestOutcome::error(code, message)
 }
 
 async fn respond(ctx: &RequestCtx, body: Vec<u8>) -> RequestOutcome {

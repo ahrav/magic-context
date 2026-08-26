@@ -115,10 +115,7 @@ impl CompositeComponent for EchoPrimary {
 
     async fn handle(&self, ctx: RequestCtx) -> RequestOutcome {
         let Ok(mut body) = ctx.reserve_output(ctx.body.len()).await else {
-            return RequestOutcome::Error {
-                code: "internal_error".to_owned(),
-                message: "reservation failed".to_owned(),
-            };
+            return RequestOutcome::error("internal_error", "reservation failed");
         };
         body.extend_from_slice(&ctx.body)
             .expect("reservation matches body");

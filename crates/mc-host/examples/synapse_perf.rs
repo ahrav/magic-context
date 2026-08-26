@@ -137,10 +137,7 @@ impl CompositeComponent for PerfPrimary {
 
     async fn handle(&self, ctx: RequestCtx) -> RequestOutcome {
         let Ok(mut body) = ctx.reserve_output(ctx.body.len()).await else {
-            return RequestOutcome::Error {
-                code: "internal_error".to_owned(),
-                message: "output reservation failed".to_owned(),
-            };
+            return RequestOutcome::error("internal_error", "output reservation failed");
         };
         body.extend_from_slice(&ctx.body)
             .expect("reservation matches request length");
@@ -187,10 +184,7 @@ impl CompositeComponent for PlaceholderBroca {
     }
 
     async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
-        RequestOutcome::Error {
-            code: "internal_error".to_owned(),
-            message: "unreachable: broca binds are rejected".to_owned(),
-        }
+        RequestOutcome::error("internal_error", "unreachable: broca binds are rejected")
     }
 
     async fn route_gone(&self, _route: RouteHandle) {}
@@ -390,8 +384,8 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
             // Send lag is load-generator debt, never host latency: a slot
             // that starts one full interval late means the delivered
             // arrival process no longer matches the requested rate label.
-            let lag_ns = u64::try_from(now.duration_since(scheduled).as_nanos())
-                .unwrap_or(u64::MAX);
+            let lag_ns =
+                u64::try_from(now.duration_since(scheduled).as_nanos()).unwrap_or(u64::MAX);
             send_lag_max_ns = send_lag_max_ns.max(lag_ns);
             if lag_ns >= interval_ns {
                 missed_slots += 1;

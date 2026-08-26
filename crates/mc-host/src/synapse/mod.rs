@@ -49,6 +49,7 @@ pub struct SynapseLimits {
     pub max_page_encoded_bytes: usize,
     pub retention: std::time::Duration,
     pub retry_after_ms: u64,
+    pub query_retry_after_ms: u64,
 }
 
 impl SynapseLimits {
@@ -79,6 +80,7 @@ impl Default for SynapseLimits {
             max_page_encoded_bytes: 2 * 1024 * 1024,
             retention: std::time::Duration::from_secs(15 * 60),
             retry_after_ms: 50,
+            query_retry_after_ms: 50,
         }
     }
 }
@@ -408,17 +410,11 @@ pub(crate) fn owned_input_bytes(request: &Request) -> usize {
 }
 
 fn request_error(error: RequestError) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: error.code.to_owned(),
-        message: error.message,
-    }
+    RequestOutcome::error(error.code, error.message)
 }
 
 fn app_error(code: &str, message: &str) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: code.to_owned(),
-        message: message.to_owned(),
-    }
+    RequestOutcome::error(code, message)
 }
 
 async fn respond(ctx: &RequestCtx, body: Vec<u8>) -> RequestOutcome {
@@ -476,7 +472,11 @@ impl SynapseComponent {
             return app_error("cancelled", "the host is shutting down");
         }
         let Ok(query_permit) = Arc::clone(&self.inner.query_admission).try_acquire_owned() else {
-            return app_error("queue_full", "query admission capacity is exhausted");
+            return RequestOutcome::error_retry_after(
+                "queue_full",
+                "query admission capacity is exhausted",
+                self.inner.limits.query_retry_after_ms,
+            );
         };
         // The handler copy keeps the query lane charged while the response is
         // produced; the worker copy keeps the charge through a native call
@@ -741,7 +741,7 @@ impl SynapseComponent {
             PollOutcome::BadCursor => {
                 app_error("schema_violation", "cursor is not valid for this job")
             }
-            PollOutcome::Failed { code, message } => RequestOutcome::Error { code, message },
+            PollOutcome::Failed { code, message } => RequestOutcome::error(code, message),
             PollOutcome::Pending { status } => {
                 respond(
                     ctx,
