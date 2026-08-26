@@ -805,6 +805,42 @@ describe("prospective holdout CLI", () => {
         }
     });
 
+    it("exempts a staging directory only on its type and scanned bytes", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-epoch-staging-"));
+        try {
+            const recomputers = completeRepository(root, { lifecycleState: "cohort-closed" });
+            const epoch = join(root, "prospective-holdout", "epochs", "epoch-test-release");
+            // A publisher killed between mkdtemp and rename leaves this behind, and reading
+            // it as a committed artifact would strand the identical retry documented as the
+            // recovery.
+            const staging = join(epoch, ".staging-abc123");
+            mkdirSync(staging, { recursive: true });
+            writeFileSync(join(staging, "manifest.json"), '{"schema":"partial"}\n');
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+            // Exempting on the name alone removes the entry from the artifact-set check
+            // without its bytes ever being scanned, so the staging name becomes a way to
+            // carry sensitive content in the public epoch tree past every privacy gate.
+            writeFileSync(join(staging, "manifest.json"), '{"path":"/Users/realperson/secrets"}\n');
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["epoch: staging-privacy-rejected"],
+            });
+            rmSync(staging, { recursive: true, force: true });
+            // A publish only ever creates a directory here, so a regular file under the
+            // same name is not staging state this exemption owns.
+            writeFileSync(join(epoch, ".staging-abc123"), "committed bytes\n");
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["epoch: staging-entry-not-directory"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("rejects an adjudication close approved by either cohort close approver", async () => {
         for (const approver of ["custodian-one", "reviewer-two"]) {
             const root = mkdtempSync(join(tmpdir(), "holdout-cli-adjudication-dependent-"));

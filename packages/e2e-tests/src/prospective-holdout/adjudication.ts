@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalFingerprint, canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { type BlindedPacket, type ConcealedMap, verifyConcealedMap } from "./blinding";
@@ -242,16 +242,30 @@ export function parseAdjudicationClose(raw: unknown): AdjudicationClose {
 }
 
 export function publishAdjudicationClose(close: AdjudicationClose, destination: string): void {
-    if (existsSync(destination)) throw new HoldoutContractError(["adjudication-close: destination-exists"]);
+    const bytes = `${JSON.stringify(close, null, 2)}\n`;
+    /**
+     * A publisher interrupted after `linkSync` installed the complete close reaches here
+     * again on its identical retry. Rejecting on existence alone leaves automation unable
+     * to recover through that retry, or to tell a finished prior attempt from conflicting
+     * bytes, so the installed bytes are compared with the ones this call would write: the
+     * retry that finds its own close returns, and anything else fails. This is the
+     * accept-existing contract the freeze artifact publisher already uses.
+     */
+    const acceptExisting = (): boolean => {
+        if (!existsSync(destination)) return false;
+        if (readFileSync(destination, "utf8") !== bytes) {
+            throw new HoldoutContractError(["adjudication-close: destination-conflict"]);
+        }
+        return true;
+    };
+    if (acceptExisting()) return;
     mkdirSync(dirname(destination), { recursive: true });
     const temp = `${destination}.tmp-${randomBytes(8).toString("hex")}`;
     try {
-        writeFileSync(temp, `${JSON.stringify(close, null, 2)}\n`, { flag: "wx" });
+        writeFileSync(temp, bytes, { flag: "wx" });
         linkSync(temp, destination);
     } catch (error) {
-        if (existsSync(destination)) {
-            throw new HoldoutContractError(["adjudication-close: destination-exists"]);
-        }
+        if (acceptExisting()) return;
         throw error;
     } finally {
         rmSync(temp, { force: true });
@@ -268,6 +282,14 @@ export function unblindAfterClose(input: {
     concealedMap: ConcealedMap;
     commitmentSecret: Uint8Array;
     unblindApprover: string;
+    /**
+     * Secret the approving reviewer holds, and the map custodian does not.
+     *
+     * Separate from `authenticationKey` on purpose: that key authenticates the judgments
+     * the custodian's own close already covers, so reusing it here would let the party
+     * being checked produce the check.
+     */
+    unblindApprovalKey: Uint8Array;
     approvalFingerprint: string;
 }): ConcealedMap {
     if (
@@ -296,13 +318,23 @@ export function unblindAfterClose(input: {
     ) {
         fail("unblind: judgment-set-mismatch");
     }
-    const expectedApproval = canonicalFingerprint({
-        kind: "unblind",
-        approver: input.unblindApprover,
-        adjudicationCloseFingerprint: canonicalFingerprint(input.close),
-        closeManifestFingerprint: input.trustedCloseFingerprint,
-        mapCommitment: input.cohortClose.body.subjectiveMapCommitment,
-    });
+    // Every input below is supplied to this call or already public in the committed
+    // artifacts, so a plain digest over them is reproducible by whoever calls it. The map
+    // custodian holds `commitmentSecret`, so they could pick any unused actor name,
+    // compute that digest themselves, and reveal the concealed release mapping alone --
+    // which is exactly the second actor this gate exists to require. Keying the digest
+    // with a secret only the approving reviewer holds is what makes the fingerprint
+    // evidence of their approval rather than evidence that someone can hash.
+    if (input.unblindApprovalKey.byteLength < 32) fail("unblind.approval-key: too-short");
+    const expectedApproval = createHmac("sha256", input.unblindApprovalKey)
+        .update(canonicalJson({
+            kind: "unblind",
+            approver: input.unblindApprover,
+            adjudicationCloseFingerprint: canonicalFingerprint(input.close),
+            closeManifestFingerprint: input.trustedCloseFingerprint,
+            mapCommitment: input.cohortClose.body.subjectiveMapCommitment,
+        }))
+        .digest("hex");
     if (expectedApproval !== input.approvalFingerprint) fail("unblind: approval-invalid");
     return verifyConcealedMap(
         input.concealedMap,

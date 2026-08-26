@@ -100,6 +100,76 @@ function requiredEvent(events: readonly LifecycleEvent[], state: LifecycleEvent[
 }
 
 /**
+ * Rejects anything under a staging entry that a publish could not have created, and
+ * scans the bytes of one that it could have.
+ *
+ * A publish only ever creates a directory of regular files here, so a symlink, or an
+ * entry that is neither, is not staging state this exemption owns. Scanning the files is
+ * what keeps the exemption from becoming a privacy hole: every committed artifact's
+ * bytes are scanned, and an entry removed from the artifact-set check would otherwise
+ * reach neither that scan nor this one.
+ *
+ * A concurrent publish can rename its staging directory away or finish writing a file
+ * mid-walk, so a vanished entry is skipped rather than reported: it is no longer in the
+ * tree this run is validating.
+ */
+function scanStagingDirectory(directory: string): void {
+    let entries: string[];
+    try {
+        entries = readdirSync(directory);
+    } catch {
+        return;
+    }
+    for (const name of entries) {
+        const path = join(directory, name);
+        const stat = lstatSync(path, { throwIfNoEntry: false });
+        if (!stat) continue;
+        if (stat.isDirectory()) {
+            scanStagingDirectory(path);
+            continue;
+        }
+        if (stat.isSymbolicLink() || !stat.isFile()) {
+            throw new HoldoutContractError(["epoch: staging-entry-not-regular"]);
+        }
+        let raw: string;
+        try {
+            raw = readFileSync(path, "utf8");
+        } catch {
+            continue;
+        }
+        if (scanForSensitiveContent(raw).length > 0) {
+            throw new HoldoutContractError(["epoch: staging-privacy-rejected"]);
+        }
+    }
+}
+
+/**
+ * Decides whether `entry` is transient staging state the artifact-set check exempts.
+ *
+ * A publisher killed between `mkdtempSync` and `renameSync` leaves its staging directory
+ * beside the artifacts, and reading that as a committed artifact rejects the epoch and
+ * strands the identical retry documented as the recovery. Matching the name alone is not
+ * enough evidence to exempt it: a file, a symlink, or a committed directory under the
+ * same name leaves the check without its type or its bytes ever being inspected, so it
+ * can carry arbitrary untrusted or sensitive content in the public epoch tree while this
+ * validation and its privacy scans stay green. The type and the contents are what
+ * distinguish staging state from bytes wearing its name.
+ */
+function exemptStagingEntry(epochRoot: string, entry: string): boolean {
+    if (!STAGING_ENTRY_RE.test(entry)) return false;
+    const path = join(epochRoot, entry);
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    // A publish that renamed its staging directory away between the read of the epoch
+    // directory and this check left no entry for the artifact set to account for.
+    if (!stat) return true;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new HoldoutContractError(["epoch: staging-entry-not-directory"]);
+    }
+    scanStagingDirectory(path);
+    return true;
+}
+
+/**
  * Expected epoch entries that are artifact directories. Every other expected entry is a
  * regular file, so one list carries the required type for the whole artifact set and a
  * name added to the set cannot acquire an unstated type.
@@ -287,6 +357,17 @@ export function validateHoldoutRepository(
             if (insufficientEvidence !== (reportEvent?.state === "insufficient-evidence")) {
                 throw new HoldoutContractError(["report: lifecycle-state-mismatch"]);
             }
+            // `invalidated` forces the report's decision, so the state check above cannot
+            // reach it: an invalidated report is not `insufficient-evidence`, which leaves
+            // `reported` as the only state it pairs with, and the check passes. The lifecycle
+            // then permits `reported -> graduated` while graduation validation never reads the
+            // decision, so evidence the report itself declares invalid would enter the
+            // permanent incident catalog. Requiring the terminal transition is what stops it:
+            // `invalidated` and `graduated` are both terminal, so a ledger carrying one cannot
+            // carry the other.
+            if (report.body.invalidated && !requiredEvent(events, "invalidated")) {
+                throw new HoldoutContractError(["report: invalidated-requires-terminal-transition"]);
+            }
             if (close.manifest.body.cases.some((entry) => entry.subjective)) {
                 expectEntry("adjudication-close.json");
                 expectedTrustEntries.add(`${epochId}:adjudication-close`);
@@ -383,11 +464,13 @@ export function validateHoldoutRepository(
         // directory a killed publisher left behind all live beside the artifacts, so a
         // validation run concurrent with a transition or a publish, or one after a worker
         // was killed mid-reclaim or mid-publish, would otherwise read them as unexpected
-        // committed artifacts. They are runtime state under names no artifact uses.
+        // committed artifacts. They are runtime state under names no artifact uses, and
+        // the staging exemption proves that from the entry's type and bytes rather than
+        // from its name alone.
         const actualEntries = readdirSync(epochRoot)
             .filter((entry) =>
                 !/^lifecycle\.jsonl\.lock(?:\.reclaimed-[0-9a-f]+)?$/.test(entry) &&
-                !STAGING_ENTRY_RE.test(entry),
+                !exemptStagingEntry(epochRoot, entry),
             )
             .sort();
         if (

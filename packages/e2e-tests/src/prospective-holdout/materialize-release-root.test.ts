@@ -38,26 +38,60 @@ describe("release root materialization", () => {
             expect(lstatSync(join(destination, manifest.entrypoints.rustHost)).mode & 0o111).toBe(0o111);
             expect(lstatSync(join(destination, manifest.entrypoints.databaseTemplate)).mode & 0o222).toBe(0);
             expect(existsSync(join(parent, ".v2.publish-lock"))).toBe(false);
-            // The lock wraps the existence check, so a rejected republication proves
-            // both that the operation's own diagnostic survives the wrapper unchanged
-            // and that the wrapper still releases the lock on that path.
+            // A worker killed after the rename installed this root retries with the same
+            // inputs, so the retry must complete rather than report a conflict it cannot
+            // distinguish from one. It leaves no staging directory behind and releases the
+            // lock, which is what proves the accept-existing path runs inside the wrapper.
+            const stagingBefore = readdirSync(parent).filter((entry) => entry.startsWith(".v2.staging-")).sort();
+            const retried = materializeReleaseRoot({
+                promotedRoot: promoted,
+                destination,
+                manifest,
+                expectedRootFingerprint: manifest.rootFingerprint,
+                activeCheckout: active,
+            });
+            expect(retried.root).toBe(destination);
+            expect(retried.observedRootFingerprint).toBe(materialized.observedRootFingerprint);
+            // The accepted retry leaves its own staging directory behind no more than a
+            // completed publication does.
+            expect(readdirSync(parent).filter((entry) => entry.startsWith(".v2.staging-")).sort())
+                .toEqual(stagingBefore);
+            expect(existsSync(join(parent, ".v2.publish-lock"))).toBe(false);
+            // Bytes that are not this root are the case existence alone could not tell
+            // apart, and the lock wraps that rejection too, so its diagnostic surviving
+            // the wrapper unchanged proves the wrapper still releases on that path.
+            const conflicting = mkdtempSync(join(tmpdir(), "holdout-conflicting-"));
+            const conflictingDestination = join(parent, "v3");
             let rejected: unknown;
             try {
+                const other = releaseRootFixture(conflicting, {
+                    releaseId: "rel-conflicting",
+                    sourceBytes: "conflicting-source",
+                });
+                materializeReleaseRoot({
+                    promotedRoot: conflicting,
+                    destination: conflictingDestination,
+                    manifest: other,
+                    expectedRootFingerprint: other.rootFingerprint,
+                    activeCheckout: active,
+                });
                 materializeReleaseRoot({
                     promotedRoot: promoted,
-                    destination,
+                    destination: conflictingDestination,
                     manifest,
                     expectedRootFingerprint: manifest.rootFingerprint,
                     activeCheckout: active,
                 });
             } catch (error) {
                 rejected = error;
+            } finally {
+                rmSync(conflicting, { recursive: true, force: true });
             }
             expect(rejected).toBeInstanceOf(HoldoutContractError);
             expect((rejected as HoldoutContractError).diagnostics).toEqual([
-                "release-root-materialize: destination-exists",
+                "release-root-materialize: destination-conflict",
             ]);
-            expect(existsSync(join(parent, ".v2.publish-lock"))).toBe(false);
+            expect(existsSync(join(parent, ".v3.publish-lock"))).toBe(false);
         } finally {
             rmSync(promoted, { recursive: true, force: true });
             makeDirectoriesWritable(parent);

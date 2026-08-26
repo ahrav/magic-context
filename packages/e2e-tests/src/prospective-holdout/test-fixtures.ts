@@ -6,6 +6,7 @@ import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmar
 import type { ReleaseFileKind, ReleaseRootManifest } from "./release-root";
 import type { SanitizedIntake } from "./intake";
 import type { ProspectiveCellResult } from "./runner";
+import { appendLifecycleEvent, type LifecycleEvent } from "./lifecycle";
 import {
     CLOSE_SCHEMA,
     FREEZE_SCHEMA,
@@ -308,4 +309,19 @@ export function deadPid(): number | null {
         }
     }
     return null;
+}
+
+/**
+ * The `frozen` lifecycle event an epoch commits to, which is where intake review reads
+ * publication time from.
+ */
+export function frozenEventFixture(occurredAt = "2026-09-01T00:00:00Z"): LifecycleEvent {
+    return appendLifecycleEvent([], {
+        epochId: "epoch-test-release",
+        state: "frozen",
+        occurredAt,
+        artifactFingerprint: H1,
+        reasonCode: null,
+        approvers: ["reviewer-one"],
+    })[0]!;
 }

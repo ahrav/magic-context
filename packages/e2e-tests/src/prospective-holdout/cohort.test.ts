@@ -17,13 +17,13 @@ import { buildCohortClose, ProspectiveIntakeStore } from "./cohort";
 import { HoldoutContractError } from "./contract";
 import { reviewSanitizedIntake, staticPrivacyRejection } from "./intake";
 import { LOCK_OWNER_FILE, lockAbandoned, lockSidelinePath, takeOverLock, withRecoverableLock } from "./lock";
-import { deadPid, H1, H2, H3, sanitizedIntakeFixture } from "./test-fixtures";
+import { deadPid, H1, H2, H3, sanitizedIntakeFixture, frozenEventFixture } from "./test-fixtures";
 
 const key = new TextEncoder().encode("c".repeat(32));
 const reviewOptions = {
     commitmentKey: key,
     expectedRubricFingerprint: H3,
-    freezePublishedAt: "2026-09-01T00:00:00Z",
+    frozenEvent: frozenEventFixture(),
     intakeOpensAt: "2026-09-01T00:00:00Z",
     intakeClosesAt: "2026-09-08T00:00:00Z",
 };
@@ -46,11 +46,13 @@ describe("cohort close", () => {
             expect(store.submit(admitted)).toBe("included");
             expect(store.submit(staticPrivacyRejection(
                 `intake-${"e".repeat(32)}`,
+                sanitizedIntakeFixture().submittedAt,
                 sanitizedIntakeFixture().deletionEvidence,
             ))).toBe("included");
             const snapshot = store.closeSnapshot("epoch-test-release", "2026-09-08T00:00:00Z");
             expect(store.submit(staticPrivacyRejection(
                 `intake-${"f".repeat(32)}`,
+                sanitizedIntakeFixture().submittedAt,
                 sanitizedIntakeFixture().deletionEvidence,
             ))).toBe("late");
             const afterClose = store.readDecisions();

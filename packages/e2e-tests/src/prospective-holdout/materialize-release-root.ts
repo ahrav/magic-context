@@ -65,7 +65,24 @@ export function materializeReleaseRoot(input: {
         const lock = join(parent, `.${basename(destination)}.publish-lock`);
         withRecoverableLock(lock, { busyCode: "release-root-materialize: publication-busy" }, () => {
             if (existsSync(destination)) {
-                throw new HoldoutContractError(["release-root-materialize: destination-exists"]);
+                // A worker killed after the rename below installed the complete verified
+                // root reaches here on its identical retry. Rejecting on existence alone
+                // contradicts the interrupted-publication recovery the sibling artifact
+                // publisher documents, and leaves automation unable to tell a finished
+                // prior attempt from a conflicting root. Verifying the installed bytes
+                // against the same manifest and root fingerprint is what separates them:
+                // the retry that finds its own root proceeds, and conflicting bytes still
+                // fail. The staging directory stays unpublished, so the `finally` below
+                // removes it.
+                try {
+                    verifyReleaseRoot(destination, source.manifest, {
+                        expectedRootFingerprint: source.observedRootFingerprint,
+                        activeCheckout: input.activeCheckout,
+                    });
+                } catch {
+                    throw new HoldoutContractError(["release-root-materialize: destination-conflict"]);
+                }
+                return;
             }
             renameSync(staging, destination);
             published = true;

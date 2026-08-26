@@ -15,6 +15,7 @@ import {
     staticId,
     string,
 } from "./contract";
+import type { LifecycleEvent } from "./lifecycle";
 
 export const SANITIZED_INTAKE_SCHEMA = "prospective-sanitized-intake/v1";
 export const INTAKE_PROVENANCE = ["regression", "user-correction", "unexpected-failure"] as const;
@@ -94,6 +95,42 @@ export function parseDeletionEvidence(raw: unknown, label: string): DeletionEvid
     });
 }
 
+/**
+ * Requires deletion evidence for exactly the declared stores, each completed within its
+ * deadline and no earlier than `submittedAt`.
+ *
+ * A store cannot have been cleared of this report's data before the report reached the
+ * store, so a completion earlier than `submittedAt` attests some earlier retention run
+ * and leaves this report's own copies unaccounted for. Completion at `submittedAt` is the
+ * legal boundary: nothing is retained past the instant intake records.
+ *
+ * Shared with the privacy-rejection path, which never builds a `SanitizedIntake`. Without
+ * a submission instant of its own, that path can only be checked against the deadline and
+ * the cohort close, and completions predating the report itself satisfy both and still
+ * reach the manifest's retention fingerprint.
+ */
+export function assertDeletionEvidenceCoversSubmission(
+    deletionEvidence: readonly DeletionEvidence[],
+    submittedAt: string,
+    label: string,
+): void {
+    if (
+        deletionEvidence.length !== DELETION_STORES.length ||
+        new Set(deletionEvidence.map((entry) => entry.store)).size !== DELETION_STORES.length
+    ) {
+        fail(`${label}: exact-stores-required`);
+    }
+    const submittedAtMs = Date.parse(submittedAt);
+    for (const evidence of deletionEvidence) {
+        if (Date.parse(evidence.completedAt) > Date.parse(evidence.deadline)) {
+            fail(`${label}: overdue`);
+        }
+        if (Date.parse(evidence.completedAt) < submittedAtMs) {
+            fail(`${label}: before-submission`);
+        }
+    }
+}
+
 export function parseSanitizedIntake(raw: unknown): SanitizedIntake {
     const value = record(raw, "intake");
     exact(value, [
@@ -145,26 +182,7 @@ export function parseSanitizedIntake(raw: unknown): SanitizedIntake {
     // report exists bounds every completion below.
     const submittedAt = instant(value.submittedAt, "intake.submittedAt");
     const deletionEvidence = parseDeletionEvidence(value.deletionEvidence, "intake.deletionEvidence");
-    if (
-        deletionEvidence.length !== DELETION_STORES.length ||
-        new Set(deletionEvidence.map((entry) => entry.store)).size !== DELETION_STORES.length
-    ) {
-        fail("intake.deletionEvidence: exact-stores-required");
-    }
-    const submittedAtMs = Date.parse(submittedAt);
-    for (const evidence of deletionEvidence) {
-        if (Date.parse(evidence.completedAt) > Date.parse(evidence.deadline)) {
-            fail("intake.deletionEvidence: overdue");
-        }
-        // A store cannot have been cleared of this report's data before the report
-        // reached the store, so a completion earlier than `submittedAt` attests some
-        // earlier retention run and leaves this report's own copies unaccounted for.
-        // Completion at `submittedAt` is the legal boundary: nothing is retained past
-        // the instant intake records.
-        if (Date.parse(evidence.completedAt) < submittedAtMs) {
-            fail("intake.deletionEvidence: before-submission");
-        }
-    }
+    assertDeletionEvidenceCoversSubmission(deletionEvidence, submittedAt, "intake.deletionEvidence");
     const parsed: SanitizedIntake = {
         schema: SANITIZED_INTAKE_SCHEMA,
         intakeId: staticId(value.intakeId, "intake.intakeId", INTAKE_ID_RE),
@@ -217,7 +235,17 @@ export function reviewSanitizedIntake(
     input: {
         commitmentKey: Uint8Array;
         expectedRubricFingerprint: string;
-        freezePublishedAt: string;
+        /**
+         * The epoch's trusted `frozen` lifecycle event.
+         *
+         * Publication time is read from this event rather than accepted as a standalone
+         * option. A caller-supplied instant earlier than the actual freeze admits any
+         * report submitted in the gap, because such a report is still inside the declared
+         * intake window and the close manifest drops `submittedAt`, so repository
+         * validation cannot detect the pre-freeze admission afterwards. The ledger event
+         * is the only publication evidence the epoch commits to.
+         */
+        frozenEvent: LifecycleEvent;
         intakeOpensAt: string;
         intakeClosesAt: string;
         forbiddenTokens?: readonly string[];
@@ -230,7 +258,9 @@ export function reviewSanitizedIntake(
     if (intake.admission.rubricFingerprint !== input.expectedRubricFingerprint) {
         fail("intake.admission.rubricFingerprint: freeze-mismatch");
     }
-    if (Date.parse(intake.submittedAt) <= Date.parse(input.freezePublishedAt)) {
+    if (input.frozenEvent.state !== "frozen") fail("intake.frozenEvent.state: not-frozen");
+    const freezePublishedAt = input.frozenEvent.occurredAt;
+    if (Date.parse(intake.submittedAt) <= Date.parse(freezePublishedAt)) {
         fail("intake.submittedAt: not-prospective");
     }
     // Publication and the declared opening are separate instants, and a freeze may be
@@ -267,14 +297,38 @@ export function reviewSanitizedIntake(
     };
 }
 
+/**
+ * Records a report rejected by the privacy gate, which never produces a
+ * `SanitizedIntake` to carry its own submission instant.
+ *
+ * `submittedAt` is required for exactly that reason: the cohort close checks deletion
+ * evidence against each store's deadline and against the close, and both bounds are upper
+ * ones, so evidence for a retention run that finished before this report existed would
+ * satisfy them and still enter the manifest's retention fingerprint. Carrying the instant
+ * here puts this path under the same rule the sanitized path already enforces.
+ */
 export function staticPrivacyRejection(
     intakeId: string,
+    submittedAt: string,
     deletionEvidence: DeletionEvidence[],
-): { status: "rejected"; intakeId: string; reasonCode: "privacy-rejected"; deletionEvidence: DeletionEvidence[] } {
+): {
+    status: "rejected";
+    intakeId: string;
+    reasonCode: "privacy-rejected";
+    submittedAt: string;
+    deletionEvidence: DeletionEvidence[];
+} {
+    const recordedAt = instant(submittedAt, "intake.privacy-rejected.submittedAt");
+    assertDeletionEvidenceCoversSubmission(
+        deletionEvidence,
+        recordedAt,
+        "intake.privacy-rejected.deletionEvidence",
+    );
     return {
         status: "rejected",
         intakeId: staticId(intakeId, "intake.intakeId", INTAKE_ID_RE),
         reasonCode: "privacy-rejected",
+        submittedAt: recordedAt,
         deletionEvidence,
     };
 }

@@ -275,6 +275,33 @@ describe("prospective runner", () => {
         });
     });
 
+    it("refuses verifier evidence whose container is not an array of objects", async () => {
+        await withRoots(async (root, paired, active) => {
+            // A verifier is scenario code, so its declared array type is no evidence about
+            // the container. Each of these throws on `.length`, `.map`, or a member read,
+            // and that throw lands outside the verifier's own `try`: it rejects the call and
+            // can stop the whole cohort instead of recording the malformed-result cell.
+            const containers: Array<[string, unknown]> = [
+                ["null", null],
+                ["undefined", undefined],
+                ["non-array object", { id: "check-current", passed: true }],
+                ["array holding null", [null]],
+                ["array holding a primitive", [7]],
+            ];
+            for (const [label, produced] of containers) {
+                const result = await runProspectiveCase({
+                    ...baseInput(root, paired, active),
+                    scenario: scenario(async () => ({ state: "current" }), {
+                        verifier: () => produced as ReturnType<ProspectiveScenario["verifier"]>,
+                    }),
+                });
+                expect([label, result.runHealth, result.productOutcome, result.reasonCode]).toEqual([
+                    label, "completed", "fail", "invalid-result",
+                ]);
+            }
+        });
+    });
+
     it("aborts and awaits cleanup before returning a timeout", async () => {
         await withRoots(async (root, paired, active) => {
             let resolveDriver: ((value: { state: string }) => void) | undefined;
@@ -316,9 +343,9 @@ describe("prospective runner", () => {
         });
     });
 
-    it("bounds a cleanup that never settles and records it as a crash", async () => {
+    it("refuses a cell when a timed-out cleanup never settles", async () => {
         await withRoots(async (root, paired, active) => {
-            const result = await runProspectiveCase({
+            const breach = rejectionDiagnostics(runProspectiveCase({
                 ...baseInput(root, paired, active),
                 timeoutMs: 5,
                 scenario: scenario(
@@ -329,10 +356,27 @@ describe("prospective runner", () => {
                     }),
                     { cleanup: () => new Promise<void>(() => {}) },
                 ),
-            });
-            expect([result.runHealth, result.productOutcome, result.reasonCode]).toEqual([
-                "crash", "not-evaluated", "runner-crash",
-            ]);
+            }));
+            // A cleanup still running can keep writing the workspace, and a crash cell leaves
+            // the pair short of "completed", which `buildPairedFacts` reads as grounds for
+            // another attempt against those writes. The breach stops the run instead.
+            expect(await breach).toEqual(["prospective-runner: cleanup-abandoned"]);
+        });
+    }, 1_000);
+
+    it("refuses a cell when cleanup never settles after the driver completes", async () => {
+        await withRoots(async (root, paired, active) => {
+            // Cleanup after a driver that returned normally is bounded by the same deadline:
+            // an unbounded wait here wedges the cohort until the outer CI timeout.
+            const breach = rejectionDiagnostics(runProspectiveCase({
+                ...baseInput(root, paired, active),
+                timeoutMs: 5,
+                scenario: scenario(
+                    async () => ({ state: "ok" }),
+                    { cleanup: () => new Promise<void>(() => {}) },
+                ),
+            }));
+            expect(await breach).toEqual(["prospective-runner: cleanup-abandoned"]);
         });
     }, 1_000);
 

@@ -180,10 +180,36 @@ export async function runProspectiveCase(input: {
             return false;
         }
     };
+    /**
+     * Waits for `cleanup` under the execution deadline, reporting the breach when it
+     * never settles.
+     *
+     * Cleanup is scenario code on every path, not only after an execution timeout, so
+     * an unbounded wait wedges the whole cohort until the outer CI timeout whenever a
+     * driver that returned normally leaves a cleanup that never settles. `timeoutMs` is
+     * the only budget the caller declared, so it bounds this wait too.
+     *
+     * An unsettled cleanup is not the same evidence as a throwing one. A throwing
+     * cleanup has finished: the workspace is unproven but static, which a crash cell
+     * describes. An unsettled cleanup is still running and can keep writing the
+     * workspace, and the cell it would produce leaves the pair short of "completed",
+     * which `buildPairedFacts` accepts as grounds for another attempt. That attempt
+     * would observe the abandoned cleanup's writes as its own, so isolation is
+     * unprovable and the breach stops the run instead of emitting a cell a retry could
+     * build on. This is the rule `driver-abandoned` already applies to a driver that
+     * survives its drain.
+     */
+    const settleCleanup = async (): Promise<boolean> => {
+        const settled = await bounded(cleanup(), input.timeoutMs);
+        if (settled === UNSETTLED) {
+            throw new HoldoutContractError(["prospective-runner: cleanup-abandoned"]);
+        }
+        return settled;
+    };
     const finish = async (
         fields: Pick<ProspectiveCellResult, "runHealth" | "productOutcome" | "failedChecks" | "reasonCode">,
     ): Promise<ProspectiveCellResult> => {
-        if (!await cleanup()) {
+        if (!await settleCleanup()) {
             return terminal(input.scenario, input.releaseRole, root, expected, coordinate, {
                 runHealth: "crash",
                 productOutcome: "not-evaluated",
@@ -202,11 +228,8 @@ export async function runProspectiveCase(input: {
         controller.abort();
         // Cleanup is scenario code, so it can hang exactly the way a driver can. An unbounded
         // wait here outlives timeoutMs before the drain below bounds anything, which is the
-        // hang the deadline exists to prevent, so this wait carries the same bound. An
-        // elapsed bound leaves the workspace in the state a throwing cleanup leaves it in,
-        // unproven either way, so both report the crash terminal rather than splitting into a
-        // third outcome no committed row can carry.
-        const cleanupSucceeded = (await bounded(cleanup(), input.timeoutMs)) === true;
+        // hang the deadline exists to prevent, so this wait carries the same bound.
+        const settledCleanup = await bounded(cleanup(), input.timeoutMs);
         // A driver that ignores the abort signal, and that cleanup cannot terminate, would
         // otherwise make this await outlive timeoutMs entirely and hang the suite until the
         // CI job timeout. Draining is best effort and bounded by another timeoutMs.
@@ -216,11 +239,21 @@ export async function runProspectiveCase(input: {
         // "completed", which `buildPairedFacts` accepts as grounds for another attempt, so
         // that attempt would run against the abandoned driver's writes and observe them as its
         // own. Isolation is unprovable once the driver survives the drain, so the breach stops
-        // the run instead of emitting a cell any retry could build on.
+        // the run instead of emitting a cell any retry could build on. The driver is reported
+        // first because it is the more specific breach: its own code outlived the deadline,
+        // whereas an unsettled cleanup may be waiting on that same driver.
         if (drained === UNSETTLED) {
             throw new HoldoutContractError(["prospective-runner: driver-abandoned"]);
         }
-        return terminal(input.scenario, input.releaseRole, root, expected, coordinate, cleanupSucceeded ? {
+        // A cleanup that never settled is still live and can keep writing the workspace, so
+        // it carries the same unprovable isolation as an abandoned driver and stops the run
+        // for the same reason. Only a settled cleanup distinguishes the timeout terminal from
+        // the crash terminal: it either restored the workspace or threw and left it unproven
+        // but static, and no committed row carries a third outcome.
+        if (settledCleanup === UNSETTLED) {
+            throw new HoldoutContractError(["prospective-runner: cleanup-abandoned"]);
+        }
+        return terminal(input.scenario, input.releaseRole, root, expected, coordinate, settledCleanup ? {
             runHealth: "timeout",
             productOutcome: "not-evaluated",
             failedChecks: [],
@@ -256,10 +289,10 @@ export async function runProspectiveCase(input: {
             reasonCode: "runner-crash",
         });
     }
-    let checks: ReturnType<ProspectiveScenario["verifier"]>;
+    let produced: unknown;
     try {
         canonicalJson(raced.raw as JsonValue);
-        checks = input.scenario.verifier(input.scenario.normalizer(raced.raw));
+        produced = input.scenario.verifier(input.scenario.normalizer(raced.raw));
     } catch {
         return finish({
             runHealth: "completed",
@@ -269,11 +302,31 @@ export async function runProspectiveCase(input: {
         });
     }
     // A verifier is scenario code and its return value reaches here unvalidated, so the
-    // declared `boolean` is no evidence about `passed`. A truthy non-boolean such as the
-    // string "false" satisfies the failure filter below and would record a pass, so the
-    // gate proves the type before any outcome is derived from it.
+    // declared array type is no evidence about the container either. `null`, a non-array
+    // object, or an array holding a non-object would throw on `.length`, `.map`, or a
+    // member read, and that throw lands outside the `try` above: it rejects
+    // `runProspectiveCase` and can stop the whole cohort instead of producing the
+    // `invalid-result` cell malformed verifier output is supposed to produce. The
+    // container is proved before any member is read.
     if (
-        checks.length === 0 ||
+        !Array.isArray(produced) ||
+        produced.length === 0 ||
+        produced.some((check) => typeof check !== "object" || check === null)
+    ) {
+        return finish({
+            runHealth: "completed",
+            productOutcome: "fail",
+            failedChecks: [],
+            reasonCode: "invalid-result",
+        });
+    }
+    const checks = produced as ReturnType<ProspectiveScenario["verifier"]>;
+    // With the container proved, the declared `boolean` is still no evidence about
+    // `passed`. A truthy non-boolean such as the string "false" satisfies the failure
+    // filter below and would record a pass, so the gate proves the type before any
+    // outcome is derived from it.
+    if (
+        checks.some((check) => typeof check.id !== "string") ||
         new Set(checks.map((check) => check.id)).size !== checks.length ||
         checks.some((check) => !/^check-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(check.id)) ||
         checks.some((check) => typeof check.passed !== "boolean")

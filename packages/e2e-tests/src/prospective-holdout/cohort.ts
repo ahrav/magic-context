@@ -17,6 +17,7 @@ import {
 } from "./contract";
 import {
     DELETION_STORES,
+    assertDeletionEvidenceCoversSubmission,
     parseDeletionEvidence,
     parseSanitizedIntake,
     type DeletionEvidence,
@@ -28,6 +29,13 @@ export type StaticPrivacyRejection = {
     status: "rejected";
     intakeId: string;
     reasonCode: "privacy-rejected";
+    /**
+     * Instant the rejected report was submitted.
+     *
+     * Carried explicitly because this path never builds a `SanitizedIntake`, so nothing
+     * else on it bounds deletion completions from below.
+     */
+    submittedAt: string;
     deletionEvidence: DeletionEvidence[];
 };
 export type CohortDisposition = IntakeDisposition | StaticPrivacyRejection;
@@ -141,15 +149,24 @@ function parseStoredDisposition(raw: unknown): CohortDisposition {
         };
     }
     if (value.reasonCode === "privacy-rejected") {
-        exact(value, ["status", "intakeId", "reasonCode", "deletionEvidence"], "cohort-store.record");
+        exact(value, ["status", "intakeId", "reasonCode", "submittedAt", "deletionEvidence"], "cohort-store.record");
+        const submittedAt = instant(value.submittedAt, "cohort-store.record.submittedAt");
         const deletionEvidence = parseDeletionEvidence(
             value.deletionEvidence,
+            "cohort-store.record.deletionEvidence",
+        );
+        // A stored record is bytes on disk, so the rule the factory applied is re-applied
+        // here rather than assumed of whatever wrote the file.
+        assertDeletionEvidenceCoversSubmission(
+            deletionEvidence,
+            submittedAt,
             "cohort-store.record.deletionEvidence",
         );
         return {
             status: "rejected",
             intakeId: staticId(value.intakeId, "cohort-store.record.intakeId", INTAKE_ID_RE),
             reasonCode: "privacy-rejected",
+            submittedAt,
             deletionEvidence,
         };
     }
@@ -261,12 +278,22 @@ export function buildCohortClose(input: {
     const closedAtMs = Date.parse(input.closedAt);
     const deletionEvidence = input.decisions.map((entry) => {
         const evidence = "intake" in entry ? entry.intake.deletionEvidence : entry.deletionEvidence;
+        const submittedAt = "intake" in entry ? entry.intake.submittedAt : entry.submittedAt;
         if (
             evidence.length !== DELETION_STORES.length ||
             new Set(evidence.map((item) => item.store)).size !== DELETION_STORES.length ||
             evidence.some((item) => Date.parse(item.completedAt) > Date.parse(item.deadline))
         ) {
             throw new HoldoutContractError(["cohort: deletion-evidence-invalid"]);
+        }
+        // The deadline and the close are both upper bounds, so on their own they admit
+        // evidence for a retention run that finished before the report existed, which
+        // leaves this report's own copies unaccounted for while the manifest's retention
+        // fingerprint covers it. Submission is the lower bound that closes that, and it
+        // holds for every disposition: the privacy-rejected path carries the instant
+        // itself because it has no sanitized intake to read it from.
+        if (evidence.some((item) => Date.parse(item.completedAt) < Date.parse(submittedAt))) {
+            throw new HoldoutContractError(["cohort: deletion-before-submission"]);
         }
         // A per-store deadline may fall after the cohort closes, so the deadline
         // test on its own admits evidence for deletion that has not run at close
