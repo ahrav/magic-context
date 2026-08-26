@@ -222,7 +222,7 @@ jobs:
 
       # `bun run test` ends in test:release, whose dependency-boundary check
       # shells out to `cargo tree -p mc-host`. cargo refuses to load the
-      # workspace until every path-dep manifest exists, including the private
+      # workspace until every path-dep manifest exists, including the
       # ../commons cortexkit crates. Metadata-only stubs satisfy the manifest
       # graph; nothing in this job compiles them.
       - name: Provision metadata-only sibling stubs
