@@ -20,6 +20,7 @@ build/
 coverage/
 .cache/
 tmp/
+packages/e2e-tests/artifacts/
 
 .sisyphus/
 .opencode/

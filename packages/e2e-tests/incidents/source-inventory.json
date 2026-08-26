@@ -1,0 +1,921 @@
+{
+    "schema": "incident-source-inventory/v1",
+    "items": [
+        {
+            "id": "src-audit-known-issues",
+            "source_path": "docs/AUDIT-KNOWN-ISSUES.md",
+            "content_digest": "8fbe9809b0544a2ddb13e6c50b5f818ae5cd7887c0b18cb7d16aa27c2e465066",
+            "claims": [
+                {
+                    "id": "claim-audit-a1",
+                    "content_digest": "766908103f3d94c6f37aff0449caf8e4ad227de3b0f820da8f06964b41fcdc33",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a2",
+                    "content_digest": "608e39f5eb174dab9a09c47fa708aa34273aa5f79d933aa93649e8ceb01b374f",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a3",
+                    "content_digest": "833b14c93183a61548533792e278b186542990244e4d3d7973b2dfcb8cf6aaab",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a4",
+                    "content_digest": "8f3d5b4aa57200a430e00dc53688e31eaa84fb3cc682da72b879ccb1b2a7a45e",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a5",
+                    "content_digest": "064384d96dba6621f2c3d72a1c322b3416e1f62313bcee3235fe4b051833b131",
+                    "disposition": "executable_accepted_behavior",
+                    "rationale": "re-observation must preserve one archived row, bump recurrence, create no active duplicate, and stay out of agent recall; behavioral contract worth executing",
+                    "family_links": [
+                        "fam-archived-reobservation"
+                    ]
+                },
+                {
+                    "id": "claim-audit-a6b",
+                    "content_digest": "9f6d1a77e28f46f472ee7c13792dc719ceb8afe3fe2936d02b8de116cd40719c",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a6",
+                    "content_digest": "ad088c46682db01d22892b9b7ec671ed103dcf0e973470b782ab3c2f0f9b7329",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a7",
+                    "content_digest": "4a6d9c015beda1bee00264c09cc3e6c92a82b959b8d2595f16b15e02ebe8ac8e",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a8",
+                    "content_digest": "2a230133f101a273cebd5156a82beb2152f3ecb23684562f3a9cafa8c18a15c0",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a9",
+                    "content_digest": "cd5db8bcaf129405dde0051a0783510d21d7265596e0fbfc4a22db856bebe0e8",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a10",
+                    "content_digest": "580122f3533913211ee2b5a1d20af9aca3bf1d111c583cbe246f62a5647daa99",
+                    "disposition": "executable_accepted_behavior",
+                    "rationale": "supersede-delta contract: effective m0 plus m1 context is judged together and hard folds converge; behavioral contract worth executing",
+                    "family_links": [
+                        "fam-supersede-reconciliation"
+                    ]
+                },
+                {
+                    "id": "claim-audit-note-a8-addendum-materialize-boundary-cutoff",
+                    "content_digest": "fa4ceb5a887124644d46bf9721a24946d68c8196dd0784606ec017db0e376666",
+                    "disposition": "duplicate",
+                    "rationale": "the addendum records the same TTL-precision-at-the-boundary tradeoff claim-audit-a8 already accepts; not a separate finding",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a11",
+                    "content_digest": "063f86df94fe768d936c92586a410aaebb588fde493443274a0c668c4a7bccd4",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a12",
+                    "content_digest": "75d138a7275c9d5996317da750b68951dceb1ab5dc9d112ca5528b22031f66a2",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a13",
+                    "content_digest": "5e350939bd65529f158a037b073dc7e4b94d52451c2c13be64eeb4df304f1be6",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-note-dead-surface-note-v1-render-path-session-facts-plugin-messages-ts",
+                    "content_digest": "7d498b45f06fee58a7c9eaf1a6bb870b889d6be413e74c4bb2e524bb0ea5eabc",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-note-coverage-note-missing-co-located-migration-tests",
+                    "content_digest": "357cca142774c39d423f4655f425f7fe651a8272313386323d169a86dcd0776d",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-g1",
+                    "content_digest": "fcdf4b20623543a3654b56ffb47c612ccf7306f9f18b1578f2d743c1d43d0ae3",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-g2",
+                    "content_digest": "ceea4cabb252123b3ddb0e6dc317f85f16a0d1dfaaa2569afb8188e01bcb24f6",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-fix-pi-non-ui-ctx-status",
+                    "content_digest": "f2a9138d81844c1a0b929a94e1b33c361bac8d05d1b5a15f63d28d441e0467ce",
+                    "disposition": "informational",
+                    "rationale": "triaged deferred low-priority fix; recorded so audits know it is tracked, no executable behavioral contract in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-fix-dashboard-bulk-restore-epoch-toctou",
+                    "content_digest": "e9c432e6deb91a1ba9dd35a0183f168ea30a133f91015ac72d0519ec9177b25b",
+                    "disposition": "informational",
+                    "rationale": "triaged deferred low-priority fix; recorded so audits know it is tracked, no executable behavioral contract in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-fix-dashboard-work-metrics-carry",
+                    "content_digest": "1a798bf789f5bc2a1c2f293d2d80789c0aa06e2c89c9a0a4dd083a851057a965",
+                    "disposition": "informational",
+                    "rationale": "triaged deferred low-priority fix; recorded so audits know it is tracked, no executable behavioral contract in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-fix-dashboard-token-breakdown",
+                    "content_digest": "d3ff22a88a78e15c1b3046474ef14b48493d04df5bb136eb05d6486c29349727",
+                    "disposition": "informational",
+                    "rationale": "triaged deferred low-priority fix; recorded so audits know it is tracked, no executable behavioral contract in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a14",
+                    "content_digest": "867842645297ea42a82e2e181bd91055dea8074453e6fea2c2a60ef889f61278",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a15",
+                    "content_digest": "84c231361efbf2cc6b42116900dbdc3f943602a327ab1f0b3c08e331cb5c88d0",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a16",
+                    "content_digest": "b15818612b9300e369d3a610e4b6c82fda5a36841750c942dfd86257be5dd49d",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a17",
+                    "content_digest": "0cb70a2839b8c052a4183ef02752e4df42fc80751fbb45d2b1fe1e8be0642fa6",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a18",
+                    "content_digest": "8dc19da12bb17e780246d0746bda97924ac4f755b24dc59f8e3b5514cbb4ddbd",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a19",
+                    "content_digest": "38136eba0177b031cc48ef70b48de713cb97cc4ce1f3a22b8e2fd40e7d551783",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a20",
+                    "content_digest": "e8ff63aecc108def024b4eedc00e0ace91e405730abaf23d00ceb52d2886f4ab",
+                    "disposition": "false_positive",
+                    "rationale": "the entry adjudicates the recurring cursor-confusion audit claim as a false positive with source evidence",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a21",
+                    "content_digest": "989d25f48f1b2d6a9e0e3ee8c8fb03c8709b9b30cebc0479474869b17f4e82d6",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a22",
+                    "content_digest": "f5e2c84ba9e9e2201400e3a3315346b21be6d15205c48d9df99344d96a0653ef",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a23",
+                    "content_digest": "f06f6ceaa44ed0f081c8b976e8529f8f24c260a52eff23a9decb2ef05799f8ef",
+                    "disposition": "false_positive",
+                    "rationale": "both sub-claims (map growth, merge tier visibility) are adjudicated false positives in the source",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a24",
+                    "content_digest": "02bcab290abb09347acdfeb58ca3f014bfb4fb2eef4c5742a912fdd2383e941c",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a25",
+                    "content_digest": "a09240adb67f38b86fea04b341c7c7bce3db1546ad302d2b1f25e07bf389219c",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a26",
+                    "content_digest": "069ecc9870e820c94a83d049fe907d831b9aa99c9b569c7ab81d9a97fd797479",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a27",
+                    "content_digest": "9507062207709de138aa6a1cbcd52b84e27554c0a8402fbc7a820273189c5160",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a28",
+                    "content_digest": "78a9803d44abf244a697f01dfaae1be2bac27a2d2560d86ed696070bc8b92ab4",
+                    "disposition": "executable_accepted_behavior",
+                    "rationale": "historian failure dumps are accepted debug behavior with a containment contract: project-local placement, gitignore coverage, report redaction, terminal metacharacter safety",
+                    "family_links": [
+                        "fam-historian-failure-dump"
+                    ]
+                },
+                {
+                    "id": "claim-audit-a29",
+                    "content_digest": "c94f2888644ba24f88e71307c582ce2b37b4e125ad7c0b1c3ef41cbd7277ed6c",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-note-a14-update-session-facts-is-now-fully-retired-no-live-reader",
+                    "content_digest": "e02bd4fc0324764d5d449ce60b0b1ce08654f559515ca2e879787c2f099cb920",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a30",
+                    "content_digest": "93bd9a2b2d9a90595f5370b328c2e80b876a78a9034711efb642ab4aa0104f51",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a31",
+                    "content_digest": "f451571051c3d08e6acb1df5c36fd75d15cf48a23da9122bffd66b747d928360",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a32",
+                    "content_digest": "b86bc2edad4d79d14f6f996f6da82189b66e41b711f6b792b5d8162fe3a6ec37",
+                    "disposition": "executable_known_defect",
+                    "rationale": "an already-persisted vector survives an out-of-band in-place content edit; demonstrated stale semantic recall documented by EMBED#3/EMBED#5/MEM#3",
+                    "family_links": [
+                        "fam-embedding-freshness"
+                    ]
+                },
+                {
+                    "id": "claim-audit-a33",
+                    "content_digest": "0c86babf2a57ab83f1dd0c3ef796aa7795035cd2a5eebf2c0e8f6000077e6846",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a34",
+                    "content_digest": "804ead8154ac777a4a91c9faca10a54034816a36bc4b19bbd8991acc1256bdee",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a35",
+                    "content_digest": "a12168440f283b17f0a112c6f746c3781e80ecc75efed526baaa4aee660d0c94",
+                    "disposition": "false_positive",
+                    "rationale": "the isTransaction shim claim is verified incorrect against the native node:sqlite getter",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a36",
+                    "content_digest": "c3bb1ac2bffce44dd6faea2d71442808e5b1173de90d705715271925b04d9fbc",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a37",
+                    "content_digest": "30a360098b09f18f56c550ce0fc5c620195c222e26293339d99a6e44930ee994",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a38",
+                    "content_digest": "9424d7e72da279bcf15f93d14d5e9f7b4578571c264428e34ecb3e428c103f61",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a39",
+                    "content_digest": "fbfdf894409528c023b26112c18c6419b804f8cef675eb44529dc5e364e743b4",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a40",
+                    "content_digest": "9066462009184d9846b21bc41b80593328cbc42838f1ec0734f2657a81fb39c6",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a41",
+                    "content_digest": "08e642bc3ecc8892f3816e074adab77779fa0c55010a438ca5ab34a3984b6733",
+                    "disposition": "executable_accepted_behavior",
+                    "rationale": "dashboard archive rides the m1 supersede delta instead of an epoch bump; same reconciliation contract as A10",
+                    "family_links": [
+                        "fam-supersede-reconciliation"
+                    ]
+                },
+                {
+                    "id": "claim-audit-a42",
+                    "content_digest": "d630ef88716f3684d009923006ce19fc244378aefdd4c521552259cdbb1a9007",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a43",
+                    "content_digest": "e7a9146554366cd8f2fc6af6b2e87d518f64333dcda473d1532c603e87cad5aa",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a45",
+                    "content_digest": "80ae467a70a6edd9472cfbeb1bc939b462d680823a7d6b90fa8cb30741526d93",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a46",
+                    "content_digest": "4f861152daae6274fd5d901ec86a48a1f8eb53e9f9f6c46ce6425ad5a0c989e9",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a44",
+                    "content_digest": "1cdc1602ecd586d2fee22c4616871d59f070572fc2d0f9f8d9f22a771b9f18f4",
+                    "disposition": "executable_known_defect",
+                    "rationale": "a common-literal message hit can outrank a known-better memory through the linear-band remap; parked in source, preserved as known red",
+                    "family_links": [
+                        "fam-cross-source-rank"
+                    ]
+                },
+                {
+                    "id": "claim-audit-a47",
+                    "content_digest": "139131795d54e286f2852763239deed60c4edf468848015bd58285581f43d1e5",
+                    "disposition": "executable_known_defect",
+                    "rationale": "agentic curate path can commit a ctx_memory write in the window between a lost lease and the abort; demonstrated pre-existing property",
+                    "family_links": [
+                        "fam-lease-loss-residual-write"
+                    ]
+                },
+                {
+                    "id": "claim-audit-a48",
+                    "content_digest": "358f60dface1d0eea2f690006471f21d6f391e6bb9ac7a2f9444a3d444be88db",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a49",
+                    "content_digest": "fc906951310c68519135e90ebd09bc1c613943ad142919fb4a711a04476c1458",
+                    "disposition": "false_positive",
+                    "rationale": "the cross-process GC window is verified unreachable given the ensureRegistered-before-GC ordering",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a50",
+                    "content_digest": "5d218c87e4ce69ed4425bdf4d7e3248d01072f5d227cb1ec2981f3b02fedcd3c",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a51",
+                    "content_digest": "f1d57f05185c6431f1c84327ad9f68e0f5a230a69a9e756d874e12048d241214",
+                    "disposition": "false_positive",
+                    "rationale": "the source verifies the stale-compiled-check claim as a false positive: checks key on the trigger, not the body",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a52",
+                    "content_digest": "c5f95bcfd6c7c4c862b6bb13b85954dabe2864fab679f83607e6612e0e4071fb",
+                    "disposition": "false_positive",
+                    "rationale": "the conflicted-shared-config scenario is structurally unreachable per the migrator's refuse-on-conflict invariant",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a53",
+                    "content_digest": "1fa6661cc2ea1803bbf59fbb3ee1521ff62250454980426e90ad9e39e41106a2",
+                    "disposition": "informational",
+                    "rationale": "accepted-as-is audit entry with recorded reasoning; no demonstrated behavioral contract worth executing in this pool",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-audit-a54",
+                    "content_digest": "479e05a9b39b9c1e2e06b08bff83c308a21fb4f7f51f8b0d0877059c0866778a",
+                    "disposition": "executable_accepted_behavior",
+                    "rationale": "explicit ctx_search returns pending smart notes with status=pending while unprompted surfacing stays gated; behavioral contract worth executing",
+                    "family_links": [
+                        "fam-pending-note-recall"
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "src-auditor-guide",
+            "source_path": "AUDITOR.md",
+            "content_digest": "c265ecd47aef3e2af4b19900c484f71d3334183622bfc4c3a0c6cb3dd5509315",
+            "claims": []
+        },
+        {
+            "id": "src-parity-findings-s2",
+            "source_path": "packages/e2e-tests/parity-findings-s2.md",
+            "content_digest": "cf0f003805d93640cac696ca5acee08c34a3415fd4e3c75305b810ccc684da61",
+            "claims": [
+                {
+                    "id": "claim-parity-a1",
+                    "content_digest": "ad3483a68bb7f66a5d586ed3c786b02108c59157de8088411ff68c61849a9fc9",
+                    "disposition": "executable_fixed_regression",
+                    "rationale": "real parity defect, fixed by first-render tag activation; preserved as an executable regression via the shared source-linked driver",
+                    "family_links": [
+                        "fam-first-render-tag-stability"
+                    ]
+                },
+                {
+                    "id": "claim-parity-a3",
+                    "content_digest": "7fe89f4bbd70ca95d420050bc33a639f8138618dfff28b17327b25a3099a8f18",
+                    "disposition": "executable_fixed_regression",
+                    "rationale": "real parity defect (aged ctx_reduce prefix survival), fixed by the same first-render tag activation; same root cause as parity A1",
+                    "family_links": [
+                        "fam-first-render-tag-stability"
+                    ]
+                },
+                {
+                    "id": "claim-parity-b9",
+                    "content_digest": "834c804874dae10de60840fe3ca4cf37330acd21169818adc09f54f8fab12e03",
+                    "disposition": "historical_harness_gap",
+                    "rationale": "producer unavailable in the hermetic Rust stack; the current hermetic Broca successor (tests/rust-historian-producer.test.ts) supplies publish coverage without relabeling the gap as a product defect",
+                    "family_links": [
+                        "fam-parity-harness-gaps"
+                    ]
+                },
+                {
+                    "id": "claim-parity-b10",
+                    "content_digest": "0fc3ec2650fd64835b8fb03f31ad7836e20a7c9952276040078de958f1f5982b",
+                    "disposition": "test_assumption",
+                    "rationale": "the original setup wrote TS context.db memories that Rust module authority correctly rejects; corrected coverage writes through public ctx_memory",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-parity-b11",
+                    "content_digest": "b00822ada118d49732b9efeaebb6d4a30d90a3456ccfc8d48734b2bd65366868",
+                    "disposition": "test_assumption",
+                    "rationale": "the original setup mutated module-owned rows in TS SQLite; corrected coverage drives ctx_memory and provider-visible bytes",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-parity-b12",
+                    "content_digest": "974ee7f56a985c099fc239577b472a7eee06fed2736af556451e5df74c5092db",
+                    "disposition": "test_assumption",
+                    "rationale": "the TS project_state mirror is not the effective Rust epoch; the module unit test owns the authoritative epoch-fold assertion",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-parity-todo-1",
+                    "content_digest": "07bd58e7ae936f7051bec4f8c146f037f658575e036ebc8ed6a90de5d8f9c676",
+                    "disposition": "executable_known_defect",
+                    "rationale": "provider request lacks the synthetic todowrite pair after Rust captured last_todo_state; retained red",
+                    "family_links": [
+                        "fam-synthetic-todo-handoff"
+                    ]
+                },
+                {
+                    "id": "claim-parity-todo-2",
+                    "content_digest": "a9c879be80dca7a10270ba2481476e3128ae7daea7e469f8300e6fbc8b975315",
+                    "disposition": "executable_known_defect",
+                    "rationale": "byte-identical defer replay is blocked on the same missing synthetic pair as Todo 1; retained red",
+                    "family_links": [
+                        "fam-synthetic-todo-handoff"
+                    ]
+                },
+                {
+                    "id": "claim-parity-todo-3",
+                    "content_digest": "22b1134ed5c809d6940e28a810bac3c69814016193a72f534d293d798488fe87",
+                    "disposition": "executable_known_defect",
+                    "rationale": "newer-real-todo deferral cannot establish its precondition while the frozen pair is absent; retained red",
+                    "family_links": [
+                        "fam-synthetic-todo-handoff"
+                    ]
+                },
+                {
+                    "id": "claim-parity-todo-4",
+                    "content_digest": "cceb976d3f69e1612d551b97369a2f4860ff93cb6c82db47c320dc1de26ed250",
+                    "disposition": "executable_known_defect",
+                    "rationale": "legacy empty-state anchor does not become a provider-visible Rust synthetic pair; retained red",
+                    "family_links": [
+                        "fam-synthetic-todo-handoff"
+                    ]
+                },
+                {
+                    "id": "claim-parity-todo-5",
+                    "content_digest": "bdfe79c08a7691e8be2c6537ac43a9e0066d465bff2fe9045f3d101786df2dda",
+                    "disposition": "executable_known_defect",
+                    "rationale": "terminal-state clearing cannot be distinguished from never injecting while the active pair is absent; retained red",
+                    "family_links": [
+                        "fam-synthetic-todo-handoff"
+                    ]
+                },
+                {
+                    "id": "claim-parity-thinking-a",
+                    "content_digest": "3a167a25087262f072bb43f9152e78ccd704a24b9540c4a7b24392fa403e2400",
+                    "disposition": "test_assumption",
+                    "rationale": "PARITY.md defines Rust historical reasoning as cleared, not signature-preserving; the corrected per-mode assertions are in the shared thinking-block driver",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-parity-thinking-b",
+                    "content_digest": "21ae15253694274f8018c39cff0996fd4e0d1dc1310ce64b551697d13a90f251",
+                    "disposition": "test_assumption",
+                    "rationale": "direct TS tag mutation does not move module-owned drop state; corrected coverage issues a real ctx_reduce",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-parity-thinking-c",
+                    "content_digest": "55dd6f7b8a7968a36f608fecd5bd16b204965840f011acbe431066ffe35d5b22",
+                    "disposition": "test_assumption",
+                    "rationale": "same invalid TS-side tag mutation as Thinking B; corrected coverage resolves the public tag handle and issues ctx_reduce",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-parity-long-running-composite",
+                    "content_digest": "4cdfcf78dace84211f3b08a0198f26e6a1ea0f63dcffb4fcabd3e590fbaed2f3",
+                    "disposition": "historical_harness_gap",
+                    "rationale": "the 23-turn composite requires a historian publish the hermetic stack could not produce; successor coverage exists in module and fold-gated suites without relabeling the gap",
+                    "family_links": [
+                        "fam-parity-harness-gaps"
+                    ]
+                },
+                {
+                    "id": "claim-parity-first-turn-memory-injection-timeout",
+                    "content_digest": "61945aef4f7d375025e2eca918a8e99885e6d67d2584f937bc9661ebef7ef291",
+                    "disposition": "test_assumption",
+                    "rationale": "the poll predicate watched TS tag rows for module-owned state; corrected coverage writes through ctx_memory and asserts the first provider request",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-thinking-block-adjudication",
+            "source_path": "packages/e2e-tests/mutations/thinking-block-adjudication.md",
+            "content_digest": "f3a5f484a201a2c8f828bd568c25f34d47b7b3881c589bd0bc86e3445d878274",
+            "claims": [
+                {
+                    "id": "claim-thinking-block-flake",
+                    "content_digest": "f3a5f484a201a2c8f828bd568c25f34d47b7b3881c589bd0bc86e3445d878274",
+                    "disposition": "historical_harness_gap",
+                    "rationale": "17/3 serial flake caused by the auto-search hint racing the FTS index; test-scoping fix (auto_search disabled) with a 12/12 green successor preserved via the shared thinking-block driver",
+                    "family_links": [
+                        "fam-thinking-block-flake"
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "src-pi-todo-declared-red-suite",
+            "source_path": "packages/e2e-tests/incidents/pi-todo-provenance.md",
+            "content_digest": "8912e33646c0b6a39bf6c440d8862a61230537fa8cc511468c24f171c75b99a7",
+            "claims": [
+                {
+                    "id": "claim-pi-todo-synthesis-gap",
+                    "content_digest": "8912e33646c0b6a39bf6c440d8862a61230537fa8cc511468c24f171c75b99a7",
+                    "disposition": "executable_known_defect",
+                    "rationale": "U6 preserves every declared-red Pi assertion in four live incident variants outside the Pi green selection; current passing observations remain resolution candidates until reviewed adjudication",
+                    "family_links": [
+                        "fam-pi-todo-gap"
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "src-bead-magic-context-x4l-9",
+            "source_path": "bead:magic-context-x4l.9",
+            "content_digest": "7ca18e2cada0acfdbbdbdecb46081878812198d419c2040570c93451b60143d1",
+            "claims": [
+                {
+                    "id": "claim-bead-wrong-dreamer-archival",
+                    "content_digest": "5c1a9ee0aca2d71aed232eb7dcb20946a95edfe55a8234ef3a24008a922262c0",
+                    "disposition": "unsupported",
+                    "rationale": "missing evidence: no demonstrated wrong-archival incident exists in the named sources, only bead wording and verify-prompt.ts risk language; revisit with x4l.12/x4l.16 evidence",
+                    "family_links": [
+                        "fam-wrong-dreamer-archival"
+                    ]
+                },
+                {
+                    "id": "claim-bead-historian-inconsistent-state",
+                    "content_digest": "3ea3b0391d9111055714c4eba97a276057ffff8e04b2f207a8c251037016e19b",
+                    "disposition": "unsupported",
+                    "rationale": "missing evidence: the bead wording beside A28 attaches no demonstrated inconsistent-state failure; record the provenance mismatch and revisit when one is attached",
+                    "family_links": [
+                        "fam-historian-inconsistent-state"
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-oc-1",
+            "source_path": "packages/e2e-tests/mutations/fm-oc-1.json",
+            "content_digest": "689cd7bab49d7768da4c079cb53c5312a3219294c80b476375b8436a1fb5aa93",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-oc-1-rung-swap",
+                    "content_digest": "161cd71cca214e4a5ccfa970b008f0ec159d8c23bee3a16c0430029550b64fee",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-oc-1-rung-deletion",
+                    "content_digest": "32f65a2c79da39617a3e6793fa71915d4f601ef57403dc4307125975464ee34f",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-oc-2",
+            "source_path": "packages/e2e-tests/mutations/fm-oc-2.json",
+            "content_digest": "5aa92dd02fa7ecb4ae9c624b420036aab5cdf3af659e902835ba9bc69bde01a6",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-oc-2-rung-swap",
+                    "content_digest": "7791cfd23441f92c192821e6f10d770df0c5d1e73e55f266e965133cbf5cad80",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-oc-2-rung-deletion",
+                    "content_digest": "9b49cc6c55e3443e6adf3b49bd7e9744558c08e486c278edad32b731586c4f0f",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-oc-3",
+            "source_path": "packages/e2e-tests/mutations/fm-oc-3.json",
+            "content_digest": "00255cea1f70110403fe3b83db80df357c956f39ff8d67782d4a24bfbedb50dd",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-oc-3-rung-swap",
+                    "content_digest": "8c673a8700f56b93bde8115cc3b41758e54e987be4587f6f8289b9761b801dae",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-oc-3-rung-deletion",
+                    "content_digest": "b399ed408f4aafa8dbd2a647777b3c10770b1f0803c4577b88f2b79d4ec9e311",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-oc-4",
+            "source_path": "packages/e2e-tests/mutations/fm-oc-4.json",
+            "content_digest": "3d0bc881d181e04741efe8875b8c161a46128ae1905154ae1e6de7a83df154af",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-oc-4-rung-swap",
+                    "content_digest": "c614b57cbd99a234e6aa604d20f26744391d596609577f7028efae2dd0946115",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-oc-4-rung-deletion",
+                    "content_digest": "0920723c4d384d006ff55a3aa8ed197aba80206bd914d7e0260c6a447718261d",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-oc-5",
+            "source_path": "packages/e2e-tests/mutations/fm-oc-5.json",
+            "content_digest": "cfc111561a472eb04c0481c2ba770966eed343ffb87a44c6fa3b821187397d18",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-oc-5-rung-swap",
+                    "content_digest": "94ecdeffcdcca5cd150503ee3ab827859c0ebb911536edf9c2ab8bcaac6a11e3",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-oc-5-rung-deletion",
+                    "content_digest": "9508e80d8a37ad7200944cc1fb089d41efdde6305392d5d12e89a11d74fea699",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-oc-6",
+            "source_path": "packages/e2e-tests/mutations/fm-oc-6.json",
+            "content_digest": "1d91014e6264621b90f3426688aa71f1be0105174f317ee3e6aad4313d93747e",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-oc-6-rung-swap",
+                    "content_digest": "2625564521cc5f43e60d200a12150eeecead21ba967fbf446fe9456476239c0f",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-oc-6-rung-deletion",
+                    "content_digest": "1f787e8cd64b7fa60dc048b207c0eea7e33e1b0ab2f88b0639a4dcf9e8a9ace0",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-pi-1",
+            "source_path": "packages/e2e-tests/mutations/fm-pi-1.json",
+            "content_digest": "1e5d0e46f40e78c6ddda1573b5f1ff7bd99ab23638fad7bce2135ff1bc1baaeb",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-pi-1-mutate-rung-swap",
+                    "content_digest": "f87d196ffb3519d20d6058b26f98d7eaedfdb29e69b2b6e4fb41081460dbbe4b",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-pi-1-mutate-rung-deletion",
+                    "content_digest": "1715790523ef974ef9a56f70caaf800145b61f9e2262cea7c5e8816c3d2f86d3",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-fm-pi-4",
+            "source_path": "packages/e2e-tests/mutations/fm-pi-4.json",
+            "content_digest": "e3ffdc4a8986c5881abdeb423060d08e57473d39a3a4ac3d8f76bef88fbf8243",
+            "claims": [
+                {
+                    "id": "claim-mutation-fm-pi-4-mutate-rung-swap",
+                    "content_digest": "424ab38b51cac71e4f4f32e7b886d21ed60de83ec5d47fd73ee4f5eca40495c9",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                },
+                {
+                    "id": "claim-mutation-fm-pi-4-mutate-rung-deletion",
+                    "content_digest": "1c3401b408741af34c5813f250e09196186031dbe46d9c0f456ec8167248ae88",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-goldens-dg-1",
+            "source_path": "packages/e2e-tests/mutations/goldens-dg-1.json",
+            "content_digest": "3460cfe3cfa31ef3a4576235ac24fba0b36d9372804fd941a9c7ab6d239b52af",
+            "claims": [
+                {
+                    "id": "claim-mutation-dg-1-one-byte-input",
+                    "content_digest": "699b8ecac7c032dc22cf933fd15444210e377f780c5f6dea1a6dcbed241378ea",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-goldens-dg-2",
+            "source_path": "packages/e2e-tests/mutations/goldens-dg-2.json",
+            "content_digest": "f8b7e04765f428b159fa21306fa6e70b7918a92309537b67af1a6cc6a5b69eda",
+            "claims": [
+                {
+                    "id": "claim-mutation-dg-2-one-byte-input",
+                    "content_digest": "3752ddfbb41b864bb06fcb04cc19750ff3a62e9a5ed23dfb86f8885d6d15b0d1",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-goldens-dg-3",
+            "source_path": "packages/e2e-tests/mutations/goldens-dg-3.json",
+            "content_digest": "155c8ec37fb0be2d906a0000e2671d5e473106ae70b02b0cfb0d1ee8e28f7c41",
+            "claims": [
+                {
+                    "id": "claim-mutation-dg-3-one-byte-input",
+                    "content_digest": "ef2002c55f0e79da2d971cf5bac4d76864189989f8fa5dcd8c23571b0073f047",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-rust-ctx-reduce-roundtrip",
+            "source_path": "packages/e2e-tests/mutations/rust-ctx-reduce-roundtrip.json",
+            "content_digest": "caa3fe45dcc88ba38a238a62acdca67411102b31b0f370e820e3254059599766",
+            "claims": [
+                {
+                    "id": "claim-mutation-ctx-reduce-unknown-target",
+                    "content_digest": "dd23e7e078dc72c8de534efe62fff6ff24b79192e01b84e11e0c7ec98e0d965f",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        },
+        {
+            "id": "src-mutation-rust-historian-producer",
+            "source_path": "packages/e2e-tests/mutations/rust-historian-producer.json",
+            "content_digest": "de87b529e70052aa024ec72c0081e524be37c960a7c925f0d6185d07deeba099",
+            "claims": [
+                {
+                    "id": "claim-mutation-rust-historian-typed-failure",
+                    "content_digest": "539fd6d9eadfac485220faf7fa2f448baea1444d19273a745a590605873e68c5",
+                    "disposition": "verifier_evidence",
+                    "rationale": "committed mutation record: crafted invalid state observed red and reverted rerun observed green against its bound verifier",
+                    "family_links": []
+                }
+            ]
+        }
+    ]
+}

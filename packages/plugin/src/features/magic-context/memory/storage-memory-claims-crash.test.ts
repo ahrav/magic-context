@@ -668,6 +668,7 @@ function evidenceReport(
             "No torn-write claim.",
             "No storage-controller-cache claim.",
             "No exactly-once external delivery claim.",
+            "Single-host evidence: covers only the recorded environment (OS, architecture, runtime and SQLite versions); no cross-platform claim.",
         ],
     };
 }

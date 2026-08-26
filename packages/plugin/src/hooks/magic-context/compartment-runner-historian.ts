@@ -117,6 +117,7 @@ export async function runValidatedHistorianPass(args: {
      */
     fallbackModels?: readonly string[];
     callbacks?: HistorianProgressCallbacks;
+    responseDumpObserver?: (dumpPath: string) => void;
     /** When true, run a second editor pass after successful historian output
      *  to clean low-signal U: lines and cross-compartment duplicates. If editor
      *  validation fails, falls back to the draft (first-pass) result. */
@@ -247,6 +248,7 @@ async function runEditorPassOrFallback(args: {
     draftValidation: ValidatedHistorianPassResult;
     draftDumpPath?: string;
     draftInvocationId?: number | null;
+    responseDumpObserver?: (dumpPath: string) => void;
 }): Promise<ValidatedHistorianPassResult> {
     shared.sessionLog(args.parentSessionId, "historian two-pass: running editor on draft");
     const editorRun = await runHistorianPrompt({
@@ -259,6 +261,7 @@ async function runEditorPassOrFallback(args: {
         dumpLabel: `${args.dumpLabelBase}-editor`,
         agentId: HISTORIAN_EDITOR_AGENT,
         parentInvocationId: args.draftInvocationId ?? null,
+        responseDumpObserver: args.responseDumpObserver,
     });
 
     if (!editorRun.ok || !editorRun.result) {
@@ -307,6 +310,7 @@ async function runHistorianPrompt(args: {
     fallbackModels?: readonly string[];
     subagentKind?: SubagentKind;
     parentInvocationId?: number | null;
+    responseDumpObserver?: (dumpPath: string) => void;
 }): Promise<HistorianRunResult> {
     const {
         client,
@@ -321,6 +325,7 @@ async function runHistorianPrompt(args: {
         fallbackModels,
         subagentKind,
         parentInvocationId,
+        responseDumpObserver,
     } = args;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
@@ -475,6 +480,19 @@ async function runHistorianPrompt(args: {
             dumpLabel ?? "historian-response",
             result,
         );
+        if (dumpPath) {
+            try {
+                responseDumpObserver?.(dumpPath);
+            } catch (observerError: unknown) {
+                // The dump is already durably written and the model output is
+                // valid; an observer fault must not be reported as a historian
+                // failure, which would discard the result and force fallback.
+                shared.sessionLog(
+                    parentSessionId,
+                    `historian response dump observer failed: ${describeError(observerError).brief}`,
+                );
+            }
+        }
         outcomeOk = true;
         return { ok: true, result, dumpPath, invocationId: invocationId ?? undefined };
     } catch (modelError: unknown) {
@@ -543,6 +561,7 @@ async function runFallbackHistorianPass(args: {
     fallbackModelId?: string;
     callbacks?: HistorianProgressCallbacks;
     agentId?: string;
+    responseDumpObserver?: (dumpPath: string) => void;
     error: string;
     dumpPaths: Array<string | undefined>;
 }): Promise<ValidatedHistorianPassResult> {
@@ -590,6 +609,7 @@ async function runFallbackHistorianPass(args: {
             dumpLabel: `${args.dumpLabelBase}-fallback-${i + 1}`,
             modelOverride,
             agentId: args.agentId,
+            responseDumpObserver: args.responseDumpObserver,
         });
         if (!fallbackRun.ok || !fallbackRun.result) {
             lastError = fallbackRun.error ?? lastError;
