@@ -129,7 +129,11 @@ jobs:
       - name: Source-build transport, host, addon, and iceoryx
         run: |
           cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
+          cargo build -p mc-module --bin ck-mc-host
           cargo check -p mc-shm-transport --features iceoryx
+
+      - name: Native lifecycle binary contract
+        run: cargo test -p mc-module --test lifecycle_cli
 
       - name: Rust contracts and lifecycle (Linux)
         if: runner.os == 'Linux'

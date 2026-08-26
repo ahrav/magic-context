@@ -59,7 +59,7 @@
       "version": "0.38.0"
     }
   ],
-  "production_inputs_lock_sha256": "5348c49b7041a2e4db3179ca00caa3e0a0c8b57edecf8edb1913fd620e38442a",
+  "production_inputs_lock_sha256": "2359e7efe026b1e91e28373d0de2086bdd3d5484bcd2e7c4527b5659a3d52d5c",
   "production_qualified": false,
   "publication": {
     "order": [

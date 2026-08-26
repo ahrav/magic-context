@@ -32,7 +32,11 @@ const tempRoots: string[] = [];
 function freshRoot(): string {
     const root = mkdtempSync(join(tmpdir(), "mc-host-release-"));
     tempRoots.push(root);
-    cpSync(join(repoRoot, REGISTRY_GATE_PATH), join(root, REGISTRY_GATE_PATH));
+    mkdirSync(join(root, dirname(REGISTRY_GATE_PATH)), { recursive: true });
+    writeFileSync(
+        join(root, REGISTRY_GATE_PATH),
+        `${JSON.stringify(gateCopy(), null, 2)}\n`,
+    );
     return root;
 }
 
@@ -50,7 +54,17 @@ function contractCopy(): any {
 
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the gate
 function gateCopy(): any {
-    return JSON.parse(readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8"));
+    const gate = JSON.parse(readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8"));
+    for (const pkg of gate.packages) {
+        pkg.ownership_verified = true;
+        pkg.trusted_publisher_configured = true;
+        pkg.synchronized_version_unpublished = true;
+        if (pkg.kind === "payload") {
+            pkg.reservation_version = "0.0.1";
+            pkg.bootstrap_credential_revoked = true;
+        }
+    }
+    return gate;
 }
 
 describe("deterministic generation", () => {
@@ -69,7 +83,12 @@ describe("deterministic generation", () => {
     });
 
     test("committed outputs match a clean regeneration (--check green)", () => {
-        const result = generate(repoRoot, { check: true });
+        const root = freshRoot();
+        for (const relative of Object.values(OUTPUT_PATHS)) {
+            mkdirSync(dirname(join(root, relative)), { recursive: true });
+            cpSync(join(repoRoot, relative), join(root, relative));
+        }
+        const result = generate(root, { check: true });
         expect(result.drift).toEqual([]);
     });
 
@@ -274,8 +293,14 @@ describe("pre-build schema", () => {
 });
 
 describe("registry gate", () => {
-    test("the committed gate passes", () => {
+    test("a synthetic complete gate passes while the committed gate stays fail-closed", () => {
         validateRegistryGate(gateCopy(), buildContract());
+        const committed = JSON.parse(
+            readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8"),
+        );
+        expect(() => validateRegistryGate(committed, buildContract())).toThrow(
+            /is not unpublished|ownership not verified/,
+        );
     });
 
     test("generation fails when the gate file is absent", () => {
