@@ -14,7 +14,7 @@ import { dirname, join, resolve } from "node:path";
 import { initializeIsolatedContextDb } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
 import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
-import { isSecretEnvKey } from "../secret-env-keys";
+import { isSensitiveEnvKey } from "../secret-env-keys";
 import {
     buildDirectHostFixture,
     detectRustModePrereqs,
@@ -428,8 +428,10 @@ function isInheritableEnvKey(key: string): boolean {
     // needs a credential passes it through `extraEnv`, where
     // `assertSecretsBoundToLoopback` governs it. Dropping them here is what
     // makes that guard total, by leaving `extraEnv` as the only channel a caller
-    // secret can arrive on.
-    if (isSecretEnvKey(key)) return false;
+    // secret can arrive on. The predicate covers vendor-prefixed names as well as
+    // secret-shaped suffixes, so `OPENAI_KEY` and `GCP_SA_KEY` are dropped too;
+    // `assertSafeExtraEnv` shares that one definition.
+    if (isSensitiveEnvKey(key)) return false;
     return true;
 }
 
@@ -473,7 +475,7 @@ function assertSecretsBoundToLoopback(
     hostname: ServeHostname,
 ): void {
     if (hostname === "127.0.0.1" || resolvedOpts.allowSecretEnvOffLoopback) return;
-    const secretKeys = Object.keys(resolvedOpts.extraEnv ?? {}).filter(isSecretEnvKey);
+    const secretKeys = Object.keys(resolvedOpts.extraEnv ?? {}).filter(isSensitiveEnvKey);
     if (secretKeys.length === 0) return;
     throw new Error(
         `refusing to bind the unauthenticated serve API to ${hostname} while extraEnv carries ` +

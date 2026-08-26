@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
-import { isSecretEnvKey } from "../secret-env-keys";
+import { isSensitiveEnvKey } from "../secret-env-keys";
 import {
     CHECK_ID_RE,
     EXECUTABLE_LANES,
@@ -789,10 +789,7 @@ export function assertSafeExtraEnv(extraEnv: Record<string, string>): void {
             key.startsWith("XDG_") ||
             ISOLATION_ENV_KEYS.has(key) ||
             /PROXY/i.test(key) ||
-            /^(?:AWS|AZURE|GOOGLE|GCP|OPENAI|ANTHROPIC|COHERE|HUGGINGFACE|SSH)_/i.test(
-                key,
-            ) ||
-            isSecretEnvKey(key);
+            isSensitiveEnvKey(key);
         if (unsafe) {
             throw new Error(`unsafe incident case extraEnv key ${key}`);
         }

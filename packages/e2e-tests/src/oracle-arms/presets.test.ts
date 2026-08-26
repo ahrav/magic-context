@@ -161,6 +161,13 @@ describe("oracle arm presets", () => {
             "AWS_SESSION_TOKEN",
             "GH_COOKIE",
             "SSH_AUTH_SOCK",
+            // Vendor-prefixed names carrying no secret-shaped word. These match
+            // none of API_KEY, ACCESS_KEY, or PRIVATE_KEY, so a suffix-only rule
+            // would forward them.
+            "OPENAI_KEY",
+            "GCP_SA_KEY",
+            "SSH_KEY",
+            "ANTHROPIC_BASE_URL",
         ]) {
             expect(isInheritableEnvKey(key)).toBe(false);
         }
