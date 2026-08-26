@@ -1160,12 +1160,17 @@ export async function driveEmbeddingFreshness(
         // an embedding was REQUESTED, not that the returned vector was
         // persisted, and a single-row search can satisfy the fresh/stale query
         // assertions with a merely favorable wrong vector. Compare against the
-        // deterministic embedding of the edited content and require the same
-        // model, so durable embedding provenance is what is asserted.
+        // deterministic embedding of the edited content, and tie the persisted
+        // identity to the CONFIGURED model rather than only to the seed row —
+        // agreement between two rows written under the same wrong identity is
+        // not provenance. Containment rather than equality because the stored
+        // identity may be composite; the point is that an unrelated model
+        // cannot satisfy it.
         const vectorReplacedBySearchTime =
             finalVector !== null &&
             vectorsRoughlyEqual(finalVector.vector, newVector) &&
-            finalVector.modelId === seeded.modelId;
+            finalVector.modelId === seeded.modelId &&
+            finalVector.modelId.includes(fixture.embeddingModel);
 
         return {
             kind: "a32-embedding-freshness",
