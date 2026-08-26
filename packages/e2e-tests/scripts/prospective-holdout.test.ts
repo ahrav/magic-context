@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint, canonicalJson } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -11,10 +11,13 @@ import {
     type JudgmentEvent,
 } from "../src/prospective-holdout/adjudication";
 import { buildBlindedPacket } from "../src/prospective-holdout/blinding";
-import type { CohortCloseManifest } from "../src/prospective-holdout/contract";
+import type { CohortCloseManifest, ReleaseFreezeManifest } from "../src/prospective-holdout/contract";
+import { rowDigest } from "../src/incident-pool/history";
+import type { PairedCaseFact } from "../src/prospective-holdout/comparison";
+import { buildGraduationCandidate, type GraduationCandidate } from "../src/prospective-holdout/graduation";
 import { appendLifecycleEvent, parseLifecycleLedger } from "../src/prospective-holdout/lifecycle";
 import { LOCK_LEASE_MS, LOCK_OWNER_FILE } from "../src/prospective-holdout/lock";
-import { buildProspectiveReport, type ReportRecomputers } from "../src/prospective-holdout/report";
+import { buildProspectiveReport, type ProspectiveReport, type ReportRecomputers } from "../src/prospective-holdout/report";
 import { publishClose, publishFreeze } from "../src/prospective-holdout/freeze";
 import { cellResultFixture, closeManifest, deadPid, freezeManifest, H1, H2, readyPolicies } from "../src/prospective-holdout/test-fixtures";
 import { runProspectiveHoldoutCli } from "./prospective-holdout";
@@ -49,7 +52,10 @@ export const scorecard = {
 /** Authenticates the judgment chain a subjective cohort's adjudication close commits to. */
 const ADJUDICATION_KEY = new TextEncoder().encode("a".repeat(32));
 
-type EpochTerminalState = "cohort-closed" | "running" | "reported" | "insufficient-evidence";
+type EpochTerminalState = "cohort-closed" | "running" | "reported" | "insufficient-evidence" | "graduated";
+
+/** Incident bytes a constructor-built candidate carries: no path, identifier, or secret. */
+const CLEAN_INCIDENT_BYTES = { scenario: "synthetic-current-state", expected: "pass" };
 
 interface RepositoryOptions {
     sufficient?: boolean;
@@ -63,6 +69,81 @@ interface RepositoryOptions {
     subjective?: boolean;
     /** Approver stamped onto the adjudication close in place of the independent one. */
     adjudicationApprover?: string;
+    /**
+     * Instant the cohort close manifest declares. A value after the `cohort-closed` event's
+     * `occurredAt` describes a cohort the ledger claims closed before the manifest fixed it.
+     */
+    closedAt?: string;
+    /** Incident bytes stamped into the installed graduation candidate. */
+    incidentBytes?: unknown;
+}
+
+/**
+ * Restamps the cohort close at a different instant. The approvals carry the body's fingerprint,
+ * so they are re-derived: `parseCloseManifest` rejects a stale subject, and an installed
+ * manifest therefore reaches the load path with approvers bound to whatever instant it declares.
+ */
+function closeManifestAt(
+    freeze: ReleaseFreezeManifest,
+    options: { subjective: boolean; closedAt?: string },
+): CohortCloseManifest {
+    const base = closeManifest(freeze, { subjective: options.subjective });
+    if (options.closedAt === undefined) return base;
+    const body = { ...base.body, closedAt: options.closedAt };
+    const subjectFingerprint = canonicalFingerprint(body);
+    return {
+        ...base,
+        body,
+        approvals: base.approvals.map((approval) => ({ ...approval, subjectFingerprint })),
+    };
+}
+
+/**
+ * Mints a graduation candidate through the real constructor, then restates it around the
+ * incident bytes it should carry. Restating re-derives the source fingerprint and the second
+ * privacy approval's subject, so every binding the load path recomputes agrees with the bytes
+ * present: bytes the constructor refuses to stamp still arrive self-consistent, which is what
+ * an artifact installed directly into the tree looks like. Clean bytes restate to the
+ * constructor's own output.
+ */
+function graduationCandidate(
+    close: { manifest: CohortCloseManifest; manifestFingerprint: string },
+    report: ProspectiveReport,
+    pairs: readonly PairedCaseFact[],
+    incidentBytes: unknown,
+): GraduationCandidate {
+    const candidate = buildGraduationCandidate({
+        close: close.manifest,
+        trustedCloseFingerprint: close.manifestFingerprint,
+        report,
+        pairs,
+        incidentBytes: CLEAN_INCIDENT_BYTES,
+        semanticRevisionId: "rev-first",
+        secondPrivacyApproval: {
+            approver: "privacy-reviewer",
+            subjectFingerprint: canonicalFingerprint({
+                epochId: close.manifest.body.epochId,
+                caseId: close.manifest.body.cases[0]!.caseId,
+                closeManifestFingerprint: close.manifestFingerprint,
+                incidentBytesFingerprint: canonicalFingerprint(CLEAN_INCIDENT_BYTES),
+            }),
+        },
+    });
+    const incidentBytesFingerprint = canonicalFingerprint(incidentBytes);
+    const source = {
+        ...candidate.source,
+        incident_bytes_fingerprint: incidentBytesFingerprint,
+        second_privacy_approval: {
+            approver: candidate.source.second_privacy_approval.approver,
+            subject_fingerprint: canonicalFingerprint({
+                epochId: candidate.source.epoch_id,
+                caseId: candidate.source.case_id,
+                closeManifestFingerprint: candidate.source.close_manifest_fingerprint,
+                incidentBytesFingerprint,
+            }),
+        },
+    };
+    return { ...candidate, source, sourceFingerprint: rowDigest(source), incidentBytes };
 }
 
 /**
@@ -111,7 +192,10 @@ function subjectiveAdjudicationClose(
 function completeRepository(root: string, options: RepositoryOptions = {}): ReportRecomputers {
     const terminal: EpochTerminalState = options.lifecycleState ?? "reported";
     const reachedRunning = terminal !== "cohort-closed";
-    const reportState = terminal === "reported" || terminal === "insufficient-evidence" ? terminal : null;
+    // Graduation follows a report, so a graduated ledger carries the reported event too.
+    const reportState = terminal === "reported" || terminal === "insufficient-evidence"
+        ? terminal
+        : terminal === "graduated" ? "reported" : null;
     const holdout = join(root, "prospective-holdout");
     const epoch = join(holdout, "epochs", "epoch-test-release");
     mkdirSync(join(holdout, "policies"), { recursive: true });
@@ -121,7 +205,10 @@ function completeRepository(root: string, options: RepositoryOptions = {}): Repo
     writeJson(join(holdout, "policies", "scorecard-policy.json"), policies.scorecard);
     const freeze = publishFreeze(freezeManifest(), join(epoch, "freeze"), policies);
     const close = publishClose(
-        closeManifest(freeze.manifest, { subjective: options.subjective ?? false }),
+        closeManifestAt(freeze.manifest, {
+            subjective: options.subjective ?? false,
+            closedAt: options.closedAt,
+        }),
         join(epoch, "close"),
         freeze,
     );
@@ -183,6 +270,18 @@ function completeRepository(root: string, options: RepositoryOptions = {}): Repo
         invalidated: false,
     });
     if (report) writeJson(join(epoch, "report.json"), report);
+    let graduationFingerprint: string | undefined;
+    if (report && terminal === "graduated") {
+        const candidate = graduationCandidate(
+            close,
+            report,
+            [pair],
+            options.incidentBytes ?? CLEAN_INCIDENT_BYTES,
+        );
+        mkdirSync(join(epoch, "graduation"), { recursive: true });
+        writeJson(join(epoch, "graduation", `${candidate.source.case_id}.json`), candidate);
+        graduationFingerprint = canonicalFingerprint([candidate]);
+    }
     let adjudication: AdjudicationClose | undefined;
     if (report && close.manifest.body.cases.some((entry) => entry.subjective)) {
         const independent = subjectiveAdjudicationClose(close, "reviewer-three");
@@ -237,6 +336,16 @@ function completeRepository(root: string, options: RepositoryOptions = {}): Repo
             state: reportState,
             occurredAt: "2026-09-09T00:00:00Z",
             artifactFingerprint: report.reportFingerprint,
+            reasonCode: null,
+            approvers: ["reviewer-one"],
+        });
+    }
+    if (graduationFingerprint) {
+        lifecycle = appendLifecycleEvent(lifecycle, {
+            epochId: freeze.manifest.body.epochId,
+            state: "graduated",
+            occurredAt: "2026-09-10T00:00:00Z",
+            artifactFingerprint: graduationFingerprint,
             reasonCode: null,
             approvers: ["reviewer-one"],
         });
@@ -358,6 +467,132 @@ describe("prospective holdout CLI", () => {
             expect(await validateRepository(root, recomputers)).toEqual({
                 code: 0,
                 messages: ["prospective-holdout valid epochs=1"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a cohort-closed event stamped before the close manifest's closedAt", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-close-before-manifest-"));
+        try {
+            // The event sits at the frozen intake cutoff while the manifest declares a later
+            // close, so the ledger reports a fixed cohort over a case set intake can still
+            // change, and every event after it inherits that claim.
+            const recomputers = completeRepository(root, {
+                lifecycleState: "cohort-closed",
+                closedAt: "2026-09-08T12:00:00Z",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["lifecycle.cohort-closed.occurredAt: before-cohort-close"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("validates a cohort-closed event stamped at the close manifest's closedAt", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-close-at-manifest-"));
+        try {
+            // The cohort is fixed at that instant, so equality is the legal boundary.
+            const recomputers = completeRepository(root, {
+                lifecycleState: "cohort-closed",
+                closedAt: "2026-09-08T00:00:00Z",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a symlink standing in for an expected epoch entry", async () => {
+        for (const entry of ["lifecycle.jsonl", "close"]) {
+            const root = mkdtempSync(join(tmpdir(), "holdout-cli-entry-symlink-"));
+            try {
+                const recomputers = completeRepository(root, { lifecycleState: "cohort-closed" });
+                // The artifact keeps the bytes it was published with and only its place in the
+                // epoch becomes a link. The readers open these names and follow whatever they
+                // resolve to, so the epoch would otherwise be validated against a target the
+                // reviewed tree does not hold.
+                const epoch = join(root, "prospective-holdout", "epochs", "epoch-test-release");
+                const outside = join(root, `outside-${entry}`);
+                renameSync(join(epoch, entry), outside);
+                symlinkSync(outside, join(epoch, entry));
+                expect(await validateRepository(root, recomputers)).toEqual({
+                    code: 1,
+                    messages: ["epoch: entry-not-regular"],
+                });
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        }
+    });
+
+    it("validates an epoch whose expected entries are all regular files and directories", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-entry-regular-"));
+        try {
+            // A subjective reported epoch owes every expected entry but the graduation
+            // directory: the freeze and close artifact directories plus four JSON or JSONL files.
+            const recomputers = completeRepository(root, { subjective: true });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects an installed graduation candidate carrying sensitive incident bytes", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-graduation-privacy-"));
+        try {
+            // The candidate's source and approval fingerprints agree with the bytes it carries,
+            // so nothing but a content scan separates it from a clean candidate.
+            const recomputers = completeRepository(root, {
+                lifecycleState: "graduated",
+                incidentBytes: { scenario: "/home/customer-x/notes.txt" },
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["graduation: privacy-rejected"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a symlink standing in for a graduation candidate file", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-graduation-symlink-"));
+        try {
+            const recomputers = completeRepository(root, { lifecycleState: "graduated" });
+            const directory = join(root, "prospective-holdout", "epochs", "epoch-test-release", "graduation");
+            const candidate = readdirSync(directory)[0]!;
+            const target = join(root, "outside-candidate.json");
+            renameSync(join(directory, candidate), target);
+            symlinkSync(target, join(directory, candidate), "file");
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["graduation: entry-not-regular"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("admits a clean installed graduation candidate past the privacy gate", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-graduation-clean-"));
+        try {
+            const recomputers = completeRepository(root, { lifecycleState: "graduated" });
+            // The scan, the parse, the source evidence, and cohort completeness all admit the
+            // candidate. The run reaches the first binding that reads the repository's incident
+            // pool, which an epoch root assembled under a temporary directory does not carry.
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["graduation.inventory: unreadable"],
             });
         } finally {
             rmSync(root, { recursive: true, force: true });

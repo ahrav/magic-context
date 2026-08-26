@@ -98,6 +98,29 @@ function requiredEvent(events: readonly LifecycleEvent[], state: LifecycleEvent[
     return events.find((event) => event.state === state);
 }
 
+/**
+ * Expected epoch entries that are artifact directories. Every other expected entry is a
+ * regular file, so one list carries the required type for the whole artifact set and a
+ * name added to the set cannot acquire an unstated type.
+ */
+const EPOCH_DIRECTORY_ENTRIES = new Set(["freeze", "close", "graduation"]);
+
+/**
+ * Reject an epoch entry whose type is not the one its name owes. `lstat` reports the entry
+ * itself rather than its target, so a symlink fails here instead of resolving: the readers
+ * open these names directly, and a link makes validation depend on mutable or unavailable
+ * state outside the reviewed tree. An absent entry is left to the reader that opens it,
+ * which already reports a missing artifact under its own diagnostic.
+ */
+function assertEpochEntryType(epochRoot: string, name: string): void {
+    const entry = lstatSync(join(epochRoot, name), { throwIfNoEntry: false });
+    if (!entry) return;
+    const requiresDirectory = EPOCH_DIRECTORY_ENTRIES.has(name);
+    if (entry.isSymbolicLink() || (requiresDirectory ? !entry.isDirectory() : !entry.isFile())) {
+        throw new HoldoutContractError(["epoch: entry-not-regular"]);
+    }
+}
+
 function pairedRetryLimit(rawPolicy: unknown): number {
     const policy = record(rawPolicy, "policy.analysis.policy");
     if (!Number.isSafeInteger(policy.pairedRetryLimit) || (policy.pairedRetryLimit as number) < 0) {
@@ -134,9 +157,20 @@ export function validateHoldoutRepository(
         if (!lstatSync(epochRoot).isDirectory() || lstatSync(epochRoot).isSymbolicLink()) {
             throw new HoldoutContractError(["epochs: irregular-entry"]);
         }
+        // Every reader below opens its artifact by name and follows whatever that name
+        // resolves to, so an entry is typed at the moment it becomes expected, ahead of the
+        // reader that opens it. Recording the expectation and enforcing the type in one step
+        // is what keeps the two from drifting as the artifact set grows.
+        const expectedEntries = new Set<string>();
+        const expectEntry = (name: string): void => {
+            expectedEntries.add(name);
+            assertEpochEntryType(epochRoot, name);
+        };
+        expectEntry("lifecycle.jsonl");
         const events = lifecycleFile(join(epochRoot, "lifecycle.jsonl"));
         const lifecycle = validateLifecycle(events, { epochId });
         validateTrustedLifecycle(trust, epochId, events);
+        expectEntry("freeze");
         const freeze = loadFreeze(
             join(epochRoot, "freeze"),
             trustedFingerprint(trust, epochId, "freeze"),
@@ -145,19 +179,29 @@ export function validateHoldoutRepository(
         if (events[0]!.artifactFingerprint !== freeze.manifestFingerprint) {
             throw new HoldoutContractError(["lifecycle: freeze-artifact-mismatch"]);
         }
-        const expectedEntries = new Set(["freeze", "lifecycle.jsonl"]);
         const closeEvent = requiredEvent(events, "cohort-closed");
         let close: ReturnType<typeof loadClose> | undefined;
         if (closeEvent || requiredEvent(events, "running") || requiredEvent(events, "reported") || requiredEvent(events, "insufficient-evidence") || requiredEvent(events, "graduated")) {
-            expectedEntries.add("close");
+            expectEntry("close");
             expectedTrustEntries.add(`${epochId}:close`);
             close = loadClose(
                 join(epochRoot, "close"),
                 trustedFingerprint(trust, epochId, "close"),
                 freeze,
             );
-            if (closeEvent && closeEvent.artifactFingerprint !== close.manifestFingerprint) {
-                throw new HoldoutContractError(["lifecycle: close-artifact-mismatch"]);
+            if (closeEvent) {
+                if (closeEvent.artifactFingerprint !== close.manifestFingerprint) {
+                    throw new HoldoutContractError(["lifecycle: close-artifact-mismatch"]);
+                }
+                // The manifest fixes the cohort at its own `closedAt`, so an event stamped
+                // before that instant claims a closed cohort the manifest does not yet
+                // describe, and comparison would begin against a case set intake can still
+                // change. Ledger order is monotonic in `occurredAt`, so bounding the close
+                // event bounds every event after it. The same instant is legal: the cohort is
+                // fixed at that point.
+                if (Date.parse(closeEvent.occurredAt) < Date.parse(close.manifest.body.closedAt)) {
+                    throw new HoldoutContractError(["lifecycle.cohort-closed.occurredAt: before-cohort-close"]);
+                }
             }
         }
         const runningEvent = requiredEvent(events, "running");
@@ -171,7 +215,7 @@ export function validateHoldoutRepository(
         );
         let outcomes: ProspectiveOutcomes = { attempts: [], aa: [] };
         if (reachedRunning) {
-            expectedEntries.add("outcomes.json");
+            expectEntry("outcomes.json");
             const raw = canonicalFile(join(epochRoot, "outcomes.json"), "outcomes");
             const violations = scanForSensitiveContent(raw);
             if (violations.length > 0) throw new HoldoutContractError(["outcomes: privacy-rejected"]);
@@ -184,7 +228,7 @@ export function validateHoldoutRepository(
         let report: ReturnType<typeof parseProspectiveReport> | undefined;
         let pairs: PairedCaseFact[] = [];
         if (reportEvent || requiredEvent(events, "graduated")) {
-            expectedEntries.add("report.json");
+            expectEntry("report.json");
             expectedTrustEntries.add(`${epochId}:report`);
             const raw = canonicalFile(join(epochRoot, "report.json"), "report");
             if (canonicalFingerprint(raw) !== trustedFingerprint(trust, epochId, "report")) {
@@ -218,7 +262,7 @@ export function validateHoldoutRepository(
                 throw new HoldoutContractError(["report: lifecycle-state-mismatch"]);
             }
             if (close.manifest.body.cases.some((entry) => entry.subjective)) {
-                expectedEntries.add("adjudication-close.json");
+                expectEntry("adjudication-close.json");
                 expectedTrustEntries.add(`${epochId}:adjudication-close`);
                 const adjudicationRaw = canonicalFile(join(epochRoot, "adjudication-close.json"), "adjudication-close");
                 if (canonicalFingerprint(adjudicationRaw) !== trustedFingerprint(trust, epochId, "adjudication-close")) {
@@ -251,7 +295,7 @@ export function validateHoldoutRepository(
         const graduatedEvent = requiredEvent(events, "graduated");
         if (graduatedEvent) {
             if (!close || !report) throw new HoldoutContractError(["graduation: prior-artifacts-missing"]);
-            expectedEntries.add("graduation");
+            expectEntry("graduation");
             const directory = join(epochRoot, "graduation");
             // Every other failure here carries a stable diagnostic code, so a ledger that
             // claims graduation without the directory must not surface as a raw ENOENT.
@@ -263,7 +307,21 @@ export function validateHoldoutRepository(
                 if (!/^case-[0-9a-f]{32}\.json$/.test(file)) {
                     throw new HoldoutContractError(["graduation: filename-invalid"]);
                 }
-                const candidate = parseGraduationCandidate(canonicalFile(join(directory, file), "graduation"));
+                // The epoch-level type gate covers `graduation` itself, not its contents, so a
+                // symlink named like a candidate would still be followed by the read below.
+                const entry = lstatSync(join(directory, file));
+                if (entry.isSymbolicLink() || !entry.isFile()) {
+                    throw new HoldoutContractError(["graduation: entry-not-regular"]);
+                }
+                const raw = canonicalFile(join(directory, file), "graduation");
+                // `buildGraduationCandidate` scans the bytes it stamps, so bytes installed
+                // straight into the tree are the only ones that reach a committed candidate
+                // unscanned. The scan precedes parsing because a candidate carrying a customer
+                // path, identifier, or secret is self-consistent as far as its source and
+                // approval fingerprints are concerned, and parsing would admit it.
+                const violations = scanForSensitiveContent(raw);
+                if (violations.length > 0) throw new HoldoutContractError(["graduation: privacy-rejected"]);
+                const candidate = parseGraduationCandidate(raw);
                 verifyProspectiveSourceEvidence(
                     candidate.source,
                     close!.manifest,
