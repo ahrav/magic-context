@@ -41,10 +41,17 @@ export function readyPolicies(): { analysis: PolicyOwnerDocument; scorecard: Pol
     };
 }
 
-export function freezeManifest(): ReleaseFreezeManifest {
+/**
+ * `epochId` names the epoch the freeze binds, so one repository can hold sibling epochs.
+ *
+ * The independent reviewer is disjoint from every approver `closeManifest` stamps: an actor
+ * attesting the release identities the epoch compares may not also attest the intake and
+ * admission boundary those releases are measured over.
+ */
+export function freezeManifest(options: { epochId?: string } = {}): ReleaseFreezeManifest {
     const policies = readyPolicies();
     const body: FreezeBody = {
-        epochId: "epoch-test-release",
+        epochId: options.epochId ?? "epoch-test-release",
         releases: [
             {
                 role: "release-n",
@@ -106,7 +113,7 @@ export function freezeManifest(): ReleaseFreezeManifest {
         body,
         approvals: [
             { kind: "release-operator", approver: "operator-one", subjectFingerprint },
-            { kind: "independent-review", approver: "reviewer-two", subjectFingerprint },
+            { kind: "independent-review", approver: "reviewer-five", subjectFingerprint },
         ],
     };
 }
@@ -237,25 +244,37 @@ export function cellResultFixture(
  * `subjective` marks the single admitted case as needing adjudication, which is the only
  * condition under which an epoch owes a trusted `adjudication-close.json`. Omitting it keeps
  * the manifest, and therefore its subject fingerprint, byte-identical to the objective cohort.
+ *
+ * `intakeIds` names the three dispositions the manifest carries. A repository holding more
+ * than one epoch needs a distinct set per epoch, because a disposition is terminal for the
+ * intake it names and no later cohort may claim that intake again.
  */
 export function closeManifest(
     freeze = freezeManifest(),
-    options: { subjective?: boolean } = {},
+    options: {
+        subjective?: boolean;
+        intakeIds?: { admitted: string; rejected: string; late: string };
+    } = {},
 ): CohortCloseManifest {
+    const intakeIds = options.intakeIds ?? {
+        admitted: `intake-${"d".repeat(32)}`,
+        rejected: `intake-${"b".repeat(32)}`,
+        late: `intake-${"c".repeat(32)}`,
+    };
     const body = {
         epochId: freeze.body.epochId,
         freezeManifestFingerprint: canonicalFingerprint(freeze),
         closedAt: "2026-09-08T00:00:00Z",
         cases: [{
-            intakeId: `intake-${"d".repeat(32)}`,
+            intakeId: intakeIds.admitted,
             caseId: `case-${"a".repeat(32)}`,
             caseCommitment: H1,
             familyId: "fam-context-loss",
             scenarioFingerprint: H2,
             subjective: options.subjective ?? false,
         }],
-        rejected: [{ intakeId: `intake-${"b".repeat(32)}`, reasonCode: "privacy-rejected" as const }],
-        late: [{ intakeId: `intake-${"c".repeat(32)}` }],
+        rejected: [{ intakeId: intakeIds.rejected, reasonCode: "privacy-rejected" as const }],
+        late: [{ intakeId: intakeIds.late }],
         aggregateCounts: { admitted: 1, rejected: 1, late: 1 },
         subjectiveMapCommitment: H3,
         retentionEvidenceFingerprint: H4,

@@ -151,6 +151,9 @@ export function validateHoldoutRepository(
     }
     const states: Record<string, string> = {};
     const expectedTrustEntries = new Set<string>();
+    // Every intake a closed cohort has already disposed of, accumulated across epochs.
+    // Iteration is sorted, so the epoch that first claims an intake is fixed.
+    const closedIntakeIds = new Set<string>();
     for (const epochId of epochNames) {
         expectedTrustEntries.add(`${epochId}:freeze`);
         expectedTrustEntries.add(`${epochId}:lifecycle`);
@@ -203,6 +206,28 @@ export function validateHoldoutRepository(
                 if (Date.parse(closeEvent.occurredAt) < Date.parse(close.manifest.body.closedAt)) {
                     throw new HoldoutContractError(["lifecycle.cohort-closed.occurredAt: before-cohort-close"]);
                 }
+            }
+        }
+        // Admitted, rejected, and late are the three dispositions a close manifest records,
+        // and each names the intake it disposed of, so every one of them is an intake this
+        // repository has already ruled on. `parseCloseManifest` keeps those ids unique inside
+        // one manifest and cannot see any other epoch, so an id already ruled on stays
+        // available to a later cohort: a report the tree admitted, refused, or timed out
+        // before a later freeze was published can be re-entered under that freeze and scored
+        // as though it arrived prospectively. Late ids are covered for exactly that reason —
+        // arriving after one cutoff is what places a report before the next freeze — and a
+        // genuine re-submission is a new intake carrying a new id, so nothing legitimate
+        // depends on reuse.
+        if (close) {
+            for (const intakeId of [
+                ...close.manifest.body.cases.map((entry) => entry.intakeId),
+                ...close.manifest.body.rejected.map((entry) => entry.intakeId),
+                ...close.manifest.body.late.map((entry) => entry.intakeId),
+            ]) {
+                if (closedIntakeIds.has(intakeId)) {
+                    throw new HoldoutContractError(["close.body.dispositions.intakeId: reused-across-epochs"]);
+                }
+                closedIntakeIds.add(intakeId);
             }
         }
         const runningEvent = requiredEvent(events, "running");
@@ -290,6 +315,16 @@ export function validateHoldoutRepository(
                 // The same instant is legal: the cohort is fixed at that point.
                 if (Date.parse(adjudicationClose.closedAt) < Date.parse(close.manifest.body.closedAt)) {
                     throw new HoldoutContractError(["adjudication-close.closedAt: before-cohort-close"]);
+                }
+                // The report scores the subjective verdicts this close seals, so a report
+                // produced before the seal scores judgments that were still open to change.
+                // Ledger ordering cannot reach this: the adjudication close is an artifact, not
+                // a lifecycle event, so nothing in the ledger names the instant it sealed. The
+                // event compared is whichever one carries the report, `reported` or
+                // `insufficient-evidence`. The same instant is legal: the judgments are sealed
+                // at that point.
+                if (reportEvent && Date.parse(reportEvent.occurredAt) < Date.parse(adjudicationClose.closedAt)) {
+                    throw new HoldoutContractError(["lifecycle.report.occurredAt: before-adjudication-close"]);
                 }
             }
         }
@@ -410,6 +445,29 @@ export function validateHoldoutRepository(
             }
             if (outcomes.attempts.length > 0 && expectedCells.size > 0) {
                 throw new HoldoutContractError(["outcomes: selected-matrix-incomplete"]);
+            }
+            // The check above deletes by cell identity while walking every attempt, so it
+            // aggregates a coordinate's two release roles across attempt numbers: arms committed
+            // under different attempts empty `expectedCells` between them and the epoch is
+            // accepted. A pair is only comparable within one attempt, so `buildPairedFacts`
+            // refuses such a coordinate — but that runs on the report path, after the cohort run
+            // is already paid for, which is the stranding the empty-attempts rule above exists to
+            // prevent. Requiring one attempt to hold both arms moves the refusal to the running
+            // epoch that produced the split.
+            //
+            // The code stays separate from `selected-matrix-incomplete` because the two name
+            // different defects with different remedies: that one reports a cell the run never
+            // produced, this one reports two cells that exist but were never run together. Folding
+            // them would leave an operator unable to tell which of the two the epoch owes.
+            if (outcomes.attempts.length > 0) {
+                const attemptNumbers = new Set(outcomes.attempts.map((entry) => entry.attempt));
+                for (const coordinate of coordinates) {
+                    const paired = [...attemptNumbers].some((attempt) =>
+                        seenAttempts.has(`${attempt}:${coordinate}:release-n`) &&
+                        seenAttempts.has(`${attempt}:${coordinate}:release-n-minus-1`),
+                    );
+                    if (!paired) throw new HoldoutContractError(["outcomes: attempt-pair-incomplete"]);
+                }
             }
         }
         states[epochId] = lifecycle.state;

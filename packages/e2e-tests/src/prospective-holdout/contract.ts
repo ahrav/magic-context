@@ -12,7 +12,14 @@ export const INTAKE_ID_RE = /^intake-[0-9a-f]{32}$/;
 export const FAMILY_ID_RE = /^fam-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const STATIC_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RELEASE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/;
-const ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+/**
+ * The two spellings an instant may take: seconds precision, or seconds plus exactly three
+ * fractional digits. The `Z` designator is the only offset admitted, so every accepted
+ * instant is already stated in UTC. The groups carry the calendar text and the optional
+ * fraction so `instant` can restate the supplied instant in the one form `toISOString`
+ * renders.
+ */
+const ISO_INSTANT_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{3})?Z$/;
 
 export class HoldoutContractError extends Error {
     readonly diagnostics: readonly string[];
@@ -61,7 +68,22 @@ export function hex64(value: unknown, label: string): string {
 
 export function instant(value: unknown, label: string): string {
     const result = string(value, label);
-    if (!ISO_INSTANT_RE.test(result) || !Number.isFinite(Date.parse(result))) {
+    const parts = ISO_INSTANT_RE.exec(result);
+    const parsed = parts === null ? Number.NaN : Date.parse(result);
+    if (parts === null || !Number.isFinite(parsed)) {
+        fail(`${label}: instant-invalid`);
+    }
+    // A shape that passes the pattern can still name a day its month does not have, and the
+    // parser answers such a date by carrying the overflow into the following month rather
+    // than refusing it, so the instant is finite. Every ordering comparison downstream reads
+    // that carried instant rather than the calendar date the artifact states, so the parsed
+    // value is re-rendered and required to spell the instant it came from.
+    //
+    // `toISOString` always renders milliseconds and always uses `Z`, and the pattern admits
+    // no offset other than `Z`, so the two sides differ only in whether the fraction is
+    // written. Restoring the absent fraction normalises both sides to one spelling, which
+    // compares the whole instant in a single step instead of reading six fields back out.
+    if (new Date(parsed).toISOString() !== `${parts[1]}${parts[2] ?? ".000"}Z`) {
         fail(`${label}: instant-invalid`);
     }
     return result;

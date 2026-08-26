@@ -127,6 +127,38 @@ describe("freeze and close publication", () => {
         }
     });
 
+    it("rejects a close sharing an approver with the freeze on both paths", () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-close-independence-"));
+        try {
+            const freeze = freezeManifest();
+            const published = publishFreeze(freeze, join(root, "freeze"), readyPolicies());
+            // Each seat in turn: a shared release operator and a shared independent reviewer
+            // are the same defect, and each manifest's own parse sees only its own two
+            // approvers, so neither is caught before the pair is in scope together.
+            for (const [seat, approver] of [[0, "operator-one"], [1, "reviewer-five"]] as const) {
+                const shared = closeManifest(freeze);
+                // The approver sits outside the fingerprinted subject, so the manifest stays
+                // self-consistent and only the actor changes. Its own two approvers stay
+                // distinct, which is the independence the close manifest can check alone.
+                shared.approvals[seat]!.approver = approver;
+                const installed = join(root, `close-shared-${seat}`);
+                const fingerprint = installCloseArtifact(installed, shared);
+                expect(() => loadClose(installed, fingerprint, published))
+                    .toThrow(/close\.approvals: freeze-independence-required/);
+                expect(() => publishClose(shared, join(root, `close-shared-published-${seat}`), published))
+                    .toThrow(/close\.approvals: freeze-independence-required/);
+            }
+            // Four distinct actors across the two manifests: the close publishes and reloads.
+            const destination = join(root, "close");
+            const closed = publishClose(closeManifest(freeze), destination, published);
+            expect(loadClose(destination, closed.manifestFingerprint, published)
+                .manifest.approvals.map((approval) => approval.approver))
+                .toEqual(["custodian-one", "reviewer-two"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("reports one freeze-link diagnostic for either broken close link", () => {
         const root = mkdtempSync(join(tmpdir(), "holdout-close-link-"));
         try {

@@ -61,14 +61,20 @@ interface RepositoryOptions {
     sufficient?: boolean;
     lifecycleState?: EpochTerminalState;
     /**
-     * Drops one arm of the outcomes evidence. The running event binds the canonical fingerprint
-     * of whatever is written, so the dropped arm can never be supplied afterwards.
+     * Drops one arm of the outcomes evidence, or splits a coordinate's arms across attempt
+     * numbers. The running event binds the canonical fingerprint of whatever is written, so a
+     * dropped or misplaced arm can never be corrected afterwards.
      */
-    outcomes?: "complete" | "attempts-empty" | "aa-empty";
+    outcomes?: "complete" | "attempts-empty" | "aa-empty" | "split-attempt" | "retried-arm";
     /** Marks the admitted case subjective, which obliges the epoch to carry an adjudication close. */
     subjective?: boolean;
     /** Approver stamped onto the adjudication close in place of the independent one. */
     adjudicationApprover?: string;
+    /**
+     * Instant the adjudication close declares. A value after the report event's `occurredAt`
+     * describes a report scoring verdicts the close had not yet sealed.
+     */
+    adjudicationClosedAt?: string;
     /**
      * Instant the cohort close manifest declares. A value after the `cohort-closed` event's
      * `occurredAt` describes a cohort the ledger claims closed before the manifest fixed it.
@@ -76,18 +82,33 @@ interface RepositoryOptions {
     closedAt?: string;
     /** Incident bytes stamped into the installed graduation candidate. */
     incidentBytes?: unknown;
+    /**
+     * Epoch this call assembles. Naming a second epoch adds it beside the first: the policies
+     * are byte-identical and the trust registry accumulates, so one root can hold several.
+     */
+    epochId?: string;
+    /** Dispositions the cohort close records, so sibling epochs can name disjoint intakes. */
+    intakeIds?: { admitted: string; rejected: string; late: string };
 }
 
 /**
- * Restamps the cohort close at a different instant. The approvals carry the body's fingerprint,
- * so they are re-derived: `parseCloseManifest` rejects a stale subject, and an installed
- * manifest therefore reaches the load path with approvers bound to whatever instant it declares.
+ * Restamps the cohort close at a different instant, or around a different set of intake ids.
+ * The approvals carry the body's fingerprint, so they are re-derived: `parseCloseManifest`
+ * rejects a stale subject, and an installed manifest therefore reaches the load path with
+ * approvers bound to whatever it declares.
  */
 function closeManifestAt(
     freeze: ReleaseFreezeManifest,
-    options: { subjective: boolean; closedAt?: string },
+    options: {
+        subjective: boolean;
+        closedAt?: string;
+        intakeIds?: { admitted: string; rejected: string; late: string };
+    },
 ): CohortCloseManifest {
-    const base = closeManifest(freeze, { subjective: options.subjective });
+    const base = closeManifest(freeze, {
+        subjective: options.subjective,
+        ...(options.intakeIds === undefined ? {} : { intakeIds: options.intakeIds }),
+    });
     if (options.closedAt === undefined) return base;
     const body = { ...base.body, closedAt: options.closedAt };
     const subjectFingerprint = canonicalFingerprint(body);
@@ -154,6 +175,7 @@ function graduationCandidate(
 function subjectiveAdjudicationClose(
     close: { manifest: CohortCloseManifest; manifestFingerprint: string },
     approver: string,
+    closedAt: string,
 ): AdjudicationClose {
     const sealedPackets = close.manifest.body.cases
         .filter((entry) => entry.subjective)
@@ -181,7 +203,7 @@ function subjectiveAdjudicationClose(
     return closeAdjudication({
         close: close.manifest,
         trustedCloseFingerprint: close.manifestFingerprint,
-        closedAt: "2026-09-09T00:00:00Z",
+        closedAt,
         judgments,
         sealedPackets,
         authenticationKey: ADJUDICATION_KEY,
@@ -197,29 +219,42 @@ function completeRepository(root: string, options: RepositoryOptions = {}): Repo
         ? terminal
         : terminal === "graduated" ? "reported" : null;
     const holdout = join(root, "prospective-holdout");
-    const epoch = join(holdout, "epochs", "epoch-test-release");
+    const epochId = options.epochId ?? "epoch-test-release";
+    const epoch = join(holdout, "epochs", epochId);
     mkdirSync(join(holdout, "policies"), { recursive: true });
     mkdirSync(epoch, { recursive: true });
     const policies = readyPolicies();
     writeJson(join(holdout, "policies", "analysis-policy.json"), policies.analysis);
     writeJson(join(holdout, "policies", "scorecard-policy.json"), policies.scorecard);
-    const freeze = publishFreeze(freezeManifest(), join(epoch, "freeze"), policies);
+    const freeze = publishFreeze(freezeManifest({ epochId }), join(epoch, "freeze"), policies);
     const close = publishClose(
         closeManifestAt(freeze.manifest, {
             subjective: options.subjective ?? false,
             closedAt: options.closedAt,
+            intakeIds: options.intakeIds,
         }),
         join(epoch, "close"),
         freeze,
     );
     const releaseN = cellResultFixture("release-n", {}, freeze.manifest);
     const releaseNMinus1 = cellResultFixture("release-n-minus-1", {}, freeze.manifest);
-    const outcomes = {
-        schema: "prospective-outcomes/v1",
-        attempts: options.outcomes === "attempts-empty" ? [] : [
+    // A coordinate is only comparable within one attempt number, so where the arms sit decides
+    // whether the matrix is actually paired: `split-attempt` puts them under different attempts,
+    // while `retried-arm` adds a second release-N run beside a complete attempt-0 pair.
+    const attemptsByShape: Record<string, Array<{ attempt: number; cell: typeof releaseN }>> = {
+        complete: [{ attempt: 0, cell: releaseN }, { attempt: 0, cell: releaseNMinus1 }],
+        "attempts-empty": [],
+        "aa-empty": [{ attempt: 0, cell: releaseN }, { attempt: 0, cell: releaseNMinus1 }],
+        "split-attempt": [{ attempt: 0, cell: releaseN }, { attempt: 1, cell: releaseNMinus1 }],
+        "retried-arm": [
             { attempt: 0, cell: releaseN },
             { attempt: 0, cell: releaseNMinus1 },
+            { attempt: 1, cell: releaseN },
         ],
+    };
+    const outcomes = {
+        schema: "prospective-outcomes/v1",
+        attempts: attemptsByShape[options.outcomes ?? "complete"]!,
         // One same-build control per frozen coordinate, which is what the comparison gate
         // requires before it accepts the release-N versus release-N-1 cells.
         aa: options.outcomes === "aa-empty"
@@ -284,7 +319,11 @@ function completeRepository(root: string, options: RepositoryOptions = {}): Repo
     }
     let adjudication: AdjudicationClose | undefined;
     if (report && close.manifest.body.cases.some((entry) => entry.subjective)) {
-        const independent = subjectiveAdjudicationClose(close, "reviewer-three");
+        const independent = subjectiveAdjudicationClose(
+            close,
+            "reviewer-three",
+            options.adjudicationClosedAt ?? "2026-09-09T00:00:00Z",
+        );
         // The approver sits outside the fingerprinted subject, so restamping it leaves the
         // artifact parseable. `closeAdjudication` refuses to mint a dependent approval itself,
         // which is the only way a repository acquires one.
@@ -368,7 +407,11 @@ function completeRepository(root: string, options: RepositoryOptions = {}): Repo
             ? [{ schema: "prospective-trust-entry/v1", epochId: freeze.manifest.body.epochId, kind: "adjudication-close", sequence: null, manifestFingerprint: canonicalFingerprint(adjudication) }]
             : []),
     ];
-    writeFileSync(join(holdout, "trusted-manifests.jsonl"), trust.map(canonicalJson).join("\n") + "\n");
+    // One registry serves the whole repository, so a second epoch assembled into the same root
+    // adds its entries rather than replacing the first epoch's.
+    const trustPath = join(holdout, "trusted-manifests.jsonl");
+    const priorTrust = existsSync(trustPath) ? readFileSync(trustPath, "utf8") : "";
+    writeFileSync(trustPath, priorTrust + trust.map(canonicalJson).join("\n") + "\n");
     return recomputers;
 }
 
@@ -499,6 +542,145 @@ describe("prospective holdout CLI", () => {
             const recomputers = completeRepository(root, {
                 lifecycleState: "cohort-closed",
                 closedAt: "2026-09-08T00:00:00Z",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a running epoch whose coordinate arms sit under different attempt numbers", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-attempt-pair-"));
+        try {
+            // Both release roles ran, so the matrix-completeness check is satisfied by the two
+            // arms between them. Neither attempt holds a pair, so no coordinate is comparable,
+            // and the epoch would otherwise be accepted until a report was produced.
+            const recomputers = completeRepository(root, {
+                lifecycleState: "running",
+                outcomes: "split-attempt",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["outcomes: attempt-pair-incomplete"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("validates a running epoch whose retried arm leaves one attempt holding the pair", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-attempt-retry-"));
+        try {
+            // A second release-N run under attempt 1 sits beside a complete attempt-0 pair. One
+            // attempt holding both arms is the whole requirement, so a surplus unpaired arm
+            // under another attempt is legal.
+            const recomputers = completeRepository(root, {
+                lifecycleState: "running",
+                outcomes: "retried-arm",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=1"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a later epoch re-claiming an intake an earlier cohort already disposed of", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-intake-reused-"));
+        try {
+            completeRepository(root, {
+                epochId: "epoch-test-release-a",
+                lifecycleState: "cohort-closed",
+                intakeIds: {
+                    admitted: `intake-${"1".repeat(32)}`,
+                    rejected: `intake-${"2".repeat(32)}`,
+                    late: `intake-${"3".repeat(32)}`,
+                },
+            });
+            // The later cohort admits the intake the earlier one ruled late. Arriving after one
+            // cutoff is what places a report before the next freeze, so admitting it here scores
+            // a pre-freeze report as though it had arrived prospectively.
+            const recomputers = completeRepository(root, {
+                epochId: "epoch-test-release-b",
+                lifecycleState: "cohort-closed",
+                intakeIds: {
+                    admitted: `intake-${"3".repeat(32)}`,
+                    rejected: `intake-${"4".repeat(32)}`,
+                    late: `intake-${"5".repeat(32)}`,
+                },
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["close.body.dispositions.intakeId: reused-across-epochs"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("validates sibling epochs whose closed cohorts dispose of disjoint intakes", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-intake-disjoint-"));
+        try {
+            completeRepository(root, {
+                epochId: "epoch-test-release-a",
+                lifecycleState: "cohort-closed",
+                intakeIds: {
+                    admitted: `intake-${"1".repeat(32)}`,
+                    rejected: `intake-${"2".repeat(32)}`,
+                    late: `intake-${"3".repeat(32)}`,
+                },
+            });
+            // Nine distinct intakes across two epochs: reuse is the only thing refused, and an
+            // epoch may still admit, reject, and time out its own three.
+            const recomputers = completeRepository(root, {
+                epochId: "epoch-test-release-b",
+                lifecycleState: "cohort-closed",
+                intakeIds: {
+                    admitted: `intake-${"4".repeat(32)}`,
+                    rejected: `intake-${"5".repeat(32)}`,
+                    late: `intake-${"6".repeat(32)}`,
+                },
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 0,
+                messages: ["prospective-holdout valid epochs=2"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a subjective report stamped before its adjudication close sealed", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-report-before-adjudication-"));
+        try {
+            // The adjudication close seals one second after the report event. The ledger holds
+            // no event for the seal, so lifecycle ordering cannot see it and the report passes
+            // every other binding while scoring verdicts that were still open.
+            const recomputers = completeRepository(root, {
+                subjective: true,
+                adjudicationClosedAt: "2026-09-09T00:00:01Z",
+            });
+            expect(await validateRepository(root, recomputers)).toEqual({
+                code: 1,
+                messages: ["lifecycle.report.occurredAt: before-adjudication-close"],
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("validates a subjective report stamped at its adjudication close", async () => {
+        const root = mkdtempSync(join(tmpdir(), "holdout-cli-report-at-adjudication-"));
+        try {
+            // The judgments are sealed at that instant, so equality is the legal boundary.
+            const recomputers = completeRepository(root, {
+                subjective: true,
+                adjudicationClosedAt: "2026-09-09T00:00:00Z",
             });
             expect(await validateRepository(root, recomputers)).toEqual({
                 code: 0,

@@ -272,6 +272,17 @@ function assertCloseBoundToFreeze(
     if (Date.parse(manifest.body.closedAt) < Date.parse(trustedFreeze.manifest.body.intakeWindow.closesAt)) {
         throw new HoldoutContractError(["close.closedAt: before-cutoff"]);
     }
+    // Each manifest's own parse keeps its two approvers distinct, which is independence
+    // within one attestation and says nothing across the pair. The freeze's approvers attest
+    // the release identities the epoch will compare; the close's attest the raw-intake and
+    // admission boundary those releases are measured over. One actor holding a seat in both
+    // sets attests that boundary already knowing which builds it decides between, which is
+    // the separation the two sets exist to create. Both manifests are in scope only here, so
+    // this is the only place the pair can be compared.
+    const freezeApprovers = new Set(trustedFreeze.manifest.approvals.map((approval) => approval.approver));
+    if (manifest.approvals.some((approval) => freezeApprovers.has(approval.approver))) {
+        throw new HoldoutContractError(["close.approvals: freeze-independence-required"]);
+    }
 }
 
 export function publishClose(
