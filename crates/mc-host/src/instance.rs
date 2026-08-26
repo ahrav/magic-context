@@ -133,18 +133,21 @@ pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -
     }
 }
 
-/// Resolves the data root: the override, a nonempty `$XDG_DATA_HOME`, or a
-/// nonempty `$HOME/.local/share`, in that order.
+/// Relative or empty `XDG_DATA_HOME`/`HOME` values are ignored rather than
+/// used, so a poisoned `XDG_DATA_HOME=./x` cannot select a cwd-dependent
+/// lifecycle root.
 pub(crate) fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
+    fn absolute(value: std::ffi::OsString) -> Option<PathBuf> {
+        let path = PathBuf::from(value);
+        path.is_absolute().then_some(path)
+    }
     match data_dir_override {
         Some(dir) => Ok(dir.to_path_buf()),
-        None => match std::env::var_os("XDG_DATA_HOME") {
-            Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-            _ => match std::env::var_os("HOME") {
-                Some(home) if !home.is_empty() => {
-                    Ok(PathBuf::from(home).join(".local").join("share"))
-                }
-                _ => Err(InstanceError::NoDataDir),
+        None => match std::env::var_os("XDG_DATA_HOME").and_then(absolute) {
+            Some(dir) => Ok(dir),
+            None => match std::env::var_os("HOME").and_then(absolute) {
+                Some(home) => Ok(home.join(".local").join("share")),
+                None => Err(InstanceError::NoDataDir),
             },
         },
     }
@@ -835,12 +838,30 @@ mod tests {
             PathBuf::from("/xdg-root/cortexkit/run")
         );
 
-        std::env::remove_var("XDG_DATA_HOME");
+        // A relative or empty XDG_DATA_HOME must never be joined to cwd.
         std::env::set_var("HOME", "/home-root");
+        for ignored in ["relative/xdg", "./xdg", ""] {
+            std::env::set_var("XDG_DATA_HOME", ignored);
+            assert_eq!(
+                runtime_dir_path(None).expect("relative xdg falls back to home"),
+                PathBuf::from("/home-root/.local/share/cortexkit/run"),
+                "XDG_DATA_HOME={ignored:?}"
+            );
+        }
+
+        std::env::remove_var("XDG_DATA_HOME");
         assert_eq!(
             runtime_dir_path(None).expect("home"),
             PathBuf::from("/home-root/.local/share/cortexkit/run")
         );
+
+        // A relative HOME is equally ignored: with no absolute root at all,
+        // the result is exactly NoDataDir.
+        std::env::set_var("HOME", "relative-home");
+        assert!(matches!(
+            runtime_dir_path(None),
+            Err(InstanceError::NoDataDir)
+        ));
 
         std::env::remove_var("HOME");
         assert!(matches!(

@@ -526,7 +526,9 @@ export function sanitizedCandidateFactory(
                     // Plain snapshot: the provider result's getters must not
                     // carry deferred provider code past this boundary, where
                     // a later read would escape unsanitized.
-                    return { daemonVer: String(result.daemonVer) };
+                    const daemonId =
+                        result.daemonId instanceof Uint8Array ? result.daemonId.slice() : null;
+                    return { daemonVer: String(result.daemonVer), daemonId };
                 } catch {
                     throw sanitizedProviderError(transport, "start");
                 }

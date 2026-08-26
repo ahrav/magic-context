@@ -51,7 +51,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.native = options.nativeChannel ?? null;
     }
 
-    async start(deadline: Deadline): Promise<{ daemonVer: string }> {
+    async start(deadline: Deadline): Promise<{ daemonVer: string; daemonId: Uint8Array | null }> {
         if (this.closed) {
             throw new McHostCallError("not_sent", "shared-memory channel closed");
         }
@@ -61,7 +61,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
             }
             this.native = NativeChannel.attach(this.options.descriptor as NativeDescriptor);
         }
-        return { daemonVer: "shared-memory-test" };
+        return { daemonVer: "shared-memory-test", daemonId: null };
     }
 
     beginFrames(): void {

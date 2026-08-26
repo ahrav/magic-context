@@ -277,7 +277,12 @@ describe("McHostClient facade", () => {
         const catalogPromise = client.catalogList();
         const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
         expect(catalogFrame.body.toString("utf8")).toBe('{"op":"catalog.list"}');
-        const entry = { module_id: "magic-context", roles: [], control_ops: ["route.open"] };
+        const entry = {
+            module_id: "magic-context",
+            module_version: "0.1.0",
+            roles: [],
+            control_ops: ["route.open"],
+        };
         await sendResponse(conn, catalogFrame.corr, {
             op: "catalog.list",
             generation: 1,
@@ -502,7 +507,12 @@ describe("McHostClient facade", () => {
         await conn2.authenticated;
         const cursor2 = frameCursor(conn2);
         const catalogFrame = await cursor2.next((f) => isControlOp(f, "catalog.list"));
-        await sendResponse(conn2, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn2, catalogFrame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         expect(await catalogPromise).toEqual([]);
     });
 
@@ -1583,7 +1593,12 @@ describe("transport negotiation", () => {
         const catalogPromise = client.catalogList();
         const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
         expect(catalogFrame.corr).toBe(2n);
-        await sendResponse(conn, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn, catalogFrame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         expect(await catalogPromise).toEqual([]);
     });
 
@@ -1641,7 +1656,12 @@ describe("transport negotiation", () => {
 
         const catalogPromise = client.catalogList();
         const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
-        await sendResponse(conn, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn, catalogFrame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         await catalogPromise;
         expect(conn.frames.filter(isNegotiate).length).toBe(1);
         expect(provider.connectCount).toBe(0);
@@ -1654,7 +1674,12 @@ describe("transport negotiation", () => {
         expect(conn2.clientAuthValid).toBe(true);
         const cursor2 = frameCursor(conn2);
         const catalogFrame2 = await cursor2.next((f) => isControlOp(f, "catalog.list"));
-        await sendResponse(conn2, catalogFrame2.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn2, catalogFrame2.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         expect(await catalog2).toEqual([]);
         expect(conn2.frames.filter(isNegotiate).length).toBe(1);
         expect(peer.connections.length).toBe(2);
@@ -1707,7 +1732,12 @@ describe("transport negotiation", () => {
                 op?: string;
             };
             if (parsed.op === "catalog.list") {
-                host.respondJson(frame.header.corr, { op: "catalog.list", modules: [] });
+                host.respondJson(frame.header.corr, {
+                    op: "catalog.list",
+                    generation: 1,
+                    modules: [],
+                    subc_ops: ["route.open"],
+                });
             } else if (parsed.op === "route.open") {
                 host.respondJson(frame.header.corr, {
                     op: "route.open",
@@ -2192,5 +2222,148 @@ describe("shm re-upgrade probe eligibility (R11)", () => {
         const shadow = peer.connections[1] as FakePeerConnection;
         await shadow.authenticated;
         expect(shadow.clientAuthValid).toBe(true);
+    });
+});
+
+describe("authenticated state retention (U3/KTD6)", () => {
+    test("authenticated identity comes from the handshake, publication from the file", async () => {
+        const { client, peer } = await connected();
+        // The connection file's daemon_ver is written by test-util as
+        // "fake-peer/0.0.1" and the peer reports the same string in its
+        // ServerProof by default; the two surfaces must still be separate
+        // objects sourced from different transcripts.
+        const authenticated = client.authenticated;
+        expect(authenticated).not.toBeNull();
+        expect(authenticated?.daemonVer).toBe("fake-peer/0.0.1");
+        expect(authenticated?.proof).toBe("current");
+        expect(Array.from(authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
+        const publication = client.publication;
+        expect(publication?.daemonVer).toBe("fake-peer/0.0.1");
+        expect(typeof publication?.pid).toBe("number");
+    });
+
+    test("a divergent publication daemon_ver never masks the authenticated value", async () => {
+        const peer = await startPeer({ daemonVer: "mc-host/9.9.9-auth" });
+        const filePath = freshFilePath();
+        // writeConnectionFile pins the publication daemon_ver to
+        // "fake-peer/0.0.1", so the two transcripts disagree on purpose.
+        await writeConnectionFile(filePath, peer);
+        const client = await McHostClient.connect({ connectionFile: filePath });
+        clients.push(client);
+        expect(client.authenticated?.daemonVer).toBe("mc-host/9.9.9-auth");
+        expect(client.publication?.daemonVer).toBe("fake-peer/0.0.1");
+    });
+});
+
+describe("strict catalog parsing (U3 scenario 10)", () => {
+    async function catalogRejection(body: unknown): Promise<McHostCallError> {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const catalogPromise = client.catalogList();
+        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
+        await sendResponse(conn, catalogFrame.corr, body);
+        return expectCallError(await rejection(catalogPromise), "terminal");
+    }
+
+    const validEntry = {
+        module_id: "magic-context",
+        module_version: "0.1.0",
+        roles: [],
+        control_ops: ["route.open"],
+    };
+    const valid = {
+        op: "catalog.list",
+        generation: 1,
+        modules: [validEntry],
+        subc_ops: ["route.open", "catalog.list", "host.shutdown", "transport.negotiate"],
+    };
+
+    test("rejects every malformed catalog shape without casting", async () => {
+        const cases: Record<string, unknown> = {
+            missing_generation: { ...valid, generation: undefined },
+            fractional_generation: { ...valid, generation: 1.5 },
+            negative_generation: { ...valid, generation: -1 },
+            missing_subc_ops: { ...valid, subc_ops: undefined },
+            empty_subc_ops: { ...valid, subc_ops: [] },
+            non_string_subc_ops: { ...valid, subc_ops: [7] },
+            duplicate_subc_ops: { ...valid, subc_ops: ["route.open", "route.open"] },
+            unknown_top_level_field: { ...valid, extra: true },
+            non_array_modules: { ...valid, modules: {} },
+            module_not_object: { ...valid, modules: [7] },
+            missing_module_version: {
+                ...valid,
+                modules: [{ module_id: "m", roles: [], control_ops: [] }],
+            },
+            empty_module_version: { ...valid, modules: [{ ...validEntry, module_version: "" }] },
+            missing_module_id: {
+                ...valid,
+                modules: [{ module_version: "0.1.0", roles: [], control_ops: [] }],
+            },
+            oversized_module_id: {
+                ...valid,
+                modules: [{ ...validEntry, module_id: "x".repeat(129) }],
+            },
+            duplicate_module_id: { ...valid, modules: [validEntry, validEntry] },
+            unknown_module_field: { ...valid, modules: [{ ...validEntry, extra: 1 }] },
+            malformed_control_ops: { ...valid, modules: [{ ...validEntry, control_ops: [""] }] },
+            non_array_roles: { ...valid, modules: [{ ...validEntry, roles: "admin" }] },
+        };
+        for (const [name, body] of Object.entries(cases)) {
+            const error = await catalogRejection(JSON.parse(JSON.stringify(body)));
+            expect({ name, code: error.code }).toEqual({
+                name,
+                code: "malformed_control_response",
+            });
+        }
+    }, 30_000);
+
+    test("a valid catalog yields the tagged snapshot", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const snapshotPromise = client.catalogSnapshot();
+        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
+        await sendResponse(conn, catalogFrame.corr, valid);
+        const snapshot = await snapshotPromise;
+        expect(snapshot.generation).toBe(1);
+        expect(snapshot.subcOps).toEqual([
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "transport.negotiate",
+        ]);
+        expect(snapshot.modules).toEqual([validEntry]);
+    });
+});
+
+describe("host.shutdown (U3 scenario 11)", () => {
+    test("hostShutdown sends one tagged request and resolves on the echoed response", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const shutdownPromise = client.hostShutdown();
+        const frame = await cursor.next((f) => isControlOp(f, "host.shutdown"));
+        expect(frame.body.toString("utf8")).toBe('{"op":"host.shutdown"}');
+        await sendResponse(conn, frame.corr, { op: "host.shutdown" });
+        await shutdownPromise;
+    });
+
+    test("a response that does not echo the operation is a typed failure", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const shutdownPromise = client.hostShutdown();
+        const frame = await cursor.next((f) => isControlOp(f, "host.shutdown"));
+        await sendResponse(conn, frame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
+        expectCallError(await rejection(shutdownPromise), "terminal", "malformed_control_response");
+    });
+
+    test("ordinary close never sends host.shutdown", async () => {
+        const { client, conn } = await connected();
+        await client.closeAsync();
+        const shutdownFrames = conn.frames.filter((f) => isControlOp(f, "host.shutdown"));
+        expect(shutdownFrames).toEqual([]);
     });
 });

@@ -70,6 +70,7 @@ export interface AuthenticateOptions {
 export interface AuthResult {
     /** The server-reported daemon version string (diagnostic metadata). */
     daemonVer: string;
+    daemonId: Uint8Array;
 }
 
 /**
@@ -274,5 +275,5 @@ export async function authenticateClient(
         server.daemonId,
     );
     await writeMessage(io, { client_auth: Array.from(clientAuth) }, deadline);
-    return { daemonVer: server.daemonVer };
+    return { daemonVer: server.daemonVer, daemonId: server.daemonId.slice() };
 }

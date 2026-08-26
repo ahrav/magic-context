@@ -66,12 +66,15 @@ import {
     sanitizedCandidateFactory,
 } from "./transport-provider";
 import type {
+    AuthenticatedPeer,
     BindIdentity,
     CatalogEntry,
+    CatalogSnapshot,
     ConnectOptions,
     ConsumerIdentity,
     ManagedCallOptions,
     ManagedRouteKind,
+    PublicationDiagnostics,
     RequestOptions,
     RouteTarget,
 } from "./types";
@@ -493,6 +496,34 @@ export class McHostClient {
     }
 
     /**
+     * Handshake-retained peer identity for the current connection, or null
+     * when no authenticated generation is live. Lifecycle policy must use
+     * this, never {@link publication}, for compatibility and fencing.
+     */
+    get authenticated(): AuthenticatedPeer | null {
+        const active = this.active;
+        if (!active || active.generation.isRetired()) return null;
+        const daemonVer = active.generation.daemonVer;
+        if (daemonVer === null) return null;
+        return {
+            daemonVer,
+            daemonId: active.generation.authenticatedDaemonId,
+            proof: "current",
+        };
+    }
+
+    /**
+     * Connection-file `daemon_ver`/`pid` for the current connection, or null.
+     * Untrusted display metadata only: it must never authorize
+     * compatibility, shutdown, or cleanup.
+     */
+    get publication(): PublicationDiagnostics | null {
+        const active = this.active;
+        if (!active) return null;
+        return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
+    }
+
+    /**
      * Open a route and return its connection-bound immutable handle. One
      * attempt under one bounded deadline; retry policy belongs to owners
      * above (managed `call()` owns its own allowlisted retry loop).
@@ -608,19 +639,34 @@ export class McHostClient {
 
     /** List catalog entries through a validated tagged `catalog.list`. */
     async catalogList(): Promise<CatalogEntry[]> {
+        return (await this.catalogSnapshot()).modules;
+    }
+
+    /**
+     * One strictly validated `catalog.list`: tagged generation, closed-shape
+     * host `subc_ops`, and per-module id/version/roles/control_ops. Any
+     * duplicate, missing field, unknown field, or out-of-bounds value is a
+     * terminal `malformed_control_response` — never a cast.
+     */
+    async catalogSnapshot(): Promise<CatalogSnapshot> {
         const deadline = Deadline.start(this.requestTimeoutMs, this.clock);
         const active = await this.ensureConnection(deadline);
         const bodyText = JSON.stringify({ op: "catalog.list" });
         const parsed = await this.controlRequest(active, bodyText, "catalog.list", deadline);
-        const modules = parsed.modules ?? [];
-        if (!Array.isArray(modules)) {
-            throw new McHostCallError(
-                "terminal",
-                "catalog.list response carried a non-array modules field",
-                "malformed_control_response",
-            );
-        }
-        return modules as CatalogEntry[];
+        return parseCatalogResponse(parsed);
+    }
+
+    /**
+     * Bounded authenticated `host.shutdown`. Resolves only after the host's
+     * correlated success response is fully received — the caller-observable
+     * stop-commit point. Never called by `close()`/`closeAsync()`; ordinary
+     * client close remains connection teardown only.
+     */
+    async hostShutdown(options: { timeoutMs?: number } = {}): Promise<void> {
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const active = await this.ensureConnection(deadline);
+        const bodyText = JSON.stringify({ op: "host.shutdown" });
+        await this.controlRequest(active, bodyText, "host.shutdown", deadline);
     }
 
     /**
@@ -1924,6 +1970,98 @@ function parseResponseJson<Response = JsonValue>(terminal: RequestTerminal): Res
         "response body was not valid JSON",
         "invalid_response_body",
     );
+}
+
+const MAX_CATALOG_MODULES = 64;
+const MAX_CATALOG_OPS = 32;
+const MAX_CATALOG_ROLES = 32;
+const MAX_CATALOG_STRING_LEN = 128;
+const OP_NAME_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
+
+function malformedCatalog(detail: string): McHostCallError {
+    return new McHostCallError(
+        "terminal",
+        `catalog.list response rejected: ${detail}`,
+        "malformed_control_response",
+    );
+}
+
+function requireOpArray(value: unknown, field: string, allowEmpty: boolean): string[] {
+    if (!Array.isArray(value)) throw malformedCatalog(`${field} is not an array`);
+    if (!allowEmpty && value.length === 0) throw malformedCatalog(`${field} is empty`);
+    if (value.length > MAX_CATALOG_OPS) throw malformedCatalog(`${field} exceeds the entry cap`);
+    const seen = new Set<string>();
+    for (const entry of value) {
+        if (typeof entry !== "string" || !OP_NAME_PATTERN.test(entry)) {
+            throw malformedCatalog(`${field} carries a non-operation entry`);
+        }
+        if (seen.has(entry)) throw malformedCatalog(`${field} carries a duplicate entry`);
+        seen.add(entry);
+    }
+    return value as string[];
+}
+
+function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot {
+    const keys = Object.keys(parsed).sort();
+    const expected = ["generation", "modules", "op", "subc_ops"];
+    if (keys.length !== expected.length || keys.some((key, i) => key !== expected[i])) {
+        throw malformedCatalog("unexpected top-level shape");
+    }
+    const generation = parsed.generation;
+    if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+        throw malformedCatalog("generation is not a nonnegative integer");
+    }
+    const subcOps = requireOpArray(parsed.subc_ops, "subc_ops", false);
+    const rawModules = parsed.modules;
+    if (!Array.isArray(rawModules)) throw malformedCatalog("modules is not an array");
+    if (rawModules.length > MAX_CATALOG_MODULES) {
+        throw malformedCatalog("modules exceeds the entry cap");
+    }
+    const seenIds = new Set<string>();
+    const modules: CatalogEntry[] = rawModules.map((raw) => {
+        if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+            throw malformedCatalog("module entry is not an object");
+        }
+        const record = raw as Record<string, unknown>;
+        const moduleKeys = Object.keys(record).sort();
+        const expectedModuleKeys = ["control_ops", "module_id", "module_version", "roles"];
+        if (
+            moduleKeys.length !== expectedModuleKeys.length ||
+            moduleKeys.some((key, i) => key !== expectedModuleKeys[i])
+        ) {
+            throw malformedCatalog("unexpected module-entry shape");
+        }
+        const moduleId = record.module_id;
+        if (
+            typeof moduleId !== "string" ||
+            moduleId.length === 0 ||
+            moduleId.length > MAX_CATALOG_STRING_LEN
+        ) {
+            throw malformedCatalog("module_id is not a bounded nonempty string");
+        }
+        if (seenIds.has(moduleId)) throw malformedCatalog("duplicate module_id");
+        seenIds.add(moduleId);
+        const moduleVersion = record.module_version;
+        if (
+            typeof moduleVersion !== "string" ||
+            moduleVersion.length === 0 ||
+            moduleVersion.length > MAX_CATALOG_STRING_LEN
+        ) {
+            throw malformedCatalog("module_version is not a bounded nonempty string");
+        }
+        const roles = record.roles;
+        if (!Array.isArray(roles) || roles.length > MAX_CATALOG_ROLES) {
+            throw malformedCatalog("roles is not a bounded array");
+        }
+        const controlOps = requireOpArray(record.control_ops, "control_ops", true);
+        return {
+            module_id: moduleId,
+            module_version: moduleVersion,
+            roles,
+            control_ops: controlOps,
+        };
+    });
+    return { generation, subcOps, modules };
 }
 
 function wrapNegotiationError(error: unknown): Error {

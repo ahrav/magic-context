@@ -1,0 +1,191 @@
+import { describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { NativeLaunchError, runNativeLifecycle } from "./native-launcher";
+
+const SECRET = "hunter2-credential-canary";
+
+let counter = 0;
+
+function scriptBinary(dir: string, body: string): string {
+    counter += 1;
+    const file = path.join(dir, `fake-ck-mc-host-${counter}.sh`);
+    writeFileSync(file, `#!/bin/sh\n${body}\n`);
+    chmodSync(file, 0o700);
+    return file;
+}
+
+function probeResultJson(ok: boolean): string {
+    return JSON.stringify({
+        schema: "magic-context.daemon/v1",
+        command: "probe",
+        ok,
+        state: ok ? "running" : "stopped",
+        reason: ok ? "healthy" : "not_running",
+        remediation: ok ? null : "run_daemon_start",
+        effects: null,
+        readiness: null,
+        checks: [],
+        versions: {
+            release: "0.38.0",
+            proof: null,
+            daemon: null,
+            magic_context: null,
+            synapse: null,
+            broca: null,
+        },
+    });
+}
+
+describe("native launcher output handling (U3 scenario 17)", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "mc-native-launcher-"));
+    process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+
+    test("a conforming single JSON object with agreeing exit parses", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
+        const result = await runNativeLifecycle(
+            { kind: "test-binary", path: binary },
+            { command: "probe", deadlineMs: 10_000 },
+        );
+        expect(result.state).toBe("stopped");
+        expect(result.reason).toBe("not_running");
+    });
+
+    test("extra stdout bytes after the object fail closed", async () => {
+        const binary = scriptBinary(
+            dir,
+            `echo '${probeResultJson(false)}'\necho '{"second":1}'\nexit 1`,
+        );
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error?.code).toBe("malformed_output");
+    });
+
+    test("unknown fields, empty output, and non-JSON output fail closed", async () => {
+        const bodies = [
+            `echo '{"schema":"magic-context.daemon/v1","surprise":1}'\nexit 1`,
+            `exit 1`,
+            `echo 'plain text failure'\nexit 1`,
+        ];
+        for (const body of bodies) {
+            const binary = scriptBinary(dir, body);
+            let error: NativeLaunchError | null = null;
+            try {
+                await runNativeLifecycle(
+                    { kind: "test-binary", path: binary },
+                    { command: "probe", deadlineMs: 10_000 },
+                );
+            } catch (caught) {
+                error = caught as NativeLaunchError;
+            }
+            expect(error?.code).toBe("malformed_output");
+        }
+    });
+
+    test("exit/result disagreement is rejected even when the JSON is valid", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 0`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error?.code).toBe("exit_disagreement");
+    });
+
+    test("stderr is tainted: its bytes never appear in the typed failure", async () => {
+        const binary = scriptBinary(dir, `echo "${SECRET}" >&2\necho 'not json'\nexit 1`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.message).not.toContain(SECRET);
+        expect(error?.stack ?? "").not.toContain(SECRET);
+    });
+
+    test("a signal exit is typed, never parsed", async () => {
+        const binary = scriptBinary(dir, `kill -KILL $$`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error?.code).toBe("signal_exit");
+    });
+
+    test("a hung child is killed at the deadline (KTD22 bound)", async () => {
+        const binary = scriptBinary(dir, `sleep 30`);
+        const started = Date.now();
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 500 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error?.code).toBe("timeout");
+        expect(Date.now() - started).toBeLessThan(5_000);
+    }, 10_000);
+
+    test("usage exits (2) are a typed contract failure with no lifecycle result", async () => {
+        const binary = scriptBinary(dir, `exit 2`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error?.code).toBe("usage_error");
+    });
+
+    test("the child receives the envelope on stdin and a minimal environment", async () => {
+        const binary = scriptBinary(
+            dir,
+            `input=$(cat)\nif [ "$input" = '{"probe":true}' ] && [ -z "$HOME" ] && [ -z "$LD_PRELOAD" ]; then\n  echo '${probeResultJson(false)}'\n  exit 1\nfi\nexit 2`,
+        );
+        const result = await runNativeLifecycle(
+            { kind: "test-binary", path: binary },
+            { command: "probe", deadlineMs: 10_000, envelope: { probe: true } },
+        );
+        expect(result.reason).toBe("not_running");
+    });
+
+    test("spawn failure for a missing binary is typed", async () => {
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: path.join(dir, "does-not-exist") },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error?.code).toBe("spawn_failed");
+    });
+});

@@ -469,7 +469,7 @@ export interface FrameChannel {
 }
 
 export interface SetupFrameChannel extends FrameChannel {
-    start(deadline: Deadline): Promise<{ daemonVer: string }>;
+    start(deadline: Deadline): Promise<{ daemonVer: string; daemonId?: Uint8Array | null }>;
     beginFrames(): void;
 }
 

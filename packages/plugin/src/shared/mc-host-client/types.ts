@@ -36,8 +36,30 @@ export interface ConsumerIdentity {
  */
 export interface CatalogEntry {
     module_id: string;
+    module_version: string;
     roles: unknown[];
     control_ops: string[];
+}
+
+export interface CatalogSnapshot {
+    generation: number;
+    subcOps: string[];
+    modules: CatalogEntry[];
+}
+
+/**
+ * AuthenticatedPeer retains handshake-authenticated identity separately from
+ * untrusted connection-file `daemon_ver` and `pid` metadata.
+ */
+export interface AuthenticatedPeer {
+    daemonVer: string;
+    daemonId: Uint8Array | null;
+    proof: "current";
+}
+
+export interface PublicationDiagnostics {
+    daemonVer: string;
+    pid: number;
 }
 
 /**

@@ -315,6 +315,8 @@ export class ConnectionGeneration {
     readonly retired: Promise<RetirementInfo>;
     /** Server-reported daemon version after a successful handshake. */
     daemonVer: string | null = null;
+    /** Daemon ID retained from the handshake, when the channel supplies one. */
+    authenticatedDaemonId: Uint8Array | null = null;
 
     private readonly channel: SetupFrameChannel;
     private readonly budget: ByteBudget;
@@ -698,7 +700,10 @@ export class ConnectionGeneration {
             // within the window and keeps its richer classification, and
             // both branches attach handlers, so no promise is left
             // unhandled.
-            const result = await new Promise<{ daemonVer: string }>((resolve, reject) => {
+            const result = await new Promise<{
+                daemonVer: string;
+                daemonId?: Uint8Array | null;
+            }>((resolve, reject) => {
                 let settled = false;
                 let fallback: ReturnType<typeof setTimeout> | null = null;
                 const settle = (complete: () => void): void => {
@@ -744,6 +749,8 @@ export class ConnectionGeneration {
                       );
             }
             this.daemonVer = result.daemonVer;
+            this.authenticatedDaemonId =
+                result.daemonId instanceof Uint8Array ? result.daemonId : null;
             this.phase = "frames";
         } finally {
             cancelSetupTimer();

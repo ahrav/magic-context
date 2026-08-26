@@ -274,11 +274,16 @@ where
     Ok(Authenticated)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuthenticated {
+    pub daemon_ver: String,
+}
+
 pub async fn authenticate_client<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
     deadline: Duration,
-) -> Result<(), AuthError>
+) -> Result<ClientAuthenticated, AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -294,7 +299,7 @@ async fn authenticate_client_inner<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
     deadline: Deadline,
-) -> Result<(), AuthError>
+) -> Result<ClientAuthenticated, AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -340,7 +345,10 @@ where
         &ClientAuth { client_auth },
         deadline,
     )
-    .await
+    .await?;
+    Ok(ClientAuthenticated {
+        daemon_ver: server_proof.daemon_ver,
+    })
 }
 
 fn validate_key(key: &[u8]) -> Result<(), AuthError> {

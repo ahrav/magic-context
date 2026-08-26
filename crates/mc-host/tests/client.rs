@@ -568,6 +568,11 @@ async fn zero_length_stream_item_is_delivered_and_does_not_retire_the_connection
     let client = Client::connect(&publication)
         .await
         .expect("managed client connects to fake peer");
+    assert_eq!(
+        client.daemon_ver(),
+        "fake-peer",
+        "the client retains the ServerProof daemon_ver for lifecycle policy"
+    );
     let route = client
         .open_route(target(), identity("empty-item"))
         .await
