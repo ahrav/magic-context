@@ -5,6 +5,10 @@ import { describe, expect, test } from "bun:test";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import {
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "../memory/storage-claim-current-state";
+import {
     computeProjectMemoryMutationToken,
     createProjectMemoryClaim,
     getProjectMemoryClaimByPublicId,
@@ -68,6 +72,41 @@ function count(
     table: "claim_operation_receipts" | "claim_operation_effects",
 ): number {
     return (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
+}
+
+/** The current revision's stored policy decision: the maturity rung and the
+ *  automatic-surface bit that gate injection. */
+function currentPolicy(
+    db: Database,
+    publicClaimId: string,
+): { revision: number; maturity: string; taint: string; autoEligible: number } {
+    const claim = getProjectMemoryClaimByPublicId(db, publicClaimId);
+    if (!claim) throw new Error(`missing claim ${publicClaimId}`);
+    const row = db
+        .prepare(
+            `SELECT effective_maturity AS maturity, origin_taint AS taint,
+                    auto_eligible AS autoEligible
+               FROM claim_effective_policy WHERE revision_id = ?`,
+        )
+        .get(claim.currentRevisionId) as {
+        maturity: string;
+        taint: string;
+        autoEligible: number;
+    };
+    return { revision: claim.revision, ...row };
+}
+
+/** Public claim ids the automatic-injection surface would publish. */
+function autoInjectIds(db: Database, projectIdentity: string): string[] {
+    const [projectId] = resolveProjectIdsForIdentities(db, [projectIdentity]);
+    if (projectId === undefined) return [];
+    const result = readProjectMemoryCurrentState(db, {
+        projectIds: [projectId],
+        lifecycleStates: ["active"],
+        surface: "auto_inject",
+        workspaceEpoch: `test:auto_inject:${projectIdentity}`,
+    });
+    return result.status === "ok" ? result.items.map((item) => item.publicClaimId) : [];
 }
 
 describe("claim-native classification", () => {
@@ -186,6 +225,125 @@ describe("claim-native classification", () => {
             expect(result.complete).toBe(false);
             expect(result.remaining).toBe(10);
             expect(count(db, "claim_operation_effects")).toBe(effectsBefore);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+/** Classification only ever rewrites importance/scope/sharing, never the claim
+ *  bytes. A revision carrying identical bytes keeps the evidence that supports
+ *  them, so metadata upkeep cannot quietly demote a trusted memory off the
+ *  automatic surfaces — nor promote model-authored bytes onto them. */
+describe("classification and claim trust", () => {
+    test("metadata-only classification keeps a verified memory injectable", () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-trust-preserved";
+            const publicClaimId = seedClaim(db, projectIdentity, 1);
+            const [snapshot] = readDreamerProjectClaims(db, projectIdentity, "hygiene");
+            if (!snapshot) throw new Error("missing claim snapshot");
+
+            expect(currentPolicy(db, publicClaimId)).toEqual({
+                revision: 1,
+                maturity: "VERIFIED",
+                taint: "USER_EXPLICIT",
+                autoEligible: 1,
+            });
+            expect(autoInjectIds(db, projectIdentity)).toEqual([publicClaimId]);
+
+            expect(
+                applyClassifications(
+                    classifyArgs(db, projectIdentity),
+                    [snapshot],
+                    `<classify><memory claim="${publicClaimId}" importance="85"/></classify>`,
+                ),
+            ).toEqual({ classified: 1, changed: 1 });
+
+            // A new revision is minted, so the rung is re-derived from scratch.
+            // The carried explicit-user observation is what keeps it at VERIFIED;
+            // the revision's own origin stays honestly DREAMER_INFERENCE, which
+            // does not gate the automatic surfaces.
+            expect(currentPolicy(db, publicClaimId)).toEqual({
+                revision: 2,
+                maturity: "VERIFIED",
+                taint: "DREAMER_INFERENCE",
+                autoEligible: 1,
+            });
+            expect(autoInjectIds(db, projectIdentity)).toEqual([publicClaimId]);
+
+            // Both observations support the identical bytes, and because the
+            // dreamer re-states that same content they are not an independent
+            // pair — carrying evidence forward must not inflate corroboration.
+            const evidence = db
+                .prepare(
+                    `SELECT observations.source_trust_class AS trust
+                       FROM claim_evidence
+                       JOIN observations ON observations.id = claim_evidence.observation_id
+                      WHERE claim_evidence.revision_id = ?
+                        AND claim_evidence.relation = 'supports'
+                      ORDER BY trust`,
+                )
+                .all(getProjectMemoryClaimByPublicId(db, publicClaimId)?.currentRevisionId);
+            expect(evidence).toEqual([{ trust: "explicit_user" }, { trust: "model_inference" }]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("classification cannot lift model-authored content to explicit-user trust", () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-trust-trap";
+            const publicClaimId = seedClaim(db, projectIdentity, 1);
+            // A content rewrite replaces the bytes the user asserted, so the
+            // explicit-user observation must NOT follow it.
+            reviseProjectMemoryClaim(
+                db,
+                { producer: "test", operationKey: "model-rewrite" },
+                {
+                    token: computeProjectMemoryMutationToken(db, publicClaimId),
+                    content: "Replacement the user never asserted.",
+                    provenance: {
+                        sourceLocator: "dreamer://rewrite",
+                        sourceContent: "Replacement the user never asserted.",
+                        extractor: "dreamer-map-memories",
+                        extractorVersion: "1",
+                        extractorRunId: "rewrite",
+                        independenceKey: "rewrite",
+                        sourceTrustClass: "model_inference",
+                    },
+                    actor: "dreamer:test",
+                },
+            );
+            expect(currentPolicy(db, publicClaimId)).toEqual({
+                revision: 2,
+                maturity: "CANDIDATE",
+                taint: "DREAMER_INFERENCE",
+                autoEligible: 0,
+            });
+            expect(autoInjectIds(db, projectIdentity)).toEqual([]);
+
+            const [snapshot] = readDreamerProjectClaims(db, projectIdentity, "hygiene");
+            if (!snapshot) throw new Error("missing claim snapshot");
+            expect(
+                applyClassifications(
+                    classifyArgs(db, projectIdentity),
+                    [snapshot],
+                    `<classify><memory claim="${publicClaimId}" importance="95"/></classify>`,
+                ),
+            ).toEqual({ classified: 1, changed: 1 });
+
+            // Carrying the prior revision's evidence forward is safe: those
+            // observations are model inference, and the explicit-user standing
+            // was already severed by the rewrite.
+            expect(currentPolicy(db, publicClaimId)).toEqual({
+                revision: 3,
+                maturity: "CANDIDATE",
+                taint: "DREAMER_INFERENCE",
+                autoEligible: 0,
+            });
+            expect(autoInjectIds(db, projectIdentity)).toEqual([]);
         } finally {
             closeQuietly(db);
         }

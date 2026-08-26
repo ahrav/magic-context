@@ -80,6 +80,14 @@ function createArgs(content: string) {
 	return { action: "create", category: "ARCHITECTURE", content };
 }
 
+/**
+ * A model that saw a clamped tool call in reduced history imitates that wrapper.
+ * Mutations must survive the imitation, tokens included.
+ */
+function reduced(inner: Record<string, unknown>) {
+	return { reduced: true, summary: JSON.stringify(inner) };
+}
+
 describe("Pi ctx_memory U4 scenario 1: create", () => {
 	it("returns canonical direct-claim result", async () => {
 		const db = createClaimReaderTestDatabase();
@@ -383,6 +391,122 @@ describe("Pi ctx_memory U4 scenario 7: human authority", () => {
 			);
 			expect(unknown.isError).toBeTrue();
 			expect(textOf(unknown)).toContain("not allowed");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});
+
+describe("Pi ctx_memory imitated reduced arguments carry mutation tokens", () => {
+	it("decodes a reduced revise that carries its single token", async () => {
+		const db = createClaimReaderTestDatabase();
+		try {
+			const tool = harness(db);
+			const created = parseResult(
+				await tool.execute(
+					createArgs("Pi reduced original."),
+					"call-reduced-create",
+				),
+			);
+			const first = created.affectedClaims?.[0];
+			if (!first) throw new Error("missing create result");
+			const revised = parseResult(
+				await tool.execute(
+					reduced({
+						action: "revise",
+						publicClaimId: first.publicClaimId,
+						mutationToken: first.mutationToken,
+						content: "Pi reduced revised.",
+					}),
+					"call-reduced-revise",
+				),
+			);
+			expect(revised).toMatchObject({ action: "revise", outcome: "applied" });
+			expect(revised.affectedClaims?.[0]?.revisionLocator).toContain("/r2/");
+			expect(
+				getProjectMemoryClaimByPublicId(db, first.publicClaimId)?.revision,
+			).toBe(2);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("decodes a reduced merge that carries an ordered token array", async () => {
+		const db = createClaimReaderTestDatabase();
+		try {
+			const target = seedProjectMemoryClaim(db, {
+				projectIdentity: PROJECT,
+				content: "Pi reduced merge target.",
+				operationKey: "u4-pi-reduced-merge-target",
+			});
+			const source = seedProjectMemoryClaim(db, {
+				projectIdentity: PROJECT,
+				content: "Pi reduced merge source.",
+				operationKey: "u4-pi-reduced-merge-source",
+			});
+			const tool = harness(db);
+			const merged = parseResult(
+				await tool.execute(
+					reduced({
+						action: "merge",
+						mutationTokens: [target.token, source.token],
+						content: "Pi reduced merged claim.",
+					}),
+					"call-reduced-merge",
+				),
+			);
+			expect(
+				merged.affectedClaims?.map((claim) => claim.publicClaimId).sort(),
+			).toEqual([target.publicClaimId, source.publicClaimId].sort());
+			const sourceGet = parseResult(
+				await tool.execute(
+					{ action: "get", publicClaimIds: [source.publicClaimId] },
+					"call-reduced-merge-get",
+				),
+			);
+			expect(sourceGet.claims?.[0]?.lifecycleState).toBe("retired");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("rejects a malformed reduced token without reaching the mutation path", async () => {
+		const db = createClaimReaderTestDatabase();
+		try {
+			const tool = harness(db);
+			const created = parseResult(
+				await tool.execute(
+					createArgs("Pi reduced malformed base."),
+					"call-reduced-create",
+				),
+			);
+			const first = created.affectedClaims?.[0];
+			if (!first) throw new Error("missing create result");
+
+			for (const [index, badToken] of [
+				{
+					...first.mutationToken,
+					revision: String(first.mutationToken.revision),
+				},
+				{ ...first.mutationToken, extra: "smuggled" },
+				"not-an-object",
+			].entries()) {
+				const rejected = await tool.execute(
+					reduced({
+						action: "revise",
+						publicClaimId: first.publicClaimId,
+						mutationToken: badToken,
+						content: "Must not apply.",
+					}),
+					`call-reduced-bad-${index}`,
+				);
+				expect(rejected.isError).toBeTrue();
+				expect(textOf(rejected)).toContain("not allowed");
+			}
+
+			expect(
+				getProjectMemoryClaimByPublicId(db, first.publicClaimId)?.revision,
+			).toBe(1);
 		} finally {
 			closeQuietly(db);
 		}

@@ -1189,7 +1189,13 @@ fn golden_inventory_db(path: &std::path::Path) -> Connection {
     .expect("create marker and tampering targets");
     conn.execute(
         "INSERT INTO mc_format_marker VALUES (1, ?1, ?2, ?3, ?4, ?5)",
-        params![format_epoch, incarnation, manifest, created_at, marker_digest],
+        params![
+            format_epoch,
+            incarnation,
+            manifest,
+            created_at,
+            marker_digest
+        ],
     )
     .expect("insert marker row");
     conn.execute_batch(
@@ -1216,8 +1222,10 @@ fn golden_inventory_db(path: &std::path::Path) -> Connection {
         if already_created.contains(&name) {
             continue;
         }
-        conn.execute_batch(&format!("CREATE TABLE \"{name}\" (id INTEGER PRIMARY KEY);"))
-            .unwrap_or_else(|error| panic!("create {name}: {error}"));
+        conn.execute_batch(&format!(
+            "CREATE TABLE \"{name}\" (id INTEGER PRIMARY KEY);"
+        ))
+        .unwrap_or_else(|error| panic!("create {name}: {error}"));
     }
     conn
 }

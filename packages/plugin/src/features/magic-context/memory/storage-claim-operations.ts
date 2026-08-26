@@ -1235,8 +1235,9 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         sharing: input.sharing ?? current.sharing,
         expiresAt: input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
     };
+    const contentUnchanged = sha256Utf8Hex(nextContent) === claim.contentDigest;
     const unchanged =
-        sha256Utf8Hex(nextContent) === claim.contentDigest &&
+        contentUnchanged &&
         nextAttributes.category === current.category &&
         nextAttributes.importance === current.importance &&
         nextAttributes.memoryScope === current.memoryScope &&
@@ -1253,11 +1254,40 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         claimId: claim.claimId,
     });
     const observationId = writeEvidenceChain(db, claim.projectId, input.provenance, nextContent);
+    // A metadata-only revision re-states the current revision's exact bytes, so
+    // every observation supporting those bytes still supports them. Dropping
+    // them would rebuild this revision's trust from the reviser's provenance
+    // alone — `hasExplicitUserEvidence` and `countIndependentEvidenceGroups`
+    // both read `supports` rows per revision — so an importance/scope/sharing
+    // change would reclassify a user-asserted memory down to the reviser's own
+    // maturity and drop it out of the automatic surfaces. A content-changing
+    // revision carries nothing: those observations attest to bytes this
+    // revision replaced. Relations are named rather than copied wholesale so a
+    // future non-supporting relation (a refutation, say) is never re-asserted
+    // as support here, the same discipline the merge path applies to lineage.
+    // Carrying a stamp forward cannot by itself manufacture trust:
+    // `hasExplicitUserEvidence` independently requires a non-first revision to
+    // still hold the claim's first-revision bytes, so model-authored content
+    // never inherits explicit-user standing through this path.
+    const carriedObservationIds = contentUnchanged
+        ? (
+              db
+                  .prepare(
+                      `SELECT observation_id AS observationId FROM claim_evidence
+                        WHERE revision_id = ? AND relation = 'supports'
+                        ORDER BY observation_id`,
+                  )
+                  .all(claim.currentRevisionId) as Array<{ observationId: number }>
+          ).map((row) => row.observationId)
+        : [];
     const appended = appendClaimRevisionInCurrentTransaction(db, {
         claimId: claim.claimId,
         expectedCurrentRevisionId: claim.currentRevisionId,
         content: nextContent,
-        evidence: [{ observationId }],
+        evidence: [...new Set([observationId, ...carriedObservationIds])].map((carried) => ({
+            observationId: carried,
+            relation: "supports" as const,
+        })),
         sourceSessionId: input.provenance.sourceSessionId ?? null,
     });
     if (appended.status !== "applied") {

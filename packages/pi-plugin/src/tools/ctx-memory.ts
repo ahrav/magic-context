@@ -8,7 +8,10 @@ import {
 } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { executeCtxMemoryClaimAction } from "@magic-context/core/tools/ctx-memory/claim-actions";
-import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
+import {
+	CTX_MEMORY_DESCRIPTION,
+	CTX_MEMORY_MUTATION_TOKEN_RULE,
+} from "@magic-context/core/tools/ctx-memory/constants";
 import type { CtxMemoryArgs } from "@magic-context/core/tools/ctx-memory/types";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
@@ -122,6 +125,12 @@ export function createCtxMemoryTool(
 					category: { type: "enum", values: V2_MEMORY_CATEGORIES },
 					publicClaimId: "string",
 					publicClaimIds: { type: "array", items: "string", maxItems: 20 },
+					mutationToken: CTX_MEMORY_MUTATION_TOKEN_RULE,
+					mutationTokens: {
+						type: "array",
+						items: CTX_MEMORY_MUTATION_TOKEN_RULE,
+						maxItems: 20,
+					},
 					limit: "number",
 					reason: "string",
 				});

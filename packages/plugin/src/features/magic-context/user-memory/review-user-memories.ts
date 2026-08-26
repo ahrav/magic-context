@@ -131,12 +131,40 @@ class StaleUserMemoryReviewError extends Error {
     }
 }
 
+/**
+ * Candidates a review running for `projectIdentity` is permitted to act on:
+ * unbound candidates (no session→project mapping, so they can only ever feed the
+ * global user profile) plus candidates bound to this project.
+ *
+ * Candidates bound exclusively to OTHER projects are excluded because the two
+ * halves of the contract disagree about them: `validateManifestReferences`
+ * rejects `promote_project` for a candidate not bound to the run's project,
+ * while `consume_candidate_ids` would still hard-delete it
+ * (`deleteUserMemoryCandidates`). Since every project runs its own review over
+ * one shared candidate table, leaving foreign candidates in the snapshot lets
+ * whichever project reviews first delete another project's project-bound
+ * observation without promoting it anywhere, and the owning project then finds
+ * nothing to review. Keeping them out of the snapshot means the model cannot see
+ * them and so can never name them in `consume_candidate_ids`.
+ */
+function isReviewableInProject(
+    projectIdentities: readonly string[],
+    projectIdentity: string,
+): boolean {
+    return projectIdentities.length === 0 || projectIdentities.includes(projectIdentity);
+}
+
 function reviewSnapshotDigest(
     candidates: readonly ReviewCandidateSnapshot[],
     stableMemories: readonly UserMemory[],
+    projectIdentity: string,
 ): string {
     return sha256Utf8Hex(
         canonicalJsonEncode({
+            // The digest covers the review scope, not just its contents: a
+            // snapshot captured for one project must not validate as fresh when
+            // applied under another.
+            projectIdentity,
             candidates: candidates.map((candidate) => ({
                 content: candidate.content,
                 createdAt: candidate.createdAt,
@@ -160,25 +188,26 @@ function reviewSnapshotDigest(
 
 export function captureUserMemoryReviewSnapshot(
     db: Database,
+    projectIdentity: string,
     now: number = Date.now(),
 ): UserMemoryReviewSnapshot {
     const cutoff = now - USER_MEMORY_CANDIDATE_TTL_MS;
-    const candidates = getUserMemoryCandidates(db).filter(
-        (candidate) => candidate.createdAt >= cutoff,
-    );
+    const fresh = getUserMemoryCandidates(db).filter((candidate) => candidate.createdAt >= cutoff);
     const projectsByCandidate = getUserMemoryCandidateProjectIdentities(
         db,
-        candidates.map((candidate) => candidate.id),
+        fresh.map((candidate) => candidate.id),
     );
-    const enriched = candidates.map((candidate) => ({
-        ...candidate,
-        projectIdentities: projectsByCandidate.get(candidate.id) ?? [],
-    }));
+    const enriched = fresh
+        .map((candidate) => ({
+            ...candidate,
+            projectIdentities: projectsByCandidate.get(candidate.id) ?? [],
+        }))
+        .filter((candidate) => isReviewableInProject(candidate.projectIdentities, projectIdentity));
     const stableMemories = getActiveUserMemories(db);
     return {
         candidates: enriched,
         stableMemories,
-        digest: reviewSnapshotDigest(enriched, stableMemories),
+        digest: reviewSnapshotDigest(enriched, stableMemories, projectIdentity),
     };
 }
 
@@ -390,7 +419,11 @@ export function applyUserMemoryReviewManifest(args: {
             let projectId: number | undefined;
             const checkSnapshot = () => {
                 if (!checkedSnapshot) {
-                    const current = captureUserMemoryReviewSnapshot(args.db, nowMs);
+                    const current = captureUserMemoryReviewSnapshot(
+                        args.db,
+                        args.projectIdentity,
+                        nowMs,
+                    );
                     staleReason =
                         current.digest === args.snapshot.digest
                             ? null
@@ -543,7 +576,7 @@ export async function reviewUserMemories(args: ReviewUserMemoriesArgs): Promise<
     };
     const leaseKey = args.leaseKey ?? DREAMING_LEASE_KEY;
     const snapshotNow = Date.now();
-    const snapshot = captureUserMemoryReviewSnapshot(args.db, snapshotNow);
+    const snapshot = captureUserMemoryReviewSnapshot(args.db, args.projectIdentity, snapshotNow);
     if (snapshot.candidates.length < args.promotionThreshold) {
         const prunedExpired = runLeaseGuardedWrite(
             args.db,
