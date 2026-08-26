@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, For, on, Show } from "solid-js";
 import { formatTimestamp } from "../../lib/api";
 import type { ClaimMemory } from "../../lib/types";
 import FilterSelect from "../shared/FilterSelect";
@@ -18,6 +18,21 @@ interface Props {
 
 export default function MemoryDetail(props: Props) {
   const [editing, setEditing] = createSignal(false);
+
+  // The parent renders this panel through a non-keyed `Show`, whose child
+  // callback re-runs only on falsy<->truthy transitions of its condition. This
+  // instance therefore survives a change of focused claim, so the editor has to
+  // close itself or clicking a second claim would open straight into an edit
+  // box holding the first claim's draft. Keyed on the public claim id rather
+  // than the object, so a refetch of the same claim leaves an open editor
+  // alone.
+  createEffect(
+    on(
+      () => props.memory.publicClaimId,
+      () => setEditing(false),
+      { defer: true },
+    ),
+  );
 
   const handleSave = async () => {
     if (await props.onContentChange(props.memory, props.draft)) setEditing(false);

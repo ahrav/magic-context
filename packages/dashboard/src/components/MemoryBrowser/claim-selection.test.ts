@@ -63,15 +63,45 @@ const A = "mcm_00112233445566778899aabbccddeeff";
 const B = "mcm_ffeeddccbbaa99887766554433221100";
 
 describe("claim selection", () => {
-  it("preserves missing selections and flags them stale", () => {
+  it("preserves out-of-view selections without flagging them stale", () => {
     let selected = toggleClaimSelection(new Map(), claim(A));
     selected = toggleClaimSelection(selected, claim(B));
 
     const reconciled = reconcileClaimSelection(selected, [claim(A)]);
 
     expect([...reconciled.keys()]).toEqual([A, B]);
-    expect(reconciled.get(A)?.stale).toBe(false);
-    expect(reconciled.get(B)?.stale).toBe(true);
+    expect(reconciled.get(A)).toMatchObject({ stale: false, offScope: false });
+    expect(reconciled.get(B)).toMatchObject({ stale: false, offScope: true });
+  });
+
+  it("excludes out-of-view selections from a batch instead of refusing it", () => {
+    // A filter change drops B out of view. Archiving must still act on A rather
+    // than failing for all three, and the count must name only what it acts on.
+    let selected = toggleClaimSelection(new Map(), claim(A));
+    selected = toggleClaimSelection(selected, claim(B));
+    const reconciled = reconcileClaimSelection(selected, [claim(A)]);
+
+    const targets = selectionTargets(reconciled);
+    expect(targets.map((target) => target.mutationToken.publicClaimId)).toEqual([A]);
+  });
+
+  it("re-admits a selection that comes back into view unchanged", () => {
+    let selected = toggleClaimSelection(new Map(), claim(A));
+    selected = reconcileClaimSelection(selected, []);
+    expect(selected.get(A)?.offScope).toBe(true);
+
+    selected = reconcileClaimSelection(selected, [claim(A)]);
+    expect(selected.get(A)).toMatchObject({ stale: false, offScope: false });
+    expect(selectionTargets(selected)).toHaveLength(1);
+  });
+
+  it("flags token drift on a selection that returns to view moved", () => {
+    let selected = toggleClaimSelection(new Map(), claim(A));
+    selected = reconcileClaimSelection(selected, []);
+    selected = reconcileClaimSelection(selected, [claim(A, 2)]);
+
+    expect(selected.get(A)?.stale).toBe(true);
+    expect(() => selectionTargets(selected)).toThrow("Refresh stale selections");
   });
 
   it("preserves selection while flagging token drift", () => {

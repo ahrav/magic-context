@@ -902,6 +902,54 @@ fn tauri_and_http_mutations_record_distinct_provenance() {
 }
 
 #[test]
+fn tauri_content_edits_keep_explicit_user_eligibility() {
+    // A user rewriting a claim in the dashboard produces revision 2 with a new
+    // digest, so the "bytes still equal revision 1" carve-out cannot cover it.
+    // The edit must stay explicitly and automatically eligible, or the user's
+    // own memory silently drops out of injection. The HTTP channel is the
+    // control: it is not an explicit-user producer and must not be promoted.
+    let mut conn = test_db();
+    seed_claim(&conn, CLAIM_A, "alpha", "FACT", "active");
+    seed_claim(&conn, CLAIM_B, "beta", "FACT", "active");
+    let tauri = read_claim(&conn, CLAIM_A);
+    let http = read_claim(&conn, CLAIM_B);
+
+    claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::TauriExplicitUser,
+        claim_adapter::ReviseClaimInput {
+            target: target(&tauri),
+            operation_key: "tauri-edit".to_string(),
+            content: Some("alpha rewritten by the user".to_string()),
+            category: None,
+        },
+    )
+    .unwrap();
+    claim_adapter::revise_claim(
+        &mut conn,
+        claim_adapter::MutationChannel::BearerHttp,
+        claim_adapter::ReviseClaimInput {
+            target: target(&http),
+            operation_key: "http-edit".to_string(),
+            content: Some("beta rewritten by a model".to_string()),
+            category: None,
+        },
+    )
+    .unwrap();
+
+    let edited = read_claim(&conn, CLAIM_A);
+    assert_eq!(edited.revision, 2);
+    assert_eq!(edited.policy.effective_maturity, "VERIFIED");
+    assert!(edited.policy.auto_eligible);
+    assert!(edited.policy.explicit_eligible);
+
+    let inferred = read_claim(&conn, CLAIM_B);
+    assert_eq!(inferred.revision, 2);
+    assert_eq!(inferred.policy.effective_maturity, "CANDIDATE");
+    assert!(!inferred.policy.auto_eligible);
+}
+
+#[test]
 fn adapter_runtime_and_format_checks_refuse_unsafe_inputs() {
     let outdated = sqlite_runtime::SqliteEngineIdentity {
         sqlite_version: "3.45.0".to_string(),

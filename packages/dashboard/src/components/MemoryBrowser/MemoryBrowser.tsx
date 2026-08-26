@@ -212,6 +212,8 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
 
   const selectedCount = () => selected().size;
   const staleSelectedCount = () => [...selected().values()].filter((entry) => entry.stale).length;
+  const offScopeSelectedCount = () =>
+    [...selected().values()].filter((entry) => entry.offScope && !entry.stale).length;
   const allVisibleState = () => selectionState(selected(), visibleClaims());
   const draftForFocused = () => {
     const claim = focusedClaim();
@@ -304,6 +306,10 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
             <span class="bulk-action-count">
               {selectedCount()} selected
               <Show when={staleSelectedCount() > 0}> · {staleSelectedCount()} stale</Show>
+              <Show when={offScopeSelectedCount() > 0}>
+                {" "}
+                · {offScopeSelectedCount()} out of view
+              </Show>
             </span>
           </div>
           <div class="bulk-action-right">

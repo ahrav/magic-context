@@ -863,17 +863,36 @@ function appendLifecycleEvent(
     );
 }
 
+/**
+ * `exemptClaimIds` names every claim this operation itself is about to move off
+ * the (project, category, hash) coordinate, so its own participants can never
+ * read as the pre-existing owner. A revise or restore exempts one claim; a
+ * merge exempts the target AND its sources, because the sources are still
+ * `active` at check time and only retire later in the same transaction —
+ * without the exemption, merged content that keeps a source's wording (the
+ * common outcome) collides with that source and rejects a legitimate merge.
+ */
 function assertNoLiveDuplicate(
     db: Database,
-    args: { projectId: number; category: string; normalizedHash: string; claimId: number },
+    args: {
+        projectId: number;
+        category: string;
+        normalizedHash: string;
+        exemptClaimIds: readonly number[];
+    },
 ): void {
+    const exempt = [...new Set(args.exemptClaimIds)];
+    // An empty exemption list must not emit `NOT IN ()`, which SQLite rejects
+    // as a syntax error rather than matching every row.
+    const exemptClause =
+        exempt.length === 0 ? "" : ` AND claim_id NOT IN (${exempt.map(() => "?").join(", ")})`;
     const duplicate = db
         .prepare(
             `SELECT claim_id AS claimId FROM claim_memory_current_heads
               WHERE project_id = ? AND category = ? AND normalized_hash = ?
-                AND lifecycle_state = 'active' AND claim_id <> ?`,
+                AND lifecycle_state = 'active'${exemptClause}`,
         )
-        .get(args.projectId, args.category, args.normalizedHash, args.claimId) as
+        .get(args.projectId, args.category, args.normalizedHash, ...exempt) as
         | { claimId: number }
         | undefined;
     if (duplicate) {
@@ -1251,7 +1270,7 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         projectId: claim.projectId,
         category: nextAttributes.category,
         normalizedHash,
-        claimId: claim.claimId,
+        exemptClaimIds: [claim.claimId],
     });
     const observationId = writeEvidenceChain(db, claim.projectId, input.provenance, nextContent);
     // A metadata-only revision re-states the current revision's exact bytes, so
@@ -1430,7 +1449,7 @@ export function stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
             projectId: claim.projectId,
             category: attributes.category,
             normalizedHash: attributes.normalizedHash,
-            claimId: claim.claimId,
+            exemptClaimIds: [claim.claimId],
         });
     }
     appendLifecycleEvent(db, {
@@ -1553,7 +1572,7 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         projectId: target.projectId,
         category: targetAttributes.category,
         normalizedHash,
-        claimId: target.claimId,
+        exemptClaimIds: [target.claimId, ...sources.map((source) => source.claimId)],
     });
 
     // Both evidence relations carry lineage, so both flow into the merged
@@ -1599,15 +1618,6 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         projectId: target.projectId,
         attributes: { ...targetAttributes, category: targetAttributes.category },
         normalizedHash,
-        nowMs,
-    });
-    upsertCurrentHead(db, {
-        claimId: target.claimId,
-        projectId: target.projectId,
-        category: targetAttributes.category,
-        normalizedHash,
-        revisionId: appended.revisionId,
-        lifecycleState: lifecycleHead(db, target.claimId)?.state ?? "active",
         nowMs,
     });
     createPolicySubjectForRevision(db, {
@@ -1666,6 +1676,21 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         });
         policyRevisionIds.push(source.currentRevisionId);
     }
+    // The target head lands only after every source head is `retired`. The
+    // dedup index over (project, category, normalized_hash) is partial on
+    // `lifecycle_state = 'active'`, so merged content that keeps a source's
+    // wording still collides with that source's live head until it vacates the
+    // coordinate. Retiring first makes the ordering carry the same guarantee
+    // the exemption in `assertNoLiveDuplicate` states.
+    upsertCurrentHead(db, {
+        claimId: target.claimId,
+        projectId: target.projectId,
+        category: targetAttributes.category,
+        normalizedHash,
+        revisionId: appended.revisionId,
+        lifecycleState: lifecycleHead(db, target.claimId)?.state ?? "active",
+        nowMs,
+    });
     const locator = {
         publicClaimId: target.publicClaimId,
         revision: appended.revision,
@@ -1987,11 +2012,18 @@ export interface ClaimOutboxPruneResult {
 
 /**
  * Consumption-driven outbox retention (KTD13): the prune boundary is the
- * minimum acknowledged effect id across every REQUIRED consumer (a consumer
- * with no checkpoint pins the boundary at zero), and only complete receipt
- * groups at or below the boundary leave. Receipts themselves never leave
- * (R20). Runs inside the caller's write transaction so the enabled=1
- * capability row can never commit.
+ * minimum acknowledged effect id across every REQUIRED consumer paired with
+ * every project the outbox still holds effects for (an absent checkpoint pins
+ * the boundary at zero), and only complete receipt groups at or below the
+ * boundary leave. Receipts themselves never leave (R20). Runs inside the
+ * caller's write transaction so the enabled=1 capability row can never commit.
+ *
+ * The pairing is what makes the boundary sound. Checkpoints are keyed
+ * (consumer, project_id) while the delete below is global over effect ids, so a
+ * consumer-only aggregate reports a boundary derived from the projects it HAS
+ * acknowledged and silently ignores the ones it never checkpointed. A consumer
+ * caught up on one project past another project's effect ids would then prune
+ * effects it never processed.
  */
 export function pruneClaimOperationEffectsInCurrentTransaction(
     db: Database,
@@ -2009,8 +2041,11 @@ export function pruneClaimOperationEffectsInCurrentTransaction(
     for (const consumer of requiredConsumers) {
         const row = db
             .prepare(
-                `SELECT MIN(acked_effect_id) AS acked FROM claim_outbox_consumer_checkpoints
-                  WHERE consumer = ?`,
+                `SELECT MIN(COALESCE(checkpoint.acked_effect_id, 0)) AS acked
+                   FROM (SELECT DISTINCT project_id FROM claim_operation_effects) project
+                   LEFT JOIN claim_outbox_consumer_checkpoints checkpoint
+                     ON checkpoint.consumer = ?
+                    AND checkpoint.project_id = project.project_id`,
             )
             .get(consumer) as { acked: number | null };
         boundary = Math.min(boundary, row.acked ?? 0);

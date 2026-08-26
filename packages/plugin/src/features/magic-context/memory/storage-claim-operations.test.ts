@@ -792,6 +792,58 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
         }
     });
 
+    test("a project the consumer never checkpointed pins the boundary at zero", () => {
+        // Checkpoints are keyed (consumer, project_id) while the delete is
+        // global over effect ids, so a consumer caught up on one project must
+        // not license pruning another project's unprocessed effects.
+        const ctx = setup();
+        try {
+            const otherProjectId = ensureProject(ctx.db, "git:u2-ops-other");
+            createClaimOp({ db: ctx.db, projectId: otherProjectId }, "op-other", "Other project.");
+            const { maxEffectId } = seedOutbox(ctx);
+            const effectsBefore = rowCount(ctx.db, "claim_operation_effects");
+
+            ctx.db
+                .transaction(() => {
+                    advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                        consumer: "module-mirror",
+                        projectId: ctx.projectId,
+                        ackedEffectId: maxEffectId,
+                    });
+                })
+                .immediate();
+
+            const pruned = ctx.db
+                .transaction(() =>
+                    pruneClaimOperationEffectsInCurrentTransaction(ctx.db, ["module-mirror"]),
+                )
+                .immediate();
+            expect(pruned.boundary).toBe(0);
+            expect(pruned.prunedEffectRows).toBe(0);
+            expect(rowCount(ctx.db, "claim_operation_effects")).toBe(effectsBefore);
+
+            // Checkpointing the second project too releases the boundary.
+            ctx.db
+                .transaction(() => {
+                    advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                        consumer: "module-mirror",
+                        projectId: otherProjectId,
+                        ackedEffectId: maxEffectId,
+                    });
+                })
+                .immediate();
+            const after = ctx.db
+                .transaction(() =>
+                    pruneClaimOperationEffectsInCurrentTransaction(ctx.db, ["module-mirror"]),
+                )
+                .immediate();
+            expect(after.boundary).toBe(maxEffectId);
+            expect(after.prunedEffectRows).toBeGreaterThan(0);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("a checkpoint cannot split a receipt group and cannot regress", () => {
         const ctx = setup();
         try {
@@ -1166,6 +1218,61 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
             expect(merged.outcome).toBe("stale");
             expect(merged.result.effects).toHaveLength(0);
             expect(snapshotCounts(ctx.db)).toEqual(before);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("merged content may keep a source's exact wording", () => {
+        // The sources are still `active` when the duplicate-content guard runs
+        // and only retire later in the same transaction, so a merge that keeps
+        // one source's wording — the common outcome — must not read that source
+        // as the pre-existing owner of the coordinate.
+        const ctx = setup();
+        try {
+            const target = createClaimOp(ctx, "op-target", "Target claim content.");
+            const source = createClaimOp(ctx, "op-source", "Source claim content.");
+            const sourceRef = getProjectMemoryClaimByPublicId(ctx.db, publicIdOf(source));
+            if (!sourceRef) throw new Error("unreachable");
+
+            const merged = mergeProjectMemoryClaims(
+                ctx.db,
+                { producer: "test", operationKey: "op-merge" },
+                {
+                    targetToken: computeProjectMemoryMutationToken(ctx.db, publicIdOf(target)),
+                    sourceTokens: [computeProjectMemoryMutationToken(ctx.db, publicIdOf(source))],
+                    mergedContent: "Source claim content.",
+                    actor: "user:test",
+                },
+            );
+
+            expect(merged.outcome).toBe("applied");
+            const targetRef = getProjectMemoryClaimByPublicId(ctx.db, publicIdOf(target));
+            expect(targetRef?.revision).toBe(2);
+            expect(
+                (
+                    ctx.db
+                        .prepare(
+                            "SELECT state FROM claim_memory_lifecycle_heads WHERE claim_id = ?",
+                        )
+                        .get(sourceRef.claimId) as { state: string }
+                ).state,
+            ).toBe("retired");
+            // The retired source vacates the coordinate, so exactly one live
+            // claim owns the merged content afterwards.
+            expect(
+                (
+                    ctx.db
+                        .prepare(
+                            `SELECT COUNT(*) AS count FROM claim_memory_current_heads
+                              WHERE normalized_hash = (
+                                  SELECT normalized_hash FROM claim_memory_current_heads
+                                  WHERE claim_id = ?)
+                                AND lifecycle_state = 'active'`,
+                        )
+                        .get(targetRef?.claimId as number) as { count: number }
+                ).count,
+            ).toBe(1);
         } finally {
             closeQuietly(ctx.db);
         }

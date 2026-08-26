@@ -19,6 +19,14 @@ const TAINT_CLASSIFIER_METHOD: &str = "mc-taint-classifier-v1";
 
 pub type AdapterResult<T> = Result<T, String>;
 
+/// The only producer whose explicit-user observation may grant explicit-user
+/// credit to a revision that changes content. Mirrored by
+/// `EXPLICIT_USER_REVISION_PRODUCER` in
+/// `packages/plugin/src/features/magic-context/memory/storage-claim-policy.ts`;
+/// the conformance suite compares the two policies' verdicts, so a drift here
+/// shows up as a maturity disagreement rather than passing silently.
+pub const EXPLICIT_USER_REVISION_PRODUCER: &str = "dashboard:tauri";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationChannel {
     TauriExplicitUser,
@@ -28,7 +36,7 @@ pub enum MutationChannel {
 impl MutationChannel {
     fn producer(self) -> &'static str {
         match self {
-            Self::TauriExplicitUser => "dashboard:tauri",
+            Self::TauriExplicitUser => EXPLICIT_USER_REVISION_PRODUCER,
             Self::BearerHttp => "dashboard:http",
         }
     }
@@ -1405,16 +1413,36 @@ fn finalize_policy(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ))?;
     append_maturity(conn, revision_id, project_id, "CANDIDATE", now_ms)?;
+    // Explicit-user credit for a later revision needs a witness that the stamp
+    // was authored FOR this revision, not inherited. Two of the three branches
+    // predate this adapter: revision 1 carries its own stated provenance, and a
+    // later revision whose bytes still equal revision 1's is the classification
+    // path re-observing unchanged content. Neither admits a rewrite that
+    // changes content.
+    //
+    // The third branch is this adapter's own write path. `write_evidence`
+    // records the NEW content as the observation's `extracted_text`, so an
+    // observation authored here has `content_sha256` equal to the revision it
+    // supports. Requiring the producer as well as that digest match keeps the
+    // defense the other branches provide: the hazard those branches guard is a
+    // held-open pre-v86 writer copying a retained `user` trust class onto a
+    // model-authored successor, and such a writer predates this producer string
+    // entirely, so it cannot mint one. Without this branch a genuine dashboard
+    // content edit — revision 2 with a new digest — silently loses explicit-user
+    // credit and drops out of automatic injection.
     let explicit_user = sql(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM claim_evidence evidence \
          JOIN observations observation ON observation.id = evidence.observation_id \
          JOIN claim_revisions revision ON revision.id = evidence.revision_id \
          WHERE evidence.revision_id = ?1 AND evidence.relation = 'supports' \
            AND observation.source_trust_class = 'explicit_user' \
-           AND (revision.revision = 1 OR revision.content_sha256 = ( \
-               SELECT first.content_sha256 FROM claim_revisions first \
-               WHERE first.claim_id = revision.claim_id AND first.revision = 1)))",
-        [revision_id],
+           AND (revision.revision = 1 \
+                OR revision.content_sha256 = ( \
+                    SELECT first.content_sha256 FROM claim_revisions first \
+                    WHERE first.claim_id = revision.claim_id AND first.revision = 1) \
+                OR (observation.extractor = ?2 \
+                    AND observation.content_sha256 = revision.content_sha256)))",
+        rusqlite::params![revision_id, EXPLICIT_USER_REVISION_PRODUCER],
         |row| row.get::<_, i64>(0),
     ))? != 0;
     let verified = sql(conn.query_row(
@@ -2001,6 +2029,15 @@ fn lifecycle_stage(
     })
 }
 
+/// Build the response for an already-committed mutation.
+///
+/// Every hydrate failure here is post-commit, so none of them may fail the
+/// mutation: the write is durable, and returning `Err` would invite the caller
+/// to retry or report failure for an operation that succeeded. A claim that
+/// cannot be hydrated is omitted from `refreshed_claims` — the same treatment
+/// an unknown or hidden claim already gets — and the reason goes to stderr so
+/// an invariant violation stays diagnosable instead of vanishing. `outcome`
+/// still reports what happened.
 fn response(
     conn: &Connection,
     run: RunResult,
@@ -2010,18 +2047,19 @@ fn response(
     let refreshed_claims = public_ids
         .iter()
         .filter_map(|public_id| match hydrate_claim(conn, public_id) {
-            Ok(claim) => Some(Ok(claim)),
+            Ok(claim) => Some(claim),
             Err(error) if error.starts_with("unknown project-memory claim") => None,
-            Err(error) => Some(Err(error)),
+            Err(error) => {
+                eprintln!(
+                    "claim adapter: post-commit hydrate of {public_id} failed, omitting it from the response: {error}"
+                );
+                None
+            }
         })
         // A mutation response never discloses more than a read would: a hidden
         // claim is omitted, and the outcome still reports what happened.
-        .filter_map(|claim| match claim {
-            Ok(claim) if claim_memory_is_explicitly_visible(&claim, now_ms) => Some(Ok(claim)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<AdapterResult<Vec<_>>>()?;
+        .filter(|claim| claim_memory_is_explicitly_visible(claim, now_ms))
+        .collect::<Vec<_>>();
     let project_ids = public_ids
         .iter()
         .filter_map(|public_id| get_claim(conn, public_id).ok().flatten())
