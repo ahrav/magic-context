@@ -99,6 +99,19 @@
             ]
         },
         {
+            "path": "tests/incident-pool-green.test.ts",
+            "tier": "both-modes",
+            "invocation": {
+                "ts": true,
+                "rust": true
+            },
+            "rationale": "baseline-green incident wrappers run only catalog-declared OpenCode or Rust variants through the isolated runner; retained-red variants stay in the report lane",
+            "contract_refs": [
+                "U7-INCIDENT-POOL",
+                "R7"
+            ]
+        },
+        {
             "path": "tests/long-running-session.test.ts",
             "tier": "both-modes",
             "invocation": {
@@ -413,18 +426,6 @@
             ]
         },
         {
-            "path": "tests/pi-todo-synthesis.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
             "path": "tests/rust-cold-start-drop-seed.test.ts",
             "tier": "rust-only",
             "invocation": {
@@ -650,15 +651,16 @@
         },
         {
             "path": "tests/todo-synthesis.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "synthetic todowrite state-sync, bust-time injection, anchor persistence, and defer replay are shared cache contracts",
+            "rationale": "OpenCode synthetic todowrite stays green here; retained-red Rust and Pi variants execute only through incident registry bindings",
             "contract_refs": [
                 "S2-MIGRATION",
-                "ARCHITECTURE.md#synthetic-todowrite"
+                "ARCHITECTURE.md#synthetic-todowrite",
+                "U6-INCIDENT-POOL"
             ]
         },
         {

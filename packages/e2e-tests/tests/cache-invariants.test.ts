@@ -34,7 +34,6 @@ import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
-import type { Database } from "../../plugin/src/shared/sqlite";
 import {
     extractM0,
     extractM1,
@@ -45,6 +44,13 @@ import {
 import { TestHarness } from "../src/harness";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
+import {
+    driveAgedCtxReduceSurvival,
+    driveFirstRenderPureDeferStability,
+    failedCheckIds,
+    verifyAgedCtxReduceSurvival,
+    verifyFirstRenderPureDeferStability,
+} from "../src/incident-pool/scenarios/source-linked-regressions";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
@@ -192,8 +198,13 @@ function projectIdentity(): string {
     return resolveProjectIdentity(realpathSync(pathResolve(h.opencode.env.workdir)));
 }
 
-function writeContextDb<T>(fn: (db: Database) => T): T {
-    const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
+function writeContextDb<T>(fn: (db: ReturnType<typeof openTestDb>) => T): T {
+    const dbPath = join(
+        h.opencode.env.dataDir,
+        "cortexkit",
+        "magic-context",
+        "context.db",
+    );
     const db = openTestDb(dbPath, { readwrite: true });
     try {
         return fn(db);
@@ -202,9 +213,12 @@ function writeContextDb<T>(fn: (db: Database) => T): T {
     }
 }
 
-function seedMemory(content: string, category: Memory["category"] = "PROJECT_RULES"): number {
+function seedMemory(
+    content: string,
+    category: Memory["category"] = "PROJECT_RULES",
+): number {
     return writeContextDb((db) => {
-        const id = insertMemory(db, {
+        const id = insertMemory(db as never, {
             projectPath: projectIdentity(),
             category,
             content,
@@ -214,7 +228,7 @@ function seedMemory(content: string, category: Memory["category"] = "PROJECT_RUL
             // deterministic before the next turn materializes m[0].
             sourceType: "user",
         }).id;
-        updateMemoryVerification(db, id, "verified");
+        updateMemoryVerification(db as never, id, "verified");
         return id;
     });
 }
@@ -261,7 +275,12 @@ function queueMemoryUpdate(targetId: number, newContent: string): void {
                 (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
              VALUES (?, 'update', ?, NULL, NULL, ?, ?)`,
         ).run(projectIdentity(), targetId, newContent, Date.now());
-        updateMemoryContent(db, targetId, newContent, computeNormalizedHash(newContent));
+        updateMemoryContent(
+            db as never,
+            targetId,
+            newContent,
+            computeNormalizedHash(newContent),
+        );
     });
 }
 
@@ -277,34 +296,6 @@ function bumpProjectEpoch(): void {
              VALUES (?, 1)
              ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = project_memory_epoch + 1`,
         ).run(projectIdentity());
-    });
-}
-
-/** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
-function emitCtxReduceOnce(drop: string): void {
-    let emitted = false;
-    h.mock.addMatcher((body) => {
-        if (emitted) return null;
-        const sys = JSON.stringify(body.system ?? "");
-        if (!sys.includes("## Magic Context")) return null;
-        const tools = Array.isArray(body.tools) ? body.tools : [];
-        const name = tools
-            .map((t) => (t && typeof t === "object" ? (t as { name?: unknown }).name : null))
-            .find((n) => typeof n === "string" && /ctx_reduce/.test(n)) as string | undefined;
-        if (!name) return null;
-        emitted = true;
-        return {
-            content: [
-                {
-                    type: "tool_use",
-                    id: `toolu_ci_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
-                    name,
-                    input: { drop },
-                },
-            ],
-            stop_reason: "tool_use" as const,
-            usage: DEFER_USAGE,
-        };
     });
 }
 
@@ -377,31 +368,21 @@ async function waitForRustCompartment(sessionId: string): Promise<void> {
     throw new Error("waitForRustCompartment timed out after 60000ms");
 }
 
-function assertNoBusts(label: string): void {
-    const requests = mainAgentRequests(h.mock.requests());
-    const busts = findBusts(requests);
-    if (busts.length > 0) {
-        // Surface the exact wire divergence so a CI failure is actionable.
-        console.error(`[cache-invariant:${label}] ${busts.length} bust(s):\n${formatBustReport(busts)}`);
-    }
-    expect({ label, busts: busts.length }).toEqual({ label, busts: 0 });
-}
-
 describe("cache invariants — replay class", () => {
     describe("#given a low-pressure conversation (A1)", () => {
         describe("#when several pure-defer turns grow the tail", () => {
             it("#then the cached prefix never busts across defer passes", async () => {
-                //#given / #when
-                const sessionId = await h.createSession();
-                for (let i = 1; i <= 6; i++) {
-                    setDefer(`A1 reply ${i}`);
-                    await h.sendPrompt(sessionId, `A1 turn ${i}: low-pressure cache-stability probe.`);
-                }
+                const observation = await driveFirstRenderPureDeferStability(h);
 
-                //#then
-                const requests = mainAgentRequests(h.mock.requests());
-                expect(requests.length).toBeGreaterThanOrEqual(6);
-                assertNoBusts("A1-low-pressure-defer");
+                if (observation.bustReport) {
+                    console.error(
+                        `[cache-invariant:A1-low-pressure-defer] ${observation.bustCount} bust(s):\n${observation.bustReport}`,
+                    );
+                }
+                expect(observation.mainRequestCount).toBeGreaterThanOrEqual(6);
+                const result = verifyFirstRenderPureDeferStability(observation);
+                expect(failedCheckIds(result)).toEqual([]);
+                expect(result.verdict).toBe("pass");
             }, 120_000);
         });
     });
@@ -446,37 +427,18 @@ describe("cache invariants — replay class", () => {
     describe("#given an aged ctx_reduce call in the conversation (A3 — the regression)", () => {
         describe("#when pure-defer turns grow the tail past the protected window", () => {
             it("#then the ctx_reduce message never vanishes mid-prefix and the prefix never busts", async () => {
-                //#given — a normal turn, then a turn that emits a real ctx_reduce
-                // tool call, then enough defer growth to push it well past
-                // protected_tags (1).
-                const sessionId = await h.createSession();
-                setDefer("A3 reply 1");
-                await h.sendPrompt(sessionId, "A3 turn 1: establish baseline content.");
+                const observation = await driveAgedCtxReduceSurvival(h);
 
-                emitCtxReduceOnce("99999");
-                setDefer("A3 reply 2 (after ctx_reduce tool call)");
-                await h.sendPrompt(sessionId, "A3 turn 2: this turn issues a ctx_reduce call.");
-
-                // Capture the wire signature of the ctx_reduce call once it's on
-                // the wire, then grow the conversation with pure-defer turns.
-                let sawReduceOnWire = false;
-                for (let i = 3; i <= 8; i++) {
-                    setDefer(`A3 defer reply ${i}`);
-                    await h.sendPrompt(sessionId, `A3 turn ${i}: defer growth ages the ctx_reduce call.`);
-                    const body = JSON.stringify(h.mock.lastRequest()?.body ?? {});
-                    if (body.includes("ctx_reduce")) sawReduceOnWire = true;
+                if (observation.bustReport) {
+                    console.error(
+                        `[cache-invariant:A3-ctx_reduce-defer-growth] ${observation.bustCount} bust(s):\n${observation.bustReport}`,
+                    );
                 }
-
-                //#then — across the whole post-ctx_reduce window, zero busts.
-                // Pre-fix, one of these defer passes would strip the aged
-                // ctx_reduce call mid-prefix (vanish + shift) → a bust here.
-                expect(sawReduceOnWire).toBe(true);
-                assertNoBusts("A3-ctx_reduce-defer-growth");
-
-                // And the ctx_reduce call must still be present on the final wire
-                // (never silently removed on a defer pass).
-                const finalBody = JSON.stringify(mainAgentRequests(h.mock.requests()).at(-1)?.body ?? {});
-                expect(finalBody).toContain("ctx_reduce");
+                expect(observation.sawReduceOnWire).toBe(true);
+                expect(observation.finalWireHasCtxReduce).toBe(true);
+                const result = verifyAgedCtxReduceSurvival(observation);
+                expect(failedCheckIds(result)).toEqual([]);
+                expect(result.verdict).toBe("pass");
             }, 150_000);
         });
     });
@@ -649,10 +611,18 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // maxMemoryId advances when the new memory is seeded, but it must
                 // NOT re-materialize m[0] (not a HARD trigger); the new memory is
                 // an m[1] delta via the readNewMemoriesForM1 watermark.
-                h.mock.setDefault({ text: "B10 pressure", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B10 turn 4: high usage marks the next pass execute.");
+                h.mock.setDefault({
+                    text: "B10 pressure",
+                    usage: EXECUTE_USAGE,
+                });
+                await h.sendPrompt(
+                    sessionId,
+                    "B10 turn 4: high usage marks the next pass execute.",
+                );
                 const epochBeforeAdditive = projectEpoch();
-                seedMemory("B10 fresh rule: always run the full gate before a release.");
+                seedMemory(
+                    "B10 fresh rule: always run the full gate before a release.",
+                );
                 setProjectEpoch(epochBeforeAdditive);
                 setDefer("B10 surface");
                 await h.sendPrompt(sessionId, "B10 turn 5: execute pass surfaces the new memory.");
@@ -748,15 +718,26 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // m[0] must NOT re-materialize: the stale baseline still shows the
                 // ORIGINAL text, and m[1] carries a <memory-updates> correction.
                 // Turn 4 records high usage so turn 5 is the cache-busting pass.
-                h.mock.setDefault({ text: "B11 pressure", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B11 turn 4: high usage marks the next pass execute.");
+                h.mock.setDefault({
+                    text: "B11 pressure",
+                    usage: EXECUTE_USAGE,
+                });
+                await h.sendPrompt(
+                    sessionId,
+                    "B11 turn 4: high usage marks the next pass execute.",
+                );
                 const epochBeforeUpdate = projectEpoch();
-                queueMemoryUpdate(memId, "B11 revised rule: deploys go straight to production with a feature flag.");
+                queueMemoryUpdate(
+                    memId,
+                    "B11 revised rule: deploys go straight to production with a feature flag.",
+                );
                 // A content rewrite withdraws verification (the successor revision
                 // starts CANDIDATE); re-verify through the real API so the revised
                 // row stays render-eligible, then pin the epoch so the mutation
                 // rides the m[1] delta instead of HARD-refolding m[0].
-                writeContextDb((db) => updateMemoryVerification(db, memId, "verified"));
+                writeContextDb((db) =>
+                    updateMemoryVerification(db as never, memId, "verified"),
+                );
                 setProjectEpoch(epochBeforeUpdate);
                 setDefer("B11 reconcile");
                 await h.sendPrompt(sessionId, "B11 turn 5: execute pass renders the memory-updates delta.");
@@ -835,10 +816,18 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 setDefer("B12 materialize-empty");
                 await h.sendPrompt(sessionId, "B12 turn 3: execute pass materializes empty m[0].");
 
-                h.mock.setDefault({ text: "B12 pressure", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B12 turn 4: high usage marks next pass execute.");
+                h.mock.setDefault({
+                    text: "B12 pressure",
+                    usage: EXECUTE_USAGE,
+                });
+                await h.sendPrompt(
+                    sessionId,
+                    "B12 turn 4: high usage marks next pass execute.",
+                );
                 const epochBeforeSeed = projectEpoch();
-                seedMemory("B12 delta rule: keep the cache prefix byte-identical across defer passes.");
+                seedMemory(
+                    "B12 delta rule: keep the cache prefix byte-identical across defer passes.",
+                );
                 setProjectEpoch(epochBeforeSeed);
                 setDefer("B12 surface");
                 await h.sendPrompt(sessionId, "B12 turn 5: execute pass surfaces the memory into m[1].");

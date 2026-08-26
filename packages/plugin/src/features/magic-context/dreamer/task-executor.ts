@@ -130,6 +130,10 @@ export interface DreamTaskExecutorDeps {
     retinaHandoff?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
+    curateLifecycle?: {
+        beforePrompt?: () => Promise<void> | void;
+        afterPrompt?: (declareLeaseLost: () => void) => Promise<void> | void;
+    };
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
             context_store_uuid: string;
@@ -1197,14 +1201,15 @@ async function runAgenticTask(
 
     const abortController = new AbortController();
     let leaseLost = false;
+    const declareLeaseLost = (): void => {
+        leaseLost = true;
+        abortController.abort();
+    };
     const heartbeat = startLeaseHeartbeat(
         db,
         holderId,
         leaseKey,
-        () => {
-            leaseLost = true;
-            abortController.abort();
-        },
+        declareLeaseLost,
         ctx.leaseAcquisition,
     );
 
@@ -1246,7 +1251,24 @@ async function runAgenticTask(
             curate: curateMemories ? { memories: curateMemories } : undefined,
         });
 
+        if (task === "curate") await deps.curateLifecycle?.beforePrompt?.();
+        // Recompute AFTER the awaited lifecycle hook: a slow beforePrompt
+        // spends deadline budget, and a stale remaining window would let the
+        // prompt run past the deadline the lease heartbeat is sized against.
         const remainingMs = Math.max(0, deadline - Date.now());
+        const promptTimeoutMs = Math.min(remainingMs, config.timeoutMinutes * 60 * 1000);
+        if (promptTimeoutMs <= 0) {
+            // Mark this transient explicitly. Each executor invocation
+            // recomputes `startedAt`, so a hot retry gets a full deadline and
+            // this exhaustion is recoverable — but classifyFailure keys off the
+            // error shape, and "deadline expired" matches none of its timeout
+            // patterns, so an unflagged throw would advance to the next cron
+            // slot instead of using the bounded hot-retry path.
+            throw Object.assign(
+                new Error(`Dreamer ${task} deadline expired before the prompt was submitted.`),
+                { transient: true },
+            );
+        }
         const run = await shared.promptSyncWithValidatedOutputRetry(
             deps.client,
             {
@@ -1271,7 +1293,7 @@ async function runAgenticTask(
                 },
             },
             {
-                timeoutMs: Math.min(remainingMs, config.timeoutMinutes * 60 * 1000),
+                timeoutMs: promptTimeoutMs,
                 signal: abortController.signal,
                 fallbackModels: config.fallbackModels,
                 callContext: `dreamer:${task}`,
@@ -1291,6 +1313,9 @@ async function runAgenticTask(
                 },
             },
         );
+        if (task === "curate") {
+            await deps.curateLifecycle?.afterPrompt?.(declareLeaseLost);
+        }
 
         if (leaseLost) throw new Error("Dream lease lost during task");
 

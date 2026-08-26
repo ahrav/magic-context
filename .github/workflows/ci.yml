@@ -8,7 +8,10 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Pipeline shape on every push to main and on every PR:
+permissions:
+  contents: read
+
+# Pipeline shape on every push to main and every PR:
 #
 #   check-plugin, check-pi-plugin
 #   (unit tests + lint + typecheck, parallel)
@@ -434,7 +437,10 @@ jobs:
     # Gated on Docker e2e: no point exercising the deep behavior suite if
     # the simpler install+smoke path is broken.
     needs: [e2e-opencode]
-    timeout-minutes: 40
+    # The manifest selection includes the incident-pool green wrapper, which
+    # runs its cases sequentially in an isolated second phase, each paying a
+    # cold harness boot; 40 minutes is too tight for that plus the host suite.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -481,21 +487,14 @@ jobs:
         env:
           NODE_ENV: ""
           MC_E2E_MODE: ts
-        run: |
-          # The mode validator independently checks tests/**/*.test.ts and
-          # derives this OpenCode list. Rust is intentionally absent from public
-          # CI because its private ../commons and ../subconscious path-deps are
-          # not provisioned here; the local release gate runs that host group.
-          cd packages/e2e-tests
-          files=$(
-            bun scripts/validate-mode-manifest.ts --mode ts --harness opencode |
-              tr '\n' ' '
-          )
-          echo "Running OpenCode host tests from mode manifest: $files"
-          # shellcheck disable=SC2086
-          bun test --timeout 600000 $files
-          # This oracle is outside the manifest's tests/**/*.test.ts inventory.
-          bun test --timeout 600000 src/cache-analysis.test.ts
+        # run-test-selection.ts derives the OpenCode list from the mode
+        # manifest, carries the standalone oracles that live outside the
+        # manifest's tests/**/*.test.ts inventory (see standaloneUnitFiles),
+        # and runs the incident-pool green wrapper alone in a second phase
+        # with --max-concurrency 1. Rust is intentionally absent from public
+        # CI because its private ../commons and ../subconscious path-deps are
+        # not provisioned here; the local release gate runs that host group.
+        run: bun run --cwd packages/e2e-tests test:opencode-e2e
 
   e2e-host-pi:
     name: E2E (Pi, host behavior)
@@ -544,12 +543,66 @@ jobs:
         env:
           NODE_ENV: ""
           MC_E2E_MODE: ts
+        run: bun run --cwd packages/e2e-tests test:pi-e2e
+
+  incident-regression-pool:
+    name: Incident regression pool (supported TS)
+    runs-on: ubuntu-latest
+    needs: [check-plugin, check-pi-plugin]
+    # Sized for the aggregate sequential deadline, not the happy path. `--mode
+    # ts` runs 10 OpenCode then 4 Pi variants one at a time, each allowed the
+    # 600s budget below, so a run where cases time out can need ~140 minutes on
+    # top of setup. At a lower cap the job is killed mid-schedule and publishes
+    # no report at all, which loses the per-case classification that is the
+    # whole point of this job — strictly worse than a slow red build. Cases
+    # normally finish in seconds, so this bound is only reached when something
+    # is already wrong.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Install opencode
         run: |
-          cd packages/e2e-tests
-          files=$(
-            bun scripts/validate-mode-manifest.ts --mode ts --harness pi |
-              tr '\n' ' '
-          )
-          echo "Running Pi host tests from mode manifest: $files"
-          # shellcheck disable=SC2086
-          bun test --timeout 600000 $files
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Build supported TS harness plugins
+        run: |
+          bun run --cwd packages/plugin build
+          bun run --cwd packages/pi-plugin build
+
+      - name: Validate append-only incident history against trusted event base
+        run: bun run --cwd packages/e2e-tests validate:incident-history:ci
+
+      - name: Reject changed mutation-bound verifiers without replay evidence
+        run: bun run --cwd packages/e2e-tests validate:incident-verifiers:ci
+
+      - name: Run incident unit coverage
+        run: bun run --cwd packages/e2e-tests test:incident-unit
+
+      - name: Run supported TS incident schedule
+        env:
+          NODE_ENV: ""
+        # Same 600s per-case budget the host suites use: a cold runner pays Bun
+        # bootstrap plus a fresh harness and `opencode serve` startup inside the
+        # first case, which the 120s default deadline cannot cover.
+        run: >-
+          bun run --cwd packages/e2e-tests test:incidents --mode ts
+          --timeout 600000
+
+      - name: Archive explicit incident report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-pool-ts
+          path: packages/e2e-tests/artifacts/incident-pool-ts-report.json
+          if-no-files-found: warn

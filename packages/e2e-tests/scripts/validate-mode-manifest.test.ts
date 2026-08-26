@@ -1,12 +1,28 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { parseIncidentCatalog } from "../src/incident-pool/contract";
+import { incidentUnitFiles } from "./run-test-selection";
 import {
+    E2E_ROOT,
     filesForMode,
+    validateGreenIncidentWrapperSource,
+    validateGreenPackageScripts,
     validateManifestDocument,
     validateModeManifest,
     type ModeManifest,
 } from "./validate-mode-manifest";
 
 const validation = validateModeManifest();
+const catalog = parseIncidentCatalog(
+    JSON.parse(
+        readFileSync(resolve(E2E_ROOT, "incidents", "catalog.json"), "utf8"),
+    ),
+);
+const greenWrapperSource = readFileSync(
+    resolve(E2E_ROOT, "tests", "incident-pool-green.test.ts"),
+    "utf8",
+);
 
 function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
     return {
@@ -19,11 +35,16 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
         expect(validation.files.length).toBe(60);
-        expect(validation.manifest.entries).toHaveLength(validation.files.length);
-        expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
+        expect(validation.manifest.entries).toHaveLength(
             validation.files.length,
         );
-        expect(validation.manifest.entries.map((entry) => entry.path).sort()).toEqual(validation.files);
+        expect(
+            new Set(validation.manifest.entries.map((entry) => entry.path))
+                .size,
+        ).toBe(validation.files.length);
+        expect(
+            validation.manifest.entries.map((entry) => entry.path).sort(),
+        ).toEqual(validation.files);
     });
 
     it("derives separate TS and Rust invocation lists", () => {
@@ -31,19 +52,31 @@ describe("mode manifest validator", () => {
         const rust = filesForMode(validation, "rust");
         expect(ts).toHaveLength(41);
         expect(rust).toHaveLength(31);
-        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(22);
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(19);
-        expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
+        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(
+            21,
+        );
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(20);
+        expect(filesForMode(validation, "ts", "pi")).toHaveLength(21);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length);
+        expect(filesForMode(validation, "ts", "pi")).not.toContain(
+            "tests/pi-todo-synthesis.test.ts",
+        );
+        expect(rust).not.toContain("tests/todo-synthesis.test.ts");
     });
 
     it("rejects a missing, duplicated, or dead manifest path", () => {
         const entries = validation.manifest.entries;
-        expect(() => validateManifestDocument(manifestWith(entries.slice(0, -1)), validation.files)).toThrow(
-            /missing manifest entries/,
-        );
         expect(() =>
-            validateManifestDocument(manifestWith([...entries, entries[0]!]), validation.files),
+            validateManifestDocument(
+                manifestWith(entries.slice(0, -1)),
+                validation.files,
+            ),
+        ).toThrow(/missing manifest entries/);
+        expect(() =>
+            validateManifestDocument(
+                manifestWith([...entries, entries[0]!]),
+                validation.files,
+            ),
         ).toThrow(/duplicate manifest entry/);
         expect(() =>
             validateManifestDocument(
@@ -75,6 +108,70 @@ describe("mode manifest validator", () => {
         );
         expect(filesForMode(both, "ts")).toContain(entries[0]!.path);
         expect(filesForMode(both, "rust")).toContain(entries[0]!.path);
+    });
+
+    it("accepts only complete canonical green wrapper arrays", () => {
+        const selected = validateGreenIncidentWrapperSource(
+            greenWrapperSource,
+            catalog,
+        );
+        expect(selected).toContain("var-a5-archived-reobservation");
+        expect(selected).toContain("var-parity-a3-ctx-reduce-survival");
+
+        expect(() =>
+            validateGreenIncidentWrapperSource(
+                greenWrapperSource.replace(
+                    '"var-a5-archived-reobservation",',
+                    "",
+                ),
+                catalog,
+            ),
+        ).toThrow(/must equal complete catalog green set/);
+        expect(() =>
+            validateGreenIncidentWrapperSource(
+                greenWrapperSource.replace(
+                    '"var-a5-archived-reobservation",',
+                    '// "var-a5-archived-reobservation",',
+                ),
+                catalog,
+            ),
+        ).toThrow(/must equal complete catalog green set/);
+        expect(() =>
+            validateGreenIncidentWrapperSource(
+                greenWrapperSource.replace(
+                    '"var-a5-archived-reobservation",',
+                    '"var-a32-stale-embedding-recall",',
+                ),
+                catalog,
+            ),
+        ).toThrow(/known-red registry ID/);
+        expect(() =>
+            validateGreenIncidentWrapperSource(
+                `import { parityPiTodoIncidentCases } from "../src/incident-pool/scenarios/parity-pi-todo";\n${greenWrapperSource}`,
+                catalog,
+            ),
+        ).toThrow(/known-red-only scenario module/);
+    });
+
+    it("keeps incident-unit selection closed over manifest negative tests", () => {
+        expect(incidentUnitFiles()).toEqual(
+            expect.arrayContaining([
+                "scripts/check-rust-prerequisites.test.ts",
+                "scripts/validate-incident-history.test.ts",
+                "scripts/validate-incident-verifiers.test.ts",
+                "scripts/validate-mode-manifest.test.ts",
+            ]),
+        );
+    });
+
+    it("rejects broad-glob green package scripts", () => {
+        const pkg = JSON.parse(
+            readFileSync(resolve(E2E_ROOT, "package.json"), "utf8"),
+        ) as { scripts: Record<string, string> };
+        pkg.scripts["test:rust-e2e"] = "bun test tests/rust-*.test.ts";
+        expect(() => validateGreenPackageScripts(pkg)).toThrow(
+            /must derive its exact file list/,
+        );
     });
 
     it("rejects invalid tiers and a both-modes entry missing an invocation", () => {

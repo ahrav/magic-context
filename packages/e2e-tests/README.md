@@ -9,13 +9,64 @@ mock Anthropic server and drives sessions through the appropriate harness.
 
 ## Running
 
-```bash
-# From repo root
-bun run test:e2e
+Every green command resolves an exact, nonempty file list from
+`mode-manifest.json`. No command relies on a test glob.
 
-# Or directly in this package
-cd packages/e2e-tests && bun test
+```bash
+# Default supported TS green suite (OpenCode and Pi)
+bun run --cwd packages/e2e-tests test
+
+# Exact harness green suites
+bun run --cwd packages/e2e-tests test:opencode-e2e
+bun run --cwd packages/e2e-tests test:pi-e2e
+
+# Incident contracts, verifiers, runner, evidence, and history fixtures
+bun run --cwd packages/e2e-tests test:incident-unit
+
+# Conservative contributor gate against mutation-bound verifier drift
+bun run --cwd packages/e2e-tests validate:incident-verifiers
+
+# Supported TS incident schedule: OpenCode plus applicable Pi variants
+bun run --cwd packages/e2e-tests test:incidents --mode ts
+
+# Provisioned-host Rust green suite and incident report
+bun run --cwd packages/e2e-tests test:rust-e2e
+bun run --cwd packages/e2e-tests test:incidents:rust
 ```
+
+Rust commands require Unix socket support, Cargo, and this repository's own
+Cargo workspace metadata for the `direct_host_fixture` example. Absent
+prerequisites are unavailable, not passing. Public CI runs the supported TS
+report only.
+
+### Incident report artifacts
+
+The TS command atomically writes
+`packages/e2e-tests/artifacts/incident-pool-ts-report.json`. The provisioned
+Rust command writes
+`packages/e2e-tests/artifacts/incident-pool-rust-report.json`. CI uploads only
+the explicit TS path.
+
+Both files use `incident-pool-scheduled-report/v1`. Each scheduled report has a
+mode, harness report count, expected/result counts, distinct family count,
+`evaluation_complete`, and `completion_marker: true`. Nested
+`incident-pool-report/v1` entries bind one harness to its ledger fingerprint,
+selected-set digest, expected count, and terminal results.
+
+Each result keeps three independent dimensions:
+
+- `run_health`: `completed`, `timeout`, `crash`, `unavailable`, or `malformed`;
+- `behavioral_verdict`: `pass`, `assertion_fail`, or `not_evaluated`;
+- `baseline_comparison`: `expected_green`, `regression`, `expected_red`,
+  `unexpected_failure`, `resolution_candidate`, or `unscored`.
+
+Structural completion means every selected variant produced exactly one
+allowlisted terminal result and publication completed atomically. Evaluation
+completion means every result completed with a behavioral verdict and scored
+baseline comparison. Reviewed `blocked_by` incompleteness may exit zero while
+`evaluation_complete` remains false. Other incomplete results exit nonzero.
+
+See `incidents/README.md` for approved registration and append-only rules.
 
 ## Architecture
 
@@ -71,8 +122,8 @@ current JSON protocol was introduced in `0.16.0`.
   lane separately:
 
   ```bash
-  # From this package (or `bun run test:rust-e2e` from the repo root)
-  bun run test:rust-e2e
+  # From repo root
+  bun run --cwd packages/e2e-tests test:rust-e2e
   ```
 
   U7 qualifies only the focused fixture, smoke, and historian scenarios. Broad
