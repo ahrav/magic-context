@@ -73,6 +73,7 @@ export interface ClassifyArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
+    modelChain?: readonly string[];
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
     moduleProjectRoot?: string;
@@ -390,6 +391,11 @@ async function runClassifyThroughModule(
             authority_generation: args.moduleAuthorityGeneration,
             payload: {
                 prompt_body: prompt,
+                model_chain: args.modelChain ?? [
+                    ...(args.model ? [args.model] : []),
+                    ...(args.fallbackModels ?? []),
+                ],
+                timeout_ms: Math.max(1, sliceMs - 40_000),
                 items: chunk.map((claim) => ({
                     public_claim_id: claim.publicClaimId,
                     revision_locator: claim.revisionLocator,

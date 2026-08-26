@@ -215,8 +215,10 @@ interface SerialLane {
 interface OpeningRoute {
     client: McHostClient;
     generation: number;
-    /** Set by `closeSession` while the open is in flight; the open must not cache its route. */
-    closed: boolean;
+    state: {
+        /** Set by `closeSession` while the open is in flight; the open must not cache its route. */
+        closed: boolean;
+    };
     promise: Promise<EnsuredRoute>;
 }
 
@@ -901,7 +903,7 @@ export class McHostModuleTransport {
         let closedOpenings = false;
         for (const [key, opening] of [...this.routeOpenings.entries()]) {
             if (!key.startsWith(prefix)) continue;
-            opening.closed = true;
+            opening.state.closed = true;
             this.routeOpenings.delete(key);
             closedOpenings = true;
         }
@@ -951,14 +953,8 @@ export class McHostModuleTransport {
             return await opening.promise;
         }
 
-        const routeOpening: OpeningRoute = {
-            client,
-            generation,
-            closed: false,
-            // SAFETY: placeholder for two-phase construction. commentlint: allow(JUDGE)
-            promise: undefined as unknown as Promise<EnsuredRoute>,
-        };
-        routeOpening.promise = (async (): Promise<EnsuredRoute> => {
+        const state = { closed: false };
+        const promise = (async (): Promise<EnsuredRoute> => {
             const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
             const identity: BindIdentity = {
                 project_root: projectRoot,
@@ -971,7 +967,7 @@ export class McHostModuleTransport {
                 "opening the module route",
             );
             if (
-                routeOpening?.closed === true ||
+                state.closed ||
                 this.client !== client ||
                 generation !== this.connectionGeneration
             ) {
@@ -983,13 +979,12 @@ export class McHostModuleTransport {
             this.routes.set(routeKey, { route, generation });
             return { client, route, routeKey, generation };
         })();
-        const newOpening: OpeningRoute = { client, generation, closed: false, promise };
-        routeOpening = newOpening;
-        this.routeOpenings.set(routeKey, newOpening);
+        const routeOpening: OpeningRoute = { client, generation, state, promise };
+        this.routeOpenings.set(routeKey, routeOpening);
         try {
-            return await newOpening.promise;
+            return await routeOpening.promise;
         } finally {
-            if (this.routeOpenings.get(routeKey) === newOpening) {
+            if (this.routeOpenings.get(routeKey) === routeOpening) {
                 this.routeOpenings.delete(routeKey);
             }
         }

@@ -58,6 +58,11 @@ use chrono::{Local, TimeZone};
 use cortexkit_lease::LeaseError;
 use cortexkit_store::StoreError;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+use mc_host::{
+    BindOutcome, CompositeComponent, HealthReport, HealthStatus, HostInit, InitError,
+    ManifestSnapshot, PrimaryComponent, RequestCtx, RequestOutcome, ResourceDeclaration,
+    RouteHandle, RouteIdentity, ShutdownError,
+};
 #[cfg(test)]
 use mc_store::TagNumberRow;
 use mc_store::{
@@ -6233,7 +6238,7 @@ impl McHandler {
         // completion without parsing the summary or issuing another operation: a retained
         // delivered-command record includes its coverage, row version, and current wrapup state.
         let m1_signal = match crate::m1_compose::m1_revision_signal_parts_for_claims_timed(
-            store,
+            &store,
             &binding.project_root.to_string_lossy(),
             &session_id,
             loaded.meta.user_profile_version,
@@ -8578,7 +8583,7 @@ impl McHandler {
             .await
     }
 
-    fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    fn handle_state_sync_value(&self, channel: RouteHandle, request: Value) -> PreparedOutcome {
         const ENVELOPE_FIELDS: [&str; 5] = [
             "seed_id",
             "seed_generation",
@@ -9652,12 +9657,15 @@ impl McHandler {
         };
         // The requested IDs are the accept predicate's oracle: an attempt is
         // successful only if its manifest covers exactly these.
-        let mut expected_ids: BTreeSet<i64> = BTreeSet::new();
+        let mut expected_ids: BTreeSet<String> = BTreeSet::new();
         for item in items {
-            let Some(memory_id) = item.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("classify items require an integer memory_id");
+            let Some(public_claim_id) = item.get("public_claim_id").and_then(Value::as_str) else {
+                return invalid_params_error("classify items require public_claim_id");
             };
-            expected_ids.insert(memory_id);
+            if !mc_core::claim_operation::is_valid_public_claim_id(public_claim_id) {
+                return invalid_params_error("classify items require a valid public_claim_id");
+            }
+            expected_ids.insert(public_claim_id.to_string());
         }
         let Some(models) = payload.get("model_chain").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires model_chain");
@@ -9957,7 +9965,7 @@ impl McHandler {
         }
     }
 
-    async fn handle_facade_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+    async fn handle_facade_value(&self, channel: RouteHandle, request: Value) -> PreparedOutcome {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
@@ -9977,7 +9985,7 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_intent_stage(&self, request: &Value) -> HandlerOutcome {
+    fn handle_claim_intent_stage(&self, request: &Value) -> PreparedOutcome {
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.stage requires arguments");
         };
@@ -9988,25 +9996,25 @@ impl McHandler {
                 return invalid_params_error(format!("invalid claim intent stage: {error}"))
             }
         };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
-        match memory_tool::stage_claim_intent(store, &parsed, now_ms()) {
+        match memory_tool::stage_claim_intent(&store, &parsed, now_ms()) {
             Ok(response) => match serde_json::to_value(response) {
                 Ok(value) => respond(value),
-                Err(error) => HandlerOutcome::Error {
+                Err(error) => PreparedOutcome::Error {
                     code: "claim_intent_encode_failed".to_string(),
                     message: error.to_string(),
                 },
             },
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "claim_intent_stage_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_claim_intent_inspect(&self, request: &Value) -> HandlerOutcome {
+    fn handle_claim_intent_inspect(&self, request: &Value) -> PreparedOutcome {
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.inspect requires arguments");
         };
@@ -10019,25 +10027,25 @@ impl McHandler {
                     ));
                 }
             };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
-        match memory_tool::inspect_claim_intents(store, &parsed) {
+        match memory_tool::inspect_claim_intents(&store, &parsed) {
             Ok(response) => match serde_json::to_value(response) {
                 Ok(value) => respond(value),
-                Err(error) => HandlerOutcome::Error {
+                Err(error) => PreparedOutcome::Error {
                     code: "claim_intent_encode_failed".to_string(),
                     message: error.to_string(),
                 },
             },
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "claim_intent_inspect_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_claim_intent_ack(&self, request: &Value) -> HandlerOutcome {
+    fn handle_claim_intent_ack(&self, request: &Value) -> PreparedOutcome {
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.ack requires arguments");
         };
@@ -10047,25 +10055,25 @@ impl McHandler {
                 return invalid_params_error(format!("invalid claim intent ack: {error}"))
             }
         };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
-        match memory_tool::acknowledge_claim_intent(store, &parsed, now_ms()) {
+        match memory_tool::acknowledge_claim_intent(&store, &parsed, now_ms()) {
             Ok(response) => match serde_json::to_value(response) {
                 Ok(value) => respond(value),
-                Err(error) => HandlerOutcome::Error {
+                Err(error) => PreparedOutcome::Error {
                     code: "claim_intent_encode_failed".to_string(),
                     message: error.to_string(),
                 },
             },
-            Err(error) => HandlerOutcome::Error {
+            Err(error) => PreparedOutcome::Error {
                 code: "claim_intent_ack_failed".to_string(),
                 message: error.to_string(),
             },
         }
     }
 
-    fn handle_claim_effects_apply(&self, request: &Value) -> HandlerOutcome {
+    fn handle_claim_effects_apply(&self, request: &Value) -> PreparedOutcome {
         let Some(arguments) = request.get("arguments").and_then(Value::as_object) else {
             return invalid_params_error("claim.effects.apply requires arguments");
         };
@@ -10131,9 +10139,13 @@ impl McHandler {
         }))
     }
 
-    fn handle_claim_mirror_replace(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_claim_mirror_replace(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         if self.facade_binding(channel).is_err() {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "route_unbound".to_string(),
                 message: "claim mirror replace requires a bound facade route".to_string(),
             };
@@ -10150,7 +10162,7 @@ impl McHandler {
                 return invalid_params_error(format!("invalid claim mirror snapshot: {error}"))
             }
         };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         match store.replace_claim_mirror_snapshot(&parsed.snapshot, now_ms()) {
@@ -10164,9 +10176,9 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_mirror_apply(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    fn handle_claim_mirror_apply(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
         if self.facade_binding(channel).is_err() {
-            return HandlerOutcome::Error {
+            return PreparedOutcome::Error {
                 code: "route_unbound".to_string(),
                 message: "claim mirror apply requires a bound facade route".to_string(),
             };
@@ -10183,7 +10195,7 @@ impl McHandler {
                 return invalid_params_error(format!("invalid claim mirror receipt: {error}"))
             }
         };
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         match store.apply_claim_mirror_receipt(&parsed.receipt, now_ms()) {
@@ -10471,7 +10483,7 @@ impl McHandler {
         if !facade_scope.memory_enabled {
             return tool_error_result("Error: memory is disabled for this project.".to_string());
         }
-        let Some(store) = self.store.get() else {
+        let Some(store) = self.store() else {
             return store_unavailable_error();
         };
         match action {
@@ -10507,7 +10519,7 @@ impl McHandler {
                 }
                 let requested = requested.into_iter().collect::<BTreeSet<_>>();
                 let limit = usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100);
-                let rows = match memory_tool::list_committed_claims(store, &requested, limit) {
+                let rows = match memory_tool::list_committed_claims(&store, &requested, limit) {
                     Ok(rows) => rows,
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 };
@@ -10533,7 +10545,11 @@ impl McHandler {
         }
     }
 
-    async fn handle_ctx_search_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+    async fn handle_ctx_search_facade(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
         let Some(args) = facade_arguments(request, &["query"]) else {
             return invalid_params_error("ctx_search arguments must be an object");
         };
@@ -10559,7 +10575,7 @@ impl McHandler {
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
         match memory_tool::search_compartments_and_notes_for_session(
-            store,
+            &store,
             memory_project,
             conversation_key,
             query,
@@ -12950,7 +12966,7 @@ fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Dur
 /// every retry.
 fn length_capped_or_invalid(
     result: &historian_producer::ProducerOutput,
-    expected_ids: &BTreeSet<i64>,
+    expected_ids: &BTreeSet<String>,
 ) -> Result<(), String> {
     if result.length_capped {
         return Err("a length-capped generation".to_owned());
@@ -15707,7 +15723,7 @@ mod tests {
         CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
         HarnessMeta, ProviderExtras,
     };
-    use historian_producer::{ErrorClass, ProducerOutput, RunHandle, RunState};
+    use historian_producer::{ProducerOutput, RunHandle, RunState};
     use mc_core::CoreState;
     use mc_store::{
         HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, NoteEvaluationInput,

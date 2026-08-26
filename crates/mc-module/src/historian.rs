@@ -1823,6 +1823,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    use crate::historian_producer::HistorianSendOutcome;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
     use mc_core::CoreState;
     use mc_store::{ModuleMeta, StoredCompartment};
