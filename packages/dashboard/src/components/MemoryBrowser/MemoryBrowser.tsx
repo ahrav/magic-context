@@ -17,6 +17,7 @@ import type { ClaimLifecycleState, ClaimMemory } from "../../lib/types";
 import FilterSelect from "../shared/FilterSelect";
 import {
   type ClaimDraft,
+  isSelectableClaim,
   reconcileClaimSelection,
   reconcileDraft,
   type SelectionEntry,
@@ -207,6 +208,15 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
       setError(cause instanceof Error ? cause.message : String(cause));
       return;
     }
+    // The derived count, not the selection size, decides whether there is
+    // anything to do: every selected claim can be out of view after a filter
+    // change, and `bulk_archive_claims` refuses an empty target list — so
+    // prompting to archive zero and then invoking it would surface a backend
+    // error for a no-op the user never asked for.
+    if (targets.length === 0) {
+      setError("Every selected memory is out of view. Adjust the filter or clear the selection.");
+      return;
+    }
     const confirmed = await ask(
       `Archive ${targets.length} memor${targets.length === 1 ? "y" : "ies"}?`,
       { title: "Confirm Archive", kind: "warning" },
@@ -372,15 +382,17 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
                           style={{ width: "100%", "text-align": "left" }}
                         >
                           <span class="memory-card-checkbox">
-                            <input
-                              type="checkbox"
-                              checked={selected().has(claim.publicClaimId)}
-                              onChange={() =>
-                                setSelected((previous) => toggleClaimSelection(previous, claim))
-                              }
-                              onClick={(event) => event.stopPropagation()}
-                              aria-label={`Select memory ${claim.publicClaimId}`}
-                            />
+                            <Show when={isSelectableClaim(claim)}>
+                              <input
+                                type="checkbox"
+                                checked={selected().has(claim.publicClaimId)}
+                                onChange={() =>
+                                  setSelected((previous) => toggleClaimSelection(previous, claim))
+                                }
+                                onClick={(event) => event.stopPropagation()}
+                                aria-label={`Select memory ${claim.publicClaimId}`}
+                              />
+                            </Show>
                           </span>
                           <div class="memory-card-body">
                             <div class="card-title">

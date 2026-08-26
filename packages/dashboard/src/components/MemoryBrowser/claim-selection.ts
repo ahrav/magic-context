@@ -51,6 +51,19 @@ function tokenChanged(previous: ClaimMemory, current: ClaimMemory): boolean {
 }
 
 /**
+ * Whether a bulk action can address this claim at all.
+ *
+ * Retirement is terminal in the adapter: `validate_target` refuses every
+ * mutation of a retired claim, and `bulk_archive_claims` validates every target
+ * before staging any of them. So one retired row in a batch archives nothing.
+ * The Retired and all-lifecycle views both return such claims, so they are
+ * excluded from selection rather than allowed to poison a batch.
+ */
+export function isSelectableClaim(claim: ClaimMemory): boolean {
+  return claim.lifecycleState !== "retired";
+}
+
+/**
  * Re-bind a selection to a freshly fetched claim list.
  *
  * Off-scope and stale are tracked apart because only one of them is a hazard.
@@ -83,15 +96,17 @@ export function toggleClaimSelection(
 ): Map<string, SelectionEntry> {
   const next = new Map(previous);
   if (next.has(claim.publicClaimId)) next.delete(claim.publicClaimId);
-  else next.set(claim.publicClaimId, { claim, stale: false, offScope: false });
+  else if (isSelectableClaim(claim))
+    next.set(claim.publicClaimId, { claim, stale: false, offScope: false });
   return next;
 }
 
 export function selectionState(selected: SelectionState, claims: readonly ClaimMemory[]): TriState {
-  if (claims.length === 0) return "none";
-  const selectedCount = claims.filter((claim) => selected.has(claim.publicClaimId)).length;
+  const selectable = claims.filter(isSelectableClaim);
+  if (selectable.length === 0) return "none";
+  const selectedCount = selectable.filter((claim) => selected.has(claim.publicClaimId)).length;
   if (selectedCount === 0) return "none";
-  return selectedCount === claims.length ? "all" : "some";
+  return selectedCount === selectable.length ? "all" : "some";
 }
 
 export function toggleClaimsSelection(
@@ -100,7 +115,7 @@ export function toggleClaimsSelection(
 ): Map<string, SelectionEntry> {
   const next = new Map(previous);
   const state = selectionState(previous, claims);
-  for (const claim of claims) {
+  for (const claim of claims.filter(isSelectableClaim)) {
     if (state === "all") next.delete(claim.publicClaimId);
     else next.set(claim.publicClaimId, { claim, stale: false, offScope: false });
   }

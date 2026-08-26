@@ -981,7 +981,18 @@ function attachEvidenceStage(
         payload: { claim: claimPayloadLocator(claim), kind: "evidence_attached" },
         effects: [
             {
-                effectKey: `evidence:${claim.publicClaimId}:r${claim.revision}`,
+                // The observation identifies the attachment. One receipt can
+                // hold several attachments to the SAME claim and revision — an
+                // autonomous manifest whose entries normalize onto one live
+                // (project, category, hash) slot creates the claim once and
+                // attaches the rest, and an unchanged revise attaches too. A
+                // key of claim plus revision alone repeats across them, and
+                // `claim_operation_effects` enforces UNIQUE (receipt_id,
+                // effect_key) with an append-only trigger, so the second
+                // attachment would abort the whole manifest — including the
+                // unrelated entries in it — and every deterministic retry the
+                // same way.
+                effectKey: `evidence:${claim.publicClaimId}:r${claim.revision}:o${observationId}`,
                 projectId: claim.projectId,
                 claimId: claim.claimId,
                 revisionId: claim.currentRevisionId,
@@ -1965,9 +1976,10 @@ export function readOutboxConsumerCheckpoint(
 }
 
 /**
- * Advance one consumer/project cursor. Regression is rejected, and the
- * acknowledged id must not split a receipt group within the project: a page
- * cannot expose half an operation (KTD13).
+ * Advance one consumer/project cursor. Regression is rejected, the cursor may
+ * not run past the current outbox tail, and the acknowledged id must not split a
+ * receipt group within the project: a page cannot expose half an operation
+ * (KTD13).
  */
 export function advanceOutboxConsumerCheckpointInCurrentTransaction(
     db: Database,
@@ -1980,6 +1992,25 @@ export function advanceOutboxConsumerCheckpointInCurrentTransaction(
     if (args.ackedEffectId < existing) {
         throw new Error(
             `outbox checkpoint for ${args.consumer}/${args.projectId} cannot regress (${existing} -> ${args.ackedEffectId})`,
+        );
+    }
+    // A cursor past the tail claims to have observed effects that do not exist.
+    // Nothing else catches it: the receipt-split query below finds no `pending`
+    // row beyond such an id, so it passes. Left unchecked, once every required
+    // consumer holds a future cursor the prune boundary becomes that future id,
+    // and effects allocated below it afterwards are deleted having never been
+    // published to anyone.
+    //
+    // The tail falls back to the existing cursor rather than zero so a
+    // re-acknowledgement stays idempotent after pruning empties the table — the
+    // acknowledged effects are gone precisely because they were consumed.
+    const tailRow = db.prepare("SELECT MAX(id) AS tail FROM claim_operation_effects").get() as {
+        tail: number | null;
+    };
+    const tail = tailRow.tail ?? existing;
+    if (args.ackedEffectId > tail) {
+        throw new Error(
+            `outbox checkpoint ${args.ackedEffectId} for ${args.consumer}/${args.projectId} is beyond the outbox tail (${tail})`,
         );
     }
     const split = db

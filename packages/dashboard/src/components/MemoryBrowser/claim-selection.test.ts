@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { ClaimMemory } from "../../lib/types";
 import {
+  isSelectableClaim,
   reconcileClaimSelection,
   reconcileDraft,
   selectionState,
@@ -152,6 +153,30 @@ describe("claim selection", () => {
     selected = reconcileClaimSelection(selected, [claim(A, 2), claim(B)]);
     expect(selected.get(A)).toMatchObject({ stale: true, offScope: false });
     expect(() => selectionTargets(selected)).toThrow("Refresh stale selections");
+  });
+
+  it("refuses to select a retired claim, alone or through select-all", () => {
+    // Retirement is terminal in the adapter and `bulk_archive_claims` validates
+    // every target before staging any, so one retired row archives nothing.
+    const active = claim(A);
+    const retired = { ...claim(B), lifecycleState: "retired" as const };
+
+    expect(isSelectableClaim(active)).toBe(true);
+    expect(isSelectableClaim(retired)).toBe(false);
+
+    expect(toggleClaimSelection(new Map(), retired).size).toBe(0);
+
+    const all = toggleClaimsSelection(new Map(), [active, retired]);
+    expect([...all.keys()]).toEqual([A]);
+    // Select-all reads "all" off the selectable rows only, so it toggles off
+    // rather than getting stuck because the retired row can never be selected.
+    expect(selectionState(all, [active, retired])).toBe("all");
+    expect(toggleClaimsSelection(all, [active, retired]).size).toBe(0);
+  });
+
+  it("reports no selectable state for a view of only retired claims", () => {
+    const retired = { ...claim(A), lifecycleState: "retired" as const };
+    expect(selectionState(new Map(), [retired])).toBe("none");
   });
 
   it("preserves draft text and reports a revision advance", () => {

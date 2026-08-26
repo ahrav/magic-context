@@ -29,6 +29,7 @@ import {
     type SnapshotVector,
 } from "./claim-operation-contract";
 import contractFixture from "./fixtures/claim-operation-contract-v1.json";
+import { combineClaimOperationStageOutcomes } from "./storage-claim-autonomous";
 import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
     applyProjectMemoryMapping,
@@ -46,6 +47,7 @@ import {
     reviseProjectMemoryClaim,
     runClaimOperation,
     setProjectMemoryClaimLifecycle,
+    stageCreateProjectMemoryClaimInCurrentTransaction,
 } from "./storage-claim-operations";
 import { ensureProject } from "./storage-claims";
 
@@ -502,6 +504,47 @@ describe("claim operations: duplicate statements (scenarios 6-7, R7)", () => {
         }
     });
 
+    test("several attachments to one claim in one receipt carry distinct effect keys", () => {
+        // An autonomous manifest whose entries normalize onto the same live
+        // (project, category, hash) slot creates the claim once and attaches the
+        // rest. Those attachments share a claim AND a revision, so a key built
+        // from those alone repeats — and `claim_operation_effects` enforces
+        // UNIQUE (receipt_id, effect_key) with an append-only trigger, so the
+        // duplicate aborts the whole manifest including its unrelated entries.
+        const ctx = setup();
+        try {
+            const staged = ctx.db
+                .transaction(() => {
+                    const outcomes = ["ik-a", "ik-b", "ik-c"].map((key, index) =>
+                        stageCreateProjectMemoryClaimInCurrentTransaction(
+                            ctx.db,
+                            {
+                                projectId: ctx.projectId,
+                                content: "One slot, three manifest entries.",
+                                category: "ARCHITECTURE",
+                                provenance: provenance(key, `run-${index}`),
+                                actor: "historian:test",
+                            },
+                            1_000,
+                        ),
+                    );
+                    return combineClaimOperationStageOutcomes(outcomes, null);
+                })
+                .immediate();
+
+            if (staged.kind !== "effects") throw new Error(`unexpected stage kind ${staged.kind}`);
+            // One create plus two attachments.
+            expect(staged.effects).toHaveLength(3);
+            expect(
+                staged.effects.filter((effect) => effect.changeKind === "evidence"),
+            ).toHaveLength(2);
+            const keys = staged.effects.map((effect) => effect.effectKey);
+            expect(new Set(keys).size).toBe(keys.length);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("the unique current-head index converges concurrent duplicates and rebuilds from authoritative rows", () => {
         const ctx = setup();
         try {
@@ -839,6 +882,70 @@ describe("claim outbox: checkpoints and pruning (scenarios 10-11)", () => {
                 .immediate();
             expect(after.boundary).toBe(maxEffectId);
             expect(after.prunedEffectRows).toBeGreaterThan(0);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
+    test("a checkpoint beyond the outbox tail is refused", () => {
+        // A cursor past the tail claims effects that do not exist. The
+        // receipt-split guard cannot see it — there is no pending row beyond
+        // such an id — and once every required consumer holds one, the prune
+        // boundary becomes that future id and later effects are deleted unread.
+        const ctx = setup();
+        try {
+            const { maxEffectId } = seedOutbox(ctx);
+            expect(() =>
+                ctx.db
+                    .transaction(() =>
+                        advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                            consumer: "module-mirror",
+                            projectId: ctx.projectId,
+                            ackedEffectId: maxEffectId + 1,
+                        }),
+                    )
+                    .immediate(),
+            ).toThrow("beyond the outbox tail");
+
+            // The tail itself is fine, and re-acknowledging it stays idempotent
+            // after pruning empties the table — those effects are gone because
+            // they were consumed.
+            ctx.db
+                .transaction(() => {
+                    for (const consumer of [
+                        "module-mirror",
+                        "policy-projector",
+                        "retrieval-projector",
+                    ]) {
+                        advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                            consumer,
+                            projectId: ctx.projectId,
+                            ackedEffectId: maxEffectId,
+                        });
+                    }
+                })
+                .immediate();
+            ctx.db
+                .transaction(() =>
+                    pruneClaimOperationEffectsInCurrentTransaction(ctx.db, [
+                        "module-mirror",
+                        "policy-projector",
+                        "retrieval-projector",
+                    ]),
+                )
+                .immediate();
+            expect(rowCount(ctx.db, "claim_operation_effects")).toBe(0);
+            expect(() =>
+                ctx.db
+                    .transaction(() =>
+                        advanceOutboxConsumerCheckpointInCurrentTransaction(ctx.db, {
+                            consumer: "module-mirror",
+                            projectId: ctx.projectId,
+                            ackedEffectId: maxEffectId,
+                        }),
+                    )
+                    .immediate(),
+            ).not.toThrow();
         } finally {
             closeQuietly(ctx.db);
         }
