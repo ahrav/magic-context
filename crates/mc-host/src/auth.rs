@@ -689,31 +689,19 @@ mod tests {
     /// that has not been rebuilt.
     #[test]
     fn committed_wire_vectors_pin_the_proof_construction() {
-        fn unhex(hex: &str) -> Vec<u8> {
-            assert!(hex.len().is_multiple_of(2), "odd-length hex");
-            (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
-                .collect()
-        }
-
-        let key = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
-        let client_nonce: [u8; NONCE_LEN] = unhex(&"ab".repeat(NONCE_LEN))
-            .try_into()
-            .expect("client nonce length");
-        let server_nonce: [u8; NONCE_LEN] = unhex(&"cd".repeat(NONCE_LEN))
-            .try_into()
-            .expect("server nonce length");
-        let daemon_id = unhex("000102030405060708090a0b0c0d0e0f");
+        let key: Vec<u8> = (0x00..0x20).collect();
+        let client_nonce = std::array::from_fn(|index| 0x20 + index as u8);
+        let server_nonce = std::array::from_fn(|index| 0x40 + index as u8);
+        let daemon_id: Vec<u8> = (0x60..0x70).collect();
 
         for (domain, expected) in [
             (
                 SERVER_PROOF_DOMAIN,
-                "aae98ec5fcb04b243159e51f082ed655daf75f15172dd45ec4550782d8cc5312",
+                "409a5444176474bd0279894fb1ac6b346cae98d0da19f9a09ad42a445b6c5583",
             ),
             (
                 CLIENT_AUTH_DOMAIN,
-                "c2329009bf0e672c3948c134ab83d69f71642f7b4f7acc085163e426af5be0ee",
+                "b88af33700bd5834361b047081d6ca39fc924bdd77b1f700c1cece1a5a93f7bb",
             ),
         ] {
             let proof = compute_proof(
@@ -721,7 +709,7 @@ mod tests {
                 domain,
                 &client_nonce,
                 &server_nonce,
-                TEST_DAEMON_VER,
+                "mc-host/0.1.0",
                 &daemon_id,
             );
             let actual: String = proof.iter().map(|byte| format!("{byte:02x}")).collect();

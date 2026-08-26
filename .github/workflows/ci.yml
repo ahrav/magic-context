@@ -189,6 +189,41 @@ jobs:
           rm -f packages/mc-shm-native/mc_shm_native.node
           test ! -e packages/mc-shm-native/mc_shm_native.node
 
+  mc-host-lifecycle:
+    name: mc-host lifecycle integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: magic-context
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: magic-context
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ahrav/commons
+          ref: d2208eda95d845193d84199dbfd0781a1f479291
+          path: commons
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Host lifecycle and closure proofs
+        run: |
+          cargo test -p mc-host \
+            --test broca_protocol \
+            --test broca_subprocess \
+            --test harness_closure \
+            --test protocol_vectors
+
+      - name: Native module adapter and CLI lifecycle
+        run: |
+          cargo test -p mc-module --bin ck-mc-host
+          cargo test -p mc-module \
+            --test host_adapter \
+            --test lifecycle_cli
+
   check-plugin:
     name: Check (plugin)
     runs-on: ubuntu-latest
