@@ -457,11 +457,15 @@ impl RoutedWire {
         if let Some(error) = self.reader_error.lock().await.clone() {
             return Err(WireCallError::Transport(error));
         }
-        let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(corr, tx);
-        let sent_ns = {
+        // The host retires the generation on any non-increasing Request
+        // correlation (connection.rs read-loop watermark), so allocation and
+        // socket write must be atomic: allocating outside the writer lock
+        // lets two tasks write in inverted correlation order under load.
+        let (corr, rx, sent_ns) = {
             let mut writer = self.writer.lock().await;
+            let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = oneshot::channel();
+            self.pending.lock().await.insert(corr, tx);
             let sent_ns = self.elapsed_ns();
             let mut frame = raw_client::header(
                 u32::try_from(body.len())
@@ -479,7 +483,7 @@ impl RoutedWire {
                     "send correlation {corr}: {error}"
                 )));
             }
-            sent_ns
+            (corr, rx, sent_ns)
         };
         match tokio::time::timeout(budget, rx).await {
             Ok(Ok((frame, received_ns))) => Ok(WireReply {
@@ -557,6 +561,7 @@ struct RunContext {
     attempts: Arc<Mutex<Vec<AttemptRecord>>>,
     next_attempt: Arc<AtomicU64>,
     fatal_errors: Arc<Mutex<Vec<String>>>,
+    connection_loss: Arc<AtomicU64>,
     opts: Opts,
 }
 
@@ -580,7 +585,7 @@ impl RunContext {
                 let disposition = if method == SynapseMethod::Result {
                     AttemptDisposition::Poll
                 } else if reply.frame.ty == raw_client::TY_ERROR
-                    && code.as_deref() == Some("queue_full")
+                    && matches!(code.as_deref(), Some("queue_full" | "module_restarted"))
                 {
                     AttemptDisposition::RetryableRejection
                 } else if reply.frame.ty == raw_client::TY_ERROR
@@ -669,6 +674,49 @@ fn terminal_record(
         attempts,
         polls,
     }
+}
+
+/// One-resubmission budget for `module_restarted`, mirroring the plugin
+/// policy (embedding-synapse.ts): a host restart evicts every in-flight
+/// job, the first `module_restarted` on a logical request resubmits the
+/// batch once, and a second is terminal for that logical request.
+#[derive(Debug)]
+struct RestartBudget {
+    used: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartAction {
+    Resubmit,
+    Terminal,
+}
+
+impl RestartBudget {
+    fn new() -> Self {
+        Self { used: false }
+    }
+
+    fn on_module_restarted(&mut self) -> RestartAction {
+        if self.used {
+            RestartAction::Terminal
+        } else {
+            self.used = true;
+            RestartAction::Resubmit
+        }
+    }
+}
+
+/// True when a harness error is a lost shared wire rather than a harness
+/// defect: reader-loop frame failures (early EOF), send failures on the
+/// write half, and callers that observed the reader's stored error. The
+/// harness's single connection cannot reconnect mid-run, so these remain
+/// fatal, but the summary counts them separately from real harness bugs.
+fn is_connection_loss(error: &str) -> bool {
+    error.contains("frame header: ")
+        || error.contains("frame body: ")
+        || error.contains("send correlation ")
+        || error.contains("connection closed while awaiting reply")
+        || error.to_ascii_lowercase().contains("broken pipe")
 }
 
 async fn execute_query(
@@ -838,120 +886,21 @@ async fn execute_batch(
     let mut rng = DeterministicRng::new(ctx.opts.seed ^ logical_id.rotate_left(17));
     let mut first_send = None;
     let mut batch_attempts = 0u64;
-    let (job_id, served_poll_cap) = loop {
-        batch_attempts += 1;
-        let (reply, json) = match ctx
-            .record_call(logical_id, SynapseMethod::Batch, body.clone(), deadline)
-            .await
-        {
-            Ok(value) => value,
-            Err(error) if error == "attempt timeout" => {
-                if batch_attempts < u64::from(MAX_TOTAL_ATTEMPTS) {
-                    let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
-                    if Instant::now() + delay < deadline {
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                }
-                let now = ctx.wire.elapsed_ns();
-                return Ok(terminal_record(
-                    logical_id,
-                    scheduled_start_ns,
-                    first_send.unwrap_or(now),
-                    now,
-                    LogicalDisposition::TimedOut,
-                    Some("attempt_timeout".to_owned()),
-                    batch_attempts,
-                    0,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        first_send.get_or_insert(reply.sent_ns);
-        if reply.frame.ty == raw_client::TY_RESPONSE {
-            let result = &json["result"];
-            let job_id = result["job_id"]
-                .as_str()
-                .ok_or_else(|| format!("batch descriptor omitted job_id: {json}"))?
-                .to_owned();
-            break (job_id, result["retry_after_ms"].as_u64().unwrap_or(50));
-        }
-        let code = json["code"].as_str().unwrap_or("unparsable");
-        if code != "queue_full" {
-            return Err(format!("unexpected embed.batch error: {json}"));
-        }
-        if batch_attempts == u64::from(MAX_TOTAL_ATTEMPTS) {
-            return Ok(terminal_record(
-                logical_id,
-                scheduled_start_ns,
-                first_send.expect("set above"),
-                reply.received_ns,
-                LogicalDisposition::Rejected,
-                Some(code.to_owned()),
-                batch_attempts,
-                0,
-            ));
-        }
-        let base = json["retry_after_ms"].as_u64().unwrap_or(100);
-        let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
-        if Instant::now() + delay >= deadline {
-            return Ok(terminal_record(
-                logical_id,
-                scheduled_start_ns,
-                first_send.expect("set above"),
-                reply.received_ns,
-                LogicalDisposition::Rejected,
-                Some(code.to_owned()),
-                batch_attempts,
-                0,
-            ));
-        }
-        tokio::time::sleep(delay).await;
-    };
-
-    let mut cursor = serde_json::Value::Null;
     let mut polls = 0u64;
-    let mut collected = Vec::with_capacity(items.len());
-    let mut poll_delay_ms = if let Some(delay) = ctx.opts.variant.initial_poll_delay_ms(&mut rng) {
-        tokio::time::sleep(Duration::from_secs_f64(delay / 1_000.0)).await;
-        delay
-    } else {
-        0.0
-    };
-    loop {
-        let mut poll_attempt = 0u32;
-        let (reply, json) = loop {
-            let mut poll = constraints();
-            poll["job_id"] = job_id.clone().into();
-            poll["request_key"] = request_key.clone().into();
-            poll["cursor"] = cursor.clone();
-            let result = ctx
-                .record_call(
-                    logical_id,
-                    SynapseMethod::Result,
-                    request("embed.result", poll)?,
-                    deadline,
-                )
-                .await;
-            polls += 1;
-            poll_attempt += 1;
-            match result {
-                Ok((reply, json)) => {
-                    let code = json["code"].as_str();
-                    let retryable = reply.frame.ty == raw_client::TY_ERROR
-                        && matches!(code, Some("queue_full" | "timeout"));
-                    if !retryable || poll_attempt == MAX_TOTAL_ATTEMPTS {
-                        break (reply, json);
-                    }
-                    let base = json["retry_after_ms"].as_u64().unwrap_or(100);
-                    let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
-                    if Instant::now() + delay >= deadline {
-                        break (reply, json);
-                    }
-                    tokio::time::sleep(delay).await;
-                }
+    let mut restart_budget = RestartBudget::new();
+    // The outer loop reruns submit-then-poll when a host restart evicts the
+    // job: the resubmitted batch keeps the same logical request, deadline,
+    // and accumulating attempt/poll counters.
+    'logical: loop {
+        let (job_id, served_poll_cap) = loop {
+            batch_attempts += 1;
+            let (reply, json) = match ctx
+                .record_call(logical_id, SynapseMethod::Batch, body.clone(), deadline)
+                .await
+            {
+                Ok(value) => value,
                 Err(error) if error == "attempt timeout" => {
-                    if poll_attempt < MAX_TOTAL_ATTEMPTS {
+                    if batch_attempts < u64::from(MAX_TOTAL_ATTEMPTS) {
                         let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
                         if Instant::now() + delay < deadline {
                             tokio::time::sleep(delay).await;
@@ -962,7 +911,7 @@ async fn execute_batch(
                     return Ok(terminal_record(
                         logical_id,
                         scheduled_start_ns,
-                        first_send.expect("batch sent"),
+                        first_send.unwrap_or(now),
                         now,
                         LogicalDisposition::TimedOut,
                         Some("attempt_timeout".to_owned()),
@@ -971,66 +920,208 @@ async fn execute_batch(
                     ));
                 }
                 Err(error) => return Err(error),
-            }
-        };
-        if reply.frame.ty == raw_client::TY_ERROR {
-            let code = json["code"].as_str().unwrap_or("unparsable");
-            let disposition = if code == "timeout" {
-                LogicalDisposition::TimedOut
-            } else if code == "queue_full" {
-                LogicalDisposition::Rejected
-            } else {
-                return Err(format!("unexpected embed.result error {code}: {json}"));
             };
-            return Ok(terminal_record(
-                logical_id,
-                scheduled_start_ns,
-                first_send.expect("batch sent"),
-                reply.received_ns,
-                disposition,
-                Some(code.to_owned()),
-                batch_attempts + polls,
-                polls,
-            ));
-        }
-        let result = &json["result"];
-        if let Some(vectors) = result["vectors"].as_array() {
-            for vector in vectors {
-                collected.push(
-                    vector["id"]
-                        .as_str()
-                        .ok_or_else(|| format!("vector omitted id: {json}"))?
-                        .to_owned(),
-                );
+            first_send.get_or_insert(reply.sent_ns);
+            if reply.frame.ty == raw_client::TY_RESPONSE {
+                let result = &json["result"];
+                let job_id = result["job_id"]
+                    .as_str()
+                    .ok_or_else(|| format!("batch descriptor omitted job_id: {json}"))?
+                    .to_owned();
+                break (job_id, result["retry_after_ms"].as_u64().unwrap_or(50));
             }
-            if result["done"] == true {
-                let expected: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
-                if collected != expected {
-                    return Err("batch result did not preserve every item exactly once".to_owned());
+            let code = json["code"].as_str().unwrap_or("unparsable");
+            if code == "module_restarted" {
+                match restart_budget.on_module_restarted() {
+                    RestartAction::Resubmit => continue,
+                    RestartAction::Terminal => {
+                        return Ok(terminal_record(
+                            logical_id,
+                            scheduled_start_ns,
+                            first_send.expect("set above"),
+                            reply.received_ns,
+                            LogicalDisposition::Rejected,
+                            Some(code.to_owned()),
+                            batch_attempts + polls,
+                            polls,
+                        ));
+                    }
                 }
+            }
+            if code != "queue_full" {
+                return Err(format!("unexpected embed.batch error: {json}"));
+            }
+            if batch_attempts >= u64::from(MAX_TOTAL_ATTEMPTS) {
+                return Ok(terminal_record(
+                    logical_id,
+                    scheduled_start_ns,
+                    first_send.expect("set above"),
+                    reply.received_ns,
+                    LogicalDisposition::Rejected,
+                    Some(code.to_owned()),
+                    batch_attempts + polls,
+                    polls,
+                ));
+            }
+            let base = json["retry_after_ms"].as_u64().unwrap_or(100);
+            let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
+            if Instant::now() + delay >= deadline {
+                return Ok(terminal_record(
+                    logical_id,
+                    scheduled_start_ns,
+                    first_send.expect("set above"),
+                    reply.received_ns,
+                    LogicalDisposition::Rejected,
+                    Some(code.to_owned()),
+                    batch_attempts + polls,
+                    polls,
+                ));
+            }
+            tokio::time::sleep(delay).await;
+        };
+
+        let mut cursor = serde_json::Value::Null;
+        let mut collected = Vec::with_capacity(items.len());
+        let mut poll_delay_ms =
+            if let Some(delay) = ctx.opts.variant.initial_poll_delay_ms(&mut rng) {
+                tokio::time::sleep(Duration::from_secs_f64(delay / 1_000.0)).await;
+                delay
+            } else {
+                0.0
+            };
+        loop {
+            let mut poll_attempt = 0u32;
+            let (reply, json) = loop {
+                let mut poll = constraints();
+                poll["job_id"] = job_id.clone().into();
+                poll["request_key"] = request_key.clone().into();
+                poll["cursor"] = cursor.clone();
+                let result = ctx
+                    .record_call(
+                        logical_id,
+                        SynapseMethod::Result,
+                        request("embed.result", poll)?,
+                        deadline,
+                    )
+                    .await;
+                polls += 1;
+                poll_attempt += 1;
+                match result {
+                    Ok((reply, json)) => {
+                        let code = json["code"].as_str();
+                        let retryable = reply.frame.ty == raw_client::TY_ERROR
+                            && matches!(code, Some("queue_full" | "timeout"));
+                        if !retryable || poll_attempt == MAX_TOTAL_ATTEMPTS {
+                            break (reply, json);
+                        }
+                        let base = json["retry_after_ms"].as_u64().unwrap_or(100);
+                        let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
+                        if Instant::now() + delay >= deadline {
+                            break (reply, json);
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) if error == "attempt timeout" => {
+                        if poll_attempt < MAX_TOTAL_ATTEMPTS {
+                            let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
+                            if Instant::now() + delay < deadline {
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                        }
+                        let now = ctx.wire.elapsed_ns();
+                        return Ok(terminal_record(
+                            logical_id,
+                            scheduled_start_ns,
+                            first_send.expect("batch sent"),
+                            now,
+                            LogicalDisposition::TimedOut,
+                            Some("attempt_timeout".to_owned()),
+                            batch_attempts + polls,
+                            polls,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if reply.frame.ty == raw_client::TY_ERROR {
+                let code = json["code"].as_str().unwrap_or("unparsable");
+                if code == "module_restarted" {
+                    match restart_budget.on_module_restarted() {
+                        RestartAction::Resubmit => continue 'logical,
+                        RestartAction::Terminal => {
+                            return Ok(terminal_record(
+                                logical_id,
+                                scheduled_start_ns,
+                                first_send.expect("batch sent"),
+                                reply.received_ns,
+                                LogicalDisposition::Rejected,
+                                Some(code.to_owned()),
+                                batch_attempts + polls,
+                                polls,
+                            ));
+                        }
+                    }
+                }
+                let disposition = if code == "timeout" {
+                    LogicalDisposition::TimedOut
+                } else if code == "queue_full" {
+                    LogicalDisposition::Rejected
+                } else {
+                    return Err(format!("unexpected embed.result error {code}: {json}"));
+                };
                 return Ok(terminal_record(
                     logical_id,
                     scheduled_start_ns,
                     first_send.expect("batch sent"),
                     reply.received_ns,
-                    LogicalDisposition::Completed,
-                    None,
+                    disposition,
+                    Some(code.to_owned()),
                     batch_attempts + polls,
                     polls,
                 ));
             }
-            cursor = result["next_cursor"].clone();
-            if !cursor.is_string() {
-                return Err(format!("non-final page omitted cursor: {json}"));
+            let result = &json["result"];
+            if let Some(vectors) = result["vectors"].as_array() {
+                for vector in vectors {
+                    collected.push(
+                        vector["id"]
+                            .as_str()
+                            .ok_or_else(|| format!("vector omitted id: {json}"))?
+                            .to_owned(),
+                    );
+                }
+                if result["done"] == true {
+                    let expected: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
+                    if collected != expected {
+                        return Err(
+                            "batch result did not preserve every item exactly once".to_owned()
+                        );
+                    }
+                    return Ok(terminal_record(
+                        logical_id,
+                        scheduled_start_ns,
+                        first_send.expect("batch sent"),
+                        reply.received_ns,
+                        LogicalDisposition::Completed,
+                        None,
+                        batch_attempts + polls,
+                        polls,
+                    ));
+                }
+                cursor = result["next_cursor"].clone();
+                if !cursor.is_string() {
+                    return Err(format!("non-final page omitted cursor: {json}"));
+                }
+                continue;
             }
-            continue;
+            let served_delay = result["retry_after_ms"].as_u64().unwrap_or(served_poll_cap);
+            poll_delay_ms = ctx
+                .opts
+                .variant
+                .pending_poll_delay_ms(poll_delay_ms, served_delay);
+            tokio::time::sleep(Duration::from_secs_f64(poll_delay_ms / 1_000.0)).await;
         }
-        let served_delay = result["retry_after_ms"].as_u64().unwrap_or(served_poll_cap);
-        poll_delay_ms = ctx
-            .opts
-            .variant
-            .pending_poll_delay_ms(poll_delay_ms, served_delay);
-        tokio::time::sleep(Duration::from_secs_f64(poll_delay_ms / 1_000.0)).await;
     }
 }
 
@@ -1068,6 +1159,9 @@ async fn execute(
     match result {
         Ok(record) => record,
         Err(error) => {
+            if is_connection_loss(&error) {
+                ctx.connection_loss.fetch_add(1, Ordering::Relaxed);
+            }
             ctx.fatal_errors
                 .lock()
                 .await
@@ -1101,6 +1195,7 @@ async fn warm(ctx: &RunContext) -> Result<(), String> {
     }
     ctx.attempts.lock().await.clear();
     ctx.fatal_errors.lock().await.clear();
+    ctx.connection_loss.store(0, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1206,6 +1301,10 @@ struct Summary {
     missed_slots: u64,
     censored_per_mille: f64,
     task_deltas: Vec<process_resources::TaskDelta>,
+    /// Transport-loss failures on the single shared wire. A subset of
+    /// `fatal_errors` (still part of the fatal gate), counted separately
+    /// so analysis can distinguish connection loss from harness defects.
+    connection_loss_errors: u64,
     fatal_errors: Vec<String>,
 }
 
@@ -1305,6 +1404,7 @@ async fn run(
         attempts: Arc::new(Mutex::new(Vec::new())),
         next_attempt: Arc::new(AtomicU64::new(1)),
         fatal_errors: Arc::new(Mutex::new(Vec::new())),
+        connection_loss: Arc::new(AtomicU64::new(0)),
         opts,
     };
     warm(&ctx).await?;
@@ -1317,6 +1417,7 @@ async fn run(
     let task_deltas = process_resources::task_deltas(&task_before, &task_after);
     let attempts = ctx.attempts.lock().await.clone();
     let fatal_errors = ctx.fatal_errors.lock().await.clone();
+    let connection_loss_errors = ctx.connection_loss.load(Ordering::Relaxed);
     let ledger = perf_measurement::validate_synapse_ledgers(&logical, &attempts);
     let attempt_latency =
         LatencySummary::from_unsorted(attempts.iter().map(|attempt| attempt.latency_ns).collect());
@@ -1368,6 +1469,7 @@ async fn run(
         missed_slots,
         censored_per_mille,
         task_deltas,
+        connection_loss_errors,
         fatal_errors,
     };
     drop(ctx);
@@ -1547,6 +1649,81 @@ mod tests {
     fn service_time_mean_retains_raw_sample_mean() {
         assert_eq!(mean(&[10, 20, 30]), Some(20.0));
         assert_eq!(mean(&[]), None);
+    }
+
+    #[test]
+    fn restart_budget_allows_exactly_one_resubmission() {
+        let mut budget = RestartBudget::new();
+        assert_eq!(budget.on_module_restarted(), RestartAction::Resubmit);
+        assert_eq!(budget.on_module_restarted(), RestartAction::Terminal);
+        assert_eq!(budget.on_module_restarted(), RestartAction::Terminal);
+    }
+
+    #[test]
+    fn terminal_module_restarted_rejection_keeps_ledgers_valid() {
+        // One submit, one poll that answered module_restarted, one
+        // resubmission, then a terminal module_restarted poll: four owned
+        // attempts, disposition Rejected.
+        let record = terminal_record(
+            7,
+            None,
+            0,
+            4,
+            LogicalDisposition::Rejected,
+            Some("module_restarted".to_owned()),
+            4,
+            2,
+        );
+        let attempt = |attempt_id, method, disposition, code: Option<&str>| AttemptRecord {
+            logical_id: 7,
+            attempt_id,
+            method,
+            disposition,
+            code: code.map(str::to_owned),
+            retry_after_ms: None,
+            actual_send_ns: attempt_id,
+            terminal_ns: attempt_id + 1,
+            latency_ns: 1,
+        };
+        let attempts = [
+            attempt(1, SynapseMethod::Batch, AttemptDisposition::Success, None),
+            attempt(
+                2,
+                SynapseMethod::Result,
+                AttemptDisposition::Poll,
+                Some("module_restarted"),
+            ),
+            attempt(3, SynapseMethod::Batch, AttemptDisposition::Success, None),
+            attempt(
+                4,
+                SynapseMethod::Result,
+                AttemptDisposition::Poll,
+                Some("module_restarted"),
+            ),
+        ];
+        let ledger = perf_measurement::validate_synapse_ledgers(&[record], &attempts);
+
+        assert!(ledger.valid, "{:?}", ledger.errors);
+        assert_eq!(censored_count(&ledger), 0);
+    }
+
+    #[test]
+    fn connection_loss_strings_classify_as_connection_loss() {
+        assert!(is_connection_loss("frame header: early eof"));
+        assert!(is_connection_loss("frame body: unexpected end of file"));
+        assert!(is_connection_loss(
+            "send correlation 42: Broken pipe (os error 32)"
+        ));
+        assert!(is_connection_loss("connection closed while awaiting reply"));
+        assert!(is_connection_loss("Broken pipe (os error 32)"));
+
+        assert!(!is_connection_loss(
+            "unexpected embed.result error schema_violation: {}"
+        ));
+        assert!(!is_connection_loss("response JSON: expected value"));
+        assert!(!is_connection_loss(
+            "batch result did not preserve every item exactly once"
+        ));
     }
 
     #[test]
