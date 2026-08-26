@@ -6,6 +6,11 @@ import { initializeDatabase } from "../../../../plugin/src/features/magic-contex
 import { runMigrations } from "../../../../plugin/src/features/magic-context/migrations";
 import { runValidatedHistorianPass } from "../../../../plugin/src/hooks/magic-context/compartment-runner-historian";
 import { openTestDb } from "../../test-db";
+import {
+    findToolResultText,
+    publishedToolName,
+    runScriptedToolCall,
+} from "../../scripted-tool-call";
 import { createDreamTaskExecutor } from "../../../../plugin/src/features/magic-context/dreamer/task-executor";
 import {
     acquireLeaseWithAcquisition,
@@ -27,9 +32,7 @@ import {
     caseNamespaceIsUnique,
     createCaseHarness,
     DEFER_USAGE,
-    findToolResultText,
     readContextDb,
-    runScriptedToolCall,
 } from "../support/tool-loop";
 
 function check(id: string, passed: boolean): VerifierCheck {
@@ -492,23 +495,6 @@ function barrier(): Barrier {
             await released;
         },
     };
-}
-
-function publishedToolName(
-    body: Record<string, unknown>,
-    expected: string,
-): string | null {
-    if (!Array.isArray(body.tools)) return null;
-    for (const tool of body.tools) {
-        if (
-            tool &&
-            typeof tool === "object" &&
-            (tool as { name?: unknown }).name === expected
-        ) {
-            return expected;
-        }
-    }
-    return null;
 }
 
 function contextDbPath(context: CaseDriverContext, dataDir: string): string {

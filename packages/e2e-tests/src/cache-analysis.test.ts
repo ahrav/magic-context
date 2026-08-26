@@ -1,7 +1,13 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { analyzePasses, buildSegments, findBusts, mainAgentRequests } from "./cache-analysis";
+import {
+    analyzePasses,
+    buildSegments,
+    findBusts,
+    isInternalOpenCodeAgentRequest,
+    mainAgentRequests,
+} from "./cache-analysis";
 
 /**
  * Unit coverage for the cache-bust oracle itself.
@@ -234,6 +240,39 @@ describe("cache-bust oracle", () => {
                 expect(filtered).toHaveLength(1);
                 expect(filtered[0]).toBe(mc);
             });
+        });
+    });
+
+    describe("#given OpenCode agent request signatures", () => {
+        it("rejects title, summary, and compaction requests from body.system only", () => {
+            const signatures = [
+                "You are a title generator. You output ONLY a thread title.",
+                "Summarize what was done in this conversation. Write like a pull request description.",
+                "You are an anchored context summarization assistant for coding sessions.",
+            ];
+            for (const signature of signatures) {
+                expect(
+                    isInternalOpenCodeAgentRequest({
+                        body: { system: signature, messages: [MC_SYSTEM] },
+                    }),
+                ).toBe(true);
+            }
+            expect(
+                isInternalOpenCodeAgentRequest({
+                    body: {
+                        system: MC_SYSTEM,
+                        messages: signatures,
+                    },
+                }),
+            ).toBe(false);
+        });
+
+        it("accepts a main-agent request", () => {
+            expect(
+                isInternalOpenCodeAgentRequest({
+                    body: { system: MC_SYSTEM, messages: [] },
+                }),
+            ).toBe(false);
         });
     });
 

@@ -34,6 +34,10 @@ bun run --cwd packages/e2e-tests test:rust-e2e
 bun run --cwd packages/e2e-tests test:incidents:rust
 ```
 
+The OpenCode command includes `tests/oracle-arms-demo.test.ts`. This demo is
+registered as TS-only because `seedGoldMemories` writes through the TypeScript
+memory authority; it does not run in the Rust lane.
+
 Rust commands require Unix socket support, Cargo, and this repository's own
 Cargo workspace metadata for the `direct_host_fixture` example. Absent
 prerequisites are unavailable, not passing. Public CI runs the supported TS
@@ -85,6 +89,97 @@ See `incidents/README.md` for approved registration and append-only rules.
 - **`src/pi-runner/`** + **`src/pi-harness.ts`** — Pi-flavored counterpart to the
   OpenCode runner. Spawns a real Pi child process pointed at the same mock
   Anthropic server and loads the Pi plugin from local source.
+
+### Oracle arms
+
+`src/oracle-arms/` provides controlled interventions for attributing a failed
+scenario to retrieval, formation, or representation. The helpers operate on a
+`TestHarness` unless noted otherwise:
+
+- `seedGoldMemories({ workdir, dbPath, rows, verification })` inserts each
+  `{ category, content, importance? }` through the production claim-aware write
+  path and returns the inserted `Memory[]`. Use `"candidate"` for search-only R1
+  rows and `"verified"` for injection-eligible R2 rows. `context.db` must already
+  exist or the helper throws without creating it. Inserts commit one at a time;
+  duplicate normalized content raises SQLite's `UNIQUE constraint failed` error
+  and leaves earlier inserts committed. A verified row disappearing during
+  promotion also throws.
+- `scriptedCtxSearchTurn(harness, sessionId, idsOrQuery)` executes one real
+  `ctx_search` tool turn and returns its wire `tool_result` text. An id array may
+  contain positive safe integers or objects with an `id`; it must contain 1–5
+  entries and is rendered in caller order as `#id` tokens. Larger sets are
+  rejected, not chunked. A string is used as the query unchanged. The helper
+  propagates tool-loop infrastructure failures, including an unpublished
+  `ctx_search`, and its shared driver resets the mock and removes installed
+  matchers, so reinstall extra matchers before the next step.
+- `goldEvidencePrompt(blocks)` renders `{ label, content }` values as
+  `<gold-evidence label="...">` blocks separated by blank lines. It returns the
+  prompt string for `harness.sendPrompt`; labels and content are passed through
+  rather than escaped or validated.
+- `mcOffOptions()` returns `{ openCodeConfigExtra: { plugin: [] } }`. There is no
+  `ctx_search` tool or `<project-memory>` block in this arm.
+- `naiveCompactionOptions()` returns
+  `{ openCodeConfigExtra: { compaction: { auto: true } } }`. Conflict handling
+  disables Magic Context and no `context.db` is initialized, so gold seeding
+  fails its database precondition.
+- `liveModelSpawnOptions({ apiKey, providerBlock })` returns the `extraEnv` and
+  `openCodeConfigExtra` portion of raw `SpawnOptions`. It sets
+  `ANTHROPIC_API_KEY` and installs the supplied provider map; it does not send a
+  request or validate provider contents.
+
+The demonstration uses this capability matrix:
+
+| Capability | R0 | R1 | R2 | R3 | MC-off | Compaction |
+|---|---|---|---|---|---|---|
+| Gold rows | none | candidate | verified | none | none | unavailable: no DB |
+| Scripted `ctx_search` | no | yes, by returned ids | no | no | unavailable | unavailable |
+| Gold evidence prompt | no | no | no | yes | yes | yes |
+| Main-agent observation | no gold | search result only; no injection | gold in `<project-memory>` | prompt verbatim | no tool or memory block | no tool or memory block |
+| Preset | none | none | none | none | `mcOffOptions()` | `naiveCompactionOptions()` |
+
+Keep these four traps explicit when building a scenario:
+
+1. **`normalized_hash` uniqueness:** use distinct gold content. Duplicate content
+   throws after any earlier rows have committed.
+2. **Resolved project identity:** pass the harness workdir. Seeding applies
+   `realpath` and `resolveProjectIdentity`; do not construct or copy a
+   `project_path` value.
+3. **`memory_block_cache`:** seed before `createSession()` so a cached empty
+   memory block cannot mask gold rows. Claim-aware writes also advance the
+   project memory epoch, which invalidates a session cache when mid-session
+   seeding is unavoidable.
+4. **`visibleMemoryIds`:** rows already injected into a session are filtered from
+   `ctx_search`. Run arms in separate sessions and seed R1 rows as candidates so
+   they remain explicit-search eligible without being injected.
+
+For a live-model configuration check, compose the recipe with raw
+`spawnOpencode`:
+
+```ts
+const live = liveModelSpawnOptions({
+    apiKey: process.env.ANTHROPIC_API_KEY!,
+    providerBlock: {
+        anthropic: {
+            api: "@ai-sdk/anthropic",
+            name: "Anthropic",
+            npm: "@ai-sdk/anthropic",
+            env: ["ANTHROPIC_API_KEY"],
+            models: {},
+        },
+    },
+});
+const opencode = await spawnOpencode({ mockProviderURL: baseURL, ...live });
+```
+
+`openCodeConfigExtra` is shallowly spread, so `providerBlock` replaces the
+entire default provider map. Include a complete `mock-anthropic` entry beside
+the live provider if later prompts still use the mock. Also,
+`RustTestHarness.restart()` drops `openCodeConfigExtra`; rebuild or reapply the
+recipe after a restart. The shipped test only checks the generated config and
+never calls a live model.
+
+Callers own scoring and aggregation. Given scores R0 through R3, compute regret
+as retrieval = R1 - R0, formation = R2 - R1, and representation = R3 - R2.
 
 ### Pi RPC harness
 

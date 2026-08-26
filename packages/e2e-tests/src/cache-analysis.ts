@@ -65,6 +65,22 @@ interface MinimalRequest {
     body: { system?: unknown; messages?: unknown; [k: string]: unknown };
 }
 
+const INTERNAL_OPENCODE_AGENT_SIGNATURES = [
+    "You are a title generator. You output ONLY a thread title.",
+    "Summarize what was done in this conversation. Write like a pull request description.",
+    "You are an anchored context summarization assistant for coding sessions.",
+] as const;
+
+/** Detect OpenCode's native title, summary, and compaction requests. */
+export function isInternalOpenCodeAgentRequest(request: MinimalRequest): boolean {
+    const system = request.body.system;
+    if (system === undefined || system === null) return false;
+    const systemText = typeof system === "string" ? system : JSON.stringify(system);
+    return INTERNAL_OPENCODE_AGENT_SIGNATURES.some((signature) =>
+        systemText.includes(signature),
+    );
+}
+
 function sha(s: string): string {
     return createHash("sha256").update(s).digest("hex").slice(0, 12);
 }
