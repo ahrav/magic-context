@@ -18,7 +18,9 @@ pub mod jobs;
 pub mod protocol;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -33,6 +35,253 @@ use jobs::{AdmitOutcome, JobTable, PollOutcome};
 use protocol::{Request, RequestError};
 
 pub const SYNAPSE_MODULE_ID: &str = "synapse";
+
+pub const HISTOGRAM_EDGES_MS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000];
+pub const HISTOGRAM_BUCKETS: usize = HISTOGRAM_EDGES_MS.len() + 1;
+/// Terminal outcomes for a query waiting on the CPU permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum QueryWaitOutcome {
+    Granted,
+    Timeout,
+    WaiterGone,
+    CancelledOrClosed,
+}
+
+/// Terminal outcomes for a batch waiting on the CPU permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum BatchWaitOutcome {
+    Granted,
+    Cancelled,
+    Closed,
+}
+
+/// Fixed reasons why Synapse rejects work as `queue_full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum QueueFullReason {
+    ParseReservationUnsatisfiable,
+    ParseResidentExhausted,
+    CoverageShort,
+    QueryAdmission,
+    JobAdmission,
+    ResultPageResident,
+}
+
+/// Wire-visible outcomes of one result poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum PollMetricOutcome {
+    Restarted,
+    KeyMismatch,
+    BadCursor,
+    Failed,
+    PendingQueued,
+    PendingRunning,
+    Page,
+}
+
+pub const QUERY_WAIT_OUTCOMES: usize = QueryWaitOutcome::CancelledOrClosed as usize + 1;
+pub const BATCH_WAIT_OUTCOMES: usize = BatchWaitOutcome::Closed as usize + 1;
+pub const QUEUE_FULL_REASONS: usize = QueueFullReason::ResultPageResident as usize + 1;
+pub const POLL_OUTCOMES: usize = PollMetricOutcome::Page as usize + 1;
+
+/// Plain snapshot of one fixed-edge duration histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HistogramSnapshot {
+    pub buckets: [u64; HISTOGRAM_BUCKETS],
+    pub count: u64,
+    pub sum_us: u64,
+}
+
+/// Query and batch snapshots for one duration category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LaneHistogramsSnapshot {
+    pub query: HistogramSnapshot,
+    pub batch: HistogramSnapshot,
+}
+
+/// Query and batch terminal permit-wait counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct WaitOutcomeSnapshot {
+    pub query: [u64; QUERY_WAIT_OUTCOMES],
+    pub batch: [u64; BATCH_WAIT_OUTCOMES],
+}
+
+/// Allocation-free, fixed-cardinality Synapse metrics snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SynapseMetricsSnapshot {
+    pub cpu_wait: LaneHistogramsSnapshot,
+    pub cpu_hold: LaneHistogramsSnapshot,
+    pub inference: LaneHistogramsSnapshot,
+    pub cpu_wait_outcome: WaitOutcomeSnapshot,
+    pub queue_full: [u64; QUEUE_FULL_REASONS],
+    pub poll_outcome: [u64; POLL_OUTCOMES],
+    pub batch_items_embedded: u64,
+    pub free_cpu_permits: usize,
+    pub free_query_permits: usize,
+    pub jobs_active: usize,
+    pub jobs_retained: usize,
+    pub queued_text_bytes: u64,
+    pub retained_result_bytes: u64,
+}
+
+/// Fixed-edge duration histogram with monotonic relaxed atomic counters.
+#[derive(Default)]
+pub struct Histogram {
+    buckets: [AtomicU64; HISTOGRAM_BUCKETS],
+    count: AtomicU64,
+    sum_us: AtomicU64,
+}
+
+impl Histogram {
+    pub fn record(&self, duration: Duration) {
+        let elapsed_ms = duration.as_millis();
+        let bucket = HISTOGRAM_EDGES_MS
+            .iter()
+            .position(|edge_ms| elapsed_ms < u128::from(*edge_ms))
+            .unwrap_or(HISTOGRAM_EDGES_MS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        saturating_add(
+            &self.sum_us,
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+        );
+    }
+
+    pub fn snapshot(&self) -> HistogramSnapshot {
+        HistogramSnapshot {
+            buckets: load_counters(&self.buckets),
+            count: self.count.load(Ordering::Relaxed),
+            sum_us: self.sum_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Shared fixed-cardinality metrics core for one Synapse component.
+pub struct SynapseMetrics {
+    cpu_wait_query: Histogram,
+    cpu_wait_batch: Histogram,
+    cpu_hold_query: Histogram,
+    cpu_hold_batch: Histogram,
+    inference_query: Histogram,
+    inference_batch: Histogram,
+    query_wait_outcome: [AtomicU64; QUERY_WAIT_OUTCOMES],
+    batch_wait_outcome: [AtomicU64; BATCH_WAIT_OUTCOMES],
+    queue_full: [AtomicU64; QUEUE_FULL_REASONS],
+    poll_outcome: [AtomicU64; POLL_OUTCOMES],
+    batch_items_embedded: AtomicU64,
+    cpu: Arc<tokio::sync::Semaphore>,
+    query_admission: Arc<tokio::sync::Semaphore>,
+}
+
+impl SynapseMetrics {
+    fn new(cpu: Arc<tokio::sync::Semaphore>, query_admission: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            cpu_wait_query: Histogram::default(),
+            cpu_wait_batch: Histogram::default(),
+            cpu_hold_query: Histogram::default(),
+            cpu_hold_batch: Histogram::default(),
+            inference_query: Histogram::default(),
+            inference_batch: Histogram::default(),
+            query_wait_outcome: std::array::from_fn(|_| AtomicU64::new(0)),
+            batch_wait_outcome: std::array::from_fn(|_| AtomicU64::new(0)),
+            queue_full: std::array::from_fn(|_| AtomicU64::new(0)),
+            poll_outcome: std::array::from_fn(|_| AtomicU64::new(0)),
+            batch_items_embedded: AtomicU64::new(0),
+            cpu,
+            query_admission,
+        }
+    }
+
+    pub fn record_cpu_wait_query(&self, duration: Duration) {
+        self.cpu_wait_query.record(duration);
+    }
+
+    pub fn record_cpu_wait_batch(&self, duration: Duration) {
+        self.cpu_wait_batch.record(duration);
+    }
+
+    pub fn record_cpu_hold_query(&self, duration: Duration) {
+        self.cpu_hold_query.record(duration);
+    }
+
+    pub fn record_cpu_hold_batch(&self, duration: Duration) {
+        self.cpu_hold_batch.record(duration);
+    }
+
+    pub fn record_inference_query(&self, duration: Duration) {
+        self.inference_query.record(duration);
+    }
+
+    pub fn record_inference_batch(&self, duration: Duration) {
+        self.inference_batch.record(duration);
+    }
+
+    pub fn increment_query_wait_outcome(&self, outcome: QueryWaitOutcome) {
+        self.query_wait_outcome[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_batch_wait_outcome(&self, outcome: BatchWaitOutcome) {
+        self.batch_wait_outcome[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_queue_full(&self, reason: QueueFullReason) {
+        self.queue_full[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_poll_outcome(&self, outcome: PollMetricOutcome) {
+        self.poll_outcome[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_batch_items_embedded(&self, count: usize) {
+        saturating_add(
+            &self.batch_items_embedded,
+            u64::try_from(count).unwrap_or(u64::MAX),
+        );
+    }
+
+    pub fn snapshot(&self) -> SynapseMetricsSnapshot {
+        SynapseMetricsSnapshot {
+            cpu_wait: LaneHistogramsSnapshot {
+                query: self.cpu_wait_query.snapshot(),
+                batch: self.cpu_wait_batch.snapshot(),
+            },
+            cpu_hold: LaneHistogramsSnapshot {
+                query: self.cpu_hold_query.snapshot(),
+                batch: self.cpu_hold_batch.snapshot(),
+            },
+            inference: LaneHistogramsSnapshot {
+                query: self.inference_query.snapshot(),
+                batch: self.inference_batch.snapshot(),
+            },
+            cpu_wait_outcome: WaitOutcomeSnapshot {
+                query: load_counters(&self.query_wait_outcome),
+                batch: load_counters(&self.batch_wait_outcome),
+            },
+            queue_full: load_counters(&self.queue_full),
+            poll_outcome: load_counters(&self.poll_outcome),
+            batch_items_embedded: self.batch_items_embedded.load(Ordering::Relaxed),
+            free_cpu_permits: self.cpu.available_permits(),
+            free_query_permits: self.query_admission.available_permits(),
+            jobs_active: 0,
+            jobs_retained: 0,
+            queued_text_bytes: 0,
+            retained_result_bytes: 0,
+        }
+    }
+}
+
+fn load_counters<const N: usize>(counters: &[AtomicU64; N]) -> [u64; N] {
+    std::array::from_fn(|index| counters[index].load(Ordering::Relaxed))
+}
+
+fn saturating_add(counter: &AtomicU64, increment: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(increment))
+    });
+}
 
 /// Finite host-owned capacities for the Synapse lane. Requests can never
 /// select these; they live in trusted startup configuration only.
@@ -172,6 +421,7 @@ struct SynapseInner {
     /// At most one query may wait for or use the serialized CPU lane. Batch
     /// work is bounded separately by the job table.
     query_admission: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<SynapseMetrics>,
     /// Owns every started native call through shutdown.
     tracker: TaskTracker,
     /// Cancels queued (not yet started) work and closes admission.
@@ -188,6 +438,12 @@ impl SynapseComponent {
             .as_ref()
             .map(|config| config.limits.clone())
             .unwrap_or_default();
+        let cpu = Arc::new(tokio::sync::Semaphore::new(1));
+        let query_admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let metrics = Arc::new(SynapseMetrics::new(
+            Arc::clone(&cpu),
+            Arc::clone(&query_admission),
+        ));
         Self {
             inner: Arc::new(SynapseInner {
                 config,
@@ -196,8 +452,9 @@ impl SynapseComponent {
                 state: Mutex::new(LaneState::Disabled {
                     reason: "not initialized".to_owned(),
                 }),
-                cpu: Arc::new(tokio::sync::Semaphore::new(1)),
-                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                cpu,
+                query_admission,
+                metrics,
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
             }),
@@ -212,6 +469,12 @@ impl SynapseComponent {
         limits: SynapseLimits,
     ) -> Self {
         lane.max_text_bytes = limits.max_text_bytes;
+        let cpu = Arc::new(tokio::sync::Semaphore::new(1));
+        let query_admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let metrics = Arc::new(SynapseMetrics::new(
+            Arc::clone(&cpu),
+            Arc::clone(&query_admission),
+        ));
         Self {
             inner: Arc::new(SynapseInner {
                 config: None,
@@ -221,8 +484,9 @@ impl SynapseComponent {
                     backend: engine,
                     lane,
                 }))),
-                cpu: Arc::new(tokio::sync::Semaphore::new(1)),
-                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                cpu,
+                query_admission,
+                metrics,
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
             }),
@@ -239,6 +503,14 @@ impl SynapseComponent {
                 reason: reason.clone(),
             },
         }
+    }
+
+    pub fn metrics(&self) -> SynapseMetricsSnapshot {
+        self.inner.metrics.snapshot()
+    }
+
+    pub fn metrics_handle(&self) -> Arc<SynapseMetrics> {
+        Arc::clone(&self.inner.metrics)
     }
 
     fn ready_lane(&self) -> Option<Arc<ReadyLane>> {
@@ -988,5 +1260,146 @@ impl SecondaryComponent for SynapseComponent {
                 "synapse initialization task failed: {join_error}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    struct TestEngine;
+
+    impl EmbeddingEngine for TestEngine {
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
+            Ok(vec![vec![0.0]; texts.len()])
+        }
+    }
+
+    fn test_lane() -> LaneInfo {
+        LaneInfo {
+            model: "test".to_owned(),
+            fingerprint: "test".to_owned(),
+            table_epoch: 1,
+            dims: 1,
+            max_tokens: 1,
+            max_text_bytes: 1,
+            provenance: serde_json::json!({}),
+            recommended_rows: 1,
+            recommended_token_budget: 1,
+        }
+    }
+
+    fn assert_zero_metrics(snapshot: &SynapseMetricsSnapshot) {
+        for histogram in [
+            snapshot.cpu_wait.query,
+            snapshot.cpu_wait.batch,
+            snapshot.cpu_hold.query,
+            snapshot.cpu_hold.batch,
+            snapshot.inference.query,
+            snapshot.inference.batch,
+        ] {
+            assert_eq!(histogram.count, 0);
+            assert_eq!(histogram.sum_us, 0);
+            assert_eq!(histogram.buckets, [0; HISTOGRAM_BUCKETS]);
+        }
+        assert_eq!(snapshot.cpu_wait_outcome.query, [0; QUERY_WAIT_OUTCOMES]);
+        assert_eq!(snapshot.cpu_wait_outcome.batch, [0; BATCH_WAIT_OUTCOMES]);
+        assert_eq!(snapshot.queue_full, [0; QUEUE_FULL_REASONS]);
+        assert_eq!(snapshot.poll_outcome, [0; POLL_OUTCOMES]);
+        assert_eq!(snapshot.batch_items_embedded, 0);
+        assert_eq!(snapshot.free_cpu_permits, 1);
+        assert_eq!(snapshot.free_query_permits, 1);
+        assert_eq!(snapshot.jobs_active, 0);
+        assert_eq!(snapshot.jobs_retained, 0);
+        assert_eq!(snapshot.queued_text_bytes, 0);
+        assert_eq!(snapshot.retained_result_bytes, 0);
+    }
+
+    #[test]
+    fn metrics_histogram_places_every_boundary_and_overflow() {
+        let histogram = Histogram::default();
+        let mut observations = vec![Duration::ZERO];
+        observations.extend(HISTOGRAM_EDGES_MS.map(Duration::from_millis));
+        observations.push(Duration::from_millis(5_001));
+
+        for duration in &observations {
+            histogram.record(*duration);
+        }
+
+        let snapshot = histogram.snapshot();
+        assert_eq!(snapshot.count, observations.len() as u64);
+        assert_eq!(snapshot.count, snapshot.buckets.iter().sum::<u64>());
+        assert_eq!(snapshot.buckets[0], 1);
+        assert!(snapshot.buckets[1..12].iter().all(|count| *count == 1));
+        assert_eq!(snapshot.buckets[12], 2);
+        assert_eq!(
+            snapshot.sum_us,
+            observations
+                .iter()
+                .map(|duration| duration.as_micros() as u64)
+                .sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn metrics_histogram_sum_saturates() {
+        let histogram = Histogram::default();
+        histogram.sum_us.store(u64::MAX - 1, Ordering::Relaxed);
+        histogram.record(Duration::from_micros(2));
+        assert_eq!(histogram.snapshot().sum_us, u64::MAX);
+    }
+
+    #[test]
+    fn metrics_snapshot_deltas_match_recordings() {
+        let component = SynapseComponent::new(None);
+        let before = component.metrics();
+        let metrics = component.metrics_handle();
+
+        metrics.record_cpu_wait_query(Duration::from_millis(50));
+        metrics.increment_query_wait_outcome(QueryWaitOutcome::Granted);
+        metrics.increment_batch_wait_outcome(BatchWaitOutcome::Cancelled);
+        metrics.increment_queue_full(QueueFullReason::CoverageShort);
+        metrics.increment_poll_outcome(PollMetricOutcome::PendingRunning);
+        metrics.add_batch_items_embedded(3);
+
+        let after = metrics.snapshot();
+        assert_eq!(after.cpu_wait.query.count - before.cpu_wait.query.count, 1);
+        assert_eq!(
+            after.cpu_wait.query.sum_us - before.cpu_wait.query.sum_us,
+            50_000
+        );
+        assert_eq!(
+            after.cpu_wait.query.buckets[6] - before.cpu_wait.query.buckets[6],
+            1
+        );
+        assert_eq!(
+            after.cpu_wait_outcome.query[QueryWaitOutcome::Granted as usize],
+            1
+        );
+        assert_eq!(
+            after.cpu_wait_outcome.batch[BatchWaitOutcome::Cancelled as usize],
+            1
+        );
+        assert_eq!(after.queue_full[QueueFullReason::CoverageShort as usize], 1);
+        assert_eq!(
+            after.poll_outcome[PollMetricOutcome::PendingRunning as usize],
+            1
+        );
+        assert_eq!(after.batch_items_embedded - before.batch_items_embedded, 3);
+    }
+
+    #[test]
+    fn metrics_start_zero_from_both_constructors() {
+        assert_zero_metrics(&SynapseComponent::new(None).metrics());
+        assert_zero_metrics(
+            &SynapseComponent::ready_with_engine(
+                test_lane(),
+                Arc::new(TestEngine),
+                SynapseLimits::default(),
+            )
+            .metrics(),
+        );
     }
 }
