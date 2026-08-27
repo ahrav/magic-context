@@ -491,6 +491,26 @@ describe("immutable input fail-closed rules", () => {
         );
     });
 
+    test("a production source carries no query string", () => {
+        // A credential hides in a query value as readily as in its name — a nested
+        // URL with its own userinfo, and one level down from that. The component is
+        // rejected outright in production rather than proven clean at every depth.
+        for (const query of [
+            "?redirect=https%3A%2F%2Fuser%3Asecret%40storage.example%2Fx",
+            "?harmless=1",
+        ]) {
+            const root = freshRoot();
+            installProductionManifest(root, (manifest) => {
+                const digest = manifest.inputs.model_onnx.sha256;
+                manifest.inputs.model_onnx.source =
+                    `https://models.mchost-release.io/m/resolve/${digest}/model.onnx${query}`;
+            });
+            expect(() => generate(root, { check: false })).toThrow(
+                /production source must not carry a query string/,
+            );
+        }
+    });
+
     test("a production source must name its content", () => {
         // A denylist of ref names can never be complete, so immutability is required
         // positively: an unlisted branch reads as immutable only because nobody
@@ -1047,6 +1067,14 @@ describe("immutable input fail-closed rules", () => {
                         'ort = { fakeversion = "=2.0.0-rc.13", version = "=2.0.0-rc.12",',
                     ),
                 /pinned ort identity does not match/,
+            ],
+            [
+                // A dotted assignment creates its own table, so this declares a
+                // Linux `ort` dependency before the first header — where the section
+                // is still empty and the key is unreadable to a text scan.
+                (cargo) =>
+                    `target.'cfg(target_os = "linux")'.dependencies.ort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n${cargo}`,
+                /must be declared exactly once/,
             ],
             [
                 // TOML permits whitespace around the dots in a table header, and it

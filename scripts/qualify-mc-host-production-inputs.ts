@@ -1337,6 +1337,18 @@ function validateQualifiedArtifact(
             );
         }
     }
+    // Names are not enough: a credential hides just as well inside a *value*, as a
+    // nested URL with its own userinfo, and one level down from that too. Rather
+    // than chase nesting depth, production rejects the whole component — a source
+    // whose path must already name its content digest has nothing left for a query
+    // string to identify, so there is no legitimate production form to lose.
+    // `test-fixture` mode keeps the name and value checks, which is where the
+    // mutable-ref-in-query rules still apply.
+    if (mode === "production" && sourceUrl.search !== "") {
+        fail(
+            `inputs.${key}: production source must not carry a query string (it cannot be proven credential-free and the path already names the content)`,
+        );
+    }
     // A fragment is never sent to the server, so it cannot select artifact bytes:
     // on an immutable artifact URL it is noise at best, and at worst it is where
     // an OAuth-style flow puts an access token — which `buildLock` would copy
@@ -1797,6 +1809,37 @@ function stripTomlComments(line: string): string {
 }
 
 /**
+ * The key text of an assignment, up to the first `=` outside quotes, or `null` when
+ * the line holds no assignment.
+ *
+ * A quoted key may contain `=` — `target.'cfg(target_os = "linux")'.dependencies.ort`
+ * is one key — so splitting on the first `=` anywhere truncates it to
+ * `target.'cfg(target_os `, which is neither the real key nor recognizable as
+ * mentioning a dependency table. Structure is only structure outside strings here
+ * too.
+ */
+function assignmentKeyText(line: string): string | null {
+    let quote: string | null = null;
+    let escaped = false;
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (quote !== null) {
+            if (quote === '"') {
+                if (escaped) escaped = false;
+                else if (char === "\\") escaped = true;
+                else if (char === '"') quote = null;
+            } else if (char === "'") {
+                quote = null;
+            }
+            continue;
+        }
+        if (char === '"' || char === "'") quote = char;
+        else if (char === "=") return line.slice(0, i);
+    }
+    return null;
+}
+
+/**
  * Normalize a TOML table header to its dotted form, collapsing the whitespace TOML
  * permits around dots.
  *
@@ -2042,12 +2085,23 @@ function dependencyDeclarations(
             continue;
         }
         if (!atTopLevel) continue;
-        const assignment = /^(.*?)=/.exec(trimmed);
-        if (assignment === null) continue;
+        const keyText = assignmentKeyText(trimmed);
+        if (keyText === null) continue;
         const isDependencyTable = dependencyTable.test(section);
-        const key = resolveTomlName(assignment[1] ?? "");
+        const key = resolveTomlName(keyText);
         if (key === null) {
-            if (isDependencyTable) return null;
+            // A dotted assignment creates its own table:
+            // `target.'cfg(...)'.dependencies.ort_cuda = { package = "ort" }` is a
+            // dependency declaration wherever it appears, including before the first
+            // header where `section` is still empty. The key is unreadable to this
+            // scan either way, so a key that mentions `dependencies` refuses the file
+            // rather than being skipped as unrelated.
+            if (
+                isDependencyTable ||
+                /(?:^|\.)[^.]*dependencies(?:\.|$)/.test(keyText.trim())
+            ) {
+                return null;
+            }
             continue;
         }
         const entry = joinInlineEntry(lines, index);
@@ -2333,7 +2387,7 @@ function assertNoForbiddenFeatureForwarding(
             continue;
         }
         if (section !== "features") continue;
-        if (!/=/.test(trimmed)) continue;
+        if (assignmentKeyText(trimmed) === null) continue;
         const entry = joinInlineEntry(lines, index);
         if (entry === null) {
             fail(
