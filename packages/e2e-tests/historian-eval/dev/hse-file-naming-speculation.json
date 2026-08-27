@@ -1,0 +1,79 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-file-naming-speculation",
+  "title": "Assistant's naming ideas must not be promoted beyond the decided rule",
+  "families": [
+    "assistant-speculation"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "New rule: all source files use kebab-case names, like user-profile.ts.",
+        "assistant": "Recorded: source file names are kebab-case. We could probably also enforce PascalCase for exported class names and maybe ban default exports entirely — thinking out loud, none of that is decided."
+      },
+      {
+        "user": "Only the kebab-case file naming rule is decided. Your other ideas are not adopted.",
+        "assistant": "Understood: kebab-case file naming is the only adopted rule. The PascalCase idea and the default-export idea remain undecided."
+      },
+      {
+        "user": "Perfect, naming conventions are done for now.",
+        "assistant": "Closing out the naming discussion."
+      }
+    ],
+    "epilogueStartIndex": 2
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-kebab-files",
+        "category": "NAMING",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "kebab-case"
+        },
+        "sourceTurnRange": [
+          0,
+          1
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-default-export-ban",
+        "family": "assistant-speculation",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "ban default exports"
+        }
+      },
+      {
+        "id": "abs-pascal-enforced",
+        "family": "assistant-speculation",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "enforce pascalcase"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-file-naming",
+      "question": "Which case style do source file names use?",
+      "answerType": "exact",
+      "goldAnswer": "kebab-case",
+      "sourceClaimRef": "exp-kebab-files"
+    }
+  ]
+}

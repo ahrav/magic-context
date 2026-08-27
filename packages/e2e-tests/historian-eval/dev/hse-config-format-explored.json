@@ -1,0 +1,106 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-config-format-explored",
+  "title": "Explored config formats must not surface as an adopted format",
+  "families": [
+    "explored-never-accepted"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "Our app config file is getting messy. What formats could replace it?",
+        "assistant": "Candidates: TOML for first-class comments, YAML for familiarity, JSON5 for minimal migration. All three are viable and none is a clear winner without a spike."
+      },
+      {
+        "user": "Table the format question — no decision yet. What IS decided: config is loaded once at startup and never hot-reloaded.",
+        "assistant": "Recorded: config loads once at startup with no hot reload. The file format remains an open question."
+      },
+      {
+        "user": "And environment overrides use the APP_ prefix, like APP_PORT.",
+        "assistant": "Noted: environment variable overrides use the APP_ prefix."
+      },
+      {
+        "user": "That's it for config today.",
+        "assistant": "Closing the config discussion."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-startup-load",
+        "category": "CONSTRAINTS",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "once at startup"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-env-prefix",
+        "category": "NAMING",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "app_ prefix"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-toml-adopted",
+        "family": "explored-never-accepted",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "use toml for the config"
+        }
+      },
+      {
+        "id": "abs-yaml-adopted",
+        "family": "explored-never-accepted",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "use yaml for the config"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-env-prefix",
+      "question": "Which prefix do environment overrides use?",
+      "answerType": "exact",
+      "goldAnswer": "APP_",
+      "sourceClaimRef": "exp-env-prefix"
+    },
+    {
+      "id": "probe-reload",
+      "question": "How is application config loaded?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "hot reload on change",
+        "loaded once at startup"
+      ],
+      "goldAnswer": "loaded once at startup",
+      "sourceClaimRef": "exp-startup-load"
+    }
+  ]
+}
