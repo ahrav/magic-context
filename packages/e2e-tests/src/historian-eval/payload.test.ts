@@ -107,6 +107,38 @@ describe("buildMockHistorianOutput", () => {
         expect(parsed.facts).toEqual([{ category: "ARCHITECTURE", content }]);
     });
 
+    test("literal entity text throws rather than round-tripping decoded", () => {
+        // The production `unescapeXml` decodes `&amp;` first, so an authored
+        // `&lt;` comes back as `<`. Fixing that needs a change to the production
+        // decoder, so the builder refuses instead of silently handing a test
+        // different content than it asked for.
+        for (const entity of ["&lt;", "&gt;", "&quot;", "&apos;"]) {
+            expect(() =>
+                buildMockHistorianOutput({
+                    compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
+                    facts: [{ category: "ARCHITECTURE", content: `use ${entity}token` }],
+                }),
+            ).toThrow(/cannot round-trip/);
+        }
+        // Titles and bodies go through the same escaping, so they are covered too.
+        expect(() =>
+            buildMockHistorianOutput({ compartments: [{ start: 1, end: 2, title: "a &lt; b", body: "b" }] }),
+        ).toThrow(/cannot round-trip/);
+    });
+
+    test("an ampersand and unknown entities still round-trip", () => {
+        // `&amp;` survives the decoder's ordering, and `&nbsp;` is not one of the
+        // five it decodes, so neither needs to be rejected.
+        const content = "keep & and &nbsp; intact";
+        const parsed = parseCompartmentOutput(
+            buildMockHistorianOutput({
+                compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
+                facts: [{ category: "ARCHITECTURE", content }],
+            }),
+        );
+        expect(parsed.facts).toEqual([{ category: "ARCHITECTURE", content }]);
+    });
+
     test("wrong-but-well-formed category is allowed for the mutation battery and not promoted", () => {        const raw = buildMockHistorianOutput({
             compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
             facts: [{ category: "WORKFLOW_RULES", content: "outside taxonomy" }],

@@ -175,8 +175,25 @@ export function buildMockHistorianOutput(options: MockHistorianOutputOptions): s
     ].join("\n");
 }
 
-/** Escape the five XML-special characters so arbitrary prose stays well-formed. */
+/**
+ * Escape the five XML-special characters so arbitrary prose stays well-formed.
+ *
+ * Refuses input this escaping cannot survive a round trip through the production
+ * parser. `unescapeXml` there decodes `&amp;` FIRST, so authored text containing
+ * a literal `&lt;`, `&gt;`, `&quot;`, or `&apos;` comes back as the decoded
+ * character instead: `"use &lt;token&gt;"` is emitted as `"use &amp;lt;..."` and
+ * parses as `"use <token>"`. Fixing that needs a change to the production
+ * decoder, so the builder fails loudly rather than handing a mutation or scoring
+ * test different content than it asked for. `&amp;` itself and unknown entities
+ * such as `&nbsp;` do round-trip and stay allowed.
+ */
 function escapeXml(text: string): string {
+    const unrecoverable = text.match(/&(?:lt|gt|quot|apos);/);
+    if (unrecoverable) {
+        throw new Error(
+            `buildMockHistorianOutput: text contains an entity the production parser cannot round-trip (${unrecoverable[0]}): ${JSON.stringify(text)}`,
+        );
+    }
     return text
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")

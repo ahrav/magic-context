@@ -25,9 +25,12 @@ import {
 } from "../../../plugin/src/hooks/magic-context/derive-budgets";
 import {
     compactRole,
+    compactTextForSummary,
     formatBlock,
+    normalizeText,
     type ChunkBlock,
 } from "../../../plugin/src/hooks/magic-context/read-session-formatting";
+import { cleanUserText } from "../../../plugin/src/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
 import { ballastProse } from "../ballast";
@@ -207,6 +210,15 @@ export const MAX_TURN_TEXT_CHARS = 20_000;
  * cap is enforced before the arrays are mapped, so the parse itself stays cheap.
  */
 export const MAX_EXPECTATION_ENTRIES = 100;
+/**
+ * Operational maximum for one probe's option list. Bounded before the array is
+ * mapped for the same reason as the expectation arrays, and separately from them
+ * because it is nested: a scenario can stay under the probe cap while each probe
+ * carries an enormous option list, and every option is normalized on parse and
+ * normalized and sorted again for `probeIdentity`. A question with more options
+ * than this is also not one a model can usefully answer.
+ */
+export const MAX_PROBE_CHOICES = 10;
 
 function turnText(value: unknown, label: string): string {
     const result = string(value, label);
@@ -272,9 +284,9 @@ function parseProbe(raw: unknown, label: string): Probe {
     }
     if (answerType === "multiple-choice") {
         exact(value, ["id", "question", "answerType", "choices", "goldAnswer", "sourceClaimRef"], label);
-        const choices = array(value.choices, `${label}.choices`).map((entry, index) =>
-            string(entry, `${label}.choices[${index}]`),
-        );
+        const rawChoices = array(value.choices, `${label}.choices`);
+        if (rawChoices.length > MAX_PROBE_CHOICES) fail(`${label}.choices: above-operational-maximum`);
+        const choices = rawChoices.map((entry, index) => string(entry, `${label}.choices[${index}]`));
         if (choices.length < 2) fail(`${label}.choices: choices-invalid`);
         // Normalized, not verbatim: `probeIdentity` treats case and incidental
         // whitespace as the same answer, so `"Redis"` beside `" redis "` would be
@@ -595,15 +607,53 @@ export function predicateMatches(predicate: ContentPredicate, content: string): 
 }
 
 /**
+ * Whether `content` states `value` as a COMPLETE value rather than merely
+ * containing its characters.
+ *
+ * A predicate is a substring matcher by design, but a probe's gold answer is one
+ * exact value: plain containment would accept `"4"` as evidenced by a transcript
+ * that only ever says `"4096"`, freezing a probe that rewards a wrong answer.
+ * The boundary is letter-or-digit adjacency, so `"in-process lru"` still matches
+ * inside a sentence while `"4"` no longer matches inside `"4096"`.
+ */
+function containsCompleteValue(content: string, value: string): boolean {
+    const needle = normalizeContent(value);
+    if (needle.length === 0) return false;
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "u").test(normalizeContent(content));
+}
+
+/**
+ * One authored message as the historian will actually receive it. Production
+ * runs every text part through `normalizeText`, and every USER part through
+ * `cleanUserText` first, before the chunk builder ever sees it (see
+ * read-session-chunk.ts). Both are applied here so the lint's two consumers —
+ * the rendered byte mass and the authored-evidence search — agree with the
+ * runtime rather than with the raw JSON.
+ *
+ * This is why the evidence rules cannot search the raw strings: text a
+ * `<system-reminder>` block or a Magic Context directive carries is stripped
+ * before the historian sees it, so a predicate or gold answer found only there
+ * is not authored evidence at all — it would make recall failures inevitable or
+ * an absence check vacuous.
+ */
+function messageAsHistorianSeesIt(role: "user" | "assistant", text: string): string {
+    return normalizeText(role === "user" ? cleanUserText(text) : text);
+}
+
+/**
  * Authored evidence text for a half-open turn range: both messages of every
- * turn, ballast excluded. Ballast is harness-owned filler that never carries
- * authored evidence, so including it could only let a predicate match by
- * accident against generated prose.
+ * turn as the historian receives them, ballast excluded. Ballast is
+ * harness-owned filler that never carries authored evidence, so including it
+ * could only let a predicate match by accident against generated prose.
  */
 function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTurnExclusive: number): string {
     return scenario.transcript.turns
         .slice(startTurn, endTurnExclusive)
-        .map((turn) => `${turn.user} ${turn.assistant}`)
+        .map(
+            (turn) =>
+                `${messageAsHistorianSeesIt("user", turn.user)} ${messageAsHistorianSeesIt("assistant", turn.assistant)}`,
+        )
         .join(" ");
 }
 
@@ -636,27 +686,29 @@ function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTur
  * measurement surface, so its agreement with the harness is a contract.
  */
 export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): string[] {
-    const blocks: ChunkBlock[] = [];
     const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
+    // Built through the production text path, not from the raw authored strings:
+    // `compactTextForSummary` strips a commit hash out of assistant prose and
+    // returns it separately, and `formatBlock` then re-attaches it as a `commits:`
+    // suffix. Hard-coding empty `commitHashes` and raw text produced different
+    // bytes — and therefore a different token count — from what the historian
+    // receives, which near the budget decides whether the live chunk splits.
+    const block = (role: "user" | "assistant", text: string, ordinal: number): ChunkBlock => {
+        const compacted = compactTextForSummary(messageAsHistorianSeesIt(role, text), role);
+        return {
+            role: compactRole(role),
+            startOrdinal: ordinal,
+            endOrdinal: ordinal,
+            parts: [compacted.text],
+            meta: [],
+            commitHashes: compacted.commitHashes,
+            isToolOnly: false,
+        };
+    };
+    const blocks: ChunkBlock[] = [];
     scenario.transcript.turns.forEach((turn, index) => {
-        blocks.push({
-            role: compactRole("user"),
-            startOrdinal: index * 2 + 1,
-            endOrdinal: index * 2 + 1,
-            parts: [ballast ? `${turn.user} ${ballast}` : turn.user],
-            meta: [],
-            commitHashes: [],
-            isToolOnly: false,
-        });
-        blocks.push({
-            role: compactRole("assistant"),
-            startOrdinal: index * 2 + 2,
-            endOrdinal: index * 2 + 2,
-            parts: [turn.assistant],
-            meta: [],
-            commitHashes: [],
-            isToolOnly: false,
-        });
+        blocks.push(block("user", ballast ? `${turn.user} ${ballast}` : turn.user, index * 2 + 1));
+        blocks.push(block("assistant", turn.assistant, index * 2 + 2));
     });
     return blocks.map(formatBlock);
 }
@@ -720,7 +772,7 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         if (probe.answerType === "claim-id") continue;
         const range = claimRangeById.get(probe.sourceClaimRef);
         if (range === undefined) continue;
-        if (!normalizeContent(range).includes(normalizeContent(probe.goldAnswer))) {
+        if (!containsCompleteValue(range, probe.goldAnswer)) {
             diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: not-authored-in-source-range`);
         }
     }

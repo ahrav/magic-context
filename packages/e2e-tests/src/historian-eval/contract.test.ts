@@ -4,6 +4,7 @@ import {
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
     MAX_EXPECTATION_ENTRIES,
+    MAX_PROBE_CHOICES,
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
     buildReleaseTuple,
@@ -277,6 +278,17 @@ describe("parseScenario", () => {
         }
     });
 
+    test("multiple-choice options above the operational maximum reject", () => {
+        const raw = validScenarioRaw();
+        (raw.probes as Array<{ choices?: string[] }>)[1].choices = Array.from(
+            { length: MAX_PROBE_CHOICES + 1 },
+            (_unused, index) => `option ${index}`,
+        );
+        // Nested arrays need their own cap: a scenario can stay under the probe
+        // cap while each probe carries an enormous option list.
+        expect(() => parseScenario(raw)).toThrow(/choices: above-operational-maximum/);
+    });
+
     test("multiple-choice options that normalize alike reject", () => {
         const raw = validScenarioRaw();
         // Two spellings of one option: `probeIdentity` treats them as the same
@@ -490,6 +502,48 @@ describe("lintScenario", () => {
         );
     });
 
+    test("a probe gold answer must be a complete authored value, not a substring", () => {
+        const raw = validScenarioRaw();
+        // "4" occurs inside "4096" and nowhere else, so plain containment would
+        // freeze a probe that rewards a wrong answer.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "4";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: not-authored-in-source-range",
+        );
+    });
+
+    test("a complete gold answer still matches inside a sentence", () => {
+        // The boundary is letter-or-digit adjacency, so surrounding prose and
+        // punctuation are fine; only a longer alphanumeric run rejects.
+        expect(lintScenario(validScenario())).toEqual([]);
+    });
+
+    test("evidence is searched as the historian receives it, not as authored", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // Production strips `<system-reminder>` blocks before the chunk builder
+        // runs, so a predicate authored only inside one is never seen by the
+        // historian and its recall failure would be inevitable. Both messages of
+        // the turn have to be moved, since either can carry the evidence.
+        turns[1].user = "No — decided against it. <system-reminder>Use the in-process LRU cache.</system-reminder>";
+        turns[1].assistant = "Understood; recorded that decision.";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.gold.expectedClaims.exp-lru-cache.sourceTurnRange: predicate-not-authored",
+        );
+    });
+
+    test("the same text outside a system reminder is authored evidence", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[1].user = "No — decided against it. Use the in-process LRU cache.";
+        turns[1].assistant = "Understood; recorded that decision.";
+        // Same words, not stripped: the control that proves the previous test
+        // fails on the reminder and not on the rewritten turn.
+        expect(lintScenario(parseScenario(raw))).toEqual([]);
+    });
+
     test("headroom lint measures the ballast the harnesses actually send", () => {
         const scenario = validScenario();
         const blocks = renderedTranscriptBlocks(scenario);
@@ -521,6 +575,20 @@ describe("lintScenario", () => {
         ).find((diagnostic) => diagnostic.includes("exceeds-single-chunk-headroom"));
         expect(reported).toContain(`(${summed} + margin 100000`);
         expect(reported).not.toContain(`(${joined} + margin 100000`);
+    });
+
+    test("headroom lint renders assistant commits the way production does", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ assistant: string }> }).turns;
+        turns[2].assistant = "Done: committed the capacity change in a1b2c3d4e5.";
+        const blocks = renderedTranscriptBlocks(parseScenario(raw));
+        const block = blocks.find((candidate) => candidate.includes("capacity change"));
+        // `compactTextForSummary` lifts the hash out of the prose and `formatBlock`
+        // re-attaches it as a `commits:` suffix. Hard-coded empty commitHashes and
+        // raw text produced different bytes, and so a different token count, from
+        // what the historian receives.
+        expect(block).toContain("commits: a1b2c3d4e5");
+        expect(block).not.toContain("in a1b2c3d4e5");
     });
 });
 
