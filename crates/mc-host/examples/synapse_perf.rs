@@ -471,6 +471,12 @@ impl RoutedWire {
         u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
+    /// Position of `at` on the same wire clock [`Self::elapsed_ns`] reports,
+    /// so a scheduled instant and a recorded send are directly comparable.
+    fn ns_at(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX)
+    }
+
     async fn call(&self, body: Vec<u8>, budget: Duration) -> Result<WireReply, WireCallError> {
         if let Some(error) = self.reader_error.lock().await.clone() {
             return Err(WireCallError::Transport(error));
@@ -606,6 +612,22 @@ struct RunContext {
     opts: Opts,
 }
 
+/// Outcome of a recorded wire call that the caller has to tell apart.
+///
+/// The timeout arm carries the send timestamp the attempt ledger recorded
+/// rather than a sentinel string. A logical request's latency starts at its
+/// first wire send, so a first attempt that times out must still supply that
+/// instant: substituting the timeout instant reports a terminal timeout as
+/// near-zero logical latency, and letting a later retry set the anchor instead
+/// omits both the first attempt and the retry delay.
+enum CallError {
+    Timeout {
+        sent_ns: u64,
+    },
+    /// Transport loss or an unparsable response. The caller cannot act on it.
+    Fatal(String),
+}
+
 impl RunContext {
     async fn record_call(
         &self,
@@ -613,14 +635,14 @@ impl RunContext {
         method: SynapseMethod,
         body: Vec<u8>,
         deadline: Instant,
-    ) -> Result<(WireReply, serde_json::Value), String> {
+    ) -> Result<(WireReply, serde_json::Value), CallError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let attempt_id = self.next_attempt.fetch_add(1, Ordering::Relaxed);
         let result = self.wire.call(body, remaining).await;
         match result {
             Ok(reply) => {
                 let json: serde_json::Value = serde_json::from_slice(&reply.frame.body)
-                    .map_err(|error| format!("response JSON: {error}"))?;
+                    .map_err(|error| CallError::Fatal(format!("response JSON: {error}")))?;
                 let code = json["code"].as_str().map(str::to_owned);
                 // Error envelopes carry the hint at the top level; a served
                 // batch descriptor and a pending poll reply carry it under
@@ -658,6 +680,9 @@ impl RunContext {
                     actual_send_ns: reply.sent_ns,
                     terminal_ns: reply.received_ns,
                     latency_ns: reply.received_ns.saturating_sub(reply.sent_ns),
+                    // Stamped from the owning logical request once the hold
+                    // window's boundaries are known.
+                    warmup: false,
                 });
                 Ok((reply, json))
             }
@@ -679,10 +704,11 @@ impl RunContext {
                     actual_send_ns: sent_ns,
                     terminal_ns,
                     latency_ns: terminal_ns.saturating_sub(sent_ns),
+                    warmup: false,
                 });
-                Err("attempt timeout".to_owned())
+                Err(CallError::Timeout { sent_ns })
             }
-            Err(WireCallError::Transport(error)) => Err(error),
+            Err(WireCallError::Transport(error)) => Err(CallError::Fatal(error)),
         }
     }
 }
@@ -726,6 +752,8 @@ fn terminal_record(
         terminal_code: code,
         attempts,
         polls,
+        // Stamped once the hold window's boundaries are known.
+        warmup: false,
     }
 }
 
@@ -789,7 +817,10 @@ async fn execute_query(
             .await
         {
             Ok(value) => value,
-            Err(error) if error == "attempt timeout" => {
+            Err(CallError::Timeout { sent_ns }) => {
+                // The attempt reached the wire, so it anchors this request's
+                // latency whether or not a retry follows.
+                first_send.get_or_insert(sent_ns);
                 let may_retry = ctx
                     .opts
                     .variant
@@ -808,7 +839,7 @@ async fn execute_query(
                 return Ok(terminal_record(
                     logical_id,
                     scheduled_start_ns,
-                    first_send.unwrap_or(now),
+                    first_send.expect("the timed-out attempt recorded its send"),
                     now,
                     LogicalDisposition::TimedOut,
                     Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
@@ -816,7 +847,7 @@ async fn execute_query(
                     0,
                 ));
             }
-            Err(error) => return Err(error),
+            Err(CallError::Fatal(error)) => return Err(error),
         };
         first_send.get_or_insert(reply.sent_ns);
         if reply.frame.ty == raw_client::TY_RESPONSE {
@@ -923,6 +954,12 @@ async fn execute_batch(
         .collect::<Vec<_>>()
         .into();
     let body = request("embed.batch", params)?;
+    // Served pages are checked against the request's own item identities, so
+    // the lookup is built once per logical request rather than per page.
+    let expected_items: std::collections::BTreeMap<&str, &str> = items
+        .iter()
+        .map(|item| (item.id.as_str(), item.content_sha256.as_str()))
+        .collect();
     let mut rng = DeterministicRng::new(ctx.opts.seed ^ logical_id.rotate_left(17));
     let mut first_send = None;
     let mut batch_attempts = 0u64;
@@ -948,7 +985,10 @@ async fn execute_batch(
                 .await
             {
                 Ok(value) => value,
-                Err(error) if error == "attempt timeout" => {
+                Err(CallError::Timeout { sent_ns }) => {
+                    // The submission reached the wire, so it anchors this
+                    // request's latency even when a resubmission follows.
+                    first_send.get_or_insert(sent_ns);
                     if submit_attempts < MAX_TOTAL_ATTEMPTS {
                         let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
                         if Instant::now() + delay < deadline {
@@ -960,7 +1000,7 @@ async fn execute_batch(
                     return Ok(terminal_record(
                         logical_id,
                         scheduled_start_ns,
-                        first_send.unwrap_or(now),
+                        first_send.expect("the timed-out submission recorded its send"),
                         now,
                         LogicalDisposition::TimedOut,
                         Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
@@ -968,7 +1008,7 @@ async fn execute_batch(
                         polls,
                     ));
                 }
-                Err(error) => return Err(error),
+                Err(CallError::Fatal(error)) => return Err(error),
             };
             first_send.get_or_insert(reply.sent_ns);
             if reply.frame.ty == raw_client::TY_RESPONSE {
@@ -1082,7 +1122,10 @@ async fn execute_batch(
                         }
                         tokio::time::sleep(delay).await;
                     }
-                    Err(error) if error == "attempt timeout" => {
+                    Err(CallError::Timeout { .. }) => {
+                        // `first_send` is already anchored by the submission
+                        // that produced this job, so the poll's own send adds
+                        // nothing to the logical latency window.
                         if poll_attempt < MAX_TOTAL_ATTEMPTS {
                             let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
                             if Instant::now() + delay < deadline {
@@ -1102,7 +1145,7 @@ async fn execute_batch(
                             polls,
                         ));
                     }
-                    Err(error) => return Err(error),
+                    Err(CallError::Fatal(error)) => return Err(error),
                 }
             };
             if reply.frame.ty == raw_client::TY_ERROR {
@@ -1142,6 +1185,7 @@ async fn execute_batch(
             }
             let result = &json["result"];
             if let Some(vectors) = result["vectors"].as_array() {
+                validate_batch_page(&json, &expected_items)?;
                 for vector in vectors {
                     collected.push(
                         vector["id"]
@@ -1171,6 +1215,26 @@ async fn execute_batch(
                 cursor = result["next_cursor"].clone();
                 if !cursor.is_string() {
                     return Err(format!("non-final page omitted cursor: {json}"));
+                }
+                // Paged fetches carry no pending delay, so this is the only
+                // place the page loop can observe an exhausted deadline. The
+                // pending path below clamps its sleep and stops here for the
+                // same reason: `record_call` would otherwise enter with a zero
+                // budget and `RoutedWire::call` writes before its receiver
+                // expires, emitting and recording a post-deadline poll that
+                // inflates amplification and host load in slow cells.
+                if Instant::now() >= deadline {
+                    let now = ctx.wire.elapsed_ns();
+                    return Ok(terminal_record(
+                        logical_id,
+                        scheduled_start_ns,
+                        first_send.expect("batch sent"),
+                        now,
+                        LogicalDisposition::TimedOut,
+                        Some("timeout".to_owned()),
+                        batch_attempts + polls,
+                        polls,
+                    ));
                 }
                 continue;
             }
@@ -1228,6 +1292,71 @@ fn validate_vectors(json: &serde_json::Value, expected: usize) -> Result<(), Str
     Ok(())
 }
 
+/// Validates one `embed.result` page's lane identity and vector payload.
+///
+/// The query arm gates every reply through [`validate_vectors`]. Without the
+/// same gate on the batch arm, a host or engine regression that returns the
+/// expected item ids alongside corrupted vectors, a mismatched content hash,
+/// or the wrong lane identity still reaches `LogicalDisposition::Completed`
+/// and contributes to the completed rate and the latency summaries. `done` is
+/// not checked here because it is a paging state, not a payload property: the
+/// caller distinguishes a final page from a continuation.
+fn validate_batch_page(
+    json: &serde_json::Value,
+    expected: &std::collections::BTreeMap<&str, &str>,
+) -> Result<(), String> {
+    let result = &json["result"];
+    if result["model"] != MODEL
+        || result["fingerprint"] != FINGERPRINT
+        || result["table_epoch"] != 1
+        || result["dims"] != 8
+    {
+        return Err(format!(
+            "batch page carries the wrong lane identity: {json}"
+        ));
+    }
+    let vectors = result["vectors"]
+        .as_array()
+        .ok_or_else(|| format!("batch page omitted vectors: {json}"))?;
+    for item in vectors {
+        let id = item["id"]
+            .as_str()
+            .ok_or_else(|| format!("vector omitted id: {json}"))?;
+        let served_sha = item["content_sha256"]
+            .as_str()
+            .ok_or_else(|| format!("vector {id} omitted content_sha256: {json}"))?;
+        match expected.get(id) {
+            // An unrequested id is caught here rather than by the exactly-once
+            // comparison, which only sees the collected order.
+            None => return Err(format!("batch page returned unrequested id {id}: {json}")),
+            Some(want) if *want != served_sha => {
+                return Err(format!(
+                    "vector {id} content_sha256 does not match its request"
+                ));
+            }
+            Some(_) => {}
+        }
+        // The engine serves one golden vector for every text, so a payload
+        // that drifts from it is a regression rather than input variation.
+        let vector = item["vector"]
+            .as_array()
+            .ok_or_else(|| format!("vector {id} omitted its payload: {json}"))?;
+        if vector.len() != 8 || vector[0].as_f64() != Some(1.0) {
+            return Err(format!(
+                "vector {id} payload is not the golden vector: {json}"
+            ));
+        }
+        // A JSON non-finite arrives as a non-number, so a component that is
+        // neither integral nor floating point never reaches the ledger.
+        if vector.iter().any(|value| value.as_f64().is_none()) {
+            return Err(format!(
+                "vector {id} carries a non-finite component: {json}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn execute(
     ctx: &RunContext,
     logical_id: u64,
@@ -1280,22 +1409,59 @@ async fn warm(ctx: &RunContext) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
+/// One repetition's load-generation result.
+///
+/// Grouped rather than returned as a widening tuple because every field is
+/// derived from the same generator run and the window is what makes the other
+/// two interpretable.
+struct LoadOutcome {
+    records: Vec<LogicalRecord>,
+    send_lag_max_ns: u64,
+    missed_slots: u64,
+    window: perf_measurement::HoldWindow,
+}
+
+/// Open-loop validity gate measured at the wire rather than at the pacer.
+///
+/// The pacer's wake-up delay is only part of a slot's lateness: once the pacer
+/// spawns the request, the task can still wait on the runtime's queue or the
+/// shared writer before its first byte reaches the socket. Sampling the lag
+/// before the spawn therefore lets a saturated, no-longer-open-loop repetition
+/// pass with zero missed slots and silently corrupt the tail comparison. A slot
+/// is missed when its recorded first send lands a full slot gap or more after
+/// its intended start.
+fn open_loop_send_lag(records: &[LogicalRecord], rate: u64) -> (u64, u64) {
+    let mut send_lag_max_ns = 0;
+    let mut missed_slots = 0;
+    for record in records {
+        let Some(scheduled_ns) = record.scheduled_start_ns else {
+            continue;
+        };
+        let lag_ns = record.actual_first_send_ns.saturating_sub(scheduled_ns);
+        send_lag_max_ns = send_lag_max_ns.max(lag_ns);
+        let slot = record.logical_id.saturating_sub(1);
+        let slot_gap_ns = perf_measurement::open_loop_offset_ns(slot + 1, rate)
+            .saturating_sub(perf_measurement::open_loop_offset_ns(slot, rate));
+        if slot_gap_ns != 0 && lag_ns >= slot_gap_ns {
+            missed_slots += 1;
+        }
+    }
+    (send_lag_max_ns, missed_slots)
+}
+
+async fn run_load(ctx: RunContext) -> LoadOutcome {
     match ctx.opts.load {
         Load::Open { rate } => {
             let offered = rate * ctx.opts.seconds;
             let start = Instant::now() + Duration::from_millis(25);
+            let start_ns = ctx.wire.ns_at(start);
             let mut tasks = tokio::task::JoinSet::new();
-            let mut send_lag_max_ns = 0;
-            let mut missed_slots = 0;
             for slot in 0..offered {
-                let scheduled =
-                    start + Duration::from_nanos(perf_measurement::open_loop_offset_ns(slot, rate));
-                // A slot is missed when its send lag reaches the next
-                // scheduled slot; the threshold is this slot's own gap,
-                // exact for every rate rather than a global constant.
-                let slot_gap_ns = perf_measurement::open_loop_offset_ns(slot + 1, rate)
-                    - perf_measurement::open_loop_offset_ns(slot, rate);
+                let offset_ns = perf_measurement::open_loop_offset_ns(slot, rate);
+                let scheduled = start + Duration::from_nanos(offset_ns);
+                // A slot's own spacing is the gap to the next slot; exact for
+                // every rate rather than a global constant.
+                let slot_gap_ns = perf_measurement::open_loop_offset_ns(slot + 1, rate) - offset_ns;
                 // The spin window is bounded by half the slot gap so the
                 // pacer can never busy-spin continuously at high rates: an
                 // unbounded spin per sub-slack slot would saturate a worker
@@ -1303,18 +1469,15 @@ async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
                 // inflate the tails this harness measures.
                 let slack = PACING_SLACK.min(Duration::from_nanos(slot_gap_ns / 2));
                 tokio::time::sleep_until((scheduled - slack).into()).await;
-                let mut now = Instant::now();
-                while now < scheduled {
+                while Instant::now() < scheduled {
                     std::hint::spin_loop();
-                    now = Instant::now();
                 }
-                let lag =
-                    u64::try_from(now.duration_since(scheduled).as_nanos()).unwrap_or(u64::MAX);
-                send_lag_max_ns = send_lag_max_ns.max(lag);
-                if lag >= slot_gap_ns {
-                    missed_slots += 1;
-                }
-                let scheduled_ns = ctx.wire.elapsed_ns().saturating_sub(lag);
+                // The intended schedule, not a reconstruction from the pacer's
+                // observed lag. The frozen offered rate is defined by intended
+                // starts, and comparing the recorded first send against this
+                // value is what makes the validity gate sensitive to time the
+                // request spent queued after the pacer released it.
+                let scheduled_ns = start_ns.saturating_add(offset_ns);
                 let task_ctx = ctx.clone();
                 tasks.spawn(async move { execute(&task_ctx, slot + 1, Some(scheduled_ns)).await });
             }
@@ -1330,10 +1493,18 @@ async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
                 }
             }
             records.sort_by_key(|record| record.logical_id);
-            (records, send_lag_max_ns, missed_slots)
+            let (send_lag_max_ns, missed_slots) = open_loop_send_lag(&records, rate);
+            LoadOutcome {
+                records,
+                send_lag_max_ns,
+                missed_slots,
+                window: perf_measurement::HoldWindow::new(start_ns, ctx.opts.seconds),
+            }
         }
         Load::Closed { concurrency } => {
-            let end = Instant::now() + Duration::from_secs(ctx.opts.seconds);
+            let start = Instant::now();
+            let start_ns = ctx.wire.ns_at(start);
+            let end = start + Duration::from_secs(ctx.opts.seconds);
             let next_id = Arc::new(AtomicU64::new(1));
             let mut workers = tokio::task::JoinSet::new();
             for _ in 0..concurrency {
@@ -1360,7 +1531,13 @@ async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
                 }
             }
             records.sort_by_key(|record| record.logical_id);
-            (records, 0, 0)
+            LoadOutcome {
+                records,
+                // Closed-loop work has no schedule to fall behind.
+                send_lag_max_ns: 0,
+                missed_slots: 0,
+                window: perf_measurement::HoldWindow::new(start_ns, ctx.opts.seconds),
+            }
         }
     }
 }
@@ -1376,6 +1553,11 @@ struct Summary {
     engine_delay_ms: u64,
     max_waiting_queries: usize,
     query_retry_after_ms: u64,
+    /// Subtracted from every permit-wait sample, so two runs with otherwise
+    /// identical emitted configuration derive different wait distributions
+    /// when it differs. Emitted with the other treatment inputs to keep that
+    /// subtraction reproducible from the summary alone.
+    transport_floor_ns: u64,
     ledger: perf_measurement::SynapseLedgerSummary,
     attempt_latency: Option<LatencySummary>,
     logical_latency: Option<LatencySummary>,
@@ -1386,6 +1568,15 @@ struct Summary {
     service_time_cv: Option<f64>,
     send_lag_max_ns: u64,
     missed_slots: u64,
+    /// Frozen hold window on the wire clock. Emitted so the warmup discard and
+    /// the in-flight censoring below are both re-derivable from raw evidence.
+    hold_window_start_ns: u64,
+    warmup_end_ns: u64,
+    hold_window_end_ns: u64,
+    /// Rows held out of every estimate above as the window's warmup prefix.
+    /// They stay in raw evidence marked `warmup`.
+    warmup_offered: u64,
+    warmup_attempts: u64,
     censored_per_mille: f64,
     task_deltas: Vec<process_resources::TaskDelta>,
     /// Transport-loss failures on the single shared wire. A subset of
@@ -1504,18 +1695,42 @@ async fn run(
     service_ns.lock().expect("service samples").clear();
     let task_before =
         process_resources::observe_tasks(std::process::id()).map_err(|error| error.to_string())?;
-    let (logical, send_lag_max_ns, missed_slots) = run_load(ctx.clone()).await;
+    let load = run_load(ctx.clone()).await;
     let task_after =
         process_resources::observe_tasks(std::process::id()).map_err(|error| error.to_string())?;
     let task_deltas = process_resources::task_deltas(&task_before, &task_after);
-    let attempts = ctx.attempts.lock().await.clone();
+    let LoadOutcome {
+        mut records,
+        send_lag_max_ns,
+        missed_slots,
+        window,
+    } = load;
+    let mut attempts = ctx.attempts.lock().await.clone();
+    // Apply the frozen window before anything is estimated: mark the warmup
+    // prefix and censor requests the window closed on.
+    window.stamp(&mut records, &mut attempts);
+    let logical = records;
+    // Raw evidence keeps every row; only the post-warmup set feeds the ledger,
+    // the rates, and the percentiles.
+    let (logical_estimates, logical_warmup) =
+        perf_measurement::partition_warmup(&logical, |record| record.warmup);
+    let (attempt_estimates, attempt_warmup) =
+        perf_measurement::partition_warmup(&attempts, |attempt| attempt.warmup);
     let fatal_errors = ctx.fatal_errors.lock().await.clone();
     let connection_loss_errors = ctx.connection_loss.load(Ordering::Relaxed);
-    let ledger = perf_measurement::validate_synapse_ledgers(&logical, &attempts);
-    let attempt_latency =
-        LatencySummary::from_unsorted(attempts.iter().map(|attempt| attempt.latency_ns).collect());
-    let logical_latency =
-        LatencySummary::from_unsorted(logical.iter().map(|request| request.latency_ns).collect());
+    let ledger = perf_measurement::validate_synapse_ledgers(&logical_estimates, &attempt_estimates);
+    let attempt_latency = LatencySummary::from_unsorted(
+        attempt_estimates
+            .iter()
+            .map(|attempt| attempt.latency_ns)
+            .collect(),
+    );
+    let logical_latency = LatencySummary::from_unsorted(
+        logical_estimates
+            .iter()
+            .map(|request| request.latency_ns)
+            .collect(),
+    );
     // Permit wait is only meaningful for attempts the engine actually
     // served: a rejected or timed-out query attempt did no engine work,
     // so subtracting the engine delay from it produces a hugely negative
@@ -1523,7 +1738,7 @@ async fn run(
     // stays signed and unclamped so genuine timer-resolution negatives
     // on successful attempts remain visible.
     let permit_wait = SignedSummary::from_unsorted(
-        attempts
+        attempt_estimates
             .iter()
             .filter(|attempt| {
                 attempt.method == SynapseMethod::Query
@@ -1537,8 +1752,12 @@ async fn run(
             })
             .collect(),
     );
-    let poll_distribution =
-        CountSummary::from_unsorted(logical.iter().map(|request| request.polls).collect());
+    let poll_distribution = CountSummary::from_unsorted(
+        logical_estimates
+            .iter()
+            .map(|request| request.polls)
+            .collect(),
+    );
     let service_samples = service_ns.lock().expect("service samples").clone();
     let service_time = LatencySummary::from_unsorted(service_samples.clone());
     let service_time_mean_ns = mean(&service_samples);
@@ -1559,6 +1778,7 @@ async fn run(
         engine_delay_ms: opts.engine_delay_ms,
         max_waiting_queries: opts.max_waiting_queries,
         query_retry_after_ms: opts.query_retry_after_ms,
+        transport_floor_ns: opts.transport_floor_ns,
         ledger,
         attempt_latency,
         logical_latency,
@@ -1569,6 +1789,11 @@ async fn run(
         service_time_cv,
         send_lag_max_ns,
         missed_slots,
+        hold_window_start_ns: window.start_ns,
+        warmup_end_ns: window.warmup_end_ns,
+        hold_window_end_ns: window.end_ns,
+        warmup_offered: logical_warmup.len() as u64,
+        warmup_attempts: attempt_warmup.len() as u64,
         censored_per_mille,
         task_deltas,
         connection_loss_errors,
@@ -1858,6 +2083,7 @@ mod tests {
             actual_send_ns: attempt_id,
             terminal_ns: attempt_id + 1,
             latency_ns: 1,
+            warmup: false,
         };
         let attempts = [
             attempt(1, SynapseMethod::Batch, AttemptDisposition::Success, None),

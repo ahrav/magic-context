@@ -290,11 +290,17 @@ logical requests offered
   + in flight at window end
 ```
 
-The rate report therefore satisfies:
+The rate report therefore satisfies, dividing that identity through by the
+measured window `T` so every term is a rate in logical requests per second:
 
 ```text
-λ_off = X + terminal rejections + timeouts ± in-flight
+λ_off = X + (terminal rejections + timeouts ± in flight at window end) / T
 ```
+
+`T` is the post-warmup measured window: the hold window less its warmup
+prefix, which is the same span the emitted `hold_window_start_ns`,
+`warmup_end_ns`, and `hold_window_end_ns` delimit. Only post-warmup records
+enter either side, so the counts above and the rates here describe one set.
 
 The sign on in-flight records whether the report uses starts or settled work;
 the manifest states the convention. The raw count equality is authoritative.

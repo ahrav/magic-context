@@ -990,6 +990,81 @@ describe("connect discovery and retry policy", () => {
     });
 });
 
+describe("embedItems page budget", () => {
+    it("spans submission and polling with one page deadline", async () => {
+        // The page budget is 1s. The submission burns 400ms of it on one
+        // queue_full retry, then the job stays pending forever. Polling must
+        // draw on what is left of that same 1s rather than re-anchoring, so
+        // the whole page settles at the deadline instead of at 1.4s.
+        const pageTimeoutMs = 1_000;
+        let batchCalls = 0;
+        let resultCalls = 0;
+        // Zero jitter draws; declared generously because the poll ladder's
+        // draw count is a property of the schedule under test, not of the
+        // deadline bound this test pins.
+        const time = virtualTime(new Array(64).fill(0));
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            batchTimeoutMs: pageTimeoutMs,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(
+                        _module: string,
+                        method: string,
+                    ): Promise<Response> {
+                        if (method === "models.list") {
+                            return {
+                                models: [
+                                    {
+                                        model: "gte-modernbert-base-f16",
+                                        fingerprint: "fp-live",
+                                        table_epoch: 0,
+                                        dims: 3,
+                                    },
+                                ],
+                            } as Response;
+                        }
+                        if (method === "embed.batch") {
+                            batchCalls += 1;
+                            if (batchCalls === 1) {
+                                const error = new Error("batch admission is full") as Error & {
+                                    code: string;
+                                    retry_after_ms: number;
+                                };
+                                error.code = "queue_full";
+                                error.retry_after_ms = 400;
+                                throw error;
+                            }
+                            return { result: { job_id: "job-1" } } as Response;
+                        }
+                        if (method !== "embed.result") throw new Error(`unexpected ${method}`);
+                        resultCalls += 1;
+                        // The canonical pending shape: no items, no cursor.
+                        return { result: { retry_after_ms: 100 } } as Response;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        const text = "hello";
+        const contentSha256 = createHash("sha256").update(text).digest("hex");
+        const vectors = await provider.embedItems([{ id: "a", text, contentSha256 }]);
+
+        // The page never completed, and it gave up inside its own budget.
+        expect(vectors.size).toBe(0);
+        expect(resultCalls).toBeGreaterThan(0);
+        expect(time.now()).toBeLessThanOrEqual(pageTimeoutMs);
+    });
+});
+
 describe("embedItemsDetailed", () => {
     const MODEL = "gte-modernbert-base-f16";
     const FP = "fp-live";

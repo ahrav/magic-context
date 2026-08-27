@@ -800,12 +800,17 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 const requestKey = this.requestKey(page);
                 let body: unknown = {};
                 let restarted = false;
+                // One absolute deadline for the whole page: submission and the
+                // poll sequence that follows it draw on the same budget, and a
+                // resubmission after `module_restarted` inherits what is left
+                // rather than restarting the clock.
+                const deadlineAt = this.now() + this.pageTimeoutMs;
                 for (;;) {
                     try {
                         body = await this.callWithRetry(
                             "embed.batch",
                             this.batchRequest(page, requestKey),
-                            this.pageTimeoutMs,
+                            Math.max(0, deadlineAt - this.now()),
                             true,
                             signal,
                         );
@@ -816,6 +821,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                                 jobId,
                                 requestKey,
                                 readRetryAfter(first),
+                                deadlineAt,
                                 signal,
                             );
                         }
@@ -1452,15 +1458,17 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private async pollBatch(
         jobId: string,
         requestKey: string,
-        servedPollDelayMs?: number,
+        servedPollDelayMs: number | undefined,
+        deadlineAt: number,
         signal?: AbortSignal,
     ): Promise<unknown> {
         let cursor: unknown = null;
         const allItems: Array<Record<string, unknown>> = [];
-        // One absolute deadline spans the whole poll sequence, so a job that
-        // never leaves the queue cannot poll without bound; each call is
-        // bounded by the remaining budget.
-        const deadlineAt = this.now() + this.pageTimeoutMs;
+        // The caller's absolute page deadline spans submission and polling, as
+        // `collectJobPages` already receives one. Re-anchoring it here would
+        // grant the poll sequence a second full `pageTimeoutMs` on top of the
+        // budget `embed.batch` already spent, so one page could take twice the
+        // configured page timeout.
         // The first `embed.result` goes out immediately; the fast-first seed
         // is consumed by the first pending reply (see `pendingPollDelay`).
         const pollDelay = this.newPollDelayState(servedPollDelayMs);

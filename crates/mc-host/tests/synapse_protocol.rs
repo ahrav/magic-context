@@ -75,10 +75,22 @@ async fn bounded_query_waiters_are_fifo_and_reject_bound_plus_one() {
 
     let first = spawn_query(&host, &lane, "first", 30_000).await;
     yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+    // Each waiter travels its own connection, so admission order follows when
+    // its task reaches the socket rather than the spawn order here. A waiter
+    // blocks before the engine, so `engine.calls` cannot witness its arrival
+    // and there is nothing for `yield_until` to observe; a single yield is one
+    // scheduler turn, which need not carry a spawn through write, dispatch,
+    // and semaphore acquisition. Draining the queue the way the rest of this
+    // suite does keeps the FIFO assertion below from depending on how many
+    // await points that path happens to contain.
     let second = spawn_query(&host, &lane, "second", 30_000).await;
-    tokio::task::yield_now().await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
     let third = spawn_query(&host, &lane, "third", 30_000).await;
-    tokio::task::yield_now().await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
     let fourth = spawn_query(&host, &lane, "fourth", 30_000).await;
     yield_until(|| fourth.is_finished()).await;
     let rejected = fourth.await.expect("fourth query task");

@@ -284,6 +284,12 @@ pub struct AttemptRecord {
     pub actual_send_ns: u64,
     pub terminal_ns: u64,
     pub latency_ns: u64,
+    /// True when the owning logical request opened inside the hold window's
+    /// warmup prefix. Retained in raw evidence and excluded from estimates.
+    /// Deliberately not `#[serde(default)]`: evidence written without the
+    /// marker is not contract-conformant, so it must fail to parse rather
+    /// than silently read as post-warmup.
+    pub warmup: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -306,6 +312,95 @@ pub struct LogicalRecord {
     pub terminal_code: Option<String>,
     pub attempts: u64,
     pub polls: u64,
+    /// True when this request opened inside the hold window's warmup prefix.
+    /// See [`AttemptRecord::warmup`] for the retention and parsing contract.
+    pub warmup: bool,
+}
+
+/// Code marking a request the hold window closed on. Its wire outcome, if any
+/// arrived, stays in the attempt ledger; the logical row records only that the
+/// request had not settled when measurement ended.
+pub const IN_FLIGHT_AT_WINDOW_END_CODE: &str = "in_flight_at_window_end";
+
+/// Fraction of the hold window the frozen contract discards as warmup: the
+/// first 10%, matching the `mc-host-baseline.md` convention.
+const WARMUP_WINDOW_DIVISOR: u64 = 10;
+
+/// One repetition's scheduled hold window on the harness wire clock.
+///
+/// The contract measures a fixed window, so both frozen boundaries are derived
+/// from the *scheduled* span rather than from observed completions: the warmup
+/// prefix that stays out of estimates, and the end past which an unsettled
+/// request is censored instead of being awaited into a completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldWindow {
+    pub start_ns: u64,
+    pub warmup_end_ns: u64,
+    pub end_ns: u64,
+}
+
+impl HoldWindow {
+    /// `start_ns` is the first scheduled slot on the wire clock and `seconds`
+    /// the frozen hold duration.
+    pub fn new(start_ns: u64, seconds: u64) -> Self {
+        let span_ns = seconds.saturating_mul(1_000_000_000);
+        Self {
+            start_ns,
+            warmup_end_ns: start_ns.saturating_add(span_ns / WARMUP_WINDOW_DIVISOR),
+            end_ns: start_ns.saturating_add(span_ns),
+        }
+    }
+
+    /// The instant a logical request opened: its scheduled start for open-loop
+    /// work, or its first wire send for closed-loop work, matching the frozen
+    /// definition of a logical request.
+    pub fn opened_ns(record: &LogicalRecord) -> u64 {
+        record
+            .scheduled_start_ns
+            .unwrap_or(record.actual_first_send_ns)
+    }
+
+    /// Stamps the frozen window boundaries onto one repetition's ledgers.
+    ///
+    /// A request that settled after the window closed was, at the window's
+    /// end, still in flight; recording its later outcome as a completion or
+    /// timeout would understate censoring and let post-window work inflate the
+    /// completed rate over the configured window. Its attempt rows keep the
+    /// wire outcome that did arrive, so nothing is lost from raw evidence.
+    pub fn stamp(&self, logical: &mut [LogicalRecord], attempts: &mut [AttemptRecord]) {
+        let mut warmup_ids = std::collections::BTreeSet::new();
+        for record in logical.iter_mut() {
+            record.warmup = Self::opened_ns(record) < self.warmup_end_ns;
+            if record.warmup {
+                warmup_ids.insert(record.logical_id);
+            }
+            if record.terminal_ns > self.end_ns
+                && record.disposition != LogicalDisposition::InFlight
+            {
+                record.disposition = LogicalDisposition::InFlight;
+                record.terminal_code = Some(IN_FLIGHT_AT_WINDOW_END_CODE.to_owned());
+            }
+        }
+        for attempt in attempts.iter_mut() {
+            attempt.warmup = warmup_ids.contains(&attempt.logical_id);
+        }
+    }
+}
+
+/// Splits one repetition's ledgers into the estimate set and the warmup
+/// prefix. Only the estimate set feeds rates, percentiles, and gates; the
+/// caller retains both in raw evidence.
+pub fn partition_warmup<T: Clone>(records: &[T], warmup: impl Fn(&T) -> bool) -> (Vec<T>, Vec<T>) {
+    let mut estimates = Vec::with_capacity(records.len());
+    let mut discarded = Vec::new();
+    for record in records {
+        if warmup(record) {
+            discarded.push(record.clone());
+        } else {
+            estimates.push(record.clone());
+        }
+    }
+    (estimates, discarded)
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -390,11 +485,15 @@ pub fn validate_synapse_ledgers(
     // (logical + attempts) instead of rescanning every attempt per request.
     let mut first_method_by_logical: BTreeMap<u64, &'static str> = BTreeMap::new();
     let mut attempts_by_logical: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut polls_by_logical: BTreeMap<u64, u64> = BTreeMap::new();
     for attempt in attempts {
         first_method_by_logical
             .entry(attempt.logical_id)
             .or_insert_with(|| attempt.method.wire_name());
         *attempts_by_logical.entry(attempt.logical_id).or_default() += 1;
+        if attempt.disposition == AttemptDisposition::Poll {
+            *polls_by_logical.entry(attempt.logical_id).or_default() += 1;
+        }
 
         let queue_full = attempt.code.as_deref() == Some("queue_full");
         // A client-side attempt timeout produced no terminal, so the wire
@@ -498,6 +597,20 @@ pub fn validate_synapse_ledgers(
             errors.push(format!(
                 "logical {} records {} attempts but owns {actual}",
                 request.logical_id, request.attempts
+            ));
+        }
+        // The attempt total alone cannot catch a misattributed poll count: a
+        // row claiming zero polls while owning a Poll attempt still balances
+        // whenever its total matches, and the poll distribution it feeds is
+        // then wrong while the ledger reports valid.
+        let owned_polls = polls_by_logical
+            .get(&request.logical_id)
+            .copied()
+            .unwrap_or(0);
+        if owned_polls != request.polls {
+            errors.push(format!(
+                "logical {} records {} polls but owns {owned_polls}",
+                request.logical_id, request.polls
             ));
         }
     }

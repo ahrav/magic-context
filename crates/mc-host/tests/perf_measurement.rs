@@ -188,6 +188,7 @@ fn synapse_ledgers_reconcile_exactly() {
             actual_send_ns: 10,
             terminal_ns: 20,
             latency_ns: 10,
+            warmup: false,
         },
         AttemptRecord {
             logical_id: 7,
@@ -199,6 +200,7 @@ fn synapse_ledgers_reconcile_exactly() {
             actual_send_ns: 30,
             terminal_ns: 40,
             latency_ns: 10,
+            warmup: false,
         },
     ];
     let logical = vec![LogicalRecord {
@@ -211,6 +213,7 @@ fn synapse_ledgers_reconcile_exactly() {
         terminal_code: None,
         attempts: 2,
         polls: 1,
+        warmup: false,
     }];
     let ledger = validate_synapse_ledgers(&logical, &attempts);
     assert!(ledger.valid, "{:?}", ledger.errors);
@@ -318,6 +321,7 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         actual_send_ns: 0,
         terminal_ns: 1,
         latency_ns: 1,
+        warmup: false,
     };
     let logical = |logical_id, attempts| LogicalRecord {
         logical_id,
@@ -329,6 +333,7 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         terminal_code: None,
         attempts,
         polls: 0,
+        warmup: false,
     };
 
     // Duplicate logical rows: two rows claim logical 1.
@@ -401,6 +406,7 @@ fn overload_and_closed_singleton_ledgers_keep_expected_amplification() {
         actual_send_ns: attempt_id,
         terminal_ns: attempt_id + 1,
         latency_ns: 1,
+        warmup: false,
     };
     let logical = |logical_id, disposition, attempts| LogicalRecord {
         logical_id,
@@ -413,6 +419,7 @@ fn overload_and_closed_singleton_ledgers_keep_expected_amplification() {
             .then(|| "queue_full".to_owned()),
         attempts,
         polls: 0,
+        warmup: false,
     };
 
     let singleton = validate_synapse_ledgers(
@@ -513,4 +520,275 @@ fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
         SynapseVariant::C.pending_poll_delay_ms(&mut fast_ladder, 73),
         10.0
     );
+}
+
+#[test]
+fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
+    use perf_measurement::{
+        AttemptDisposition, AttemptRecord, HoldWindow, LogicalDisposition, LogicalRecord,
+        SynapseMethod, IN_FLIGHT_AT_WINDOW_END_CODE,
+    };
+
+    // A 10-second hold beginning at 1s: warmup covers the first second of the
+    // window (its first 10%) and the window closes at 11s.
+    let window = HoldWindow::new(1_000_000_000, 10);
+    assert_eq!(window.warmup_end_ns, 2_000_000_000);
+    assert_eq!(window.end_ns, 11_000_000_000);
+
+    let logical_row = |logical_id, scheduled_ns: u64, terminal_ns| LogicalRecord {
+        logical_id,
+        scheduled_start_ns: Some(scheduled_ns),
+        actual_first_send_ns: scheduled_ns,
+        terminal_ns,
+        latency_ns: terminal_ns - scheduled_ns,
+        disposition: LogicalDisposition::Completed,
+        terminal_code: None,
+        attempts: 1,
+        polls: 0,
+        warmup: false,
+    };
+    let attempt_row = |logical_id| AttemptRecord {
+        logical_id,
+        attempt_id: logical_id,
+        method: SynapseMethod::Query,
+        disposition: AttemptDisposition::Success,
+        code: None,
+        retry_after_ms: None,
+        actual_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        warmup: false,
+    };
+
+    let mut logical = vec![
+        // Opens inside the warmup prefix.
+        logical_row(1, 1_500_000_000, 1_600_000_000),
+        // The boundary itself is already post-warmup: the prefix is the first
+        // 10% exclusive of its end.
+        logical_row(2, 2_000_000_000, 2_100_000_000),
+        // Settles inside the window.
+        logical_row(3, 5_000_000_000, 6_000_000_000),
+        // Still outstanding when the window closes.
+        logical_row(4, 10_900_000_000, 13_500_000_000),
+    ];
+    let mut attempts = vec![
+        attempt_row(1),
+        attempt_row(2),
+        attempt_row(3),
+        attempt_row(4),
+    ];
+
+    window.stamp(&mut logical, &mut attempts);
+
+    assert_eq!(
+        logical.iter().map(|r| r.warmup).collect::<Vec<_>>(),
+        [true, false, false, false],
+        "only the request opening before the warmup boundary is marked"
+    );
+    // Attempts inherit the marker from the request that owns them, so the two
+    // ledgers are discarded together and stay reconcilable.
+    assert_eq!(
+        attempts.iter().map(|a| a.warmup).collect::<Vec<_>>(),
+        [true, false, false, false]
+    );
+
+    // A request the window closed on is censored, not credited as completed.
+    assert_eq!(logical[3].disposition, LogicalDisposition::InFlight);
+    assert_eq!(
+        logical[3].terminal_code.as_deref(),
+        Some(IN_FLIGHT_AT_WINDOW_END_CODE)
+    );
+    // Requests that settled inside the window keep their outcome.
+    for record in logical.iter().take(3) {
+        assert_eq!(record.disposition, LogicalDisposition::Completed);
+    }
+
+    // The estimate set excludes the warmup prefix while raw evidence keeps it.
+    let (estimates, discarded) = perf_measurement::partition_warmup(&logical, |r| r.warmup);
+    assert_eq!(estimates.len(), 3);
+    assert_eq!(discarded.len(), 1);
+    assert_eq!(discarded[0].logical_id, 1);
+}
+
+#[test]
+fn outcome_unknown_attempts_are_neither_admitted_nor_rejected() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod, ATTEMPT_TIMEOUT_CODE,
+    };
+
+    let attempt = |attempt_id, disposition, code: Option<&str>| AttemptRecord {
+        logical_id: 1,
+        attempt_id,
+        method: SynapseMethod::Query,
+        disposition,
+        code: code.map(str::to_owned),
+        retry_after_ms: None,
+        actual_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        warmup: false,
+    };
+    let logical = vec![LogicalRecord {
+        logical_id: 1,
+        scheduled_start_ns: None,
+        actual_first_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        disposition: LogicalDisposition::TimedOut,
+        terminal_code: Some(ATTEMPT_TIMEOUT_CODE.to_owned()),
+        attempts: 3,
+        polls: 0,
+        warmup: false,
+    }];
+    let ledger = validate_synapse_ledgers(
+        &logical,
+        &[
+            // A served call: wire evidence that the host admitted it.
+            attempt(1, AttemptDisposition::Success, None),
+            // An admission rejection: wire evidence that it did not.
+            attempt(
+                2,
+                AttemptDisposition::RetryableRejection,
+                Some("queue_full"),
+            ),
+            // No terminal arrived, so the wire says nothing either way.
+            attempt(3, AttemptDisposition::Timeout, Some(ATTEMPT_TIMEOUT_CODE)),
+        ],
+    );
+
+    assert!(ledger.valid, "{:?}", ledger.errors);
+    assert_eq!(
+        ledger.admitted_by_method.get("embed.query"),
+        Some(&1),
+        "an outcome-unknown attempt must not inflate measured admitted rate"
+    );
+    assert_eq!(
+        ledger.outcome_unknown_by_method.get("embed.query"),
+        Some(&1)
+    );
+    assert_eq!(
+        ledger.rejected_by_method_code.get("embed.query:queue_full"),
+        Some(&1)
+    );
+}
+
+#[test]
+fn an_error_outside_the_client_vocabulary_is_not_a_success() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod,
+    };
+
+    let logical = vec![LogicalRecord {
+        logical_id: 1,
+        scheduled_start_ns: None,
+        actual_first_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        disposition: LogicalDisposition::InFlight,
+        terminal_code: Some("harness_error".to_owned()),
+        attempts: 1,
+        polls: 0,
+        warmup: false,
+    }];
+    let ledger = validate_synapse_ledgers(
+        &logical,
+        &[AttemptRecord {
+            logical_id: 1,
+            attempt_id: 1,
+            method: SynapseMethod::Query,
+            disposition: AttemptDisposition::Failure,
+            code: Some("schema_violation".to_owned()),
+            retry_after_ms: None,
+            actual_send_ns: 0,
+            terminal_ns: 1,
+            latency_ns: 1,
+            warmup: false,
+        }],
+    );
+
+    assert_eq!(ledger.successes, 0, "the row must not be counted a success");
+    assert_eq!(ledger.failures, 1);
+    // The frozen attempt vocabulary has four categories, so a recorded failure
+    // makes the repetition inadmissible rather than silently reshaping rates.
+    assert!(!ledger.valid);
+    assert!(
+        ledger
+            .errors
+            .iter()
+            .any(|error| error.contains("outside the frozen vocabulary")),
+        "{:?}",
+        ledger.errors
+    );
+}
+
+#[test]
+fn a_misattributed_poll_count_is_rejected_even_when_attempts_balance() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod,
+    };
+
+    let attempt = |attempt_id, method, disposition| AttemptRecord {
+        logical_id: 1,
+        attempt_id,
+        method,
+        disposition,
+        code: None,
+        retry_after_ms: None,
+        actual_send_ns: attempt_id,
+        terminal_ns: attempt_id + 1,
+        latency_ns: 1,
+        warmup: false,
+    };
+    // The row owns one submission and one poll, and its total is honest, so
+    // the attempt-count check alone accepts it while `polls` is understated.
+    let logical = vec![LogicalRecord {
+        logical_id: 1,
+        scheduled_start_ns: None,
+        actual_first_send_ns: 1,
+        terminal_ns: 4,
+        latency_ns: 3,
+        disposition: LogicalDisposition::Completed,
+        terminal_code: None,
+        attempts: 2,
+        polls: 0,
+        warmup: false,
+    }];
+    let ledger = validate_synapse_ledgers(
+        &logical,
+        &[
+            attempt(1, SynapseMethod::Batch, AttemptDisposition::Success),
+            attempt(2, SynapseMethod::Result, AttemptDisposition::Poll),
+        ],
+    );
+
+    assert!(
+        !ledger.valid,
+        "an understated poll count must invalidate the repetition"
+    );
+    assert!(
+        ledger
+            .errors
+            .iter()
+            .any(|error| error.contains("records 0 polls but owns 1")),
+        "{:?}",
+        ledger.errors
+    );
+
+    // The same ledger with the poll count corrected is admissible, so the new
+    // check rejects only the misattribution and not the shape itself.
+    let corrected = vec![LogicalRecord {
+        polls: 1,
+        ..logical[0].clone()
+    }];
+    let ledger = validate_synapse_ledgers(
+        &corrected,
+        &[
+            attempt(1, SynapseMethod::Batch, AttemptDisposition::Success),
+            attempt(2, SynapseMethod::Result, AttemptDisposition::Poll),
+        ],
+    );
+    assert!(ledger.valid, "{:?}", ledger.errors);
 }
