@@ -2117,6 +2117,9 @@ describe("release prerequisite (CLI)", () => {
             repoRoot,
             "scripts/qualify-mc-host-production-inputs.ts",
         );
+        // No `--verify-bytes`, so the gate regenerates in check mode and reads no
+        // artifact: it must reach the verdict rather than stop on the runtime binding,
+        // which only governs runs that will actually hash bytes.
         const required = spawnSync("bun", [script, "--require-qualified"], {
             cwd: repoRoot,
             encoding: "utf8",

@@ -3052,11 +3052,15 @@ function main(): void {
     }
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
     // Byte verification is the qualifying host's operation, so it is the one place
-    // the pinned harness runtime is bound to a real interpreter. The condition must
-    // match `generate`'s own default — write mode verifies bytes without being asked
-    // — or the documented `release:qualify` command would hash artifacts while the
-    // binding sat unenforced.
-    if (verifyBytes || !check) {
+    // the pinned harness runtime is bound to a real interpreter. The condition has to
+    // predict `generate`'s own resolution rather than restate part of it: write mode
+    // verifies bytes without being asked, while the consumption gate always regenerates
+    // in check mode and so verifies only when explicitly told to. Getting this subset
+    // wrong in either direction is a live failure — too narrow and the documented
+    // `release:qualify` hashes artifacts unbound, too wide and the gate refuses to run
+    // on a host that was never going to read a byte.
+    const willVerifyBytes = requireQualified ? verifyBytes : verifyBytes || !check;
+    if (willVerifyBytes) {
         try {
             assertPinnedQualifyingRuntime(process.versions?.bun);
         } catch (error) {
