@@ -10,7 +10,7 @@ mod raw_client;
 
 use perf_measurement::{
     fixture_workload, nearest_rank, open_loop_offset_ns, tail_publishable, validate_open_loop_rate,
-    LatencySummary, Outcome, OutcomeCounts, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
+    LatencySummary, Outcome, OutcomeCounts, WindowClass, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
 };
 
 #[test]
@@ -188,7 +188,7 @@ fn synapse_ledgers_reconcile_exactly() {
             actual_send_ns: 10,
             terminal_ns: 20,
             latency_ns: 10,
-            warmup: false,
+            window: WindowClass::Measured,
         },
         AttemptRecord {
             logical_id: 7,
@@ -200,7 +200,7 @@ fn synapse_ledgers_reconcile_exactly() {
             actual_send_ns: 30,
             terminal_ns: 40,
             latency_ns: 10,
-            warmup: false,
+            window: WindowClass::Measured,
         },
     ];
     let logical = vec![LogicalRecord {
@@ -213,7 +213,7 @@ fn synapse_ledgers_reconcile_exactly() {
         terminal_code: None,
         attempts: 2,
         polls: 1,
-        warmup: false,
+        window: WindowClass::Measured,
     }];
     let ledger = validate_synapse_ledgers(&logical, &attempts);
     assert!(ledger.valid, "{:?}", ledger.errors);
@@ -321,7 +321,7 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         actual_send_ns: 0,
         terminal_ns: 1,
         latency_ns: 1,
-        warmup: false,
+        window: WindowClass::Measured,
     };
     let logical = |logical_id, attempts| LogicalRecord {
         logical_id,
@@ -333,7 +333,7 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         terminal_code: None,
         attempts,
         polls: 0,
-        warmup: false,
+        window: WindowClass::Measured,
     };
 
     // Duplicate logical rows: two rows claim logical 1.
@@ -406,7 +406,7 @@ fn overload_and_closed_singleton_ledgers_keep_expected_amplification() {
         actual_send_ns: attempt_id,
         terminal_ns: attempt_id + 1,
         latency_ns: 1,
-        warmup: false,
+        window: WindowClass::Measured,
     };
     let logical = |logical_id, disposition, attempts| LogicalRecord {
         logical_id,
@@ -419,7 +419,7 @@ fn overload_and_closed_singleton_ledgers_keep_expected_amplification() {
             .then(|| "queue_full".to_owned()),
         attempts,
         polls: 0,
-        warmup: false,
+        window: WindowClass::Measured,
     };
 
     let singleton = validate_synapse_ledgers(
@@ -545,7 +545,7 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
         terminal_code: None,
         attempts: 1,
         polls: 0,
-        warmup: false,
+        window: WindowClass::Measured,
     };
     let attempt_row = |logical_id| AttemptRecord {
         logical_id,
@@ -557,7 +557,7 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
         actual_send_ns: 0,
         terminal_ns: 1,
         latency_ns: 1,
-        warmup: false,
+        window: WindowClass::Measured,
     };
 
     let mut logical = vec![
@@ -570,29 +570,37 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
         logical_row(3, 5_000_000_000, 6_000_000_000),
         // Still outstanding when the window closes.
         logical_row(4, 10_900_000_000, 13_500_000_000),
+        // Opened only after the window had already closed: a closed-loop
+        // worker that passed the boundary test but did not reach the wire in
+        // time. It never ran under measurement.
+        logical_row(5, 11_200_000_000, 11_900_000_000),
     ];
     let mut attempts = vec![
         attempt_row(1),
         attempt_row(2),
         attempt_row(3),
         attempt_row(4),
+        attempt_row(5),
     ];
 
     window.stamp(&mut logical, &mut attempts);
 
+    use WindowClass::{AfterWindow, Measured, Warmup};
     assert_eq!(
-        logical.iter().map(|r| r.warmup).collect::<Vec<_>>(),
-        [true, false, false, false],
-        "only the request opening before the warmup boundary is marked"
+        logical.iter().map(|r| r.window).collect::<Vec<_>>(),
+        [Warmup, Measured, Measured, Measured, AfterWindow],
+        "both boundaries are half-open: the warmup end is already measured and \
+         the window end is already outside"
     );
-    // Attempts inherit the marker from the request that owns them, so the two
+    // Attempts inherit the class from the request that owns them, so the two
     // ledgers are discarded together and stay reconcilable.
     assert_eq!(
-        attempts.iter().map(|a| a.warmup).collect::<Vec<_>>(),
-        [true, false, false, false]
+        attempts.iter().map(|a| a.window).collect::<Vec<_>>(),
+        [Warmup, Measured, Measured, Measured, AfterWindow]
     );
 
-    // A request the window closed on is censored, not credited as completed.
+    // A measured request the window closed on is censored, not credited as
+    // completed.
     assert_eq!(logical[3].disposition, LogicalDisposition::InFlight);
     assert_eq!(
         logical[3].terminal_code.as_deref(),
@@ -602,12 +610,78 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
     for record in logical.iter().take(3) {
         assert_eq!(record.disposition, LogicalDisposition::Completed);
     }
+    // The after-window row is excluded outright, so rewriting its disposition
+    // would destroy a true outcome without changing any estimate. The in-flight
+    // code therefore means exactly "the measured window closed on this
+    // request".
+    assert_eq!(logical[4].disposition, LogicalDisposition::Completed);
+    assert_eq!(logical[4].terminal_code, None);
 
-    // The estimate set excludes the warmup prefix while raw evidence keeps it.
-    let (estimates, discarded) = perf_measurement::partition_warmup(&logical, |r| r.warmup);
-    assert_eq!(estimates.len(), 3);
-    assert_eq!(discarded.len(), 1);
-    assert_eq!(discarded[0].logical_id, 1);
+    // The estimate set excludes both discards while raw evidence keeps them.
+    let (estimates, excluded) = perf_measurement::partition_measured(&logical, |r| r.window);
+    assert_eq!(
+        estimates.iter().map(|r| r.logical_id).collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+    assert_eq!(
+        excluded.iter().map(|r| r.logical_id).collect::<Vec<_>>(),
+        [1, 5]
+    );
+    assert_eq!(
+        perf_measurement::count_class(&excluded, Warmup, |r| r.window),
+        1
+    );
+    assert_eq!(
+        perf_measurement::count_class(&excluded, AfterWindow, |r| r.window),
+        1
+    );
+}
+
+#[test]
+fn an_orphan_attempt_cannot_enter_the_measured_set() {
+    use perf_measurement::{
+        AttemptDisposition, AttemptRecord, HoldWindow, LogicalDisposition, LogicalRecord,
+        SynapseMethod,
+    };
+
+    let window = HoldWindow::new(0, 10);
+    let mut logical = vec![LogicalRecord {
+        logical_id: 1,
+        scheduled_start_ns: Some(5_000_000_000),
+        actual_first_send_ns: 5_000_000_000,
+        terminal_ns: 5_100_000_000,
+        latency_ns: 100_000_000,
+        disposition: LogicalDisposition::Completed,
+        terminal_code: None,
+        attempts: 1,
+        polls: 0,
+        window: WindowClass::Measured,
+    }];
+    let attempt = |logical_id, attempt_id| AttemptRecord {
+        logical_id,
+        attempt_id,
+        method: SynapseMethod::Query,
+        disposition: AttemptDisposition::Success,
+        code: None,
+        retry_after_ms: None,
+        actual_send_ns: 5_000_000_000,
+        terminal_ns: 5_100_000_000,
+        latency_ns: 100_000_000,
+        window: WindowClass::Measured,
+    };
+    // Attempt 2 names a logical request that is not in the ledger. Leaving the
+    // constructed default in place would let an unattributable row into
+    // estimates, so an orphan is classified out of the measured set; the ledger
+    // validator reports the inconsistency itself.
+    let mut attempts = vec![attempt(1, 1), attempt(99, 2)];
+
+    window.stamp(&mut logical, &mut attempts);
+
+    assert_eq!(attempts[0].window, WindowClass::Measured);
+    assert_eq!(attempts[1].window, WindowClass::AfterWindow);
+    let (measured, excluded) = perf_measurement::partition_measured(&attempts, |a| a.window);
+    assert_eq!(measured.len(), 1);
+    assert_eq!(excluded.len(), 1);
 }
 
 #[test]
@@ -627,7 +701,7 @@ fn outcome_unknown_attempts_are_neither_admitted_nor_rejected() {
         actual_send_ns: 0,
         terminal_ns: 1,
         latency_ns: 1,
-        warmup: false,
+        window: WindowClass::Measured,
     };
     let logical = vec![LogicalRecord {
         logical_id: 1,
@@ -639,7 +713,7 @@ fn outcome_unknown_attempts_are_neither_admitted_nor_rejected() {
         terminal_code: Some(ATTEMPT_TIMEOUT_CODE.to_owned()),
         attempts: 3,
         polls: 0,
-        warmup: false,
+        window: WindowClass::Measured,
     }];
     let ledger = validate_synapse_ledgers(
         &logical,
@@ -690,7 +764,7 @@ fn an_error_outside_the_client_vocabulary_is_not_a_success() {
         terminal_code: Some("harness_error".to_owned()),
         attempts: 1,
         polls: 0,
-        warmup: false,
+        window: WindowClass::Measured,
     }];
     let ledger = validate_synapse_ledgers(
         &logical,
@@ -704,7 +778,7 @@ fn an_error_outside_the_client_vocabulary_is_not_a_success() {
             actual_send_ns: 0,
             terminal_ns: 1,
             latency_ns: 1,
-            warmup: false,
+            window: WindowClass::Measured,
         }],
     );
 
@@ -740,7 +814,7 @@ fn a_misattributed_poll_count_is_rejected_even_when_attempts_balance() {
         actual_send_ns: attempt_id,
         terminal_ns: attempt_id + 1,
         latency_ns: 1,
-        warmup: false,
+        window: WindowClass::Measured,
     };
     // The row owns one submission and one poll, and its total is honest, so
     // the attempt-count check alone accepts it while `polls` is understated.
@@ -754,7 +828,7 @@ fn a_misattributed_poll_count_is_rejected_even_when_attempts_balance() {
         terminal_code: None,
         attempts: 2,
         polls: 0,
-        warmup: false,
+        window: WindowClass::Measured,
     }];
     let ledger = validate_synapse_ledgers(
         &logical,

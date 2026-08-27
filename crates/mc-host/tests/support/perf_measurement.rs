@@ -284,12 +284,12 @@ pub struct AttemptRecord {
     pub actual_send_ns: u64,
     pub terminal_ns: u64,
     pub latency_ns: u64,
-    /// True when the owning logical request opened inside the hold window's
-    /// warmup prefix. Retained in raw evidence and excluded from estimates.
-    /// Deliberately not `#[serde(default)]`: evidence written without the
-    /// marker is not contract-conformant, so it must fail to parse rather
-    /// than silently read as post-warmup.
-    pub warmup: bool,
+    /// The window class of the owning logical request, so an attempt is
+    /// included or excluded with the request it belongs to rather than by its
+    /// own send instant. Deliberately not `#[serde(default)]`: evidence
+    /// written without the marker is not contract-conformant, so it must fail
+    /// to parse rather than silently read as measured.
+    pub window: WindowClass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -312,9 +312,9 @@ pub struct LogicalRecord {
     pub terminal_code: Option<String>,
     pub attempts: u64,
     pub polls: u64,
-    /// True when this request opened inside the hold window's warmup prefix.
-    /// See [`AttemptRecord::warmup`] for the retention and parsing contract.
-    pub warmup: bool,
+    /// Which part of the hold window this request opened in. See
+    /// [`AttemptRecord::window`] for the retention and parsing contract.
+    pub window: WindowClass,
 }
 
 /// Code marking a request the hold window closed on. Its wire outcome, if any
@@ -325,6 +325,50 @@ pub const IN_FLIGHT_AT_WINDOW_END_CODE: &str = "in_flight_at_window_end";
 /// Fraction of the hold window the frozen contract discards as warmup: the
 /// first 10%, matching the `mc-host-baseline.md` convention.
 const WARMUP_WINDOW_DIVISOR: u64 = 10;
+
+/// Where an observation falls relative to the frozen hold window.
+///
+/// One field rather than a pair of exclusion booleans: every consumer asks the
+/// same question — is this row part of the measured set — and a single class
+/// cannot encode the contradictory answers two independent flags can. Only
+/// [`WindowClass::Measured`] rows feed ledgers, rates, percentiles, and gates;
+/// the other two stay in raw evidence so the discard is auditable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowClass {
+    /// Opened inside the window's warmup prefix.
+    Warmup,
+    /// Opened inside the measured span between the warmup boundary and the
+    /// window end.
+    Measured,
+    /// Opened at or after the window end. Closed-loop workers test the
+    /// boundary before dispatching, so a worker that passes the test can still
+    /// land its first wire send after the window closed; such a request never
+    /// started under measurement and must not be counted as offered.
+    AfterWindow,
+}
+
+impl WindowClass {
+    /// True for the only class that feeds estimates.
+    pub fn is_measured(self) -> bool {
+        matches!(self, Self::Measured)
+    }
+}
+
+/// One engine service-time observation, timestamped so it can be attributed to
+/// a window class.
+///
+/// The duration alone is not sufficient evidence: without a start instant a
+/// consumer cannot tell a call made under the warmup prefix, or one drained
+/// after the window closed, from one served inside the measured span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceSample {
+    /// When the engine call began, on the harness wire clock.
+    pub started_ns: u64,
+    /// Wall time the engine call occupied.
+    pub service_ns: u64,
+    pub window: WindowClass,
+}
 
 /// One repetition's scheduled hold window on the harness wire clock.
 ///
@@ -351,6 +395,19 @@ impl HoldWindow {
         }
     }
 
+    /// Classifies an opening instant. Both boundaries are half-open: the
+    /// warmup boundary itself is already measured, and the window end itself is
+    /// already outside.
+    pub fn classify(&self, opened_ns: u64) -> WindowClass {
+        if opened_ns < self.warmup_end_ns {
+            WindowClass::Warmup
+        } else if opened_ns >= self.end_ns {
+            WindowClass::AfterWindow
+        } else {
+            WindowClass::Measured
+        }
+    }
+
     /// The instant a logical request opened: its scheduled start for open-loop
     /// work, or its first wire send for closed-loop work, matching the frozen
     /// definition of a logical request.
@@ -367,14 +424,19 @@ impl HoldWindow {
     /// timeout would understate censoring and let post-window work inflate the
     /// completed rate over the configured window. Its attempt rows keep the
     /// wire outcome that did arrive, so nothing is lost from raw evidence.
+    ///
+    /// The censoring rewrite applies only to measured rows. A warmup or
+    /// after-window request is excluded from estimates outright, so rewriting
+    /// its disposition would discard a true outcome from raw evidence and buy
+    /// nothing; it also keeps the in-flight-at-window-end code meaning exactly
+    /// "the measured window closed on this request".
     pub fn stamp(&self, logical: &mut [LogicalRecord], attempts: &mut [AttemptRecord]) {
-        let mut warmup_ids = std::collections::BTreeSet::new();
+        let mut classes = std::collections::BTreeMap::new();
         for record in logical.iter_mut() {
-            record.warmup = Self::opened_ns(record) < self.warmup_end_ns;
-            if record.warmup {
-                warmup_ids.insert(record.logical_id);
-            }
-            if record.terminal_ns > self.end_ns
+            record.window = self.classify(Self::opened_ns(record));
+            classes.insert(record.logical_id, record.window);
+            if record.window.is_measured()
+                && record.terminal_ns > self.end_ns
                 && record.disposition != LogicalDisposition::InFlight
             {
                 record.disposition = LogicalDisposition::InFlight;
@@ -382,25 +444,39 @@ impl HoldWindow {
             }
         }
         for attempt in attempts.iter_mut() {
-            attempt.warmup = warmup_ids.contains(&attempt.logical_id);
+            // An attempt whose logical row is missing cannot be attributed to
+            // the measured set; the ledger validator reports the orphan.
+            attempt.window = classes
+                .get(&attempt.logical_id)
+                .copied()
+                .unwrap_or(WindowClass::AfterWindow);
         }
     }
 }
 
-/// Splits one repetition's ledgers into the estimate set and the warmup
-/// prefix. Only the estimate set feeds rates, percentiles, and gates; the
-/// caller retains both in raw evidence.
-pub fn partition_warmup<T: Clone>(records: &[T], warmup: impl Fn(&T) -> bool) -> (Vec<T>, Vec<T>) {
-    let mut estimates = Vec::with_capacity(records.len());
-    let mut discarded = Vec::new();
+/// Splits one repetition's ledgers into the measured set and everything the
+/// frozen window excludes. Only the measured set feeds rates, percentiles, and
+/// gates; the caller retains both in raw evidence.
+pub fn partition_measured<T: Clone>(
+    records: &[T],
+    class: impl Fn(&T) -> WindowClass,
+) -> (Vec<T>, Vec<T>) {
+    let mut measured = Vec::with_capacity(records.len());
+    let mut excluded = Vec::new();
     for record in records {
-        if warmup(record) {
-            discarded.push(record.clone());
+        if class(record).is_measured() {
+            measured.push(record.clone());
         } else {
-            estimates.push(record.clone());
+            excluded.push(record.clone());
         }
     }
-    (estimates, discarded)
+    (measured, excluded)
+}
+
+/// Counts excluded rows of one class, so the summary can report the warmup
+/// discard and the after-window discard as the distinct quantities they are.
+pub fn count_class<T>(records: &[T], want: WindowClass, class: impl Fn(&T) -> WindowClass) -> u64 {
+    records.iter().filter(|row| class(row) == want).count() as u64
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -732,6 +732,48 @@ describe("connect discovery and retry policy", () => {
         expect(time.sleeps).toEqual(new Array(63).fill(1));
     });
 
+    it("ends a retry delay as soon as the caller aborts", async () => {
+        let queryCalls = 0;
+        const controller = new AbortController();
+        // The injected sleep never settles, so only the abort can end the race.
+        // A delay that ignored the signal would hang here rather than return a
+        // wrong value: the retry ladder waits a served 2s hint, and the whole
+        // point is that an aborted caller must not be held for it.
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 30_000,
+            now: () => 0,
+            sleep: () => {
+                controller.abort();
+                return new Promise<void>(() => {});
+            },
+            random: () => 0,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(): Promise<Response> {
+                        queryCalls += 1;
+                        const error = new Error("query admission is full") as Error & {
+                            code: string;
+                            retry_after_ms: number;
+                        };
+                        error.code = "queue_full";
+                        error.retry_after_ms = 2_000;
+                        throw error;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        expect(await provider.embed("hello", controller.signal)).toBeNull();
+        // The wait was abandoned, so the next attempt was never dispatched.
+        expect(queryCalls).toBe(1);
+    });
+
     it("lets the deadline, not the four-attempt cap, budget queue-full retries", async () => {
         let queryCalls = 0;
         // The host-served 50ms hint with zero jitter draws: attempts at

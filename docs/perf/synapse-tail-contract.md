@@ -75,7 +75,19 @@ Wire replies and harness timestamps are the sole attribution source for logical
 request and attempt outcomes. Production metrics and in-host counters are not
 outcome evidence. Process-level `utime`, `stime`, and voluntary and nonvoluntary
 context-switch series read by the harness from `/proc` are separate no-busy-poll
-evidence.
+evidence. Both observations are taken at the measured window's own boundaries,
+not around the whole generate-and-drain interval: snapshots spanning the discard
+and the post-window drain would charge each arm for a different amount of extra
+accounting time, and the overloaded arm drains longest, so the difference would
+track the treatment. The instants the two observations landed on are emitted as
+`task_window_start_ns` and `task_window_end_ns`, and the deltas are absent
+rather than widened when an observation fails.
+
+Engine service samples carry the instant the call began, so the same window
+classification partitions them. Without that timestamp a service duration cannot
+be told apart from one measured under the warmup prefix or drained after the
+boundary, and `S`, its coefficient of variation, and the capacity estimate built
+on them would describe a different cohort than the logical and attempt ledgers.
 
 ### Timing boundaries
 
@@ -97,8 +109,23 @@ The warm state begins after successful authentication, route setup, engine
 initialization, fixture loading, and one untimed request of every method used by
 the cell. Each independent block then discards the first 10% of its scheduled
 hold window as warmup, matching the convention in
-[mc-host-baseline.md](./mc-host-baseline.md). Warmup observations remain in raw
-evidence with `warmup=true` and do not enter estimates.
+[mc-host-baseline.md](./mc-host-baseline.md).
+
+Every logical request, attempt, and engine service sample carries one `window`
+class against the frozen boundaries, and only `measured` rows enter estimates:
+
+- `warmup` — opened before `warmup_end_ns`.
+- `measured` — opened in `[warmup_end_ns, hold_window_end_ns)`. Both boundaries
+  are half-open, so the warmup boundary itself is already measured.
+- `after_window` — opened at or after `hold_window_end_ns`. A closed-loop worker
+  tests the boundary before it dispatches, so a worker that passes the test can
+  still reach the wire after the window has closed. Such a request never ran
+  under measurement, and counting it would inflate offered counts, amplification,
+  and censoring in exactly the saturated cells where the delay occurs.
+
+Excluded observations remain in raw evidence with their class, and the summary
+reports `warmup_offered`, `warmup_attempts`, `after_window_offered`, and
+`after_window_attempts` so both discards are auditable and re-derivable.
 
 ## Outcomes and ratio orientation
 
@@ -304,6 +331,17 @@ enter either side, so the counts above and the rates here describe one set.
 
 The sign on in-flight records whether the report uses starts or settled work;
 the manifest states the convention. The raw count equality is authoritative.
+
+Latency percentiles are computed over measured requests that reached a terminal,
+non-censored outcome — completions and terminal rejections. Timed-out and
+in-flight-at-window-end rows are right-censored: a timeout's duration is
+truncated at its deadline, and an in-flight row's `latency_ns` runs to whenever
+the request actually settled, which for a saturated cell can be seconds or
+minutes past the boundary. Admitting either would let the reported tail be
+dominated by durations the same ledger declares censored, with the contamination
+growing alongside the treatment. The censoring rate is reported beside the
+percentiles, so the pair reads as one statement: the tail of the requests that
+were answered, plus the fraction that were not.
 
 For every logical request, the mutually exclusive attempt ledger satisfies:
 

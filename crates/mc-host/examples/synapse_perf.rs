@@ -29,7 +29,7 @@ use mc_host::{
 };
 use perf_measurement::{
     AttemptDisposition, AttemptRecord, DeterministicRng, LatencySummary, LogicalDisposition,
-    LogicalRecord, SynapseMethod, SynapseVariant,
+    LogicalRecord, ServiceSample, SynapseMethod, SynapseVariant, WindowClass,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -215,7 +215,10 @@ fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
 
 struct DelayEngine {
     delay: Duration,
-    service_ns: Arc<StdMutex<Vec<u64>>>,
+    /// Shared with the wire clock so a service sample's start instant is
+    /// directly comparable to the hold window's boundaries.
+    origin: Instant,
+    service: Arc<StdMutex<Vec<ServiceSample>>>,
 }
 
 impl EmbeddingEngine for DelayEngine {
@@ -227,10 +230,17 @@ impl EmbeddingEngine for DelayEngine {
             .map(|_| vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .collect();
         let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.service_ns
+        let started_ns = u64::try_from(start.saturating_duration_since(self.origin).as_nanos())
+            .unwrap_or(u64::MAX);
+        self.service
             .lock()
             .expect("service samples")
-            .push(elapsed);
+            .push(ServiceSample {
+                started_ns,
+                service_ns: elapsed,
+                // Classified once the hold window's boundaries are known.
+                window: WindowClass::Measured,
+            });
         Ok(vectors)
     }
 }
@@ -471,6 +481,12 @@ impl RoutedWire {
         u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
+    /// The zero of the wire clock, so a consumer outside the wire can place its
+    /// own observations on the same axis as recorded sends and terminals.
+    fn origin(&self) -> Instant {
+        self.origin
+    }
+
     /// Position of `at` on the same wire clock [`Self::elapsed_ns`] reports,
     /// so a scheduled instant and a recorded send are directly comparable.
     fn ns_at(&self, at: Instant) -> u64 {
@@ -682,7 +698,7 @@ impl RunContext {
                     latency_ns: reply.received_ns.saturating_sub(reply.sent_ns),
                     // Stamped from the owning logical request once the hold
                     // window's boundaries are known.
-                    warmup: false,
+                    window: WindowClass::Measured,
                 });
                 Ok((reply, json))
             }
@@ -704,7 +720,7 @@ impl RunContext {
                     actual_send_ns: sent_ns,
                     terminal_ns,
                     latency_ns: terminal_ns.saturating_sub(sent_ns),
-                    warmup: false,
+                    window: WindowClass::Measured,
                 });
                 Err(CallError::Timeout { sent_ns })
             }
@@ -753,7 +769,7 @@ fn terminal_record(
         attempts,
         polls,
         // Stamped once the hold window's boundaries are known.
-        warmup: false,
+        window: WindowClass::Measured,
     }
 }
 
@@ -1419,6 +1435,60 @@ struct LoadOutcome {
     send_lag_max_ns: u64,
     missed_slots: u64,
     window: perf_measurement::HoldWindow,
+    /// `None` when a boundary observation failed; the reason is recorded in the
+    /// run's fatal errors, which already invalidate the repetition.
+    task_window: Option<TaskWindow>,
+}
+
+/// Task counter evidence for one repetition's measured window.
+///
+/// The deltas and the span they cover travel together: a delta whose interval
+/// is unknown cannot support the resource-shift claim, so they are one value
+/// rather than two independently-optional fields that could disagree.
+struct TaskWindow {
+    deltas: Vec<process_resources::TaskDelta>,
+    /// The instants the two observations actually landed on. A saturated
+    /// harness can overshoot a boundary, so the covered span is reported rather
+    /// than assumed to equal the frozen boundaries exactly.
+    observed_start_ns: u64,
+    observed_end_ns: u64,
+}
+
+/// Observes the process task counters at the measured window's own boundaries.
+///
+/// Snapshots taken around the whole generate-and-drain interval would charge
+/// the discarded warmup prefix and any post-window drain to the comparison,
+/// and an overloaded cell drains for longer than its control — so the extra
+/// accounting time is itself correlated with the treatment. Sampling at
+/// `warmup_end` and `end` keeps the CPU and context-switch deltas on the same
+/// span as every other estimate.
+///
+/// Returns the deltas and the instants the observations landed on. A failed
+/// observation yields the error text instead: the counters are evidence for
+/// the resource-shift claim, so a missing sample must invalidate that claim
+/// rather than silently degrade to a wider span.
+async fn observe_task_window(
+    origin: Instant,
+    warmup_end: Instant,
+    end: Instant,
+) -> Result<TaskWindow, String> {
+    let pid = std::process::id();
+    let ns_since = |at: Instant| -> u64 {
+        u64::try_from(at.saturating_duration_since(origin).as_nanos()).unwrap_or(u64::MAX)
+    };
+    tokio::time::sleep_until(warmup_end.into()).await;
+    let observed_start = Instant::now();
+    let before = process_resources::observe_tasks(pid)
+        .map_err(|error| format!("task counters at the warmup boundary: {error}"))?;
+    tokio::time::sleep_until(end.into()).await;
+    let observed_end = Instant::now();
+    let after = process_resources::observe_tasks(pid)
+        .map_err(|error| format!("task counters at the window end: {error}"))?;
+    Ok(TaskWindow {
+        deltas: process_resources::task_deltas(&before, &after),
+        observed_start_ns: ns_since(observed_start),
+        observed_end_ns: ns_since(observed_end),
+    })
 }
 
 /// Open-loop validity gate measured at the wire rather than at the pacer.
@@ -1449,12 +1519,47 @@ fn open_loop_send_lag(records: &[LogicalRecord], rate: u64) -> (u64, u64) {
     (send_lag_max_ns, missed_slots)
 }
 
+/// The two boundary instants of `window` on the caller's clock.
+///
+/// Derived from the window rather than recomputed from `seconds` so the
+/// observation boundaries cannot drift from the boundaries every estimate is
+/// partitioned by.
+fn window_boundaries(window: &perf_measurement::HoldWindow, start: Instant) -> (Instant, Instant) {
+    (
+        start + Duration::from_nanos(window.warmup_end_ns.saturating_sub(window.start_ns)),
+        start + Duration::from_nanos(window.end_ns.saturating_sub(window.start_ns)),
+    )
+}
+
+/// Collects the boundary observation, recording any failure as a fatal error.
+///
+/// A lost or failed observation leaves the deltas absent instead of widening
+/// their span: the resource-shift comparison is only meaningful over the
+/// measured window, so no sample is better than a sample covering a different
+/// interval in each arm.
+async fn join_task_window(
+    ctx: &RunContext,
+    observed: tokio::task::JoinHandle<Result<TaskWindow, String>>,
+) -> Option<TaskWindow> {
+    let error = match observed.await {
+        Ok(Ok(window)) => return Some(window),
+        Ok(Err(error)) => error,
+        Err(error) => format!("task counter observer: {error}"),
+    };
+    ctx.fatal_errors.lock().await.push(error);
+    None
+}
+
 async fn run_load(ctx: RunContext) -> LoadOutcome {
     match ctx.opts.load {
         Load::Open { rate } => {
             let offered = rate * ctx.opts.seconds;
             let start = Instant::now() + Duration::from_millis(25);
             let start_ns = ctx.wire.ns_at(start);
+            let window = perf_measurement::HoldWindow::new(start_ns, ctx.opts.seconds);
+            let (warmup_end, end) = window_boundaries(&window, start);
+            let tasks_observed =
+                tokio::spawn(observe_task_window(ctx.wire.origin(), warmup_end, end));
             let mut tasks = tokio::task::JoinSet::new();
             for slot in 0..offered {
                 let offset_ns = perf_measurement::open_loop_offset_ns(slot, rate);
@@ -1494,17 +1599,22 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
             }
             records.sort_by_key(|record| record.logical_id);
             let (send_lag_max_ns, missed_slots) = open_loop_send_lag(&records, rate);
+            let task_window = join_task_window(&ctx, tasks_observed).await;
             LoadOutcome {
                 records,
                 send_lag_max_ns,
                 missed_slots,
-                window: perf_measurement::HoldWindow::new(start_ns, ctx.opts.seconds),
+                window,
+                task_window,
             }
         }
         Load::Closed { concurrency } => {
             let start = Instant::now();
             let start_ns = ctx.wire.ns_at(start);
-            let end = start + Duration::from_secs(ctx.opts.seconds);
+            let window = perf_measurement::HoldWindow::new(start_ns, ctx.opts.seconds);
+            let (warmup_end, end) = window_boundaries(&window, start);
+            let tasks_observed =
+                tokio::spawn(observe_task_window(ctx.wire.origin(), warmup_end, end));
             let next_id = Arc::new(AtomicU64::new(1));
             let mut workers = tokio::task::JoinSet::new();
             for _ in 0..concurrency {
@@ -1531,12 +1641,14 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
                 }
             }
             records.sort_by_key(|record| record.logical_id);
+            let task_window = join_task_window(&ctx, tasks_observed).await;
             LoadOutcome {
                 records,
                 // Closed-loop work has no schedule to fall behind.
                 send_lag_max_ns: 0,
                 missed_slots: 0,
-                window: perf_measurement::HoldWindow::new(start_ns, ctx.opts.seconds),
+                window,
+                task_window,
             }
         }
     }
@@ -1566,19 +1678,36 @@ struct Summary {
     service_time: Option<LatencySummary>,
     service_time_mean_ns: Option<f64>,
     service_time_cv: Option<f64>,
+    /// Engine calls the service estimates above are built from, and those the
+    /// window classification held out. Emitted so a reader can tell a cell with
+    /// few in-window engine calls from one whose samples were discarded.
+    service_measured_samples: u64,
+    service_excluded_samples: u64,
     send_lag_max_ns: u64,
     missed_slots: u64,
-    /// Frozen hold window on the wire clock. Emitted so the warmup discard and
-    /// the in-flight censoring below are both re-derivable from raw evidence.
+    /// Frozen hold window on the wire clock. Emitted so both discards and the
+    /// in-flight censoring below are re-derivable from raw evidence.
     hold_window_start_ns: u64,
     warmup_end_ns: u64,
     hold_window_end_ns: u64,
     /// Rows held out of every estimate above as the window's warmup prefix.
-    /// They stay in raw evidence marked `warmup`.
+    /// They stay in raw evidence with `window: "warmup"`.
     warmup_offered: u64,
     warmup_attempts: u64,
+    /// Rows held out because they opened at or after the window end: a
+    /// closed-loop worker that passed the boundary test but did not reach the
+    /// wire until the window had closed. They stay in raw evidence with
+    /// `window: "after_window"`.
+    after_window_offered: u64,
+    after_window_attempts: u64,
     censored_per_mille: f64,
-    task_deltas: Vec<process_resources::TaskDelta>,
+    /// Task counter deltas over the measured window, absent when a boundary
+    /// observation failed. The instants the two observations landed on are
+    /// emitted alongside so the covered span is auditable rather than assumed
+    /// to equal `[warmup_end_ns, hold_window_end_ns]` exactly.
+    task_deltas: Option<Vec<process_resources::TaskDelta>>,
+    task_window_start_ns: Option<u64>,
+    task_window_end_ns: Option<u64>,
     /// Transport-loss failures on the single shared wire. A subset of
     /// `fatal_errors` (still part of the fatal gate), counted separately
     /// so analysis can distinguish connection loss from harness defects.
@@ -1643,12 +1772,27 @@ impl SignedSummary {
 
 async fn run(
     opts: Opts,
-) -> Result<(Vec<LogicalRecord>, Vec<AttemptRecord>, Vec<u64>, Summary), String> {
+) -> Result<
+    (
+        Vec<LogicalRecord>,
+        Vec<AttemptRecord>,
+        Vec<ServiceSample>,
+        Summary,
+    ),
+    String,
+> {
     let data_root = tempfile::tempdir().map_err(|error| format!("temporary data root: {error}"))?;
-    let service_ns = Arc::new(StdMutex::new(Vec::new()));
+    // One origin for the engine and the wire: service samples and logical rows
+    // are only comparable to the hold window if they share a clock. Taken
+    // before the host starts so the engine, which is built first, can hold it;
+    // every timestamp is window-relative, so the extra startup offset is
+    // common to all of them and cancels.
+    let origin = Instant::now();
+    let service = Arc::new(StdMutex::new(Vec::new()));
     let engine = Arc::new(DelayEngine {
         delay: Duration::from_millis(opts.engine_delay_ms),
-        service_ns: Arc::clone(&service_ns),
+        origin,
+        service: Arc::clone(&service),
     });
     let mut limits = SynapseLimits {
         max_waiting_queries: opts.max_waiting_queries,
@@ -1692,30 +1836,26 @@ async fn run(
         opts,
     };
     warm(&ctx).await?;
-    service_ns.lock().expect("service samples").clear();
-    let task_before =
-        process_resources::observe_tasks(std::process::id()).map_err(|error| error.to_string())?;
+    service.lock().expect("service samples").clear();
     let load = run_load(ctx.clone()).await;
-    let task_after =
-        process_resources::observe_tasks(std::process::id()).map_err(|error| error.to_string())?;
-    let task_deltas = process_resources::task_deltas(&task_before, &task_after);
     let LoadOutcome {
         mut records,
         send_lag_max_ns,
         missed_slots,
         window,
+        task_window,
     } = load;
     let mut attempts = ctx.attempts.lock().await.clone();
-    // Apply the frozen window before anything is estimated: mark the warmup
-    // prefix and censor requests the window closed on.
+    // Apply the frozen window before anything is estimated: classify every row
+    // against the boundaries and censor requests the window closed on.
     window.stamp(&mut records, &mut attempts);
     let logical = records;
-    // Raw evidence keeps every row; only the post-warmup set feeds the ledger,
-    // the rates, and the percentiles.
-    let (logical_estimates, logical_warmup) =
-        perf_measurement::partition_warmup(&logical, |record| record.warmup);
-    let (attempt_estimates, attempt_warmup) =
-        perf_measurement::partition_warmup(&attempts, |attempt| attempt.warmup);
+    // Raw evidence keeps every row; only the measured set feeds the ledger, the
+    // rates, and the percentiles.
+    let (logical_estimates, logical_excluded) =
+        perf_measurement::partition_measured(&logical, |record| record.window);
+    let (attempt_estimates, attempt_excluded) =
+        perf_measurement::partition_measured(&attempts, |attempt| attempt.window);
     let fatal_errors = ctx.fatal_errors.lock().await.clone();
     let connection_loss_errors = ctx.connection_loss.load(Ordering::Relaxed);
     let ledger = perf_measurement::validate_synapse_ledgers(&logical_estimates, &attempt_estimates);
@@ -1725,9 +1865,18 @@ async fn run(
             .map(|attempt| attempt.latency_ns)
             .collect(),
     );
+    // Percentiles describe requests that reached a terminal outcome inside the
+    // window. A censored row's `latency_ns` runs to whenever it actually
+    // settled — seconds or minutes past the boundary for an overloaded cell —
+    // so admitting it would let the tail be dominated by durations the ledger
+    // simultaneously declares right-censored, and the contamination would grow
+    // with the treatment. The censoring rate reports what this excludes, so the
+    // pair stays interpretable: percentiles over answered requests, plus the
+    // fraction that went unanswered.
     let logical_latency = LatencySummary::from_unsorted(
         logical_estimates
             .iter()
+            .filter(|request| !is_censored(request.disposition))
             .map(|request| request.latency_ns)
             .collect(),
     );
@@ -1758,10 +1907,24 @@ async fn run(
             .map(|request| request.polls)
             .collect(),
     );
-    let service_samples = service_ns.lock().expect("service samples").clone();
-    let service_time = LatencySummary::from_unsorted(service_samples.clone());
-    let service_time_mean_ns = mean(&service_samples);
-    let service_time_cv = coefficient_of_variation(&service_samples);
+    // Service samples carry their own start instant, so the same window
+    // classification that partitions logical rows partitions them. Without it
+    // the engine calls made under the discarded warmup prefix — and those
+    // drained after the boundary — would enter mean S, CV, and the service
+    // percentiles that the capacity estimate is built on, while the logical and
+    // attempt ledgers excluded that very cohort.
+    let mut service_samples = service.lock().expect("service samples").clone();
+    for sample in &mut service_samples {
+        sample.window = window.classify(sample.started_ns);
+    }
+    let service_measured: Vec<u64> = service_samples
+        .iter()
+        .filter(|sample| sample.window.is_measured())
+        .map(|sample| sample.service_ns)
+        .collect();
+    let service_time = LatencySummary::from_unsorted(service_measured.clone());
+    let service_time_mean_ns = mean(&service_measured);
+    let service_time_cv = coefficient_of_variation(&service_measured);
     let censored = censored_count(&ledger);
     let censored_per_mille = if ledger.offered == 0 {
         0.0
@@ -1787,15 +1950,37 @@ async fn run(
         service_time,
         service_time_mean_ns,
         service_time_cv,
+        service_measured_samples: service_measured.len() as u64,
+        service_excluded_samples: (service_samples.len() - service_measured.len()) as u64,
         send_lag_max_ns,
         missed_slots,
         hold_window_start_ns: window.start_ns,
         warmup_end_ns: window.warmup_end_ns,
         hold_window_end_ns: window.end_ns,
-        warmup_offered: logical_warmup.len() as u64,
-        warmup_attempts: attempt_warmup.len() as u64,
+        warmup_offered: perf_measurement::count_class(
+            &logical_excluded,
+            WindowClass::Warmup,
+            |record| record.window,
+        ),
+        warmup_attempts: perf_measurement::count_class(
+            &attempt_excluded,
+            WindowClass::Warmup,
+            |attempt| attempt.window,
+        ),
+        after_window_offered: perf_measurement::count_class(
+            &logical_excluded,
+            WindowClass::AfterWindow,
+            |record| record.window,
+        ),
+        after_window_attempts: perf_measurement::count_class(
+            &attempt_excluded,
+            WindowClass::AfterWindow,
+            |attempt| attempt.window,
+        ),
         censored_per_mille,
-        task_deltas,
+        task_deltas: task_window.as_ref().map(|window| window.deltas.clone()),
+        task_window_start_ns: task_window.as_ref().map(|window| window.observed_start_ns),
+        task_window_end_ns: task_window.as_ref().map(|window| window.observed_end_ns),
         connection_loss_errors,
         fatal_errors,
     };
@@ -1828,10 +2013,23 @@ fn censored_count(ledger: &perf_measurement::SynapseLedgerSummary) -> u64 {
     ledger.timed_out.saturating_add(ledger.in_flight)
 }
 
+/// The two dispositions the censoring rate counts, and therefore the two the
+/// latency percentiles exclude. A timeout's duration is truncated at the
+/// deadline and an in-flight row's runs past the window, so both are
+/// right-censored observations rather than measured request latencies; keeping
+/// one definition means the reported rate always describes exactly the rows the
+/// percentiles omit.
+fn is_censored(disposition: LogicalDisposition) -> bool {
+    matches!(
+        disposition,
+        LogicalDisposition::TimedOut | LogicalDisposition::InFlight
+    )
+}
+
 fn emit(
     logical: &[LogicalRecord],
     attempts: &[AttemptRecord],
-    service_samples: &[u64],
+    service_samples: &[ServiceSample],
     summary: &Summary,
 ) -> Result<(), String> {
     for record in logical {
@@ -1862,7 +2060,7 @@ fn emit(
             .map_err(|error| error.to_string())?
         );
     }
-    for (index, service_ns) in service_samples.iter().enumerate() {
+    for (index, sample) in service_samples.iter().enumerate() {
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
@@ -1872,7 +2070,7 @@ fn emit(
                 "load": summary.load,
                 "seed": summary.seed,
                 "index": index,
-                "service_ns": service_ns
+                "sample": sample
             }))
             .map_err(|error| error.to_string())?
         );
@@ -2083,7 +2281,7 @@ mod tests {
             actual_send_ns: attempt_id,
             terminal_ns: attempt_id + 1,
             latency_ns: 1,
-            warmup: false,
+            window: WindowClass::Measured,
         };
         let attempts = [
             attempt(1, SynapseMethod::Batch, AttemptDisposition::Success, None),

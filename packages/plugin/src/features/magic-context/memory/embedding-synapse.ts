@@ -1312,7 +1312,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 this.now(),
             );
             if (pendingDelay !== null) {
-                await this.sleep(pendingDelay);
+                await this.delay(pendingDelay, signal);
                 continue;
             }
             if (!hasVectors) {
@@ -1419,6 +1419,50 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         });
     }
 
+    /**
+     * Waits `ms`, but stops as soon as `signal` aborts.
+     *
+     * Every delay in this provider sits between two abort checks, so an
+     * unconditional wait leaves the request pending for the whole delay after
+     * the caller has already given up. That is not academic here: a `queue_full`
+     * retry ladder can wait seconds, so an aborted embedding would hold its
+     * caller — and anything awaiting shutdown behind it — for that long.
+     *
+     * The injected `sleep` seam is preserved: it still drives the timing, and
+     * tests that supply their own `sleep` keep full control of it. The listener
+     * is removed on every exit path so a long-lived signal does not accumulate
+     * one per delay.
+     */
+    private async delay(ms: number, signal?: AbortSignal): Promise<void> {
+        if (!signal) {
+            await this.sleep(ms);
+            return;
+        }
+        let onAbort: (() => void) | undefined;
+        try {
+            await Promise.race([
+                // First in the array so the listener is registered before the
+                // sleep starts, and `aborted` is re-tested inside the executor:
+                // an abort that lands between an earlier check and the
+                // registration would otherwise be missed for the whole delay,
+                // which is the exact failure this method exists to prevent.
+                new Promise<never>((_resolve, reject) => {
+                    const fail = () =>
+                        reject(new SynapseEmbeddingError("cancelled", "Synapse request aborted"));
+                    if (signal.aborted) {
+                        fail();
+                        return;
+                    }
+                    onAbort = fail;
+                    signal.addEventListener("abort", fail, { once: true });
+                }),
+                this.sleep(ms),
+            ]);
+        } finally {
+            if (onAbort) signal.removeEventListener("abort", onAbort);
+        }
+    }
+
     private positiveOption(value: number | undefined, fallback: number): number {
         return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
     }
@@ -1506,7 +1550,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     this.now(),
                 );
                 if (pendingDelay !== null) {
-                    await this.sleep(pendingDelay);
+                    await this.delay(pendingDelay, signal);
                     continue;
                 }
             }
@@ -1592,7 +1636,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 const delay = base + random * 2 * base;
                 if (this.now() + delay >= deadlineAtMs) throw classified;
                 attempt += 1;
-                await this.sleep(delay);
+                await this.delay(delay, signal);
             }
         }
     }

@@ -194,12 +194,17 @@ struct SynapseInner {
     limits: SynapseLimits,
     state: Mutex<LaneState>,
     jobs: JobTable,
-    /// One permit: at most one native inference call runs at a time, and
-    /// waiters are served FIFO.
+    /// One permit: at most one native inference call runs at a time. Tokio's
+    /// semaphore is fair, so waiters are served in the order they register on
+    /// it. That order is what bounds a waiter's wait and rules out starvation;
+    /// it is not a claim that it matches the order the host admitted the
+    /// queries, because each admitted query registers from its own task and
+    /// concurrent requests have no wire-level total order to be faithful to.
     cpu: Arc<tokio::sync::Semaphore>,
-    /// One running query plus at most `max_waiting_queries` FIFO waiters may
-    /// use the serialized CPU lane. Batch work is bounded separately by the
-    /// job table.
+    /// One running query plus at most `max_waiting_queries` waiters may use the
+    /// serialized CPU lane. Admission is a non-blocking count: it decides
+    /// whether a query may wait at all, never where in the queue it lands.
+    /// Batch work is bounded separately by the job table.
     query_admission: Arc<tokio::sync::Semaphore>,
     /// Owns every started native call through shutdown.
     tracker: TaskTracker,
@@ -591,15 +596,24 @@ impl SynapseComponent {
                 // verdict land before this backstop reports the generic
                 // awaiting-result expiry.
                 tokio::task::yield_now().await;
-                match rx.try_recv() {
-                    Ok(result) => result,
-                    Err(_) => {
-                        return app_error(
-                            "timeout",
-                            "the query deadline expired awaiting the result",
-                        )
+                // Only the queued-timeout verdict is consumed, and only to
+                // attribute the expiry. Any other value that happens to land
+                // inside the yield interval is discarded rather than returned:
+                // a successful vector from an engine call that finished late is
+                // still a result produced after the caller's deadline, and
+                // answering the request with it would break the very budget
+                // this arm exists to enforce. The yield is an unbounded
+                // scheduling interval under saturation, which is exactly the
+                // tail condition where a late completion is most likely.
+                return match rx.try_recv() {
+                    Ok(Err(QueryFault::Timeout)) => {
+                        app_error("timeout", "the query deadline expired while queued")
                     }
-                }
+                    _ => app_error(
+                        "timeout",
+                        "the query deadline expired awaiting the result",
+                    ),
+                };
             }
         };
         match result {
