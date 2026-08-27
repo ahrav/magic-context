@@ -31,6 +31,7 @@ import {
     type ChunkBlock,
 } from "../../../plugin/src/hooks/magic-context/read-session-formatting";
 import { cleanUserText } from "../../../plugin/src/hooks/magic-context/read-session-chunk";
+import { isSystemDirective } from "../../../plugin/src/shared/system-directive";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
 import { ballastProse } from "../ballast";
@@ -635,21 +636,27 @@ function containsCompleteValue(content: string, value: string): boolean {
 }
 
 /**
- * One authored message as the historian will actually receive it. Production
- * runs every text part through `normalizeText`, and every USER part through
- * `cleanUserText` first, before the chunk builder ever sees it (see
- * read-session-chunk.ts). Both are applied here so the lint's two consumers —
- * the rendered byte mass and the authored-evidence search — agree with the
- * runtime rather than with the raw JSON.
+ * One authored message as the historian will actually receive it, or `""` when
+ * production discards it outright.
  *
- * This is why the evidence rules cannot search the raw strings: text a
- * `<system-reminder>` block or a Magic Context directive carries is stripped
- * before the historian sees it, so a predicate or gold answer found only there
- * is not authored evidence at all — it would make recall failures inevitable or
- * an absence check vacuous.
+ * Production runs every text part through `normalizeText`, and every USER part
+ * through `cleanUserText` first; then it drops a user message whose cleaned text
+ * is empty or is a Magic Context system directive, since `hasMeaningfulUserText`
+ * rejects both and an authored eval transcript carries no tool parts to rescue it
+ * (read-session-chunk.ts). All three rules are applied here so the lint's two
+ * consumers — the rendered byte mass and the authored-evidence search — agree
+ * with the runtime rather than with the raw JSON.
+ *
+ * This is why the evidence rules cannot search the raw strings: text that a
+ * `<system-reminder>` block carries, or that a directive-only turn carries, is
+ * gone before the historian sees it, so a predicate or gold answer found only
+ * there is not authored evidence at all — it would make recall failures
+ * inevitable or an absence check vacuous.
  */
 function messageAsHistorianSeesIt(role: "user" | "assistant", text: string): string {
-    return normalizeText(role === "user" ? cleanUserText(text) : text);
+    if (role !== "user") return normalizeText(text);
+    const cleaned = cleanUserText(text);
+    return isSystemDirective(cleaned) ? "" : normalizeText(cleaned);
 }
 
 /**
@@ -704,8 +711,15 @@ export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): strin
     // suffix. Hard-coding empty `commitHashes` and raw text produced different
     // bytes — and therefore a different token count — from what the historian
     // receives, which near the budget decides whether the live chunk splits.
-    const block = (role: "user" | "assistant", text: string, ordinal: number): ChunkBlock => {
-        const compacted = compactTextForSummary(messageAsHistorianSeesIt(role, text), role);
+    const block = (role: "user" | "assistant", text: string, ordinal: number): ChunkBlock | null => {
+        const seen = messageAsHistorianSeesIt(role, text);
+        // Production `continue`s past a message with no remaining text rather than
+        // emitting an empty block, so emitting one here would put bytes in the
+        // measurement that the historian never receives. Ordinals are derived from
+        // the turn index, so skipping one does not renumber the rest.
+        if (!seen) return null;
+        const compacted = compactTextForSummary(seen, role);
+        if (!compacted.text) return null;
         return {
             role: compactRole(role),
             startOrdinal: ordinal,
@@ -718,8 +732,10 @@ export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): strin
     };
     const blocks: ChunkBlock[] = [];
     scenario.transcript.turns.forEach((turn, index) => {
-        blocks.push(block("user", ballast ? `${turn.user} ${ballast}` : turn.user, index * 2 + 1));
-        blocks.push(block("assistant", turn.assistant, index * 2 + 2));
+        const user = block("user", ballast ? `${turn.user} ${ballast}` : turn.user, index * 2 + 1);
+        if (user) blocks.push(user);
+        const assistant = block("assistant", turn.assistant, index * 2 + 2);
+        if (assistant) blocks.push(assistant);
     });
     return blocks.map(formatBlock);
 }
@@ -1028,16 +1044,55 @@ export function parseManifest(raw: unknown, label = "manifest"): ReleaseManifest
 }
 
 /**
+ * The two facts a release states about its own errata: which release it is, and
+ * which scenario ids it retires. Nothing here is policy-versioned.
+ *
+ * Separate from `ReleaseManifest` so a HISTORICAL predecessor can be read for the
+ * inheritance check after a deliberate privacy or sanitizer bump. `parseManifest`
+ * pins those constants to the ones the lane implements, which is right for a
+ * release being published but makes a formerly valid predecessor unparseable the
+ * moment either constant rotates — and that is exactly when its tombstones still
+ * need to be carried forward. A current `ReleaseManifest` satisfies this shape,
+ * so the same check serves both.
+ */
+export interface ReleaseLineage {
+    releaseVersion: string;
+    tombstones: readonly string[];
+}
+
+/**
+ * Read the lineage facts out of any manifest document, current or historical.
+ *
+ * Validates the manifest schema, the release version, and the tombstone ids —
+ * the values this check actually relies on — and deliberately ignores the tuple
+ * and approvals. A predecessor is being consulted for what it retired, not
+ * re-certified: its approvals were bound to its own corpus under the policy of
+ * its day, and re-imposing today's policy on it would only make the inheritance
+ * gate unusable across the rotation it is most needed for.
+ */
+export function parseReleaseLineage(raw: unknown, label = "lineage"): ReleaseLineage {
+    const root = record(raw, label);
+    if (root.schema !== MANIFEST_SCHEMA) fail(`${label}.schema: version-invalid`);
+    const releaseVersion = string(root.releaseVersion, `${label}.releaseVersion`);
+    if (!RELEASE_VERSION_RE.test(releaseVersion)) fail(`${label}.releaseVersion: version-invalid`);
+    const tombstones = array(root.tombstones, `${label}.tombstones`).map((entry, index) =>
+        staticId(entry, `${label}.tombstones[${index}]`, SCENARIO_ID_RE),
+    );
+    unique(tombstones, `${label}.tombstones`);
+    return { releaseVersion, tombstones };
+}
+
+/**
  * Enforce the errata invariant across a release boundary: a later release
  * carries forward every tombstone its predecessor declared.
  *
- * Separate from `parseManifest` because this is a relation between two
- * manifests, not a property of one document. `parseManifest` can prove a
- * release's approvals are bound to exactly the corpus and tombstone set they
- * signed, which stops a prior release's approvals being REPLAYED on a manifest
- * that drops a tombstone — but a release that drops one and collects fresh
- * approvals is internally consistent, and would resurrect a scenario already
- * known to be wrong. Only the predecessor can rule that out.
+ * Separate from `parseManifest` because this is a relation between two releases,
+ * not a property of one document. `parseManifest` can prove a release's
+ * approvals are bound to exactly the corpus and tombstone set they signed, which
+ * stops a prior release's approvals being REPLAYED on a manifest that drops a
+ * tombstone — but a release that drops one and collects fresh approvals is
+ * internally consistent, and would resurrect a scenario already known to be
+ * wrong. Only the predecessor can rule that out.
  *
  * Version order is checked too, so the arguments cannot be supplied backwards
  * and quietly pass: "later" is what makes the inheritance direction meaningful.
@@ -1046,10 +1101,10 @@ export function parseManifest(raw: unknown, label = "manifest"): ReleaseManifest
  * The stronger alternative is an append-only tombstone registry the promote step
  * reads instead of the previous manifest; this check is what the contract can
  * enforce with no store, and the two are compatible — a registry would supply
- * the `previous` set.
+ * the `previous` lineage.
  */
-export function assertReleaseSuccession(previous: ReleaseManifest, next: ReleaseManifest): void {
-    const versionOf = (release: ReleaseManifest): number => Number(release.releaseVersion.slice(1));
+export function assertReleaseSuccession(previous: ReleaseLineage, next: ReleaseLineage): void {
+    const versionOf = (release: ReleaseLineage): number => Number(release.releaseVersion.slice(1));
     if (versionOf(next) <= versionOf(previous)) {
         fail("releaseSuccession.releaseVersion: not-later-than-previous");
     }
@@ -1060,5 +1115,25 @@ export function assertReleaseSuccession(previous: ReleaseManifest, next: Release
         // is a diagnostic the operator can act on rather than an echo of the
         // material under review.
         fail(`releaseSuccession.tombstones: dropped-${dropped.join(",")}`);
+    }
+}
+
+/**
+ * A release must not publish and retire the same scenario.
+ *
+ * The corpus and the tombstone set arrive from opposite directions —
+ * `buildReleaseTuple` sees only scenarios, `parseManifest` sees only ids — so
+ * neither can catch an id that appears in both, and a release would ship a
+ * scenario it simultaneously declares known-wrong. Checked against the scenarios
+ * the tuple was built from, since that is the set the fingerprint covers.
+ */
+export function assertTombstonesRetired(
+    scenarios: readonly HistorianEvalScenario[],
+    release: ReleaseLineage,
+): void {
+    const retired = new Set(release.tombstones);
+    const published = scenarios.map((scenario) => scenario.id).filter((id) => retired.has(id)).sort();
+    if (published.length > 0) {
+        fail(`releaseTombstones.scenarios: still-published-${published.join(",")}`);
     }
 }

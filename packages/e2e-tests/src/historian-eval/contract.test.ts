@@ -3,7 +3,10 @@ import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
+    SCENARIO_SCHEMA,
     assertReleaseSuccession,
+    assertTombstonesRetired,
+    parseReleaseLineage,
     MAX_EXPECTATION_ENTRIES,
     MAX_PROBE_CHOICES,
     MAX_TRANSCRIPT_TURNS,
@@ -535,6 +538,23 @@ describe("lintScenario", () => {
         );
     });
 
+    test("a directive-only turn is not authored evidence and renders no block", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // Production drops a user message whose cleaned text is a Magic Context
+        // directive, so evidence there is never seen and the block never exists.
+        turns[1].user = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT] Use the in-process LRU cache.";
+        turns[1].assistant = "Understood; recorded that decision.";
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toContain(
+            "hse-auth-rejected-redis.gold.expectedClaims.exp-lru-cache.sourceTurnRange: predicate-not-authored",
+        );
+        // One block short of two-per-turn, and none of them carries the directive.
+        const blocks = renderedTranscriptBlocks(scenario);
+        expect(blocks).toHaveLength(scenario.transcript.turns.length * 2 - 1);
+        expect(blocks.some((block) => block.includes("SYSTEM DIRECTIVE"))).toBe(false);
+    });
+
     test("the same text outside a system reminder is authored evidence", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
@@ -838,6 +858,65 @@ describe("release tuple and manifest", () => {
         // version order is checked rather than silently passing.
         expect(() => assertReleaseSuccession(carriesForward, v1)).toThrow(/not-later-than-previous/);
         expect(() => assertReleaseSuccession(v1, v1)).toThrow(/not-later-than-previous/);
+    });
+
+    test("a historical predecessor stays readable across a policy rotation", () => {
+        // parseManifest pins the privacy/sanitizer constants, which is right for a
+        // release being published but makes a formerly valid predecessor
+        // unparseable the moment either rotates — exactly when its tombstones
+        // still have to be carried forward.
+        const rotated = {
+            schema: MANIFEST_SCHEMA,
+            releaseVersion: "v1",
+            releaseTuple: {
+                corpusFingerprint: "a".repeat(64),
+                scenarioSchemaVersion: SCENARIO_SCHEMA,
+                privacyPolicyVersion: "retired-policy-v0",
+                sanitizerVersion: "retired-sanitizer-v0",
+            },
+            approvals: {
+                privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint: "b".repeat(64) },
+                goldIntent: { kind: "gold-intent", approver: "operator-b", releaseFingerprint: "b".repeat(64) },
+            },
+            tombstones: ["hse-known-wrong"],
+        };
+        expect(() => parseManifest(rotated)).toThrow(/privacyPolicyVersion: version-invalid/);
+
+        const previous = parseReleaseLineage(rotated);
+        expect(previous.tombstones).toEqual(["hse-known-wrong"]);
+        // And the gate still works from it.
+        expect(() =>
+            assertReleaseSuccession(previous, { releaseVersion: "v2", tombstones: ["hse-known-wrong"] }),
+        ).not.toThrow();
+        expect(() => assertReleaseSuccession(previous, { releaseVersion: "v2", tombstones: [] })).toThrow(
+            /dropped-hse-known-wrong/,
+        );
+    });
+
+    test("lineage parsing still rejects a malformed predecessor", () => {
+        // Ignoring the tuple and approvals must not mean trusting anything: a bad
+        // version or id would weaken the gate silently.
+        expect(() => parseReleaseLineage({ schema: "wrong", releaseVersion: "v1", tombstones: [] })).toThrow(
+            /schema: version-invalid/,
+        );
+        expect(() => parseReleaseLineage({ schema: MANIFEST_SCHEMA, releaseVersion: "1", tombstones: [] })).toThrow(
+            /releaseVersion: version-invalid/,
+        );
+        expect(() =>
+            parseReleaseLineage({ schema: MANIFEST_SCHEMA, releaseVersion: "v1", tombstones: ["nope"] }),
+        ).toThrow(/tombstones\[0\]: id-invalid/);
+    });
+
+    test("a release cannot publish and retire the same scenario", () => {
+        const scenario = validScenario();
+        expect(() =>
+            assertTombstonesRetired([scenario], { releaseVersion: "v2", tombstones: [scenario.id] }),
+        ).toThrow(/releaseTombstones\.scenarios: still-published-hse-auth-rejected-redis/);
+        // The corpus and the tombstone set arrive from opposite directions, so
+        // neither buildReleaseTuple nor parseManifest can see this on its own.
+        expect(() =>
+            assertTombstonesRetired([scenario], { releaseVersion: "v2", tombstones: ["hse-retired-elsewhere"] }),
+        ).not.toThrow();
     });
 
     test("privacy and sanitizer versions must be the ones the lane implements", () => {        const tuple = buildReleaseTuple([validScenario()]);
