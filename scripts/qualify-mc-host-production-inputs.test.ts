@@ -17,6 +17,8 @@ import { fileURLToPath } from "node:url";
 import { buildContract } from "./generate-mc-host-release-manifest";
 import {
     assertPinsMatchContract,
+    FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS,
+    RUNTIME_IDENTITY,
     buildCredentialsDoc,
     canonicalCredentialRowEncoding,
     checkOracleEvidence,
@@ -580,6 +582,11 @@ describe("immutable input fail-closed rules", () => {
             // the list would never match without normalizing first.
             "[::1]",
             "127.0.0.1",
+            // The whole 127.0.0.0/8 block is loopback, not only `.1`.
+            "127.0.0.2",
+            // `URL` canonicalizes an IPv4-mapped literal to `[::ffff:7f00:1]`,
+            // which equals neither entry in the list it is meant to match.
+            "[::ffff:127.0.0.1]",
         ]) {
             const root = freshRoot();
             installProductionManifest(root, (manifest) => {
@@ -1258,6 +1265,46 @@ describe("immutable input fail-closed rules", () => {
                         'ort = { fakeversion = "=2.0.0-rc.13", version = "=2.0.0-rc.12",',
                     ),
                 /pinned ort identity does not match/,
+            ],
+            [
+                // A key inside an inline table is a TOML key, so it may be quoted.
+                // Cargo reports the `cuda` feature from `"features"` exactly as it
+                // does from the bare spelling, while a pattern over the bare key
+                // missed both the presence test and the extraction.
+                (cargo) =>
+                    cargo.replace(
+                        /^ort = \{ version = "=2\.0\.0-rc\.13", default-features = false,.*$/m,
+                        'ort = { version = "=2.0.0-rc.13", default-features = false, "features" = ["load-dynamic", "cuda"] }',
+                    ),
+                /ort feature cuda .* is outside the qualified closure/,
+            ],
+            [
+                // The literal-string spelling of the same key.
+                (cargo) =>
+                    cargo.replace(
+                        /^ort = \{ version = "=2\.0\.0-rc\.13", default-features = false,.*$/m,
+                        "ort = { version = \"=2.0.0-rc.13\", default-features = false, 'features' = [\"load-dynamic\", \"tensorrt\"] }",
+                    ),
+                /ort feature tensorrt .* is outside the qualified closure/,
+            ],
+            [
+                // An escaped quoted key decodes to the same name and no pattern over
+                // literal spellings can represent it, so the entry is refused rather
+                // than examined with the key read as absent.
+                (cargo) =>
+                    cargo.replace(
+                        /^ort = \{ version = "=2\.0\.0-rc\.13", default-features = false,.*$/m,
+                        'ort = { version = "=2.0.0-rc.13", default-features = false, "featu\\u0072es" = ["cuda"] }',
+                    ),
+                /must be declared exactly once/,
+            ],
+            [
+                // A quoted `package` conceals a rename the same way, so the renamed
+                // declaration would be filed under its key and leave the base entry
+                // as the only match.
+                (cargo) =>
+                    `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\nort_cuda = { "package" = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
             ],
             [
                 // Same form with the whitespace TOML permits around the dots.
@@ -2334,6 +2381,58 @@ describe("qualifying-runtime binding", () => {
             expect(() => assertPinnedQualifyingRuntime(running)).toThrow(
                 /byte verification must run under the pinned Bun/,
             );
+        }
+    });
+});
+
+describe("resolved runtime feature closure", () => {
+    test("the graph Cargo resolves carries no forbidden capability", () => {
+        // The manifest scans bound what `crates/mc-host/Cargo.toml` declares. They
+        // cannot bound what Cargo *selects*: features are unified per package across
+        // the whole normal dependency graph, so any node — another workspace member,
+        // a path dependency, or a registry crate whose manifest is not in this
+        // repository — can turn on an accelerator on the same ORT node while the leaf
+        // manifest still reads as CPU-only. Only the resolver knows, which is why
+        // this assertion lives here rather than in the portable drift check: it needs
+        // a resolvable workspace and a toolchain, exactly as the `cargo tree`
+        // dependency-boundary test does.
+        const metadata = spawnSync(
+            "cargo",
+            ["metadata", "--format-version", "1"],
+            { cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+        );
+        expect(metadata.status).toBe(0);
+        const resolved = new Map<string, string[]>();
+        for (const node of JSON.parse(metadata.stdout).resolve.nodes as {
+            id: string;
+            features: string[];
+        }[]) {
+            // Ids are `<source>#<name>@<version>`, or `<source>#<version>` when the
+            // path segment already names the package.
+            const tail = node.id.split("#").pop() ?? "";
+            const name = tail.includes("@") ? tail.split("@")[0] : tail;
+            if (name !== undefined) resolved.set(name, node.features);
+        }
+        // Not "no forbidden feature appears" alone: the published closure is an exact
+        // claim, so anything the resolver adds to it — forbidden or merely undeclared
+        // — contradicts the lock and has to fail.
+        expect(resolved.get("ort")).toEqual([
+            ...RUNTIME_IDENTITY.rust_crates.ort_features,
+        ]);
+        for (const crate of ["ort", "ort-sys", "fastembed"]) {
+            for (const feature of resolved.get(crate) ?? []) {
+                const forbidden = FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS.find(
+                    (hint) => feature.toLowerCase().includes(hint),
+                );
+                expect(
+                    forbidden === undefined ? null : `${crate}/${feature}`,
+                ).toBeNull();
+            }
+        }
+        // `ort-sys` is the crate that would link or download a runtime, so the
+        // opt-out the lock publishes has to be active in the resolved set too.
+        for (const feature of RUNTIME_IDENTITY.rust_crates.ort_sys_features) {
+            expect(resolved.get("ort-sys")).toContain(feature);
         }
     });
 });

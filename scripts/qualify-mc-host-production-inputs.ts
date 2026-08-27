@@ -1001,6 +1001,33 @@ const RESERVED_SOURCE_HOST_SUFFIXES = [
     "::1",
 ];
 
+/** The IPv4 loopback block, which is reserved in full rather than at `.1` alone. */
+const LOOPBACK_IPV4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+/**
+ * The reserved-host comparison form of a URL hostname: lowercased, IPv6 brackets
+ * stripped, and an IPv4-mapped IPv6 literal reduced to the IPv4 address it carries.
+ *
+ * `URL.hostname` brackets an IPv6 literal, so a bare `::1` entry would never match
+ * without stripping. It also canonicalizes `[::ffff:127.0.0.1]` to
+ * `[::ffff:7f00:1]` — loopback written in a form that equals neither `127.0.0.1`
+ * nor `::1` — so the mapped prefix is reduced to dotted quad before comparison.
+ * Decimal and octal spellings need no help here: the parser already normalizes
+ * `2130706433` and `0177.0.0.1` to `127.0.0.1`.
+ */
+function reservedHostForm(hostname: string): string {
+    const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+    if (hex !== null) {
+        const high = Number.parseInt(hex[1] ?? "", 16);
+        const low = Number.parseInt(hex[2] ?? "", 16);
+        return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
+    }
+    // The dotted-quad spelling of the same mapping, which `URL` preserves as written.
+    const dotted = /^::ffff:((?:\d{1,3}\.){3}\d{1,3})$/.exec(host);
+    return dotted?.[1] ?? host;
+}
+
 /** The decoded path segments of a source URL, refusing a malformed escape. */
 function sourcePathSegments(url: URL): string[] {
     return url.pathname.split("/").map((raw) => {
@@ -1326,12 +1353,13 @@ function validateQualifiedArtifact(
     // lock naming one records provenance that cannot be acted on. Allowed in
     // `test-fixture` mode, which is what the committed fixtures use.
     if (mode === "production") {
-        // `URL.hostname` brackets an IPv6 literal, so `[::1]` would never equal the
-        // `::1` entry in the list it is meant to match.
-        const host = sourceUrl.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-        const reserved = RESERVED_SOURCE_HOST_SUFFIXES.find(
-            (suffix) => host === suffix || host.endsWith(`.${suffix}`),
-        );
+        const host = reservedHostForm(sourceUrl.hostname);
+        const reserved =
+            RESERVED_SOURCE_HOST_SUFFIXES.find(
+                (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+            ) ??
+            // The whole 127.0.0.0/8 block is loopback, not only `127.0.0.1`.
+            (LOOPBACK_IPV4.test(host) ? "127.0.0.0/8" : undefined);
         if (reserved !== undefined) {
             fail(
                 `inputs.${key}: source host ${host} is reserved (${reserved}) and can never serve a production artifact`,
@@ -1758,8 +1786,16 @@ function verifyArtifactBytes(
  * substrings of each declared feature name so a renamed or versioned spelling
  * (`download-binaries`, `fetch-models`, `cuda-12`) still lands, since the point
  * is to deny a class of behavior rather than an exact feature list.
+ *
+ * Exported because the same denylist has to be applied to the *resolved* feature
+ * graph, which this scan cannot see. Cargo unifies the features selected for a
+ * package anywhere in the graph, including from a manifest that is not in this
+ * repository at all, so no reading of `crates/mc-host/Cargo.toml` can bound the
+ * effective closure — only `cargo metadata` can, and it needs a resolvable
+ * workspace and a toolchain the portable drift check must not require. The
+ * release-script test suite runs where both exist and asserts it there.
  */
-const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
+export const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
     "download",
     "fetch",
     "hf-hub",
@@ -1979,8 +2015,26 @@ function escapeRegex(literal: string): string {
  * boundary — three of them did, one did not, and that is the bug this removes.
  */
 function tomlKeyPattern(key: string, value: string): RegExp {
-    return new RegExp(`(?:^|[\\s,{])${escapeRegex(key)}\\s*=\\s*${value}`);
+    const bare = escapeRegex(key);
+    // A key inside an inline table is a TOML key like any other, so it may be
+    // quoted: Cargo reads `"features" = ["cuda"]` exactly as it reads the bare
+    // spelling. Matching only the bare one meant both the presence test and the
+    // extraction missed the array, so its accelerator was never examined — and a
+    // quoted `"package"` concealed a rename the same way.
+    const spelling = `(?:${bare}|"${bare}"|'${bare}')`;
+    return new RegExp(`(?:^|[\\s,{])${spelling}\\s*=\\s*${value}`);
 }
+
+/**
+ * A quoted key carrying a backslash escape, which is the one spelling
+ * `tomlKeyPattern` cannot represent.
+ *
+ * `"featu\u0072es"` is `features` to Cargo, and a pattern over literal spellings
+ * cannot decode it, so an entry holding one is refused rather than examined with the
+ * key treated as absent. The refusal direction is what matters: a hidden `features`
+ * array or `package` rename is exactly the declaration that must not pass.
+ */
+const ESCAPED_TOML_KEY = /(?:^|[\s,{])"[^"]*\\[^"]*"\s*=/;
 
 /**
  * The net brace and bracket nesting a line opens or closes, ignoring quoted text.
@@ -2304,8 +2358,11 @@ function dependencyDeclarations(
 }
 
 /** The crate a declaration resolves to: `package = "..."` when renamed, else the
- *  key. `null` when a `package` value is present but unreadable. */
+ *  key. `null` when a `package` value is present but unreadable, or when the entry
+ *  spells any key in a way this scan cannot resolve — a concealed `package` is
+ *  indistinguishable from an absent one, so an unreadable key spelling refuses. */
 function resolveRenamedCrate(key: string, entry: string): string | null {
+    if (ESCAPED_TOML_KEY.test(entry)) return null;
     if (!tomlKeyPattern("package", "").test(entry)) return key;
     const renamed = tomlKeyPattern("package", `("[^"\\\\]*"|'[^']*')`).exec(entry);
     return resolveTomlName(renamed?.[1] ?? "");
