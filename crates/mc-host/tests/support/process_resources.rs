@@ -170,9 +170,6 @@ pub fn task_deltas(
         .values()
         .map(|end| {
             let start = before.get(&end.tid);
-            let delta = |value: u64, prior: fn(&TaskCounters) -> u64| {
-                value.saturating_sub(start.map(prior).unwrap_or(0))
-            };
             TaskDelta {
                 tid: end.tid,
                 name: end.name.clone(),
@@ -181,14 +178,18 @@ pub fn task_deltas(
                 } else {
                     "generator"
                 },
-                utime_ticks: delta(end.utime_ticks, |task| task.utime_ticks),
-                stime_ticks: delta(end.stime_ticks, |task| task.stime_ticks),
-                voluntary_context_switches: delta(end.voluntary_context_switches, |task| {
-                    task.voluntary_context_switches
-                }),
-                nonvoluntary_context_switches: delta(end.nonvoluntary_context_switches, |task| {
-                    task.nonvoluntary_context_switches
-                }),
+                utime_ticks: end
+                    .utime_ticks
+                    .saturating_sub(start.map_or(0, |task| task.utime_ticks)),
+                stime_ticks: end
+                    .stime_ticks
+                    .saturating_sub(start.map_or(0, |task| task.stime_ticks)),
+                voluntary_context_switches: end
+                    .voluntary_context_switches
+                    .saturating_sub(start.map_or(0, |task| task.voluntary_context_switches)),
+                nonvoluntary_context_switches: end
+                    .nonvoluntary_context_switches
+                    .saturating_sub(start.map_or(0, |task| task.nonvoluntary_context_switches)),
             }
         })
         .collect()

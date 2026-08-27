@@ -36,6 +36,17 @@ async fn yield_until(predicate: impl Fn() -> bool) {
     panic!("condition did not become true");
 }
 
+/// Limits admitting `max_waiting_queries` waiters. Waiting queries and the
+/// queued-batch budget share one scratch pool; the default 64 MiB queued
+/// budget leaves no waiter headroom, so it is shrunk to 8 MiB.
+fn waiter_limits(max_waiting_queries: usize) -> SynapseLimits {
+    SynapseLimits {
+        max_waiting_queries,
+        max_queued_request_bytes: 8 * 1024 * 1024,
+        ..SynapseLimits::default()
+    }
+}
+
 fn keep_paused_clock_manual() -> (
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     tokio::task::JoinHandle<()>,
@@ -55,12 +66,8 @@ async fn bounded_query_waiters_are_fifo_and_reject_bound_plus_one() {
     let engine = DeterministicEngine::new();
     let gate = engine.block_calls();
     let limits = SynapseLimits {
-        max_waiting_queries: 2,
         query_retry_after_ms: 73,
-        // Waiting queries and the queued-batch budget share one scratch
-        // pool; the default 64 MiB queued budget leaves no waiter headroom.
-        max_queued_request_bytes: 8 * 1024 * 1024,
-        ..SynapseLimits::default()
+        ..waiter_limits(2)
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
     let (clock_running, clock_task) = keep_paused_clock_manual();
@@ -98,11 +105,7 @@ async fn bounded_query_waiters_are_fifo_and_reject_bound_plus_one() {
 async fn expired_waiter_releases_its_slot_without_engine_work() {
     let engine = DeterministicEngine::new();
     let gate = engine.block_calls();
-    let limits = SynapseLimits {
-        max_waiting_queries: 1,
-        max_queued_request_bytes: 8 * 1024 * 1024,
-        ..SynapseLimits::default()
-    };
+    let limits = waiter_limits(1);
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
     let (clock_running, clock_task) = keep_paused_clock_manual();
     let lane = test_lane();
@@ -150,11 +153,7 @@ async fn expired_waiter_releases_its_slot_without_engine_work() {
 async fn mixed_batch_and_query_waiters_share_fifo_cpu_without_starvation() {
     let engine = DeterministicEngine::new();
     let gate = engine.block_calls();
-    let limits = SynapseLimits {
-        max_waiting_queries: 2,
-        max_queued_request_bytes: 8 * 1024 * 1024,
-        ..SynapseLimits::default()
-    };
+    let limits = waiter_limits(2);
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
     let (clock_running, clock_task) = keep_paused_clock_manual();
     let lane = test_lane();
@@ -204,11 +203,7 @@ async fn mixed_batch_and_query_waiters_share_fifo_cpu_without_starvation() {
 async fn shutdown_cancels_waiters_but_drains_started_query() {
     let engine = DeterministicEngine::new();
     let gate = engine.block_calls();
-    let limits = SynapseLimits {
-        max_waiting_queries: 1,
-        max_queued_request_bytes: 8 * 1024 * 1024,
-        ..SynapseLimits::default()
-    };
+    let limits = waiter_limits(1);
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
     let (clock_running, clock_task) = keep_paused_clock_manual();
     let lane = test_lane();
@@ -258,11 +253,7 @@ async fn shutdown_cancels_waiters_but_drains_started_query() {
 async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
     let engine = DeterministicEngine::new();
     let gate = engine.block_calls();
-    let limits = SynapseLimits {
-        max_waiting_queries: 1,
-        max_queued_request_bytes: 8 * 1024 * 1024,
-        ..SynapseLimits::default()
-    };
+    let limits = waiter_limits(1);
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
     let (clock_running, clock_task) = keep_paused_clock_manual();
     let lane = test_lane();
@@ -338,11 +329,6 @@ async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
 async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
     let engine = DeterministicEngine::new();
     let gate = engine.block_calls();
-    let limits_for = |waiting: usize| SynapseLimits {
-        max_waiting_queries: waiting,
-        max_queued_request_bytes: 8 * 1024 * 1024,
-        ..SynapseLimits::default()
-    };
     // The feasible boundary under the startup scratch formula, pinned so a
     // formula or pool change must recompute it deliberately:
     //   reservable = SCRATCH_RESERVED_BYTES (176,226,560)
@@ -356,13 +342,13 @@ async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
     mc_host::synapse::SynapseComponent::ready_with_engine(
         test_lane(),
         engine.clone(),
-        limits_for(BOUNDARY),
+        waiter_limits(BOUNDARY),
     )
     .expect("the boundary configuration is feasible");
     let error = match mc_host::synapse::SynapseComponent::ready_with_engine(
         test_lane(),
         engine.clone(),
-        limits_for(BOUNDARY + 1),
+        waiter_limits(BOUNDARY + 1),
     ) {
         Ok(_) => panic!("one waiter past the boundary must fail validation"),
         Err(error) => error,
@@ -371,7 +357,7 @@ async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
         .to_string()
         .contains("query admission capacity requires"));
 
-    let host = SynapseHost::start(ready_component(engine.clone(), limits_for(BOUNDARY))).await;
+    let host = SynapseHost::start(ready_component(engine.clone(), waiter_limits(BOUNDARY))).await;
     let (clock_running, clock_task) = keep_paused_clock_manual();
     let lane = test_lane();
     let text = "x".repeat(lane.max_text_bytes);

@@ -548,6 +548,18 @@ impl SynapseVariant {
         }
     }
 
+    /// CLI spelling of the variant; the inverse of `parse`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::HygieneOnly => "hygiene-only",
+            Self::A => "a",
+            Self::B => "b",
+            Self::C => "c",
+            Self::APlusC => "a+c",
+        }
+    }
+
     pub fn needs_waiting_queries(self) -> bool {
         matches!(self, Self::A | Self::APlusC)
     }

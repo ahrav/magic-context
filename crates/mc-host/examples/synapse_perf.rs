@@ -181,13 +181,13 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
     if variant.needs_waiting_queries() && max_waiting_queries == 0 {
         return Err(format!(
             "variant {} requires --max-waiting-queries greater than zero",
-            variant_name(variant)
+            variant.as_str()
         ));
     }
     if !variant.needs_waiting_queries() && max_waiting_queries != 0 {
         return Err(format!(
             "variant {} requires --max-waiting-queries 0",
-            variant_name(variant)
+            variant.as_str()
         ));
     }
     if let Load::Open { rate, .. } = load {
@@ -206,17 +206,6 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
         seed,
         transport_floor_ns,
     })
-}
-
-fn variant_name(variant: SynapseVariant) -> &'static str {
-    match variant {
-        SynapseVariant::Baseline => "baseline",
-        SynapseVariant::HygieneOnly => "hygiene-only",
-        SynapseVariant::A => "a",
-        SynapseVariant::B => "b",
-        SynapseVariant::C => "c",
-        SynapseVariant::APlusC => "a+c",
-    }
 }
 
 fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
@@ -713,36 +702,6 @@ fn terminal_record(
     }
 }
 
-/// One-resubmission budget for `module_restarted`, mirroring the plugin
-/// policy (embedding-synapse.ts): a host restart evicts every in-flight
-/// job, the first `module_restarted` on a logical request resubmits the
-/// batch once, and a second is terminal for that logical request.
-#[derive(Debug)]
-struct RestartBudget {
-    used: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestartAction {
-    Resubmit,
-    Terminal,
-}
-
-impl RestartBudget {
-    fn new() -> Self {
-        Self { used: false }
-    }
-
-    fn on_module_restarted(&mut self) -> RestartAction {
-        if self.used {
-            RestartAction::Terminal
-        } else {
-            self.used = true;
-            RestartAction::Resubmit
-        }
-    }
-}
-
 /// True when a harness error is a lost shared wire rather than a harness
 /// defect: reader-loop frame failures (early EOF), send failures on the
 /// write half, and callers that observed the reader's stored error. The
@@ -924,7 +883,11 @@ async fn execute_batch(
     let mut first_send = None;
     let mut batch_attempts = 0u64;
     let mut polls = 0u64;
-    let mut restart_budget = RestartBudget::new();
+    // One-resubmission budget for `module_restarted`, mirroring the plugin
+    // policy (embedding-synapse.ts): a host restart evicts every in-flight
+    // job, the first `module_restarted` on a logical request resubmits the
+    // batch once, and a second is terminal for that logical request.
+    let mut restart_used = false;
     // The outer loop reruns submit-then-poll when a host restart evicts the
     // job: the resubmitted batch keeps the same logical request, deadline,
     // and accumulating attempt/poll counters. Submit retries are gated on a
@@ -974,23 +937,21 @@ async fn execute_batch(
             }
             let code = json["code"].as_str().unwrap_or("unparsable");
             if code == "module_restarted" {
-                match restart_budget.on_module_restarted() {
+                if !std::mem::replace(&mut restart_used, true) {
                     // A resubmission is a new submission: restart the outer
                     // loop so the per-submission retry budget resets.
-                    RestartAction::Resubmit => continue 'logical,
-                    RestartAction::Terminal => {
-                        return Ok(terminal_record(
-                            logical_id,
-                            scheduled_start_ns,
-                            first_send.expect("set above"),
-                            reply.received_ns,
-                            LogicalDisposition::Rejected,
-                            Some(code.to_owned()),
-                            batch_attempts + polls,
-                            polls,
-                        ));
-                    }
+                    continue 'logical;
                 }
+                return Ok(terminal_record(
+                    logical_id,
+                    scheduled_start_ns,
+                    first_send.expect("set above"),
+                    reply.received_ns,
+                    LogicalDisposition::Rejected,
+                    Some(code.to_owned()),
+                    batch_attempts + polls,
+                    polls,
+                ));
             }
             if code != "queue_full" {
                 return Err(format!("unexpected embed.batch error: {json}"));
@@ -1091,21 +1052,19 @@ async fn execute_batch(
             if reply.frame.ty == raw_client::TY_ERROR {
                 let code = json["code"].as_str().unwrap_or("unparsable");
                 if code == "module_restarted" {
-                    match restart_budget.on_module_restarted() {
-                        RestartAction::Resubmit => continue 'logical,
-                        RestartAction::Terminal => {
-                            return Ok(terminal_record(
-                                logical_id,
-                                scheduled_start_ns,
-                                first_send.expect("batch sent"),
-                                reply.received_ns,
-                                LogicalDisposition::Rejected,
-                                Some(code.to_owned()),
-                                batch_attempts + polls,
-                                polls,
-                            ));
-                        }
+                    if !std::mem::replace(&mut restart_used, true) {
+                        continue 'logical;
                     }
+                    return Ok(terminal_record(
+                        logical_id,
+                        scheduled_start_ns,
+                        first_send.expect("batch sent"),
+                        reply.received_ns,
+                        LogicalDisposition::Rejected,
+                        Some(code.to_owned()),
+                        batch_attempts + polls,
+                        polls,
+                    ));
                 }
                 let disposition = if code == "timeout" {
                     LogicalDisposition::TimedOut
@@ -1718,49 +1677,6 @@ mod tests {
     fn service_time_mean_retains_raw_sample_mean() {
         assert_eq!(mean(&[10, 20, 30]), Some(20.0));
         assert_eq!(mean(&[]), None);
-    }
-
-    #[test]
-    fn restart_budget_allows_exactly_one_resubmission() {
-        let mut budget = RestartBudget::new();
-        assert_eq!(budget.on_module_restarted(), RestartAction::Resubmit);
-        assert_eq!(budget.on_module_restarted(), RestartAction::Terminal);
-        assert_eq!(budget.on_module_restarted(), RestartAction::Terminal);
-    }
-
-    #[test]
-    fn restart_loop_contract_is_two_submissions_then_rejected() {
-        // The loop contract at the pure seam `execute_batch` consumes:
-        // every submission is accepted and every poll answers
-        // module_restarted. The budget permits the initial submission plus
-        // exactly one resubmission (two embed.batch submissions total),
-        // and the second restart is terminal with disposition Rejected.
-        // Each resubmission re-enters the outer loop, which hands the
-        // submit path a fresh per-submission retry budget; only the
-        // cumulative attempt counter (the ledger's input) persists.
-        let mut budget = RestartBudget::new();
-        let mut submissions = 0u32;
-        let mut cumulative_attempts = 0u64;
-        let disposition = loop {
-            // Fresh per-submission window, as in `execute_batch`'s
-            // `'logical` loop; the accepted submit consumes one attempt.
-            let submit_attempts = 1u32;
-            assert!(submit_attempts < MAX_TOTAL_ATTEMPTS);
-            submissions += 1;
-            cumulative_attempts += 1;
-            // The poll for this submission answers module_restarted.
-            cumulative_attempts += 1;
-            match budget.on_module_restarted() {
-                RestartAction::Resubmit => continue,
-                RestartAction::Terminal => break LogicalDisposition::Rejected,
-            }
-        };
-        assert_eq!(
-            submissions, 2,
-            "initial submission plus exactly one resubmission"
-        );
-        assert_eq!(cumulative_attempts, 4, "the ledger keeps every attempt");
-        assert_eq!(disposition, LogicalDisposition::Rejected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

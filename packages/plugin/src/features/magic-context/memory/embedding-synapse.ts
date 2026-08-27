@@ -118,8 +118,6 @@ export interface SynapseEmbeddingProviderOptions {
     now?: () => number;
     random?: () => number;
     pollInitialDelayMs?: number;
-    pollDelayMultiplier?: number;
-    pollMinDelayMs?: number;
     pollDefaultDelayMs?: number;
 }
 
@@ -262,8 +260,6 @@ type SynapseCallParams =
 
 interface PollDelayState {
     nextDelayMs: number;
-    multiplier: number;
-    minDelayMs: number;
     defaultDelayMs: number;
 }
 
@@ -283,8 +279,14 @@ function pendingPollDelay(
     now: number,
 ): number | null {
     if (parsed.done === true || (hasVectors && parsed.next_cursor != null)) return null;
-    const cap = Math.max(state.minDelayMs, readRetryAfter(parsed) ?? state.defaultDelayMs);
-    state.nextDelayMs = Math.max(state.minDelayMs, state.nextDelayMs * state.multiplier);
+    const cap = Math.max(
+        SYNAPSE_POLL_MIN_DELAY_MS,
+        readRetryAfter(parsed) ?? state.defaultDelayMs,
+    );
+    state.nextDelayMs = Math.max(
+        SYNAPSE_POLL_MIN_DELAY_MS,
+        state.nextDelayMs * SYNAPSE_POLL_DELAY_MULTIPLIER,
+    );
     return Math.min(state.nextDelayMs, cap, Math.max(0, deadlineAt - now));
 }
 
@@ -545,8 +547,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private readonly now: () => number;
     private readonly random: () => number;
     private readonly pollInitialDelayMs: number;
-    private readonly pollDelayMultiplier: number;
-    private readonly pollMinDelayMs: number;
     private readonly pollDefaultDelayMs: number;
 
     constructor(options: SynapseEmbeddingProviderOptions) {
@@ -557,14 +557,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         this.pollInitialDelayMs = this.positiveOption(
             options.pollInitialDelayMs,
             SYNAPSE_POLL_INITIAL_DELAY_MS,
-        );
-        this.pollDelayMultiplier = this.positiveOption(
-            options.pollDelayMultiplier,
-            SYNAPSE_POLL_DELAY_MULTIPLIER,
-        );
-        this.pollMinDelayMs = this.positiveOption(
-            options.pollMinDelayMs,
-            SYNAPSE_POLL_MIN_DELAY_MS,
         );
         this.pollDefaultDelayMs = this.positiveOption(
             options.pollDefaultDelayMs,
@@ -1408,13 +1400,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private newPollDelayState(servedPollDelayMs?: number): PollDelayState {
         const random = Math.min(Math.max(this.random(), 0), 1 - Number.EPSILON);
         const defaultDelayMs = Math.max(
-            this.pollMinDelayMs,
+            SYNAPSE_POLL_MIN_DELAY_MS,
             servedPollDelayMs ?? this.pollDefaultDelayMs,
         );
         return {
             nextDelayMs: Math.min(this.pollInitialDelayMs * (1 + random), defaultDelayMs),
-            multiplier: this.pollDelayMultiplier,
-            minDelayMs: this.pollMinDelayMs,
             defaultDelayMs,
         };
     }

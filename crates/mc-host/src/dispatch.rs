@@ -109,11 +109,7 @@ fn escaped_json_len(s: &str) -> usize {
 }
 
 fn decimal_u64_len(value: u64) -> usize {
-    if value == 0 {
-        1
-    } else {
-        value.ilog10() as usize + 1
-    }
+    value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
 fn error_body_len(code: &str, message: &str, retry_after_ms: Option<u64>) -> usize {
@@ -1472,7 +1468,7 @@ mod tests {
 
     #[test]
     fn error_body_length_model_is_exact_with_and_without_retry_hint() {
-        for retry_after_ms in [None, Some(0), Some(50), Some(u64::MAX)] {
+        for retry_after_ms in [None, Some(0), Some(9), Some(10), Some(50), Some(u64::MAX)] {
             let code = "quoted\"code";
             let message = "line one\nline two\\tail";
             let expected = error_body_len(code, message, retry_after_ms);
