@@ -2002,8 +2002,17 @@ async function executeUnifiedSearch(args: {
         queryContract?.chunkModelId ??
         options.chunkModelIdOverride ??
         embeddingSnapshot?.chunkModelId;
-    const antiMemoryResults = runAntiMemories
-        ? await searchAntiMemories({
+    const laneSpanIds: number[] = [];
+    const antiMemorySpan =
+        trace && runAntiMemories
+            ? trace.begin("fusion", "memory", {
+                  parent: rootId,
+                  dependsOn: [...filterDeps, ...semanticDeps],
+              })
+            : null;
+    if (trace && !runAntiMemories) trace.notApplicable("fusion", "memory", rootId);
+    const antiMemoryPromise: Promise<AntiMemorySearchResult[]> = runAntiMemories
+        ? searchAntiMemories({
               db,
               projectPath,
               query: trimmedQuery,
@@ -2012,8 +2021,23 @@ async function executeUnifiedSearch(args: {
               queryEmbedding,
               embedPassages,
               signal: options.signal,
-          })
-        : [];
+          }).then(
+              (results) => {
+                  if (antiMemorySpan) {
+                      laneSpanIds.push(antiMemorySpan.id);
+                      antiMemorySpan.end("ok", {
+                          candidatesOut: results.length,
+                          ...laneDepth,
+                      });
+                  }
+                  return results;
+              },
+              (error) => {
+                  antiMemorySpan?.end(options.signal?.aborted ? "cancelled" : "failed");
+                  throw error;
+              },
+          )
+        : Promise.resolve([]);
     let compartmentLoad: VectorLoadEvent | null = null;
     const compartmentSpan =
         trace && runCompartmentChunks
@@ -2068,7 +2092,7 @@ async function executeUnifiedSearch(args: {
         candidatesOut: messageLikeResults.length,
     });
 
-    const laneSpanIds: number[] = messageFusionSpan ? [messageFusionSpan.id] : [];
+    if (messageFusionSpan) laneSpanIds.push(messageFusionSpan.id);
 
     // Hybrid lanes (git-commit, primer) decompose into lexical_scan,
     // vector_scan, and fusion spans through stage marks the lane functions
@@ -2185,7 +2209,8 @@ async function executeUnifiedSearch(args: {
         return lane;
     };
 
-    const [gitCommitResults, primerResults, noteResults] = await Promise.all([
+    const [antiMemoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
+        antiMemoryPromise,
         runGitCommits
             ? Promise.resolve(runGitCommitLane())
             : Promise.resolve([] as GitCommitSearchResult[]),

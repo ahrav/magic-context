@@ -101,5 +101,8 @@ describe("verify prompt", () => {
         expect(VERIFY_SYSTEM_PROMPT).toContain("anti-memory");
         expect(VERIFY_SYSTEM_PROMPT).toContain("ARCHIVE");
         expect(VERIFY_SYSTEM_PROMPT).toContain("stale");
+        expect(VERIFY_SYSTEM_PROMPT).toContain(
+            "Use ARCHIVE when the rejection no longer clearly holds; the host preserves it as labeled stale history rather than deleting it.",
+        );
     });
 });

@@ -15,7 +15,8 @@
  *   - Every dynamic source field is bounded to MAX_RENDER_FIELD_BYTES of
  *     valid UTF-8 BEFORE compression or tokenization, so the budget check
  *     itself never performs unbounded work
- *   - Per-fragment token cap (~20 tokens, ~80 chars) with ellipsis truncation
+ *   - Ordinary fragments use a small character cap. Anti-memory warnings use
+ *     bounded fields so their complete warning contract remains visible.
  *   - Skip fragments whose source is already present in visible session-history
  *     (caller handles) — this module only knows about search results
  *   - Total output is token-packed under MAX_AUTO_HINT_TOKENS: an over-budget
@@ -29,11 +30,11 @@ import {
 } from "../../features/magic-context/search-bounds";
 import { formatAge } from "../../shared/format-age";
 import { estimateTokens } from "../../shared/token-estimator";
-import { renderAntiMemoryWarning } from "../../tools/ctx-search/render";
 import { cavemanCompress } from "./caveman";
 
 const MAX_FRAGMENTS = 3;
 const FRAGMENT_CHAR_CAP = 80; // ~20 tokens at 3.5 chars/token
+const WARNING_FIELD_CHAR_CAP = 72;
 
 export interface AutoSearchHintOptions {
     maxFragments?: number;
@@ -49,10 +50,23 @@ function truncate(text: string, limit: number): string {
     return `${normalized.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
 }
 
+function warningField(text: string): string {
+    return truncate(boundDynamicField(text), WARNING_FIELD_CHAR_CAP);
+}
+
+function renderCompactAntiMemoryWarning(
+    result: Extract<UnifiedSearchResult, { source: "anti_memory" }>,
+): string {
+    const alternative = result.saferAlternative
+        ? ` Safer alternative: ${warningField(result.saferAlternative)}.`
+        : "";
+    return `⚠ Previously rejected: ${warningField(result.rejectedStrategy)}. Reason: ${warningField(result.rejectionReason)}.${alternative} Verify before proceeding: confirm the rejection no longer applies to ${warningField(result.trigger)}.`;
+}
+
 function renderFragment(result: UnifiedSearchResult, charCap: number, nowMs: number): string {
     switch (result.source) {
         case "anti_memory":
-            return truncate(renderAntiMemoryWarning(result), charCap);
+            return renderCompactAntiMemoryWarning(result);
         case "memory": {
             const compressed = cavemanCompress(boundDynamicField(result.content), "ultra");
             return truncate(compressed, charCap);

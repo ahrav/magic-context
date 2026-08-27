@@ -395,7 +395,8 @@ function stageVerificationItem(
             if (record === null)
                 throw new Error(`missing anti-memory ${item.binding.publicClaimId}`);
             const expiresAt = nowMs + ANTI_MEMORY_DEFAULT_TTL_MS;
-            if (record.expiresAt !== null && record.expiresAt < expiresAt) {
+            const extendBelow = nowMs + ANTI_MEMORY_DEFAULT_TTL_MS / 2;
+            if (record.expiresAt !== null && record.expiresAt < extendBelow) {
                 outcomes.push(
                     stageExtendAntiMemoryTtlInCurrentTransaction(
                         db,

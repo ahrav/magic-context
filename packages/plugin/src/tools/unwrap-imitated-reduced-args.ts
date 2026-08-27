@@ -45,7 +45,11 @@ function validObjectField(
     if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
     const record = value as Record<string, unknown>;
     const declared = Object.entries(fields);
-    if (Object.keys(record).some((field) => !(field in fields) && !(field in optionalFields))) {
+    if (
+        Object.keys(record).some(
+            (field) => !Object.hasOwn(fields, field) && !Object.hasOwn(optionalFields, field),
+        )
+    ) {
         return false;
     }
     return (

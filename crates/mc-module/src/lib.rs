@@ -15812,6 +15812,14 @@ fn ctx_memory_schema() -> Value {
                 "properties": {
                     "action": { "enum": ["get", "list", "archive", "restore", "merge"] }
                 }
+            },
+            {
+                "required": ["reduced", "summary"],
+                "properties": {
+                    "reduced": { "const": true },
+                    "summary": { "type": "string" }
+                },
+                "not": { "required": ["action"] }
             }
         ]
     })
@@ -25487,8 +25495,20 @@ mod tests {
             by_name["ctx_memory"].schema["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(5),
+            Some(6),
             "ctx_memory write arms must stay discriminated"
+        );
+        assert_eq!(
+            by_name["ctx_memory"].schema["oneOf"][5],
+            json!({
+                "required": ["reduced", "summary"],
+                "properties": {
+                    "reduced": { "const": true },
+                    "summary": { "type": "string" }
+                },
+                "not": { "required": ["action"] }
+            }),
+            "ctx_memory must advertise only the action-less imitated-reduced envelope"
         );
         assert!(
             by_name["ctx_memory"].schema["properties"]["category"]["enum"]

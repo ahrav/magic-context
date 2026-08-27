@@ -1,4 +1,9 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import {
+	createAntiMemory,
+	readAntiMemory,
+} from "@magic-context/core/features/magic-context/memory/storage-anti-memory";
+import { ensureProject } from "@magic-context/core/features/magic-context/memory/storage-claims";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
@@ -109,6 +114,84 @@ describe("runAutoSearchHintForPi", () => {
 
 			const options = spy.mock.calls[0]?.[4];
 			expect(options?.sources).toEqual(["memory", "message", "git_commit"]);
+			expect(options?.memoryPolicySurface).toBe("auto_search");
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("delivers anti-memory warnings and increments retrieval usage once", async () => {
+		const db = createTestDb();
+		const created = createAntiMemory(
+			db,
+			{ producer: "pi-runner-test", operationKey: "anti-warning" },
+			{
+				projectId: ensureProject(db, baseOptions.projectPath),
+				payload: {
+					trigger: "session caching",
+					rejectedStrategy: "Redis",
+					rejectionReason: "split ownership",
+					saferAlternative: "use SQLite",
+				},
+				provenance: {
+					sourceLocator: "test://pi/anti",
+					sourceContent: "Redis rejected",
+					extractor: "test",
+					extractorVersion: "1",
+					extractorRunId: "seed",
+					independenceKey: "pi-anti",
+					sourceTrustClass: "explicit_user",
+				},
+				actor: "user:test",
+			},
+		);
+		const publicClaimId = (
+			created.result.payload as { claim: { publicClaimId: string } }
+		).claim.publicClaimId;
+		const anti = readAntiMemory(db, publicClaimId);
+		if (anti === null) throw new Error("missing anti-memory");
+		const warning: UnifiedSearchResult = {
+			source: "anti_memory",
+			score: 0.95,
+			publicClaimId,
+			revisionLocator: anti.revisionLocator,
+			contentDigest: anti.contentDigest,
+			claimId: anti.claimId,
+			normalizedHash: anti.normalizedHash,
+			trigger: anti.payload.trigger,
+			rejectedStrategy: anti.payload.rejectedStrategy,
+			rejectionReason: anti.payload.rejectionReason,
+			saferAlternative: anti.payload.saferAlternative,
+			matchType: "lexical",
+		};
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([
+			warning,
+		]);
+		try {
+			const messages = [
+				userMessage("please add Redis backed session caching", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+			expect(textOf(messages[0])).toContain("⚠ Previously rejected: Redis");
+			expect(
+				db
+					.prepare(
+						`SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
+						  JOIN claim_public_ids public ON public.claim_id = usage.claim_id
+						 WHERE public.public_id = ?`,
+					)
+					.get(publicClaimId),
+			).toEqual({ count: 1 });
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
+				decision: "hint",
+				memoryFragments: [{ id: anti.claimId, hash: anti.normalizedHash }],
+			});
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);

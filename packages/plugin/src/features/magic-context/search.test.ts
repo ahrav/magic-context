@@ -127,15 +127,23 @@ function createTestDb(): Database {
     return createClaimReaderTestDatabase();
 }
 
-function seedAntiMemory(db: Database, projectIdentity: string, key: string, nowMs = Date.now()) {
+function seedAntiMemory(
+    db: Database,
+    projectIdentity: string,
+    key: string,
+    nowMs = Date.now(),
+    pair: { trigger: string; rejectedStrategy: string } = {
+        trigger: "session caching",
+        rejectedStrategy: "Redis",
+    },
+) {
     const result = createAntiMemory(
         db,
         { producer: "search-test", operationKey: `anti-${key}` },
         {
             projectId: ensureProject(db, projectIdentity),
             payload: {
-                trigger: "session caching",
-                rejectedStrategy: "Redis",
+                ...pair,
                 rejectionReason: "it creates split ownership",
                 saferAlternative: "use SQLite",
             },
@@ -421,7 +429,14 @@ describe("unifiedSearch", () => {
         db.prepare(
             "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'test', ?)",
         ).run(staleRevision.id, Date.now());
-        seedAntiMemory(db, project, "expired", Date.now() - 91 * 24 * 60 * 60 * 1_000);
+        const expired = seedAntiMemory(
+            db,
+            project,
+            "expired",
+            Date.now() - 91 * 24 * 60 * 60 * 1_000,
+            { trigger: "session cache expiry", rejectedStrategy: "Memcached" },
+        );
+        expect(expired.publicClaimId).not.toBe(stale.publicClaimId);
 
         const explicit = await unifiedSearch(db, "session-anti", project, "Redis session caching", {
             sources: ["memory"],
@@ -448,6 +463,15 @@ describe("unifiedSearch", () => {
             },
         );
         expect(automatic).toEqual([]);
+
+        expect(
+            await unifiedSearch(db, "session-anti", project, "Memcached session cache expiry", {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                memoryPolicySurface: "explicit_search",
+            }),
+        ).toEqual([]);
     });
 
     it("suppresses the project-memory lane in unified search until retrieval activates", async () => {

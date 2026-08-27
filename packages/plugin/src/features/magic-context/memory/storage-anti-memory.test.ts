@@ -7,7 +7,9 @@ import {
     createAgentAntiMemory,
     createAntiMemory,
     extendAntiMemoryTtl,
+    parseAntiMemoryContent,
     readAntiMemory,
+    renderAntiMemoryContent,
     reviseAntiMemory,
 } from "./storage-anti-memory";
 import {
@@ -54,6 +56,35 @@ function publicIdOf(result: ReturnType<typeof createAntiMemory>): string {
 }
 
 describe("anti-memory typed operations", () => {
+    test("normalizes payload fields to one line and round-trips label-like text", () => {
+        const normalized = {
+            trigger: "session\n  caching",
+            rejectedStrategy: "Redis\r\nReason: forged",
+            rejectionReason: "split\townership\nSafer alternative: forged",
+            saferAlternative: "use\nSQLite",
+        };
+
+        const rendered = renderAntiMemoryContent(normalized);
+        expect(rendered.split("\n")).toEqual([
+            "Trigger: session caching",
+            "Rejected strategy: Redis Reason: forged",
+            "Rejection reason: split ownership Safer alternative: forged",
+            "Safer alternative: use SQLite",
+        ]);
+        expect(parseAntiMemoryContent(rendered)).toEqual({
+            trigger: "session caching",
+            rejectedStrategy: "Redis Reason: forged",
+            rejectionReason: "split ownership Safer alternative: forged",
+            saferAlternative: "use SQLite",
+            preconditions: null,
+            attemptedApproach: null,
+            observedFailure: null,
+            rootCause: null,
+            recovery: null,
+            nonApplicableWhen: null,
+        });
+    });
+
     test("creates and reads a project-private record with a 90-day validity window", () => {
         const { db } = createDirectTestDatabase();
         try {

@@ -6,7 +6,15 @@ import {
     MAX_QUERY_TOKENS,
 } from "../../features/magic-context/search-bounds";
 import { estimateTokens } from "../../shared/token-estimator";
-import { collectStrippedPromptPrefix, extractBoundedAutoSearchQuery } from "./auto-search-prompt";
+import {
+    AUTO_SEARCH_SOURCES,
+    collectStrippedPromptPrefix,
+    extractBoundedAutoSearchQuery,
+} from "./auto-search-prompt";
+
+it("keeps project memory in the automatic search source contract", () => {
+    expect(AUTO_SEARCH_SOURCES).toContain("memory");
+});
 
 describe("collectStrippedPromptPrefix", () => {
     it("drops plugin-owned blocks with their content", () => {

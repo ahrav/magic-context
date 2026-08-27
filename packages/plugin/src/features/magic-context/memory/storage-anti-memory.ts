@@ -95,7 +95,7 @@ function requiredText(value: unknown, field: string): string {
     if (typeof value !== "string" || value.trim().length === 0) {
         throw new ClaimOperationInputError(`anti-memory ${field} must be non-empty`);
     }
-    return value.trim();
+    return value.replace(/\s+/g, " ").trim();
 }
 
 function optionalText(value: unknown, field: string): string | null {
@@ -461,7 +461,7 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
             `anti-memory ${publicClaimId} current revision has no payload row`,
         );
     }
-    const payload: StoredAntiMemoryPayload = {
+    const payload = normalizePayload({
         trigger: row.trigger,
         rejectedStrategy: row.rejectedStrategy,
         rejectionReason: row.rejectionReason,
@@ -472,7 +472,7 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
         rootCause: row.rootCause,
         recovery: row.recovery,
         nonApplicableWhen: row.nonApplicableWhen,
-    };
+    });
     return {
         claimId: row.claimId,
         publicClaimId,

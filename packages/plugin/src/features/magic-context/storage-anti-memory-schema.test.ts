@@ -126,9 +126,15 @@ describe("anti-memory payload schema", () => {
             const second = seedBareAntiClaim(db, "Second rejection.");
             const firstIds = claimIds(db, first);
             const secondIds = claimIds(db, second);
-            const missingReason = payloadValues(firstIds.revisionId, firstIds.claimId);
-            missingReason[4] = null;
-            expect(() => db.prepare(INSERT_PAYLOAD).run(...missingReason)).toThrow();
+            for (const index of [2, 3, 4]) {
+                const missing = payloadValues(firstIds.revisionId, firstIds.claimId);
+                missing[index] = null;
+                expect(() => db.prepare(INSERT_PAYLOAD).run(...missing)).toThrow();
+
+                const blank = payloadValues(firstIds.revisionId, firstIds.claimId);
+                blank[index] = "   ";
+                expect(() => db.prepare(INSERT_PAYLOAD).run(...blank)).toThrow();
+            }
 
             expect(() =>
                 db
@@ -157,6 +163,11 @@ describe("anti-memory payload schema", () => {
             expect(() =>
                 db.prepare("DELETE FROM claim_anti_memory_revision_payloads").run(),
             ).toThrow(/append-only/);
+            expect(() =>
+                db
+                    .prepare(INSERT_PAYLOAD.replace("INSERT INTO", "INSERT OR REPLACE INTO"))
+                    .run(...payloadValues(ids.revisionId, ids.claimId)),
+            ).toThrow(/key collisions/);
         } finally {
             closeQuietly(db);
         }

@@ -162,7 +162,7 @@ describe("buildAutoSearchHint", () => {
         expect(packed.tokenCount).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
     });
 
-    it("truncates an oversized warning instead of dropping the whole hint", () => {
+    it("keeps a full-structure warning when every dynamic field is oversized", () => {
         const warning = antiMemory(`mcm_${"c".repeat(32)}`, "x".repeat(20_000));
         if (warning.source !== "anti_memory") throw new Error("expected anti-memory fixture");
         warning.rejectionReason = "y".repeat(20_000);
@@ -172,12 +172,11 @@ describe("buildAutoSearchHint", () => {
         expect(packed.text).not.toBeNull();
         expect(packed.delivered).toEqual([warning]);
         expect(packed.tokenCount).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
-        expect(
-            packed.text
-                ?.split("\n")
-                .find((line) => line.startsWith("- "))
-                ?.endsWith("…"),
-        ).toBe(true);
+        expect(packed.text).toContain("⚠ Previously rejected:");
+        expect(packed.text).toContain("Reason:");
+        expect(packed.text).toContain("Safer alternative:");
+        expect(packed.text).toContain("Verify before proceeding:");
+        expect(packed.text?.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(1);
     });
 });
 

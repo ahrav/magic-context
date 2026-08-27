@@ -133,6 +133,29 @@ function tokenWithout(field: string): Record<string, unknown> {
 }
 
 describe("imitated reduced object and nested array fields", () => {
+    test("accepts required-only and nullable optional object fields", () => {
+        const schema: ImitatedArgsSchema = {
+            payload: {
+                type: "object",
+                fields: { required: "string" },
+                optionalFields: { optional: { type: "nullable", value: "string" } },
+            },
+        };
+        for (const accepted of [
+            { payload: { required: "yes" } },
+            { payload: { required: "yes", optional: null } },
+        ]) {
+            const outer = { reduced: true, summary: JSON.stringify(accepted) };
+            expect(unwrapImitatedReducedArgs(outer, ["action"], schema)).toEqual(accepted);
+        }
+    });
+
+    test("rejects prototype-name extras that are not declared own fields", () => {
+        const accepted = { action: "revise", mutationToken: token({ toString: "forged" }) };
+        const outer = { reduced: true, summary: JSON.stringify(accepted) };
+        expect(unwrapImitatedReducedArgs(outer, OBJECT_PRIMARY, OBJECT_SCHEMA)).toBe(outer);
+    });
+
     for (const [name, accepted] of [
         ["single mutation token", { action: "revise", mutationToken: token() }],
         [

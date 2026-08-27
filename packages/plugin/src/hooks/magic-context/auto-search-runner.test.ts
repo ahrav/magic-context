@@ -193,6 +193,7 @@ describe("auto-search-runner", () => {
 
             const options = spy.mock.calls[0]?.[4];
             expect(options?.sources).toEqual(["memory", "message", "git_commit"]);
+            expect(options?.memoryPolicySurface).toBe("auto_search");
         } finally {
             spy.mockRestore();
         }

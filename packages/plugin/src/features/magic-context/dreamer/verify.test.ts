@@ -84,7 +84,7 @@ function seedAntiMemory(db: Database, projectIdentity: string, key: string): str
                 sourceTrustClass: "explicit_user",
             },
             actor: "user:test",
-            nowMs: Date.now() - 30 * 24 * 60 * 60 * 1_000,
+            nowMs: Date.now() - 60 * 24 * 60 * 60 * 1_000,
         },
     );
     return (result.result.payload as { claim: { publicClaimId: string } }).claim.publicClaimId;
@@ -170,6 +170,37 @@ describe("claim-native verification", () => {
             const verified = readAntiMemory(db, verifiedId);
             expect(verified?.revision).toBe(2);
             expect(verified?.expiresAt).toBeGreaterThan(beforeExpiry);
+            const revisionsAfterFirstVerify = (
+                db
+                    .prepare(
+                        `SELECT COUNT(*) AS count FROM claim_revisions revisions
+                          JOIN claim_public_ids public ON public.claim_id = revisions.claim_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(verifiedId) as { count: number }
+            ).count;
+            const secondBatch = promptBatch(db, projectIdentity).filter(
+                (memory) => memory.publicClaimId === verifiedId,
+            );
+            expect(
+                await applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    secondBatch,
+                    `<verify><verified claim="${verifiedId}" files=""/></verify>`,
+                ),
+            ).toEqual({ verified: 1, updated: 0, archived: 0 });
+            expect(readAntiMemory(db, verifiedId)?.revision).toBe(2);
+            expect(
+                (
+                    db
+                        .prepare(
+                            `SELECT COUNT(*) AS count FROM claim_revisions revisions
+                              JOIN claim_public_ids public ON public.claim_id = revisions.claim_id
+                             WHERE public.public_id = ?`,
+                        )
+                        .get(verifiedId) as { count: number }
+                ).count,
+            ).toBe(revisionsAfterFirstVerify);
             const outcomes = db
                 .prepare(
                     `SELECT public.public_id AS publicClaimId, events.outcome

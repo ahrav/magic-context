@@ -92,7 +92,14 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         ).id;
         const anti = readAntiMemory(db, publicClaimId);
         expect(anti?.payload.rejectionReason).toBe("The cache must remain offline capable");
-        expect(JSON.stringify(anti)).not.toContain("Never persist this quote");
+        const persisted = db
+            .prepare(
+                `SELECT o.extracted_text AS extractedText
+                   FROM claim_evidence e JOIN observations o ON o.id = e.observation_id
+                  WHERE e.revision_id = (SELECT current_revision_id FROM claims LIMIT 1)`,
+            )
+            .get();
+        expect(JSON.stringify(persisted)).not.toContain("Never persist this quote");
         expect(
             db
                 .prepare(
@@ -102,6 +109,34 @@ describe("historian trajectory-correction anti-memory harvest", () => {
                 )
                 .get(),
         ).toEqual({ trust: "explicit_user" });
+    });
+
+    test("keeps non-user corrections as model inference despite matching user evidence", () => {
+        db = createClaimReaderTestDatabase();
+        const compartmentId = seedSession(
+            db,
+            "ses-tool-source",
+            "The cache must remain offline capable, so use SQLite.",
+        );
+        insertCompartmentEvents(
+            db,
+            "ses-tool-source",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    fields: correctionFields({ correction_source: "tool_result" }),
+                },
+            ],
+            [compartmentId],
+        );
+
+        db.transaction(() =>
+            harvestAntiMemoriesFromCorrections({ db: db as Database, projectIdentity: PROJECT }),
+        ).immediate();
+        expect(
+            db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
+        ).toEqual({ trust: "model_inference" });
     });
 
     test("downgrades forged user source and receipts poison skips without blocking", () => {
