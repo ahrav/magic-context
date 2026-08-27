@@ -464,6 +464,24 @@ fn app_error(code: &str, message: &str) -> RequestOutcome {
     RequestOutcome::error(code, message)
 }
 
+/// The expiry response for a query whose deadline has passed, attributed from
+/// whatever verdict the worker managed to deliver.
+///
+/// A `Timeout` fault is the worker's own queued-deadline arm reporting that the
+/// query never obtained the CPU permit; anything else — including a vector from
+/// an engine call that completed after the deadline — means the query was
+/// already running, and the result is discarded rather than returned. Both
+/// escape paths from the deadline share this function so the two messages cannot
+/// drift apart.
+fn expired_query(result: Option<&Result<Vec<Vec<f32>>, QueryFault>>) -> RequestOutcome {
+    match result {
+        Some(Err(QueryFault::Timeout)) => {
+            app_error("timeout", "the query deadline expired while queued")
+        }
+        _ => app_error("timeout", "the query deadline expired awaiting the result"),
+    }
+}
+
 async fn respond(ctx: &RequestCtx, body: Vec<u8>) -> RequestOutcome {
     let Ok(mut output) = ctx.reserve_output(body.len()).await else {
         return app_error("internal_error", "output reservation failed");
@@ -593,29 +611,25 @@ impl SynapseComponent {
                 // The worker's queued-deadline arm shares this exact instant,
                 // and its verdict distinguishes a query that never started
                 // from one still running. One yield lets that same-instant
-                // verdict land before this backstop reports the generic
-                // awaiting-result expiry.
+                // verdict land before the expiry is attributed.
                 tokio::task::yield_now().await;
-                // Only the queued-timeout verdict is consumed, and only to
-                // attribute the expiry. Any other value that happens to land
-                // inside the yield interval is discarded rather than returned:
-                // a successful vector from an engine call that finished late is
-                // still a result produced after the caller's deadline, and
-                // answering the request with it would break the very budget
-                // this arm exists to enforce. The yield is an unbounded
-                // scheduling interval under saturation, which is exactly the
-                // tail condition where a late completion is most likely.
-                return match rx.try_recv() {
-                    Ok(Err(QueryFault::Timeout)) => {
-                        app_error("timeout", "the query deadline expired while queued")
-                    }
-                    _ => app_error(
-                        "timeout",
-                        "the query deadline expired awaiting the result",
-                    ),
-                };
+                return expired_query(rx.try_recv().ok().as_ref());
             }
         };
+        // The expired timer outranks a result that raced it, whichever arm
+        // produced the value. `biased` polls the receiver first, so a handler
+        // descheduled past its deadline resumes with both arms ready and never
+        // polls the timer at all: without this check a vector sent after the
+        // deadline is returned as a success, which is the same defect the
+        // deadline arm above exists to prevent, reached by a different path.
+        //
+        // Cancellation is exempt because it is not a deadline event: the host
+        // is shutting down, and that is the more actionable verdict for a
+        // caller whose deadline happened to lapse at the same time.
+        if tokio::time::Instant::now() >= deadline && !matches!(result, Err(QueryFault::Cancelled))
+        {
+            return expired_query(Some(&result));
+        }
         match result {
             Ok(vectors) => match vectors.first() {
                 Some(vector) => {

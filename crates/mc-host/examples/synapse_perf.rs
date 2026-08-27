@@ -994,6 +994,26 @@ async fn execute_batch(
     'logical: loop {
         let mut submit_attempts = 0u32;
         let (job_id, served_poll_cap) = loop {
+            // Mirrors the query loop's pre-attempt guard above and the plugin's
+            // per-attempt remaining-budget check. Testing the deadline before a
+            // retry sleep is not sufficient: the timer can wake after it under
+            // saturation, and `record_call` would then hand `RoutedWire::call` a
+            // zero budget, which writes its frame before timing out the
+            // receiver. The harness would put a post-deadline submission on the
+            // wire and record the attempt it created.
+            if Instant::now() >= deadline {
+                let now = ctx.wire.elapsed_ns();
+                return Ok(terminal_record(
+                    logical_id,
+                    scheduled_start_ns,
+                    first_send.unwrap_or(now),
+                    now,
+                    LogicalDisposition::TimedOut,
+                    Some("timeout".to_owned()),
+                    batch_attempts + polls,
+                    polls,
+                ));
+            }
             batch_attempts += 1;
             submit_attempts += 1;
             let (reply, json) = match ctx
@@ -1101,6 +1121,22 @@ async fn execute_batch(
         loop {
             let mut poll_attempt = 0u32;
             let (reply, json) = loop {
+                // Same pre-send guard as the submission loop: a late-waking
+                // poll or pending-ladder timer must not turn into a
+                // zero-budget `embed.result` that still reaches the wire.
+                if Instant::now() >= deadline {
+                    let now = ctx.wire.elapsed_ns();
+                    return Ok(terminal_record(
+                        logical_id,
+                        scheduled_start_ns,
+                        first_send.unwrap_or(now),
+                        now,
+                        LogicalDisposition::TimedOut,
+                        Some("timeout".to_owned()),
+                        batch_attempts + polls,
+                        polls,
+                    ));
+                }
                 let mut poll = constraints();
                 poll["job_id"] = job_id.clone().into();
                 poll["request_key"] = request_key.clone().into();
@@ -1785,8 +1821,10 @@ async fn run(
     // One origin for the engine and the wire: service samples and logical rows
     // are only comparable to the hold window if they share a clock. Taken
     // before the host starts so the engine, which is built first, can hold it;
-    // every timestamp is window-relative, so the extra startup offset is
-    // common to all of them and cancels.
+    // every timestamp is window-relative, so the extra startup offset is common
+    // to all of them and cancels. Shadowing this with a second `Instant::now()`
+    // for the wire would put service samples and window boundaries on different
+    // zeros, shifting every service classification by the startup interval.
     let origin = Instant::now();
     let service = Arc::new(StdMutex::new(Vec::new()));
     let engine = Arc::new(DelayEngine {
@@ -1825,7 +1863,6 @@ async fn run(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let origin = Instant::now();
     let wire = RoutedWire::connect(&publication, origin).await?;
     let ctx = RunContext {
         wire,
