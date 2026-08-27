@@ -638,6 +638,119 @@ fn the_hold_window_marks_warmup_and_censors_unsettled_requests() {
 }
 
 #[test]
+fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, HoldWindow,
+        LogicalDisposition, LogicalRecord, SynapseMethod,
+    };
+
+    // A 10-second window: warmup ends at 1s, the window closes at 10s.
+    let window = HoldWindow::new(0, 10);
+    let attempt = |logical_id, attempt_id, send_ns: u64, disposition| AttemptRecord {
+        logical_id,
+        attempt_id,
+        method: SynapseMethod::Result,
+        disposition,
+        code: None,
+        retry_after_ms: None,
+        actual_send_ns: send_ns,
+        terminal_ns: send_ns + 1_000_000,
+        latency_ns: 1_000_000,
+        window: WindowClass::Measured,
+    };
+    let request =
+        |logical_id, opened_ns: u64, terminal_ns, attempts, polls, disposition| LogicalRecord {
+            logical_id,
+            scheduled_start_ns: Some(opened_ns),
+            actual_first_send_ns: opened_ns,
+            terminal_ns,
+            latency_ns: terminal_ns - opened_ns,
+            disposition,
+            terminal_code: None,
+            attempts,
+            polls,
+            window: WindowClass::Measured,
+        };
+
+    let mut logical = vec![
+        // Opens inside the measured span and keeps polling past the window end,
+        // which a batch request can legitimately do for its whole deadline.
+        request(
+            1,
+            9_500_000_000,
+            14_000_000_000,
+            3,
+            2,
+            LogicalDisposition::Completed,
+        ),
+        // Opens in the warmup prefix and keeps polling well past the warmup
+        // boundary.
+        request(
+            2,
+            500_000_000,
+            4_000_000_000,
+            2,
+            1,
+            LogicalDisposition::Completed,
+        ),
+    ];
+    let mut attempts = vec![
+        attempt(1, 1, 9_500_000_000, AttemptDisposition::Success),
+        // Both of these are sent after the window closed.
+        attempt(1, 2, 11_000_000_000, AttemptDisposition::Poll),
+        attempt(1, 3, 13_000_000_000, AttemptDisposition::Poll),
+        attempt(2, 4, 500_000_000, AttemptDisposition::Success),
+        // Sent after the warmup boundary, by a warmup request.
+        attempt(2, 5, 3_000_000_000, AttemptDisposition::Poll),
+    ];
+
+    window.stamp(&mut logical, &mut attempts);
+
+    // Ownership, not the attempt's own send instant: request 1's post-window
+    // polls stay measured, and request 2's post-warmup poll is discarded.
+    assert_eq!(
+        attempts.iter().map(|a| a.window).collect::<Vec<_>>(),
+        [
+            WindowClass::Measured,
+            WindowClass::Measured,
+            WindowClass::Measured,
+            WindowClass::Warmup,
+            WindowClass::Warmup,
+        ]
+    );
+
+    // This is the reason the rule cannot be per-attempt: the estimate sets must
+    // reconcile per request. Classifying attempt 2 and 3 out of the measured set
+    // while logical 1 stays in it would leave logical 1 claiming three attempts
+    // and owning one, which validation reports as an invalid repetition.
+    let (logical_estimates, _) = perf_measurement::partition_measured(&logical, |r| r.window);
+    let (attempt_estimates, _) = perf_measurement::partition_measured(&attempts, |a| a.window);
+    let ledger = validate_synapse_ledgers(&logical_estimates, &attempt_estimates);
+    assert!(ledger.valid, "{:?}", ledger.errors);
+    assert_eq!(ledger.offered, 1);
+    assert_eq!(ledger.attempts, 3);
+    assert_eq!(ledger.polls, 2);
+
+    // Dropping the two post-window attempts is exactly what the contract
+    // forbids, so it must fail loudly rather than quietly shrink the ledger.
+    let truncated: Vec<_> = attempt_estimates
+        .iter()
+        .filter(|a| a.actual_send_ns < window.end_ns)
+        .cloned()
+        .collect();
+    let broken = validate_synapse_ledgers(&logical_estimates, &truncated);
+    assert!(!broken.valid);
+    assert!(
+        broken
+            .errors
+            .iter()
+            .any(|error| error.contains("records 3 attempts but owns 1")),
+        "{:?}",
+        broken.errors
+    );
+}
+
+#[test]
 fn an_orphan_attempt_cannot_enter_the_measured_set() {
     use perf_measurement::{
         AttemptDisposition, AttemptRecord, HoldWindow, LogicalDisposition, LogicalRecord,

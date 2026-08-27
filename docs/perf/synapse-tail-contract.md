@@ -112,7 +112,8 @@ hold window as warmup, matching the convention in
 [mc-host-baseline.md](./mc-host-baseline.md).
 
 Every logical request, attempt, and engine service sample carries one `window`
-class against the frozen boundaries, and only `measured` rows enter estimates:
+class, and only `measured` rows enter estimates. A **logical request** and an
+**engine service sample** are classified by their own opening instant:
 
 - `warmup` — opened before `warmup_end_ns`.
 - `measured` — opened in `[warmup_end_ns, hold_window_end_ns)`. Both boundaries
@@ -122,6 +123,24 @@ class against the frozen boundaries, and only `measured` rows enter estimates:
   still reach the wire after the window has closed. Such a request never ran
   under measurement, and counting it would inflate offered counts, amplification,
   and censoring in exactly the saturated cells where the delay occurs.
+
+An **attempt** is classified by the request that owns it, not by its own
+`actual_send_ns`. An attempt is not an independent observation: it is one wire
+call belonging to a logical request, and the contract makes the per-request
+reconciliation authoritative — validation rejects a repetition in which a
+logical row's `attempts` or `polls` count disagrees with the attempts it owns.
+Classifying attempts independently would break that identity for every measured
+request that keeps retrying or polling past `hold_window_end_ns`, because the
+attempt rows would leave the estimate set while the logical row that counts them
+stayed, so an ordinary saturated repetition would be reported inadmissible.
+
+Ownership also keeps `A` conservative. Amplification is attempts per logical
+request, so numerator and denominator must cover the same requests; truncating a
+censored request's attempts at the boundary would *understate* the amplification
+this study exists to measure. The consequence to state plainly is that a measured
+request's post-window wire calls do enter the admitted and rejected counts, the
+attempt latency distribution, and `A` — as calls that request actually cost — and
+that a warmup request's later attempts are discarded with it.
 
 Excluded observations remain in raw evidence with their class, and the summary
 reports `warmup_offered`, `warmup_attempts`, `after_window_offered`, and

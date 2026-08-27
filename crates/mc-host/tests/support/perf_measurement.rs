@@ -286,9 +286,21 @@ pub struct AttemptRecord {
     pub latency_ns: u64,
     /// The window class of the owning logical request, so an attempt is
     /// included or excluded with the request it belongs to rather than by its
-    /// own send instant. Deliberately not `#[serde(default)]`: evidence
-    /// written without the marker is not contract-conformant, so it must fail
-    /// to parse rather than silently read as measured.
+    /// own send instant.
+    ///
+    /// An attempt is not an independent observation but one wire call of a
+    /// logical request, and [`validate_synapse_ledgers`] rejects a repetition
+    /// whose logical row disagrees with the attempts it owns. Classifying by
+    /// `actual_send_ns` would break that identity for every measured request
+    /// still retrying or polling past the window end, so an ordinary saturated
+    /// repetition would be reported inadmissible. Ownership also keeps
+    /// amplification conservative: attempts per request needs both sides over
+    /// the same requests, and truncating a censored request's attempts at the
+    /// boundary would understate it.
+    ///
+    /// Deliberately not `#[serde(default)]`: evidence written without the
+    /// marker is not contract-conformant, so it must fail to parse rather than
+    /// silently read as measured.
     pub window: WindowClass,
 }
 
@@ -444,8 +456,11 @@ impl HoldWindow {
             }
         }
         for attempt in attempts.iter_mut() {
-            // An attempt whose logical row is missing cannot be attributed to
-            // the measured set; the ledger validator reports the orphan.
+            // Ownership, not the attempt's own send instant: see
+            // `AttemptRecord::window` for why the per-request ledger identity
+            // requires it. An attempt whose logical row is missing cannot be
+            // attributed to the measured set at all; the ledger validator
+            // reports the orphan.
             attempt.window = classes
                 .get(&attempt.logical_id)
                 .copied()
