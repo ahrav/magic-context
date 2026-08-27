@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { readAntiMemory } from "../memory/storage-anti-memory";
 import type { AutonomousManifestIdentity } from "../memory/storage-claim-autonomous";
 import {
     readProjectMemoryCurrentState,
@@ -82,6 +83,31 @@ describe("parseRetrospectiveLearnings", () => {
     test("returns an empty manifest when the root is absent", () => {
         expect(parseRetrospectiveLearnings("no xml here")).toEqual([]);
     });
+
+    test("parses typed anti-memory entries without dropping valid siblings", () => {
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger>Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <safer_alternative>Use the existing SQLite store</safer_alternative>
+            </learning>
+            <learning route="anti_memory"><trigger>incomplete</trigger></learning>
+            <learning route="memory" category="PROJECT_RULES">Run focused tests before broad checks.</learning>
+        </learnings>`);
+
+        expect(learnings).toHaveLength(2);
+        expect(learnings[0]).toMatchObject({
+            route: "anti_memory",
+            payload: {
+                trigger: "Choosing a session cache backend",
+                rejectedStrategy: "Use Redis for session cache storage",
+                rejectionReason: "The deployment must remain single-process and offline-capable",
+                saferAlternative: "Use the existing SQLite store",
+            },
+        });
+        expect(learnings[1]?.route).toBe("memory");
+    });
 });
 
 describe("retrospective privacy validation", () => {
@@ -105,6 +131,53 @@ describe("retrospective privacy validation", () => {
 });
 
 describe("applyRetrospectiveLearnings", () => {
+    test("writes typed anti-memory with model-inference trust and pair dedup", () => {
+        db = createClaimReaderTestDatabase();
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger>Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <safer_alternative>Use the existing SQLite store</safer_alternative>
+            </learning>
+        </learnings>`);
+        apply(db, {
+            projectIdentity: PROJECT,
+            sourceSessionId: "ses-anti",
+            learnings,
+            userMemoryCollectionEnabled: false,
+        });
+        const publicClaimId = (
+            db.prepare("SELECT public_id AS id FROM claim_public_ids LIMIT 1").get() as {
+                id: string;
+            }
+        ).id;
+        const anti = readAntiMemory(db, publicClaimId);
+        expect(anti?.payload.saferAlternative).toBe("Use the existing SQLite store");
+        expect(claims(db)[0]?.policy.originTaint).toBe("DREAMER_INFERENCE");
+
+        apply(
+            db,
+            {
+                projectIdentity: PROJECT,
+                sourceSessionId: "ses-anti-2",
+                learnings: parseRetrospectiveLearnings(`<learnings>
+                    <learning route="anti_memory">
+                        <trigger>Choosing a session cache backend</trigger>
+                        <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                        <rejection_reason>A later retrospective gives a different reason</rejection_reason>
+                    </learning>
+                </learnings>`),
+                userMemoryCollectionEnabled: false,
+            },
+            identity("retro-run-2", "window-2"),
+        );
+        expect(claims(db)).toHaveLength(1);
+        expect(readAntiMemory(db, publicClaimId)?.payload.rejectionReason).toBe(
+            "The deployment must remain single-process and offline-capable",
+        );
+    });
+
     test("writes an inference-tainted claim and gates profile observations", () => {
         db = createClaimReaderTestDatabase();
         const learnings = parseRetrospectiveLearnings(`<learnings>

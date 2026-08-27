@@ -42,6 +42,11 @@ export interface StoredCompartmentEvent extends CompartmentEventInput {
     createdAt: number;
 }
 
+export interface ProjectCompartmentEvent extends StoredCompartmentEvent {
+    compartmentStartMessage: number | null;
+    compartmentEndMessage: number | null;
+}
+
 /**
  * Persist historian-extracted events for a publish.
  *
@@ -100,6 +105,49 @@ export function getCompartmentEvents(db: Database, sessionId: string): StoredCom
         atCompartment: r.at_compartment,
         fields: parseFields(r.fields_json),
         createdAt: r.created_at,
+    }));
+}
+
+/** Read project-scoped events oldest first for idempotent background consumers. */
+export function getProjectCompartmentEvents(
+    db: Database,
+    projectIdentity: string,
+    kind: string,
+): ProjectCompartmentEvent[] {
+    const rows = db
+        .prepare(
+            `SELECT DISTINCT events.id, events.session_id, events.compartment_id, events.kind,
+                    events.at_compartment, events.fields_json, events.created_at,
+                    compartments.start_message, compartments.end_message
+               FROM compartment_events events
+               JOIN session_projects projects ON projects.session_id = events.session_id
+               LEFT JOIN compartments
+                 ON compartments.id = events.compartment_id
+                AND compartments.session_id = events.session_id
+              WHERE projects.project_path = ? AND events.kind = ?
+              ORDER BY events.id ASC`,
+        )
+        .all(projectIdentity, kind) as Array<{
+        id: number;
+        session_id: string;
+        compartment_id: number | null;
+        kind: string;
+        at_compartment: number | null;
+        fields_json: string;
+        created_at: number;
+        start_message: number | null;
+        end_message: number | null;
+    }>;
+    return rows.map((row) => ({
+        id: row.id,
+        sessionId: row.session_id,
+        compartmentId: row.compartment_id,
+        kind: row.kind,
+        atCompartment: row.at_compartment,
+        fields: parseFields(row.fields_json),
+        createdAt: row.created_at,
+        compartmentStartMessage: row.start_message,
+        compartmentEndMessage: row.end_message,
     }));
 }
 

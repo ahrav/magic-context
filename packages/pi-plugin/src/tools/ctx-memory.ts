@@ -1,6 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getAuthorityManagedMarker } from "@magic-context/core/features/magic-context/context-authority";
-import { V2_MEMORY_CATEGORIES } from "@magic-context/core/features/magic-context/memory";
+import { WRITABLE_MEMORY_CATEGORIES } from "@magic-context/core/features/magic-context/memory";
 import { getProjectEmbeddingSnapshot } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -8,7 +8,10 @@ import {
 	ClaimOperationKeyReuseError,
 } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { executeCtxMemoryClaimAction } from "@magic-context/core/tools/ctx-memory/claim-actions";
+import {
+	assertCtxMemoryWriteShape,
+	executeCtxMemoryClaimAction,
+} from "@magic-context/core/tools/ctx-memory/claim-actions";
 import {
 	CTX_MEMORY_DESCRIPTION,
 	CTX_MEMORY_MUTATION_TOKEN_RULE,
@@ -38,6 +41,19 @@ const MutationTokenSchema = Type.Object({
 	policyHeadsDigest: Type.String(),
 });
 
+const AntiMemorySchema = Type.Object({
+	trigger: Type.String(),
+	rejectedStrategy: Type.String(),
+	rejectionReason: Type.String(),
+	saferAlternative: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	preconditions: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	attemptedApproach: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	observedFailure: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	rootCause: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	recovery: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	nonApplicableWhen: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+});
+
 const ParamsSchema = Type.Object(
 	{
 		action: Type.Optional(
@@ -51,12 +67,13 @@ const ParamsSchema = Type.Object(
 		content: Type.Optional(Type.String({ description: "Claim content" })),
 		category: Type.Optional(
 			Type.Union(
-				V2_MEMORY_CATEGORIES.map((category) => Type.Literal(category)),
+				WRITABLE_MEMORY_CATEGORIES.map((category) => Type.Literal(category)),
 				{
 					description: "Claim category or list filter",
 				},
 			),
 		),
+		antiMemory: Type.Optional(AntiMemorySchema),
 		publicClaimId: Type.Optional(
 			Type.String({
 				description: "Public claim ID for single-claim mutations",
@@ -123,7 +140,15 @@ export function createCtxMemoryTool(
 				params = unwrapImitatedReducedArgs(params, ["action"], {
 					action: { type: "enum", values: ALL_ACTIONS },
 					content: "string",
-					category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+					category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
+					antiMemory: {
+						type: "object",
+						fields: {
+							trigger: "string",
+							rejectedStrategy: "string",
+							rejectionReason: "string",
+						},
+					},
 					publicClaimId: "string",
 					publicClaimIds: { type: "array", items: "string", maxItems: 20 },
 					mutationToken: CTX_MEMORY_MUTATION_TOKEN_RULE,
@@ -150,6 +175,7 @@ export function createCtxMemoryTool(
 					);
 				}
 				const action = rawAction as (typeof ALL_ACTIONS)[number];
+				assertCtxMemoryWriteShape({ ...params, action } as CtxMemoryArgs);
 				if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(action)) {
 					return err(
 						`Error: Action '${action}' is not allowed in this context.`,

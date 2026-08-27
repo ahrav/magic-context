@@ -15719,6 +15719,30 @@ fn ctx_memory_schema() -> Value {
             "policyHeadsDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         }
     });
+    let positive_categories = json!([
+        "PROJECT_RULES",
+        "ARCHITECTURE",
+        "CONSTRAINTS",
+        "CONFIG_VALUES",
+        "NAMING"
+    ]);
+    let anti_memory = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trigger", "rejectedStrategy", "rejectionReason"],
+        "properties": {
+            "trigger": { "type": "string", "minLength": 1 },
+            "rejectedStrategy": { "type": "string", "minLength": 1 },
+            "rejectionReason": { "type": "string", "minLength": 1 },
+            "saferAlternative": { "type": ["string", "null"] },
+            "preconditions": { "type": ["string", "null"] },
+            "attemptedApproach": { "type": ["string", "null"] },
+            "observedFailure": { "type": ["string", "null"] },
+            "rootCause": { "type": ["string", "null"] },
+            "recovery": { "type": ["string", "null"] },
+            "nonApplicableWhen": { "type": ["string", "null"] }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": true,
@@ -15729,9 +15753,10 @@ fn ctx_memory_schema() -> Value {
             },
             "category": {
                 "type": "string",
-                "enum": ["PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALUES", "NAMING"]
+                "enum": ["PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALUES", "NAMING", "REJECTED_APPROACH"]
             },
             "content": { "type": "string", "maxLength": 65536 },
+            "antiMemory": anti_memory,
             "publicClaimId": { "type": "string", "pattern": "^mcm_[0-9a-f]{32}$" },
             "publicClaimIds": {
                 "type": "array",
@@ -15747,7 +15772,48 @@ fn ctx_memory_schema() -> Value {
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
             "reason": { "type": "string", "maxLength": 4096 },
             "memory_project": { "type": "string" }
-        }
+        },
+        "oneOf": [
+            {
+                "required": ["action", "category", "content"],
+                "properties": {
+                    "action": { "const": "create" },
+                    "category": { "enum": positive_categories }
+                },
+                "not": { "required": ["antiMemory"] }
+            },
+            {
+                "required": ["action", "category", "antiMemory"],
+                "properties": {
+                    "action": { "const": "create" },
+                    "category": { "const": "REJECTED_APPROACH" }
+                },
+                "not": { "required": ["content"] }
+            },
+            {
+                "required": ["action"],
+                "properties": {
+                    "action": { "const": "revise" },
+                    "category": { "enum": positive_categories }
+                },
+                "anyOf": [{ "required": ["content"] }, { "required": ["category"] }],
+                "not": { "required": ["antiMemory"] }
+            },
+            {
+                "required": ["action", "category", "antiMemory"],
+                "properties": {
+                    "action": { "const": "revise" },
+                    "category": { "const": "REJECTED_APPROACH" }
+                },
+                "not": { "required": ["content"] }
+            },
+            {
+                "required": ["action"],
+                "properties": {
+                    "action": { "enum": ["get", "list", "archive", "restore", "merge"] }
+                }
+            }
+        ]
     })
 }
 
@@ -25367,6 +25433,7 @@ mod tests {
                 "ctx_memory",
                 vec![
                     "action",
+                    "antiMemory",
                     "category",
                     "content",
                     "publicClaimId",
@@ -25415,6 +25482,18 @@ mod tests {
             by_name["ctx_expand"].schema["properties"]["verbose"]["type"],
             json!("boolean"),
             "ctx_expand must advertise verbose range previews"
+        );
+        assert_eq!(
+            by_name["ctx_memory"].schema["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(5),
+            "ctx_memory write arms must stay discriminated"
+        );
+        assert!(
+            by_name["ctx_memory"].schema["properties"]["category"]["enum"]
+                .as_array()
+                .is_some_and(|categories| categories.contains(&json!("REJECTED_APPROACH")))
         );
 
         for (name, expected) in expected_fields {
@@ -25544,6 +25623,38 @@ mod tests {
         )
         .await;
         assert!(tool_is_error(oversized));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_advertises_anti_memory_but_keeps_mutation_host_owned() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[(
+            "token",
+            FakeResolve::Hit("opaque-own-conversation".to_string()),
+        )]);
+        let (handler, _store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(test_route(7), binding("/repo", "token"));
+
+        let outcome = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "create",
+                "category": "REJECTED_APPROACH",
+                "antiMemory": {
+                    "trigger": "Choosing a cache backend",
+                    "rejectedStrategy": "Use Redis",
+                    "rejectionReason": "The project must work offline"
+                }
+            }),
+        )
+        .await;
+        let body = tool_body(outcome);
+        assert_eq!(body["isError"], json!(true));
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("host claim-operation commit path")));
     }
 
     /// A classify budget large enough that no test's own setup can exhaust it,

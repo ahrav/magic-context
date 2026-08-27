@@ -40,6 +40,7 @@ import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
+import { harvestAntiMemoriesFromCorrections } from "./anti-memory-from-corrections";
 import {
     claimManifestBinding,
     dreamerInferenceProvenance,
@@ -819,6 +820,16 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
 
             if (config.task === "retrospective") {
                 const memoryBefore = censusProjectMemoryClaims(db, projectIdentity);
+                const correctionHarvest = runLeaseGuardedWrite(
+                    db,
+                    holderId,
+                    leaseKey,
+                    () => harvestAntiMemoriesFromCorrections({ db, projectIdentity }),
+                    leaseAcquisition.generation,
+                );
+                if (!correctionHarvest) {
+                    throw new Error("Dream lease lost during trajectory-correction harvest");
+                }
                 const retro = await runRetrospectiveTask(config, ctx, {
                     deps,
                     deadline,
@@ -832,7 +843,10 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 // projects still writing that table.
                 recordRun("completed", null, {
                     memoryChanges:
-                        claimEffectMemoryChanges(retro.effects) ?? computeMemoryDelta(memoryBefore),
+                        claimEffectMemoryChanges([
+                            ...correctionHarvest.effects,
+                            ...retro.effects,
+                        ]) ?? computeMemoryDelta(memoryBefore),
                 });
                 // Advance the content watermark on completion (incl. clean "n"
                 // runs) so the next run only scans newer messages.

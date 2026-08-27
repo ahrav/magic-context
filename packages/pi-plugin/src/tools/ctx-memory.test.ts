@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { installAuthorityManagedMarker } from "@magic-context/core/features/magic-context/context-authority";
+import { readAntiMemory } from "@magic-context/core/features/magic-context/memory/storage-anti-memory";
 import {
 	computeProjectMemoryMutationToken,
 	getProjectMemoryClaimByPublicId,
@@ -31,6 +32,8 @@ type JsonResult = {
 		publicClaimId: string;
 		revisionLocator: string;
 		content: string;
+		category?: string;
+		antiMemory?: Record<string, string | null>;
 		lifecycleState: string;
 		mutationToken: MutationToken;
 	}>;
@@ -108,6 +111,50 @@ describe("Pi ctx_memory U4 scenario 1: create", () => {
 			);
 			expect(result.affectedClaims?.[0]?.revisionLocator).toContain("/r1/");
 			expect(result.generation).toBe(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});
+
+describe("Pi ctx_memory anti-memory write union", () => {
+	it("creates typed anti-memory and rejects cross-arm payloads", async () => {
+		const db = createClaimReaderTestDatabase();
+		try {
+			const tool = harness(db);
+			const antiMemory = {
+				trigger: "Choosing a cache backend",
+				rejectedStrategy: "Use Redis",
+				rejectionReason: "The project must work offline",
+			};
+			const created = parseResult(
+				await tool.execute(
+					{ action: "create", category: "REJECTED_APPROACH", antiMemory },
+					"call-anti-create",
+				),
+			);
+			const id = created.affectedClaims?.[0]?.publicClaimId;
+			expect(readAntiMemory(db, id as string)?.payload).toMatchObject(
+				antiMemory,
+			);
+			for (const [callId, args] of [
+				[
+					"call-anti-missing",
+					{ action: "create", category: "REJECTED_APPROACH" },
+				],
+				[
+					"call-positive-anti",
+					{
+						action: "create",
+						category: "ARCHITECTURE",
+						content: "positive",
+						antiMemory,
+					},
+				],
+			] as const) {
+				const result = await tool.execute(args, callId);
+				expect(result.isError).toBeTrue();
+			}
 		} finally {
 			closeQuietly(db);
 		}

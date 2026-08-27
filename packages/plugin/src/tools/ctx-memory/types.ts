@@ -1,4 +1,5 @@
 import type { ClaimMutationToken } from "../../features/magic-context/memory/claim-operation-contract";
+import type { AntiMemoryPayload } from "../../features/magic-context/memory/storage-anti-memory";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
@@ -18,10 +19,44 @@ export const CTX_MEMORY_DREAMER_ACTIONS = [...CTX_MEMORY_ACTIONS, "list"] as con
 
 export type CtxMemoryAction = (typeof CTX_MEMORY_DREAMER_ACTIONS)[number];
 
+type PositiveWriteCategory =
+    | "PROJECT_RULES"
+    | "ARCHITECTURE"
+    | "CONSTRAINTS"
+    | "CONFIG_VALUES"
+    | "NAMING";
+
+export type CtxMemoryWriteArgs =
+    | {
+          action: "create";
+          category: PositiveWriteCategory;
+          content: string;
+          antiMemory?: never;
+      }
+    | {
+          action: "create";
+          category: "REJECTED_APPROACH";
+          antiMemory: AntiMemoryPayload;
+          content?: never;
+      }
+    | {
+          action: "revise";
+          category?: PositiveWriteCategory;
+          content?: string;
+          antiMemory?: never;
+      }
+    | {
+          action: "revise";
+          category: "REJECTED_APPROACH";
+          antiMemory: AntiMemoryPayload;
+          content?: never;
+      };
+
 export interface CtxMemoryArgs extends ImitatedReducedArgs {
     action?: CtxMemoryAction;
     content?: string;
     category?: string;
+    antiMemory?: AntiMemoryPayload;
     /** Single target for revise/archive/restore. */
     publicClaimId?: string;
     /** Targets for get; ordered [target, ...sources] for merge. */

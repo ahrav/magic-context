@@ -18,6 +18,7 @@ import {
     hasPrimerRowsWithStaleEmbeddings,
 } from "../storage-primers";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
+import { countPendingCorrectionEvents } from "./anti-memory-from-corrections";
 import { getTaskScheduleState } from "./storage-task-schedule";
 import {
     CANONICAL_DREAM_TASKS,
@@ -344,11 +345,12 @@ export function getDreamTaskBacklog(
             return { pending: countUnclassifiedActiveMemories(db, projectPath), total };
         }
         case "retrospective": {
-            const pending = countProjectSessionsSince(
+            const pendingSessions = countProjectSessionsSince(
                 db,
                 projectPath,
                 options.retrospectiveWatermarkMs ?? null,
             );
+            const pending = pendingSessions + countPendingCorrectionEvents(db, projectPath);
             return { pending, total: pending };
         }
         case "maintain-docs": {
@@ -441,7 +443,10 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // session updated mid-run would otherwise be skipped. The executor's
             // raw provider does the precise typed-user-message scan and bails
             // before any child session if empty. Never-run → "sessions exist".
-            return countProjectSessionsSince(db, project, ctx.retrospectiveWatermarkMs ?? null) > 0;
+            return (
+                countPendingCorrectionEvents(db, project) > 0 ||
+                countProjectSessionsSince(db, project, ctx.retrospectiveWatermarkMs ?? null) > 0
+            );
 
         case "maintain-docs":
             // New compartments since the last maintain-docs run. Never-run → any exist.

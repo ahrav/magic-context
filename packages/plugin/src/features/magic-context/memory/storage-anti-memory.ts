@@ -9,6 +9,7 @@ import {
     type ClaimEvidenceProvenance,
     ClaimOperationInputError,
     type ClaimOperationRunResult,
+    type ClaimOperationStageOutcome,
     type ProducerIdentity,
     runClaimOperation,
     stageCreateProjectMemoryClaimInCurrentTransaction,
@@ -187,14 +188,45 @@ function insertPayload(
     );
 }
 
+export function stageCreateAntiMemoryInCurrentTransaction(
+    db: Database,
+    input: CreateAntiMemoryInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const payload = normalizePayload(input.payload);
+    const staged = stageCreateProjectMemoryClaimInCurrentTransaction(
+        db,
+        {
+            projectId: input.projectId,
+            content: renderAntiMemoryContent(payload),
+            dedupText: antiMemoryDedupText(payload),
+            category: ANTI_MEMORY_CATEGORY,
+            importance: input.importance,
+            memoryScope: "project",
+            sharing: "private",
+            expiresAt: nowMs + ANTI_MEMORY_DEFAULT_TTL_MS,
+            provenance: input.provenance,
+            actor: input.actor,
+            requestScope: input.requestScope,
+            nowMs,
+        },
+        nowMs,
+    );
+    if (staged.kind === "effects") {
+        const created = staged.effects.find((effect) => effect.changeKind === "upsert");
+        if (created?.revisionId != null) {
+            insertPayload(db, created.revisionId, created.claimId, payload, nowMs);
+        }
+    }
+    return staged;
+}
+
 export function createAntiMemory(
     db: Database,
     producer: ProducerIdentity,
     input: CreateAntiMemoryInput,
 ): ClaimOperationRunResult {
     const payload = normalizePayload(input.payload);
-    const content = renderAntiMemoryContent(payload);
-    const dedupText = antiMemoryDedupText(payload);
     const nowMs = input.nowMs ?? Date.now();
     return runClaimOperation(
         db,
@@ -209,33 +241,7 @@ export function createAntiMemory(
                 requestScope: input.requestScope ?? null,
             }),
         },
-        () => {
-            const staged = stageCreateProjectMemoryClaimInCurrentTransaction(
-                db,
-                {
-                    projectId: input.projectId,
-                    content,
-                    dedupText,
-                    category: ANTI_MEMORY_CATEGORY,
-                    importance: input.importance,
-                    memoryScope: "project",
-                    sharing: "private",
-                    expiresAt: nowMs + ANTI_MEMORY_DEFAULT_TTL_MS,
-                    provenance: input.provenance,
-                    actor: input.actor,
-                    requestScope: input.requestScope,
-                    nowMs,
-                },
-                nowMs,
-            );
-            if (staged.kind === "effects") {
-                const created = staged.effects.find((effect) => effect.changeKind === "upsert");
-                if (created?.revisionId != null) {
-                    insertPayload(db, created.revisionId, created.claimId, payload, nowMs);
-                }
-            }
-            return staged;
-        },
+        () => stageCreateAntiMemoryInCurrentTransaction(db, { ...input, payload }, nowMs),
         nowMs,
     );
 }
