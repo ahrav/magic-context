@@ -679,12 +679,21 @@ export function validateCredentialsDoc(
         )) {
             const fieldEntries = Object.entries(variant.fields);
             const placeholderPositions = new Map<string, number>();
+            // Count occurrences, not distinct names: a Map keyed by name would
+            // collapse a template that repeats one placeholder, and
+            // `renderArgumentVariant` substitutes only `field.position`, so
+            // every other copy of that token would survive into argv unrendered.
+            let placeholderCount = 0;
             variant.template.forEach((token, index) => {
                 if (token.startsWith("{") && token.endsWith("}")) {
+                    placeholderCount += 1;
                     placeholderPositions.set(token.slice(1, -1), index);
                 }
             });
-            if (placeholderPositions.size !== fieldEntries.length) {
+            if (
+                placeholderCount !== fieldEntries.length ||
+                placeholderPositions.size !== fieldEntries.length
+            ) {
                 fail(
                     `${harnessName}/${variantName}: fields and template placeholders must correspond one-to-one`,
                 );
@@ -899,13 +908,19 @@ export const INPUT_KEYS = [
 
 const APPROVED_SPDX = ["Apache-2.0", "MIT"] as const;
 const SHA256_RE = /^[0-9a-f]{64}$/;
-const MUTABLE_SOURCE_PATTERNS = [
-    "/main/",
-    "/master/",
-    "/latest/",
-    "/HEAD/",
-    "/nightly/",
-];
+/**
+ * Ref names that identify a moving target rather than one immutable revision.
+ * Matched per URL path segment, so a ref is rejected wherever it appears —
+ * including as the final segment (`.../repo/main`), which a substring match on
+ * `/main/` misses because nothing follows the ref to supply the closing slash.
+ */
+const MUTABLE_SOURCE_REFS = new Set([
+    "main",
+    "master",
+    "latest",
+    "HEAD",
+    "nightly",
+]);
 const FIXTURE_OR_CACHE_PATH_PATTERNS = [
     "synapse-tiny",
     "tests/fixtures",
@@ -914,6 +929,15 @@ const FIXTURE_OR_CACHE_PATH_PATTERNS = [
     "/.bun/",
     "/target/",
 ];
+/**
+ * Denied only when qualifying for production. `scripts/__fixtures__` holds the
+ * committed qualification fixtures — tiny text stand-ins named after the real
+ * artifacts (`model.onnx`, `ort-runtime.so`) carrying `example.invalid`
+ * provenance. Those files are the intended input in `test-fixture` mode, so the
+ * pattern cannot join the all-mode list, but a production manifest that points
+ * at them must never reach `productionQualified: true`.
+ */
+const PRODUCTION_ONLY_DENIED_PATH_PATTERNS = ["__fixtures__"];
 
 /**
  * Resolve a `verify_local_path` to the exact absolute path whose bytes will be
@@ -967,6 +991,15 @@ function resolveVerifyPath(
                 fail(
                     `inputs.${key}: fixture/developer-cache verify path (${pattern}) is rejected`,
                 );
+            }
+        }
+        if (mode === "production") {
+            for (const pattern of PRODUCTION_ONLY_DENIED_PATH_PATTERNS) {
+                if (candidate.includes(pattern)) {
+                    fail(
+                        `inputs.${key}: fixture/developer-cache verify path (${pattern}) is rejected`,
+                    );
+                }
             }
         }
     }
@@ -1110,10 +1143,12 @@ function validateQualifiedArtifact(
     ) {
         fail(`inputs.${key}: source must be an https URL naming one artifact`);
     }
-    for (const pattern of MUTABLE_SOURCE_PATTERNS) {
-        if (artifact.source.includes(pattern)) {
+    // Compare per path segment so a mutable ref is caught in any position.
+    // The host is excluded deliberately: only the path names the revision.
+    for (const segment of new URL(artifact.source).pathname.split("/")) {
+        if (MUTABLE_SOURCE_REFS.has(segment)) {
             fail(
-                `inputs.${key}: mutable source identity (${pattern.replaceAll("/", "")} ref) is rejected`,
+                `inputs.${key}: mutable source identity (${segment} ref) is rejected`,
             );
         }
     }

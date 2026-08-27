@@ -9,7 +9,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildContract } from "./generate-mc-host-release-manifest";
@@ -85,14 +85,34 @@ function installManifest(root: string, manifest: any): void {
     );
 }
 
-function installProductionManifest(root: string): void {
+/**
+ * Where production-mode tests stage artifact bytes. Production qualification
+ * denies any verify path under `scripts/__fixtures__`, so a production manifest
+ * must name a location outside it — as a real qualifying host would.
+ */
+const STAGED_PRODUCTION_INPUT_DIR = "opt/mc-host-inputs";
+
+// biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
+function installProductionManifest(
+    root: string,
+    mutate?: (manifest: any) => void,
+): void {
     const manifest = fixtureManifest();
     manifest.mode = "production";
+    const stagedDir = join(root, STAGED_PRODUCTION_INPUT_DIR);
+    mkdirSync(stagedDir, { recursive: true });
+    cpSync(join(repoRoot, FIXTURE_DIR, "artifacts"), stagedDir, {
+        recursive: true,
+    });
     for (const artifact of Object.values(manifest.inputs) as {
         verify_local_path: string;
     }[]) {
-        artifact.verify_local_path = join(root, artifact.verify_local_path);
+        artifact.verify_local_path = join(
+            stagedDir,
+            basename(artifact.verify_local_path),
+        );
     }
+    mutate?.(manifest);
     installManifest(root, manifest);
 }
 
@@ -206,6 +226,21 @@ describe("immutable input fail-closed rules", () => {
         );
     });
 
+    test("a mutable ref as the final path segment is rejected", () => {
+        // No trailing slash follows the ref, so a substring match on `/main/`
+        // misses it while the URL still names a moving branch.
+        for (const ref of ["main", "master", "latest", "HEAD", "nightly"]) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.inputs.model_onnx.source =
+                `https://models.example.invalid/gte-modernbert-base-f16/resolve/${ref}`;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                new RegExp(`mutable source identity \\(${ref} ref\\)`),
+            );
+        }
+    });
+
     test("placeholder hashes are rejected", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
@@ -213,6 +248,28 @@ describe("immutable input fail-closed rules", () => {
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).toThrow(
             /placeholder hash/,
+        );
+    });
+
+    test("production mode rejects the committed qualification fixtures", () => {
+        // The fixture artifacts are tiny text stand-ins named `model.onnx` and
+        // `ort-runtime.so` with `example.invalid` provenance. Flipping the
+        // fixture manifest to production and absolutizing its paths in place
+        // must not let those bytes reach productionQualified.
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        manifest.mode = "production";
+        for (const artifact of Object.values(manifest.inputs) as {
+            verify_local_path: string;
+        }[]) {
+            artifact.verify_local_path = join(
+                root,
+                artifact.verify_local_path,
+            );
+        }
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).toThrow(
+            /fixture\/developer-cache verify path \(__fixtures__\)/,
         );
     });
 
@@ -321,18 +378,9 @@ describe("oracle evidence hook", () => {
         expect(withOracle.productionQualified).toBe(true);
 
         const absent = freshRoot();
-        const manifest = fixtureManifest();
-        manifest.mode = "production";
-        for (const artifact of Object.values(manifest.inputs) as {
-            verify_local_path: string;
-        }[]) {
-            artifact.verify_local_path = join(
-                absent,
-                artifact.verify_local_path,
-            );
-        }
-        manifest.oracle = null;
-        installManifest(absent, manifest);
+        installProductionManifest(absent, (manifest) => {
+            manifest.oracle = null;
+        });
         const result = generate(absent, { check: false });
         expect(result.productionQualified).toBe(false);
         const evidence = JSON.parse(
@@ -402,6 +450,25 @@ describe("provider-credential matrix", () => {
     test("matrix pins agree with the U8 contract", () => {
         validateCredentialsDoc(doc, buildContract());
         assertPinsMatchContract(buildContract());
+    });
+
+    test("a repeated template placeholder fails the one-to-one check", () => {
+        // Keyed by name, a Map collapses the duplicate and reports size 1 for a
+        // 1-field variant. `renderArgumentVariant` substitutes only
+        // `field.position`, so the other `{model}` would survive into argv.
+        const bad = credentialsCopy();
+        const [harness] = Object.keys(bad.harnesses);
+        const variants = bad.harnesses[harness].argument_variants.variants;
+        const [variantName] = Object.keys(variants);
+        const variant = variants[variantName];
+        const [fieldName, field] = Object.entries(
+            variant.fields as Record<string, { position: number }>,
+        )[0];
+        variant.template = ["--flag", `{${fieldName}}`, `{${fieldName}}`];
+        variant.fields = { [fieldName]: { ...field, position: 1 } };
+        expect(() => validateCredentialsDoc(bad, buildContract())).toThrow(
+            /fields and template placeholders must correspond one-to-one/,
+        );
     });
 
     test("mismatched U8 values fail closed", () => {
@@ -898,7 +965,7 @@ describe("verify-path resolution", () => {
 
         // Drop the artifacts a foreign host (CI) would never hold. Drift
         // checking of the committed lock must still work.
-        rmSync(join(root, FIXTURE_DIR, "artifacts"), {
+        rmSync(join(root, STAGED_PRODUCTION_INPUT_DIR), {
             recursive: true,
             force: true,
         });
