@@ -135,7 +135,12 @@ pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -
 
 /// Resolves the data root: the override, a nonempty `$XDG_DATA_HOME`, or a
 /// nonempty `$HOME/.local/share`, in that order.
-pub(crate) fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
+///
+/// Public so out-of-crate launchers can name the same data root this crate
+/// uses instead of reconstructing it by walking parents off a derived path;
+/// that inversion silently breaks whenever the managed layout gains or loses
+/// a level.
+pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     match data_dir_override {
         Some(dir) => Ok(dir.to_path_buf()),
         None => match std::env::var_os("XDG_DATA_HOME") {
@@ -150,13 +155,22 @@ pub(crate) fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf,
     }
 }
 
+/// The single managed subtree segment under the data root. Every managed
+/// path derives from this one definition so a rename cannot leave part of
+/// the tree behind.
+pub const MANAGED_DIR_NAME: &str = "cortexkit";
+
+/// Resolves `${dataDir}/cortexkit`: the replaceable managed subtree that
+/// holds the runtime directory, the lifecycle root, and module storage.
+pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
+    Ok(data_dir_path(data_dir_override)?.join(MANAGED_DIR_NAME))
+}
+
 /// Resolves `${dataDir}/cortexkit/run`, where dataDir is the override, a
 /// nonempty `$XDG_DATA_HOME`, or a nonempty `$HOME/.local/share`, in that
 /// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
-    Ok(data_dir_path(data_dir_override)?
-        .join("cortexkit")
-        .join("run"))
+    Ok(managed_dir_path(data_dir_override)?.join("run"))
 }
 
 /// One secured host incarnation: validated directory descriptor, held lock,

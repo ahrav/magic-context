@@ -60,6 +60,29 @@ fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
     Ok(OwnedFd::from(file))
 }
 
+/// Relocates a descriptor to a number strictly above stderr.
+///
+/// The child's redirection sequence assigns fds 0, 1, and 2, and `dup2`
+/// closes its target before duplicating. If the launcher was invoked with any
+/// of 0/1/2 already closed, a descriptor opened here would occupy one of
+/// those slots and be destroyed by the very sequence that reads it: with fd 0
+/// closed, `log_fd` lands at 0, `dup2(pipe_r, 0)` closes it, and the
+/// following `dup2(log_fd, 1)` then duplicates the pipe's read end into
+/// stdout. Hoisting every child-side descriptor above 2 first makes each
+/// source disjoint from every target.
+fn relocate_above_stderr(fd: OwnedFd) -> Result<OwnedFd, SpawnError> {
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    // SAFETY: `fd` is an owned live descriptor; F_DUPFD_CLOEXEC returns a new
+    // owned descriptor at or above the requested minimum, or -1.
+    let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    let raw = cvt(raw, "descriptor relocation failed")?;
+    // SAFETY: `raw` was just returned by F_DUPFD_CLOEXEC and is owned here;
+    // the original `fd` is dropped at the end of this scope.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
 /// Forks a fully detached `ck-mc-host serve` daemon and writes the bounded
 /// startup envelope to its stdin pipe. The child: new session, owner-only
 /// umask, cwd `/`, stdin from the envelope pipe, stdout/stderr appended to
@@ -73,7 +96,7 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
     if envelope.len() > MAX_ENVELOPE_BYTES {
         return Err(SpawnError("startup envelope exceeds size bound"));
     }
-    let log_fd = open_log(log_path)?;
+    let log_fd = relocate_above_stderr(open_log(log_path)?)?;
     // Retained executable identity: the fd is validated (regular, owned)
     // and execution uses only this open file description.
     let exe = std::fs::File::open("/proc/self/exe")
@@ -86,7 +109,7 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
     if !exe_meta.is_file() || exe_meta.uid() != euid {
         return Err(SpawnError("executable failed identity checks"));
     }
-    let exe_fd = OwnedFd::from(exe);
+    let exe_fd = relocate_above_stderr(OwnedFd::from(exe))?;
 
     let mut pipe_fds = [0 as libc::c_int; 2];
     // SAFETY: pipe2 writes exactly two descriptors into the array.
@@ -101,6 +124,10 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
             OwnedFd::from_raw_fd(pipe_fds[1]),
         )
     };
+    // The read end is a `dup2` source in the child, so it must not sit in a
+    // slot the sequence assigns. A same-fd `dup2(0, 0)` would also leave the
+    // pipe's `O_CLOEXEC` set, closing the daemon's stdin across the exec.
+    let pipe_r = relocate_above_stderr(pipe_r)?;
 
     // Everything the child touches is prepared before fork: with tokio
     // worker threads alive, the child may only use async-signal-safe calls

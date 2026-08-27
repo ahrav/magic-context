@@ -25,6 +25,15 @@ use crate::instance::{
 /// Canonical lifecycle-record name inside the runtime directory.
 pub const LIFECYCLE_RECORD_NAME: &str = "mc-host-lifecycle.json";
 
+/// The probe reason for a quarantined persisted record: the bytes decode to
+/// an unknown schema, so they are preserved untouched rather than repaired.
+///
+/// Exported because it is a load-bearing classification, not a diagnostic
+/// string: `InstanceGuard::acquire` refuses to start over a quarantined
+/// record, so every caller that acts on a probe must recognize this reason in
+/// both its `Stopped` (both fences free) and `Wedged` (fence held) shapes.
+pub const UNSUPPORTED_STATE_SCHEMA_REASON: &str = "unsupported_state_schema";
+
 /// Version-neutral coordination directory name directly under the data root.
 /// Every release resolves this same owner-only directory; supported code
 /// never renames, replaces, or unlinks it.
@@ -556,7 +565,7 @@ impl NamespaceAnchor {
     /// Absent entries are simply not captured: creating them later is the
     /// mutator's own work, not drift.
     pub fn capture(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
-        let base = data_dir_path(data_dir_override)?.join("cortexkit");
+        let base = crate::instance::managed_dir_path(data_dir_override)?;
         let mut entries = Vec::new();
         for path in [base.clone(), base.join("lifecycle"), base.join("run")] {
             let Some(fd) = open_validated_dir(&path, "managed namespace directory")? else {
@@ -962,7 +971,7 @@ fn classify(
         // bytes are still surfaced so callers report them instead of
         // treating the root as cleanly reusable.
         let reason = if unknown_schema {
-            "unsupported_state_schema"
+            UNSUPPORTED_STATE_SCHEMA_REASON
         } else if sample.record != EvidenceFile::Absent
             || sample.publication != EvidenceFile::Absent
         {
@@ -997,7 +1006,7 @@ fn classify(
     }
 
     if unknown_schema {
-        return wedged("unsupported_state_schema", record);
+        return wedged(UNSUPPORTED_STATE_SCHEMA_REASON, record);
     }
     if sample.record == EvidenceFile::Insecure {
         return wedged("lifecycle record failed security checks", record);

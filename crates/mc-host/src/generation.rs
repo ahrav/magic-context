@@ -25,8 +25,8 @@ use rustix::fs::{fsync, mkdirat, openat, renameat, unlinkat, AtFlags, Mode, OFla
 use sha2::Digest;
 
 use crate::instance::{
-    hex, io_err, is_safe_ancestor, mode_bits, read_all_fd, write_all_fd, InstanceError, S_IFDIR,
-    S_IFMT, S_IFREG,
+    hex, io_err, is_safe_ancestor, is_secure_regular, mode_bits, read_all_fd, write_all_fd,
+    InstanceError, S_IFDIR, S_IFMT, S_IFREG,
 };
 use crate::lifecycle::{is_canonical_payload_digest, lifecycle_dir_path};
 
@@ -359,17 +359,24 @@ impl GenerationStore {
     }
 
     /// No-create open for observational probes: `Ok(None)` when the store
-    /// does not exist yet.
+    /// does not exist yet. An existing root is held to exactly the same
+    /// ownership and ancestor predicate as [`Self::open`]: this is the path
+    /// production `start`/`restart` and the daemon itself take, so an
+    /// insecure root fails closed here rather than being silently accepted.
     pub fn open_probe(data_dir_override: Option<&Path>) -> Result<Option<Self>, GenerationError> {
         let root = lifecycle_dir_path(data_dir_override)?;
-        let Ok(root_fd) = openat(
+        let root_fd = match openat(
             rustix::fs::CWD,
             &*root,
             OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
-        ) else {
-            return Ok(None);
+        ) {
+            Ok(fd) => fd,
+            // Absent store: nothing staged yet, not a trust failure.
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(e) => return Err(io_err("open_lifecycle_root", &root, e).into()),
         };
+        validate_lifecycle_root_fd(&root_fd, &root)?;
         let Some(generations_fd) = open_child_dir(&root_fd, GENERATIONS_DIR_NAME) else {
             return Ok(None);
         };
@@ -397,7 +404,11 @@ impl GenerationStore {
             Err(_) => return Err(invalid("current profile failed security checks")),
         };
         let stat = rustix::fs::fstat(&fd).map_err(|_| invalid("current profile stat failed"))?;
-        if (mode_bits(&stat) & S_IFMT) != S_IFREG || stat.st_uid != owner_uid() {
+        // The profile is the selector that decides which generation runs, so
+        // it is held to the same predicate as every other trusted state file:
+        // owner-only, single-link, regular. A weaker check here would let an
+        // extra hard link or a group/other-writable mode redirect selection.
+        if !is_secure_regular(&stat) {
             return Err(invalid("current profile failed security checks"));
         }
         let bytes = read_all_fd(&fd, MAX_MANIFEST_BYTES)
@@ -669,6 +680,29 @@ impl GenerationStore {
         Ok(())
     }
 
+    /// Cheap removability classification for pruning. Only the manifest
+    /// schema separates a quarantined entry from a removable one, and that is
+    /// decided by the manifest decode alone; so pruning must not pay the
+    /// per-file hash and tree walk of `validate` for a directory it removes
+    /// either way. Every non-quarantine outcome (missing, insecure,
+    /// unreadable, corrupt, or fully valid) is removable, exactly as the
+    /// previous full-validation arms classified it.
+    fn is_quarantined_schema(&self, digest: &str) -> bool {
+        let Some(dir) = open_child_dir(&self.generations_fd, digest) else {
+            return false;
+        };
+        let Some(manifest_fd) = open_rel_nofollow(&dir, GENERATION_MANIFEST_NAME) else {
+            return false;
+        };
+        let Ok(bytes) = read_all_fd(&manifest_fd, MAX_MANIFEST_BYTES) else {
+            return false;
+        };
+        matches!(
+            decode_with_schema::<GenerationManifest>(&bytes),
+            SchemaDecode::UnknownSchema
+        )
+    }
+
     /// Prunes complete generations outside the protected set and removes
     /// owned incomplete staging temps. The caller holds `transaction.lock`
     /// and supplies every protected digest: the current profile target,
@@ -703,22 +737,14 @@ impl GenerationStore {
             if protected.contains(&name) {
                 continue;
             }
-            match self.validate(&name) {
-                Ok(_) => {
-                    remove_tree(&self.generations_fd, &name)?;
-                    report.removed_generations += 1;
-                }
-                Err(GenerationError::UnsupportedStateSchema) => {
-                    report.quarantined += 1;
-                }
-                // An invalid unprotected generation is still removable: it
-                // is complete garbage under a canonical name, referenced by
-                // nothing in the protected set.
-                Err(GenerationError::NativePayloadInvalid { .. }) => {
-                    remove_tree(&self.generations_fd, &name)?;
-                    report.removed_generations += 1;
-                }
-                Err(err) => return Err(err),
+            // An unprotected generation is referenced by nothing in the
+            // protected set, so its file contents cannot change the outcome:
+            // only an unknown manifest schema preserves it.
+            if self.is_quarantined_schema(&name) {
+                report.quarantined += 1;
+            } else {
+                remove_tree(&self.generations_fd, &name)?;
+                report.removed_generations += 1;
             }
         }
         fsync(&self.generations_fd).map_err(|_| invalid("generations fsync failed"))?;
@@ -899,6 +925,21 @@ fn create_dir_all_owner_only(path: &Path) -> Result<(), GenerationError> {
     Ok(())
 }
 
+/// The lifecycle-root trust predicate: a directory we own whose ancestry
+/// cannot be replaced under us. Shared by the mutating and probe opens so a
+/// single definition governs both entry points.
+fn validate_lifecycle_root_fd(fd: &OwnedFd, path: &Path) -> Result<(), GenerationError> {
+    let stat = rustix::fs::fstat(fd).map_err(|e| io_err("fstat_lifecycle_root", path, e))?;
+    let mode = mode_bits(&stat);
+    if (mode & S_IFMT) != S_IFDIR || stat.st_uid != owner_uid() {
+        return Err(invalid("lifecycle root failed security checks"));
+    }
+    if !is_safe_ancestor(&stat) {
+        return Err(invalid("lifecycle root failed security checks"));
+    }
+    Ok(())
+}
+
 fn open_validated_dir_fd(path: &Path) -> Result<OwnedFd, GenerationError> {
     let fd = openat(
         rustix::fs::CWD,
@@ -907,14 +948,7 @@ fn open_validated_dir_fd(path: &Path) -> Result<OwnedFd, GenerationError> {
         Mode::empty(),
     )
     .map_err(|e| io_err("open_lifecycle_root", path, e))?;
-    let stat = rustix::fs::fstat(&fd).map_err(|e| io_err("fstat_lifecycle_root", path, e))?;
-    let mode = mode_bits(&stat);
-    if (mode & S_IFMT) != S_IFDIR || stat.st_uid != owner_uid() {
-        return Err(invalid("lifecycle root failed security checks"));
-    }
-    if !is_safe_ancestor(&stat) {
-        return Err(invalid("lifecycle root failed security checks"));
-    }
+    validate_lifecycle_root_fd(&fd, path)?;
     Ok(fd)
 }
 

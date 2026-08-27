@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use mc_host::generation::{GenerationError, GenerationStore, SourceSpec, StageMeta};
 use mc_host::{
     Client, InstanceError, LifecycleProbe, LifecycleState, LifecycleTransactionLock,
-    NamespaceAnchor, ProbeFreshness,
+    NamespaceAnchor, ProbeFreshness, SendOutcome,
 };
 use mc_module::release_contract;
 
@@ -320,6 +320,25 @@ fn probe_state(state: LifecycleState) -> &'static str {
     }
 }
 
+/// The one classification of a quarantined-record observation, shared by
+/// every command so they cannot drift.
+///
+/// `probe_lifecycle` reports the quarantined record as `stopped` when both
+/// fences are free and as `wedged` when one is held, but the record is
+/// quarantined in both shapes and `InstanceGuard::acquire` refuses to start
+/// over either. Commands that checked only the `wedged` shape would spawn a
+/// child that can never publish and then report `startup_timeout`, so the
+/// reason — not the state — is what callers must key on.
+fn quarantined_observation(observed: &LifecycleProbe) -> Option<(&'static str, &'static str)> {
+    if observed.reason != mc_host::UNSUPPORTED_STATE_SCHEMA_REASON {
+        return None;
+    }
+    Some((
+        probe_state(observed.state),
+        mc_host::UNSUPPORTED_STATE_SCHEMA_REASON,
+    ))
+}
+
 // -------------------------------------------------------------------------
 // Shared lifecycle plumbing.
 // -------------------------------------------------------------------------
@@ -385,6 +404,12 @@ impl Runtime {
 
     /// Authenticated `host.shutdown`; `Ok` is the full-frame acknowledgement
     /// commit point (KTD4).
+    ///
+    /// `Err("shutdown_outcome_unknown")` is distinct from a definite failure:
+    /// the request reached `WRITING`/`WRITTEN` and then timed out, so the host
+    /// may already have committed and begun tearing down. Collapsing it into a
+    /// not-committed result would let a caller report a serving daemon as
+    /// untouched while it goes down.
     fn shutdown(&self, publication: &Path) -> Result<(), &'static str> {
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
@@ -393,7 +418,10 @@ impl Runtime {
                 .map_err(|_| "authentication_failed")?;
             let result = client.host_shutdown().await;
             let _ = client.close().await;
-            result.map_err(|_| "shutdown_failed")
+            result.map_err(|error| match error.outcome() {
+                SendOutcome::OutcomeUnknown => "shutdown_outcome_unknown",
+                _ => "shutdown_failed",
+            })
         })
     }
 }
@@ -454,18 +482,15 @@ fn cmd_probe() -> DaemonResult {
         }
     };
     let state = probe_state(observed.state);
-    let (ok, reason) = match observed.state {
-        LifecycleState::Running => (true, "healthy"),
-        LifecycleState::Stopped if observed.reason == "unsupported_state_schema" => {
-            (false, "unsupported_state_schema")
-        }
-        LifecycleState::Stopped => (false, "not_running"),
-        LifecycleState::Starting => (false, "starting"),
-        LifecycleState::Stopping => (false, "stopping"),
-        LifecycleState::Wedged if observed.reason == "unsupported_state_schema" => {
-            (false, "unsupported_state_schema")
-        }
-        LifecycleState::Wedged => (false, "wedged"),
+    let (ok, reason) = match quarantined_observation(&observed) {
+        Some((_, reason)) => (false, reason),
+        None => match observed.state {
+            LifecycleState::Running => (true, "healthy"),
+            LifecycleState::Stopped => (false, "not_running"),
+            LifecycleState::Starting => (false, "starting"),
+            LifecycleState::Stopping => (false, "stopping"),
+            LifecycleState::Wedged => (false, "wedged"),
+        },
     };
     let mut result = DaemonResult::new("probe", ok, state, reason);
     result.versions.daemon = publication_daemon_ver(&observed);
@@ -488,9 +513,16 @@ struct StartOutcome {
     generation_check: Option<(&'static str, &'static str)>,
 }
 
+/// Starts a successor daemon.
+///
+/// `preresolved` carries a digest already resolved by a read-only preflight
+/// (see [`preflight_generation`]); when present the generation resolution is
+/// not repeated, so `restart` validates the successor exactly once even
+/// though it must do so before committing its stop.
 fn start_phase(
     runtime: &Runtime,
     payload_dir: Option<&Path>,
+    preresolved: Option<String>,
     anchor: &NamespaceAnchor,
     outer: Instant,
 ) -> StartOutcome {
@@ -503,9 +535,12 @@ fn start_phase(
     };
 
     // Validate or stage the requested generation (KTD9).
-    let digest = match resolve_generation(payload_dir) {
-        Ok(digest) => digest,
-        Err((state, reason)) => return fail(state, reason),
+    let digest = match preresolved {
+        Some(digest) => digest,
+        None => match resolve_generation(payload_dir) {
+            Ok(digest) => digest,
+            Err((state, reason)) => return fail(state, reason),
+        },
     };
 
     // Namespace identity must still hold before the spawn commit (KTD2).
@@ -515,12 +550,11 @@ fn start_phase(
 
     let envelope = serve::StartupEnvelope {
         schema: 1,
-        data_dir: match mc_host::runtime_dir_path(None) {
-            Ok(run_dir) => run_dir
-                .parent()
-                .and_then(Path::parent)
-                .expect("runtime dir has data-root ancestors")
-                .to_path_buf(),
+        // The library owns the managed layout; deriving the data root by
+        // walking parents off a derived path would silently break if that
+        // layout ever gained or lost a level.
+        data_dir: match mc_host::data_dir_path(None) {
+            Ok(data_dir) => data_dir,
             Err(_) => return fail("stopped", "internal_error"),
         },
         payload_manifest_digest: digest,
@@ -580,6 +614,33 @@ fn start_phase(
             };
         }
         std::thread::sleep(REPROBE_INTERVAL);
+    }
+}
+
+/// Read-only preflight of the successor generation, run before any stop.
+///
+/// `restart` commits an irreversible stop, so every successor condition that
+/// is already true on disk must be discovered first. Otherwise an absent
+/// store, an absent or quarantined profile, or a generation that fails
+/// revalidation takes the serving daemon down with `stop_committed:true`,
+/// `start_committed:false`, and no takeover — a hard outage produced by
+/// state that was observable before anything was touched.
+///
+/// Returns the resolved digest when the caller may reuse it, so the
+/// successor start does not pay a second validation pass.
+fn preflight_generation(
+    payload_dir: Option<&Path>,
+) -> Result<Option<String>, (&'static str, &'static str)> {
+    match payload_dir {
+        // Dev staging prunes, stages, and promotes, so it must stay after the
+        // stop; only its read-only source enumeration is preflighted.
+        Some(dir) => {
+            payload_sources(dir)?;
+            Ok(None)
+        }
+        // Production resolution is entirely read-only, so it runs in full
+        // here and its result is handed to the successor start.
+        None => resolve_generation(None).map(Some),
     }
 }
 
@@ -722,6 +783,11 @@ fn cmd_start(payload_dir: Option<&Path>) -> DaemonResult {
             return DaemonResult::new(command, false, state, reason);
         }
     };
+    // A quarantined record blocks the start in every observed state, so it is
+    // classified before the state dispatch rather than only on `wedged`.
+    if let Some((state, reason)) = quarantined_observation(&observed) {
+        return DaemonResult::new(command, false, state, reason);
+    }
     match observed.state {
         LifecycleState::Running => {
             let publication = match publication_path() {
@@ -757,16 +823,11 @@ fn cmd_start(payload_dir: Option<&Path>) -> DaemonResult {
             probe_state(observed.state),
             "lifecycle_busy",
         ),
-        LifecycleState::Wedged => {
-            let reason = if observed.reason == "unsupported_state_schema" {
-                "unsupported_state_schema"
-            } else {
-                "wedged"
-            };
-            DaemonResult::new(command, false, "wedged", reason)
-        }
+        LifecycleState::Wedged => DaemonResult::new(command, false, "wedged", "wedged"),
         LifecycleState::Stopped => {
-            let outcome = start_phase(&runtime, payload_dir, &anchor, outer);
+            // Nothing is running, so there is no stop to sequence against:
+            // resolution happens inside the start.
+            let outcome = start_phase(&runtime, payload_dir, None, &anchor, outer);
             start_outcome_result(command, outcome, None)
         }
     }
@@ -810,6 +871,12 @@ fn start_outcome_result(
 /// transaction lock and has already observed `Running`. Returns
 /// `(stop_committed, terminal)` where terminal is `Ok(())` for a completed
 /// teardown or the (state, reason) failure.
+///
+/// An unknown shutdown outcome is resolved by observation, never assumed: the
+/// host commits at full-frame write completion, so a client-side timeout can
+/// race a commit that already happened. Reporting that as not-committed would
+/// tell a caller the daemon is untouched while it is tearing down, and would
+/// make `restart` skip its successor start.
 fn stop_phase(
     runtime: &Runtime,
     outer: Instant,
@@ -818,16 +885,23 @@ fn stop_phase(
         Ok(path) => path,
         Err(_) => return (false, Err(("running", "internal_error"))),
     };
+    let mut commit_uncertain = false;
     match runtime.shutdown(&publication) {
         Ok(()) => {}
         Err("authentication_failed") => return (false, Err(("running", "authentication_failed"))),
+        // The frame was in flight when the client deadline expired: the host
+        // may already have committed. Fall through to the teardown wait and
+        // let the probe decide, rather than asserting either bit.
+        Err("shutdown_outcome_unknown") => commit_uncertain = true,
         // A response-in-flight attempt that did not settle: not committed.
         Err(_) => return (false, Err(("running", "lifecycle_busy"))),
     }
-    // Full-frame acknowledgement received: the stop is committed (KTD4).
+    // Acknowledged (or in-flight and unresolved): wait for the teardown to
+    // become observable and let the probe settle the commit question.
     let deadline = phase_deadline(outer, phase_cap(STOP_TEARDOWN));
     loop {
         match probe() {
+            // Observed teardown proves the commit, acknowledged or not.
             Ok(observed) if observed.state == LifecycleState::Stopped => {
                 return (true, Ok(()));
             }
@@ -835,6 +909,19 @@ fn stop_phase(
             Err(_) => {}
         }
         if Instant::now() >= deadline {
+            if commit_uncertain {
+                // Never acknowledged, so the commit is decided by observation
+                // rather than assumed in either direction.
+                return match probe().map(|observed| observed.state) {
+                    // Still fully running: the shutdown did not take effect,
+                    // so the daemon really is untouched.
+                    Ok(LifecycleState::Running) => (false, Err(("running", "lifecycle_busy"))),
+                    // Teardown is visibly underway or no longer readable:
+                    // report a committed stop so no caller assumes the
+                    // daemon kept serving.
+                    _ => (true, Err(("stopping", "shutdown_timeout"))),
+                };
+            }
             return (true, Err(("stopping", "shutdown_timeout")));
         }
         std::thread::sleep(REPROBE_INTERVAL);
@@ -862,17 +949,16 @@ fn cmd_stop() -> DaemonResult {
             return DaemonResult::new(command, false, state, reason);
         }
     };
+    // Classified before the state dispatch so a quarantined record is not
+    // reported as a clean `already_stopped`: it carries an `align_versions`
+    // remediation and will block the next start.
+    if let Some((state, reason)) = quarantined_observation(&observed) {
+        return DaemonResult::new(command, false, state, reason);
+    }
     match observed.state {
         // No lock-held incarnation: nothing to signal, unlink, or clean.
         LifecycleState::Stopped => DaemonResult::new(command, true, "stopped", "already_stopped"),
-        LifecycleState::Wedged => {
-            let reason = if observed.reason == "unsupported_state_schema" {
-                "unsupported_state_schema"
-            } else {
-                "wedged"
-            };
-            DaemonResult::new(command, false, "wedged", reason)
-        }
+        LifecycleState::Wedged => DaemonResult::new(command, false, "wedged", "wedged"),
         LifecycleState::Starting | LifecycleState::Stopping => DaemonResult::new(
             command,
             false,
@@ -930,15 +1016,18 @@ fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
                 .with_effects(effects(false, false));
         }
     };
-    let stop_committed = match observed.state {
-        LifecycleState::Stopped => false,
+    // Classified before any stop: a quarantined record blocks the successor
+    // start in every observed state, so committing a stop over it would
+    // guarantee an outage with no takeover.
+    if let Some((state, reason)) = quarantined_observation(&observed) {
+        return DaemonResult::new(command, false, state, reason)
+            .with_effects(effects(false, false));
+    }
+    // States that cannot be restarted at all return before the successor
+    // preflight, so no validation work is done for a request that bails.
+    match observed.state {
         LifecycleState::Wedged => {
-            let reason = if observed.reason == "unsupported_state_schema" {
-                "unsupported_state_schema"
-            } else {
-                "wedged"
-            };
-            return DaemonResult::new(command, false, "wedged", reason)
+            return DaemonResult::new(command, false, "wedged", "wedged")
                 .with_effects(effects(false, false));
         }
         LifecycleState::Starting | LifecycleState::Stopping => {
@@ -950,6 +1039,21 @@ fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
             )
             .with_effects(effects(false, false));
         }
+        LifecycleState::Stopped | LifecycleState::Running => {}
+    }
+    // The stop below is irreversible, so the successor is proven resolvable
+    // first. Every failure here is pre-existing on-disk state and reports
+    // both effect bits false with the daemon still serving.
+    let preresolved = match preflight_generation(payload_dir) {
+        Ok(preresolved) => preresolved,
+        Err((_, reason)) => {
+            // Nothing has been touched, so the reported state is the one just
+            // observed rather than the resolver's start-from-stopped default.
+            return DaemonResult::new(command, false, probe_state(observed.state), reason)
+                .with_effects(effects(false, false));
+        }
+    };
+    let stop_committed = match observed.state {
         LifecycleState::Running => match stop_phase(&runtime, outer) {
             (_, Ok(())) => true,
             // Pre-acknowledgement failure: no start attempt, both bits false.
@@ -964,8 +1068,10 @@ fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
                     .with_effects(effects(true, false));
             }
         },
+        // Nothing was running, so there is no stop to commit.
+        _ => false,
     };
-    let outcome = start_phase(&runtime, payload_dir, &anchor, outer);
+    let outcome = start_phase(&runtime, payload_dir, preresolved, &anchor, outer);
     let start_committed = outcome.ok;
     start_outcome_result(
         command,
