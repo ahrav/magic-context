@@ -70,6 +70,9 @@ function freshRoot(): string {
         // generation requires and the generated consumer artifacts it compares
         // against must both exist in a staged root.
         "release/mc-host-registry-gate.json",
+        // Cargo resolves `[patch]`/`[replace]` from the workspace root, so ruling out
+        // an override of the qualified crates needs the root manifest too.
+        "Cargo.toml",
         "release/generated/mc-host-release-contract.rs",
         "packages/plugin/src/shared/mc-host-lifecycle/generated-contract.ts",
     ]) {
@@ -861,6 +864,47 @@ describe("immutable input fail-closed rules", () => {
         );
     });
 
+    test("a workspace override of a qualified crate fails production closed", () => {
+        // Cargo resolves `[patch]` from the workspace root, so the leaf manifest can
+        // name the exact pin while the build compiles a replacement source.
+        const cases: [string, RegExp][] = [
+            [
+                '[patch.crates-io]\nort = { path = "../vendored-ort" }\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                '[patch.crates-io.fastembed]\npath = "../vendored-fastembed"\n',
+                /overrides fastembed, so the build would not resolve/,
+            ],
+            [
+                '[replace]\n"ort:2.0.0-rc.13" = { path = "../vendored-ort" }\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+        ];
+        for (const [patch, error] of cases) {
+            const root = freshRoot();
+            installProductionManifest(root);
+            const rootManifest = join(root, "Cargo.toml");
+            writeFileSync(
+                rootManifest,
+                `${readFileSync(rootManifest, "utf8")}\n${patch}`,
+            );
+            expect(() => generate(root, { check: false })).toThrow(error);
+        }
+
+        // An override of an unrelated crate is not this check's business.
+        const unrelated = freshRoot();
+        installProductionManifest(unrelated);
+        const rootManifest = join(unrelated, "Cargo.toml");
+        writeFileSync(
+            rootManifest,
+            `${readFileSync(rootManifest, "utf8")}\n[patch.crates-io]\nserde = { path = "../vendored-serde" }\n`,
+        );
+        expect(generate(unrelated, { check: false }).productionQualified).toBe(
+            true,
+        );
+    });
+
     test("a forbidden ORT capability in Cargo.toml fails production closed", () => {
         // The declared array is not the effective feature closure, but adding a
         // download, TLS, or accelerator feature while leaving the version pin
@@ -1082,6 +1126,14 @@ describe("immutable input fail-closed rules", () => {
                 // something else and everything inside goes unexamined.
                 (cargo) =>
                     `${cargo}\n[target . 'cfg(target_os = "linux")' . dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
+            ],
+            [
+                // A multi-line string spans lines, so quote state cannot reset per
+                // line: a bracket inside one would otherwise drive the shared depth
+                // wrong for everything after it.
+                (cargo) =>
+                    `${cargo}\npoison = """\n]\n"""\n\n[target.'cfg(target_os = "linux")'.dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
             ],
             [

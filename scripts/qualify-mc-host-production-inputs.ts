@@ -77,6 +77,8 @@ const BUN_LOCK_PATH = "bun.lock";
 /** The workspace whose resolution of the Pi harness package is the released one. */
 const PI_HARNESS_WORKSPACE = "packages/pi-plugin";
 const MC_HOST_CARGO_TOML_PATH = "crates/mc-host/Cargo.toml";
+/** Cargo resolves `[patch]`/`[replace]` overrides from here, not from the leaf. */
+const WORKSPACE_CARGO_TOML_PATH = "Cargo.toml";
 
 function fail(message: string): never {
     throw new Error(`mc-host input qualification: ${message}`);
@@ -1911,24 +1913,57 @@ function tomlKeyPattern(key: string, value: string): RegExp {
  * Basic and literal strings on one line, which is what Cargo dependency and feature
  * values are; a multi-line `"""` string would need the parser this scan is not.
  */
-function structuralDelta(line: string): number {
+function structuralDelta(
+    line: string,
+    state: { multiline: string | null },
+): number {
     let delta = 0;
-    let quote: string | null = null;
-    let escaped = false;
-    for (const char of line) {
-        if (quote !== null) {
-            if (quote === '"') {
-                if (escaped) escaped = false;
-                else if (char === "\\") escaped = true;
-                else if (char === '"') quote = null;
-            } else if (char === "'") {
-                quote = null;
-            }
+    let index = 0;
+    while (index < line.length) {
+        // Inside a multi-line string nothing counts until its closing delimiter, and
+        // that delimiter may be lines away — which is why the state is the caller's,
+        // not this function's. A per-line reset let a bracket inside such a string
+        // count as structure and put the shared depth permanently wrong.
+        if (state.multiline !== null) {
+            const close = line.indexOf(state.multiline, index);
+            if (close === -1) return delta;
+            index = close + state.multiline.length;
+            state.multiline = null;
             continue;
         }
-        if (char === '"' || char === "'") quote = char;
-        else if (char === "{" || char === "[") delta++;
+        const rest = line.slice(index);
+        const opener = rest.startsWith('"""')
+            ? '"""'
+            : rest.startsWith("'''")
+              ? "'''"
+              : null;
+        if (opener !== null) {
+            state.multiline = opener;
+            index += opener.length;
+            continue;
+        }
+        const char = line[index] as string;
+        if (char === '"' || char === "'") {
+            // Single-line string: consume to its close, honouring escapes in a basic
+            // string. An unterminated one ends at the line.
+            let scan = index + 1;
+            let escaped = false;
+            for (; scan < line.length; scan++) {
+                const inner = line[scan];
+                if (char === "'") {
+                    if (inner === "'") break;
+                    continue;
+                }
+                if (escaped) escaped = false;
+                else if (inner === "\\") escaped = true;
+                else if (inner === '"') break;
+            }
+            index = scan + 1;
+            continue;
+        }
+        if (char === "{" || char === "[") delta++;
         else if (char === "}" || char === "]") delta--;
+        index++;
     }
     return delta;
 }
@@ -2058,10 +2093,11 @@ function dependencyDeclarations(
     };
     let section = "";
     let depth = 0;
+    const stringState = { multiline: null as string | null };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
         const atTopLevel = depth === 0;
-        depth += structuralDelta(line);
+        depth += structuralDelta(line, stringState);
         // A `[...]` line is only a section header at top level; inside a multiline
         // array it is array syntax.
         const header = atTopLevel ? /^\[([^\]]+)\]$/.exec(trimmed) : null;
@@ -2132,10 +2168,11 @@ function resolveRenamedCrate(key: string, entry: string): string | null {
 function joinInlineEntry(lines: string[], index: number): string | null {
     const collected: string[] = [];
     let depth = 0;
+    const stringState = { multiline: null as string | null };
     for (let i = index; i < lines.length; i++) {
         const line = lines[i] ?? "";
         collected.push(line.trim());
-        depth += structuralDelta(line);
+        depth += structuralDelta(line, stringState);
         if (depth <= 0) return collected.join(" ");
     }
     return null;
@@ -2376,10 +2413,11 @@ function assertNoForbiddenFeatureForwarding(
     const lines = cargo.split("\n").map(stripTomlComments);
     let section = "";
     let depth = 0;
+    const stringState = { multiline: null as string | null };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
         const atTopLevel = depth === 0;
-        depth += structuralDelta(line);
+        depth += structuralDelta(line, stringState);
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
@@ -2421,6 +2459,67 @@ function assertNoForbiddenFeatureForwarding(
                     `the [features] table in ${MC_HOST_CARGO_TOML_PATH} forwards ${value}, which is outside the qualified closure (${forbidden})`,
                 );
             }
+        }
+    }
+}
+
+/**
+ * Reject a workspace `[patch]` or `[replace]` override that could redirect a
+ * qualified crate.
+ *
+ * Cargo resolves overrides from the workspace root, so a leaf manifest can name the
+ * exact pin while the build compiles a replacement source entirely. No reading of
+ * `crates/mc-host/Cargo.toml` can see that.
+ *
+ * This refuses rather than resolves: an override naming a qualified crate — or a
+ * `[patch]` table this scan cannot attribute — fails the qualification instead of
+ * being followed. Following it means resolving the workspace graph through
+ * `cargo metadata`, which needs a toolchain the portable drift check must not
+ * require; that is the escalation if overrides ever become legitimate here, not a
+ * further textual rule.
+ */
+function assertNoQualifiedCrateOverride(
+    rootDir: string,
+    crates: readonly string[],
+): void {
+    const path = join(rootDir, WORKSPACE_CARGO_TOML_PATH);
+    if (!existsSync(path)) {
+        fail(
+            `${WORKSPACE_CARGO_TOML_PATH} is required to rule out an override of the qualified crates`,
+        );
+    }
+    const lines = readFileSync(path, "utf8").split("\n").map(stripTomlComments);
+    let section = "";
+    let depth = 0;
+    const stringState = { multiline: null as string | null };
+    for (const line of lines) {
+        const trimmed = line.trim();
+        const atTopLevel = depth === 0;
+        depth += structuralDelta(line, stringState);
+        if (!atTopLevel) continue;
+        const header = /^\[([^\]]+)\]$/.exec(trimmed);
+        if (header !== null) {
+            section = normalizeTableHeader(header[1] ?? "");
+            continue;
+        }
+        // `[patch.<registry>]`, `[patch.<registry>.<crate>]`, and the legacy
+        // `[replace]` are all override tables.
+        if (!/^(?:patch(?:\.|$)|replace(?:\.|$))/.test(section)) continue;
+        const overridden = section.split(".").pop() ?? "";
+        const keyText = assignmentKeyText(trimmed);
+        const named = keyText === null ? overridden : resolveTomlName(keyText);
+        if (named === null) {
+            fail(
+                `${WORKSPACE_CARGO_TOML_PATH} declares an override this qualifier cannot read, so the qualified crate identities cannot be ruled out`,
+            );
+        }
+        // A `[replace]` key is a package-ID spec (`"ort:2.0.0-rc.13"`), not a bare
+        // name, so the crate is the part before the version.
+        const crate = named.split(":")[0] ?? named;
+        if (crates.includes(crate)) {
+            fail(
+                `${WORKSPACE_CARGO_TOML_PATH} overrides ${crate}, so the build would not resolve the qualified crate identity`,
+            );
         }
     }
 }
@@ -2474,6 +2573,12 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
         assertNoForbiddenFeatureForwarding(
             cargo,
             declarations,
+            qualified.map(([crate]) => crate),
+        );
+        // The leaf manifest is not the whole answer: an override in the workspace
+        // root redirects the crate Cargo actually builds.
+        assertNoQualifiedCrateOverride(
+            rootDir,
             qualified.map(([crate]) => crate),
         );
     }
@@ -2947,8 +3052,11 @@ function main(): void {
     }
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
     // Byte verification is the qualifying host's operation, so it is the one place
-    // the pinned harness runtime is bound to a real interpreter.
-    if (verifyBytes) {
+    // the pinned harness runtime is bound to a real interpreter. The condition must
+    // match `generate`'s own default — write mode verifies bytes without being asked
+    // — or the documented `release:qualify` command would hash artifacts while the
+    // binding sat unenforced.
+    if (verifyBytes || !check) {
         try {
             assertPinnedQualifyingRuntime(process.versions?.bun);
         } catch (error) {
