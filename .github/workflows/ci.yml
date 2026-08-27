@@ -322,20 +322,39 @@ jobs:
       - name: Prospective holdout unit contracts
         run: bun run test:prospective-unit
 
-      # Shares this job rather than adding its own: both are pure-data artifact
-      # contract lanes that need nothing beyond Bun — no opencode, no Cargo — so
-      # a second checkout and install would buy nothing. Without a CI caller the
-      # historian-eval contract and freeze lint can regress while every other
-      # lane stays green (test:e2e selects --mode ts and test:opencode-e2e runs
-      # the green manifest; neither includes historianEvalUnitFiles()).
-      - name: Historian eval unit contracts
-        run: bun run test:historian-eval-unit
-
       - name: Authenticate lifecycle-appropriate epoch artifacts
         run: bun run validate:prospective-holdout
 
       - name: E2E harness typecheck
         run: bun run --cwd packages/e2e-tests typecheck
+
+  # Its own job, not a step in prospective-release-holdout: steps in one job
+  # short-circuit, so an unrelated contract lane failing first would skip this
+  # one and leave the historian-eval gate silently unenforced — which is the
+  # state this job exists to end. Nothing invoked test:historian-eval-unit
+  # before: test:e2e selects --mode ts and test:opencode-e2e runs the green
+  # manifest, and neither reaches historianEvalUnitFiles(), so the contract and
+  # freeze lint could regress with every other lane green.
+  historian-eval-contracts:
+    name: Historian eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Historian eval unit contracts
+        run: bun run test:historian-eval-unit
 
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
