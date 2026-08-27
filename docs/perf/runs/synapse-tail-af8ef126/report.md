@@ -109,8 +109,9 @@ per-block load samples, and absent production-bundle confirmation.
 The collection host's name in `environment.txt` and the absolute paths in
 `calibration.json` were replaced with `<redacted: collection host>` and `<repo>`
 when this bundle moved into version control in a public repository. The
-`SHA256SUMS` entries for those two files were recomputed; every other digest,
-including every raw sample, is original. The commit, artifact hash, kernel,
+`SHA256SUMS` was refreshed for exactly the derived files changed after
+collection: those two, plus this report, which this disclosure modifies. Every
+other digest, including every raw sample, is original. The commit, artifact hash, kernel,
 architecture, and toolchain versions needed to reproduce a cell are all retained.
 `analyze.py`, `select.py`, and `run_matrix.py` are unaltered, so they remain the
 scripts that produced this evidence.

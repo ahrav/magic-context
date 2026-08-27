@@ -207,10 +207,15 @@ control in a public repository: the collection host's name in `environment.txt`
 and the absolute working-directory and executable paths in `calibration.json`,
 replaced by `<redacted: collection host>` and `<repo>`. Neither is needed to
 reproduce a cell — the commit, artifact hash, kernel, architecture, and toolchain
-versions that identify the environment are all retained. The `SHA256SUMS` entries
-for those two files were recomputed so the manifest stays self-consistent; every
-other entry, including every raw sample file, is the original digest and still
-verifies against an unmodified local bundle.
+versions that identify the environment are all retained.
+
+`SHA256SUMS` was refreshed for exactly the derived files this repository changed
+after collection: the two redacted files above and this report, which the
+disclosure itself modifies. Every other entry, including every raw sample, is the
+original digest, so `sha256sum --check` over the full bundle distinguishes an
+intact measurement set from tampering. The distinction to keep in mind when
+auditing: raw-sample digests are collection-time evidence, while the digests of
+derived documents track their current committed content.
 
 Not altered: `analyze.py`, `select.py`, and `run_matrix.py` are the scripts that
 produced this evidence, so they are retained exactly as run even where review
