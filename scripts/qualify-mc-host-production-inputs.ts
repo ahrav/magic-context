@@ -1595,7 +1595,39 @@ const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
 ];
 
 /**
- * Assert one `Cargo.toml` dependency line pins `version` exactly, opts out of
+ * Extract one crate's complete inline dependency entry from `Cargo.toml`, across
+ * however many lines its inline table spans.
+ *
+ * Returns `null` when the declaration is absent, unbalanced, or written in the
+ * `[dependencies.<crate>]` section form, whose keys this text scan cannot
+ * attribute to the crate. Callers must fail closed on `null` rather than read it
+ * as "declares nothing".
+ *
+ * Brace and bracket counting is enough here because Cargo dependency values are
+ * versions, paths, and URLs, none of which contain them.
+ */
+function inlineDependencyEntry(cargo: string, crate: string): string | null {
+    const lines = cargo.split("\n");
+    const start = lines.findIndex((line) =>
+        line.trimStart().startsWith(`${crate} = `),
+    );
+    if (start === -1) return null;
+    const collected: string[] = [];
+    let depth = 0;
+    for (let i = start; i < lines.length; i++) {
+        const line = lines[i] ?? "";
+        collected.push(line.trim());
+        for (const char of line) {
+            if (char === "{" || char === "[") depth++;
+            else if (char === "}" || char === "]") depth--;
+        }
+        if (depth <= 0) return collected.join(" ");
+    }
+    return null;
+}
+
+/**
+ * Assert one `Cargo.toml` dependency entry pins `version` exactly, opts out of
  * default features, and declares no forbidden capability.
  *
  * The declared array is not the effective feature closure — most of
@@ -1603,26 +1635,40 @@ const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
  * enforces the closure's negative half, which is the part a silent edit would
  * exploit: adding a download, TLS, or accelerator feature while leaving the
  * version pin untouched.
+ *
+ * Every unreadable shape fails rather than passing vacuously. A declared
+ * `features` key whose array cannot be read is the dangerous case: reading it as
+ * an empty list is exactly how a reformatted multiline array would smuggle a
+ * forbidden capability past the version pin.
  */
 function assertPinnedCrateFeatures(
     cargo: string,
     crate: string,
     version: string,
 ): void {
-    const line = cargo
-        .split("\n")
-        .find((candidate) => candidate.trimStart().startsWith(`${crate} = `));
-    if (line === undefined || !line.includes(`version = "=${version}"`)) {
+    const entry = inlineDependencyEntry(cargo, crate);
+    if (entry === null) {
+        fail(
+            `${crate} is not declared as an inline dependency table in ${MC_HOST_CARGO_TOML_PATH}; the qualified feature closure cannot be checked`,
+        );
+    }
+    if (!entry.includes(`version = "=${version}"`)) {
         fail(
             `pinned ${crate} identity does not match ${MC_HOST_CARGO_TOML_PATH}`,
         );
     }
-    if (!/default-features\s*=\s*false/.test(line)) {
+    if (!/default-features\s*=\s*false/.test(entry)) {
         fail(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} must set default-features = false`,
         );
     }
-    const declared = /features\s*=\s*\[([^\]]*)\]/.exec(line);
+    const declared = /features\s*=\s*\[([^\]]*)\]/.exec(entry);
+    // `default-features` ends in the same word, so require a boundary before it.
+    if (/(?:^|[\s,{])features\s*=/.test(entry) && declared === null) {
+        fail(
+            `${crate} in ${MC_HOST_CARGO_TOML_PATH} declares a features list this qualifier cannot read`,
+        );
+    }
     for (const raw of declared?.[1]?.split(",") ?? []) {
         const feature = raw.trim().replace(/^["']|["']$/g, "").toLowerCase();
         if (feature.length === 0) continue;

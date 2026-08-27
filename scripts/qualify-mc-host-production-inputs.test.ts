@@ -552,12 +552,45 @@ describe("immutable input fail-closed rules", () => {
                     ),
                 /ort .* must set default-features = false/,
             ],
+            [
+                // The same declaration reformatted across lines. A one-line scan
+                // sees no closing bracket, finds no features array, and would
+                // pass vacuously.
+                (cargo) =>
+                    cargo.replace(
+                        'features = ["load-dynamic", "ndarray", "std"] }',
+                        'features = [\n    "load-dynamic",\n    "ndarray",\n    "std",\n    "download-binaries",\n] }',
+                    ),
+                /ort feature download-binaries .* outside the qualified closure/,
+            ],
+            [
+                // A features key whose array cannot be read must fail, not be
+                // treated as an empty list.
+                (cargo) =>
+                    cargo.replace(
+                        'features = ["load-dynamic", "ndarray", "std"] }',
+                        'features = FEATURES }',
+                    ),
+                /declares a features list this qualifier cannot read/,
+            ],
+            [
+                // The section form puts the crate's keys on lines this text scan
+                // cannot attribute to it, so it must be rejected outright.
+                (cargo) =>
+                    cargo.replace(
+                        /^ort = .*$/m,
+                        '[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = ["load-dynamic"]',
+                    ),
+                /not declared as an inline dependency table/,
+            ],
         ];
         for (const [mutate, error] of cases) {
             const root = freshRoot();
             installProductionManifest(root);
             const path = join(root, cargoPath);
-            writeFileSync(path, mutate(readFileSync(path, "utf8")));
+            const mutated = mutate(readFileSync(path, "utf8"));
+            expect(mutated).not.toBe(readFileSync(path, "utf8"));
+            writeFileSync(path, mutated);
             expect(() => generate(root, { check: false })).toThrow(error);
         }
     });
