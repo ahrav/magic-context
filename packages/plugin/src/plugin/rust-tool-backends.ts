@@ -74,7 +74,6 @@ export interface RustToolBackends {
     memory?: (args: RustMemoryToolRequest) => Promise<string>;
     /** Smart-note writes fail closed when the host evaluator cannot send note.evaluate for this project. */
     noteEvaluationAvailable?: (projectPath: string) => boolean;
-    memorySync?: (sessionId: string) => void;
 }
 
 export function isRustAuthorityDrainingError(error: unknown): boolean {

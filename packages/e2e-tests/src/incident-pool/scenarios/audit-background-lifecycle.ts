@@ -2,8 +2,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { Database } from "../../../../plugin/src/shared/sqlite";
 import type { PluginContext } from "../../../../plugin/src/plugin/types";
-import { initializeDatabase } from "../../../../plugin/src/features/magic-context/storage-db";
-import { runMigrations } from "../../../../plugin/src/features/magic-context/migrations";
+import { createDirectTestDatabase } from "../../../../plugin/src/features/magic-context/test-database";
 import { runValidatedHistorianPass } from "../../../../plugin/src/hooks/magic-context/compartment-runner-historian";
 import { openTestDb } from "../../test-db";
 import {
@@ -205,9 +204,11 @@ export async function driveHistorianFailureDump(
     const shellCanary = `$(touch ${sideEffectPath}) ; A28_SHELL_CANARY`;
     const invalidOutput = `<output><broken>${contentCanary}${terminalCanary}${shellCanary}</broken>`;
     const dumpPaths: string[] = [];
-    const db = openTestDb(join(context.storeDir, "a28-context.db"));
-    initializeDatabase(db);
-    runMigrations(db);
+    const a28DbPath = join(context.storeDir, "a28-context.db");
+    // Bootstrap the registered direct format, then reopen through the shared
+    // helper the rest of this driver uses.
+    createDirectTestDatabase({ path: a28DbPath }).db.close();
+    const db = openTestDb(a28DbPath);
 
     try {
         const client = {
@@ -843,8 +844,8 @@ const A47_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/incident-pool/support/tool-loop.ts",
     "packages/plugin/src/features/magic-context/dreamer/task-executor.ts",
     "packages/plugin/src/features/magic-context/dreamer/lease.ts",
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts",
-    "packages/plugin/src/features/magic-context/storage-memory-mutation-log.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-claim-operations.ts",
+    "packages/plugin/src/features/magic-context/storage-m0-mutation-log.ts",
     "packages/plugin/src/tools/ctx-memory/tools.ts",
 ];
 

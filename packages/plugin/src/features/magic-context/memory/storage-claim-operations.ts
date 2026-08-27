@@ -22,7 +22,7 @@
  * stable operation keys; the kernel owns all SQL and effect ordering (KTD7).
  */
 
-import { type Database, isInTransaction } from "../../../shared/sqlite";
+import { type Database, isInTransaction } from "../../../shared/sqlite.ts";
 import type { SourceTrustClass } from "../storage-claim-applicability-schema.ts";
 import {
     APPLICABILITY_BASELINE_STREAM_KEY,
@@ -338,8 +338,11 @@ export interface ClaimOperationRunResult {
 }
 
 class StaleRollback extends Error {
-    constructor(public readonly reason: string) {
+    readonly reason: string;
+
+    constructor(reason: string) {
         super(reason);
+        this.reason = reason;
         this.name = "StaleRollback";
     }
 }

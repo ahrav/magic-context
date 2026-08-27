@@ -1,10 +1,9 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import {
     advanceProjectorWatermarkInCurrentTransaction,
     appendMaturityAssertionInCurrentTransaction,
@@ -33,10 +32,8 @@ interface Fixture {
 }
 
 function fixture(): Fixture {
-    const db = new Database(":memory:");
+    const db = createDirectTestDatabase().db;
     db.exec("PRAGMA foreign_keys=ON");
-    initializeDatabase(db);
-    runMigrations(db);
     const now = 1_000;
     db.prepare("INSERT INTO projects (canonical_identity, created_at) VALUES ('git:pol', ?)").run(
         now,
@@ -97,13 +94,13 @@ function addObservation(
 
 function addRevision(fx: Fixture, observationIds: readonly number[]): number {
     uniq += 1;
+    const subject = `subject-${uniq}`;
     fx.db
         .prepare(
             `INSERT INTO claims (project_id, subject, predicate, scope, state, created_at)
              VALUES (?, ?, 'states', '', 'active', 1)`,
         )
-        // pi-lens-ignore-next-line: sql-injection
-        .run(fx.projectId, `subject-${uniq}`);
+        .run(fx.projectId, subject);
     const claimId = Number(
         (fx.db.prepare("SELECT MAX(id) AS id FROM claims").get() as { id: number }).id,
     );
@@ -451,92 +448,7 @@ describe("claim policy storage kernel", () => {
         }
     });
 
-    test("retained user metadata counts as explicit-user evidence only at or below the seed boundary", () => {
-        const fx = fixture();
-        try {
-            const observationId = addObservation(fx);
-            const revisionId = addRevision(fx, [observationId]);
-            fx.db
-                .prepare(
-                    `INSERT INTO claim_revision_memory_metadata
-                        (revision_id, category, normalized_hash, importance, memory_scope,
-                         shareable, source_type, created_at)
-                     VALUES (?, 'CONSTRAINTS', 'hash', 50, 'project', 0, 'user', 1)`,
-                )
-                .run(revisionId);
-            // A fresh database initializes the boundary to 0.
-            expect(hasExplicitUserEvidence(fx.db, revisionId)).toBeFalse();
-            fx.db
-                .prepare(
-                    "UPDATE schema_migrations_meta SET value = ? WHERE key = 'claim_policy_seed_boundary_revision_id'",
-                )
-                .run(String(revisionId));
-            expect(hasExplicitUserEvidence(fx.db, revisionId)).toBeTrue();
-            // The observation trust class qualifies at any boundary.
-            const explicit = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
-            expect(hasExplicitUserEvidence(fx.db, explicit)).toBeTrue();
-        } finally {
-            closeQuietly(fx.db);
-        }
-    });
-
-    test("pre-boundary rewrite revisions cannot inherit explicit-user trust", () => {
-        const fx = fixture();
-        try {
-            const first = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
-            const claimId = Number(
-                (
-                    fx.db
-                        .prepare("SELECT claim_id AS id FROM claim_revisions WHERE id = ?")
-                        .get(first) as { id: number }
-                ).id,
-            );
-            // A v85 rewrite appended revision 2 with the retained `user`
-            // stamp on both the observation and the revision metadata even
-            // though the replacement bytes were model-authored.
-            fx.db
-                .prepare(
-                    `INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at)
-                     VALUES (?, 2, 'model rewrite', ?, 2)`,
-                )
-                .run(claimId, "c".repeat(64));
-            const rewrite = Number(
-                (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
-                    .id,
-            );
-            fx.db
-                .prepare(
-                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
-                )
-                .run(rewrite, addObservation(fx, { trust: "explicit_user" }));
-            fx.db
-                .prepare(
-                    `INSERT INTO claim_revision_memory_metadata
-                        (revision_id, category, normalized_hash, importance, memory_scope,
-                         shareable, source_type, created_at)
-                     VALUES (?, 'CONSTRAINTS', 'hash-rewrite', 50, 'project', 0, 'user', 2)`,
-                )
-                .run(rewrite);
-            fx.db
-                .prepare(
-                    "UPDATE schema_migrations_meta SET value = ? WHERE key = 'claim_policy_seed_boundary_revision_id'",
-                )
-                .run(String(rewrite));
-            // Below the boundary only the claim's first revision keeps its
-            // stated user provenance; the rewrite qualifies through neither
-            // the observation nor the retained metadata.
-            expect(hasExplicitUserEvidence(fx.db, rewrite)).toBeFalse();
-            expect(hasExplicitUserEvidence(fx.db, first)).toBeTrue();
-        } finally {
-            closeQuietly(fx.db);
-        }
-    });
-
     test("a dashboard explicit-user edit keeps trust while a copied stamp on the same bytes does not", () => {
-        // The dashboard is the one writer that authors NEW user-content
-        // revisions, so its stamp must survive a digest change. The producer is
-        // the witness: a pre-v86 rewrite copying the trust class onto the same
-        // replacement bytes is otherwise indistinguishable.
         const fx = fixture();
         try {
             const first = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
@@ -559,8 +471,8 @@ describe("claim policy storage kernel", () => {
                     .id,
             );
 
-            // A copied legacy stamp on the exact same bytes: right digest,
-            // wrong producer.
+            // Matching bytes are insufficient when the producer cannot attest
+            // that a user authored the revision.
             const copied = addObservation(fx, {
                 trust: "explicit_user",
                 extractor: "historian",
@@ -629,7 +541,6 @@ describe("claim policy storage kernel", () => {
             closeQuietly(fx.db);
         }
     });
-
     test("the effective projection materializes the pure decision and rebuilds identically", () => {
         const fx = fixture();
         try {

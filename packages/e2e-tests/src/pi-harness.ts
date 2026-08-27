@@ -1,9 +1,10 @@
 /** PiTestHarness — facade for Pi Magic Context e2e tests. */
 
-import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { Database } from "../../plugin/src/shared/sqlite";
-import { initializeIsolatedContextDb } from "./initialize-context-db";
+import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "./initialize-context-db";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
 import type { VerifiedReleaseRoot } from "./prospective-holdout/release-root";
@@ -38,6 +39,20 @@ const DEFAULT_MOCK_RESPONSE: MockResponse = {
     cache_read_input_tokens: 0,
   },
 };
+
+function initializeIsolatedContextDb(
+  dataDir: string,
+  releaseRoot?: VerifiedReleaseRoot,
+): void {
+  if (releaseRoot) {
+    initializeContextDbFromRelease(dataDir, releaseRoot);
+    return;
+  }
+  const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+  if (existsSync(path)) return;
+  mkdirSync(dirname(path), { recursive: true });
+  createDirectTestDatabase({ path }).db.close();
+}
 
 export class PiTestHarness {
   readonly mock: MockProvider;

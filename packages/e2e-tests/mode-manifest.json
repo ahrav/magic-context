@@ -27,6 +27,21 @@
             ]
         },
         {
+            "path": "tests/claims-direct-cutover.test.ts",
+            "tier": "both-modes",
+            "invocation": {
+                "ts": true,
+                "rust": true
+            },
+            "rationale": "real OpenCode and Pi harnesses share one direct claims authority; Rust mode exercises the OpenCode staged-intent adapter while Pi remains the TS comparison surface",
+            "contract_refs": [
+                "DIRECT-CLAIMS-U8",
+                "AE3",
+                "R2",
+                "R6"
+            ]
+        },
+        {
             "path": "tests/compaction-off.test.ts",
             "tier": "ts-only",
             "invocation": {

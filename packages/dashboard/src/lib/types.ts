@@ -136,16 +136,7 @@ export interface ClaimMutationResponse {
 
 export type MemoryScope = "project" | "ecosystem" | "universe";
 
-export type MemoryCategory =
-  | "ARCHITECTURE_DECISIONS"
-  | "CONSTRAINTS"
-  | "CONFIG_DEFAULTS"
-  | "NAMING"
-  | "USER_PREFERENCES"
-  | "USER_DIRECTIVES"
-  | "ENVIRONMENT"
-  | "WORKFLOW_RULES"
-  | "KNOWN_ISSUES";
+export type MemoryCategory = WorkspaceShareCategory;
 
 export type ClaimLifecycleState = "active" | "archived" | "retired";
 
@@ -473,19 +464,6 @@ export interface DreamRunMemoryChanges {
   deleted?: number;
   archived?: number;
   merged?: number;
-}
-
-export interface DreamMemoryChange {
-  id: number;
-  category: string;
-  content: string;
-  status: string;
-}
-
-export interface DreamRunMemoryDetail {
-  written: DreamMemoryChange[];
-  archived: DreamMemoryChange[];
-  merged: DreamMemoryChange[];
 }
 
 export interface DreamRun {

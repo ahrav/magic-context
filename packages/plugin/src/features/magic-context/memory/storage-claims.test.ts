@@ -6,10 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import { clearSession } from "../storage-meta-session";
 import { isCanonicalProjectIdentity } from "../storage-project-identities";
+import { createDirectTestDatabase } from "../test-database";
 import {
     addClaimConflict,
     addClaimConflictInCurrentTransaction,
@@ -34,10 +33,8 @@ import {
 } from "./storage-claims";
 
 function migratedDb(path = ":memory:"): Database {
-    const db = new Database(path);
+    const db = createDirectTestDatabase({ path: path }).db;
     db.exec("PRAGMA foreign_keys=ON");
-    initializeDatabase(db);
-    runMigrations(db);
     return db;
 }
 
@@ -975,9 +972,6 @@ describe("storage-claims: session cleanup and the claim-memory kernel (U2 scenar
     test("clearSession preserves every claim-owned row and operation receipt", async () => {
         const db = migratedDb();
         try {
-            // The claim-memory fragment overlays a migrated database:
-            // claim_project_generations already exists from the v84 chain.
-            const { createClaimMemorySchema } = await import("../storage-claim-memory-schema");
             const {
                 createProjectMemoryClaim,
                 recordProjectMemoryVerification,
@@ -985,7 +979,6 @@ describe("storage-claims: session cleanup and the claim-memory kernel (U2 scenar
                 getProjectMemoryClaimByPublicId,
             } = await import("./storage-claim-operations");
             const { formatRevisionLocator } = await import("./claim-operation-contract");
-            createClaimMemorySchema(db);
 
             const sessionId = "ses_kernel_durable";
             db.prepare(

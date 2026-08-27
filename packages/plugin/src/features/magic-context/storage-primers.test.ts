@@ -1,9 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { Database } from "../../shared/sqlite";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import type { Database } from "../../shared/sqlite";
 import { clearSession } from "./storage-meta-session";
 import {
     createPrimer,
@@ -15,11 +13,10 @@ import {
     updatePrimerSupport,
 } from "./storage-primers";
 import { bumpProjectMemoryEpoch, getProjectState } from "./storage-project-state";
+import { createDirectTestDatabase } from "./test-database";
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 
@@ -177,15 +174,11 @@ describe("primer candidate storage", () => {
         expect(primerOccurrenceUtcDay(Date.UTC(2026, 0, 2, 0, 1))).toBe("2026-01-02");
     });
 
-    it("updatePrimerAnswer is cache-neutral: no epoch bump, no mutation-log row", () => {
+    it("updatePrimerAnswer is cache-neutral and does not bump the project epoch", () => {
         const db = freshDb();
         // Seed an epoch row so a bump would be observable.
         bumpProjectMemoryEpoch(db, "git:abc");
         const epochBefore = getProjectState(db, "git:abc")?.project_memory_epoch ?? 0;
-        const mutationsBefore = (
-            db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get() as { n: number }
-        ).n;
-
         const primerId = createPrimer(db, {
             projectPath: "git:abc",
             question: "How does the cache split work?",
@@ -195,12 +188,7 @@ describe("primer candidate storage", () => {
         });
         updatePrimerAnswer(db, primerId, "An answer grounded in current source.");
 
-        // The whole reason refresh-primers must use the locked no-ctx_memory
-        // investigator: a primer answer write must NEVER touch the project memory
-        // epoch (which busts m[0]) or the supersede-delta mutation log (m[1]).
+        // Primer answers are not project-memory claims, so updatePrimerAnswer must not increment project_memory_epoch.
         expect(getProjectState(db, "git:abc")?.project_memory_epoch ?? 0).toBe(epochBefore);
-        expect(
-            (db.prepare("SELECT COUNT(*) AS n FROM memory_mutation_log").get() as { n: number }).n,
-        ).toBe(mutationsBefore);
     });
 });

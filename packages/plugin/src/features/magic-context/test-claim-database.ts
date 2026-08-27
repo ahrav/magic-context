@@ -1,4 +1,4 @@
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import type { ClaimMutationToken } from "./memory/claim-operation-contract";
 import {
     type ClaimEvidenceProvenance,
@@ -7,16 +7,11 @@ import {
 } from "./memory/storage-claim-operations";
 import { ensureProject } from "./memory/storage-claims";
 import type { MemoryScope } from "./memory/types";
-import { runMigrations } from "./migrations";
-import { type ClaimMemorySharing, createClaimMemorySchema } from "./storage-claim-memory-schema";
-import { initializeDatabase } from "./storage-db";
+import type { ClaimMemorySharing } from "./storage-claim-memory-schema";
+import { createDirectTestDatabase } from "./test-database";
 
 export function createClaimReaderTestDatabase(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
-    db.transaction(() => createClaimMemorySchema(db)).immediate();
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 export interface SeedProjectMemoryClaimArgs {

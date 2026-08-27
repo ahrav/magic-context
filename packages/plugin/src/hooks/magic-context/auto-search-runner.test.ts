@@ -1,19 +1,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { insertMemory } from "../../features/magic-context/memory";
-import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
-import {
-    runInMemoryClaimsWriteTransaction,
-    updateMemoryContentWithClaimsInCurrentTransaction,
-    updateMemoryVerificationWithClaimsInCurrentTransaction,
-} from "../../features/magic-context/memory/storage-memory-claims";
-import { runMigrations } from "../../features/magic-context/migrations";
 import * as searchModule from "../../features/magic-context/search";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
-import {
-    appendAutoSearchHintDecision,
-    getAutoSearchHintDecisions,
-} from "../../features/magic-context/storage-meta-persisted";
-import { Database } from "../../shared/sqlite";
+import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
 import {
@@ -54,9 +43,7 @@ describe("auto-search-runner", () => {
     };
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        db = createDirectTestDatabase().db;
         _resetAutoSearchCache();
     });
 
@@ -624,12 +611,11 @@ describe("auto-search-runner", () => {
         }
     });
 
-    test("fresh hints record no claim fragments and legacy fragment hints stop replaying", async () => {
+    test("fresh hints record no claim fragments", async () => {
         // R12: while no retrieval projection exists, a fresh hint decision
         // must not bind claim fragments even if a memory-shaped result leaks
         // into the delivered set.
         const content = "the historian runs on overflow";
-        const digest = sha256Utf8Hex(content);
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
             async () =>
                 [
@@ -665,71 +651,6 @@ describe("auto-search-runner", () => {
         } finally {
             spy.mockRestore();
         }
-
-        // A pre-cutover persisted decision that DID bind fragments keeps its
-        // replay gate: a rewrite committed after the persist suppresses it.
-        const seeded = insertMemory(db, {
-            projectPath: "git:test",
-            category: "ARCHITECTURE",
-            content,
-        });
-        runInMemoryClaimsWriteTransaction(db, () =>
-            updateMemoryVerificationWithClaimsInCurrentTransaction(
-                db,
-                {
-                    producer: "auto-search-runner-test",
-                    operationKey: `verify:${seeded.id}`,
-                    requestDigest: sha256Utf8Hex(`verify:${seeded.id}`),
-                },
-                { memoryId: seeded.id, verificationStatus: "verified", nowMs: 2_000 },
-            ),
-        );
-        const persisted = appendAutoSearchHintDecision(db, "s-hint-legacy", {
-            messageId: "u-hint-legacy",
-            decision: "hint",
-            text: "\n\n<ctx-search-hint>historian runs on overflow</ctx-search-hint>",
-            memoryFragments: [{ id: seeded.id, hash: digest }],
-        });
-        expect(persisted.ok).toBeTrue();
-        runInMemoryClaimsWriteTransaction(db, () =>
-            updateMemoryContentWithClaimsInCurrentTransaction(
-                db,
-                {
-                    producer: "auto-search-runner-test",
-                    operationKey: `rewrite:${seeded.id}`,
-                    requestDigest: sha256Utf8Hex(`rewrite:${seeded.id}`),
-                },
-                {
-                    memoryId: seeded.id,
-                    content: "rewritten after the hint was persisted",
-                    normalizedHash: "hash:rewritten",
-                },
-            ),
-        );
-        const replaySpy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
-            throw new Error("replay must not re-search");
-        });
-        try {
-            const replayMessages: MessageLike[] = [
-                makeUserMsg(
-                    "u-hint-legacy",
-                    "please explain how the historian decides when to run",
-                ),
-            ];
-            await runAutoSearchHint({
-                sessionId: "s-hint-legacy",
-                db,
-                messages: replayMessages,
-                options: baseOptions,
-            });
-            expect(findUserPromptText(replayMessages[0])).not.toContain(
-                "historian runs on overflow",
-            );
-            expect(findUserPromptText(replayMessages[0])).not.toContain("<ctx-search-hint>");
-            expect(replaySpy).toHaveBeenCalledTimes(0);
-        } finally {
-            replaySpy.mockRestore();
-        }
     });
 });
 
@@ -748,9 +669,7 @@ describe("executeAutoSearchDelivery", () => {
     });
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        db = createDirectTestDatabase().db;
     });
 
     afterEach(() => {

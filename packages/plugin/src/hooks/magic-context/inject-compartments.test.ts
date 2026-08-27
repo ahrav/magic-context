@@ -15,26 +15,18 @@ import {
     reviseProjectMemoryClaim,
     setProjectMemoryClaimLifecycle,
 } from "../../features/magic-context/memory/storage-claim-operations";
-import {
-    getMemoriesByProject,
-    insertMemory as insertMemoryRaw,
-    setMemoryClassification,
-} from "../../features/magic-context/memory/storage-memory";
-import { runInMemoryClaimsWriteTransaction } from "../../features/magic-context/memory/storage-memory-claims";
 import type { Memory } from "../../features/magic-context/memory/types";
-import { runMigrations } from "../../features/magic-context/migrations";
 import {
     bumpSessionFactsVersion,
     getOrCreateSessionMeta,
     queueM0Mutation,
     setProjectState,
 } from "../../features/magic-context/storage";
-import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     type SeededProjectMemoryClaim,
     seedProjectMemoryClaim,
 } from "../../features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -68,42 +60,50 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
 const seededClaims = new WeakMap<Database, Map<number, SeededProjectMemoryClaim>>();
+let testMemoryId = 0;
 
-const insertMemory: typeof insertMemoryRaw = (database, input, operationIdentity) => {
-    const memory = insertMemoryRaw(database, input, operationIdentity);
-    if (!input.category.startsWith("__")) {
-        const projectIdentity =
-            input.projectPath.startsWith("git:") || input.projectPath.startsWith("dir:")
-                ? input.projectPath
-                : `dir:${input.projectPath}`;
-        const category = [
-            "PROJECT_RULES",
-            "ARCHITECTURE",
-            "CONSTRAINTS",
-            "CONFIG_VALUES",
-            "NAMING",
-        ].includes(input.category)
-            ? input.category
-            : "ARCHITECTURE";
-        const claim = seedProjectMemoryClaim(database, {
-            projectIdentity,
-            content: input.content,
-            category,
-            ...(input.importance == null ? {} : { importance: input.importance }),
-            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-        });
-        database
-            .prepare(
-                "INSERT OR IGNORE INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, ?)",
-            )
-            .run(input.projectPath, claim.projectId, Date.now());
-        const byMemoryId =
-            seededClaims.get(database) ?? new Map<number, SeededProjectMemoryClaim>();
-        byMemoryId.set(memory.id, claim);
-        seededClaims.set(database, byMemoryId);
-    }
-    return memory;
-};
+function insertMemory(
+    database: Database,
+    input: {
+        projectPath: string;
+        category: string;
+        content: string;
+        importance?: number;
+        expiresAt?: number | null;
+        sourceSessionId?: string;
+        sourceType?: string;
+        metadataJson?: string;
+    },
+): Memory {
+    testMemoryId += 1;
+    const projectIdentity =
+        input.projectPath.startsWith("git:") || input.projectPath.startsWith("dir:")
+            ? input.projectPath
+            : `dir:${input.projectPath}`;
+    const claim = seedProjectMemoryClaim(database, {
+        projectIdentity,
+        content: input.content,
+        category: input.category,
+        ...(input.importance == null ? {} : { importance: input.importance }),
+        ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+    });
+    database
+        .prepare(
+            "INSERT OR IGNORE INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, ?)",
+        )
+        .run(input.projectPath, claim.projectId, Date.now());
+    const byMemoryId = seededClaims.get(database) ?? new Map<number, SeededProjectMemoryClaim>();
+    byMemoryId.set(testMemoryId, claim);
+    seededClaims.set(database, byMemoryId);
+    return {
+        id: testMemoryId,
+        projectPath: input.projectPath,
+        category: input.category,
+        content: input.content,
+        importance: input.importance ?? 50,
+        expiresAt: input.expiresAt ?? null,
+    } as unknown as Memory;
+}
 
 function seededClaim(database: Database, memoryId: number): SeededProjectMemoryClaim {
     const claim = seededClaims.get(database)?.get(memoryId);
@@ -160,10 +160,7 @@ function archiveSeededClaim(database: Database, memoryId: number): void {
 }
 
 function makeDb(): Database {
-    const d = new Database(":memory:");
-    initializeDatabase(d);
-    runMigrations(d);
-    d.transaction(() => createClaimMemorySchema(d)).immediate();
+    const d = createDirectTestDatabase().db;
     // session_meta row must exist for memory_block_cache writes
     getOrCreateSessionMeta(d, SESSION_ID);
     return d;
@@ -311,10 +308,8 @@ describe("compact project-memory wire", () => {
             content: "Never bypass the validation gate.",
             importance: 20,
         });
-        const before = renderMemoryBlockV2(getMemoriesByProject(db, PROJECT_PATH));
-
-        expect(setMemoryClassification(db, inserted.id, { importance: 95 })).toBe(true);
-        const after = renderMemoryBlockV2(getMemoriesByProject(db, PROJECT_PATH));
+        const before = renderMemoryBlockV2([inserted]);
+        const after = renderMemoryBlockV2([{ ...inserted, importance: 95 }]);
 
         expect(after).toBe(before);
         expect(after).not.toContain("importance");
@@ -480,9 +475,6 @@ describe("prepareCompartmentInjection — workspace memory sharing", () => {
             category: "CONSTRAINTS",
             content: "foreign workspace constraint is shared",
         });
-        runInMemoryClaimsWriteTransaction(db, () =>
-            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id),
-        );
         makeSeededClaimShareable(db, foreignShared.id);
         insertMemory(db, {
             projectPath: "/tmp/foreign-project",
@@ -499,9 +491,6 @@ describe("prepareCompartmentInjection — workspace memory sharing", () => {
             category: "ARCHITECTURE",
             content: "archived high id is hidden",
         });
-        runInMemoryClaimsWriteTransaction(db, () =>
-            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(archived.id),
-        );
         archiveSeededClaim(db, archived.id);
         const expired = insertMemory(db, {
             projectPath: "/tmp/foreign-project",
@@ -509,9 +498,6 @@ describe("prepareCompartmentInjection — workspace memory sharing", () => {
             content: "expired high id is hidden",
             expiresAt: 1,
         });
-        runInMemoryClaimsWriteTransaction(db, () =>
-            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(expired.id),
-        );
         makeSeededClaimShareable(db, expired.id);
 
         const result = materializeM0({
@@ -935,10 +921,7 @@ describe("m[0]/m[1] materialization", () => {
     it("invalidates claim snapshot vectors after background claim and workspace writes", () => {
         const directory = makeProjectDir();
         const path = join(directory, "claim-vector.db");
-        const reader = new Database(path);
-        initializeDatabase(reader);
-        runMigrations(reader);
-        reader.transaction(() => createClaimMemorySchema(reader)).immediate();
+        const reader = createDirectTestDatabase({ path }).db;
         getOrCreateSessionMeta(reader, SESSION_ID);
         const writer = new Database(path);
         try {
@@ -1487,51 +1470,6 @@ describe("m[0]/m[1] materialization", () => {
         expect(renderedText(second[0])).toContain("Updated architecture");
         expect(renderedText(second[0])).toContain("Fresh docs folded on hard bust.");
         expect(renderedText(second[0])).not.toContain("Old architecture");
-    });
-
-    it("legacy classification writes cannot change claim-rendered bytes", () => {
-        db = makeDb();
-        const memory = insertMemory(db, {
-            projectPath: PROJECT_PATH,
-            category: "PROJECT_RULES",
-            content: "DIRECT_CLAIM_BYTES: Always run focused tests before shipping.",
-            importance: 90,
-        });
-        const state = readStateFromMeta();
-        const first = [userMessage("m1", "hello")];
-        injectM0M1({
-            db,
-            sessionId: SESSION_ID,
-            messages: first,
-            state,
-            projectPath: PROJECT_PATH,
-            memoryInjectionBudgetTokens: 8_000,
-        });
-        const initialM0 = renderedText(first[0]);
-        expect(initialM0).toContain("DIRECT_CLAIM_BYTES");
-
-        expect(setMemoryClassification(db, memory.id, { importance: 1 })).toBe(true);
-        expect(
-            mustMaterialize({
-                db,
-                sessionId: SESSION_ID,
-                state,
-                projectPath: PROJECT_PATH,
-                memoryInjectionBudgetTokens: 8_000,
-            }),
-        ).toMatchObject({ value: true, reason: "project_memory_change" });
-
-        const second = [userMessage("m2", "after legacy classification")];
-        const result = injectM0M1({
-            db,
-            sessionId: SESSION_ID,
-            messages: second,
-            state,
-            projectPath: PROJECT_PATH,
-            memoryInjectionBudgetTokens: 8_000,
-        });
-        expect(result.m0RematerializedThisPass).toBe(true);
-        expect(renderedText(second[0])).toBe(initialM0);
     });
 
     it("v2: a session facts version bump does NOT trigger re-materialization", () => {

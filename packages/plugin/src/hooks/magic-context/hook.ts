@@ -62,7 +62,7 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import {
-    getMigrationOnOpenRefusal,
+    getFormatRefusal,
     getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
@@ -259,40 +259,26 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 reason,
             );
             notifyMagicContextDisabled(deps.client, reason);
-            const migration = getMigrationOnOpenRefusal();
-            const blockingProcesses =
-                migration?.blockingProcesses ??
-                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
-                [];
+            const formatRefusal = getFormatRefusal();
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",
-                reason:
-                    migration && (blockingProcesses.length > 0 || migration.unreadableFile)
-                        ? {
-                              kind: "migration_guard",
-                              persistedVersion: migration.persistedVersion,
-                              supportedVersion: migration.supportedVersion,
-                              blockingProcesses,
-                              ...(migration.unreadableFile
-                                  ? { unreadableFile: migration.unreadableFile }
-                                  : {}),
-                              ...(migration.unreadableArm
-                                  ? { unreadableArm: migration.unreadableArm }
-                                  : {}),
-                          }
-                        : fence
-                          ? {
-                                kind: "schema_fence",
-                                persistedVersion: fence.persistedVersion,
-                                supportedVersion: fence.supportedVersion,
-                            }
-                          : {
-                                kind: "storage_failure",
-                                cause: migration?.unreadableFile
-                                    ? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-                                    : reason,
-                            },
+                reason: formatRefusal
+                    ? {
+                          kind: "format_refusal",
+                          family: formatRefusal.family,
+                          reasons: formatRefusal.reasons,
+                      }
+                    : fence
+                      ? {
+                            kind: "schema_fence",
+                            persistedVersion: fence.persistedVersion,
+                            supportedVersion: fence.supportedVersion,
+                        }
+                      : {
+                            kind: "storage_failure",
+                            cause: reason,
+                        },
             });
             return null;
         }
@@ -497,7 +483,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         })(),
         historianTwoPass: deps.config.historian?.two_pass === true,
-        runMigration: deps.config.memory?.enabled !== false && !!deps.config.historian?.model,
         // Option C privacy gate: behavioral observation candidates are collected
         // during historian runs only when the user has SCHEDULED the
         // review-user-memories task (schedule != ""). Replaces the v1
@@ -746,7 +731,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
-    const rustMemorySyncRequestedSessions = new Set<string>();
     // Build the same subc-backed client for the TS recovery arm. Constructing the
     // transport is inert; it connects only if a marker actually needs draining.
     const authorityRecoveryModuleClient =
@@ -826,7 +810,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
-    const runModuleDomainSync = async (domain: "memories" | "notes"): Promise<void> => {
+    const runModuleDomainSync = async (domain: "notes"): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
         for (;;) {
             const cursor = getMirrorCursor(db, domain);
@@ -842,7 +826,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Chained process-globally per (store, domain): several plugin instances
     // can share this database file, and interleaved pulls throw a cursor
     // mismatch in applyMirrorPage.
-    const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> =>
+    const syncModuleDomain = (domain: "notes"): Promise<void> =>
         chainMirrorDomainSync(db, domain, () => runModuleDomainSync(domain));
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
     const rustToolBackends: RustToolBackends | undefined =
@@ -1006,9 +990,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,
-                  memorySync: (sessionId: string) => {
-                      rustMemorySyncRequestedSessions.add(sessionId);
-                  },
               }
             : undefined;
     // Bridges are per resolved project, and sessions can resolve projects other
@@ -1345,7 +1326,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,
         tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
-        rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
         onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
     });
@@ -1398,7 +1378,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             sessionDirectoryBySession.delete(sessionId);
             recompProgressBySession.delete(sessionId);
             internalChildSessions.delete(sessionId);
-            rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
             channel2DirectiveTextBySession.delete(sessionId);
             clearEmbedSessionState(sessionId);

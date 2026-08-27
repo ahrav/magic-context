@@ -11,7 +11,8 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { initializeIsolatedContextDb } from "../initialize-context-db";
+import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
+import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
 import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
 import { isSensitiveEnvKey } from "../secret-env-keys";
@@ -33,6 +34,20 @@ const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
 const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY)
     ? PLUGIN_DIST_ENTRY
     : PLUGIN_SRC_ENTRY;
+
+function initializeIsolatedContextDb(
+    dataDir: string,
+    releaseRoot?: VerifiedReleaseRoot,
+): void {
+    if (releaseRoot) {
+        initializeContextDbFromRelease(dataDir, releaseRoot);
+        return;
+    }
+    const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+    if (existsSync(path)) return;
+    mkdirSync(dirname(path), { recursive: true });
+    createDirectTestDatabase({ path }).db.close();
+}
 
 export interface IsolatedEnv {
     configDir: string;

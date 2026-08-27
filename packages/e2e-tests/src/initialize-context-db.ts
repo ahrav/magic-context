@@ -2,9 +2,7 @@ import { constants } from "node:fs";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
-import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
-import { initializeDatabase } from "../../plugin/src/features/magic-context/storage-db";
-import { Database } from "../../plugin/src/shared/sqlite";
+import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { releaseRootPath, type VerifiedReleaseRoot } from "./prospective-holdout/release-root";
 
 export function initializeIsolatedContextDb(dataDir: string, releaseRoot?: VerifiedReleaseRoot): void {
@@ -35,11 +33,5 @@ export function initializeIsolatedContextDb(dataDir: string, releaseRoot?: Verif
         }
         return;
     }
-    const db = new Database(path);
-    try {
-        initializeDatabase(db);
-        runMigrations(db);
-    } finally {
-        db.close();
-    }
+    createDirectTestDatabase({ path }).db.close();
 }

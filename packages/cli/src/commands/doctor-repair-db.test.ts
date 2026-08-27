@@ -18,11 +18,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { CURRENT_SCHEMA_COMPONENTS } from "@magic-context/core/features/magic-context/storage-current-schema";
 import {
-    initializeDatabase,
     inspectRpcServerDiscovery,
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
@@ -107,9 +104,7 @@ function digest(path: string): string {
 }
 
 function seedCurrentDatabase(dbPath: string): void {
-    const db = new Database(dbPath);
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase({ path: dbPath }).db;
     const insertTag = db.prepare(
         "INSERT INTO tags (session_id, type, status, byte_size, tag_number, harness) VALUES (?, 'message', 'active', ?, ?, 'opencode')",
     );
@@ -117,11 +112,6 @@ function seedCurrentDatabase(dbPath: string): void {
         `INSERT INTO compartments
             (session_id, sequence, start_message, end_message, title, content, created_at, harness)
          VALUES ('session-main', ?, ?, ?, ?, ?, ?, 'opencode')`,
-    );
-    const insertMemory = db.prepare(
-        `INSERT INTO memories
-            (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
-         VALUES ('/project', 'CONSTRAINTS', ?, ?, ?, ?, ?, ?)`,
     );
     const insertNote = db.prepare(
         `INSERT INTO notes
@@ -133,7 +123,7 @@ function seedCurrentDatabase(dbPath: string): void {
             (project_path, started_at, finished_at, holder_id, tasks_json)
          VALUES ('/project', ?, ?, 'test-holder', '[]')`,
     );
-    runInMemoryClaimsWriteTransaction(db, () => {
+    db.transaction(() => {
         for (let index = 1; index <= 300; index++) {
             const content = `tag-${index}-${"t".repeat(700)}`;
             insertTag.run("session-main", Buffer.byteLength(content), index);
@@ -151,19 +141,9 @@ function seedCurrentDatabase(dbPath: string): void {
                 index,
             );
         }
-        for (let index = 1; index <= 26; index++) {
-            insertMemory.run(
-                `memory-${index}-${"m".repeat(200)}`,
-                `hash-${index}`,
-                index,
-                index,
-                index,
-                index,
-            );
-        }
         for (let index = 1; index <= 4; index++) insertNote.run(`note-${index}`, index, index);
         for (let index = 1; index <= 3; index++) insertDreamRun.run(index, index);
-    });
+    }).immediate();
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     db.exec("PRAGMA journal_mode=DELETE");
     db.close();

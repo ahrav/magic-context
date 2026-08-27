@@ -85,7 +85,7 @@ describe("storage-meta", () => {
             expect(db.transaction).toHaveBeenCalledTimes(2);
             // Includes every session-scoped table plus the nested message-index,
             // source-version, and compression-depth cleanup statements.
-            expect(db.prepare).toHaveBeenCalledTimes(28);
+            expect(db.prepare).toHaveBeenCalledTimes(27);
         });
     });
 });

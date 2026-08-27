@@ -4,11 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import {
-    isMemoryMigrationDone,
-    markMemoryMigrationDone,
-} from "../../features/magic-context/memory/memory-migration";
-import { resolveProjectIdentity } from "../../features/magic-context/project-identity";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { acquireWrapupInProgress } from "../../features/magic-context/storage-meta-persisted";
 import type { LiveSessionState } from "./live-session-state";
@@ -64,7 +59,6 @@ function makeCtx(
         memoryEnabled: true,
         autoPromote: false,
         fallbackModels: [],
-        runMigration: true,
         userMemoriesEnabled: false,
         getNotificationParams: () => ({}),
         ...overrides,
@@ -77,7 +71,6 @@ describe("runManagedUpgrade — wrapup guard", () => {
         const db = openDatabase();
         const dir = "/tmp/recomp-orch-wrapup-guard";
         const sessionId = "ses-wrapup-upgrade";
-        const project = resolveProjectIdentity(dir);
         const acquired = acquireWrapupInProgress(db, sessionId, {
             holderId: "wrapup-holder",
             messagesToKeep: 2,
@@ -94,7 +87,6 @@ describe("runManagedUpgrade — wrapup guard", () => {
 
         expect(message).toContain("## Session Upgrade — Skipped");
         expect(message).toContain("/ctx-wrapup is already compacting");
-        expect(isMemoryMigrationDone(db, project)).toBe(false);
     });
 });
 
@@ -104,7 +96,7 @@ describe("runManagedUpgrade — already-upgraded guard", () => {
         const db = openDatabase();
         const dir = "/tmp/recomp-orch-noop";
 
-        // Seed a v2 (legacy=0) compartment + mark this project's migration done.
+        // Seed a v2 (legacy=0) compartment.
         appendCompartments(db, "ses-up", [
             {
                 sequence: 0,
@@ -118,7 +110,6 @@ describe("runManagedUpgrade — already-upgraded guard", () => {
                 p1: "body",
             },
         ]);
-        markMemoryMigrationDone(db, resolveProjectIdentity(dir));
 
         const ctx = makeCtx(db, dir);
         const message = await runManagedUpgrade(ctx, "ses-up");
@@ -136,7 +127,6 @@ describe("runManagedUpgrade — already-upgraded guard", () => {
         useTempDataHome("recomp-orch-empty-");
         const db = openDatabase();
         const dir = "/tmp/recomp-orch-empty";
-        markMemoryMigrationDone(db, resolveProjectIdentity(dir));
 
         const ctx = makeCtx(db, dir);
         const message = await runManagedUpgrade(ctx, "ses-empty");

@@ -4,6 +4,7 @@ import {
     loadCompartmentChunkEmbeddingsForSearch,
     type StoredCompartmentChunkEmbedding,
 } from "./compartment-chunk-embedding";
+import { sanitizeFtsQuery } from "./fts-query";
 import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
 import { readProjectIdentityMap } from "./memory/claim-memory-render";
@@ -17,7 +18,6 @@ import {
     resolveProjectIdsForIdentities,
 } from "./memory/storage-claim-current-state";
 import { recordClaimUsage } from "./memory/storage-claim-operations";
-import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
     DEFAULT_SEARCH_RESULT_LIMIT,

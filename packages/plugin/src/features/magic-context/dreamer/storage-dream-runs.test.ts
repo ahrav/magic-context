@@ -1,12 +1,10 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createProjectMemoryClaim } from "../memory/storage-claim-operations";
 import { ensureProject } from "../memory/storage-claims";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import { createDirectTestDatabase } from "../test-database";
 import { dreamerManifestIdentity, readDreamerProjectClaims } from "./claim-manifest";
 import { acquireLease, runLeaseGuardedWrite } from "./lease";
@@ -20,9 +18,7 @@ afterEach(() => {
 });
 
 function freshDb(): Database {
-    const d = new Database(":memory:");
-    initializeDatabase(d);
-    runMigrations(d);
+    const d = createDirectTestDatabase().db;
     return d;
 }
 
@@ -82,9 +78,7 @@ describe("dream_runs memory-change id arrays (#221)", () => {
 });
 
 function freshClaimDb(): Database {
-    const d = createDirectTestDatabase().db;
-    initializeDatabase(d);
-    return d;
+    return createDirectTestDatabase().db;
 }
 
 function seedClaim(db: Database, projectIdentity: string, index: number): string {

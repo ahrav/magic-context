@@ -11,7 +11,7 @@ import {
     MAX_SEARCH_RESULT_LIMIT,
     prepareExplicitQuery,
 } from "../../src/features/magic-context/search-bounds";
-import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
+import { SOURCE_LOCATOR_KIND } from "./physical-locator";
 import { normalizeMemoryContent } from "../../src/features/magic-context/memory/normalize-hash";
 import { normalizeQueryText } from "../../src/features/magic-context/query-normalization";
 import { parseIdShapedQuery } from "../../src/features/magic-context/search-bounds";

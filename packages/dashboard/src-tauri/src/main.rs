@@ -80,7 +80,6 @@ fn main() {
             commands::get_dream_state,
             commands::get_dreamer_projects,
             commands::get_dream_runs,
-            commands::get_dream_run_memory_changes,
             // Logs & Cache
             commands::get_log_entries,
             commands::get_cache_events,

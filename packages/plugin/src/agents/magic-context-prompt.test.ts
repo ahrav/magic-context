@@ -116,7 +116,7 @@ describe("buildMagicContextSection — subagent mode", () => {
 describe("buildMagicContextSection: memory gating", () => {
     // buildMagicContextSection's 9th positional parameter is memoryEnabled
     // (defaults to true). The 7-arg legacy call below relies on that default.
-    it("memory ON (default) keeps the ctx_memory guidance and is byte-identical to legacy callers", () => {
+    it("memory ON (default) keeps claim-native ctx_memory guidance", () => {
         const legacy = buildMagicContextSection(null, 20, true, false, false, false, false);
         const memOn = buildMagicContextSection(
             null,
@@ -132,6 +132,7 @@ describe("buildMagicContextSection: memory gating", () => {
         expect(memOn).toBe(legacy);
         expect(memOn).toContain("Use `ctx_memory`");
         expect(memOn).toContain("**Save durable knowledge proactively**");
+        expect(memOn).toContain("opaque `mcm_…` public IDs");
     });
 
     it("memory OFF drops ALL ctx_memory guidance but keeps ctx_search", () => {

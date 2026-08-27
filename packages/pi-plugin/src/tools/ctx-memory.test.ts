@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { installAuthorityManagedMarker } from "@magic-context/core/features/magic-context/context-authority";
 import {
 	computeProjectMemoryMutationToken,
 	getProjectMemoryClaimByPublicId,
@@ -566,6 +567,38 @@ describe("Pi ctx_memory U4 scenario 8: no legacy active path", () => {
 			"memoryId",
 		]) {
 			expect(source).not.toContain(forbidden);
+		}
+	});
+});
+
+describe("Pi ctx_memory module-authority fence", () => {
+	it("refuses mutations while a module authority marker exists without writing a receipt", async () => {
+		const db = createClaimReaderTestDatabase();
+		try {
+			installAuthorityManagedMarker(db, PROJECT, "context-store-test");
+			const before = (
+				db
+					.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts")
+					.get() as {
+					count: number;
+				}
+			).count;
+			const result = await harness(db).execute(
+				createArgs("must remain uncommitted"),
+				"call-module-owned",
+			);
+			expect(result.isError).toBe(true);
+			expect(textOf(result)).toContain("module-owned or transitioning");
+			const after = (
+				db
+					.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts")
+					.get() as {
+					count: number;
+				}
+			).count;
+			expect(after).toBe(before);
+		} finally {
+			closeQuietly(db);
 		}
 	});
 });

@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 
 let queryEmbedding: Float32Array | null = null;
 const embeddingQueries: string[] = [];
@@ -17,7 +17,6 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
-import { insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
 import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
 import * as claimCurrentState from "./memory/storage-claim-current-state";
 import {
@@ -25,7 +24,6 @@ import {
     setProjectMemoryClaimLifecycle,
 } from "./memory/storage-claim-operations";
 import { ensureMessagesIndexed } from "./message-index";
-import { runMigrations } from "./migrations";
 import {
     _resetProjectEmbeddingRegistryForTests,
     registerProjectEmbedding,
@@ -44,7 +42,6 @@ import {
 import { QueryBoundsError } from "./search-bounds";
 import type { SearchTraceSpan } from "./search-trace";
 import { countingDatabase } from "./sql-counters";
-import { initializeDatabase } from "./storage-db";
 import {
     addNote,
     countNoteFtsMatchesBatch,
@@ -58,6 +55,7 @@ import {
     type SeededProjectMemoryClaim,
     seedProjectMemoryClaim,
 } from "./test-claim-database";
+import { createDirectTestDatabase } from "./test-database";
 
 const readMessages = (sessionId: string) => rawMessagesBySession.get(sessionId) ?? [];
 const embedQuery = async (text: string) => {
@@ -124,7 +122,6 @@ afterEach(() => {
     queryEmbedding = null;
     embeddingQueries.length = 0;
     rawMessagesBySession.clear();
-    resetEmbeddingCacheForTests();
     _resetProjectEmbeddingRegistryForTests();
 });
 
@@ -215,12 +212,6 @@ describe("unifiedSearch", () => {
             content: "Magic context stores ranked search data in SQLite.",
             category: "ARCHITECTURE",
         });
-        const memory = insertMemory(db, {
-            projectPath: "git:repo-project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "Magic context stores ranked search data in SQLite.",
-        });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
 
         rawMessagesBySession.set("ses-1", [
@@ -387,12 +378,6 @@ describe("unifiedSearch", () => {
         // so the ctx_search tool passes a cutoff of 0. Ordinals are 1-based, so a
         // 0 cutoff must exclude EVERY indexed message — none have scrolled out of
         // the live context the agent already sees (incl. the current prompt).
-        const memory = insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "Magic context stores ranked search data in SQLite.",
-        });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
 
         rawMessagesBySession.set("ses-1", [
@@ -570,11 +555,6 @@ describe("unifiedSearch", () => {
     });
 
     it("restricts note results to the note source and includes them in broad searches", async () => {
-        insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "broad recall marker from memory",
-        });
         const note = addNote(db, "session", {
             sessionId: "ses-broad-note",
             content: "broad recall marker from note",
@@ -612,12 +592,6 @@ describe("unifiedSearch", () => {
     });
 
     it("restricts results to the sources filter", async () => {
-        const memory = insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "Historian uses a compact static system prompt.",
-        });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
         queryEmbedding = new Float32Array([1, 0]);
 
         rawMessagesBySession.set("ses-sources", [
@@ -1023,7 +997,6 @@ describe("unifiedSearch", () => {
     });
 
     /**
-     * Regression for the duplicate-embed bug observed in production LMStudio    /**
      * Regression for the duplicate-embed bug observed in production LMStudio
      * logs: when both memory and git-commit search ran in parallel, EACH
      * branch independently called `embedQuery(trimmedQuery)`, producing two
@@ -1033,13 +1006,7 @@ describe("unifiedSearch", () => {
      * unifiedSearch must embed the query exactly once at the top, then pass
      * the same vector to both consumers.
      */
-    it("embeds the query exactly once even when memory + git_commit both need it", async () => {
-        const memory = insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "shared embed test.",
-        });
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), "mock:model");
+    it("embeds the query exactly once for the git-commit lane", async () => {
         queryEmbedding = new Float32Array([1, 0]);
 
         await unifiedSearch(db, "ses-1", "/repo/project", "shared embed query", {
@@ -1424,11 +1391,6 @@ describe("query-purpose provider boundary (U30)", () => {
         fetchSpy.mockImplementation((async () => {
             throw new Error("embedding endpoint down");
         }) as unknown as typeof fetch);
-        insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "queue saturation design notes",
-        });
 
         const results = await unifiedSearch(
             db,
@@ -1490,7 +1452,6 @@ describe("parseIdShapedQuery", () => {
 
 const FIXTURE_PROJECT = "git:projection-fixture";
 const FIXTURE_SESSION = "ses-projection-fixture";
-const _FIXTURE_MODEL = "mock:model";
 /** Fixed clock so note createdAt ties (and their id tie-break) are deterministic. */
 const FIXTURE_NOTE_CREATED_AT = Date.UTC(2026, 1, 1);
 
@@ -2519,7 +2480,6 @@ describe("parseLocatorShapedQuery", () => {
 });
 
 // ---------------------------------------------------------------------------
-// U4 — note candidate pruning// ---------------------------------------------------------------------------
 // U4 — note candidate pruning through the FTS projection (R36).
 // ---------------------------------------------------------------------------
 
@@ -2744,10 +2704,8 @@ describe("note candidate pruning (R36)", () => {
     });
 
     it("falls back to the scoped scan when the projection is absent", async () => {
-        const bare = new Database(":memory:");
+        const bare = createDirectTestDatabase().db;
         try {
-            initializeDatabase(bare);
-            runMigrations(bare);
             bare.exec(`
                 DROP TRIGGER IF EXISTS notes_fts_ai;
                 DROP TRIGGER IF EXISTS notes_fts_ad;

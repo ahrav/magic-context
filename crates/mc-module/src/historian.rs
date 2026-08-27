@@ -10,11 +10,10 @@ use std::fmt;
 use std::time::Duration;
 
 use mc_store::{
-    CompartmentSetGeneration, FactCandidate, HistorianChunkRange, HistorianDurableState,
-    HistorianEventCandidate, HistorianPhase, HistorianPrimerCandidate, HistorianPublishError,
-    HistorianPublishPredicate, HistorianPublishRequest, HistorianPublishResult,
-    HistorianSelectedMessageIdentity, HistorianUserMemoryCandidate, McStore, McStoreError,
-    StoredCompartment,
+    CompartmentSetGeneration, HistorianChunkRange, HistorianDurableState, HistorianEventCandidate,
+    HistorianPhase, HistorianPrimerCandidate, HistorianPublishError, HistorianPublishPredicate,
+    HistorianPublishRequest, HistorianPublishResult, HistorianSelectedMessageIdentity,
+    HistorianUserMemoryCandidate, McStore, McStoreError, StoredCompartment,
 };
 
 use crate::historian_producer::{
@@ -65,19 +64,6 @@ fn to_stored_compartment(
             1
         },
         created_at: created_at_ms,
-    }
-}
-
-/// Project a validated fact candidate onto the store's promotion input. The
-/// historian promotes facts with no importance/expiry/source at publish time —
-/// classification and decay are later, cache-neutral passes.
-fn to_store_fact(f: &crate::historian_validate::FactCandidate) -> FactCandidate {
-    FactCandidate {
-        category: f.category.clone(),
-        content: f.content.clone(),
-        importance: None,
-        expires_at: None,
-        source_session_id: None,
     }
 }
 
@@ -432,8 +418,6 @@ pub struct ValidatedPublishRequest<'a> {
     pub predicate: &'a HistorianPublishPredicate,
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
-    /// Facts are dropped when either memory.enabled or memory.auto_promote is off.
-    pub promote_facts: bool,
     /// User observations are stored only when the privacy collection gate is enabled.
     pub collect_user_memory_candidates: bool,
     pub publication_floor_ordinal: u64,
@@ -481,11 +465,6 @@ pub fn publish_validated_chunk(
         .iter()
         .map(|c| to_stored_compartment(c, request.created_at_ms, request.boundary_dates))
         .collect();
-    let facts: Vec<FactCandidate> = if request.promote_facts {
-        request.validated.facts.iter().map(to_store_fact).collect()
-    } else {
-        Vec::new()
-    };
     let events: Vec<HistorianEventCandidate> = request
         .validated
         .events
@@ -538,8 +517,6 @@ pub fn publish_validated_chunk(
         predicate: request.predicate,
         project_path: request.project_path,
         compartments: &compartments,
-        facts: &facts,
-        promote_facts: request.promote_facts,
         events: &events,
         primer_candidates: &primer_candidates,
         user_memory_candidates: &user_memory_candidates,
@@ -1744,7 +1721,6 @@ fn publish_output_from_awaiting(
             predicate: &predicate,
             observed_chunk_fingerprint,
             validated: &validated,
-            promote_facts: validate_options.memory_enabled && validate_options.auto_promote,
             collect_user_memory_candidates: validate_options.user_memory_collection_enabled,
             publication_floor_ordinal: validated.unprocessed_from,
             chunk_transcript,
@@ -1847,13 +1823,10 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    use crate::historian_producer::HistorianSendOutcome;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
     use mc_core::CoreState;
     use mc_store::{ModuleMeta, StoredCompartment};
-
-    use crate::ck_wire::{self, CkIngressMessage, CkWireMessage};
-    use crate::historian_producer::HistorianSendOutcome;
-    use crate::transform::{transform, ProducerContext, TransformRequest};
 
     fn store(dir: &std::path::Path) -> McStore {
         McStore::open(&StorageDescriptor {
@@ -1867,128 +1840,9 @@ mod tests {
         .unwrap()
     }
 
-    fn text_message(id: &str, text: &str) -> CkWireMessage {
-        CkWireMessage::from_parts(
-            "user",
-            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
-                text: text.to_string(),
-            })],
-            None,
-            ck_wire::ProviderExtras::new(),
-            ck_wire::HarnessMeta {
-                harness_id: Some(id.to_string()),
-                ..Default::default()
-            },
-        )
-    }
-
-    fn item(id: &str, ordinal: u64, bytes: &str) -> CkIngressMessage {
-        CkIngressMessage {
-            mid: id.to_string(),
-            ordinal,
-            ck: text_message(id, bytes),
-        }
-    }
-
-    fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
-        TransformRequest {
-            claim_lane: None,
-            cache_ttl: None,
-            effective_execute_threshold: None,
-            auto_search_enabled: true,
-            auto_search_score_threshold: 0.35,
-            auto_search_min_prompt_chars: 0,
-            kind: "transform".to_string(),
-            v: 2,
-            serializer_profile: "owned-llmrunner".to_string(),
-            session_id: "ses".to_string(),
-            render_config: "cfg".to_string(),
-            system_prompt_hash: String::new(),
-            upgrade_state: String::new(),
-            is_subagent: false,
-            protected_tags: 20,
-            provider_id: None,
-            model_key: None,
-            clear_reasoning_age: 50,
-            caveman_enabled: false,
-            caveman_min_chars: 500,
-            tool_present: false,
-            todo_tool_present: None,
-            prompt_surface_preset: crate::prompt_surface::PromptSurfacePreset::Full,
-            prompt_surface_model_key: None,
-            prompt_surface_config_identity: String::new(),
-            prompt_surface_tool_descriptions: BTreeMap::new(),
-            prompt_surface_guidance_override: None,
-            mural: None,
-            serve_native: false,
-            native_messages: None,
-            full_array_fingerprint: None,
-            messages,
-            tail_delta: None,
-            usage: None,
-            geometry: None,
-            provider_error: None,
-            mid_turn: false,
-            prev_response_completed_at_ms: None,
-            request_observed_at_ms: None,
-            channel2_nudge_state: String::new(),
-            channel2_delivered_id: None,
-            emergency_recovery_armed: false,
-            emergency_recovery_no_head_escape: false,
-            detected_context_limit: 0,
-            detected_context_limit_model_key: None,
-            history_budget_tokens: None,
-            declared_trim: None,
-            lineage_switched: false,
-            descent_edge_id: 0,
-            prior_conversation_key: String::new(),
-            prior_epoch: 0,
-            new_epoch: 0,
-            constituents: Vec::new(),
-            compaction_observed: false,
-        }
-    }
-
     fn empty_boundary_dates() -> &'static BTreeMap<String, String> {
         static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
         EMPTY.get_or_init(BTreeMap::new)
-    }
-
-    fn pctx<'a>() -> ProducerContext<'a> {
-        ProducerContext {
-            claim_lane: None,
-            project_path: "git:proj",
-            note_project_path: "git:proj",
-            project_directory: "/nonexistent-docs",
-            history_budget_tokens: 60_000.0,
-            memory_budget_tokens: 8_000.0,
-            user_profile_budget_tokens: 4_000.0,
-            memory_enabled: true,
-            inject_docs: true,
-            temporal_awareness: true,
-            now_ms: 0,
-            execute_threshold_percentage: 65.0,
-            compaction_enabled: true,
-            smart_drops: false,
-            cache_ttl: "5m".to_string(),
-            cache_ttl_provenance: crate::config::CacheTtlProvenance::Default,
-            model_key: None,
-            observed_last_response_at_ms: None,
-            guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
-            historian_active: false,
-            wrapup_active: false,
-            injected_reductions: Vec::new(),
-        }
-    }
-
-    fn run_transform(store: &McStore, request: &TransformRequest) -> Vec<CkWireMessage> {
-        transform(store, request, &pctx())
-            .unwrap()
-            .ck_messages
-            .unwrap_or_default()
-            .into_iter()
-            .map(crate::transform::ServedMessage::into_message)
-            .collect()
     }
 
     fn comp(seq: i64, start: i64, end: i64, end_id: &str, p1: &str) -> StoredCompartment {
@@ -4326,7 +4180,6 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
-                promote_facts: true,
                 collect_user_memory_candidates: true,
                 publication_floor_ordinal: 4,
                 chunk_transcript: "U: transcript",
@@ -4354,83 +4207,6 @@ mod tests {
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.legacy, 0);
         assert_eq!(c2.created_at, 123);
-    }
-
-    #[test]
-    fn publish_gates_facts_when_memory_or_auto_promote_is_off() {
-        use std::collections::BTreeMap;
-
-        for (session_id, memory_enabled, auto_promote) in
-            [("memory-off", false, true), ("auto-off", true, false)]
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let store = store(dir.path());
-            let loaded = store
-                .commit(
-                    session_id,
-                    None,
-                    &mc_core::CoreState::default(),
-                    &test_meta_with_historian(publishing_state()),
-                )
-                .unwrap();
-            let state = store.load(session_id).unwrap();
-            let predicate = publish_predicate(&state.meta.historian).unwrap();
-            let validated = ValidatedChunk {
-                facts: vec![crate::historian_validate::FactCandidate {
-                    category: "ARCHITECTURE".into(),
-                    content: "gated fact".into(),
-                    origin_compartment_index: None,
-                }],
-                events: vec![crate::historian_validate::ParsedEvent {
-                    kind: "causal_incident".into(),
-                    at_compartment: None,
-                    fields: BTreeMap::from([("summary".into(), "event".into())]),
-                }],
-                primer_candidates: vec![crate::historian_validate::PrimerCandidate {
-                    question: "What was preserved?".into(),
-                    origin_compartment_index: None,
-                }],
-                user_observations: vec![crate::historian_validate::UserObservationCandidate {
-                    content: "private observation".into(),
-                    origin_compartment_index: None,
-                }],
-                unprocessed_from: 1,
-                ..Default::default()
-            };
-            publish_validated_chunk(
-                &store,
-                ValidatedPublishRequest {
-                    session_id,
-                    project_path: "git:proj",
-                    expected_row_version: Some(loaded),
-                    expected_revert_epoch: 0,
-                    predicate: &predicate,
-                    observed_chunk_fingerprint: "fp",
-                    validated: &validated,
-                    promote_facts: memory_enabled && auto_promote,
-                    collect_user_memory_candidates: false,
-                    publication_floor_ordinal: 1,
-                    chunk_transcript: "U: transcript",
-                    raw_chunk_messages: "[]",
-                    boundary_dates: empty_boundary_dates(),
-                    created_at_ms: 123,
-                    failure_backoff_at_ms: 0,
-                    publication_fence: None,
-                },
-            )
-            .expect("gated publication succeeds without promoting facts");
-
-            assert!(store
-                .load_active_memories("git:proj", 0)
-                .unwrap()
-                .is_empty());
-            assert_eq!(store.load_compartment_events(session_id).unwrap().len(), 1);
-            assert_eq!(store.load_primer_candidates(session_id).unwrap().len(), 1);
-            assert!(store
-                .load_user_memory_candidates(session_id)
-                .unwrap()
-                .is_empty());
-        }
     }
 
     #[test]
@@ -4559,7 +4335,6 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "different-fingerprint",
                 validated: &ValidatedChunk::default(),
-                promote_facts: true,
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
@@ -4646,7 +4421,6 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &ValidatedChunk::default(),
-                promote_facts: true,
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
@@ -4728,7 +4502,6 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
-                promote_facts: false,
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
@@ -4888,8 +4661,6 @@ mod tests {
                 predicate: &predicate,
                 project_path: "git:proj",
                 compartments: &[comp(1, 2, 4, "m4", "summary")],
-                facts: &[],
-                promote_facts: true,
                 events: &[],
                 primer_candidates: &[],
                 user_memory_candidates: &[],
@@ -4907,86 +4678,5 @@ mod tests {
             store.load("ses").unwrap().meta.historian.state,
             HistorianPhase::Idle
         );
-    }
-
-    #[test]
-    fn publish_floor_only_between_defers_is_byte_invisible_to_transform() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        store
-            .replace_compartments("ses", &[comp(1, 1, 1, "m1", "SUMMARY")])
-            .unwrap();
-        store
-            .seed_memory(1, "git:proj", "ARCHITECTURE", "existing fact", 70)
-            .unwrap();
-        let request = req(vec![item("m1", 1, "raw"), item("t2", 2, "tail")]);
-        run_transform(&store, &request);
-        let before = run_transform(&store, &request);
-
-        let mut meta = store.load("ses").unwrap().meta;
-        let selected_range_identities = vec![HistorianSelectedMessageIdentity {
-            mid: "t2".to_string(),
-            block_identities: meta.block_identity_by_mid["t2"].clone(),
-        }];
-        let mut state = publishing_state();
-        let compartment_set_generation = store
-            .load_historian_assembly_snapshot("ses")
-            .unwrap()
-            .compartment_set_generation;
-        state.compartment_set_generation = compartment_set_generation;
-        state.chunk_range = Some(HistorianChunkRange {
-            from_ordinal: 2,
-            to_ordinal: 2,
-        });
-        state.chunk_fingerprint = "tail-fp".into();
-        state.selected_range_identities = selected_range_identities.clone();
-        state.producer_run_id = Some("run-3".into());
-        meta.historian = state;
-        let row_version = store
-            .commit(
-                "ses",
-                store.load("ses").unwrap().row_version,
-                &store.load("ses").unwrap().core,
-                &meta,
-            )
-            .unwrap();
-        let predicate = HistorianPublishPredicate {
-            firing_seq: 3,
-            producer_run_id: "run-3".into(),
-            chunk_fingerprint: "tail-fp".into(),
-            selected_range_identities,
-            compartment_set_generation,
-        };
-        store
-            .publish_historian_chunk(HistorianPublishRequest {
-                session_id: "ses",
-                expected_row_version: Some(row_version),
-                expected_revert_epoch: 0,
-                predicate: &predicate,
-                project_path: "git:proj",
-                compartments: &[],
-                facts: &[FactCandidate {
-                    category: "ARCHITECTURE".into(),
-                    content: "existing fact".into(),
-                    ..Default::default()
-                }],
-                promote_facts: true,
-                events: &[],
-                primer_candidates: &[],
-                user_memory_candidates: &[],
-                publication_floor_ordinal: 3,
-                chunk_transcript: None,
-                raw_chunk_messages: None,
-            })
-            .unwrap();
-
-        let after = run_transform(&store, &request);
-        assert_eq!(
-            after, before,
-            "publication floor and deduped facts never render"
-        );
-        let loaded = store.load("ses").unwrap();
-        assert_eq!(loaded.meta.publication_floor_ordinal, Some(3));
-        assert_eq!(loaded.meta.coverage_ordinal, Some(1));
     }
 }

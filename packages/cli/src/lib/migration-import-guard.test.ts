@@ -5,14 +5,7 @@ import { join, relative, resolve } from "node:path";
 const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");
 const SOURCE_ROOTS = ["packages/cli/src", "packages/plugin/src", "packages/pi-plugin/src"];
 
-// Schema upgrades belong to the plugin boot path. There are currently no CLI
-// class-(c) schema migration commands; if one is added, its production file
-// must be listed here explicitly and must print its version transition.
-const ALLOWED_RUN_MIGRATIONS_IMPORTS = new Set([
-    "packages/cli/src/commands/doctor-repair-db.ts",
-    "packages/plugin/src/features/magic-context/storage-db.ts",
-    "packages/plugin/src/features/magic-context/memory/fixtures/claims-crash-worker.ts",
-]);
+const ALLOWED_RUN_MIGRATIONS_IMPORTS = new Set<string>([]);
 
 function sourceFiles(directory: string): string[] {
     const result: string[] = [];

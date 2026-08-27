@@ -7,11 +7,9 @@ import {
     getAuthorityManagedMarker,
     installAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
-import { insertMemory } from "../../features/magic-context/memory/storage-memory";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getProjectState } from "../../features/magic-context/storage-project-state";
-import { Database } from "../../shared/sqlite";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import { recoverTsAuthorityProject, scheduleTsAuthorityRecovery } from "./transform";
 
@@ -33,9 +31,7 @@ describe("TS authority flip-back", () => {
     test("a linked worktree never schedules a drain while a primary checkout does", async () => {
         const linkedProject = "git:linked-flip-back";
         const primaryProject = "git:primary-flip-back";
-        const database = new Database(":memory:");
-        initializeDatabase(database);
-        runMigrations(database);
+        const database = createDirectTestDatabase().db;
         installAuthorityManagedMarker(database, linkedProject);
         installAuthorityManagedMarker(database, primaryProject);
 
@@ -116,9 +112,7 @@ describe("TS authority flip-back", () => {
     });
 
     test("drains real authority protocol, removes the marker, and bumps the memory epoch once", async () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        const db = createDirectTestDatabase().db;
         installAuthorityManagedMarker(db, PROJECT);
         const states = new Map<"memories" | "notes", AuthorityStatus["state"]>([
             ["memories", "MODULE"],
@@ -162,11 +156,10 @@ describe("TS authority flip-back", () => {
         expect(getProjectState(db, PROJECT)?.projectMemoryEpoch).toBe(1);
         expect(roots.every((root) => root === "/repo-root")).toBe(true);
         expect(() =>
-            insertMemory(db, {
-                projectPath: PROJECT,
+            seedProjectMemoryClaim(db, {
+                projectIdentity: PROJECT,
                 category: "CONSTRAINTS",
                 content: "writes are unfenced after the drain",
-                sourceSessionId: "ses-flip-back",
             }),
         ).not.toThrow();
         db.close();

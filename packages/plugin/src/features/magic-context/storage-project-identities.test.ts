@@ -3,7 +3,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { createClaimsAndEvidenceSchema } from "./storage-claims-schema";
 import {
     applyIdentityMergeToProjectRegistry,
     collectAliasesForTargets,
@@ -13,6 +12,7 @@ import {
     resolveTerminalIdentity,
     seedProjectRegistry,
 } from "./storage-project-identities";
+import { createDirectTestDatabase } from "./test-database";
 
 let db: Database | null = null;
 
@@ -23,8 +23,8 @@ function rawDb(): Database {
 }
 
 function registryDb(): Database {
-    const database = rawDb();
-    createClaimsAndEvidenceSchema(database);
+    const database = createDirectTestDatabase().db;
+    db = database;
     return database;
 }
 
@@ -131,19 +131,6 @@ describe("seed resolution", () => {
         expect(seed.aliasTargets.has("git:loop-b")).toBe(false);
     });
 
-    test("append-only audit tables are alias sources only, never grounds for a project row", () => {
-        const database = rawDb();
-        database.exec(`
-            CREATE TABLE memories (id INTEGER PRIMARY KEY, project_path TEXT);
-            CREATE TABLE memory_mutation_log (id INTEGER PRIMARY KEY, project_path TEXT);
-            INSERT INTO memories (project_path) VALUES ('git:live');
-            INSERT INTO memory_mutation_log (project_path) VALUES ('git:live'), ('git:dead-history');
-        `);
-        const seed = resolveProjectIdentitySeed(database);
-        expect(seed.terminals).toEqual(["git:live"]);
-        expect(seed.aliasTargets.has("git:dead-history")).toBe(false);
-    });
-
     test("seedProjectRegistry publishes one project per terminal with every alias", () => {
         const database = registryDb();
         seedProjectRegistry(
@@ -169,11 +156,6 @@ describe("collectAliasesForTargets", () => {
     test("flattens rekey chains and registry aliases while skipping corrupt cycles", () => {
         const database = registryDb();
         database.exec(`
-            CREATE TABLE v22_identity_rekey_map (
-                old_project_path TEXT PRIMARY KEY,
-                new_project_path TEXT NOT NULL,
-                rekeyed_at INTEGER NOT NULL
-            );
             INSERT INTO v22_identity_rekey_map VALUES ('git:hop-1', 'git:hop-2', 1);
             INSERT INTO v22_identity_rekey_map VALUES ('git:hop-2', 'git:target', 1);
             INSERT INTO v22_identity_rekey_map VALUES ('git:loop-a', 'git:loop-b', 1);
@@ -217,13 +199,6 @@ describe("collectAliasesForTargets", () => {
 describe("applyIdentityMergeToProjectRegistry", () => {
     function seededRegistry(): Database {
         const database = registryDb();
-        database.exec(`
-            CREATE TABLE v22_identity_rekey_map (
-                old_project_path TEXT PRIMARY KEY,
-                new_project_path TEXT NOT NULL,
-                rekeyed_at INTEGER NOT NULL
-            );
-        `);
         seedProjectRegistry(
             database,
             {

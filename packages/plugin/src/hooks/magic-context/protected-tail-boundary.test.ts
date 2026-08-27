@@ -50,7 +50,7 @@ describe("protected-tail N clamp", () => {
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -112,9 +112,7 @@ function createBoundaryOpenCodeDb(
 }
 
 function createContextDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 describe("protected-tail boundary integration", () => {

@@ -32,7 +32,6 @@ import {
     recordOverflowDetected,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
-import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
 import {
     appendAutoSearchHintDecision,
     appendNoteNudgeAnchor,
@@ -52,16 +51,10 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { createTransform } from "./transform";
 
-const claimSchemaDatabases = new WeakSet<Database>();
-
 function insertMemory(
     db: Database,
     input: { projectPath: string; category: string; content: string },
 ): void {
-    if (!claimSchemaDatabases.has(db)) {
-        db.transaction(() => createClaimMemorySchema(db)).immediate();
-        claimSchemaDatabases.add(db);
-    }
     seedProjectMemoryClaim(db, {
         projectIdentity: input.projectPath,
         category: [

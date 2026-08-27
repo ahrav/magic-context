@@ -2,12 +2,10 @@
 
 import { describe, expect, it } from "bun:test";
 import { setProjectMemoryClaimLifecycle } from "../../features/magic-context/memory/storage-claim-operations";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { createClaimMemorySchema } from "../../features/magic-context/storage-claim-memory-schema";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
 import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { injectM0M1, type M0M1State } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
@@ -16,9 +14,7 @@ const SESSION_ID = "ses_mural_inject";
 const PROJECT_ID = "git:mural-project";
 
 function makeDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     getOrCreateSessionMeta(db, SESSION_ID);
     return db;
 }
@@ -335,7 +331,6 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
 
     it("publishes no mural image and no marker when the claim snapshot went stale", () => {
         const db = makeDb();
-        db.transaction(() => createClaimMemorySchema(db)).immediate();
         try {
             const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
             const claim = seedProjectMemoryClaim(db, {

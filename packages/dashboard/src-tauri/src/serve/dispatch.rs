@@ -173,12 +173,6 @@ struct DreamRunsArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RunIdArgs {
-    run_id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MaxLinesArgs {
     max_lines: Option<usize>,
 }
@@ -581,14 +575,6 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             let conn = open_readonly(state)?;
             json(
                 db::get_dream_runs(&conn, a.project_path.as_deref(), a.limit.unwrap_or(20))
-                    .map_err(DispatchError::Command)?,
-            )
-        }
-        "get_dream_run_memory_changes" => {
-            let a: RunIdArgs = parse_args(args)?;
-            let conn = open_readonly(state)?;
-            json(
-                db::get_dream_run_memory_changes(&conn, a.run_id)
                     .map_err(DispatchError::Command)?,
             )
         }

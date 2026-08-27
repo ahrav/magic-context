@@ -15,8 +15,10 @@ import {
     replaceAllCompartments,
 } from "../../features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
-import { getCurrentMemoryClaimByLegacyMemoryId } from "../../features/magic-context/memory/storage-memory-claims";
+import {
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "../../features/magic-context/memory/storage-claim-current-state";
 import {
     acquireWrapupInProgress,
     closeDatabase,
@@ -1397,19 +1399,21 @@ describe("runCompartmentAgent", () => {
         expect(
             getOrCreateSessionMeta(db, "ses-post-commit-registration").compartmentInProgress,
         ).toBe(false);
-        expect(
-            getMemoriesByProject(db, resolveProjectIdentity(projectDirectory)).map(
-                (memory) => memory.content,
-            ),
-        ).toContain("Durable fact survives registration outage.");
-        const promoted = db
-            .prepare("SELECT id AS id FROM memories WHERE content = ?")
-            .get("Durable fact survives registration outage.") as { id: number } | undefined;
-        if (!promoted) throw new Error("expected the published fact to be promoted");
-        const promotedClaim = getCurrentMemoryClaimByLegacyMemoryId(db, promoted.id);
+        const promotedClaims = readProjectMemoryCurrentState(db, {
+            projectIds: resolveProjectIdsForIdentities(db, [
+                resolveProjectIdentity(projectDirectory),
+            ]),
+            lifecycleStates: ["active"],
+            surface: "maintenance_hygiene",
+        }).items;
+        expect(promotedClaims.map((claim) => claim.content)).toContain(
+            "Durable fact survives registration outage.",
+        );
+        const promotedClaim = promotedClaims.find(
+            (claim) => claim.content === "Durable fact survives registration outage.",
+        );
         expect(promotedClaim?.revision).toBe(1);
-        expect(promotedClaim?.state).toBe("active");
-        expect(promotedClaim?.content).toBe("Durable fact survives registration outage.");
+        expect(promotedClaim?.lifecycleState).toBe("active");
         expect(
             db
                 .prepare(
@@ -1432,7 +1436,7 @@ describe("runCompartmentAgent", () => {
         ]);
         const db = openTestDb();
         db.exec(
-            "CREATE TRIGGER fail_memory_insert BEFORE INSERT ON memories BEGIN SELECT RAISE(ABORT, 'memory insert fail'); END;",
+            "CREATE TRIGGER fail_claim_insert BEFORE INSERT ON claims BEGIN SELECT RAISE(ABORT, 'claim insert fail'); END;",
         );
         const onPublished = mock(() => undefined);
 
@@ -1469,7 +1473,13 @@ describe("runCompartmentAgent", () => {
 
         expect(getCompartments(db, "ses-fact-insert-rollback")).toEqual([]);
         expect(
-            getMemoriesByProject(db, resolveProjectIdentity("/tmp/fact-insert-rollback")),
+            readProjectMemoryCurrentState(db, {
+                projectIds: resolveProjectIdsForIdentities(db, [
+                    resolveProjectIdentity("/tmp/fact-insert-rollback"),
+                ]),
+                lifecycleStates: ["active"],
+                surface: "maintenance_hygiene",
+            }).items,
         ).toEqual([]);
         expect(loadProtectedTailMeta(db, "ses-fact-insert-rollback").priorBoundaryOrdinal).toBe(1);
         expect(onPublished).not.toHaveBeenCalled();

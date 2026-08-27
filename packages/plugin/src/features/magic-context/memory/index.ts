@@ -1,8 +1,6 @@
 export * from "./claim-operation-contract";
 export * from "./constants";
 export * from "./embedding";
-export * from "./embedding-backfill";
-export * from "./embedding-cache";
 export * from "./normalize-hash";
 export * from "./project-identity";
 export type { PromotedMemoryRef } from "./promotion";
@@ -11,9 +9,5 @@ export * from "./storage-claim-autonomous";
 export * from "./storage-claim-current-state";
 export * from "./storage-claim-operations";
 export * from "./storage-claims";
-export * from "./storage-memory";
-export * from "./storage-memory-embeddings";
-export * from "./storage-memory-fts";
-export * from "./storage-memory-verifications";
 export * from "./types";
 export * from "./verification-paths";

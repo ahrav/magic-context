@@ -1,13 +1,11 @@
 import { describe, expect, mock, test } from "bun:test";
 
 import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { dreamerManifestIdentity, readDreamerProjectClaims } from "../dreamer/claim-manifest";
 import { acquireLeaseWithAcquisition, releaseLease } from "../dreamer/lease";
 import { claimEffectMemoryChanges } from "../dreamer/storage-dream-runs";
-import { runMigrations } from "../migrations";
-import { createClaimMemorySchema } from "../storage-claim-memory-schema";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import {
     applyUserMemoryReviewManifest,
     captureUserMemoryReviewSnapshot,
@@ -26,11 +24,7 @@ const OTHER_PROJECT = "git:other-project";
 const LEASE = "user-memories";
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
-    db.transaction(() => createClaimMemorySchema(db)).immediate();
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 function count(db: Database, table: string): number {

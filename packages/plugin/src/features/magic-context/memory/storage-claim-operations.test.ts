@@ -135,6 +135,18 @@ function snapshotCounts(db: Database): Record<string, number> {
     return Object.fromEntries(CLAIM_ROW_TABLES.map((table) => [table, rowCount(db, table)]));
 }
 
+function snapshotSemanticRows(db: Database): Record<string, unknown[]> {
+    return Object.fromEntries(
+        CLAIM_ROW_TABLES.map((table) => {
+            // Table names come from the fixed test list, never caller input.
+            // pi-lens-ignore: sql-injection
+            const rows = db.prepare(`SELECT * FROM ${table}`).all() as unknown[];
+            rows.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+            return [table, rows];
+        }),
+    );
+}
+
 describe("claim operations: create (scenario 1)", () => {
     test("commits identity, revision 1, attributes, evidence, applicability, policy, receipt, effect, and one generation", () => {
         const ctx = setup();
@@ -296,7 +308,7 @@ describe("claim operations: stale claim-local tokens (scenario 4)", () => {
             const staleToken = computeProjectMemoryMutationToken(ctx.db, publicId);
             mutate(ctx, publicId);
 
-            const before = snapshotCounts(ctx.db);
+            const before = snapshotSemanticRows(ctx.db);
             const receiptsBefore = rowCount(ctx.db, "claim_operation_receipts");
             const attempt = reviseProjectMemoryClaim(
                 ctx.db,
@@ -313,7 +325,7 @@ describe("claim operations: stale claim-local tokens (scenario 4)", () => {
             expect(attempt.result.effects).toHaveLength(0);
             // The stale attempt adds no partial rows; it adds only the
             // zero-effect receipt.
-            expect(snapshotCounts(ctx.db)).toEqual(before);
+            expect(snapshotSemanticRows(ctx.db)).toEqual(before);
             expect(rowCount(ctx.db, "claim_operation_receipts")).toBe(receiptsBefore + 1);
 
             // The stored stale result replays byte-identically.
@@ -329,6 +341,7 @@ describe("claim operations: stale claim-local tokens (scenario 4)", () => {
             );
             expect(replay.replayed).toBe(true);
             expect(replay.resultJson).toBe(attempt.resultJson);
+            expect(snapshotSemanticRows(ctx.db)).toEqual(before);
         } finally {
             closeQuietly(ctx.db);
         }
@@ -420,11 +433,11 @@ describe("claim operations: replay and key reuse (scenario 5)", () => {
         const ctx = setup();
         try {
             const created = createClaimOp(ctx, "op-create", "Replay test claim.");
-            const before = snapshotCounts(ctx.db);
+            const before = snapshotSemanticRows(ctx.db);
             const replay = createClaimOp(ctx, "op-create", "Replay test claim.");
             expect(replay.replayed).toBe(true);
             expect(replay.resultJson).toBe(created.resultJson);
-            expect(snapshotCounts(ctx.db)).toEqual(before);
+            expect(snapshotSemanticRows(ctx.db)).toEqual(before);
         } finally {
             closeQuietly(ctx.db);
         }
@@ -1143,7 +1156,7 @@ describe("claim operations: same-project merge (R8, AE6)", () => {
                         computeProjectMemoryMutationToken(ctx.db, sourceAId),
                         computeProjectMemoryMutationToken(ctx.db, sourceBId),
                     ],
-                    mergedContent: "Merged target content.",
+                    mergedContent: "Source A content.",
                     actor: "user:test",
                 },
             );

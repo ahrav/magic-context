@@ -43,7 +43,6 @@ import {
 } from "../features/magic-context/git-commits";
 import {
     embedUnembeddedCompartmentChunksForProject,
-    embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
@@ -440,12 +439,6 @@ async function runProjectMaintenance(
     await reg.ensureRegistered(reg.directory, db);
     const memorySnapshot = getProjectEmbeddingSnapshot(reg.projectIdentity);
     if (memorySnapshot?.enabled) {
-        const embeddedCount = await embedUnembeddedMemoriesForProject(db, reg.projectIdentity);
-        if (embeddedCount > 0) {
-            log(
-                `[magic-context] proactively embedded ${embeddedCount} ${embeddedCount === 1 ? "memory" : "memories"} for project ${reg.projectIdentity}`,
-            );
-        }
         try {
             const chunkCount = await embedUnembeddedCompartmentChunksForProject(
                 db,
@@ -511,11 +504,11 @@ async function sweepProject(
     const embeddingSnapshot = getProjectEmbeddingSnapshot(reg.projectIdentity);
     const commitIndexingEnabled = gitCommitEnabled ?? embeddingSnapshot?.gitCommitEnabled === true;
     const gc = sweepStaleEmbeddingIdentitiesForProject(db, reg.projectIdentity);
-    const gcDeleted = gc.memoryRowsDeleted + gc.commitRowsDeleted + gc.chunkRowsDeleted;
+    const gcDeleted = gc.commitRowsDeleted + gc.chunkRowsDeleted;
     if (gcDeleted > 0) {
         log(
             `[magic-context] GC'd ${gcDeleted} stale embedding row(s) for ${reg.projectIdentity} ` +
-                `(memory=${gc.memoryRowsDeleted} commit=${gc.commitRowsDeleted} chunk=${gc.chunkRowsDeleted})`,
+                `(commit=${gc.commitRowsDeleted} chunk=${gc.chunkRowsDeleted})`,
         );
     }
 

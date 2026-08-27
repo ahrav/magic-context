@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import vocabulary from "./fixtures/direct-format-vocabulary-v1.json";
+import { DIRECT_FORMAT_FENCE_MIGRATION_VERSION } from "./migrations";
 import {
     buildSchemaComponentManifest,
     CURRENT_SCHEMA_COMPONENTS,
@@ -734,10 +735,24 @@ describe("direct test-database factory", () => {
         try {
             const legacyTables = db
                 .prepare(
-                    "SELECT name FROM main.sqlite_schema WHERE name IN ('schema_migrations', 'memories', 'tags')",
+                    "SELECT name FROM main.sqlite_schema WHERE name IN ('memories', 'memories_fts', 'memory_embeddings', 'memory_stats', 'memory_verifications', 'memory_mutation_log', 'legacy_memory_claims', 'claim_change_outbox', 'claim_compatibility_write_state')",
                 )
                 .all();
             expect(legacyTables).toEqual([]);
+            const sessionRuntimeTables = db
+                .prepare(
+                    "SELECT name FROM main.sqlite_schema WHERE name IN ('tags', 'session_meta', 'compartments') ORDER BY name",
+                )
+                .all() as Array<{ name: string }>;
+            expect(sessionRuntimeTables.map((row) => row.name)).toEqual([
+                "compartments",
+                "session_meta",
+                "tags",
+            ]);
+            const fenceRows = db
+                .prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .all() as Array<{ version: number }>;
+            expect(fenceRows).toEqual([{ version: DIRECT_FORMAT_FENCE_MIGRATION_VERSION }]);
             const marker = readDirectFormatMarker(db);
             expect(marker.status).toBe("present");
         } finally {

@@ -580,6 +580,58 @@ export function resolveProjectIdsForIdentities(
     return [...new Set(ids)].sort((left, right) => left - right);
 }
 
+export interface ProjectClaimLifecycleCensus {
+    total: number;
+    active: number;
+    archived: number;
+    retired: number;
+    ids: number[];
+    archivedIds: number[];
+    retiredIds: number[];
+}
+
+export function censusProjectMemoryClaims(
+    db: Database,
+    projectIdentity: string,
+): ProjectClaimLifecycleCensus {
+    const census: ProjectClaimLifecycleCensus = {
+        total: 0,
+        active: 0,
+        archived: 0,
+        retired: 0,
+        ids: [],
+        archivedIds: [],
+        retiredIds: [],
+    };
+    if (!hasClaimMemoryFragment(db)) return census;
+    const projectId = resolveProjectId(db, projectIdentity);
+    if (projectId === null) return census;
+    const rows = db
+        .prepare(
+            `SELECT claims.id AS id, heads.state AS state
+               FROM claim_public_ids
+               JOIN claims ON claims.id = claim_public_ids.claim_id
+               JOIN claim_memory_lifecycle_heads heads ON heads.claim_id = claims.id
+              WHERE claims.project_id = ?
+              ORDER BY claims.id`,
+        )
+        .all(projectId) as Array<{ id: number; state: string }>;
+    for (const row of rows) {
+        census.total += 1;
+        census.ids.push(row.id);
+        if (row.state === "archived") {
+            census.archived += 1;
+            census.archivedIds.push(row.id);
+        } else if (row.state === "retired") {
+            census.retired += 1;
+            census.retiredIds.push(row.id);
+        } else {
+            census.active += 1;
+        }
+    }
+    return census;
+}
+
 /**
  * Cheap lifecycle-state count of project-memory claims for status and gate
  * surfaces. Counts the claim set the provider would hydrate (public-ID rows

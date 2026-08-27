@@ -18,7 +18,7 @@ use crate::ck_wire::{CkIngressMessage, CkKind, FlatBlock};
 use crate::historian::{compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest};
 use crate::historian_prompt::{
     build_compartment_agent_prompt, build_reference_blocks_from_stored,
-    render_historian_claim_block, render_historian_memory_block, CompartmentPromptInputs,
+    render_historian_claim_block, CompartmentPromptInputs,
 };
 use crate::historian_validate::{
     ChunkLine, HistorianChunk, MessageRange, StoredCompartmentRange, ValidateOptions,
@@ -737,9 +737,6 @@ pub fn assemble_historian_firing(
     // memory-disabled toggle governs extraction, not what context is shown.
     let memory_block = if !config.memory_enabled {
         String::new()
-    } else if cfg!(test) && config.claim_snapshot_vector.is_none() {
-        let memories = store.load_active_memories(&config.project_path, now_ms)?;
-        render_historian_memory_block(&memories)
     } else {
         historian_claim_block(store, config.claim_snapshot_vector.as_ref())
     };

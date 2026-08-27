@@ -20,20 +20,10 @@ import {
     ensureProject,
 } from "../src/features/magic-context/memory/storage-claims.ts";
 import {
-    clearMemoryClaimFailpoints,
-    createMemoryWithClaimsInCurrentTransaction,
-    getCurrentMemoryClaimByLegacyMemoryId,
-    readMemoryClaimLink,
-    runInMemoryClaimsWriteTransaction,
-    setMemoryClaimFailpoint,
-    updateMemoryContentWithClaimsInCurrentTransaction,
-} from "../src/features/magic-context/memory/storage-memory-claims.ts";
-import {
-    readPolicySubject,
-    recordApprovalActionInCurrentTransaction,
-} from "../src/features/magic-context/memory/storage-claim-policy.ts";
-import { createClaimPolicySchema } from "../src/features/magic-context/storage-claim-policy-schema.ts";
-import { readMemoryProjectionRow } from "../src/features/magic-context/memory/storage-memory-projection.ts";
+    computeProjectMemoryMutationToken,
+    createProjectMemoryClaim,
+    reviseProjectMemoryClaim,
+} from "../src/features/magic-context/memory/storage-claim-operations.ts";
 import { createClaimsAndEvidenceSchema } from "../src/features/magic-context/storage-claims-schema.ts";
 import {
     addObservationSourceTrustClassColumn,
@@ -44,10 +34,6 @@ import {
     readApplicabilityIntervals,
     readCurrentApplicabilityAssertions,
 } from "../src/features/magic-context/memory/storage-claim-applicability.ts";
-import {
-    createMemoryClaimsCompatSchema,
-    installMemoryClaimsWriteGuards,
-} from "../src/features/magic-context/storage-memory-claims-schema.ts";
 import {
     classifyDatabaseFormatFamily,
     inspectDatabaseForClassification,
@@ -179,6 +165,7 @@ try {
     const other = new Database(join(dir, "other.db")) as unknown as { exec: (s: string) => void; close: () => void };
     other.exec("CREATE TABLE x(id INTEGER); INSERT INTO x(id) VALUES(42)");
     other.close();
+    // pi-lens-ignore: sql-injection
     db.exec(`ATTACH '${join(dir, "other.db")}' AS oc`);
     check("ATTACH + cross-db read", (db.prepare("SELECT id FROM oc.x").get() as { id: number }).id === 42);
     db.exec("DETACH oc");
@@ -298,229 +285,114 @@ try {
     }
     claimsDb.close();
 
-    const kernelDb = new Database(join(dir, "kernel.db"));
-    kernelDb.exec("PRAGMA foreign_keys=ON");
-    kernelDb.exec(`
-        CREATE TABLE memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_path TEXT NOT NULL,
-            category TEXT NOT NULL,
-            content TEXT NOT NULL,
-            normalized_hash TEXT NOT NULL,
-            importance INTEGER,
-            scope TEXT NOT NULL DEFAULT 'project',
-            shareable INTEGER NOT NULL DEFAULT 0,
-            source_session_id TEXT,
-            source_type TEXT DEFAULT 'historian',
-            seen_count INTEGER DEFAULT 1,
-            retrieval_count INTEGER DEFAULT 0,
-            first_seen_at INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            last_seen_at INTEGER NOT NULL,
-            last_retrieved_at INTEGER,
-            status TEXT DEFAULT 'active',
-            expires_at INTEGER,
-            verification_status TEXT DEFAULT 'unverified',
-            verified_at INTEGER,
-            classified_at INTEGER,
-            superseded_by_memory_id INTEGER,
-            merged_from TEXT,
-            metadata_json TEXT,
-            mural_cue TEXT,
-            mural_cue_hash TEXT,
-            mural_cue_at INTEGER,
-            mural_cue_rejection_count INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(project_path, category, normalized_hash)
-        );
-        CREATE TABLE memory_embeddings (
-            memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-            embedding BLOB NOT NULL,
-            model_id TEXT NOT NULL,
-            PRIMARY KEY(memory_id, model_id)
-        );
-        CREATE TABLE memory_verifications (
-            memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-            file_path TEXT NOT NULL,
-            verified_at INTEGER NOT NULL,
-            mapped_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (memory_id, file_path)
-        );
-        CREATE TABLE memory_stats (
-            memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-            seen_count INTEGER NOT NULL,
-            retrieval_count INTEGER NOT NULL,
-            last_seen_at INTEGER NOT NULL,
-            last_retrieved_at INTEGER,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TRIGGER memories_stats_ai AFTER INSERT ON memories BEGIN
-            INSERT INTO memory_stats (memory_id, seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at)
-            VALUES (NEW.id, COALESCE(NEW.seen_count, 1), COALESCE(NEW.retrieval_count, 0), NEW.last_seen_at, NEW.last_retrieved_at, NEW.updated_at);
-        END;
-        CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    `);
-    createClaimsAndEvidenceSchema(kernelDb);
-    createMemoryClaimsCompatSchema(kernelDb);
-    addObservationSourceTrustClassColumn(kernelDb);
-    createClaimApplicabilitySchema(kernelDb);
-    createClaimPolicySchema(kernelDb);
-    kernelDb.exec(
-        "CREATE TABLE IF NOT EXISTS schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    // Direct claim kernel under node:sqlite: create, replay, revise, and
+    // stale fencing against the registered direct format.
+    const kernel = createDirectTestDatabase({ path: join(dir, "kernel.db") });
+    const kernelDb = kernel.db;
+    const kernelProvenance = {
+        sourceLocator: "transcript://node-smoke/1",
+        sourceContent: "node smoke source",
+        extractor: "historian",
+        extractorVersion: "1",
+        extractorRunId: "run-node-smoke",
+        independenceKey: "ik-node-smoke",
+        sourceTrustClass: "explicit_user",
+    } as const;
+    const kernelProjectId = ensureProject(kernelDb, "git:kernel");
+    const kernelCreateInput = {
+        projectId: kernelProjectId,
+        content: "node kernel fact",
+        category: "CONSTRAINTS",
+        provenance: { ...kernelProvenance },
+        actor: "user:node-smoke",
+    };
+    const kernelCreated = createProjectMemoryClaim(
+        kernelDb,
+        { producer: "node-smoke", operationKey: "create-1" },
+        kernelCreateInput,
     );
-    installMemoryClaimsWriteGuards(kernelDb);
+    const createdClaim = (
+        kernelCreated.result.payload as {
+            claim: { publicClaimId: string; revision: number; revisionLocator: string };
+        }
+    ).claim;
+    check(
+        "direct kernel create commits claim revision 1",
+        kernelCreated.outcome === "applied" && createdClaim.revision === 1,
+        kernelCreated.resultJson,
+    );
 
-    let guardBlocked = false;
-    try {
-        kernelDb.exec(
-            "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES ('git:kernel', 'CONSTRAINTS', 'bare', 'h0', 1, 1, 1, 1)",
-        );
-    } catch {
-        guardBlocked = true;
-    }
-    check("v84 guard rejects a bare semantic insert", guardBlocked);
-
-    const kernelCreated = runInMemoryClaimsWriteTransaction(kernelDb, () =>
-        createMemoryWithClaimsInCurrentTransaction(
-            kernelDb,
-            { producer: "node-smoke", operationKey: "create-1", requestDigest: "a".repeat(64) },
-            {
-                projectPath: "git:kernel",
-                category: "CONSTRAINTS",
-                content: "node kernel fact",
-                normalizedHash: "hash:node kernel fact",
-                nowMs: 1_000,
-            },
-        ),
+    const kernelReplayed = createProjectMemoryClaim(
+        kernelDb,
+        { producer: "node-smoke", operationKey: "create-1" },
+        kernelCreateInput,
     );
     check(
-        "v84 kernel create links a claim",
-        kernelCreated.result.claimId !== null && kernelCreated.result.revisionId !== null,
-        JSON.stringify(kernelCreated),
+        "replaying the operation returns the stored result bytes",
+        kernelReplayed.replayed && kernelReplayed.resultJson === kernelCreated.resultJson,
+        kernelReplayed.resultJson,
     );
 
-    kernelDb.transaction(() => {
-        runInMemoryClaimsWriteTransaction(kernelDb, () =>
-            updateMemoryContentWithClaimsInCurrentTransaction(
-                kernelDb,
-                { producer: "node-smoke", operationKey: "update-1", requestDigest: "b".repeat(64) },
-                {
-                    memoryId: kernelCreated.result.memoryId,
-                    content: "node kernel fact v2",
-                    normalizedHash: "hash:node kernel fact v2",
-                },
-            ),
-        );
-    }).immediate();
-    const currentClaim = getCurrentMemoryClaimByLegacyMemoryId(kernelDb, kernelCreated.result.memoryId);
-    check("v84 nested update advanced to revision 2", currentClaim?.revision === 2);
+    const kernelToken = computeProjectMemoryMutationToken(kernelDb, createdClaim.publicClaimId);
+    const kernelRevised = reviseProjectMemoryClaim(
+        kernelDb,
+        { producer: "node-smoke", operationKey: "revise-1" },
+        {
+            token: kernelToken,
+            content: "node kernel fact v2",
+            provenance: {
+                ...kernelProvenance,
+                sourceLocator: "transcript://node-smoke/2",
+                extractorRunId: "run-node-smoke-2",
+                independenceKey: "ik-node-smoke-2",
+            },
+            actor: "user:node-smoke",
+        },
+    );
+    const revisedClaim = (
+        kernelRevised.result.payload as { claim: { revision: number } } | null
+    )?.claim;
+    check(
+        "revise advances the claim to revision 2",
+        kernelRevised.outcome === "applied" && revisedClaim?.revision === 2,
+        kernelRevised.resultJson,
+    );
 
-    const tupleCounts = (): string =>
+    const kernelCounts = (): string =>
         JSON.stringify({
-            memories: kernelDb.prepare("SELECT COUNT(*) c FROM memories").get(),
             revisions: kernelDb.prepare("SELECT COUNT(*) c FROM claim_revisions").get(),
-            outbox: kernelDb.prepare("SELECT COUNT(*) c FROM claim_change_outbox").get(),
+            effects: kernelDb.prepare("SELECT COUNT(*) c FROM claim_operation_effects").get(),
             generations: kernelDb.prepare("SELECT COUNT(*) c FROM claim_project_generations").get(),
         });
-    const countsBefore = tupleCounts();
-    setMemoryClaimFailpoint("memory-claim.050.commit.before", () => {
-        throw new Error("smoke rollback");
-    });
-    let rolledBack = false;
-    try {
-        runInMemoryClaimsWriteTransaction(kernelDb, () =>
-            createMemoryWithClaimsInCurrentTransaction(
-                kernelDb,
-                { producer: "node-smoke", operationKey: "doomed-1", requestDigest: "c".repeat(64) },
-                {
-                    projectPath: "git:kernel",
-                    category: "CONSTRAINTS",
-                    content: "doomed fact",
-                    normalizedHash: "hash:doomed fact",
-                },
-            ),
-        );
-    } catch {
-        rolledBack = true;
-    }
-    clearMemoryClaimFailpoints();
-    check(
-        "v84 failpoint rollback leaves no tuple residue",
-        rolledBack && tupleCounts() === countsBefore,
-        tupleCounts(),
+    const countsBeforeStale = kernelCounts();
+    const staleAttempt = reviseProjectMemoryClaim(
+        kernelDb,
+        { producer: "node-smoke", operationKey: "revise-stale" },
+        {
+            token: kernelToken,
+            content: "stale write",
+            provenance: {
+                ...kernelProvenance,
+                sourceLocator: "transcript://node-smoke/3",
+                extractorRunId: "run-node-smoke-3",
+                independenceKey: "ik-node-smoke-3",
+            },
+            actor: "user:node-smoke",
+        },
     );
-
-    const projectionRow = readMemoryProjectionRow(kernelDb, kernelCreated.result.memoryId);
     check(
-        "v84 legacy projection and current claim read the same state",
-        projectionRow?.content === currentClaim?.content &&
-            projectionRow?.category === currentClaim?.category &&
-            projectionRow?.normalized_hash === currentClaim?.normalizedHash &&
-            projectionRow?.status === currentClaim?.state,
-        JSON.stringify({ projectionRow, currentClaim }),
+        "a stale claim token stores a zero-effect result",
+        staleAttempt.outcome === "stale" && kernelCounts() === countsBeforeStale,
+        `${staleAttempt.outcome} ${kernelCounts()}`,
     );
-    // v86 claim trust policy under node:sqlite: subject companion rows,
-    // append-only ledger guards, approval flow, and effective projection.
-    {
-        const revisionId = kernelCreated.result.revisionId as number;
-        const subject = readPolicySubject(kernelDb, revisionId);
-        check(
-            "v86 revision writers create a frozen policy subject",
-            subject != null && subject.claimKind === "unknown",
-            JSON.stringify(subject),
-        );
-        const policyRow = kernelDb
-            .prepare(
-                "SELECT effective_maturity AS maturity, auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
-            )
-            .get(revisionId) as { maturity: string; auto: number } | undefined;
-        check(
-            "v86 effective projection materializes CANDIDATE for an unverified row",
-            policyRow?.maturity === "CANDIDATE" && policyRow?.auto === 0,
-            JSON.stringify(policyRow),
-        );
-        let updateRejected = false;
-        try {
-            kernelDb
-                .prepare(
-                    "UPDATE claim_revision_policy_subjects SET claim_kind = 'descriptive' WHERE revision_id = ?",
-                )
-                .run(revisionId);
-        } catch {
-            updateRejected = true;
-        }
-        check("v86 policy subjects reject UPDATE at the database boundary", updateRejected);
-        const approval = runInMemoryClaimsWriteTransaction(kernelDb, () =>
-            recordApprovalActionInCurrentTransaction(kernelDb, {
-                revisionId,
-                projectId: (readMemoryClaimLink(kernelDb, kernelCreated.result.memoryId) as {
-                    projectId: number;
-                }).projectId,
-                action: "approve",
-                host: "opencode",
-                sessionId: "node-smoke",
-                userCommandEvent: "evt",
-                commandIdentity: "node-smoke-approve",
-                confirmationNonce: "nonce",
-            }),
-        );
-        check("v86 approval action records under node:sqlite", approval.actionId > 0);
-        const replay = runInMemoryClaimsWriteTransaction(kernelDb, () =>
-            recordApprovalActionInCurrentTransaction(kernelDb, {
-                revisionId,
-                projectId: (readMemoryClaimLink(kernelDb, kernelCreated.result.memoryId) as {
-                    projectId: number;
-                }).projectId,
-                action: "approve",
-                host: "opencode",
-                sessionId: "node-smoke",
-                userCommandEvent: "evt",
-                commandIdentity: "node-smoke-approve",
-                confirmationNonce: "nonce",
-            }),
-        );
-        check("v86 approval replay is idempotent", replay.replayed && replay.actionId === approval.actionId);
-    }
+    const receipts = kernelDb
+        .prepare("SELECT COUNT(*) c FROM claim_operation_receipts")
+        .get() as { c: number };
+    check(
+        "every operation left one durable receipt",
+        receipts.c === 3,
+        String(receipts.c),
+    );
     kernelDb.close();
 
     const gateInput = collectSqliteRuntimeGateInput();

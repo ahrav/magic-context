@@ -204,7 +204,7 @@ pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<String>) -> Re
     }
     if &seen != expected {
         return Err(format!(
-            "manifest covers {} of the {} requested memories",
+            "manifest covers {} of the {} requested claims",
             seen.intersection(expected).count(),
             expected.len()
         ));
