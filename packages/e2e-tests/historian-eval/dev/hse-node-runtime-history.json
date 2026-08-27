@@ -1,0 +1,98 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-node-runtime-history",
+  "title": "Historical Node 16 runtime must not surface as the current runtime",
+  "families": [
+    "current-vs-historical"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "Quick history check: what runtime did the worker service originally ship on?",
+        "assistant": "The worker originally shipped on Node 16 back at launch."
+      },
+      {
+        "user": "Right, but that is history. Today the worker runs on Node 20, and the CI matrix tests only Node 20.",
+        "assistant": "Current state recorded: the worker runtime is Node 20 and CI tests only Node 20. Node 16 is historical only."
+      },
+      {
+        "user": "Also pin the package manager to pnpm 9 across the repo.",
+        "assistant": "Pinned: package manager is pnpm 9 repo-wide."
+      },
+      {
+        "user": "Great, that settles the runtime housekeeping.",
+        "assistant": "All noted; closing this thread."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-node-20",
+        "category": "CONFIG_VALUES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "node 20"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-pnpm-9",
+        "category": "CONFIG_VALUES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "pnpm 9"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-node-16-current",
+        "family": "current-vs-historical",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "runs on node 16"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-runtime",
+      "question": "Which Node version does the worker run on today?",
+      "answerType": "exact",
+      "goldAnswer": "Node 20",
+      "sourceClaimRef": "exp-node-20"
+    },
+    {
+      "id": "probe-pm",
+      "question": "Which package manager is pinned?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "pnpm 9",
+        "npm 10",
+        "yarn 4"
+      ],
+      "goldAnswer": "pnpm 9"
+    }
+  ]
+}
