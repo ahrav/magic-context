@@ -265,7 +265,12 @@ const promptCaseSpecs: PromptCaseSpec[] = [
             { id: 4, category: "CONSTRAINTS", content: "Escape \"quotes\" but content leaves them literal" },
             { id: 5, category: "CONFIG_VALUES", content: "timeout_ms=5000 & mode=fast" },
             { id: 6, category: "USER_DIRECTIVES", content: "Legacy user directive survives" },
-            { id: 7, category: "UNKNOWN", content: "unknown category is not rendered" },
+            // Two categories outside the five-entry render order, so the golden pins the
+            // alphabetical tie-break both renderers fall back to. Both are allow-listed
+            // project-memory categories: a category outside the allow-list never reaches
+            // either renderer, so pinning one here would assert bytes the surfaces refuse
+            // to produce.
+            { id: 7, category: "KNOWN_ISSUES", content: "Legacy known issue survives" },
         ],
         input_source: "Messages 53-56:\n\n[53] U: continue with XML chars & < >\n[54] A: implementing\n[55] TC: read(src/lib.rs)\n[56] A: finished",
         memory_enabled: true,

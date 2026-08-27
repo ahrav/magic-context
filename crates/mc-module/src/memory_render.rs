@@ -166,13 +166,22 @@ pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     format!("{}{source}: {content}", claim.public_claim_id)
 }
 
+/// Render the grouped claim block. Non-positive categories are dropped here, not
+/// only in `TryFrom`: the struct, its fields, and this function are all public, so
+/// a caller that assembles `MirroredClaimMemory` values by hand reaches the bytes
+/// without passing the conversion gate. Repeating the allow-list at the last
+/// boundary before bytes keeps a warning record silent on a surface that has no
+/// warning renderer instead of emitting it as an ordinary project fact.
 pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) -> String {
-    if claims.is_empty() {
+    let mut ordered = claims
+        .iter()
+        .filter(|claim| is_positive_memory_category(&claim.category))
+        .collect::<Vec<_>>();
+    if ordered.is_empty() {
         return String::new();
     }
-    let mut ordered = claims.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| claim_render_order(left, right));
-    let mut lines = Vec::with_capacity(claims.len() * 2 + 2);
+    let mut lines = Vec::with_capacity(ordered.len() * 2 + 2);
     lines.push(format!("<{wrapper}>"));
     let mut open_category: Option<&str> = None;
     for claim in ordered {
@@ -391,6 +400,45 @@ mod tests {
             MirroredClaimMemory::try_from(&mirrored_row(None)),
             Err(MirroredClaimMemoryError::MissingCategory { .. })
         ));
+    }
+
+    /// The conversion gate is not the only way into the renderer: the struct, its
+    /// fields, and `render_claim_memory_block` are public, so a hand-assembled slice
+    /// reaches the bytes directly. The allow-list has to hold on that path too.
+    #[test]
+    fn render_boundary_drops_non_positive_categories_built_without_the_conversion() {
+        let hand_built = |category: &str, content: &str| MirroredClaimMemory {
+            public_claim_id: format!("mcm_{}", "a".repeat(32)),
+            revision_locator: format!("mcm_{}/r1/{}", "a".repeat(32), "b".repeat(64)),
+            project_id: 41,
+            category: category.to_string(),
+            content: content.to_string(),
+            importance: 80,
+            provenance_label: None,
+        };
+
+        let mixed = [
+            hand_built("PROJECT_RULES", "Keep this project fact."),
+            hand_built("REJECTED_APPROACH", "Do not resurrect the shelved design."),
+            hand_built(
+                "FUTURE_NEGATIVE_CATEGORY",
+                "Unknown categories stay silent.",
+            ),
+        ];
+        let block = render_claim_memory_block(&mixed, "project-memory");
+        assert!(block.contains("Keep this project fact."));
+        assert!(!block.contains("REJECTED_APPROACH"));
+        assert!(!block.contains("Do not resurrect the shelved design."));
+        assert!(!block.contains("FUTURE_NEGATIVE_CATEGORY"));
+        assert!(!block.contains("Unknown categories stay silent."));
+
+        // An all-warning slice renders no wrapper at all, so the surface cannot emit an
+        // empty `<project-memory>` block that implies the claims were considered.
+        let only_negative = [hand_built("REJECTED_APPROACH", "Shelved design.")];
+        assert_eq!(
+            render_claim_memory_block(&only_negative, "project-memory"),
+            ""
+        );
     }
 
     /// Extract the string entries of one `export const <name>` array from the
