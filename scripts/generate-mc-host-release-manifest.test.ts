@@ -162,7 +162,7 @@ describe("pre-build schema", () => {
             const withHashKey = contractCopy();
             withHashKey.model_lane[key] = "pinned-later";
             expect(() => validateContractSchema(withHashKey)).toThrow(
-                /hash-bearing key|model_lane keys/,
+                new RegExp(`hash-bearing key|model_lane: unknown key ${key}`),
             );
         }
     });
@@ -452,6 +452,74 @@ describe("platform floors", () => {
                 }),
             ).toEqual({ supported: false, reason: "unsupported_platform" });
         }
+    });
+
+    test("garbage and prerelease host versions fail the platform gate too", () => {
+        // The U9 oracle-host check rejects these. Sharing only `compareDotted`
+        // once let this gate keep a bare `>= 0` and accept them, so the two
+        // disagreed about the same host; they now share the whole predicate.
+        for (const kernel of [
+            "999garbage",
+            // Above the floor on its first component, so the ordering check returns
+            // early: the component's shape has to be validated regardless.
+            "999garbage.0",
+            // A separator with nothing after it is not a suffix; `compareDotted`
+            // reads the digits and ignores the dangling separator.
+            "4.18-",
+            "4.18_",
+            "5",
+            "4.18-rc1",
+            "4.18.0-rc2",
+            "4.18-pre",
+            // Every separator the shape check admits, not only `-` and `.`.
+            "4.18~rc1",
+            "4.18_rc1",
+            "4.18+beta1",
+        ]) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "linux",
+                    arch: "x64",
+                    libc: "gnu",
+                    kernel,
+                    glibc: "2.28",
+                    procfsSelfFdExec: true,
+                }),
+                `kernel=${kernel} must not clear the floor`,
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+        }
+        for (const glibc of ["999garbage", "2.28-pre", "2.28-beta3", "2.28+"]) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "linux",
+                    arch: "x64",
+                    libc: "gnu",
+                    kernel: "4.18",
+                    glibc,
+                    procfsSelfFdExec: true,
+                }),
+                `glibc=${glibc} must not clear the floor`,
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+        }
+        expect(
+            evaluatePlatform(contract, {
+                os: "darwin",
+                arch: "arm64",
+                osVersion: "13.5_rc1",
+                devFdExec: true,
+            }),
+        ).toEqual({ supported: false, reason: "unsupported_platform" });
+        // A prerelease genuinely above the floor still clears it.
+        expect(
+            evaluatePlatform(contract, {
+                os: "linux",
+                arch: "x64",
+                libc: "gnu",
+                kernel: "4.19-rc1",
+                glibc: "2.28-236.el8",
+                procfsSelfFdExec: true,
+            }).supported,
+        ).toBe(true);
     });
 
     test("real-world version strings at the floor are supported", () => {

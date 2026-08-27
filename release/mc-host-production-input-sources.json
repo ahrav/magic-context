@@ -1,0 +1,48 @@
+{
+  "schema": "magic-context.mc-host-production-input-sources/v1",
+  "mode": "production",
+  "note": "Operator-populated source manifest for U9 production-input qualification (KTD23). Release engineering must qualify every byte-level artifact here with its exact immutable source, byte size, SHA-256, provenance, approved license, and a local verify path holding the real bytes, plus the recorded offline semantic-oracle evidence and the exact opencode-ai version. Real production bytes are not in this repository, so those entries are explicitly unqualified; scripts/qualify-mc-host-production-inputs.ts propagates them into non-production evidence that requireQualificationEvidence (the U2/U6 build gate) rejects. The committed tiny synapse fixture, developer caches, mutable URLs, and placeholder hashes can never qualify.",
+  "release_version": "0.38.0",
+  "inputs": {
+    "ort_runtime": {
+      "qualified": false,
+      "reason": "exact CPU-only ONNX Runtime shared-library bytes (loaded via ort 2.0.0-rc.13 dynamic loading) not yet qualified by release engineering"
+    },
+    "model_onnx": {
+      "qualified": false,
+      "reason": "production gte-modernbert-base-f16 ONNX bytes not yet qualified by release engineering"
+    },
+    "tokenizer": {
+      "qualified": false,
+      "reason": "production tokenizer.json bytes not yet qualified by release engineering"
+    },
+    "config": {
+      "qualified": false,
+      "reason": "production config.json bytes not yet qualified by release engineering"
+    },
+    "special_tokens_map": {
+      "qualified": false,
+      "reason": "production special_tokens_map.json bytes not yet qualified by release engineering"
+    },
+    "tokenizer_config": {
+      "qualified": false,
+      "reason": "production tokenizer_config.json bytes not yet qualified by release engineering"
+    },
+    "corpus": {
+      "qualified": false,
+      "reason": "production semantic-certification corpus bytes not yet qualified by release engineering"
+    }
+  },
+  "oracle": null,
+  "harnesses": {
+    "opencode": {
+      "package": "opencode-ai",
+      "version": null,
+      "unqualified_reason": "exact opencode-ai harness version (independent of the @opencode-ai SDK/plugin pins) not yet qualified by release engineering"
+    },
+    "pi": {
+      "package": "@earendil-works/pi-coding-agent",
+      "version": "0.80.2"
+    }
+  }
+}
