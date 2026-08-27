@@ -48,6 +48,8 @@ import {
     buildContract,
     canonicalJson,
     compareDotted,
+    exactKeysAsserter,
+    generate as generateReleaseOutputs,
     type ReleaseContract,
     sha256Hex,
     validateContractSchema,
@@ -78,6 +80,10 @@ function fail(message: string): never {
     throw new Error(`mc-host input qualification: ${message}`);
 }
 
+/** Shared with the U8 generator so one exact-key contract governs both, while
+ *  failures stay attributed to the file the operator actually edited. */
+const assertExactKeys = exactKeysAsserter("mc-host input qualification");
+
 // ---------------------------------------------------------------------------
 // U9 pins (cross-checked against the U8 contract; drift fails closed).
 // ---------------------------------------------------------------------------
@@ -93,8 +99,13 @@ export const RUNTIME_IDENTITY = {
     rust_crates: {
         fastembed: "6.0.0",
         ort: "2.0.0-rc.13",
-        // Resolved ORT feature closure (docs/synapse-model-bundle.md §3). No
-        // download, TLS/fetch, Hugging Face, image-model, or accelerator feature.
+        // Resolved ORT feature closure (docs/synapse-model-bundle.md §3). Most of
+        // it is enabled transitively, so `crossCheckRepoPins` does not assert
+        // this exact list against `crates/mc-host/Cargo.toml` — proving the
+        // effective graph needs Cargo resolution. What it does enforce there is
+        // the security-relevant negative: `default-features = false` on both
+        // crates, and no declared feature naming a download, TLS/fetch, Hugging
+        // Face, image-model, or accelerator capability.
         ort_features: [
             "api-17",
             "api-18",
@@ -923,28 +934,103 @@ const MUTABLE_SOURCE_REFS = new Set([
     "head",
     "nightly",
 ]);
-const FIXTURE_OR_CACHE_PATH_PATTERNS = [
-    "synapse-tiny",
-    "tests/fixtures",
-    "node_modules",
-    "/.cache/",
-    "/.bun/",
-    "/target/",
+/**
+ * Query-parameter names that carry an access credential. `buildLock` copies
+ * `source` verbatim into a committed artifact, so a credential-bearing URL would
+ * be published in Git history permanently; and a signed URL is time-limited,
+ * which is the opposite of the immutable identity a qualified source asserts.
+ *
+ * Matched against the name with separators removed, so `X-Amz-Signature`,
+ * `access_token`, and `apiKey` all land. Short, ambiguous names are matched
+ * exactly instead so an innocuous `design` or `keyspace` is not rejected.
+ */
+const CREDENTIAL_QUERY_SUBSTRINGS = [
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "apikey",
+    "accesskey",
+    "signature",
+    "authorization",
 ];
+const CREDENTIAL_QUERY_EXACT = new Set(["sig", "auth", "key", "pwd", "sas"]);
+
+function isCredentialQueryName(name: string): boolean {
+    const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+    return (
+        CREDENTIAL_QUERY_EXACT.has(normalized) ||
+        CREDENTIAL_QUERY_SUBSTRINGS.some((hint) => normalized.includes(hint))
+    );
+}
+
+/** `startsWith("https://")` does not imply parseability, so report a malformed
+ *  URL through `fail` rather than letting a raw `TypeError` escape. */
+function parseSourceUrl(key: string, source: string) {
+    try {
+        return new URL(source);
+    } catch {
+        fail(`inputs.${key}: source is not a parseable URL`);
+    }
+}
+
+/**
+ * Path *segments* that identify a committed fixture tree or a developer cache.
+ * Compared per segment, never as a substring: a real artifact store whose name
+ * merely contains one of these words — `/mnt/release/hf-tests/fixtures-store/`,
+ * `/opt/prod-node_modules_mirror/` — names nothing that is actually a fixture or
+ * a cache, and must not be permanently unqualifiable because of its spelling.
+ */
+const FIXTURE_OR_CACHE_PATH_SEGMENTS = [
+    "synapse-tiny",
+    "node_modules",
+    ".cache",
+    ".bun",
+    "target",
+];
+/** Consecutive segment runs denied wherever they appear (`.../tests/fixtures/...`). */
+const FIXTURE_OR_CACHE_SEGMENT_RUNS = [["tests", "fixtures"]];
 /**
  * Denied only when qualifying for production. `scripts/__fixtures__` holds the
  * committed qualification fixtures — tiny text stand-ins named after the real
  * artifacts (`model.onnx`, `ort-runtime.so`) carrying `example.invalid`
  * provenance. Those files are the intended input in `test-fixture` mode, so the
- * pattern cannot join the all-mode list, but a production manifest that points
+ * segment cannot join the all-mode list, but a production manifest that points
  * at them must never reach `productionQualified: true`.
  */
-const PRODUCTION_ONLY_DENIED_PATH_PATTERNS = ["__fixtures__"];
+const PRODUCTION_ONLY_DENIED_SEGMENTS = ["__fixtures__"];
+
+/** The denied segment or run a candidate path contains, or `null`. */
+function deniedPathSegment(
+    candidate: string,
+    mode: SourceManifest["mode"],
+): string | null {
+    const segments = candidate.split(/[\\/]+/);
+    const denied = [
+        ...FIXTURE_OR_CACHE_PATH_SEGMENTS,
+        ...(mode === "production" ? PRODUCTION_ONLY_DENIED_SEGMENTS : []),
+    ];
+    for (const segment of segments) {
+        if (denied.includes(segment)) return segment;
+    }
+    for (const run of FIXTURE_OR_CACHE_SEGMENT_RUNS) {
+        for (let i = 0; i + run.length <= segments.length; i++) {
+            if (run.every((part, offset) => segments[i + offset] === part)) {
+                return run.join("/");
+            }
+        }
+    }
+    return null;
+}
 
 /**
  * Resolve a `verify_local_path` to the exact absolute path whose bytes will be
- * hashed, enforcing the U9 path rules (`relative`, `no_parent_segments`,
- * `no_symlink_escape`) declared in the closure manifest schema.
+ * hashed, enforcing the U9 path rules that apply to a *production artifact*
+ * path: `no_parent_segments` and `no_symlink_escape`. The closure manifest's
+ * `relative` rule governs its own `node` paths and deliberately does not apply
+ * here — production qualification requires an absolute path instead, because the
+ * real artifacts live outside the repository on the qualifying host.
  *
  * The fixture/developer-cache deny-list is applied to the fully symlink-resolved
  * path, not just the spelling in the manifest: a symlink at an allowed path that
@@ -988,21 +1074,11 @@ function resolveVerifyPath(
         }
     }
     for (const candidate of new Set([verifyPath, lexical, resolved])) {
-        for (const pattern of FIXTURE_OR_CACHE_PATH_PATTERNS) {
-            if (candidate.includes(pattern)) {
-                fail(
-                    `inputs.${key}: fixture/developer-cache verify path (${pattern}) is rejected`,
-                );
-            }
-        }
-        if (mode === "production") {
-            for (const pattern of PRODUCTION_ONLY_DENIED_PATH_PATTERNS) {
-                if (candidate.includes(pattern)) {
-                    fail(
-                        `inputs.${key}: fixture/developer-cache verify path (${pattern}) is rejected`,
-                    );
-                }
-            }
+        const denied = deniedPathSegment(candidate, mode);
+        if (denied !== null) {
+            fail(
+                `inputs.${key}: fixture/developer-cache verify path (${denied}) is rejected`,
+            );
         }
     }
     return resolved;
@@ -1058,28 +1134,6 @@ export interface SourceManifest {
             unqualified_reason?: string;
         };
     };
-}
-
-function assertExactKeys(
-    obj: unknown,
-    keys: string[],
-    where: string,
-    optional: string[] = [],
-): void {
-    if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
-        fail(`${where} must be an object`);
-    }
-    // SAFETY: `obj` is a non-null, non-array object after the guard.
-    const record = obj as Record<string, unknown>;
-    const actual = Object.keys(record);
-    for (const key of actual) {
-        if (!keys.includes(key) && !optional.includes(key)) {
-            fail(`${where}: unknown key ${key}`);
-        }
-    }
-    for (const key of keys) {
-        if (!(key in record)) fail(`${where}: missing key ${key}`);
-    }
 }
 
 function isPlaceholderSha256(hash: string): boolean {
@@ -1169,15 +1223,29 @@ function validateQualifiedArtifact(
     }
     // Compare per path segment so a mutable ref is caught in any position.
     // The host is excluded deliberately: only the path names the revision.
-    // `startsWith("https://")` does not imply parseability, so a malformed URL
-    // is reported through `fail` rather than escaping as a raw `TypeError`.
-    let sourcePath: string;
-    try {
-        sourcePath = new URL(artifact.source).pathname;
-    } catch {
-        fail(`inputs.${key}: source is not a parseable URL`);
+    const sourceUrl = parseSourceUrl(key, artifact.source);
+    if (sourceUrl.username !== "" || sourceUrl.password !== "") {
+        fail(
+            `inputs.${key}: source must not embed URL credentials (userinfo is copied into the committed lock)`,
+        );
     }
-    for (const rawSegment of sourcePath.split("/")) {
+    for (const [name] of sourceUrl.searchParams) {
+        if (isCredentialQueryName(name)) {
+            fail(
+                `inputs.${key}: source query parameter ${name} carries a credential and is rejected`,
+            );
+        }
+    }
+    const rejectMutableRef = (value: string): void => {
+        // Case-folded: a ref differing only in case is still a moving target,
+        // and no immutable artifact URL needs a token spelled like one.
+        if (MUTABLE_SOURCE_REFS.has(value.toLowerCase())) {
+            fail(
+                `inputs.${key}: mutable source identity (${value} ref) is rejected`,
+            );
+        }
+    };
+    for (const rawSegment of sourceUrl.pathname.split("/")) {
         // `URL.pathname` preserves percent-encoding, so `ma%69n` would survive a
         // literal comparison while the server still resolves it as `main`.
         // Decode before comparing, and treat a malformed escape as a rejection
@@ -1190,13 +1258,30 @@ function validateQualifiedArtifact(
                 `inputs.${key}: source path segment ${JSON.stringify(rawSegment)} has a malformed percent-escape`,
             );
         }
-        // Case-folded: a ref differing only in case is still a moving target,
-        // and no immutable artifact URL needs a segment spelled like one.
-        if (MUTABLE_SOURCE_REFS.has(segment.toLowerCase())) {
+        rejectMutableRef(segment);
+    }
+    // An endpoint can name its revision in the query string
+    // (`/download?ref=main`) or the fragment instead of the path, and such a URL
+    // keeps resolving a moving target however immutable its path looks. Split
+    // composite values so a ref buried in `?path=repo/main/model.onnx` is caught.
+    //
+    // `URLSearchParams` already decoded these values, so they are compared as
+    // they are: decoding a second time would turn a literal `%` in a legitimate
+    // value into a malformed-escape rejection.
+    for (const [, value] of sourceUrl.searchParams) {
+        for (const token of value.split(/[\\/,;:@]+/)) rejectMutableRef(token);
+    }
+    // The fragment is raw, so decode it the same way path segments are.
+    for (const raw of sourceUrl.hash.replace(/^#/, "").split(/[\\/,;:@]+/)) {
+        let token: string;
+        try {
+            token = decodeURIComponent(raw);
+        } catch {
             fail(
-                `inputs.${key}: mutable source identity (${segment} ref) is rejected`,
+                `inputs.${key}: source fragment ${JSON.stringify(raw)} has a malformed percent-escape`,
             );
         }
+        rejectMutableRef(token);
     }
     if (
         !Number.isSafeInteger(artifact.size_bytes) ||
@@ -1298,16 +1383,27 @@ export function checkOracleEvidence(
     }
     // Same comparator the U8 platform gate uses against these same floors, so
     // the qualifier and `evaluatePlatform` cannot disagree on a host version.
-    // No format pre-filter: `compareDotted` exists precisely to read the messy
-    // strings real hosts report (`uname -r` gives `4.18.0-513.el8.x86_64`,
-    // glibc gives `2.28-236.el8`), taking each segment's leading digit run and
-    // counting a segment with no leading digits as 0. A pre-filter rejecting
-    // those spellings would make this gate disagree with the platform gate on
-    // the same host. Unreadable values still fail closed: they compare as 0 and
-    // cannot reach a floor, and a malformed floor yields NaN.
+    // No format pre-filter on the *spelling*: `compareDotted` exists precisely
+    // to read the messy strings real hosts report (`uname -r` gives
+    // `4.18.0-513.el8.x86_64`, glibc gives `2.28-236.el8`), taking each segment's
+    // leading digit run and counting a segment with no leading digits as 0.
+    //
+    // Precision is required, though. Because a missing component scores 0, a
+    // value shorter than the floor is compared as if its absent components were
+    // zeros, so a single high segment decides the result on its own and
+    // `999garbage` clears a `4.18` floor without ever naming a minor version.
+    // Demand one digit-led component per floor component before comparing: that
+    // rejects the truncated garbage while still admitting every distro suffix,
+    // which only ever appears after those components.
     const versionAtLeast = (value: unknown, floor: string): boolean => {
         if (typeof value !== "string" || value.length === 0) {
             return false;
+        }
+        const parts = value.split(".");
+        const floorParts = floor.split(".");
+        if (parts.length < floorParts.length) return false;
+        for (let i = 0; i < floorParts.length; i++) {
+            if (!/^\d/.test(parts[i] ?? "")) return false;
         }
         const ordering = compareDotted(value, floor);
         return !Number.isNaN(ordering) && ordering >= 0;
@@ -1465,6 +1561,82 @@ function verifyArtifactBytes(
     }
 }
 
+/**
+ * Capabilities the pinned ORT/fastembed closure must not carry. Matched as
+ * substrings of each declared feature name so a renamed or versioned spelling
+ * (`download-binaries`, `fetch-models`, `cuda-12`) still lands, since the point
+ * is to deny a class of behavior rather than an exact feature list.
+ */
+const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
+    "download",
+    "fetch",
+    "hf-hub",
+    "hf_hub",
+    "online",
+    "tls",
+    "cuda",
+    "tensorrt",
+    "directml",
+    "coreml",
+    "rocm",
+    "openvino",
+    "onednn",
+    "xnnpack",
+    "nnapi",
+    "armnn",
+    "qnn",
+    "migraphx",
+    "cann",
+    "rknpu",
+    "tvm",
+    "vitis",
+    "webgpu",
+    "image",
+];
+
+/**
+ * Assert one `Cargo.toml` dependency line pins `version` exactly, opts out of
+ * default features, and declares no forbidden capability.
+ *
+ * The declared array is not the effective feature closure — most of
+ * `RUNTIME_IDENTITY.rust_crates.ort_features` arrives transitively — so this
+ * enforces the closure's negative half, which is the part a silent edit would
+ * exploit: adding a download, TLS, or accelerator feature while leaving the
+ * version pin untouched.
+ */
+function assertPinnedCrateFeatures(
+    cargo: string,
+    crate: string,
+    version: string,
+): void {
+    const line = cargo
+        .split("\n")
+        .find((candidate) => candidate.trimStart().startsWith(`${crate} = `));
+    if (line === undefined || !line.includes(`version = "=${version}"`)) {
+        fail(
+            `pinned ${crate} identity does not match ${MC_HOST_CARGO_TOML_PATH}`,
+        );
+    }
+    if (!/default-features\s*=\s*false/.test(line)) {
+        fail(
+            `${crate} in ${MC_HOST_CARGO_TOML_PATH} must set default-features = false`,
+        );
+    }
+    const declared = /features\s*=\s*\[([^\]]*)\]/.exec(line);
+    for (const raw of declared?.[1]?.split(",") ?? []) {
+        const feature = raw.trim().replace(/^["']|["']$/g, "").toLowerCase();
+        if (feature.length === 0) continue;
+        const forbidden = FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS.find((hint) =>
+            feature.includes(hint),
+        );
+        if (forbidden !== undefined) {
+            fail(
+                `${crate} feature ${feature} in ${MC_HOST_CARGO_TOML_PATH} is outside the qualified closure (${forbidden})`,
+            );
+        }
+    }
+}
+
 /** Repo-pinned identity cross-checks (bun.lock harness versions, Cargo crate pins). */
 function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
     const bunLockPath = join(rootDir, BUN_LOCK_PATH);
@@ -1490,18 +1662,16 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
             fail("crates/mc-host/Cargo.toml is required to qualify the ORT crate pins");
         }
         const cargo = readFileSync(cargoPath, "utf8");
-        if (
-            !cargo.includes(
-                `fastembed = { version = "=${RUNTIME_IDENTITY.rust_crates.fastembed}"`,
-            ) ||
-            !cargo.includes(
-                `ort = { version = "=${RUNTIME_IDENTITY.rust_crates.ort}"`,
-            )
-        ) {
-            fail(
-                "pinned fastembed/ort crate identities do not match crates/mc-host/Cargo.toml",
-            );
-        }
+        assertPinnedCrateFeatures(
+            cargo,
+            "fastembed",
+            RUNTIME_IDENTITY.rust_crates.fastembed,
+        );
+        assertPinnedCrateFeatures(
+            cargo,
+            "ort",
+            RUNTIME_IDENTITY.rust_crates.ort,
+        );
     }
 }
 
@@ -1739,10 +1909,27 @@ export function generate(
  * consume. Fails closed on absent, malformed, stale (artifact or U8 digest
  * mismatch), test-only, or non-production evidence. The production verdict is
  * re-derived from the digest-verified lock bytes rather than trusted from the
- * evidence file's own `production_qualified` field. Returns the verified
- * evidence and artifact digests for embedding into build inputs.
+ * evidence file's own `production_qualified` field, and every committed U8 and U9
+ * output must equal a canonical regeneration from the committed sources, so a
+ * hand-edited lock, credential matrix, or generated contract cannot pass however
+ * consistently its digests are updated.
+ *
+ * Trust boundary: this gate proves the committed *description* of the release is
+ * canonical and production-qualified. It does not hash the production artifacts
+ * that description names unless `verifyBytes` is requested — the lock records
+ * each artifact's `sha256` but deliberately not its `verify_local_path`, which is
+ * host-specific, and the real bytes exist only on the qualifying host. A build
+ * running on that host should pass `verifyBytes: true` to re-hash them here; a
+ * build elsewhere must verify the bytes it actually embeds against the returned
+ * lock digest itself.
+ *
+ * Returns the verified evidence and artifact digests for embedding into build
+ * inputs.
  */
-export function requireQualificationEvidence(rootDir: string): {
+export function requireQualificationEvidence(
+    rootDir: string,
+    options: { verifyBytes?: boolean } = {},
+): {
     evidence: Record<string, unknown>;
     u8Digest: string;
     lockSha256: string;
@@ -1868,6 +2055,39 @@ export function requireQualificationEvidence(rootDir: string): {
         if (typeof harnesses?.[name]?.version !== "string") {
             reject(`lock row harnesses.${name} is not qualified`);
         }
+    }
+    // Everything above reads markers: it proves the lock *says* every row
+    // qualified, not that the rows still carry real artifact hashes, sizes,
+    // licenses, oracle results, or harness identities — `{ "qualified": true }`
+    // satisfies each one. Nothing above reads the generated U8 consumer
+    // artifacts either, and it is the generated Rust contract the runtime
+    // actually compiles, not the digest of the in-source literal.
+    //
+    // Both gaps close the same way: regenerate every U8 and U9 output from the
+    // committed sources and require the committed bytes to match. Stripped lock
+    // rows, a replaced credential matrix, and an edited generated contract all
+    // fail that comparison, whatever digest the evidence cites.
+    const u8 = generateReleaseOutputs(rootDir, { check: true });
+    if (u8.drift.length > 0) {
+        reject(`generated U8 outputs are not canonical: ${u8.drift.join("; ")}`);
+    }
+    const regenerated = generate(rootDir, {
+        check: true,
+        verifyBytes: options.verifyBytes,
+    });
+    if (regenerated.drift.length > 0) {
+        reject(
+            `committed qualification outputs are not a canonical regeneration: ${regenerated.drift.join("; ")}`,
+        );
+    }
+    if (!regenerated.productionQualified) {
+        reject("the canonical regeneration is not production-qualified");
+    }
+    if (
+        regenerated.lockSha256 !== digests.production_inputs_lock ||
+        regenerated.credentialsSha256 !== digests.provider_credentials
+    ) {
+        reject("regenerated artifact digests do not match the cited digests");
     }
     return {
         evidence,

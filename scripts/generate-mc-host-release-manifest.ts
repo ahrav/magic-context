@@ -497,19 +497,47 @@ function fail(message: string): never {
     throw new Error(`mc-host release contract: ${message}`);
 }
 
-function assertExactKeys(
-    obj: Record<string, unknown>,
+/**
+ * Build an exact-key asserter: the returned function requires an object to carry
+ * every key in `keys`, permits any key in `optional`, and rejects anything else,
+ * naming the first offending key.
+ *
+ * `subject` is the calling module's error prefix. The same assertion guards
+ * in-source contract literals here and operator-authored manifests in the U9
+ * qualifier, and an operator editing a source manifest must not be told the
+ * release contract is at fault, so each module binds its own reporter rather
+ * than sharing one prefix.
+ */
+export function exactKeysAsserter(
+    subject: string,
+): (
+    obj: unknown,
     keys: string[],
     where: string,
-): void {
-    const actual = Object.keys(obj).sort();
-    const expected = [...keys].sort();
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-        fail(
-            `${where} keys must be exactly ${expected.join(", ")}; got ${actual.join(", ")}`,
-        );
-    }
+    optional?: string[],
+) => void {
+    const reject = (message: string): never => {
+        throw new Error(`${subject}: ${message}`);
+    };
+    return (obj, keys, where, optional = []): void => {
+        if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+            reject(`${where} must be an object`);
+        }
+        // SAFETY: `obj` is a non-null, non-array object after the guard, and only
+        // its own enumerable keys are read.
+        const record = obj as Record<string, unknown>;
+        for (const key of Object.keys(record)) {
+            if (!keys.includes(key) && !optional.includes(key)) {
+                reject(`${where}: unknown key ${key}`);
+            }
+        }
+        for (const key of keys) {
+            if (!(key in record)) reject(`${where}: missing key ${key}`);
+        }
+    };
 }
+
+const assertExactKeys = exactKeysAsserter("mc-host release contract");
 
 function compareSemver(a: string, b: string): number {
     const pa = a.split(".").map(Number);

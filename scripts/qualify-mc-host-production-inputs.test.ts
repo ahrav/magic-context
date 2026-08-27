@@ -63,6 +63,12 @@ function freshRoot(): string {
         // Present in the real repo, so production qualification must reject its
         // artifact digests wherever those bytes are relocated to.
         FIXTURE_MANIFEST_RELATIVE,
+        // The U2/U6 gate re-derives every U8 output, so the registry gate its
+        // generation requires and the generated consumer artifacts it compares
+        // against must both exist in a staged root.
+        "release/mc-host-registry-gate.json",
+        "release/generated/mc-host-release-contract.rs",
+        "packages/plugin/src/shared/mc-host-lifecycle/generated-contract.ts",
     ]) {
         mkdirSync(join(root, dirname(relative)), { recursive: true });
         cpSync(join(repoRoot, relative), join(root, relative));
@@ -148,6 +154,27 @@ function credentialsCopy(): any {
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the contract
 function contractCopy(): any {
     return JSON.parse(JSON.stringify(buildContract()));
+}
+
+/**
+ * Overwrite a cited qualification artifact and re-point every evidence citation
+ * at the bytes now on disk, so no digest check can fire. A test using this is
+ * aiming at what the gate believes about an artifact's *contents*, not at
+ * whether it noticed a digest mismatch.
+ */
+function recite(root: string, artifactPath: string, bytes: string): void {
+    writeFileSync(artifactPath, bytes);
+    const evidencePath = join(root, OUTPUT_PATHS.evidence);
+    const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+    for (const [key, relative] of [
+        ["production_inputs_lock", OUTPUT_PATHS.lock],
+        ["provider_credentials", OUTPUT_PATHS.credentials],
+    ] as const) {
+        evidence.artifacts[key].sha256 = createHash("sha256")
+            .update(readFileSync(join(root, relative), "utf8"))
+            .digest("hex");
+    }
+    writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
 }
 
 describe("deterministic generation and drift", () => {
@@ -292,6 +319,54 @@ describe("immutable input fail-closed rules", () => {
         expect(() => generate(root, { check: false })).toThrow(
             /inputs\.model_onnx: source is not a parseable URL/,
         );
+    });
+
+    test("a mutable ref in the query string or fragment is rejected", () => {
+        // An endpoint can name its revision outside the path, and such a URL
+        // keeps resolving a moving target however immutable its path looks.
+        for (const source of [
+            "https://artifacts.example.invalid/download?ref=main",
+            "https://artifacts.example.invalid/download?rev=v1&branch=LATEST",
+            "https://artifacts.example.invalid/d?path=repo/main/model.onnx",
+            "https://artifacts.example.invalid/download#HEAD",
+        ]) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.inputs.model_onnx.source = source;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                /mutable source identity/,
+            );
+        }
+    });
+
+    test("a source URL carrying credentials is rejected", () => {
+        // `buildLock` copies `source` verbatim into a committed artifact, so
+        // accepting either shape would publish the secret in Git permanently.
+        const withUserinfo = freshRoot();
+        const userinfoManifest = fixtureManifest();
+        userinfoManifest.inputs.model_onnx.source =
+            "https://user:token@models.example.invalid/rev/abc123/model.onnx";
+        installManifest(withUserinfo, userinfoManifest);
+        expect(() => generate(withUserinfo, { check: false })).toThrow(
+            /source must not embed URL credentials/,
+        );
+
+        for (const param of [
+            "access_token=abc",
+            "X-Amz-Signature=abc",
+            "apiKey=abc",
+            "sig=abc",
+        ]) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.inputs.model_onnx.source =
+                `https://models.example.invalid/rev/abc123/model.onnx?${param}`;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                /carries a credential and is rejected/,
+            );
+        }
     });
 
     test("placeholder hashes are rejected", () => {
@@ -446,6 +521,46 @@ describe("immutable input fail-closed rules", () => {
             /does not match the resolved bun\.lock pin/,
         );
     });
+
+    test("a forbidden ORT capability in Cargo.toml fails production closed", () => {
+        // The declared array is not the effective feature closure, but adding a
+        // download, TLS, or accelerator feature while leaving the version pin
+        // untouched is exactly the edit the version-only check missed.
+        const cargoPath = "crates/mc-host/Cargo.toml";
+        const cases: [(cargo: string) => string, RegExp][] = [
+            [
+                (cargo) =>
+                    cargo.replace(
+                        '"load-dynamic", "ndarray", "std"',
+                        '"load-dynamic", "ndarray", "std", "download-binaries"',
+                    ),
+                /ort feature download-binaries .* outside the qualified closure/,
+            ],
+            [
+                (cargo) =>
+                    cargo.replace(
+                        '"ort-load-dynamic"',
+                        '"ort-load-dynamic", "hf-hub"',
+                    ),
+                /fastembed feature hf-hub .* outside the qualified closure/,
+            ],
+            [
+                (cargo) =>
+                    cargo.replace(
+                        'ort = { version = "=2.0.0-rc.13", default-features = false,',
+                        'ort = { version = "=2.0.0-rc.13",',
+                    ),
+                /ort .* must set default-features = false/,
+            ],
+        ];
+        for (const [mutate, error] of cases) {
+            const root = freshRoot();
+            installProductionManifest(root);
+            const path = join(root, cargoPath);
+            writeFileSync(path, mutate(readFileSync(path, "utf8")));
+            expect(() => generate(root, { check: false })).toThrow(error);
+        }
+    });
 });
 
 describe("oracle evidence hook", () => {
@@ -491,6 +606,25 @@ describe("oracle evidence hook", () => {
         expect(() => generate(low, { check: false })).toThrow(
             /host must meet the exact minimum Linux floor/,
         );
+    });
+
+    test("a truncated host version cannot clear a floor on one component", () => {
+        // `compareDotted` scores a missing component as 0, so a value shorter
+        // than the floor is compared as if its absent components were zeros and
+        // one high segment decides the result alone.
+        for (const [field, value] of [
+            ["kernel", "999garbage"],
+            ["glibc", "999garbage"],
+            ["kernel", "5"],
+        ] as const) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.oracle.host[field] = value;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                /host must meet the exact minimum Linux floor/,
+            );
+        }
     });
 
     test("mismatched oracle evidence is rejected", () => {
@@ -996,6 +1130,67 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
         expect(accepted.u8Digest).toBe(generated.u8Digest);
     });
 
+    test("stripped lock rows cannot pass the gate", () => {
+        // Every marker check reads only a `qualified` flag or a version's type,
+        // so a lock whose rows keep nothing but those markers satisfies all of
+        // them while carrying no artifact hash, size, license, oracle result, or
+        // harness identity at all.
+        const root = freshRoot();
+        installProductionManifest(root);
+        generate(root, { check: false });
+
+        const lockPath = join(root, OUTPUT_PATHS.lock);
+        const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+        for (const key of Object.keys(lock.inputs)) {
+            lock.inputs[key] = { qualified: true };
+        }
+        lock.oracle = { qualified: true };
+        for (const name of Object.keys(lock.harnesses)) {
+            lock.harnesses[name] = { package: "", version: "" };
+        }
+        recite(root, lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+        expect(() => requireQualificationEvidence(root)).toThrow(
+            /not a canonical regeneration.*mc-host-production-inputs\.lock\.json/,
+        );
+    });
+
+    test("a replaced credential matrix cannot pass the gate", () => {
+        // The citation loop compares a self-reported digest and never parses the
+        // matrix, so updating both together would otherwise let a production
+        // build embed an empty or foreign credential policy.
+        const root = freshRoot();
+        installProductionManifest(root);
+        generate(root, { check: false });
+
+        recite(root, join(root, OUTPUT_PATHS.credentials), "{}\n");
+
+        expect(() => requireQualificationEvidence(root)).toThrow(
+            /not a canonical regeneration.*mc-host-provider-credentials\.json/,
+        );
+    });
+
+    test("an edited generated U8 contract cannot pass the gate", () => {
+        // The runtime compiles the generated Rust contract, not the in-source
+        // literal the cited U8 digest is derived from.
+        const root = freshRoot();
+        installProductionManifest(root);
+        generate(root, { check: false });
+
+        const generatedRust = join(
+            root,
+            "release/generated/mc-host-release-contract.rs",
+        );
+        writeFileSync(
+            generatedRust,
+            `${readFileSync(generatedRust, "utf8")}// drifted\n`,
+        );
+
+        expect(() => requireQualificationEvidence(root)).toThrow(
+            /generated U8 outputs are not canonical/,
+        );
+    });
+
     test("summary-only lock edits cannot fake a verdict", () => {
         const root = freshRoot();
         // One input left unqualified, so the lock carries a false row.
@@ -1096,6 +1291,39 @@ describe("verify-path resolution", () => {
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).toThrow(
             /parent segments in the verify path are rejected/,
+        );
+    });
+
+    test("the fixture deny-list matches path segments, not substrings", () => {
+        // A real artifact store whose name merely contains a denied word names
+        // nothing that is actually a fixture or a cache.
+        const allowed = freshRoot();
+        installProductionManifest(allowed, (manifest) => {
+            const dir = join(allowed, "mnt/release/hf-tests/fixtures-store");
+            mkdirSync(dir, { recursive: true });
+            const target = join(dir, "model.onnx");
+            const bytes = Buffer.from("relocated production model bytes\n");
+            writeFileSync(target, bytes);
+            manifest.inputs.model_onnx.verify_local_path = target;
+            manifest.inputs.model_onnx.sha256 = createHash("sha256")
+                .update(bytes)
+                .digest("hex");
+            manifest.inputs.model_onnx.size_bytes = bytes.length;
+        });
+        expect(generate(allowed, { check: false }).productionQualified).toBe(
+            true,
+        );
+
+        // The real segment run is still denied wherever it appears.
+        const denied = freshRoot();
+        installProductionManifest(denied, (manifest) => {
+            manifest.inputs.model_onnx.verify_local_path = join(
+                denied,
+                "srv/tests/fixtures/model.onnx",
+            );
+        });
+        expect(() => generate(denied, { check: false })).toThrow(
+            /fixture\/developer-cache verify path \(tests\/fixtures\)/,
         );
     });
 

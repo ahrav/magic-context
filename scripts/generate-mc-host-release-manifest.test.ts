@@ -162,7 +162,7 @@ describe("pre-build schema", () => {
             const withHashKey = contractCopy();
             withHashKey.model_lane[key] = "pinned-later";
             expect(() => validateContractSchema(withHashKey)).toThrow(
-                /hash-bearing key|model_lane keys/,
+                new RegExp(`hash-bearing key|model_lane: unknown key ${key}`),
             );
         }
     });
