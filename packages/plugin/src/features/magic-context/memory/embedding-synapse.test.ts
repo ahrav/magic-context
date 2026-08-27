@@ -109,7 +109,17 @@ function virtualTime(randomValues: number[] = [0]): {
             sleeps.push(ms);
             time += ms;
         },
-        random: () => randomValues[randomIndex++] ?? randomValues.at(-1) ?? 0,
+        // Each test declares exactly the draws its scenario consumes; an
+        // extra draw is a changed jitter schedule the test must account
+        // for, not a silent repeat of the last declared value.
+        random: () => {
+            if (randomIndex >= randomValues.length) {
+                throw new Error(
+                    `virtualTime: draw ${randomIndex + 1} exceeds the ${randomValues.length} declared random value(s)`,
+                );
+            }
+            return randomValues[randomIndex++];
+        },
         sleeps,
     };
 }
@@ -688,7 +698,8 @@ describe("connect discovery and retry policy", () => {
 
     it("keeps queue-full admission inside the finite four-attempt budget", async () => {
         let queryCalls = 0;
-        const time = virtualTime([0]);
+        // Three retry sleeps, one jitter draw each.
+        const time = virtualTime([0, 0, 0]);
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
             projectRoot: "/repo",
@@ -719,6 +730,59 @@ describe("connect discovery and retry policy", () => {
         expect(await provider.embed("hello")).toBeNull();
         expect(queryCalls).toBe(4);
         expect(time.sleeps).toEqual([1, 1, 1]);
+    });
+
+    it("gives overlapping embed calls independent retry jitter", async () => {
+        // Two overlapping queries, one jitter draw each: their first-retry
+        // sleeps must differ, otherwise every concurrent caller retries in
+        // lockstep and the jitter buys nothing.
+        const time = virtualTime([0.25, 0.75]);
+        let queryCalls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 5_000,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(): Promise<Response> {
+                        queryCalls += 1;
+                        if (queryCalls <= 2) {
+                            const error = new Error("full") as Error & {
+                                code: string;
+                                retry_after_ms: number;
+                            };
+                            error.code = "queue_full";
+                            error.retry_after_ms = 100;
+                            throw error;
+                        }
+                        return {
+                            vector: [1, 2, 3],
+                            fingerprint: "fp-live",
+                            table_epoch: 0,
+                        } as Response;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        const [first, second] = await Promise.all([
+            provider.embed("first"),
+            provider.embed("second"),
+        ]);
+
+        expect(first).toEqual(new Float32Array([1, 2, 3]));
+        expect(second).toEqual(new Float32Array([1, 2, 3]));
+        expect(queryCalls).toBe(4);
+        // base 100 jittered by draws 0.25 and 0.75: 150 and 250.
+        expect([...time.sleeps].sort((left, right) => left - right)).toEqual([150, 250]);
+        expect(time.sleeps[0]).not.toBe(time.sleeps[1]);
     });
 
     it("uses authoritative retry-after jitter and rebuilds attempt deadlines", async () => {
@@ -772,11 +836,46 @@ describe("connect discovery and retry policy", () => {
             tableEpoch: 0,
             dims: 3,
             clientFactory: async () => ({
+                async call<Response = unknown>(): Promise<Response> {
+                    calls += 1;
+                    if (calls === 1) {
+                        const error = new Error("request cancelled") as Error & { code: string };
+                        error.code = "cancelled";
+                        throw error;
+                    }
+                    return {
+                        vector: [1, 2, 3],
+                        fingerprint: "fp-live",
+                        table_epoch: 0,
+                    } as Response;
+                },
+                close() {},
+            }),
+        });
+
+        expect(await provider.embed("hello")).toBeNull();
+        expect(calls).toBe(1);
+        // Cancellation is evidence about one caller's abort, never about
+        // the lane: the next embed must reach the daemon and succeed.
+        expect(await provider.embed("again")).toEqual(new Float32Array([1, 2, 3]));
+        expect(calls).toBe(2);
+    });
+
+    it("maps a code-less AbortError to cancelled by its name and never retries it", async () => {
+        let calls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            clientFactory: async () => ({
                 async call() {
                     calls += 1;
-                    const error = new Error("request cancelled") as Error & { code: string };
-                    error.code = "cancelled";
-                    throw error;
+                    // DOM/undici-style abort: no `code` field at all, the
+                    // classification must come from the error's name.
+                    throw Object.assign(new Error("aborted"), { name: "AbortError" });
                 },
                 close() {},
             }),
@@ -1185,10 +1284,11 @@ describe("embedItemsDetailed", () => {
             );
             expect(result.receipts).toHaveLength(1);
             expect(host.resultCalls()).toHaveLength(3);
-            expect(time.sleeps).toHaveLength(3);
-            expect(time.sleeps[0]).toBeCloseTo(1.5);
-            expect(time.sleeps[1]).toBeGreaterThanOrEqual(10);
-            expect(time.sleeps[2]).toBeGreaterThanOrEqual(10);
+            // Exact schedule from the constants: jittered fast-first poll
+            // min(1 * (1 + 0.5), 50) = 1.5, then the escalation
+            // max(10, 1.5 * 1.6) = 10 and max(10, 10 * 1.6) = 16, both
+            // under the served 50ms cap.
+            expect(time.sleeps).toEqual([1.5, 10, 16]);
             expect(ledgerRows(db)[0].state).toBe("ready");
         } finally {
             closeQuietly(db);
@@ -1220,8 +1320,47 @@ describe("embedItemsDetailed", () => {
 
             expect(result.receipts).toEqual([]);
             expect(result.failures[0]?.code).toBe("timeout");
-            expect(host.resultCalls().length).toBeLessThanOrEqual(3);
+            // Exact schedule: initial 30_000 (jitter draw 0), escalation
+            // 30_000 * 1.6 = 48_000, then the 42_000 remainder of the
+            // 120s deadline. Exactly two polls fit before exhaustion.
+            expect(host.resultCalls()).toHaveLength(2);
             expect(time.sleeps).toEqual([30_000, 48_000, 42_000]);
+            expect(time.now()).toBe(120_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("bounds the default-configuration poll count over the full 120s deadline", async () => {
+        const db = ledgerDb();
+        try {
+            // One jitter draw for the fast-first poll; every later delay is
+            // deterministic escalation.
+            const time = virtualTime([0]);
+            const host = new DetailedHost();
+            host.resultPages = () => ({
+                result: { done: false, status: "running", retry_after_ms: 50 },
+            });
+            const provider = detailedProvider(host, {
+                batchTimeoutMs: 120_000,
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+                pollDefaultDelayMs: 50,
+            });
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            expect(result.receipts).toEqual([]);
+            expect(result.failures[0]?.code).toBe("timeout");
+            // Escalation then flatline: sleeps 1, 10, 16, 25.6, ~40.96,
+            // then 50ms repeated to the deadline. That is 4 escalation
+            // polls + 2398 flatline polls + 1 final clamped poll = 2403,
+            // the ceiling a never-finishing job can cost under defaults.
+            expect(host.resultCalls()).toHaveLength(2403);
             expect(time.now()).toBe(120_000);
         } finally {
             closeQuietly(db);

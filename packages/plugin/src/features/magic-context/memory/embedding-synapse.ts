@@ -251,6 +251,15 @@ function wait(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Request parameters for one managed Synapse call: either the literal params
+ * object, or a builder invoked per attempt with that attempt's remaining
+ * deadline so retried requests carry a fresh `deadline_ms`.
+ */
+type SynapseCallParams =
+    | Record<string, unknown>
+    | ((deadlineMs: number) => Record<string, unknown>);
+
 interface PollDelayState {
     nextDelayMs: number;
     multiplier: number;
@@ -1497,7 +1506,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private async callWithRetry<T>(
         method: string,
-        params: unknown | ((deadlineMs: number) => unknown),
+        params: SynapseCallParams,
         timeoutMs: number,
         retryEmbeddings: boolean,
         signal?: AbortSignal,

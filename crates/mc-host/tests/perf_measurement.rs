@@ -242,6 +242,102 @@ fn retry_and_poll_schedule_matches_plugin_policy() {
 }
 
 #[test]
+fn adjacent_seeds_disperse_their_first_draw() {
+    // The benchmark seeds per-request generators as `seed ^ logical_id`,
+    // so adjacent small seeds must not produce synchronized first draws:
+    // a first draw pinned near zero would collapse every caller's first
+    // retry delay onto the base value and defeat the jitter policy.
+    let firsts: Vec<f64> = (1u64..=8)
+        .map(|id| perf_measurement::DeterministicRng::new(1 ^ id).unit())
+        .collect();
+    let min = firsts.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = firsts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        max - min > 0.25,
+        "first draws {firsts:?} span {} <= 0.25: adjacent seeds are synchronized",
+        max - min
+    );
+}
+
+#[test]
+fn distinct_seeds_yield_distinct_first_draws() {
+    // seed.max(1)-style clamping or a weak mixer can collapse distinct
+    // seeds onto one sequence; the first draw must already discriminate.
+    let a = perf_measurement::DeterministicRng::new(1 << 2).unit();
+    let b = perf_measurement::DeterministicRng::new(1 << 3).unit();
+    assert_ne!(a, b, "seeds 4 and 8 produced the same first draw");
+    let zero = perf_measurement::DeterministicRng::new(0).unit();
+    let one = perf_measurement::DeterministicRng::new(1).unit();
+    assert_ne!(zero, one, "seeds 0 and 1 collapsed onto one sequence");
+}
+
+#[test]
+fn ledger_rejects_duplicate_and_orphan_records() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod,
+    };
+    let attempt = |logical_id, attempt_id| AttemptRecord {
+        logical_id,
+        attempt_id,
+        method: SynapseMethod::Query,
+        disposition: AttemptDisposition::Success,
+        code: None,
+        retry_after_ms: None,
+        actual_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+    };
+    let logical = |logical_id, attempts| LogicalRecord {
+        logical_id,
+        scheduled_start_ns: None,
+        actual_first_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        disposition: LogicalDisposition::Completed,
+        terminal_code: None,
+        attempts,
+        polls: 0,
+    };
+
+    // Duplicate logical rows: two rows claim logical 1.
+    let duplicated_logical = validate_synapse_ledgers(
+        &[logical(1, 1), logical(1, 1)],
+        &[attempt(1, 1), attempt(1, 2)],
+    );
+    assert!(!duplicated_logical.valid);
+    assert!(duplicated_logical
+        .errors
+        .iter()
+        .any(|error| error.contains("duplicate logical_id 1")));
+
+    // Duplicate attempt rows: attempt_id 1 recorded twice.
+    let duplicated_attempt =
+        validate_synapse_ledgers(&[logical(1, 2)], &[attempt(1, 1), attempt(1, 1)]);
+    assert!(!duplicated_attempt.valid);
+    assert!(duplicated_attempt
+        .errors
+        .iter()
+        .any(|error| error.contains("duplicate attempt_id 1")));
+
+    // Orphan attempt: logical 9 owns nothing.
+    let orphan = validate_synapse_ledgers(&[logical(1, 1)], &[attempt(1, 1), attempt(9, 2)]);
+    assert!(!orphan.valid);
+    assert!(orphan
+        .errors
+        .iter()
+        .any(|error| error.contains("unknown logical_id 9")));
+
+    // Per-logical attempt-count mismatch is still caught.
+    let miscounted = validate_synapse_ledgers(&[logical(1, 3)], &[attempt(1, 1)]);
+    assert!(!miscounted.valid);
+    assert!(miscounted
+        .errors
+        .iter()
+        .any(|error| error.contains("records 3 attempts")));
+}
+
+#[test]
 fn raw_error_surfaces_retry_after_ms() {
     let frame = raw_client::RawFrame {
         len: 45,

@@ -400,6 +400,29 @@ pub fn validate_synapse_ledgers(
     }
 
     let mut errors = Vec::new();
+    // The two conservation equations below cannot fail on their own —
+    // the dispositions partition each ledger — so the falsifiable
+    // identity checks come first: duplicate logical rows, duplicate
+    // attempt rows, and attempts owned by no logical request are the
+    // corruption shapes a recording bug actually produces.
+    let mut logical_ids = std::collections::BTreeSet::new();
+    for request in logical {
+        if !logical_ids.insert(request.logical_id) {
+            errors.push(format!("duplicate logical_id {}", request.logical_id));
+        }
+    }
+    let mut attempt_ids = std::collections::BTreeSet::new();
+    for attempt in attempts {
+        if !attempt_ids.insert(attempt.attempt_id) {
+            errors.push(format!("duplicate attempt_id {}", attempt.attempt_id));
+        }
+        if !logical_ids.contains(&attempt.logical_id) {
+            errors.push(format!(
+                "attempt {} references unknown logical_id {}",
+                attempt.attempt_id, attempt.logical_id
+            ));
+        }
+    }
     if offered != completed + terminal_rejected + timed_out + in_flight {
         errors.push(format!(
             "logical ledger: {offered} != {completed} + {terminal_rejected} + {timed_out} + {in_flight}"
@@ -450,21 +473,30 @@ pub fn validate_synapse_ledgers(
 }
 
 /// Deterministic generator used only by the benchmark's jitter policy.
+///
+/// SplitMix64: the state advances by the golden-ratio increment and each
+/// draw runs the full avalanche finalizer, so the first draw from any
+/// seed — including adjacent small seeds such as `seed ^ logical_id` —
+/// is already well mixed. (A raw xorshift here would make every small
+/// seed's first draw nearly zero, synchronizing all callers' first retry
+/// delays at the base value and defeating the jitter.) Every distinct
+/// seed, including 0, yields a distinct sequence.
 #[derive(Debug, Clone)]
 pub struct DeterministicRng(u64);
 
 impl DeterministicRng {
     pub fn new(seed: u64) -> Self {
-        Self(seed.max(1))
+        Self(seed)
     }
 
     pub fn unit(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut value = self.0;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.0 = value;
-        value as f64 / (u64::MAX as f64 + 1.0)
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^= value >> 31;
+        // Top 53 bits give a uniform double in [0, 1).
+        (value >> 11) as f64 / (1u64 << 53) as f64
     }
 
     /// Mirrors plugin retry jitter: `[base, 3 * base)`.

@@ -43,9 +43,19 @@ const MAX_CENSORED_PER_MILLE: u128 = 10;
 const MAX_TOTAL_ATTEMPTS: u32 = 4;
 const QUERY_DEADLINE: Duration = Duration::from_secs(3);
 const BATCH_DEADLINE: Duration = Duration::from_secs(120);
+/// Validity ceiling on any single logical request's pending-poll count.
+/// The densest legal schedule polls at the 10 ms floor for the entire
+/// batch deadline (`BATCH_DEADLINE` / `SYNAPSE_POLL_MIN_DELAY`-equivalent
+/// floor in `next_poll_delay_ms`), plus slack for the jittered fast-first
+/// poll and cursored page reads. A max above this means the poll policy
+/// regressed (for example a delay collapsed to zero) and the repetition's
+/// amplification numbers cannot be trusted, so the run is invalidated.
+const MAX_POLLS_PER_LOGICAL: u64 = BATCH_DEADLINE.as_millis() as u64 / 10 + 64;
 const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const MODEL: &str = "synapse-perf-tiny";
 const QUERY_TEXT: &str = "model-free benchmark query";
+/// Shared queued-request byte budget for every cell (see `run`).
+const HARNESS_QUEUED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -400,12 +410,24 @@ struct WireReply {
 struct RoutedWire {
     writer: Mutex<WriteHalf<TcpStream>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<(raw_client::RawFrame, u64)>>>,
+    /// Correlations whose caller gave up (attempt timeout) but whose
+    /// terminal may still arrive. Without this, a late terminal looks
+    /// like an unknown correlation, poisons `reader_error`, and kills
+    /// every other in-flight call in the repetition. FIFO-bounded at
+    /// [`TOMBSTONE_CAP`]: the oldest tombstone is evicted first, and a
+    /// tombstone is consumed when its late terminal arrives.
+    tombstones: Mutex<std::collections::VecDeque<u64>>,
     next_corr: AtomicU64,
     channel: u16,
     epoch: u32,
     origin: Instant,
     reader_error: Mutex<Option<String>>,
 }
+
+/// Upper bound on retained timed-out correlations, sized at the largest
+/// plausible in-flight population (open-loop tasks awaiting replies) so
+/// the set cannot grow without bound across a long repetition.
+const TOMBSTONE_CAP: usize = 4096;
 
 enum WireCallError {
     Timeout { sent_ns: u64, terminal_ns: u64 },
@@ -433,6 +455,7 @@ impl RoutedWire {
         let wire = Arc::new(Self {
             writer: Mutex::new(writer),
             pending: Mutex::new(HashMap::new()),
+            tombstones: Mutex::new(std::collections::VecDeque::new()),
             next_corr: AtomicU64::new(1_000_000),
             channel,
             epoch,
@@ -500,6 +523,14 @@ impl RoutedWire {
             )),
             Err(_) => {
                 self.pending.lock().await.remove(&corr);
+                // Leave a tombstone so the reply that may still arrive is
+                // discarded instead of being read as an unknown correlation.
+                let mut tombstones = self.tombstones.lock().await;
+                if tombstones.len() >= TOMBSTONE_CAP {
+                    tombstones.pop_front();
+                }
+                tombstones.push_back(corr);
+                drop(tombstones);
                 Err(WireCallError::Timeout {
                     sent_ns,
                     terminal_ns: self.elapsed_ns(),
@@ -545,12 +576,18 @@ async fn read_terminals(
         {
             return Err("terminal frame violates route or flag contract".to_owned());
         }
-        let sender = wire
-            .pending
-            .lock()
-            .await
-            .remove(&frame.corr)
-            .ok_or_else(|| format!("terminal for unknown correlation {}", frame.corr))?;
+        let sender = wire.pending.lock().await.remove(&frame.corr);
+        let Some(sender) = sender else {
+            // A terminal for a correlation whose caller already timed out
+            // is expected wire traffic, not corruption: consume the
+            // tombstone and discard the frame silently.
+            let mut tombstones = wire.tombstones.lock().await;
+            if let Some(position) = tombstones.iter().position(|corr| *corr == frame.corr) {
+                tombstones.remove(position);
+                continue;
+            }
+            return Err(format!("terminal for unknown correlation {}", frame.corr));
+        };
         let _ = sender.send((frame, received_ns));
     }
 }
@@ -890,17 +927,22 @@ async fn execute_batch(
     let mut restart_budget = RestartBudget::new();
     // The outer loop reruns submit-then-poll when a host restart evicts the
     // job: the resubmitted batch keeps the same logical request, deadline,
-    // and accumulating attempt/poll counters.
+    // and accumulating attempt/poll counters. Submit retries are gated on a
+    // per-submission counter that resets on each resubmission, mirroring the
+    // plugin's fresh callWithRetry budget per submission; `batch_attempts`
+    // stays cumulative because it feeds the attempt ledger.
     'logical: loop {
+        let mut submit_attempts = 0u32;
         let (job_id, served_poll_cap) = loop {
             batch_attempts += 1;
+            submit_attempts += 1;
             let (reply, json) = match ctx
                 .record_call(logical_id, SynapseMethod::Batch, body.clone(), deadline)
                 .await
             {
                 Ok(value) => value,
                 Err(error) if error == "attempt timeout" => {
-                    if batch_attempts < u64::from(MAX_TOTAL_ATTEMPTS) {
+                    if submit_attempts < MAX_TOTAL_ATTEMPTS {
                         let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
                         if Instant::now() + delay < deadline {
                             tokio::time::sleep(delay).await;
@@ -933,7 +975,9 @@ async fn execute_batch(
             let code = json["code"].as_str().unwrap_or("unparsable");
             if code == "module_restarted" {
                 match restart_budget.on_module_restarted() {
-                    RestartAction::Resubmit => continue,
+                    // A resubmission is a new submission: restart the outer
+                    // loop so the per-submission retry budget resets.
+                    RestartAction::Resubmit => continue 'logical,
                     RestartAction::Terminal => {
                         return Ok(terminal_record(
                             logical_id,
@@ -951,7 +995,7 @@ async fn execute_batch(
             if code != "queue_full" {
                 return Err(format!("unexpected embed.batch error: {json}"));
             }
-            if batch_attempts >= u64::from(MAX_TOTAL_ATTEMPTS) {
+            if submit_attempts >= MAX_TOTAL_ATTEMPTS {
                 return Ok(terminal_record(
                     logical_id,
                     scheduled_start_ns,
@@ -1375,6 +1419,12 @@ async fn run(
     let mut limits = SynapseLimits {
         max_waiting_queries: opts.max_waiting_queries,
         query_retry_after_ms: opts.query_retry_after_ms,
+        // Uniform across every variant arm so admission-treatment cells stay
+        // comparable: startup validation charges (waiters + queued jobs +
+        // queued bytes) against one resident budget, and the default 64 MiB
+        // queued-byte budget leaves no room for any waiting query. The
+        // benchmark's batch payloads are far below this bound.
+        max_queued_request_bytes: HARNESS_QUEUED_REQUEST_BYTES,
         ..Default::default()
     };
     if let Arm::Batch(shape) = opts.arm {
@@ -1423,10 +1473,19 @@ async fn run(
         LatencySummary::from_unsorted(attempts.iter().map(|attempt| attempt.latency_ns).collect());
     let logical_latency =
         LatencySummary::from_unsorted(logical.iter().map(|request| request.latency_ns).collect());
+    // Permit wait is only meaningful for attempts the engine actually
+    // served: a rejected or timed-out query attempt did no engine work,
+    // so subtracting the engine delay from it produces a hugely negative
+    // residual that is scheduler noise, not permit queueing. The type
+    // stays signed and unclamped so genuine timer-resolution negatives
+    // on successful attempts remain visible.
     let permit_wait = SignedSummary::from_unsorted(
         attempts
             .iter()
-            .filter(|attempt| attempt.method == SynapseMethod::Query)
+            .filter(|attempt| {
+                attempt.method == SynapseMethod::Query
+                    && attempt.disposition == AttemptDisposition::Success
+            })
             .map(|attempt| {
                 let residual = i128::from(attempt.latency_ns)
                     - i128::from(opts.engine_delay_ms.saturating_mul(1_000_000))
@@ -1586,17 +1645,27 @@ fn main() {
             let censored = censored_count(&summary.ledger);
             let censoring_invalid = u128::from(censored) * 1_000
                 > u128::from(summary.ledger.offered) * MAX_CENSORED_PER_MILLE;
+            let poll_ceiling_exceeded = summary
+                .poll_distribution
+                .as_ref()
+                .is_some_and(|polls| polls.max > MAX_POLLS_PER_LOGICAL);
             if !summary.ledger.valid
                 || !summary.fatal_errors.is_empty()
                 || summary.missed_slots != 0
                 || censoring_invalid
+                || poll_ceiling_exceeded
             {
                 eprintln!(
-                    "synapse_perf failed: invalid repetition (ledger={}, fatal={}, missed_slots={}, censored_per_mille={:.3})",
+                    "synapse_perf failed: invalid repetition (ledger={}, fatal={}, missed_slots={}, censored_per_mille={:.3}, poll_max={} vs ceiling {})",
                     summary.ledger.valid,
                     summary.fatal_errors.len(),
                     summary.missed_slots,
-                    summary.censored_per_mille
+                    summary.censored_per_mille,
+                    summary
+                        .poll_distribution
+                        .as_ref()
+                        .map_or(0, |polls| polls.max),
+                    MAX_POLLS_PER_LOGICAL
                 );
                 std::process::exit(1);
             }
@@ -1616,14 +1685,14 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
-    fn logical(disposition: LogicalDisposition) -> LogicalRecord {
-        terminal_record(1, None, 0, 1, disposition, None, 0, 0)
+    fn logical(logical_id: u64, disposition: LogicalDisposition) -> LogicalRecord {
+        terminal_record(logical_id, None, 0, 1, disposition, None, 0, 0)
     }
 
     #[test]
     fn terminal_rejection_is_not_censoring() {
         let ledger = perf_measurement::validate_synapse_ledgers(
-            &[logical(LogicalDisposition::Rejected)],
+            &[logical(1, LogicalDisposition::Rejected)],
             &[],
         );
 
@@ -1635,8 +1704,8 @@ mod tests {
     fn timeout_and_in_flight_are_censoring() {
         let ledger = perf_measurement::validate_synapse_ledgers(
             &[
-                logical(LogicalDisposition::TimedOut),
-                logical(LogicalDisposition::InFlight),
+                logical(1, LogicalDisposition::TimedOut),
+                logical(2, LogicalDisposition::InFlight),
             ],
             &[],
         );
@@ -1657,6 +1726,111 @@ mod tests {
         assert_eq!(budget.on_module_restarted(), RestartAction::Resubmit);
         assert_eq!(budget.on_module_restarted(), RestartAction::Terminal);
         assert_eq!(budget.on_module_restarted(), RestartAction::Terminal);
+    }
+
+    #[test]
+    fn restart_loop_contract_is_two_submissions_then_rejected() {
+        // The loop contract at the pure seam `execute_batch` consumes:
+        // every submission is accepted and every poll answers
+        // module_restarted. The budget permits the initial submission plus
+        // exactly one resubmission (two embed.batch submissions total),
+        // and the second restart is terminal with disposition Rejected.
+        // Each resubmission re-enters the outer loop, which hands the
+        // submit path a fresh per-submission retry budget; only the
+        // cumulative attempt counter (the ledger's input) persists.
+        let mut budget = RestartBudget::new();
+        let mut submissions = 0u32;
+        let mut cumulative_attempts = 0u64;
+        let disposition = loop {
+            // Fresh per-submission window, as in `execute_batch`'s
+            // `'logical` loop; the accepted submit consumes one attempt.
+            let submit_attempts = 1u32;
+            assert!(submit_attempts < MAX_TOTAL_ATTEMPTS);
+            submissions += 1;
+            cumulative_attempts += 1;
+            // The poll for this submission answers module_restarted.
+            cumulative_attempts += 1;
+            match budget.on_module_restarted() {
+                RestartAction::Resubmit => continue,
+                RestartAction::Terminal => break LogicalDisposition::Rejected,
+            }
+        };
+        assert_eq!(
+            submissions, 2,
+            "initial submission plus exactly one resubmission"
+        );
+        assert_eq!(cumulative_attempts, 4, "the ledger keeps every attempt");
+        assert_eq!(disposition, LogicalDisposition::Rejected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn call_writes_strictly_increasing_correlations_under_concurrency() {
+        // The host retires the generation on any non-increasing Request
+        // correlation, so allocation and socket write must be atomic under
+        // the writer lock. This drives many concurrent callers through one
+        // wire and decodes the request headers server-side: hoisting the
+        // fetch_add outside the writer lock lets two tasks write inverted
+        // correlations, which this assertion catches.
+        const CALLERS: usize = 256;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut corrs = Vec::with_capacity(CALLERS);
+            for _ in 0..CALLERS {
+                let mut header = [0u8; raw_client::HEADER_LEN];
+                stream
+                    .read_exact(&mut header)
+                    .await
+                    .expect("request header");
+                let frame = raw_client::decode_header(&header);
+                let mut body = vec![0u8; frame.len as usize];
+                stream.read_exact(&mut body).await.expect("request body");
+                corrs.push(frame.corr);
+            }
+            corrs
+        });
+        let stream = TcpStream::connect(addr).await.expect("connect loopback");
+        let (_reader, writer) = tokio::io::split(stream);
+        let wire = Arc::new(RoutedWire {
+            writer: Mutex::new(writer),
+            pending: Mutex::new(HashMap::new()),
+            tombstones: Mutex::new(std::collections::VecDeque::new()),
+            next_corr: AtomicU64::new(1),
+            channel: 7,
+            epoch: 3,
+            origin: Instant::now(),
+            reader_error: Mutex::new(None),
+        });
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..CALLERS {
+            let wire = Arc::clone(&wire);
+            callers.spawn(async move {
+                // The server never replies, so every call resolves as an
+                // attempt timeout after its write; only the write order
+                // matters here.
+                match wire.call(b"{}".to_vec(), Duration::from_millis(1)).await {
+                    Err(WireCallError::Timeout { .. }) => {}
+                    Err(WireCallError::Transport(error)) => panic!("transport error: {error}"),
+                    Ok(_) => panic!("no reply was sent"),
+                }
+            });
+        }
+        while let Some(result) = callers.join_next().await {
+            result.expect("caller task");
+        }
+        let corrs = server.await.expect("server task");
+        assert_eq!(corrs.len(), CALLERS);
+        for pair in corrs.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "correlations left the writer in inverted order: {} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]
@@ -1705,6 +1879,14 @@ mod tests {
 
         assert!(ledger.valid, "{:?}", ledger.errors);
         assert_eq!(censored_count(&ledger), 0);
+        // module_restarted attempts are admitted work — only queue_full is
+        // an admission rejection — and they are not timeouts, so both
+        // submissions and both restarted polls count as admitted and the
+        // timeout breakdown stays empty.
+        assert_eq!(ledger.admitted_by_method["embed.batch"], 2);
+        assert_eq!(ledger.admitted_by_method["embed.result"], 2);
+        assert!(ledger.rejected_by_method_code.is_empty());
+        assert!(ledger.timed_out_by_method_code.is_empty());
     }
 
     #[test]
