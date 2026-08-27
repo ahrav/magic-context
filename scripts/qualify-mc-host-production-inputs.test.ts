@@ -877,6 +877,10 @@ describe("immutable input fail-closed rules", () => {
                 /overrides fastembed, so the build would not resolve/,
             ],
             [
+                'patch.crates-io.ort = { path = "fake-ort" }\n',
+                /dotted override assignment this qualifier cannot attribute/,
+            ],
+            [
                 '[replace]\n"ort:2.0.0-rc.13" = { path = "../vendored-ort" }\n',
                 /overrides ort, so the build would not resolve/,
             ],
@@ -1111,6 +1115,18 @@ describe("immutable input fail-closed rules", () => {
                         'ort = { fakeversion = "=2.0.0-rc.13", version = "=2.0.0-rc.12",',
                     ),
                 /pinned ort identity does not match/,
+            ],
+            [
+                // Same form with the whitespace TOML permits around the dots.
+                (cargo) =>
+                    `target . 'cfg(target_os = "linux")' . dependencies . ort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n${cargo}`,
+                /must be declared exactly once/,
+            ],
+            [
+                // `features.default` declares the feature table without a header, so
+                // a header-only scan never reaches the forwarding.
+                (cargo) => `features.default = ["ort/cuda"]\n${cargo}`,
+                /dotted features assignment this qualifier cannot attribute/,
             ],
             [
                 // A dotted assignment creates its own table, so this declares a

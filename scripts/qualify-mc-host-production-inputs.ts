@@ -1969,6 +1969,28 @@ function structuralDelta(
 }
 
 /**
+ * True when a normalized dotted key path contains a component matching `names`.
+ *
+ * A dotted assignment is a table declaration: `patch.crates-io.ort = { path = ... }`,
+ * `features.default = ["ort/cuda"]`, and
+ * `target.'cfg(...)'.dependencies.ort_cuda = { package = "ort" }` all create the table
+ * their prefix names, before any header and with whatever whitespace TOML allows
+ * around the dots. A scan that only reacts to headers reads none of them.
+ *
+ * Used to refuse those forms rather than model them: each scan here reasons about a
+ * specific table, and an assignment that reaches into one without a header is a
+ * declaration the scan cannot attribute. The table form is always available to
+ * whoever needs to express it.
+ */
+function dottedKeyTouches(keyText: string, names: readonly RegExp[]): boolean {
+    const normalized = normalizeTableHeader(keyText);
+    if (!normalized.includes(".")) return false;
+    return normalized
+        .split(".")
+        .some((part) => names.some((name) => name.test(part.trim())));
+}
+
+/**
  * Resolve a TOML key or string value as written to the name Cargo will see, or
  * `null` when this scan cannot say. Used for dependency keys, a renamed
  * dependency's `package` value, and forwarded feature values in `[features]` —
@@ -2134,7 +2156,7 @@ function dependencyDeclarations(
             // rather than being skipped as unrelated.
             if (
                 isDependencyTable ||
-                /(?:^|\.)[^.]*dependencies(?:\.|$)/.test(keyText.trim())
+                dottedKeyTouches(keyText, [/^[^.]*dependencies$/])
             ) {
                 return null;
             }
@@ -2424,8 +2446,18 @@ function assertNoForbiddenFeatureForwarding(
             section = normalizeTableHeader(header[1] ?? "");
             continue;
         }
-        if (section !== "features") continue;
-        if (assignmentKeyText(trimmed) === null) continue;
+        const keyText = assignmentKeyText(trimmed);
+        if (keyText === null) continue;
+        if (section !== "features") {
+            // `features.default = ["ort/cuda"]` declares the same table without a
+            // header, so a header-only scan never sees the forwarding.
+            if (dottedKeyTouches(keyText, [/^features$/])) {
+                fail(
+                    `${MC_HOST_CARGO_TOML_PATH} declares a dotted features assignment this qualifier cannot attribute; use the [features] table`,
+                );
+            }
+            continue;
+        }
         const entry = joinInlineEntry(lines, index);
         if (entry === null) {
             fail(
@@ -2504,7 +2536,20 @@ function assertNoQualifiedCrateOverride(
         }
         // `[patch.<registry>]`, `[patch.<registry>.<crate>]`, and the legacy
         // `[replace]` are all override tables.
-        if (!/^(?:patch(?:\.|$)|replace(?:\.|$))/.test(section)) continue;
+        if (!/^(?:patch(?:\.|$)|replace(?:\.|$))/.test(section)) {
+            // `patch.crates-io.ort = { path = "fake-ort" }` is an override declared
+            // without a header, including before `[workspace]`.
+            const dotted = assignmentKeyText(trimmed);
+            if (
+                dotted !== null &&
+                dottedKeyTouches(dotted, [/^patch$/, /^replace$/])
+            ) {
+                fail(
+                    `${WORKSPACE_CARGO_TOML_PATH} declares a dotted override assignment this qualifier cannot attribute; use the [patch] table`,
+                );
+            }
+            continue;
+        }
         const overridden = section.split(".").pop() ?? "";
         const keyText = assignmentKeyText(trimmed);
         const named = keyText === null ? overridden : resolveTomlName(keyText);
