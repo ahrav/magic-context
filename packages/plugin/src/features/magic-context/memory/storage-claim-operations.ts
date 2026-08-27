@@ -1909,6 +1909,30 @@ export interface ApplyProjectMemoryMappingInput {
     nowMs?: number;
 }
 
+/**
+ * Refuse a generic revision-scoped operation against an anti-memory claim.
+ *
+ * Anti-memory revisions carry a typed payload row and revision-bound state
+ * that only the typed writer in `storage-anti-memory.ts` knows how to keep
+ * whole. Verification and applicability both attach to one exact revision, so
+ * letting a generic caller attach them here produces state the typed writer
+ * silently drops the next time it appends a revision — a verified,
+ * path-scoped warning quietly loses its authority and scope on its next TTL
+ * extension. Refuse instead, so the gap is a failed call rather than a
+ * downgrade nobody sees.
+ */
+function refuseGenericAntiMemoryRevisionAccess(
+    db: Database,
+    revisionId: number,
+    operation: string,
+): void {
+    if (readRevisionAttributes(db, revisionId)?.category === ANTI_MEMORY_CATEGORY) {
+        throw new ClaimOperationInputError(
+            `generic anti-memory ${operation} is refused; use the typed anti-memory API`,
+        );
+    }
+}
+
 /** Transaction-local domain stage for composition inside one outer claim operation. */
 export function stageApplyProjectMemoryMappingInCurrentTransaction(
     db: Database,
@@ -1927,6 +1951,7 @@ export function stageApplyProjectMemoryMappingInCurrentTransaction(
             reason: `revision: mapping targets ${input.revisionLocator} but current is ${expectedLocator}`,
         };
     }
+    refuseGenericAntiMemoryRevisionAccess(db, claim.currentRevisionId, "applicability mapping");
     const sync = syncRevisionApplicabilityPathsInCurrentTransaction(db, {
         revisionId: claim.currentRevisionId,
         projectId: claim.projectId,
@@ -2015,6 +2040,7 @@ export function stageRecordProjectMemoryVerificationInCurrentTransaction(
             reason: `revision: verification targets ${input.revisionLocator} but current is ${expectedLocator}`,
         };
     }
+    refuseGenericAntiMemoryRevisionAccess(db, claim.currentRevisionId, "verification");
     db.prepare(
         `INSERT INTO verification_events (revision_id, observation_id, outcome, verifier, created_at)
          VALUES (?, NULL, ?, ?, ?)`,

@@ -264,32 +264,30 @@ function reviseWithPayload(
     producer: ProducerIdentity,
     args: {
         input: Omit<ReviseAntiMemoryInput, "payload">;
-        /** Payload written to the new revision. */
-        payload: StoredAntiMemoryPayload;
+        /**
+         * Produces the payload for the new revision. Runs inside the staged
+         * callback, so only after the operation-key receipt lookup misses.
+         * Every read of current state and every check against it belongs here:
+         * a pre-transaction read or comparison would reject an honest replay
+         * whose receipt should short-circuit instead — for a TTL extension the
+         * stored expiry already equals the request's, and the claim may have
+         * moved on or gone away entirely since the first attempt.
+         */
+        resolvePayload: () => StoredAntiMemoryPayload;
         /**
          * The payload as the caller *requested* it, or null for an operation
-         * that supplies none. `payload` above is what gets stored, which for a
-         * TTL extension is state read back from the current revision — folding
-         * that into the request digest would make an idempotent retry diverge
-         * as soon as an unrelated revision changed the payload in between,
-         * raising `ClaimOperationKeyReuseError` instead of replaying the
-         * receipt. The digest must describe the request, not the row.
+         * that supplies none. What gets stored can be state read back from the
+         * current revision; folding that into the request digest would make an
+         * idempotent retry diverge as soon as an unrelated revision changed
+         * the payload in between, raising `ClaimOperationKeyReuseError`
+         * instead of replaying the receipt. The digest describes the request,
+         * never the row.
          */
         digestPayload: StoredAntiMemoryPayload | null;
         expiresAt?: number;
         operation: "revise-anti-memory" | "extend-anti-memory-ttl";
-        /**
-         * Runs inside the staged callback, after the operation-key receipt
-         * lookup. Validation that compares against current state (e.g. the
-         * TTL forward-progress check) must live here, not before
-         * `runClaimOperation`: a pre-transaction check would reject an honest
-         * replay whose receipt should short-circuit instead.
-         */
-        validateStage?: () => void;
     },
 ): ClaimOperationRunResult {
-    const content = renderAntiMemoryContent(args.payload);
-    const dedupText = antiMemoryDedupText(args.payload);
     const nowMs = args.input.nowMs ?? Date.now();
     return runClaimOperation(
         db,
@@ -307,13 +305,13 @@ function reviseWithPayload(
             }),
         },
         () => {
-            args.validateStage?.();
+            const payload = args.resolvePayload();
             const staged = stageReviseProjectMemoryClaimInCurrentTransaction(
                 db,
                 {
                     token: args.input.token,
-                    content,
-                    dedupText,
+                    content: renderAntiMemoryContent(payload),
+                    dedupText: antiMemoryDedupText(payload),
                     ...(args.expiresAt === undefined ? {} : { expiresAt: args.expiresAt }),
                     provenance: args.input.provenance,
                     actor: args.input.actor,
@@ -326,7 +324,7 @@ function reviseWithPayload(
             if (staged.kind === "effects") {
                 const revised = staged.effects.find((effect) => effect.changeKind === "upsert");
                 if (revised?.revisionId != null) {
-                    insertPayload(db, revised.revisionId, revised.claimId, args.payload, nowMs);
+                    insertPayload(db, revised.revisionId, revised.claimId, payload, nowMs);
                 }
             }
             return staged;
@@ -340,12 +338,15 @@ export function reviseAntiMemory(
     producer: ProducerIdentity,
     input: ReviseAntiMemoryInput,
 ): ClaimOperationRunResult {
-    const current = readAntiMemory(db, input.token.publicClaimId);
-    if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
     const payload = normalizePayload(input.payload);
     return reviseWithPayload(db, producer, {
         input,
-        payload,
+        resolvePayload: () => {
+            if (readAntiMemory(db, input.token.publicClaimId) === null) {
+                throw new ClaimOperationInputError("unknown anti-memory claim");
+            }
+            return payload;
+        },
         digestPayload: payload,
         operation: "revise-anti-memory",
     });
@@ -359,26 +360,24 @@ export function extendAntiMemoryTtl(
     if (!Number.isSafeInteger(input.expiresAt)) {
         throw new ClaimOperationInputError("anti-memory expiry must be a safe integer");
     }
-    const current = readAntiMemory(db, input.token.publicClaimId);
-    if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
     return reviseWithPayload(db, producer, {
         input,
-        payload: current.payload,
-        digestPayload: null,
-        expiresAt: input.expiresAt,
-        operation: "extend-anti-memory-ttl",
-        // Checked inside the stage: after a successful apply the stored expiry
-        // equals the request's, so a pre-transaction check would throw on an
-        // honest same-operation-key retry that must replay its receipt.
-        validateStage: () => {
-            const latest = readAntiMemory(db, input.token.publicClaimId);
-            if (latest === null) throw new ClaimOperationInputError("unknown anti-memory claim");
-            if (latest.expiresAt === null || input.expiresAt <= latest.expiresAt) {
+        // An extension carries no payload of its own: it re-states the current
+        // one. Reading it here, inside the stage, keeps both the read and the
+        // forward-progress check off the replay path.
+        resolvePayload: () => {
+            const current = readAntiMemory(db, input.token.publicClaimId);
+            if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
+            if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
                 throw new ClaimOperationInputError(
                     "anti-memory TTL extension must move expiry forward",
                 );
             }
+            return current.payload;
         },
+        digestPayload: null,
+        expiresAt: input.expiresAt,
+        operation: "extend-anti-memory-ttl",
     });
 }
 

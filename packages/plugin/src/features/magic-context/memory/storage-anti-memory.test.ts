@@ -3,7 +3,10 @@
 import { describe, expect, test } from "bun:test";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createDirectTestDatabase } from "../test-database";
-import { computeClaimOperationRequestDigest } from "./claim-operation-contract";
+import {
+    computeClaimOperationRequestDigest,
+    formatRevisionLocator,
+} from "./claim-operation-contract";
 import {
     createAgentAntiMemory,
     createAntiMemory,
@@ -12,8 +15,11 @@ import {
     reviseAntiMemory,
 } from "./storage-anti-memory";
 import {
+    applyProjectMemoryMapping,
     computeProjectMemoryMutationToken,
+    getProjectMemoryClaimByPublicId,
     mergeProjectMemoryClaims,
+    recordProjectMemoryVerification,
     reviseProjectMemoryClaim,
     runClaimOperation,
     stageReviseProjectMemoryClaimInCurrentTransaction,
@@ -519,6 +525,69 @@ describe("anti-memory typed operations", () => {
             expect(record?.payload.preconditions).toBeNull();
             // A blank optional is absence, so the renderer omits its line.
             expect(record?.content).not.toContain("Safer alternative");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses generic verification and applicability mapping against anti-memory", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-revision-state-guard");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            const claim = getProjectMemoryClaimByPublicId(db, publicClaimId);
+            if (claim === null) throw new Error("unreachable");
+            const revisionLocator = formatRevisionLocator(claim);
+
+            // Both attach to one exact revision, and the typed writer appends a
+            // fresh revision on every extension without carrying them over, so
+            // a verified path-scoped warning would lose its authority and scope
+            // on its next TTL extension. Refuse rather than downgrade silently.
+            expect(() =>
+                recordProjectMemoryVerification(
+                    db,
+                    { producer: "test", operationKey: "verify" },
+                    {
+                        token: computeProjectMemoryMutationToken(db, publicClaimId),
+                        revisionLocator,
+                        outcome: "verified",
+                        verifier: "test",
+                        nowMs: 20,
+                    },
+                ),
+            ).toThrow(/generic anti-memory verification is refused/);
+
+            expect(() =>
+                applyProjectMemoryMapping(
+                    db,
+                    { producer: "test", operationKey: "map" },
+                    {
+                        token: computeProjectMemoryMutationToken(db, publicClaimId),
+                        revisionLocator,
+                        paths: { exact: ["src/cache.ts"] },
+                        nowMs: 20,
+                    },
+                ),
+            ).toThrow(/generic anti-memory applicability mapping is refused/);
+
+            expect(
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM verification_events WHERE revision_id = ?",
+                    )
+                    .get(claim.currentRevisionId),
+            ).toEqual({ count: 0 });
         } finally {
             closeQuietly(db);
         }
