@@ -13,10 +13,11 @@ import {
     parseScenario,
     predicateMatches,
     releaseApprovalFingerprint,
-    renderedTranscriptText,
+    renderedTranscriptBlocks,
     scenarioFingerprint,
 } from "./contract";
 import { ballastProse } from "../ballast";
+import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { validScenario, validScenarioRaw } from "./test-support";
 
 /** Deep key-order permutation: same semantics, different byte order. */
@@ -276,6 +277,14 @@ describe("parseScenario", () => {
         }
     });
 
+    test("multiple-choice options that normalize alike reject", () => {
+        const raw = validScenarioRaw();
+        // Two spellings of one option: `probeIdentity` treats them as the same
+        // answer, so a model picking the non-gold spelling would be scored wrong.
+        (raw.probes as Array<{ choices?: string[] }>)[1].choices = ["in-process lru", " In-Process   LRU "];
+        expect(() => parseScenario(raw)).toThrow(/choices: duplicate/);
+    });
+
     test("a claim-id probe carries only its expected-claim reference", () => {
         const raw = validScenarioRaw();
         (raw.probes as Record<string, unknown>[])[2].sourceClaimRef = "exp-lru-cache";
@@ -459,16 +468,59 @@ describe("lintScenario", () => {
         );
     });
 
+    test("rejects a probe gold answer absent from its claim's source range", () => {
+        const raw = validScenarioRaw();
+        // Valid reference, unsupported answer: the frozen probe would reward a
+        // hallucinated 2048 and mark the transcript-supported 4096 wrong.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "2048";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: not-authored-in-source-range",
+        );
+    });
+
+    test("a probe gold answer is checked against its own claim's range, not the whole transcript", () => {
+        const raw = validScenarioRaw();
+        // "4096" is authored in turn 2, but this probe now claims the LRU decision
+        // turn as its provenance, so the answer is not supported where it says.
+        (raw.probes as Record<string, unknown>[])[0].sourceClaimRef = "exp-lru-cache";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: not-authored-in-source-range",
+        );
+    });
+
     test("headroom lint measures the ballast the harnesses actually send", () => {
         const scenario = validScenario();
-        const rendered = renderedTranscriptText(scenario);
+        const blocks = renderedTranscriptBlocks(scenario);
         // `TestHarness.ballast(tokens)` and its pi/rust twins take no seed, so
         // every turn must carry the default-seed bytes. A per-turn seed rotation
         // here would measure a transcript no runner produces — and because the
         // word bank's words differ in length, it would measure a different size.
         const harnessBallast = ballastProse(scenario.trigger.ballastTokensPerTurn);
         expect(harnessBallast.length).toBeGreaterThan(0);
-        expect(rendered.split(harnessBallast).length - 1).toBe(scenario.transcript.turns.length);
+        expect(blocks.filter((block) => block.includes(harnessBallast))).toHaveLength(
+            scenario.transcript.turns.length,
+        );
+    });
+
+    test("headroom lint accounts per block, as production budgets", () => {
+        const scenario = validScenario();
+        const blocks = renderedTranscriptBlocks(scenario);
+        // Production tokenizes each formatBlock result and accumulates the counts,
+        // so the lint must sum the same per-block estimates. Estimation is not
+        // additive across concatenation, which is what makes this observable.
+        expect(blocks).toHaveLength(scenario.transcript.turns.length * 2);
+        const summed = blocks.reduce((total, block) => total + estimateTokens(block), 0);
+        const joined = estimateTokens(blocks.join("\n"));
+        const reported = lintScenario(
+            parseScenario({
+                ...validScenarioRaw(),
+                trigger: { ...(validScenarioRaw().trigger as Record<string, unknown>), headroomMarginTokens: 100_000 },
+            }),
+        ).find((diagnostic) => diagnostic.includes("exceeds-single-chunk-headroom"));
+        expect(reported).toContain(`(${summed} + margin 100000`);
+        expect(reported).not.toContain(`(${joined} + margin 100000`);
     });
 });
 
@@ -540,8 +592,19 @@ describe("release tuple and manifest", () => {
         expect(() => buildReleaseTuple([a, reordered])).not.toThrow();
     });
 
-    test("renumbering contract-local ids does not hide a copied scenario", () => {
+    test("respelling a predicate does not hide a copied scenario", () => {
         const a = validScenario();
+        const rawCopy = validScenarioRaw();
+        rawCopy.id = "hse-auth-rejected-redis-respelled";
+        // Every comparison of a predicate runs through normalizeContent, so a
+        // respelling that normalizes alike evaluates identically.
+        (rawCopy.gold as { expectedClaims: Array<{ predicate: { value: string } }> }).expectedClaims[0].predicate.value =
+            "  IN-PROCESS   lru   Cache ";
+        const copy = parseScenario(rawCopy);
+        expect(() => buildReleaseTuple([a, copy])).toThrow(/releaseTuple\.scenarios\.semantic: duplicate/);
+    });
+
+    test("renumbering contract-local ids does not hide a copied scenario", () => {        const a = validScenario();
         const rawCopy = validScenarioRaw();
         rawCopy.id = "hse-auth-rejected-redis-renumbered";
         rawCopy.title = "The same evaluation with every local id renamed";

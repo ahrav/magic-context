@@ -276,7 +276,11 @@ function parseProbe(raw: unknown, label: string): Probe {
             string(entry, `${label}.choices[${index}]`),
         );
         if (choices.length < 2) fail(`${label}.choices: choices-invalid`);
-        unique(choices, `${label}.choices`);
+        // Normalized, not verbatim: `probeIdentity` treats case and incidental
+        // whitespace as the same answer, so `"Redis"` beside `" redis "` would be
+        // two indistinguishable options in one question, and a model picking the
+        // non-gold spelling of the same option would be scored wrong.
+        unique(choices.map(normalizeContent), `${label}.choices`);
         const goldAnswer = string(value.goldAnswer, `${label}.goldAnswer`);
         if (!choices.includes(goldAnswer)) fail(`${label}.goldAnswer: not-a-choice`);
         return {
@@ -482,9 +486,18 @@ export function scenarioFingerprint(scenario: HistorianEvalScenario): string {
  */
 function scenarioDuplicateKey(scenario: HistorianEvalScenario): Record<string, unknown> {
     const claimById = new Map(scenario.gold.expectedClaims.map((claim) => [claim.id, claim]));
+    // Predicate values are normalized because that is how they are USED: every
+    // comparison runs through `predicateMatches`, so two predicates that
+    // normalize alike match identically and the scenarios evaluate identically.
+    // Transcript text is deliberately NOT normalized here — it is rendered and
+    // tokenized, so its whitespace changes the chunk the historian sees.
+    const normalizedPredicate = (predicate: ContentPredicate): ContentPredicate => ({
+        kind: predicate.kind,
+        value: normalizeContent(predicate.value),
+    });
     const claimSemantics = (claim: ExpectedClaim): Record<string, unknown> => ({
         category: claim.category,
-        predicate: claim.predicate,
+        predicate: normalizedPredicate(claim.predicate),
         sourceTurnRange: claim.sourceTurnRange,
     });
     const referencedClaim = (id: string): Record<string, unknown> => {
@@ -507,7 +520,10 @@ function scenarioDuplicateKey(scenario: HistorianEvalScenario): Record<string, u
         compartments: scenario.gold.compartments,
         expectedClaims: canonicalOrder(scenario.gold.expectedClaims.map(claimSemantics)),
         expectedAbsent: canonicalOrder(
-            scenario.gold.expectedAbsent.map((absent) => ({ family: absent.family, predicate: absent.predicate })),
+            scenario.gold.expectedAbsent.map((absent) => ({
+                family: absent.family,
+                predicate: normalizedPredicate(absent.predicate),
+            })),
         ),
         probes: canonicalOrder(
             scenario.probes.map((probe) => {
@@ -592,12 +608,19 @@ function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTur
 }
 
 /**
- * The raw text mass the chunk builder will see for the transcript. Rendered
- * with the PRODUCTION `formatBlock` over the block shape the chunk builder
- * constructs (one block per message, compact roles), and with the SHARED
- * ballast generator the harnesses send — so the freeze lint's headroom check
- * measures the same bytes that actually reach the historian, and stays
+ * The transcript as the chunk builder will see it: one formatted block per
+ * message. Rendered with the PRODUCTION `formatBlock` over the block shape the
+ * chunk builder constructs (one block per message, compact roles), and with the
+ * SHARED ballast generator the harnesses send — so the freeze lint's headroom
+ * check measures the same bytes that actually reach the historian, and stays
  * current when either production renderer or ballast generator changes.
+ *
+ * Returned per block, not joined, because production budgets per block: it
+ * tokenizes each `formatBlock` result and accumulates the counts (see
+ * `flushCurrentBlock` in read-session-chunk.ts). Token estimation is not
+ * additive across concatenation — BPE merges across a joining newline and the
+ * heuristic fallback rounds per call — so a joined estimate is a different
+ * number from the one the budget decision uses.
  *
  * Ballast is rendered with `ballastProse`'s default seed because that is the
  * only seed the harnesses can send: `TestHarness.ballast(tokens)` and its pi
@@ -611,7 +634,7 @@ function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTur
  * Exported for the seed-fidelity test: this rendering is the lint's whole
  * measurement surface, so its agreement with the harness is a contract.
  */
-export function renderedTranscriptText(scenario: HistorianEvalScenario): string {
+export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): string[] {
     const blocks: ChunkBlock[] = [];
     const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
     scenario.transcript.turns.forEach((turn, index) => {
@@ -634,7 +657,7 @@ export function renderedTranscriptText(scenario: HistorianEvalScenario): string 
             isToolOnly: false,
         });
     });
-    return blocks.map(formatBlock).join("\n");
+    return blocks.map(formatBlock);
 }
 
 /**
@@ -679,6 +702,26 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         // exercise; a probe-less scenario would freeze with that class
         // silently skipped.
         diagnostics.push(`${label}.probes: empty`);
+    }
+    // `parseScenario` proves a probe's gold reference RESOLVES; it says nothing
+    // about the answer. An answer absent from the referenced claim's source range
+    // is not transcript-supported, so the frozen probe would reward a
+    // hallucination and mark the supported answer wrong. Checked against the
+    // referenced range rather than the whole transcript because that range is
+    // what the probe claims as its provenance.
+    const claimRangeById = new Map(
+        scenario.gold.expectedClaims.map((claim) => [
+            claim.id,
+            evidenceText(scenario, claim.sourceTurnRange[0], claim.sourceTurnRange[1] + 1),
+        ]),
+    );
+    for (const probe of scenario.probes) {
+        if (probe.answerType === "claim-id") continue;
+        const range = claimRangeById.get(probe.sourceClaimRef);
+        if (range === undefined) continue;
+        if (!normalizeContent(range).includes(normalizeContent(probe.goldAnswer))) {
+            diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: not-authored-in-source-range`);
+        }
     }
 
     for (const absent of scenario.gold.expectedAbsent) {
@@ -728,7 +771,14 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     // margin absorbs live-model drift, and the runner records actual chunk
     // state (`hasMore`) at run time.
     const chunkBudget = deriveHistorianChunkTokens(resolveHistorianContextLimit(undefined));
-    const transcriptTokens = estimateTokens(renderedTranscriptText(scenario));
+    // Summed per block, matching production's accumulation rather than
+    // tokenizing one joined string: a joined estimate is a different number, and
+    // near the budget with a small margin the difference decides whether the live
+    // chunk splits.
+    const transcriptTokens = renderedTranscriptBlocks(scenario).reduce(
+        (total, blockText) => total + estimateTokens(blockText),
+        0,
+    );
     if (transcriptTokens + scenario.trigger.headroomMarginTokens > chunkBudget) {
         diagnostics.push(
             `${label}.transcript: exceeds-single-chunk-headroom (${transcriptTokens} + margin ${scenario.trigger.headroomMarginTokens} > ${chunkBudget})`,
