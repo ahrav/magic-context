@@ -877,6 +877,26 @@ describe("immutable input fail-closed rules", () => {
                 /overrides fastembed, so the build would not resolve/,
             ],
             [
+                // No trailing blank line: the subtable runs to EOF. Deciding from
+                // assignment lines read `path` as the crate and only reached the
+                // header's crate on a non-assignment line, so this form was never
+                // checked — and the case above passed only because its trailing
+                // newline produced one.
+                '[patch.crates-io.fastembed]\npath = "../vendored-fastembed"',
+                /overrides fastembed, so the build would not resolve/,
+            ],
+            [
+                // A patch entry renames the same way a dependency does, so the key is
+                // not the crate.
+                '[patch.crates-io]\nort_fork = { package = "ort", path = "../vendored-ort" }\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                // The same rename in subtable form.
+                '[patch.crates-io.ort_fork]\npackage = "ort"\npath = "../vendored-ort"\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
                 'patch.crates-io.ort = { path = "fake-ort" }\n',
                 /dotted override assignment this qualifier cannot attribute/,
             ],

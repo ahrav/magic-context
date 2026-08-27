@@ -471,6 +471,10 @@ describe("platform floors", () => {
             "4.18-rc1",
             "4.18.0-rc2",
             "4.18-pre",
+            // Every separator the shape check admits, not only `-` and `.`.
+            "4.18~rc1",
+            "4.18_rc1",
+            "4.18+beta1",
         ]) {
             expect(
                 evaluatePlatform(contract, {
@@ -501,7 +505,7 @@ describe("platform floors", () => {
             evaluatePlatform(contract, {
                 os: "darwin",
                 arch: "arm64",
-                osVersion: "13.5-beta",
+                osVersion: "13.5_rc1",
                 devFdExec: true,
             }),
         ).toEqual({ supported: false, reason: "unsupported_platform" });

@@ -2520,22 +2520,61 @@ function assertNoQualifiedCrateOverride(
             `${WORKSPACE_CARGO_TOML_PATH} is required to rule out an override of the qualified crates`,
         );
     }
+    const unreadable = (): never =>
+        fail(
+            `${WORKSPACE_CARGO_TOML_PATH} declares an override this qualifier cannot read, so the qualified crate identities cannot be ruled out`,
+        );
+    const reject = (crate: string): void => {
+        if (crates.includes(crate)) {
+            fail(
+                `${WORKSPACE_CARGO_TOML_PATH} overrides ${crate}, so the build would not resolve the qualified crate identity`,
+            );
+        }
+    };
     const lines = readFileSync(path, "utf8").split("\n").map(stripTomlComments);
     let section = "";
     let depth = 0;
     const stringState = { multiline: null as string | null };
-    for (const line of lines) {
+    // `[patch.<registry>.<crate>]` names its crate in the header, and its `package`
+    // rename would be an assignment inside the body, so the verdict cannot be reached
+    // until the body ends. Deciding it from assignment lines instead read `path` as
+    // the crate name and only reached the header's crate on a non-assignment line —
+    // so a subtable that ran to EOF without a trailing blank line was never checked.
+    let openCrate: string | null = null;
+    let openBody: string[] = [];
+    const closeSubtable = (): void => {
+        if (openCrate === null) return;
+        const key = openCrate;
+        const entry = openBody.join(" ");
+        openCrate = null;
+        openBody = [];
+        const resolved = resolveRenamedCrate(key, entry);
+        if (resolved === null) unreadable();
+        reject(resolved);
+    };
+    for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
         const atTopLevel = depth === 0;
         depth += structuralDelta(line, stringState);
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
+            closeSubtable();
             section = normalizeTableHeader(header[1] ?? "");
+            const parts = section.split(".");
+            if (parts[0] === "patch" && parts.length >= 3) {
+                const named = resolveTomlName(parts[parts.length - 1] ?? "");
+                if (named === null) unreadable();
+                openCrate = named;
+            }
             continue;
         }
-        // `[patch.<registry>]`, `[patch.<registry>.<crate>]`, and the legacy
-        // `[replace]` are all override tables.
+        if (openCrate !== null) {
+            if (trimmed !== "") openBody.push(trimmed);
+            continue;
+        }
+        // `[patch.<registry>]` and the legacy `[replace]` hold one assignment per
+        // overridden crate.
         if (!/^(?:patch(?:\.|$)|replace(?:\.|$))/.test(section)) {
             // `patch.crates-io.ort = { path = "fake-ort" }` is an override declared
             // without a header, including before `[workspace]`.
@@ -2550,23 +2589,22 @@ function assertNoQualifiedCrateOverride(
             }
             continue;
         }
-        const overridden = section.split(".").pop() ?? "";
         const keyText = assignmentKeyText(trimmed);
-        const named = keyText === null ? overridden : resolveTomlName(keyText);
-        if (named === null) {
-            fail(
-                `${WORKSPACE_CARGO_TOML_PATH} declares an override this qualifier cannot read, so the qualified crate identities cannot be ruled out`,
-            );
-        }
+        if (keyText === null) continue;
+        const key = resolveTomlName(keyText);
+        if (key === null) unreadable();
         // A `[replace]` key is a package-ID spec (`"ort:2.0.0-rc.13"`), not a bare
         // name, so the crate is the part before the version.
-        const crate = named.split(":")[0] ?? named;
-        if (crates.includes(crate)) {
-            fail(
-                `${WORKSPACE_CARGO_TOML_PATH} overrides ${crate}, so the build would not resolve the qualified crate identity`,
-            );
-        }
+        const entry = joinInlineEntry(lines, index);
+        if (entry === null) unreadable();
+        // A patch entry renames the same way a dependency does:
+        // `ort_fork = { package = "ort", path = "..." }` overrides `ort`, so the key
+        // is not the crate.
+        const resolved = resolveRenamedCrate(key.split(":")[0] ?? key, entry);
+        if (resolved === null) unreadable();
+        reject(resolved);
     }
+    closeSubtable();
 }
 
 /** Repo-pinned identity cross-checks (bun.lock harness versions, Cargo crate pins). */

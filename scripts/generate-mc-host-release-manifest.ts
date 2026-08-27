@@ -1304,7 +1304,10 @@ export function meetsDottedFloor(probe: unknown, floor: string): boolean {
             const leading = /^\d*/.exec(part)?.[0] ?? "";
             if (Number(leading || "0") > 0) break;
         }
-        if (/^\d*[-.]?(?:rc|pre|alpha|beta|dev|snapshot)/i.test(part)) {
+        // Every separator the shape check above admits, not just `-` and `.`:
+        // `4.18~rc1` and `13.5_rc1` are prereleases too, and accepting a separator
+        // in one regex while the other ignores it is how they slipped through.
+        if (/^\d*[-+._~]?(?:rc|pre|alpha|beta|dev|snapshot)/i.test(part)) {
             return false;
         }
     }
