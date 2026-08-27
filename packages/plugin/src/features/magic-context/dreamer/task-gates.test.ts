@@ -1,15 +1,18 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { insertMemory, recordMemoryVerifications, setMemoryClassification } from "../memory";
 import {
-    getCurrentMemoryClaimByLegacyMemoryId,
-    runInMemoryClaimsWriteTransaction,
-} from "../memory/storage-memory-claims";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+    applyProjectMemoryMapping,
+    computeProjectMemoryMutationToken,
+    recordProjectMemoryVerification,
+} from "../memory/storage-claim-operations";
+import {
+    createClaimReaderTestDatabase,
+    type SeededProjectMemoryClaim,
+    seedProjectMemoryClaim,
+} from "../test-claim-database";
 import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
 import { processedDreamTaskItems } from "./task-registry";
 
@@ -20,25 +23,81 @@ afterEach(() => {
     db = null;
 });
 
-function freshDb(): Database {
-    const database = new Database(":memory:");
-    initializeDatabase(database);
-    runMigrations(database);
-    return database;
+function mapClaim(database: Database, claim: SeededProjectMemoryClaim, paths: string[]): void {
+    const result = applyProjectMemoryMapping(
+        database,
+        { producer: "test", operationKey: `map-${claim.publicClaimId}` },
+        {
+            token: computeProjectMemoryMutationToken(database, claim.publicClaimId),
+            revisionLocator: claim.revisionLocator,
+            paths: { state: "known", exact: paths },
+        },
+    );
+    expect(result.outcome).toBe("applied");
+}
+
+function verifyClaim(database: Database, claim: SeededProjectMemoryClaim): void {
+    const result = recordProjectMemoryVerification(
+        database,
+        { producer: "test", operationKey: `verify-${claim.publicClaimId}` },
+        {
+            token: computeProjectMemoryMutationToken(database, claim.publicClaimId),
+            revisionLocator: claim.revisionLocator,
+            outcome: "verified",
+            verifier: "dreamer:test",
+        },
+    );
+    expect(result.outcome).toBe("applied");
+}
+
+/** Stamp the evidence a completed classify-memories pass leaves behind. */
+function markClassified(database: Database, claim: SeededProjectMemoryClaim): void {
+    const revisionId = (
+        database
+            .prepare(
+                `SELECT claims.current_revision_id AS id FROM claims
+                  JOIN claim_public_ids cpi ON cpi.claim_id = claims.id
+                 WHERE cpi.public_id = ?`,
+            )
+            .get(claim.publicClaimId) as { id: number }
+    ).id;
+    const spanId = (
+        database
+            .prepare(
+                `SELECT observations.source_span_id AS id FROM claim_evidence
+                  JOIN observations ON observations.id = claim_evidence.observation_id
+                 WHERE claim_evidence.revision_id = ? LIMIT 1`,
+            )
+            .get(revisionId) as { id: number }
+    ).id;
+    const key = `classify-memories:1:${claim.publicClaimId}`;
+    database
+        .prepare(
+            `INSERT INTO observations (source_span_id, extracted_text, content_sha256, extractor,
+                extractor_version, extractor_run_id, independence_key, source_trust_class, created_at)
+             VALUES (?, 'classified', ?, 'dreamer', '1', ?, ?, 'model_inference', 2)`,
+        )
+        .run(spanId, "e".repeat(64), key, key);
+    const observationId = (
+        database.prepare("SELECT MAX(id) AS id FROM observations").get() as { id: number }
+    ).id;
+    database
+        .prepare(
+            "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
+        )
+        .run(revisionId, observationId);
 }
 
 describe("dream task backlog probes", () => {
-    test("keeps claim-backed backlog probes on legacy memory shapes", () => {
-        const database = freshDb();
+    test("backlog probes read claims, never legacy memory tables", () => {
+        const database = createClaimReaderTestDatabase();
         db = database;
-        const projectIdentity = "git:u6-dreamer-reader";
-        const content = "dreamer projection bytes: café";
-        const memory = insertMemory(database, {
-            projectPath: projectIdentity,
+        const projectIdentity = "git:u3-dreamer-reader";
+        seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "dreamer projection bytes: café",
             category: "PROJECT_RULES",
-            content,
         });
-        expect(getCurrentMemoryClaimByLegacyMemoryId(database, memory.id)?.content).toBe(content);
 
         const statements: string[] = [];
         const originalPrepare = database.prepare.bind(database);
@@ -54,71 +113,122 @@ describe("dream task backlog probes", () => {
         }
 
         expect(backlog).toEqual({ pending: 1, total: 1 });
-        expect(Buffer.from(JSON.stringify(backlog))).toEqual(
-            Buffer.from('{"pending":1,"total":1}'),
-        );
-        expect(statements.some((sql) => /\bmemories\b/i.test(sql))).toBeTrue();
+        expect(statements.some((sql) => /\bclaims\b/i.test(sql))).toBeTrue();
         expect(
-            statements.some((sql) => /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql)),
+            statements.some((sql) =>
+                /\bmemories\b|\bmemory_stats\b|\bmemory_verifications\b|legacy_memory_claims/i.test(
+                    sql,
+                ),
+            ),
         ).toBeFalse();
     });
 
-    test("map and classify probes match seeded candidate counts", () => {
-        db = freshDb();
-        const projectIdentity = "/repo/project";
-        const first = insertMemory(db, {
-            projectPath: projectIdentity,
+    test("classify backlog drops as claims gain classify evidence", () => {
+        // Reporting `pending == total` forever made classification look like it
+        // never caught up, even right after a pass completed.
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-classify-backlog";
+        const first = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "first classify target",
             category: "PROJECT_RULES",
-            content: "Keep the first memory mapped.",
         });
-        insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "ARCHITECTURE",
-            content: "The second memory still needs mapping and classification.",
+        seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "second classify target",
+            category: "PROJECT_RULES",
         });
-        recordMemoryVerifications(db, first.id, ["src/first.ts"], Date.now());
 
-        expect(getDreamTaskBacklog(db, projectIdentity, "map-memories")).toEqual({
-            pending: 1,
-            total: 2,
-        });
-        expect(getDreamTaskBacklog(db, projectIdentity, "classify-memories")).toEqual({
+        expect(getDreamTaskBacklog(database, projectIdentity, "classify-memories")).toEqual({
             pending: 2,
             total: 2,
         });
 
-        setMemoryClassification(db, first.id, { importance: 80 });
-        expect(getDreamTaskBacklog(db, projectIdentity, "classify-memories")).toEqual({
+        markClassified(database, first);
+        expect(getDreamTaskBacklog(database, projectIdentity, "classify-memories")).toEqual({
             pending: 1,
             total: 2,
         });
     });
 
-    test("verify probe counts only mapped memories that are still unverified", () => {
-        db = freshDb();
-        const projectIdentity = "/repo/project";
-        const pending = insertMemory(db, {
-            projectPath: projectIdentity,
+    test("map probe counts claims without recorded path knowledge", () => {
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-map-probe";
+        const first = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "Keep the first claim mapped.",
             category: "PROJECT_RULES",
-            content: "This mapped memory still needs verification.",
         });
-        const verified = insertMemory(db, {
-            projectPath: projectIdentity,
+        seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "The second claim still needs mapping.",
             category: "ARCHITECTURE",
-            content: "This mapped memory has already been verified.",
         });
-        recordMemoryVerifications(db, pending.id, ["src/pending.ts"], Date.now());
-        recordMemoryVerifications(db, verified.id, ["src/verified.ts"], Date.now());
-        const database = db;
-        runInMemoryClaimsWriteTransaction(database, () =>
-            database
-                .prepare("UPDATE memory_verifications SET verified_at = ? WHERE memory_id = ?")
-                .run(0, pending.id),
-        );
+        mapClaim(database, first, ["src/first.ts"]);
 
-        expect(getDreamTaskBacklog(db, projectIdentity, "verify")).toEqual({
+        expect(getDreamTaskBacklog(database, projectIdentity, "map-memories")).toEqual({
             pending: 1,
             total: 2,
+        });
+        expect(getDreamTaskBacklog(database, projectIdentity, "classify-memories")).toEqual({
+            pending: 2,
+            total: 2,
+        });
+    });
+
+    test("verify probe counts only mapped claims that are still unverified", () => {
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-verify-probe";
+        const pending = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "This mapped claim still needs verification.",
+            category: "PROJECT_RULES",
+        });
+        const verified = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "This mapped claim has already been verified.",
+            category: "ARCHITECTURE",
+        });
+        mapClaim(database, pending, ["src/pending.ts"]);
+        mapClaim(database, verified, ["src/verified.ts"]);
+        verifyClaim(database, verified);
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "verify")).toEqual({
+            pending: 1,
+            total: 2,
+        });
+    });
+
+    test("compress-cues probe counts claims without a current cue", () => {
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-cue-probe";
+        const claim = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "Cue probe claim.",
+        });
+        expect(getDreamTaskBacklog(database, projectIdentity, "compress-cues")).toEqual({
+            pending: 1,
+            total: 1,
+        });
+        const claimId = (
+            database
+                .prepare("SELECT claim_id AS id FROM claim_public_ids WHERE public_id = ?")
+                .get(claim.publicClaimId) as { id: number }
+        ).id;
+        database
+            .prepare(
+                `INSERT INTO claim_mural_cues
+                    (claim_id, revision_locator, renderer_epoch, cue, rejection_count, updated_at)
+                 VALUES (?, ?, 1, 'anchor → relation', 0, ?)`,
+            )
+            .run(claimId, claim.revisionLocator, Date.now());
+        expect(getDreamTaskBacklog(database, projectIdentity, "compress-cues")).toEqual({
+            pending: 0,
+            total: 1,
         });
     });
 
@@ -128,28 +238,65 @@ describe("dream task backlog probes", () => {
     });
 });
 
+describe("uniformly absent claims are not runnable work", () => {
+    test("a quarantined claim leaves the backlog empty", () => {
+        // Lifecycle-active is not runnable: surfaceDecision drops quarantined
+        // claims on every surface, so counting the lifecycle head alone had
+        // curate opening a child session over a pool its runner sees as empty,
+        // and the backlog never drained.
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-hidden-pool";
+        const claim = seedProjectMemoryClaim(database, {
+            projectIdentity,
+            content: "quarantined claim bytes",
+            category: "PROJECT_RULES",
+        });
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "curate").total).toBe(1);
+
+        database
+            .prepare(
+                `INSERT INTO claim_disposition_events
+                    (revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
+                 SELECT claims.current_revision_id, claims.project_id, 'quarantined', 'assert',
+                        'user:test', 1, ?
+                   FROM claims
+                   JOIN claim_public_ids cpi ON cpi.claim_id = claims.id
+                  WHERE cpi.public_id = ?`,
+            )
+            .run(Date.now(), claim.publicClaimId);
+
+        expect(getDreamTaskBacklog(database, projectIdentity, "curate")).toEqual({
+            pending: 0,
+            total: 0,
+        });
+    });
+});
+
 describe("evaluateTaskGate", () => {
-    test("classify-memories runs when active memories exist", () => {
-        db = freshDb();
-        const projectIdentity = "/repo/project";
+    test("classify-memories runs when active claims exist", () => {
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-gate-classify";
         expect(
             evaluateTaskGate("classify-memories", {
-                db,
+                db: database,
                 projectIdentity,
                 lastRunAt: null,
                 promotionThreshold: 3,
             }),
         ).toBe(false);
 
-        insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "PROJECT_RULES",
+        seedProjectMemoryClaim(database, {
+            projectIdentity,
             content: "Use Bun for package scripts in this repo.",
+            category: "PROJECT_RULES",
         });
 
         expect(
             evaluateTaskGate("classify-memories", {
-                db,
+                db: database,
                 projectIdentity,
                 lastRunAt: Date.now(),
                 promotionThreshold: 3,
@@ -158,16 +305,19 @@ describe("evaluateTaskGate", () => {
     });
 
     test("retrospective gates on the CONTENT watermark, not lastRunAt", () => {
-        db = freshDb();
+        const database = createClaimReaderTestDatabase();
+        db = database;
         const projectIdentity = "/repo/project";
-        db.prepare(
-            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
-        ).run("s1", "opencode", projectIdentity, 200);
+        database
+            .prepare(
+                "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+            )
+            .run("s1", "opencode", projectIdentity, 200);
 
         // Never scanned → runs.
         expect(
             evaluateTaskGate("retrospective", {
-                db,
+                db: database,
                 projectIdentity,
                 lastRunAt: null,
                 retrospectiveWatermarkMs: null,
@@ -178,7 +328,7 @@ describe("evaluateTaskGate", () => {
         // session was updated mid-run, so its content hasn't been scanned).
         expect(
             evaluateTaskGate("retrospective", {
-                db,
+                db: database,
                 projectIdentity,
                 lastRunAt: 9999,
                 retrospectiveWatermarkMs: 100,
@@ -188,7 +338,7 @@ describe("evaluateTaskGate", () => {
         // Watermark at/after the session update → nothing new → skip.
         expect(
             evaluateTaskGate("retrospective", {
-                db,
+                db: database,
                 projectIdentity,
                 lastRunAt: null,
                 retrospectiveWatermarkMs: 300,

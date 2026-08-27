@@ -31,7 +31,7 @@ function hasBalancedParentheses(cue: string): boolean {
  * Rules enforced (all independent of other cues):
  *  - non-empty after trim
  *  - within the per-importance character budget
- *  - no leaked source id matching this memory's own id (#123)
+ *  - no leaked source id matching this memory's own claim id
  *  - balanced parentheses (prohibition mechanisms use them)
  *  - a prohibition trigger word requires a ⊘ polarity marker
  *  - every ⊘ marker needs a parenthesized mechanism
@@ -39,7 +39,7 @@ function hasBalancedParentheses(cue: string): boolean {
 export function validateCue(
     cue: string,
     importance: number,
-    ownId?: number,
+    ownId?: string,
 ): CueValidationFailure | null {
     const trimmed = cue.trim();
     if (trimmed.length === 0) return { reason: "empty" };
@@ -48,10 +48,9 @@ export function validateCue(
     const length = [...trimmed].length;
     if (length > budget) return { reason: `over-budget ${length}>${budget}` };
 
-    // Other numeric references are legitimate memory content (for example, PR and
-    // issue numbers). Only the id shown beside this memory in the prompt is a
-    // leak, and the word boundary prevents #12 from matching #123.
-    if (ownId !== undefined && new RegExp(`#${ownId}\\b`).test(trimmed)) {
+    // Other identifiers are legitimate memory content. Only the id shown
+    // beside this memory in the prompt is a leak.
+    if (ownId !== undefined && ownId.length > 0 && trimmed.includes(ownId)) {
         return { reason: "leaked-id" };
     }
 

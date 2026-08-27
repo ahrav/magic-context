@@ -48,7 +48,21 @@ import {
     createMemoryClaimsCompatSchema,
     installMemoryClaimsWriteGuards,
 } from "../src/features/magic-context/storage-memory-claims-schema.ts";
-import { Database } from "../src/shared/sqlite.ts";
+import {
+    classifyDatabaseFormatFamily,
+    inspectDatabaseForClassification,
+    readDirectFormatMarker,
+} from "../src/features/magic-context/storage-format-epoch.ts";
+import {
+    computeExpectedDirectFormat,
+    createDirectTestDatabase,
+} from "../src/features/magic-context/test-database.ts";
+import {
+    collectSqliteRuntimeGateInput,
+    Database,
+    evaluateSqliteRuntimeGate,
+    verifySqliteConnectionContract,
+} from "../src/shared/sqlite.ts";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail?: string): void {
@@ -115,6 +129,34 @@ try {
         /* expected */
     }
     check("transaction() rolls back on throw", (db.prepare("SELECT COUNT(*) c FROM t").get() as { c: number }).c === 2);
+
+    // RAISE(ROLLBACK) ends the transaction inside SQLite. The wrapper must
+    // preserve that trigger error instead of masking it with a second ROLLBACK.
+    db.exec(`
+        CREATE TRIGGER rollback_t_insert
+        BEFORE INSERT ON t
+        WHEN NEW.v = 'abort-whole'
+        BEGIN
+            SELECT RAISE(ROLLBACK, 'trigger rollback');
+        END
+    `);
+    let triggerRollbackMessage = "";
+    try {
+        db.transaction(() => {
+            db.prepare("INSERT INTO t(v, flag) VALUES(?, ?)").run("abort-whole", 0);
+        })();
+    } catch (error) {
+        triggerRollbackMessage = error instanceof Error ? error.message : String(error);
+    }
+    check(
+        "transaction() preserves trigger RAISE(ROLLBACK) error",
+        triggerRollbackMessage.includes("trigger rollback") && !triggerRollbackMessage.includes("no transaction"),
+        triggerRollbackMessage,
+    );
+    db.transaction(() => {
+        db.prepare("INSERT INTO t(v, flag) VALUES(?, ?)").run("after-trigger-rollback", 0);
+    })();
+    db.prepare("DELETE FROM t WHERE v = ?").run("after-trigger-rollback");
 
     // Nested transaction — outer commits, inner savepoint rolls back.
     db.transaction(() => {
@@ -480,6 +522,55 @@ try {
         check("v86 approval replay is idempotent", replay.replayed && replay.actionId === approval.actionId);
     }
     kernelDb.close();
+
+    const gateInput = collectSqliteRuntimeGateInput();
+    console.log(
+        `  node=${gateInput.runtimeVersion} sqlite=${gateInput.sqliteVersion} source=${gateInput.sqliteSourceId}`,
+    );
+    check(
+        "node:sqlite passes the WAL-reset-safety gate",
+        evaluateSqliteRuntimeGate(gateInput).ok,
+        evaluateSqliteRuntimeGate(gateInput).reasons.join("; "),
+    );
+    check(
+        "gate rejects Node 24.14.1",
+        !evaluateSqliteRuntimeGate({ ...gateInput, runtimeVersion: "24.14.1" }).ok,
+    );
+    check(
+        "gate rejects a pre-fix SQLite 3.46.0 source",
+        !evaluateSqliteRuntimeGate({ ...gateInput, sqliteVersion: "3.46.0" }).ok,
+    );
+
+    const directPath = join(dir, "direct-format.db");
+    const direct = createDirectTestDatabase({ path: directPath });
+    const contractViolations = verifySqliteConnectionContract(direct.db, {
+        expectWal: true,
+        minBusyTimeoutMs: 5000,
+    });
+    check(
+        "direct factory connection satisfies the contract",
+        contractViolations.length === 0,
+        contractViolations.join("; "),
+    );
+    const directClassification = classifyDatabaseFormatFamily(
+        inspectDatabaseForClassification(direct.db, directPath),
+        computeExpectedDirectFormat(),
+    );
+    check(
+        "direct factory database classifies as current under node:sqlite",
+        directClassification.family === "current",
+        JSON.stringify(directClassification),
+    );
+    direct.db.close();
+    const directReopened = new Database(directPath);
+    const rereadMarker = readDirectFormatMarker(directReopened);
+    check(
+        "database incarnation is stable across reopen under node:sqlite",
+        rereadMarker.status === "present" &&
+            rereadMarker.marker.databaseIncarnationId === direct.marker.databaseIncarnationId,
+        JSON.stringify(rereadMarker),
+    );
+    directReopened.close();
 } finally {
     rmSync(dir, { recursive: true, force: true });
 }

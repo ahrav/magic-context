@@ -104,22 +104,28 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.dreamerPrompt,
-            // CURATE-ONLY now. Curate edits the memory store via ctx_memory and
-            // never reads code (a separate verify task owns memory-vs-code
-            // correctness), so it needs only ctx_memory — not the former
-            // bash/write/edit/read/aft/ctx_search/ctx_note surface. maintain-docs
-            // and review-user-memories moved to their own scoped agents below.
+            // CURATE-ONLY, and ZERO tools. Curate emits one XML manifest; the
+            // host validates it and applies every claim write inside a single
+            // guarded transaction, which is curate's ONLY write path. Granting
+            // ctx_memory would expose list/create/revise/archive/restore/merge
+            // to the model and let a run mutate claims outside that transaction.
+            // It also reads no code (a separate verify task owns memory-vs-code
+            // correctness), so there is no read/grep/bash/aft/ctx_search surface
+            // either. maintain-docs and review-user-memories run on their own
+            // scoped agents below.
             // (Inline literal — kept byte-identical to DREAMER_CURATE_ALLOWED_TOOLS
             // by agent-registration-drift.test.ts; see the module header for why
             // these are not const imports.)
-            allowedTools: ["ctx_memory"],
+            allowedTools: [],
             // Curate is a genuine multi-step whole-pool hygiene loop, so it keeps a
             // high cap.
             maxSteps: 150,
             overrides: args.dreamerOverrides,
             // Lock the curate tool surface: a user dreamer `tools`/`permission`
-            // override must not re-grant bash/write/edit to this unsupervised
-            // memory-hygiene agent. Model/temperature overrides still apply.
+            // override must not grant ANY tool — ctx_memory included — to this
+            // unsupervised memory-hygiene agent, whose writes belong to the
+            // host-applied manifest transaction. Model/temperature overrides
+            // still apply.
             lockPermissions: true,
         },
         {

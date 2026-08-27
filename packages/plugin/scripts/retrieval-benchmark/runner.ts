@@ -602,13 +602,6 @@ function buildSearchOptions(
             return deterministicTextVector(text, dims, ctx.tokenWeights);
         },
         isEmbeddingRuntimeEnabled: () => true,
-        // The predicate's visibility exclusions execute alongside the
-        // query's own: both narrow the eligible memory set the preflight
-        // validated cardinalities against.
-        visibleMemoryIds: new Set([
-            ...ctx.query.visibleState.visibleMemoryIds,
-            ...ctx.profileCase.selectivity.predicate.visibleMemoryIds,
-        ]),
         candidateDepth: ctx.profileCase.candidateK.effective,
         ...overrides,
     };

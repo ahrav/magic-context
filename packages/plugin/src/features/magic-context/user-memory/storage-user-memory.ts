@@ -93,6 +93,33 @@ export function deleteUserMemoryCandidates(db: Database, ids: number[]): void {
     db.prepare(`DELETE FROM user_memory_candidates WHERE id IN (${placeholders})`).run(...ids);
 }
 
+/** Candidate IDs without a session-project mapping return an empty array. */
+export function getUserMemoryCandidateProjectIdentities(
+    db: Database,
+    ids: readonly number[],
+): Map<number, string[]> {
+    const uniqueIds = [...new Set(ids)].sort((left, right) => left - right);
+    const result = new Map(uniqueIds.map((id) => [id, [] as string[]]));
+    if (uniqueIds.length === 0) return result;
+    const placeholders = uniqueIds.map(() => "?").join(",");
+    const rows = db
+        .prepare(
+            `SELECT candidates.id, projects.project_path
+               FROM user_memory_candidates candidates
+               LEFT JOIN session_projects projects
+                 ON projects.session_id = candidates.session_id
+              WHERE candidates.id IN (${placeholders})
+              ORDER BY candidates.id ASC, projects.project_path ASC`,
+        )
+        .all(...uniqueIds) as Array<{ id: number; project_path: string | null }>;
+    for (const row of rows) {
+        if (row.project_path === null) continue;
+        const identities = result.get(row.id);
+        if (identities && identities.at(-1) !== row.project_path) identities.push(row.project_path);
+    }
+    return result;
+}
+
 /**
  * Time-based decay: drop candidate observations older than the TTL that never
  * accumulated enough corroborating variants to be promoted. Without this, a
@@ -149,7 +176,8 @@ function serializeUserMemorySourceProvenance(
     provenance: UserMemorySourceProvenance[],
     sourceCandidateIds: number[],
 ): string | null {
-    if (provenance.length === 0 && sourceCandidateIds.length > 0) return null;
+    const provenanceIds = new Set(provenance.map((source) => source.candidateId));
+    if (sourceCandidateIds.some((id) => !provenanceIds.has(id))) return null;
     return JSON.stringify(
         provenance.map((source) => ({
             candidate_id: source.candidateId,
@@ -207,12 +235,54 @@ export function getActiveUserMemories(db: Database): UserMemory[] {
     return rows.map(parseUserMemoryRow);
 }
 
-export function updateUserMemoryContent(db: Database, id: number, content: string): void {
-    db.prepare("UPDATE user_memories SET content = ?, updated_at = ? WHERE id = ?").run(
-        content,
-        Date.now(),
-        id,
-    );
+export function updateUserMemoryContent(
+    db: Database,
+    id: number,
+    content: string,
+    sourceCandidateIds: number[] = [],
+): void {
+    db.transaction(() => {
+        if (sourceCandidateIds.length === 0) {
+            db.prepare("UPDATE user_memories SET content = ?, updated_at = ? WHERE id = ?").run(
+                content,
+                Date.now(),
+                id,
+            );
+            return;
+        }
+        const row = db
+            .prepare(
+                "SELECT source_candidate_ids, source_candidate_provenance FROM user_memories WHERE id = ?",
+            )
+            .get(id) as
+            | { source_candidate_ids: string; source_candidate_provenance: string | null }
+            | undefined;
+        if (!row) return;
+        const candidateIds = [
+            ...new Set([...parseCandidateIds(row.source_candidate_ids), ...sourceCandidateIds]),
+        ].sort((left, right) => left - right);
+        const priorProvenance = parseUserMemorySourceProvenance(row.source_candidate_provenance);
+        const provenanceById = new Map(
+            (priorProvenance ?? []).map((source) => [source.candidateId, source]),
+        );
+        for (const source of loadUserMemorySourceProvenance(db, sourceCandidateIds)) {
+            provenanceById.set(source.candidateId, source);
+        }
+        const provenance = [...provenanceById.values()].sort(
+            (left, right) => left.candidateId - right.candidateId,
+        );
+        db.prepare(
+            `UPDATE user_memories
+                SET content = ?, source_candidate_ids = ?, source_candidate_provenance = ?, updated_at = ?
+              WHERE id = ?`,
+        ).run(
+            content,
+            JSON.stringify(candidateIds),
+            serializeUserMemorySourceProvenance(provenance, candidateIds),
+            Date.now(),
+            id,
+        );
+    })();
 }
 
 export function dismissUserMemory(db: Database, id: number): void {

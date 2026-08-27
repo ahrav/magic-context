@@ -54,11 +54,23 @@ export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
 export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         "src/cache-analysis.test.ts",
+        "src/oracle-arms/seed-gold-memories.test.ts",
         "src/opencode-runner/spawn.test.ts",
         "src/pi-runner/rpc-client.test.ts",
         "src/pi-runner/spawn.test.ts",
     ];
     return assertPresent(files, root);
+}
+
+/** OpenCode-only oracle tests that require the TypeScript TestHarness. */
+export function tsOpenCodeStandaloneFiles(root: string = E2E_ROOT): string[] {
+    return assertPresent(
+        [
+            "src/oracle-arms/presets.test.ts",
+            "src/oracle-arms/scripted-ctx-search.test.ts",
+        ],
+        root,
+    );
 }
 
 /**
@@ -91,6 +103,7 @@ export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
         ...incidentUnitFiles(root).filter((file) => file.startsWith("src/")),
         ...prospectiveUnitFiles(root).filter((file) => file.startsWith("src/")),
         ...standaloneUnitFiles(root),
+        ...tsOpenCodeStandaloneFiles(root),
         ...rustStandaloneFiles(root),
     ]);
     const unclassified = onDisk.filter((file) => !claimed.has(file)).sort();
@@ -123,6 +136,20 @@ export function greenTestFiles(
         throw new Error(`${mode}/${harness} green selection is empty`);
     }
     return files;
+}
+
+export function standaloneFilesForSelection(
+    mode: Mode,
+    harness: GreenHarness,
+    root: string = E2E_ROOT,
+): string[] {
+    return [
+        ...standaloneUnitFiles(root),
+        ...(mode === "ts" && harness !== "pi"
+            ? tsOpenCodeStandaloneFiles(root)
+            : []),
+        ...(mode === "rust" ? rustStandaloneFiles(root) : []),
+    ];
 }
 
 interface CliArgs {
@@ -212,12 +239,10 @@ async function main(): Promise<number> {
     // The wrapper drives the whole pool in-process, so it runs alone in a
     // second phase. Hermetic standalone units ride the first phase; the
     // Cargo-fixture ones join only when Rust prerequisites were proven above.
-    const standalone = args.incidentUnit || args.prospectiveUnit
-        ? []
-        : [
-              ...standaloneUnitFiles(),
-              ...(args.mode === "rust" ? rustStandaloneFiles() : []),
-          ];
+    const standalone =
+        args.incidentUnit || args.prospectiveUnit
+            ? []
+            : standaloneFilesForSelection(args.mode!, args.harness);
     const selected = [...files, ...standalone];
     const groups = selected.includes(wrapper)
         ? [selected.filter((file) => file !== wrapper), [wrapper]]

@@ -2,14 +2,15 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
-import { insertMemory } from "../features/magic-context/memory";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
+import { createClaimMemorySchema } from "../features/magic-context/storage-claim-memory-schema";
 import {
     getPersistedSchemaVersion,
     initializeDatabase,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
+import { seedProjectMemoryClaim } from "../features/magic-context/test-claim-database";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
@@ -184,6 +185,7 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
     test("computes memoryTokens on-demand when memory_block_cache is empty but memory_block_count > 0", () => {
         const db = createTestDb();
         try {
+            db.transaction(() => createClaimMemorySchema(db)).immediate();
             const sessionId = "ses-test-1";
             // Resolve a project identity that getMemoriesByProject will key on.
             // Using process.cwd() as the directory matches what the production
@@ -194,18 +196,16 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             // Insert a few memories under this project so renderMemoryBlock has
             // real content to tokenize. Without these, the on-demand render
             // returns an empty block and tokens stay at 0.
-            insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "USER_DIRECTIVES",
+            seedProjectMemoryClaim(db, {
+                projectIdentity,
+                category: "PROJECT_RULES",
                 content: "Always use Bun for builds",
-                sourceSessionId: sessionId,
             });
-            insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "ENVIRONMENT",
+            seedProjectMemoryClaim(db, {
+                projectIdentity,
+                category: "ARCHITECTURE",
                 content:
                     "OpenCode source lives at ~/Work/OSS/opencode (cloned for cross-reference, not a workspace package).",
-                sourceSessionId: sessionId,
             });
 
             // Seed session_meta with the regression-trigger shape:

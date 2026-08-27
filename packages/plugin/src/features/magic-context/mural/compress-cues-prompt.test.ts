@@ -17,17 +17,27 @@ describe("compress-cues prompt", () => {
         expect(cueBudgetFor(10)).toBe(50);
     });
 
-    test("prompt lists every memory id with its budget", () => {
+    test("prompt lists every claim id with its budget", () => {
         const prompt = buildCompressCuesPrompt({
             projectPath: "git:test",
             memories: [
-                { id: 11, category: "ARCHITECTURE", importance: 80, content: "high one" },
-                { id: 22, category: "NAMING", importance: 40, content: "low one" },
+                {
+                    id: "mcm_00000000000000000000000000000011",
+                    category: "ARCHITECTURE",
+                    importance: 80,
+                    content: "high one",
+                },
+                {
+                    id: "mcm_00000000000000000000000000000022",
+                    category: "NAMING",
+                    importance: 40,
+                    content: "low one",
+                },
             ],
         });
-        expect(prompt).toContain("[11]");
+        expect(prompt).toContain("[mcm_00000000000000000000000000000011]");
         expect(prompt).toContain("budget 90");
-        expect(prompt).toContain("[22]");
+        expect(prompt).toContain("[mcm_00000000000000000000000000000022]");
         expect(prompt).toContain("budget 50");
     });
 });
@@ -35,11 +45,11 @@ describe("compress-cues prompt", () => {
 describe("parseCuesManifest (fail-closed root)", () => {
     test("parses a complete manifest and unescapes XML", () => {
         const parsed = parseCuesManifest(
-            `<cues><cue id="7">a &lt;b&gt; &amp; c</cue><cue id="8">plain</cue></cues>`,
+            `<cues><cue id="mcm_7">a &lt;b&gt; &amp; c</cue><cue id="mcm_8">plain</cue></cues>`,
         );
         expect(parsed).toEqual([
-            { id: 7, cue: "a <b> & c" },
-            { id: 8, cue: "plain" },
+            { id: "mcm_7", cue: "a <b> & c" },
+            { id: "mcm_8", cue: "plain" },
         ]);
     });
 
@@ -55,9 +65,9 @@ describe("parseCuesManifest (fail-closed root)", () => {
 
     test("ignores prose around a complete root", () => {
         const parsed = parseCuesManifest(
-            `sure, here you go:\n<cues><cue id="1">x→y</cue></cues>\ndone`,
+            `sure, here you go:\n<cues><cue id="mcm_1">x→y</cue></cues>\ndone`,
         );
-        expect(parsed).toEqual([{ id: 1, cue: "x→y" }]);
+        expect(parsed).toEqual([{ id: "mcm_1", cue: "x→y" }]);
     });
 });
 
@@ -77,7 +87,9 @@ describe("validateCue (per-cue, applied on write)", () => {
     });
 
     test("rejects the memory's own leaked source id", () => {
-        expect(validateCue("see #7863 for detail", 80, 7863)?.reason).toBe("leaked-id");
+        expect(validateCue("see mcm_7863aa for detail", 80, "mcm_7863aa")?.reason).toBe(
+            "leaked-id",
+        );
     });
 
     test("rejects unbalanced parentheses", () => {
