@@ -406,6 +406,11 @@ struct RoutedWire {
     /// every other in-flight call in the repetition. FIFO-bounded at
     /// [`TOMBSTONE_CAP`]: the oldest tombstone is evicted first, and a
     /// tombstone is consumed when its late terminal arrives.
+    ///
+    /// Ordering protocol, which both sides must follow so a live
+    /// correlation is never absent from both maps at once: the giving-up
+    /// caller pushes here *before* removing its `pending` entry, and the
+    /// reader checks `pending` *before* checking here.
     tombstones: Mutex<std::collections::VecDeque<u64>>,
     next_corr: AtomicU64,
     channel: u16,
@@ -512,15 +517,24 @@ impl RoutedWire {
                     .unwrap_or_else(|| "connection closed while awaiting reply".to_owned()),
             )),
             Err(_) => {
-                self.pending.lock().await.remove(&corr);
-                // Leave a tombstone so the reply that may still arrive is
-                // discarded instead of being read as an unknown correlation.
+                // Install the tombstone *before* dropping the pending entry.
+                // The reader looks up `pending` first and only then consults
+                // the tombstones, so this order keeps `corr` present in
+                // `pending ∪ tombstones` at every instant. Removing from
+                // `pending` first opens a window in which a reader running
+                // concurrently finds neither, reports an unknown correlation,
+                // and poisons the shared connection for every other in-flight
+                // logical request over an expected late terminal.
                 let mut tombstones = self.tombstones.lock().await;
                 if tombstones.len() >= TOMBSTONE_CAP {
                     tombstones.pop_front();
                 }
                 tombstones.push_back(corr);
                 drop(tombstones);
+                // A terminal that already consumed the sender leaves this
+                // tombstone unclaimed; FIFO eviction at [`TOMBSTONE_CAP`]
+                // bounds that residue.
+                self.pending.lock().await.remove(&corr);
                 Err(WireCallError::Timeout {
                     sent_ns,
                     terminal_ns: self.elapsed_ns(),
@@ -608,17 +622,29 @@ impl RunContext {
                 let json: serde_json::Value = serde_json::from_slice(&reply.frame.body)
                     .map_err(|error| format!("response JSON: {error}"))?;
                 let code = json["code"].as_str().map(str::to_owned);
-                let retry_after_ms = json["retry_after_ms"].as_u64();
+                // Error envelopes carry the hint at the top level; a served
+                // batch descriptor and a pending poll reply carry it under
+                // `result`. Recording only the former leaves the ledger
+                // unable to audit whether the poll schedule honored the cap
+                // the host actually served.
+                let retry_after_ms = json["retry_after_ms"]
+                    .as_u64()
+                    .or_else(|| json["result"]["retry_after_ms"].as_u64());
+                let is_error = reply.frame.ty == raw_client::TY_ERROR;
                 let disposition = if method == SynapseMethod::Result {
                     AttemptDisposition::Poll
-                } else if reply.frame.ty == raw_client::TY_ERROR
+                } else if is_error
                     && matches!(code.as_deref(), Some("queue_full" | "module_restarted"))
                 {
                     AttemptDisposition::RetryableRejection
-                } else if reply.frame.ty == raw_client::TY_ERROR
-                    && code.as_deref() == Some("timeout")
-                {
+                } else if is_error && code.as_deref() == Some("timeout") {
                     AttemptDisposition::Timeout
+                } else if is_error {
+                    // Any other error terminal is outside the client policy's
+                    // vocabulary. The caller turns it into a harness error and
+                    // invalidates the repetition, so the retained attempt row
+                    // must not claim a successful wire call.
+                    AttemptDisposition::Failure
                 } else {
                     AttemptDisposition::Success
                 };
@@ -648,7 +674,7 @@ impl RunContext {
                     } else {
                         AttemptDisposition::Timeout
                     },
-                    code: Some("attempt_timeout".to_owned()),
+                    code: Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
                     retry_after_ms: None,
                     actual_send_ns: sent_ns,
                     terminal_ns,
@@ -785,7 +811,7 @@ async fn execute_query(
                     first_send.unwrap_or(now),
                     now,
                     LogicalDisposition::TimedOut,
-                    Some("attempt_timeout".to_owned()),
+                    Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
                     u64::from(attempts),
                     0,
                 ));
@@ -937,7 +963,7 @@ async fn execute_batch(
                         first_send.unwrap_or(now),
                         now,
                         LogicalDisposition::TimedOut,
-                        Some("attempt_timeout".to_owned()),
+                        Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
                         batch_attempts + polls,
                         polls,
                     ));
@@ -1071,7 +1097,7 @@ async fn execute_batch(
                             first_send.expect("batch sent"),
                             now,
                             LogicalDisposition::TimedOut,
-                            Some("attempt_timeout".to_owned()),
+                            Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
                             batch_attempts + polls,
                             polls,
                         ));
@@ -1153,7 +1179,29 @@ async fn execute_batch(
                 .opts
                 .variant
                 .pending_poll_delay_ms(&mut poll_ladder_ms, served_delay);
-            tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1_000.0)).await;
+            // Mirrors the plugin's `pendingPollDelay`, which clamps every
+            // pending wait to the remaining budget. An unclamped sleep
+            // crosses the logical deadline, and the next iteration still
+            // enters `record_call`: `RoutedWire::call` writes the request
+            // before its zero-budget receiver expires, so the harness both
+            // sends and records a post-deadline poll. That inflates poll
+            // amplification and host load in precisely the slow cells this
+            // benchmark is measuring.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1_000.0).min(remaining)).await;
+            if Instant::now() >= deadline {
+                let now = ctx.wire.elapsed_ns();
+                return Ok(terminal_record(
+                    logical_id,
+                    scheduled_start_ns,
+                    first_send.expect("batch sent"),
+                    now,
+                    LogicalDisposition::TimedOut,
+                    Some("timeout".to_owned()),
+                    batch_attempts + polls,
+                    polls,
+                ));
+            }
         }
     }
 }

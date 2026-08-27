@@ -463,6 +463,10 @@ fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
         SynapseVariant::HygieneOnly,
         SynapseVariant::A,
         SynapseVariant::C,
+        // `a+c` is A's bounded server waiting plus C's fast polling; reading
+        // B's served hint here would fold an unlabelled third mechanism into
+        // the arm and make its query results unattributable.
+        SynapseVariant::APlusC,
     ] {
         let mut rng = perf_measurement::DeterministicRng::new(9);
         let delay = variant.query_retry_delay_ms(Some(7), &mut rng);
@@ -474,11 +478,11 @@ fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
         assert!(!variant.uses_served_query_hint());
     }
 
-    for variant in [SynapseVariant::B, SynapseVariant::APlusC] {
+    {
         let mut rng = perf_measurement::DeterministicRng::new(9);
-        let delay = variant.query_retry_delay_ms(Some(7), &mut rng);
+        let delay = SynapseVariant::B.query_retry_delay_ms(Some(7), &mut rng);
         assert!((7.0..21.0).contains(&delay));
-        assert!(variant.uses_served_query_hint());
+        assert!(SynapseVariant::B.uses_served_query_hint());
     }
     assert!(SynapseVariant::A.needs_waiting_queries());
     assert!(SynapseVariant::APlusC.needs_waiting_queries());

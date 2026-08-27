@@ -866,6 +866,16 @@ impl CompositeComponent for SynapseComponent {
         // query plus every allowed waiter can sit parked concurrently.
         // Declaring the bound lets startup refuse a `max_waiting_queries`
         // that could park away every general handler-task slot.
+        //
+        // A component with no bundle configuration and no ready lane can
+        // never reach the parking path: `bind` rejects every route and
+        // `handle` answers `artifact_invalid` without touching admission,
+        // and only `initialize` over a `SynapseConfig` can publish a lane.
+        // Declaring a hold it cannot take would let a disabled lane fail
+        // startup for a host that reserves exactly one general slot.
+        if self.inner.config.is_none() && self.ready_lane().is_none() {
+            return crate::handler::ResourceDeclaration::default();
+        }
         crate::handler::ResourceDeclaration {
             general_task_hold_bound: self.inner.limits.max_waiting_queries.saturating_add(1),
             ..Default::default()

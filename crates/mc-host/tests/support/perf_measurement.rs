@@ -246,7 +246,23 @@ impl SynapseMethod {
     }
 }
 
+/// Code the harness records when its own deadline fired before any terminal
+/// arrived. It marks an attempt whose admission outcome the wire never
+/// revealed, which is why [`validate_synapse_ledgers`] keeps it out of both
+/// the admitted and the rejected subtotals.
+pub const ATTEMPT_TIMEOUT_CODE: &str = "attempt_timeout";
+
 /// Mutually exclusive attempt-ledger categories from the frozen contract.
+///
+/// The frozen partition is `successes + retryable rejections + timeouts +
+/// polls`. [`Self::Failure`] is the out-of-vocabulary bucket: a non-poll wire
+/// call answered with an error the client policy cannot act on
+/// (`artifact_invalid`, `schema_violation`, `cancelled`, ...). Those terminals
+/// only occur when the run is already invalid, and
+/// [`validate_synapse_ledgers`] reports any nonzero count as a ledger error,
+/// so every retained repetition still satisfies the frozen four-way identity.
+/// Recording them as successes instead would corrupt the raw evidence that
+/// diagnoses the invalid run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptDisposition {
@@ -254,6 +270,7 @@ pub enum AttemptDisposition {
     RetryableRejection,
     Timeout,
     Poll,
+    Failure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -298,6 +315,11 @@ pub struct SynapseLedgerSummary {
     pub offered: u64,
     pub offered_by_method: BTreeMap<String, u64>,
     pub admitted_by_method: BTreeMap<String, u64>,
+    /// Attempts whose admission cannot be decided from the wire: the client
+    /// deadline fired before any terminal arrived, so the harness has no
+    /// evidence the host took an admission permit or job slot. Kept out of
+    /// `admitted_by_method` because that subtotal is the measured λ_adm.
+    pub outcome_unknown_by_method: BTreeMap<String, u64>,
     pub completed: u64,
     pub completed_by_method: BTreeMap<String, u64>,
     pub rejected_by_method_code: BTreeMap<String, u64>,
@@ -309,6 +331,9 @@ pub struct SynapseLedgerSummary {
     pub retryable_rejections: u64,
     pub attempt_timeouts: u64,
     pub polls: u64,
+    /// Non-poll wire calls answered with an error outside the client policy's
+    /// vocabulary. Always zero in an admissible repetition.
+    pub failures: u64,
     pub amplification: f64,
 }
 
@@ -351,13 +376,36 @@ pub fn validate_synapse_ledgers(
         .iter()
         .filter(|record| record.disposition == AttemptDisposition::Poll)
         .count() as u64;
+    let failures = attempts
+        .iter()
+        .filter(|record| record.disposition == AttemptDisposition::Failure)
+        .count() as u64;
 
     let mut admitted_by_method = BTreeMap::new();
+    let mut outcome_unknown_by_method = BTreeMap::new();
     let mut rejected_by_method_code = BTreeMap::new();
     let mut timed_out_by_method_code = BTreeMap::new();
+    // One pass over attempts also builds the per-logical aggregates the
+    // ownership and method subtotals need, so validation stays linear in
+    // (logical + attempts) instead of rescanning every attempt per request.
+    let mut first_method_by_logical: BTreeMap<u64, &'static str> = BTreeMap::new();
+    let mut attempts_by_logical: BTreeMap<u64, u64> = BTreeMap::new();
     for attempt in attempts {
+        first_method_by_logical
+            .entry(attempt.logical_id)
+            .or_insert_with(|| attempt.method.wire_name());
+        *attempts_by_logical.entry(attempt.logical_id).or_default() += 1;
+
         let queue_full = attempt.code.as_deref() == Some("queue_full");
-        if !queue_full {
+        // A client-side attempt timeout produced no terminal, so the wire
+        // carries no evidence either way: it can neither be counted as
+        // admitted nor as rejected.
+        let outcome_unknown = attempt.code.as_deref() == Some(ATTEMPT_TIMEOUT_CODE);
+        if outcome_unknown {
+            *outcome_unknown_by_method
+                .entry(attempt.method.wire_name().to_owned())
+                .or_default() += 1;
+        } else if !queue_full {
             *admitted_by_method
                 .entry(attempt.method.wire_name().to_owned())
                 .or_default() += 1;
@@ -387,10 +435,9 @@ pub fn validate_synapse_ledgers(
     let mut offered_by_method = BTreeMap::new();
     let mut completed_by_method = BTreeMap::new();
     for request in logical {
-        let method = attempts
-            .iter()
-            .find(|attempt| attempt.logical_id == request.logical_id)
-            .map(|attempt| attempt.method.wire_name())
+        let method = first_method_by_logical
+            .get(&request.logical_id)
+            .copied()
             .unwrap_or("unknown")
             .to_owned();
         *offered_by_method.entry(method.clone()).or_default() += 1;
@@ -429,16 +476,24 @@ pub fn validate_synapse_ledgers(
         ));
     }
     let attempt_total = attempts.len() as u64;
-    if attempt_total != successes + retryable_rejections + attempt_timeouts + polls {
+    if attempt_total != successes + retryable_rejections + attempt_timeouts + polls + failures {
         errors.push(format!(
-            "attempt ledger: {attempt_total} != {successes} + {retryable_rejections} + {attempt_timeouts} + {polls}"
+            "attempt ledger: {attempt_total} != {successes} + {retryable_rejections} + {attempt_timeouts} + {polls} + {failures}"
+        ));
+    }
+    // The frozen attempt vocabulary has four categories. A recorded failure
+    // is a wire error the client policy cannot act on, so the repetition
+    // carries an instrumentation or host fault and is inadmissible.
+    if failures != 0 {
+        errors.push(format!(
+            "attempt ledger: {failures} non-poll attempts ended in an error outside the frozen vocabulary"
         ));
     }
     for request in logical {
-        let actual = attempts
-            .iter()
-            .filter(|attempt| attempt.logical_id == request.logical_id)
-            .count() as u64;
+        let actual = attempts_by_logical
+            .get(&request.logical_id)
+            .copied()
+            .unwrap_or(0);
         if actual != request.attempts {
             errors.push(format!(
                 "logical {} records {} attempts but owns {actual}",
@@ -453,6 +508,7 @@ pub fn validate_synapse_ledgers(
         offered,
         offered_by_method,
         admitted_by_method,
+        outcome_unknown_by_method,
         completed,
         completed_by_method,
         rejected_by_method_code,
@@ -464,6 +520,7 @@ pub fn validate_synapse_ledgers(
         retryable_rejections,
         attempt_timeouts,
         polls,
+        failures,
         amplification: if offered == 0 {
             0.0
         } else {
@@ -593,8 +650,12 @@ impl SynapseVariant {
         (!matches!(self, Self::Baseline)).then_some(QUEUE_FULL_MAX_ATTEMPTS)
     }
 
+    /// Only candidate B reads the host's served `query_retry_after_ms`. The
+    /// frozen matrix declares `a+c` as A's bounded server waiting plus C's
+    /// fast polling, so letting it read the hint too would make its query
+    /// results unattributable between A+C and an unlabelled B.
     pub fn uses_served_query_hint(self) -> bool {
-        matches!(self, Self::B | Self::APlusC)
+        matches!(self, Self::B)
     }
 
     pub fn fast_polls(self) -> bool {

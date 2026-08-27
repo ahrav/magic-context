@@ -215,6 +215,27 @@ async fn unconfigured_component_is_disabled_not_fatal() {
         component.health().await.status,
         mc_host::HealthStatus::Degraded
     );
+    // A lane that rejects every bind never parks a general handler task on
+    // query admission, so it must not spend one of the host's general
+    // handler-task slots: a host reserving all but one slot still starts.
+    assert_eq!(
+        component.resources().general_task_hold_bound,
+        0,
+        "a disabled lane must declare no parked general handler tasks"
+    );
+    // The bound survives for a lane that can serve: the running query plus
+    // every allowed waiter.
+    let ready = SynapseComponent::ready_with_engine(
+        test_lane(),
+        DeterministicEngine::new(),
+        SynapseLimits {
+            max_waiting_queries: 2,
+            max_queued_request_bytes: 8 * 1024 * 1024,
+            ..SynapseLimits::default()
+        },
+    )
+    .expect("two waiters fit the default scratch pool");
+    assert_eq!(ready.resources().general_task_hold_bound, 3);
 }
 
 fn identity() -> mc_host::RouteIdentity {
