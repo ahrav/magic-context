@@ -57,6 +57,9 @@ async fn bounded_query_waiters_are_fifo_and_reject_bound_plus_one() {
     let limits = SynapseLimits {
         max_waiting_queries: 2,
         query_retry_after_ms: 73,
+        // Waiting queries and the queued-batch budget share one scratch
+        // pool; the default 64 MiB queued budget leaves no waiter headroom.
+        max_queued_request_bytes: 8 * 1024 * 1024,
         ..SynapseLimits::default()
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
@@ -97,6 +100,7 @@ async fn expired_waiter_releases_its_slot_without_engine_work() {
     let gate = engine.block_calls();
     let limits = SynapseLimits {
         max_waiting_queries: 1,
+        max_queued_request_bytes: 8 * 1024 * 1024,
         ..SynapseLimits::default()
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
@@ -111,9 +115,14 @@ async fn expired_waiter_releases_its_slot_without_engine_work() {
     }
     tokio::time::advance(std::time::Duration::from_millis(11)).await;
     yield_until(|| expired.is_finished()).await;
+    let expired_terminal = expired.await.expect("expired query task");
+    assert_eq!(expired_terminal.error_code(), "timeout");
+    // The queued-waiter arm (the worker's deadline while waiting for the
+    // CPU permit) and the awaiting-result arm carry distinct messages; a
+    // waiter that never started must report the queued expiry.
     assert_eq!(
-        expired.await.expect("expired query task").error_code(),
-        "timeout"
+        expired_terminal.json()["message"],
+        "the query deadline expired while queued"
     );
     assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
@@ -143,6 +152,7 @@ async fn mixed_batch_and_query_waiters_share_fifo_cpu_without_starvation() {
     let gate = engine.block_calls();
     let limits = SynapseLimits {
         max_waiting_queries: 2,
+        max_queued_request_bytes: 8 * 1024 * 1024,
         ..SynapseLimits::default()
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
@@ -196,6 +206,7 @@ async fn shutdown_cancels_waiters_but_drains_started_query() {
     let gate = engine.block_calls();
     let limits = SynapseLimits {
         max_waiting_queries: 1,
+        max_queued_request_bytes: 8 * 1024 * 1024,
         ..SynapseLimits::default()
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
@@ -225,10 +236,16 @@ async fn shutdown_cancels_waiters_but_drains_started_query() {
         .expect("shutdown task")
         .expect("graceful shutdown");
     let _started_terminal = started.await.expect("started query task");
-    assert_eq!(
-        waiting.await.expect("waiting query task").error_code(),
-        "cancelled"
-    );
+    let waiting_terminal = waiting.await.expect("waiting query task");
+    assert_eq!(waiting_terminal.error_code(), "cancelled");
+    // Two producers emit `cancelled`: route settlement's generation cancel
+    // ("request cancelled") and the component's own shutdown arm ("the host
+    // is shutting down"). Host shutdown settles routes — cancelling admitted
+    // work — before the composite's shutdown callback cancels the synapse
+    // closing token, so the dispatcher's message is the one a client
+    // observes; pinning it keeps this test honest about which producer
+    // cancelled the waiter.
+    assert_eq!(waiting_terminal.json()["message"], "request cancelled");
     assert_eq!(
         *engine.call_texts.lock().expect("call text lock"),
         ["started"]
@@ -243,6 +260,7 @@ async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
     let gate = engine.block_calls();
     let limits = SynapseLimits {
         max_waiting_queries: 1,
+        max_queued_request_bytes: 8 * 1024 * 1024,
         ..SynapseLimits::default()
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
@@ -270,9 +288,19 @@ async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
     )
     .await
     .expect("send queued query");
+    // Positive occupancy proof: with two permits (one running, one waiter),
+    // a third query rejecting `queue_full` proves the lost query was
+    // admitted and holds the waiter slot — without it, a scheduling race
+    // could kill the route before admission and pass this test vacuously.
+    // (An admitted probe would park behind the gated engine, so a vacuous
+    // run now fails loudly instead of passing.)
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
+    let probe = spawn_query(&host, &lane, "probe", 30_000).await;
+    let probe_terminal = probe.await.expect("probe query task");
+    assert_eq!(probe_terminal.ty, TY_ERROR);
+    assert_eq!(probe_terminal.error_code(), "queue_full");
     lost.send_frame(support::raw_client::TY_GOODBYE, 0, channel, epoch, 0, b"")
         .await
         .expect("close queued query route");
@@ -295,6 +323,98 @@ async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
     assert_eq!(
         *engine.call_texts.lock().expect("call text lock"),
         ["started", "replacement"]
+    );
+
+    host.shutdown().await.expect("graceful shutdown");
+    clock_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    clock_task.await.expect("clock keeper task");
+}
+
+/// The startup scratch formula's promise holds at runtime: at the largest
+/// feasible `max_waiting_queries` for these limits, boundary+1 concurrent
+/// queries each carrying a maximal text are all admitted — none is rejected
+/// `queue_full` by resident accounting — and each returns a response.
+#[tokio::test(start_paused = true)]
+async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
+    let engine = DeterministicEngine::new();
+    let gate = engine.block_calls();
+    let limits_for = |waiting: usize| SynapseLimits {
+        max_waiting_queries: waiting,
+        max_queued_request_bytes: 8 * 1024 * 1024,
+        ..SynapseLimits::default()
+    };
+    // The feasible boundary under the startup scratch formula, pinned so a
+    // formula or pool change must recompute it deliberately:
+    //   reservable = SCRATCH_RESERVED_BYTES (176,226,560)
+    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 174,129,408
+    //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
+    //   queued text bytes = max_queued_request_bytes          =   8,388,608
+    //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
+    //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
+    //   K + 1 <= (174,129,408 - 113,037,312) / 2,097,408 = 29.13 -> K = 28
+    const BOUNDARY: usize = 28;
+    mc_host::synapse::SynapseComponent::ready_with_engine(
+        test_lane(),
+        engine.clone(),
+        limits_for(BOUNDARY),
+    )
+    .expect("the boundary configuration is feasible");
+    let error = match mc_host::synapse::SynapseComponent::ready_with_engine(
+        test_lane(),
+        engine.clone(),
+        limits_for(BOUNDARY + 1),
+    ) {
+        Ok(_) => panic!("one waiter past the boundary must fail validation"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("query admission capacity requires"));
+
+    let host = SynapseHost::start(ready_component(engine.clone(), limits_for(BOUNDARY))).await;
+    let (clock_running, clock_task) = keep_paused_clock_manual();
+    let lane = test_lane();
+    let text = "x".repeat(lane.max_text_bytes);
+
+    let first = spawn_query(&host, &lane, &text, 30_000).await;
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+    let mut waiters = Vec::new();
+    for _ in 0..BOUNDARY {
+        waiters.push(spawn_query(&host, &lane, &text, 30_000).await);
+        tokio::task::yield_now().await;
+    }
+    // Every waiter holds its decoded maximal text while the engine gate is
+    // closed, so all boundary+1 charges coexist in the scratch pool here.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "queued queries must not reach inference while the gate is closed"
+    );
+
+    DeterministicEngine::release_calls(&gate);
+    let terminal = first.await.expect("first query task");
+    assert_eq!(
+        terminal.ty,
+        support::raw_client::TY_RESPONSE,
+        "first query rejected: {}",
+        String::from_utf8_lossy(&terminal.body)
+    );
+    for waiter in waiters {
+        let terminal = waiter.await.expect("waiter query task");
+        assert_eq!(
+            terminal.ty,
+            support::raw_client::TY_RESPONSE,
+            "an admitted maximal query was rejected: {}",
+            String::from_utf8_lossy(&terminal.body)
+        );
+    }
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        BOUNDARY + 1,
+        "every admitted query runs inference exactly once"
     );
 
     host.shutdown().await.expect("graceful shutdown");

@@ -108,14 +108,37 @@ async fn expect_limits_disabled(mutate: impl FnOnce(&mut SynapseLimits), expecte
 
 #[tokio::test(start_paused = true)]
 async fn waiting_query_memory_bound_rejects_both_construction_paths() {
+    // The startup scratch formula at default limits, pinned so a formula or
+    // pool change must recompute this boundary deliberately:
+    //   reservable = SCRATCH_RESERVED_BYTES (176,226,560)
+    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 174,129,408
+    //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
+    //   queued text bytes = max_queued_request_bytes          =  67,108,864
+    //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
+    //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
+    //   K = 0: 173,854,976 <= 174,129,408 (feasible boundary)
+    //   K = 1: 175,952,384 >  174,129,408 (rejected)
+    const BOUNDARY: usize = 0;
+
+    // The accepted twin: the largest feasible K constructs on both paths.
+    let accepted = SynapseLimits {
+        max_waiting_queries: BOUNDARY,
+        ..SynapseLimits::default()
+    };
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &accepted)
+        .expect("the boundary configuration loads through the bundle path");
+    SynapseComponent::ready_with_engine(test_lane(), DeterministicEngine::new(), accepted)
+        .expect("the boundary configuration constructs through the engine path");
+
+    // One waiter past the boundary fails both paths with the scratch bound.
     expect_limits_disabled(
-        |limits| limits.max_waiting_queries = 3,
+        |limits| limits.max_waiting_queries = BOUNDARY + 1,
         "query admission capacity requires",
     )
     .await;
 
     let limits = SynapseLimits {
-        max_waiting_queries: 3,
+        max_waiting_queries: BOUNDARY + 1,
         ..SynapseLimits::default()
     };
     let error = match SynapseComponent::ready_with_engine(

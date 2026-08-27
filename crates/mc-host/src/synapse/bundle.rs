@@ -331,16 +331,51 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), BundleError> {
     Ok(())
 }
 
+/// Worst-case request-input bytes the full queued-job set can hold beyond
+/// its item texts: per-job key copies plus per-item id/hash charges. The
+/// queued-text budget (`max_queued_request_bytes`) counts text bytes only,
+/// while the runtime charges each admitted job [`jobs::job_input_bytes`] —
+/// which also holds both key copies, the decoded id and hash capacities,
+/// and their admission-time metadata copies — so startup must budget this
+/// term too or a validated configuration can still exhaust scratch.
+///
+/// Derived by running the runtime's own accounting over worst-case-shaped
+/// inputs rather than re-stating its terms, so the two cannot drift apart.
+fn max_queued_metadata_bytes(limits: &SynapseLimits) -> Option<u64> {
+    // JSON decoding may retain up to twice the decoded length as String
+    // capacity — the same factor `per_waiter_charge_bound` assumes.
+    fn worst_decoded(len: usize) -> String {
+        let mut decoded = String::with_capacity(len.saturating_mul(2));
+        decoded.extend(std::iter::repeat_n('a', len));
+        decoded
+    }
+    let worst_item = jobs::BatchItem {
+        id: worst_decoded(jobs::MAX_ITEM_ID_BYTES),
+        content_sha256: worst_decoded(jobs::CONTENT_SHA256_BYTES),
+        // Text bytes are budgeted separately by `max_queued_request_bytes`.
+        text: String::new(),
+    };
+    // The canonical request key is validated to 64 lowercase hex characters,
+    // and the job charges its length (twice), never its capacity.
+    let key = "a".repeat(64);
+    let per_item = u64::try_from(jobs::job_input_bytes("", std::slice::from_ref(&worst_item)))
+        .expect("one item's charge fits u64");
+    let per_job_key =
+        u64::try_from(jobs::job_input_bytes(&key, &[])).expect("the key charge fits u64");
+    let per_job = per_item
+        .checked_mul(u64::try_from(limits.max_batch_items).ok()?)?
+        .checked_add(per_job_key)?;
+    u64::try_from(limits.max_queued_jobs)
+        .ok()?
+        .checked_mul(per_job)
+}
+
 pub(crate) fn validate_serving_limits(
     dims: usize,
     recommended_rows: usize,
     limits: &SynapseLimits,
 ) -> Result<(), BundleError> {
-    if limits
-        .max_waiting_queries
-        .checked_add(1)
-        .is_none_or(|permits| permits > tokio::sync::Semaphore::MAX_PERMITS)
-    {
+    if limits.query_admission_permits().is_none() {
         return Err(err("query admission capacity exceeds the semaphore limit"));
     }
     if limits.max_text_bytes < 4 {
@@ -466,24 +501,28 @@ pub(crate) fn validate_serving_limits(
 
     // Every admitted query retains its decoded String capacity and response
     // scratch while waiting. The active query and all K waiters must coexist
-    // with a full queued-batch budget and the largest parse reservation.
-    let query_slots = u64::try_from(limits.max_waiting_queries)
-        .ok()
-        .and_then(|waiting| waiting.checked_add(1))
+    // with a full queued-batch budget (text bytes plus the worst per-job key
+    // and metadata charge), and the largest parse reservation.
+    let query_slots = limits
+        .query_admission_permits()
+        .and_then(|permits| u64::try_from(permits).ok())
         .ok_or_else(|| err("query admission capacity overflows"))?;
     let waiter_bound = limits
         .per_waiter_charge_bound()
         .ok_or_else(|| err("per-query resident charge bound overflows"))?;
+    let queued_metadata = max_queued_metadata_bytes(limits)
+        .ok_or_else(|| err("worst-case queued job metadata overflows"))?;
     let required_scratch = query_slots
         .checked_mul(waiter_bound)
         .and_then(|queries| queries.checked_add(limits.max_queued_request_bytes))
+        .and_then(|used| used.checked_add(queued_metadata))
         .and_then(|used| used.checked_add(worst_parse_reservation))
         .ok_or_else(|| err("combined query and queue resident bound overflows"))?;
     if required_scratch > reservable_scratch {
         return Err(err(format!(
             "query admission capacity requires {required_scratch} scratch bytes but only \
              {reservable_scratch} are reservable; lower max_waiting_queries, \
-             max_queued_request_bytes, max_batch_items, or the text limits"
+             max_queued_jobs, max_queued_request_bytes, max_batch_items, or the text limits"
         )));
     }
 
@@ -945,10 +984,13 @@ mod tests {
             .expect_err("an unservable advertised request is a permanent outage");
         assert!(error.0.contains("parse reservation"));
 
-        // A moderately larger advertised query alone (default item cap) stays valid:
-        // the reservation's item term is what overflows the pool.
+        // A moderately larger advertised query stays valid when the queued
+        // metadata term is halved beside it (the queued-job set and the
+        // query lane share one scratch pool): the reservation's item term is
+        // what overflows the pool, not the larger text alone.
         let limits = SynapseLimits {
             max_text_bytes: 2 * 1024 * 1024,
+            max_queued_jobs: 32,
             ..SynapseLimits::default()
         };
         assert!(validate_test_serving(&manifest, &limits).is_ok());

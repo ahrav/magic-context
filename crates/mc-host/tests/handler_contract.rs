@@ -504,9 +504,10 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         + (1 + 3 * 8) * 1536 * 1024
         + 3 * 8 * (96 * 1024 + 8 * 1024);
     let defaults = HostLimits::default();
-    assert!(
-        defaults.max_resident_bytes >= mc_host::config::MIN_RESIDENT_BYTES,
-        "the default covers the no-retention floor"
+    assert_eq!(
+        defaults.max_resident_bytes,
+        mc_host::config::MIN_RESIDENT_BYTES + u64::from(mc_host::MAX_FRAME_BODY_LEN),
+        "the default is the no-retention floor plus one maximum ingress body"
     );
 
     // Defaults alone cannot hold a declaring component: startup must refuse it
@@ -523,13 +524,70 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         "a declaration the ceiling cannot cover must fail startup"
     );
 
-    // Sized at the composition site, the same composite starts. The extra
-    // margin covers the resident catalog that startup also charges.
+    // Startup also charges the serialized catalog: the full body, the empty
+    // body, and each per-module body plus its id. Measure that charge from
+    // the wire — `catalog.list` serves exactly the cached resident bodies —
+    // so the sizing rule below is asserted with the computed value instead
+    // of hand-tuned slack. The probe composite declares no retention; the
+    // catalog depends only on the manifests, which are identical.
+    let catalog_charge = {
+        async fn fetch_body(
+            client: &mut support::raw_client::RawClient,
+            filter: Option<&str>,
+        ) -> Vec<u8> {
+            let mut request = serde_json::json!({"op": "catalog.list"});
+            if let Some(filter) = filter {
+                request["module_id"] = filter.into();
+            }
+            let corr = client.control(&request).await.expect("send catalog.list");
+            let frame = client.frame_within(BUDGET).await.expect("catalog body");
+            assert_eq!(frame.corr, corr);
+            frame.body
+        }
+        let probe =
+            CompositeTestHost::start(three_child_composite(broca_declaration(0)), |_| {}).await;
+        let mut client = probe.client().await;
+        let full = fetch_body(&mut client, None).await;
+        let empty = fetch_body(&mut client, Some("no-such-module")).await;
+        let modules: Vec<String> = serde_json::from_slice::<serde_json::Value>(&full)
+            .expect("catalog is JSON")["modules"]
+            .as_array()
+            .expect("modules array")
+            .iter()
+            .map(|module| module["module_id"].as_str().expect("module_id").to_owned())
+            .collect();
+        let mut charge = (full.len() + empty.len()) as u64;
+        for module_id in modules {
+            let body = fetch_body(&mut client, Some(&module_id)).await;
+            charge += (module_id.len() + body.len()) as u64;
+        }
+        probe.shutdown().await.expect("probe shutdown");
+        charge
+    };
+
+    // The sizing rule itself: the handler-dependent floor is exactly the
+    // interop floor plus the declaration plus the measured catalog charge.
+    // One byte below it fails startup; the exact floor starts.
+    let floor = mc_host::config::MIN_RESIDENT_BYTES + RETAINED + catalog_charge;
+    let refused = CompositeTestHost::try_start(
+        three_child_composite(broca_declaration(RETAINED)),
+        |config| {
+            config.limits = HostLimits {
+                max_resident_bytes: floor - 1,
+                ..HostLimits::default()
+            };
+        },
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "one byte below the computed floor must fail startup"
+    );
     let host = CompositeTestHost::start(
         three_child_composite(broca_declaration(RETAINED)),
         |config| {
             config.limits = HostLimits {
-                max_resident_bytes: HostLimits::default().max_resident_bytes + RETAINED + (1 << 20),
+                max_resident_bytes: floor,
                 ..HostLimits::default()
             };
         },

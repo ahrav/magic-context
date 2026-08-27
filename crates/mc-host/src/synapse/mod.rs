@@ -68,7 +68,11 @@ impl SynapseLimits {
             .checked_add(RESPONSE_SCRATCH_BYTES as u64)
     }
 
-    fn query_admission_permits(&self) -> Option<usize> {
+    /// Semaphore permits for query admission: the one running query plus
+    /// every allowed waiter. `None` when the count overflows or exceeds the
+    /// semaphore's supported maximum. The single derivation of the permit
+    /// rule; startup validation and both construction paths consume it.
+    pub(crate) fn query_admission_permits(&self) -> Option<usize> {
         self.max_waiting_queries
             .checked_add(1)
             .filter(|permits| *permits <= tokio::sync::Semaphore::MAX_PERMITS)
@@ -571,10 +575,30 @@ impl SynapseComponent {
             let _ = tx.send(result);
         });
 
-        let result = match tokio::time::timeout_at(deadline, rx).await {
-            Err(_) => return app_error("timeout", "the query deadline expired host-side"),
-            Ok(Err(_)) => return app_error("internal_error", "the inference task was lost"),
-            Ok(Ok(result)) => result,
+        let mut rx = rx;
+        let result = tokio::select! {
+            biased;
+            result = &mut rx => match result {
+                Err(_) => return app_error("internal_error", "the inference task was lost"),
+                Ok(result) => result,
+            },
+            () = tokio::time::sleep_until(deadline) => {
+                // The worker's queued-deadline arm shares this exact instant,
+                // and its verdict distinguishes a query that never started
+                // from one still running. One yield lets that same-instant
+                // verdict land before this backstop reports the generic
+                // awaiting-result expiry.
+                tokio::task::yield_now().await;
+                match rx.try_recv() {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return app_error(
+                            "timeout",
+                            "the query deadline expired awaiting the result",
+                        )
+                    }
+                }
+            }
         };
         match result {
             Ok(vectors) => match vectors.first() {
@@ -596,7 +620,7 @@ impl SynapseComponent {
             },
             Err(QueryFault::Cancelled) => app_error("cancelled", "the host is shutting down"),
             Err(QueryFault::Timeout) => {
-                app_error("timeout", "the query deadline expired host-side")
+                app_error("timeout", "the query deadline expired while queued")
             }
             Err(QueryFault::Engine(InferenceError::Input(reason))) => {
                 app_error("schema_violation", &reason)
