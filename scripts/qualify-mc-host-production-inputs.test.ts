@@ -2429,5 +2429,11 @@ describe("resolved runtime feature closure", () => {
         for (const feature of RUNTIME_IDENTITY.rust_crates.ort_sys_features) {
             expect(resolved.get("ort-sys")).toContain(feature);
         }
-    });
+        // The default per-test timeout is not a meaningful bound for this one:
+        // `cargo metadata` is the first toolchain invocation in its CI job, so on
+        // a cold runner it has to populate the registry index before it can
+        // resolve, which routinely outruns a few seconds. Being killed mid-fetch
+        // surfaces as `status: null` rather than a resolver disagreement, which
+        // reads as a contract failure this test never actually observed.
+    }, 120_000);
 });
