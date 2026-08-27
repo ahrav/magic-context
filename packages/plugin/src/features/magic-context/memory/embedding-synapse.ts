@@ -35,6 +35,15 @@ const SYNAPSE_POLL_DELAY_MULTIPLIER = 1.6;
 const SYNAPSE_POLL_MIN_DELAY_MS = 10;
 const SYNAPSE_POLL_DEFAULT_DELAY_MS = 50;
 /**
+ * Attempt safety cap for `queue_full` retries. Admission rejection is a
+ * deadline-bounded wait for a slot, not evidence the request is doomed, so
+ * the binding budget is the caller's deadline (`now + delay >= deadlineAtMs`
+ * stops the sequence). At the host-served 50 ms hint the deadline is always
+ * reached first; the cap only bounds amplification when a host serves a
+ * pathologically small hint.
+ */
+const SYNAPSE_QUEUE_FULL_MAX_ATTEMPTS = 64;
+/**
  * Connect budget for the shared provider client. The client-wide default is
  * sized for the hook transport, which reconnects on a per-pass deadline; this
  * lane instead memoizes one long-lived client, and the budget must cover the
@@ -233,7 +242,14 @@ function classifyError(value: unknown): SynapseEmbeddingError {
     else if (normalized.includes("probe_required")) mapped = "probe_required";
     else if (normalized.includes("idempotency_conflict")) mapped = "idempotency_conflict";
     else if (normalized.includes("schema")) mapped = "schema_violation";
-    else if (normalized.includes("cancel") || normalized.includes("abort")) mapped = "cancelled";
+    else if (normalized.includes("abort")) mapped = "cancelled";
+    // The host's shutdown teardown rejects in-flight work with the wire code
+    // `cancelled` ("the host is shutting down"). That is evidence about one
+    // host incarnation, not about this caller or the lane, so it stays in
+    // the retryable transport class: a retry within the caller's deadline
+    // can land on the restarted incarnation. Only a local abort (code or
+    // name carrying "abort") maps to the never-retried `cancelled` class.
+    else if (normalized.includes("cancel")) mapped = "transport";
     else if (normalized.includes("module_restarted") || normalized.includes("module restarted"))
         mapped = "module_restarted";
     const message = value instanceof Error ? value.message : String(value);
@@ -280,11 +296,16 @@ function pendingPollDelay(
 ): number | null {
     if (parsed.done === true || (hasVectors && parsed.next_cursor != null)) return null;
     const cap = Math.max(SYNAPSE_POLL_MIN_DELAY_MS, readRetryAfter(parsed) ?? state.defaultDelayMs);
+    // Consume-then-escalate: the first pending reply waits the jittered
+    // fast-first seed (the first poll itself was issued immediately, so a
+    // job that finishes faster than the seed never pays it), and every
+    // later pending waits the escalated value with a positive floor.
+    const current = state.nextDelayMs;
     state.nextDelayMs = Math.max(
         SYNAPSE_POLL_MIN_DELAY_MS,
-        state.nextDelayMs * SYNAPSE_POLL_DELAY_MULTIPLIER,
+        current * SYNAPSE_POLL_DELAY_MULTIPLIER,
     );
-    return Math.min(state.nextDelayMs, cap, Math.max(0, deadlineAt - now));
+    return Math.min(current, cap, Math.max(0, deadlineAt - now));
 }
 
 function sha256(value: string): string {
@@ -1256,8 +1277,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         const expected = new Map(page.map((item) => [item.id, item.contentSha256]));
         const collected = new Map<string, Float32Array>();
         let cursor: string | null = null;
+        // The first `embed.result` goes out immediately: a job that is
+        // already ready pays only the wire round trip, and the fast-first
+        // seed is consumed by the first pending reply instead.
         const pollDelay = this.newPollDelayState(servedPollDelayMs);
-        await this.sleep(Math.min(pollDelay.nextDelayMs, Math.max(0, deadlineAt - this.now())));
         for (;;) {
             if (signal?.aborted) {
                 throw new SynapseEmbeddingError("cancelled", "Synapse request aborted");
@@ -1438,8 +1461,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         // never leaves the queue cannot poll without bound; each call is
         // bounded by the remaining budget.
         const deadlineAt = this.now() + this.pageTimeoutMs;
+        // The first `embed.result` goes out immediately; the fast-first seed
+        // is consumed by the first pending reply (see `pendingPollDelay`).
         const pollDelay = this.newPollDelayState(servedPollDelayMs);
-        await this.sleep(Math.min(pollDelay.nextDelayMs, Math.max(0, deadlineAt - this.now())));
         for (;;) {
             if (signal?.aborted)
                 throw new SynapseEmbeddingError("cancelled", "Synapse request aborted");
@@ -1543,7 +1567,15 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 if (classified.code === "cancelled") throw classified;
                 const outcomeUnknown = isMcHostCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
-                if (!retryable || attempt >= 3) throw classified;
+                // `queue_full` is a bounded wait for an admission slot, so
+                // its budget is the remaining deadline rather than the fixed
+                // four-attempt cap: with the host's default fail-fast
+                // admission (max_waiting_queries = 0) a burst drains one
+                // service time per slot, and a fixed small cap would abandon
+                // the request with most of its deadline unspent.
+                const attemptCap =
+                    classified.code === "queue_full" ? SYNAPSE_QUEUE_FULL_MAX_ATTEMPTS - 1 : 3;
+                if (!retryable || attempt >= attemptCap) throw classified;
                 const base = Math.max(
                     1,
                     classified.retryAfterMs ?? Math.min(2_000, 100 * 2 ** Math.min(attempt, 4)),

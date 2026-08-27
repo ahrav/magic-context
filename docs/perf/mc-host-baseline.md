@@ -37,9 +37,13 @@ decisions on `crates/mc-host` only.
   handler tasks 256, resident bytes 256 MiB, writer queue 64 frames,
   frame_deadline 30 s, liveness off).
 - Current-code note: bounded Synapse query waiting increased the no-retention
-  resident floor to 310,444,309 bytes so one active maximum query, two optional
-  waiters, the queued-batch budget, and worst parse reservation can coexist.
+  resident floor to 318,833,941 bytes so one active maximum query, the
+  waiter-headroom slice (up to four waiters at default text limits), the
+  queued-batch budget, and worst parse reservation can coexist.
   The current default adds one maximum-body admission margin above that floor.
+  Deployments that pin `max_resident_bytes` below the floor (including the
+  previous 256 MiB default) fail startup validation after upgrading and must
+  raise the value; the rejection message names the required minimum.
   This does not revise the historical 256 MiB collection above; reruns must
   record the current `HostConfig::default()` rather than copying that old value.
 - Load generator: `examples/perf_load.rs`, separate process.

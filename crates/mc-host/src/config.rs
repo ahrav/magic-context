@@ -43,14 +43,25 @@ pub(crate) const EGRESS_RESERVED_BYTES: u64 = MAX_BODY_LEN as u64 + HEADER_LEN a
 /// request that asked for it.
 ///
 /// Sized for Synapse's worst parse reservation, full queued-batch budget,
-/// one admitted maximum query, per-item/envelope headroom, and
+/// one admitted maximum query, [`SYNAPSE_WAITER_HEADROOM_BYTES`],
+/// per-item/envelope headroom, and
 /// [`RETAINED_METADATA_RESERVED_BYTES`]. `validate_serving_limits` checks the
 /// same combined bound for configured limits.
 pub(crate) const SCRATCH_RESERVED_BYTES: u64 = (MAX_BODY_LEN as u64 * 5 / 2)
     + (6 * 1024 * 1024)
     + 256
     + (64 * 1024)
+    + SYNAPSE_WAITER_HEADROOM_BYTES
     + RETAINED_METADATA_RESERVED_BYTES;
+
+/// Scratch headroom for bounded query waiting at default Synapse limits:
+/// four waiter slots of `2 * max_text_bytes + 256` bytes each at the default
+/// 1 MiB `max_text_bytes`. Without this slice the pool admits exactly the
+/// default limits with no waiters, so `max_waiting_queries >= 1` — the knob
+/// the bounded-waiting design exists for — would be rejected at startup
+/// unless the operator also shrinks an unrelated queue budget.
+/// `tests/synapse_bundle.rs` pins the resulting feasible boundary.
+pub(crate) const SYNAPSE_WAITER_HEADROOM_BYTES: u64 = 4 * (2 * 1024 * 1024 + 256);
 
 /// Slice of [`SCRATCH_RESERVED_BYTES`] carved out for retained job metadata,
 /// which lives for the whole retention window. Parse and page reservations
@@ -420,7 +431,9 @@ impl std::fmt::Display for ConfigError {
             ),
             Self::ResidentBytesBelowInteropMinimum { configured, minimum } => write!(
                 f,
-                "max_resident_bytes {configured} cannot hold one maximum request and response; need at least {minimum}"
+                "max_resident_bytes {configured} is below the host floor {minimum} \
+                 (one maximum frame plus the egress and scratch reservations); \
+                 raise max_resident_bytes to at least {minimum}"
             ),
             Self::ResidentBytesTooLarge { configured, maximum } => write!(
                 f,

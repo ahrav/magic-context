@@ -375,6 +375,33 @@ pub(crate) fn validate_serving_limits(
     recommended_rows: usize,
     limits: &SynapseLimits,
 ) -> Result<(), BundleError> {
+    validate_limits(limits)?;
+
+    if recommended_rows > limits.max_batch_items {
+        return Err(err(format!(
+            "recommended batch rows ({recommended_rows}) exceed the host's max batch items ({})",
+            limits.max_batch_items
+        )));
+    }
+
+    let max_result_bytes = jobs::max_result_bytes(limits.max_batch_items, dims)
+        .ok_or_else(|| err("maximum retained result size overflows"))?;
+    if max_result_bytes > limits.max_retained_result_bytes {
+        return Err(err(format!(
+            "maximum batch result ({max_result_bytes} bytes) exceeds the host's retained-result \
+             limit ({} bytes)",
+            limits.max_retained_result_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// The manifest-independent half of serving validation: every bound that is
+/// a pure function of the configured [`SynapseLimits`]. Limits are trusted
+/// startup configuration, so a violation here is operator error that must
+/// fail initialization loudly; only manifest-dependent bounds (dimensions,
+/// recommended rows) may degrade the lane instead.
+pub(crate) fn validate_limits(limits: &SynapseLimits) -> Result<(), BundleError> {
     if limits.query_admission_permits().is_none() {
         return Err(err("query admission capacity exceeds the semaphore limit"));
     }
@@ -403,23 +430,6 @@ pub(crate) fn validate_serving_limits(
     // A tokenizer token can span multiple UTF-8 bytes, so no token-to-byte
     // conversion is universally safe. The validated byte cap travels with
     // the bundle and is advertised beside max_tokens instead.
-
-    if recommended_rows > limits.max_batch_items {
-        return Err(err(format!(
-            "recommended batch rows ({recommended_rows}) exceed the host's max batch items ({})",
-            limits.max_batch_items
-        )));
-    }
-
-    let max_result_bytes = jobs::max_result_bytes(limits.max_batch_items, dims)
-        .ok_or_else(|| err("maximum retained result size overflows"))?;
-    if max_result_bytes > limits.max_retained_result_bytes {
-        return Err(err(format!(
-            "maximum batch result ({max_result_bytes} bytes) exceeds the host's retained-result \
-             limit ({} bytes)",
-            limits.max_retained_result_bytes
-        )));
-    }
 
     // Retained job metadata (keys plus id/hash copies) lives for the whole
     // retention window inside the scratch pool, in a slice reserved for it;

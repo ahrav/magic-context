@@ -217,9 +217,9 @@ impl SynapseComponent {
             .as_ref()
             .map(|config| config.limits.clone())
             .unwrap_or_default();
-        // Invalid configured limits are disabled by `load_bundle` during
-        // initialization. Keep construction non-panicking until that typed
-        // validation can report the owner error.
+        // Invalid configured limits fail `initialize` before any bundle
+        // work. Keep construction non-panicking until that typed validation
+        // can report the owner error.
         let query_admission_permits = limits.query_admission_permits().unwrap_or(1);
         Self {
             inner: Arc::new(SynapseInner {
@@ -250,9 +250,11 @@ impl SynapseComponent {
         limits: SynapseLimits,
     ) -> Result<Self, bundle::BundleError> {
         bundle::validate_serving_limits(lane.dims, lane.recommended_rows as usize, &limits)?;
-        let query_admission_permits = limits.query_admission_permits().ok_or_else(|| {
-            bundle::BundleError("query admission capacity exceeds the semaphore limit".to_owned())
-        })?;
+        // The validator's first check rejects limits whose permit count
+        // overflows, so a validated configuration always has a count.
+        let query_admission_permits = limits
+            .query_admission_permits()
+            .expect("validate_serving_limits proves the permit count");
         lane.max_text_bytes = limits.max_text_bytes;
         Ok(Self {
             inner: Arc::new(SynapseInner {
@@ -858,6 +860,18 @@ impl CompositeComponent for SynapseComponent {
         }
     }
 
+    fn resources(&self) -> crate::handler::ResourceDeclaration {
+        // A query holds its general handler task while it waits on the
+        // admission semaphore, up to the request deadline, so the running
+        // query plus every allowed waiter can sit parked concurrently.
+        // Declaring the bound lets startup refuse a `max_waiting_queries`
+        // that could park away every general handler-task slot.
+        crate::handler::ResourceDeclaration {
+            general_task_hold_bound: self.inner.limits.max_waiting_queries.saturating_add(1),
+            ..Default::default()
+        }
+    }
+
     async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
         match self.status() {
             SynapseStatus::Ready(_) => BindOutcome::Accept,
@@ -1000,6 +1014,13 @@ impl SecondaryComponent for SynapseComponent {
             }
             return Ok(());
         };
+        // Limits are trusted operator startup configuration: an infeasible
+        // combination is a config error the operator must see, not an
+        // artifact fault, so it fails initialization instead of silently
+        // disabling the lane while the host reports healthy.
+        if let Err(error) = bundle::validate_limits(&config.limits) {
+            return Err(InitError(format!("synapse limits are invalid: {error}")));
+        }
         // Blocking work (file reads, hashing, native model construction,
         // probe inference) leaves the async lifecycle thread. Blocking tasks
         // detach on drop and cannot be stopped once running, so completion is

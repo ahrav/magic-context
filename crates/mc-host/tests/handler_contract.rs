@@ -304,6 +304,7 @@ fn broca_declaration(retained_resident_bytes: u64) -> ResourceDeclaration {
         reserved_handler_tasks: 96,
         reserved_pending_requests: 96,
         retained_resident_bytes,
+        general_task_hold_bound: 0,
         route_class: RouteClass::Reserved,
     }
 }
@@ -377,12 +378,14 @@ async fn class_and_reservation_mismatches_fail_startup() {
             reserved_handler_tasks: 0,
             reserved_pending_requests: 0,
             retained_resident_bytes: 0,
+            general_task_hold_bound: 0,
             route_class: RouteClass::Reserved,
         },
         ResourceDeclaration {
             reserved_handler_tasks: 4,
             reserved_pending_requests: 4,
             retained_resident_bytes: 0,
+            general_task_hold_bound: 0,
             route_class: RouteClass::General,
         },
     ];
@@ -394,6 +397,36 @@ async fn class_and_reservation_mismatches_fail_startup() {
             "declaration {declaration:?} must fail startup"
         );
     }
+}
+
+/// A module's declared bound on concurrently parked general handler tasks
+/// (for example Synapse's running query plus its FIFO waiters) must leave at
+/// least one free general task slot, or one module's waiting traffic could
+/// starve every other route: the exact-fit bound fails startup and one
+/// below it starts.
+#[tokio::test]
+async fn parked_general_task_bound_must_leave_one_free_slot() {
+    let declaration = |hold: usize| ResourceDeclaration {
+        general_task_hold_bound: hold,
+        ..ResourceDeclaration::default()
+    };
+    const TASKS: usize = 8;
+
+    let result =
+        CompositeTestHost::try_start(three_child_composite(declaration(TASKS)), |config| {
+            config.limits.max_handler_tasks = TASKS;
+        })
+        .await;
+    assert!(
+        matches!(result, Err(HostError::InitFailed(_))),
+        "a hold bound consuming every general task slot must fail startup"
+    );
+
+    let host = CompositeTestHost::start(three_child_composite(declaration(TASKS - 1)), |config| {
+        config.limits.max_handler_tasks = TASKS;
+    })
+    .await;
+    host.shutdown().await.expect("graceful shutdown");
 }
 
 /// A 64 MiB retained declaration raises the resident floor: one byte below

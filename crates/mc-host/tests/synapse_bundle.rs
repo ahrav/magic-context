@@ -94,15 +94,26 @@ async fn expect_disabled_with(mutate: impl FnOnce(&Path), expected_fragment: &st
     );
 }
 
-async fn expect_limits_disabled(mutate: impl FnOnce(&mut SynapseLimits), expected_fragment: &str) {
+/// Infeasible limits are operator configuration error: `initialize` must
+/// fail the host loudly rather than disable the lane while the host reports
+/// healthy.
+async fn expect_limits_fail_startup(
+    mutate: impl FnOnce(&mut SynapseLimits),
+    expected_fragment: &str,
+) {
     let dir = tempfile::tempdir().expect("temp bundle dir");
     copy_fixture_to(dir.path());
     let mut config = config_for(dir.path(), &pre_ort_identity());
     mutate(&mut config.limits);
-    let reason = disabled_reason(&initialize(config).await);
+    let component = SynapseComponent::new(Some(config));
+    let error = component
+        .initialize()
+        .await
+        .expect_err("infeasible limits must fail initialization");
+    let reason = error.to_string();
     assert!(
         reason.contains(expected_fragment),
-        "reason {reason:?} does not mention {expected_fragment:?}"
+        "error {reason:?} does not mention {expected_fragment:?}"
     );
 }
 
@@ -110,15 +121,15 @@ async fn expect_limits_disabled(mutate: impl FnOnce(&mut SynapseLimits), expecte
 async fn waiting_query_memory_bound_rejects_both_construction_paths() {
     // The startup scratch formula at default limits, pinned so a formula or
     // pool change must recompute this boundary deliberately:
-    //   reservable = SCRATCH_RESERVED_BYTES (176,226,560)
-    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 174,129,408
+    //   reservable = SCRATCH_RESERVED_BYTES (184,616,192)
+    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 182,519,040
     //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
     //   queued text bytes = max_queued_request_bytes          =  67,108,864
     //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
     //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
-    //   K = 0: 173,854,976 <= 174,129,408 (feasible boundary)
-    //   K = 1: 175,952,384 >  174,129,408 (rejected)
-    const BOUNDARY: usize = 0;
+    //   K = 4: 182,244,608 <= 182,519,040 (feasible boundary)
+    //   K = 5: 184,342,016 >  182,519,040 (rejected)
+    const BOUNDARY: usize = 4;
 
     // The accepted twin: the largest feasible K constructs on both paths.
     let accepted = SynapseLimits {
@@ -131,7 +142,7 @@ async fn waiting_query_memory_bound_rejects_both_construction_paths() {
         .expect("the boundary configuration constructs through the engine path");
 
     // One waiter past the boundary fails both paths with the scratch bound.
-    expect_limits_disabled(
+    expect_limits_fail_startup(
         |limits| limits.max_waiting_queries = BOUNDARY + 1,
         "query admission capacity requires",
     )
@@ -370,11 +381,11 @@ async fn retained_result_cap_below_the_manifest_batch_bound_disables_before_ort(
 }
 
 #[tokio::test]
-async fn incoherent_host_serving_limits_disable_before_ort() {
-    expect_limits_disabled(|limits| limits.max_text_bytes = 3, "UTF-8 code point").await;
-    expect_limits_disabled(|limits| limits.max_batch_items = 0, "max batch items").await;
-    expect_limits_disabled(|limits| limits.max_retained_jobs = 0, "retained job count").await;
-    expect_limits_disabled(
+async fn incoherent_host_serving_limits_fail_startup_before_ort() {
+    expect_limits_fail_startup(|limits| limits.max_text_bytes = 3, "UTF-8 code point").await;
+    expect_limits_fail_startup(|limits| limits.max_batch_items = 0, "max batch items").await;
+    expect_limits_fail_startup(|limits| limits.max_retained_jobs = 0, "retained job count").await;
+    expect_limits_fail_startup(
         |limits| limits.max_queued_request_bytes = limits.max_batch_text_bytes as u64 - 1,
         "queued request bytes",
     )

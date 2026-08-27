@@ -236,9 +236,40 @@ fn retry_and_poll_schedule_matches_plugin_policy() {
         let first = rng.first_poll_delay_ms();
         assert!((1.0..2.0).contains(&first));
     }
-    assert_eq!(perf_measurement::next_poll_delay_ms(1.5, 50), 10.0);
-    assert_eq!(perf_measurement::next_poll_delay_ms(40.0, 50), 50.0);
-    assert_eq!(perf_measurement::next_poll_delay_ms(40.0, 5), 10.0);
+    // Consume-then-escalate, mirroring the plugin's `pendingPollDelay`
+    // exactly: the first pending reply waits the jittered fast-first seed,
+    // then the ladder escalates 10 -> 16 -> 25.6 under the served cap. The
+    // unsaturated 10 -> 16 step pins the 1.6 multiplier so a drifted copy
+    // fails here instead of silently de-faithing the benchmark arms.
+    let mut ladder = 1.5;
+    assert_eq!(
+        perf_measurement::pending_poll_delay_ms(&mut ladder, 50),
+        1.5
+    );
+    assert_eq!(
+        perf_measurement::pending_poll_delay_ms(&mut ladder, 50),
+        10.0
+    );
+    assert_eq!(
+        perf_measurement::pending_poll_delay_ms(&mut ladder, 50),
+        16.0
+    );
+    assert_eq!(
+        perf_measurement::pending_poll_delay_ms(&mut ladder, 50),
+        25.6
+    );
+    // The served cap bounds the returned delay and floors at the 10 ms
+    // busy-poll minimum; the stored ladder keeps escalating uncapped.
+    let mut saturated = 64.0;
+    assert_eq!(
+        perf_measurement::pending_poll_delay_ms(&mut saturated, 50),
+        50.0
+    );
+    let mut floored = 40.0;
+    assert_eq!(
+        perf_measurement::pending_poll_delay_ms(&mut floored, 5),
+        10.0
+    );
 }
 
 #[test]
@@ -436,7 +467,10 @@ fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
         let mut rng = perf_measurement::DeterministicRng::new(9);
         let delay = variant.query_retry_delay_ms(Some(7), &mut rng);
         assert!((100.0..300.0).contains(&delay));
-        assert_eq!(variant.query_attempt_limit(), Some(4));
+        assert_eq!(
+            variant.query_attempt_limit(),
+            Some(perf_measurement::QUEUE_FULL_MAX_ATTEMPTS)
+        );
         assert!(!variant.uses_served_query_hint());
     }
 
@@ -453,18 +487,26 @@ fn variant_policy_keeps_control_arms_isolated_from_landed_hints() {
 
     let mut poll_rng = perf_measurement::DeterministicRng::new(17);
     assert_eq!(
-        SynapseVariant::Baseline.initial_poll_delay_ms(&mut poll_rng),
+        SynapseVariant::Baseline.initial_pending_delay_ms(&mut poll_rng),
         None,
-        "baseline polls immediately"
+        "baseline has no fast-first ladder seed"
     );
+    let mut control_ladder = 0.0;
     assert_eq!(
-        SynapseVariant::HygieneOnly.pending_poll_delay_ms(0.0, 73),
+        SynapseVariant::HygieneOnly.pending_poll_delay_ms(&mut control_ladder, 73),
         73.0,
         "control polling stays at the served constant"
     );
-    let first = SynapseVariant::C
-        .initial_poll_delay_ms(&mut poll_rng)
+    let mut fast_ladder = SynapseVariant::C
+        .initial_pending_delay_ms(&mut poll_rng)
         .expect("C has fast-first polling");
-    assert!((1.0..2.0).contains(&first));
-    assert_eq!(SynapseVariant::C.pending_poll_delay_ms(first, 73), 10.0);
+    assert!((1.0..2.0).contains(&fast_ladder));
+    // The first pending reply consumes the fast-first seed itself; the
+    // escalated 10 ms floor applies from the second pending onward.
+    let first_pending = SynapseVariant::C.pending_poll_delay_ms(&mut fast_ladder, 73);
+    assert!((1.0..2.0).contains(&first_pending));
+    assert_eq!(
+        SynapseVariant::C.pending_poll_delay_ms(&mut fast_ladder, 73),
+        10.0
+    );
 }

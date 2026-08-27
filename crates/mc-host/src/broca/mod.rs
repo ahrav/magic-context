@@ -111,6 +111,7 @@ impl CompositeComponent for BrocaComponent {
             reserved_handler_tasks: config::RESERVED_HANDLER_TASKS,
             reserved_pending_requests: config::RESERVED_PENDING_REQUESTS,
             retained_resident_bytes: config::DECLARED_RETAINED_RESIDENT_BYTES,
+            general_task_hold_bound: 0,
             route_class: RouteClass::Reserved,
         }
     }

@@ -44,13 +44,14 @@ const MAX_TOTAL_ATTEMPTS: u32 = 4;
 const QUERY_DEADLINE: Duration = Duration::from_secs(3);
 const BATCH_DEADLINE: Duration = Duration::from_secs(120);
 /// Validity ceiling on any single logical request's pending-poll count.
-/// The densest legal schedule polls at the 10 ms floor for the entire
-/// batch deadline (`BATCH_DEADLINE` / `SYNAPSE_POLL_MIN_DELAY`-equivalent
-/// floor in `next_poll_delay_ms`), plus slack for the jittered fast-first
-/// poll and cursored page reads. A max above this means the poll policy
-/// regressed (for example a delay collapsed to zero) and the repetition's
-/// amplification numbers cannot be trusted, so the run is invalidated.
-const MAX_POLLS_PER_LOGICAL: u64 = BATCH_DEADLINE.as_millis() as u64 / 10 + 64;
+/// The densest legal schedule polls at the busy-poll floor
+/// (`perf_measurement::POLL_MIN_DELAY_MS`) for the entire batch deadline,
+/// plus slack for the jittered fast-first poll and cursored page reads. A
+/// max above this means the poll policy regressed (for example a delay
+/// collapsed to zero) and the repetition's amplification numbers cannot be
+/// trusted, so the run is invalidated.
+const MAX_POLLS_PER_LOGICAL: u64 =
+    BATCH_DEADLINE.as_millis() as u64 / perf_measurement::POLL_MIN_DELAY_MS + 64;
 const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const MODEL: &str = "synapse-perf-tiny";
 const QUERY_TEXT: &str = "model-free benchmark query";
@@ -728,13 +729,30 @@ async fn execute_query(
         attempts += 1;
         let mut params = constraints();
         params["text"] = QUERY_TEXT.into();
-        params["deadline_ms"] = u64::try_from(
+        // Mirrors the plugin's pre-attempt guard: a remaining budget under
+        // one millisecond truncates to the out-of-contract `deadline_ms: 0`
+        // (`parse_query` rejects zero), so it is an exhausted deadline, not
+        // a sendable attempt.
+        let remaining_ms = u64::try_from(
             deadline
                 .saturating_duration_since(Instant::now())
                 .as_millis(),
         )
-        .unwrap_or(u64::MAX)
-        .into();
+        .unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
+            let now = ctx.wire.elapsed_ns();
+            return Ok(terminal_record(
+                logical_id,
+                scheduled_start_ns,
+                first_send.unwrap_or(now),
+                now,
+                LogicalDisposition::TimedOut,
+                Some("timeout".to_owned()),
+                u64::from(attempts.saturating_sub(1)),
+                0,
+            ));
+        }
+        params["deadline_ms"] = remaining_ms.into();
         let (reply, json) = match ctx
             .record_call(
                 logical_id,
@@ -956,7 +974,10 @@ async fn execute_batch(
             if code != "queue_full" {
                 return Err(format!("unexpected embed.batch error: {json}"));
             }
-            if submit_attempts >= MAX_TOTAL_ATTEMPTS {
+            // Mirrors the plugin's split budgets: `queue_full` is a
+            // deadline-bounded wait with the shared safety cap, while other
+            // transients keep the four-attempt budget.
+            if submit_attempts >= perf_measurement::QUEUE_FULL_MAX_ATTEMPTS {
                 return Ok(terminal_record(
                     logical_id,
                     scheduled_start_ns,
@@ -987,13 +1008,14 @@ async fn execute_batch(
 
         let mut cursor = serde_json::Value::Null;
         let mut collected = Vec::with_capacity(items.len());
-        let mut poll_delay_ms =
-            if let Some(delay) = ctx.opts.variant.initial_poll_delay_ms(&mut rng) {
-                tokio::time::sleep(Duration::from_secs_f64(delay / 1_000.0)).await;
-                delay
-            } else {
-                0.0
-            };
+        // The first `embed.result` goes out immediately in every arm,
+        // mirroring the plugin; fast arms seed the pending ladder with the
+        // jittered fast-first delay, consumed by the first pending reply.
+        let mut poll_ladder_ms = ctx
+            .opts
+            .variant
+            .initial_pending_delay_ms(&mut rng)
+            .unwrap_or(0.0);
         loop {
             let mut poll_attempt = 0u32;
             let (reply, json) = loop {
@@ -1016,7 +1038,15 @@ async fn execute_batch(
                         let code = json["code"].as_str();
                         let retryable = reply.frame.ty == raw_client::TY_ERROR
                             && matches!(code, Some("queue_full" | "timeout"));
-                        if !retryable || poll_attempt == MAX_TOTAL_ATTEMPTS {
+                        // Mirrors the plugin's split budgets: `queue_full`
+                        // waits for a slot under the shared deadline-bounded
+                        // cap; other transients keep four attempts.
+                        let attempt_cap = if code == Some("queue_full") {
+                            perf_measurement::QUEUE_FULL_MAX_ATTEMPTS
+                        } else {
+                            MAX_TOTAL_ATTEMPTS
+                        };
+                        if !retryable || poll_attempt >= attempt_cap {
                             break (reply, json);
                         }
                         let base = json["retry_after_ms"].as_u64().unwrap_or(100);
@@ -1119,11 +1149,11 @@ async fn execute_batch(
                 continue;
             }
             let served_delay = result["retry_after_ms"].as_u64().unwrap_or(served_poll_cap);
-            poll_delay_ms = ctx
+            let delay_ms = ctx
                 .opts
                 .variant
-                .pending_poll_delay_ms(poll_delay_ms, served_delay);
-            tokio::time::sleep(Duration::from_secs_f64(poll_delay_ms / 1_000.0)).await;
+                .pending_poll_delay_ms(&mut poll_ladder_ms, served_delay);
+            tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1_000.0)).await;
         }
     }
 }
@@ -1213,7 +1243,18 @@ async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
             for slot in 0..offered {
                 let scheduled =
                     start + Duration::from_nanos(perf_measurement::open_loop_offset_ns(slot, rate));
-                tokio::time::sleep_until((scheduled - PACING_SLACK).into()).await;
+                // A slot is missed when its send lag reaches the next
+                // scheduled slot; the threshold is this slot's own gap,
+                // exact for every rate rather than a global constant.
+                let slot_gap_ns = perf_measurement::open_loop_offset_ns(slot + 1, rate)
+                    - perf_measurement::open_loop_offset_ns(slot, rate);
+                // The spin window is bounded by half the slot gap so the
+                // pacer can never busy-spin continuously at high rates: an
+                // unbounded spin per sub-slack slot would saturate a worker
+                // core in the same process as the host under test and
+                // inflate the tails this harness measures.
+                let slack = PACING_SLACK.min(Duration::from_nanos(slot_gap_ns / 2));
+                tokio::time::sleep_until((scheduled - slack).into()).await;
                 let mut now = Instant::now();
                 while now < scheduled {
                     std::hint::spin_loop();
@@ -1222,11 +1263,6 @@ async fn run_load(ctx: RunContext) -> (Vec<LogicalRecord>, u64, u64) {
                 let lag =
                     u64::try_from(now.duration_since(scheduled).as_nanos()).unwrap_or(u64::MAX);
                 send_lag_max_ns = send_lag_max_ns.max(lag);
-                // A slot is missed when its send lag reaches the next
-                // scheduled slot; the threshold is this slot's own gap,
-                // exact for every rate rather than a global constant.
-                let slot_gap_ns = perf_measurement::open_loop_offset_ns(slot + 1, rate)
-                    - perf_measurement::open_loop_offset_ns(slot, rate);
                 if lag >= slot_gap_ns {
                     missed_slots += 1;
                 }

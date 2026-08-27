@@ -510,11 +510,32 @@ impl DeterministicRng {
     }
 }
 
-/// Advances one pending-poll delay using the landed plugin policy.
-pub fn next_poll_delay_ms(previous_ms: f64, served_cap_ms: u64) -> f64 {
-    (previous_ms * 1.6)
-        .max(10.0)
-        .min(served_cap_ms.max(10) as f64)
+/// Plugin poll-policy constants mirrored here so the benchmark's variant
+/// arms schedule exactly the shipped cadence. Single source on the Rust
+/// side; must equal `SYNAPSE_POLL_DELAY_MULTIPLIER` and
+/// `SYNAPSE_POLL_MIN_DELAY_MS` in
+/// `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts`,
+/// and `retry_and_poll_schedule_matches_plugin_policy` pins the unsaturated
+/// escalation step so a drifted copy fails a gate instead of silently
+/// invalidating client-faithfulness.
+pub const POLL_DELAY_MULTIPLIER: f64 = 1.6;
+pub const POLL_MIN_DELAY_MS: u64 = 10;
+
+/// Mirrors the plugin's `SYNAPSE_QUEUE_FULL_MAX_ATTEMPTS`: `queue_full` is a
+/// deadline-bounded wait for an admission slot, and this cap only bounds
+/// amplification when a served hint is pathologically small.
+pub const QUEUE_FULL_MAX_ATTEMPTS: u32 = 64;
+
+/// Consumes the current pending-poll delay and escalates the stored next
+/// one, mirroring the plugin's `pendingPollDelay`: the first pending reply
+/// waits the jittered fast-first seed, later pendings wait the escalated
+/// value, and the served `retry_after_ms` (floored at the busy-poll
+/// minimum) caps every returned delay while the stored state escalates
+/// uncapped.
+pub fn pending_poll_delay_ms(next_delay_ms: &mut f64, served_cap_ms: u64) -> f64 {
+    let current = *next_delay_ms;
+    *next_delay_ms = (current * POLL_DELAY_MULTIPLIER).max(POLL_MIN_DELAY_MS as f64);
+    current.min(served_cap_ms.max(POLL_MIN_DELAY_MS) as f64)
 }
 
 /// Frozen treatment arm. Policy methods keep the benchmark's client behavior
@@ -565,10 +586,11 @@ impl SynapseVariant {
     }
 
     /// `None` is the historical query-only admission loop: retry until the
-    /// single absolute deadline. Every treatment/hygiene arm has four total
-    /// attempts.
+    /// single absolute deadline with no attempt cap. Treatment/hygiene arms
+    /// mirror the plugin's `queue_full` budget: deadline-bounded with the
+    /// [`QUEUE_FULL_MAX_ATTEMPTS`] safety cap.
     pub fn query_attempt_limit(self) -> Option<u32> {
-        (!matches!(self, Self::Baseline)).then_some(4)
+        (!matches!(self, Self::Baseline)).then_some(QUEUE_FULL_MAX_ATTEMPTS)
     }
 
     pub fn uses_served_query_hint(self) -> bool {
@@ -579,15 +601,21 @@ impl SynapseVariant {
         matches!(self, Self::C | Self::APlusC)
     }
 
-    pub fn initial_poll_delay_ms(self, rng: &mut DeterministicRng) -> Option<f64> {
+    /// Seed of the pending-poll ladder for fast-poll arms: the jittered
+    /// fast-first delay, consumed by the first pending reply. The first
+    /// `embed.result` itself is issued immediately in every arm, mirroring
+    /// the plugin.
+    pub fn initial_pending_delay_ms(self, rng: &mut DeterministicRng) -> Option<f64> {
         self.fast_polls().then(|| rng.first_poll_delay_ms())
     }
 
-    pub fn pending_poll_delay_ms(self, previous_ms: f64, served_ms: u64) -> f64 {
+    /// One pending wait. Fast arms consume-then-escalate the ladder state;
+    /// other arms reproduce the historical fixed served-delay poll.
+    pub fn pending_poll_delay_ms(self, state: &mut f64, served_ms: u64) -> f64 {
         if self.fast_polls() {
-            next_poll_delay_ms(previous_ms, served_ms)
+            pending_poll_delay_ms(state, served_ms)
         } else {
-            served_ms.max(10) as f64
+            served_ms.max(POLL_MIN_DELAY_MS) as f64
         }
     }
 

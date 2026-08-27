@@ -331,14 +331,14 @@ async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
     let gate = engine.block_calls();
     // The feasible boundary under the startup scratch formula, pinned so a
     // formula or pool change must recompute it deliberately:
-    //   reservable = SCRATCH_RESERVED_BYTES (176,226,560)
-    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 174,129,408
+    //   reservable = SCRATCH_RESERVED_BYTES (184,616,192)
+    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 182,519,040
     //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
     //   queued text bytes = max_queued_request_bytes          =   8,388,608
     //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
     //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
-    //   K + 1 <= (174,129,408 - 113,037,312) / 2,097,408 = 29.13 -> K = 28
-    const BOUNDARY: usize = 28;
+    //   K + 1 <= (182,519,040 - 113,037,312) / 2,097,408 = 33.13 -> K = 32
+    const BOUNDARY: usize = 32;
     mc_host::synapse::SynapseComponent::ready_with_engine(
         test_lane(),
         engine.clone(),
