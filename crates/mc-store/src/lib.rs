@@ -22,8 +22,9 @@ use cortexkit_store_types::StorageDescriptor;
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use mc_core::claim_operation::{
     canonical_json_encode, canonical_snapshot_vector, compute_claim_operation_request_digest,
-    decode_claim_operation_result, ClaimCommandIdentity, ClaimIntentAckKind, ClaimIntentBinding,
-    ClaimIntentState, ClaimResultOutcome, SnapshotVector, CLAIM_REQUEST_ENCODING_VERSION,
+    decode_claim_operation_result, is_lower_hex, ClaimCommandIdentity, ClaimIntentAckKind,
+    ClaimIntentBinding, ClaimIntentState, ClaimResultOutcome, SnapshotVector,
+    CLAIM_REQUEST_ENCODING_VERSION,
 };
 use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -5721,13 +5722,6 @@ fn claim_intent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cla
         created_at_ms: row.get(9)?,
         updated_at_ms: row.get(10)?,
     })
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_claim_intent_fields(

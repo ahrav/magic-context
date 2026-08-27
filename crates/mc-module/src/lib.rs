@@ -11288,6 +11288,23 @@ impl McHandler {
         };
         match action {
             "get" | "list" => {
+                // Bulk enumeration returns every workspace-authorized row, which
+                // can include shared foreign-project claims, so it stays limited
+                // to dreamer maintenance exactly as the host tool contract does.
+                // The registry is module-owned state for child sessions this
+                // handler minted, unlike the client-supplied harness label.
+                if action == "list" {
+                    let bound_session = match self.facade_binding(channel) {
+                        Ok(binding) => binding.session.trim().to_string(),
+                        Err(_) => return session_unresolved_error(),
+                    };
+                    if !self.dreamer_run_registered(&bound_session) {
+                        return tool_error_result(
+                            "Error: list is restricted to dreamer maintenance sessions."
+                                .to_string(),
+                        );
+                    }
+                }
                 let requested = if action == "get" {
                     let mut ids = args
                         .get("publicClaimIds")
@@ -11318,8 +11335,21 @@ impl McHandler {
                     return tool_error_result("Error: malformed public claim ID.".to_string());
                 }
                 let requested = requested.into_iter().collect::<BTreeSet<_>>();
-                let limit = usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100);
-                let rows = match memory_tool::list_committed_claims(&store, &requested, limit) {
+                // `limit` narrows enumeration. An explicit `get` names its rows,
+                // so honoring a smaller limit there would silently drop claims the
+                // caller asked for by ID.
+                let limit = if requested.is_empty() {
+                    usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100)
+                } else {
+                    requested.len()
+                };
+                let category = string_arg(&args, "category");
+                let rows = match memory_tool::list_committed_claims(
+                    &store,
+                    &requested,
+                    category,
+                    limit,
+                ) {
                     Ok(rows) => rows,
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 };
@@ -11644,7 +11674,7 @@ impl McHandler {
             conversation_key,
             query,
             limit,
-            cfg!(test) && facade_scope.memory_enabled,
+            facade_scope.memory_enabled,
         ) {
             Ok(results) => {
                 let rendered = results

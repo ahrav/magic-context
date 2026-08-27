@@ -2174,14 +2174,29 @@ export function buildAuthorizedClaimMirrorSnapshot(args: {
     projectPath: string;
     nowMs?: number;
 }): ClaimMirrorSnapshot | null {
-    const workspace = resolveModuleWorkspaceContext(args.db, args.projectPath);
-    const workspaceEpoch = computeWorkspaceEpochFingerprint(args.db, workspace.expandedIdentities);
     for (let attempt = 0; attempt < 2; attempt += 1) {
+        // Resolved per attempt: a membership or sharing change invalidates the
+        // authorization set as well as the epoch, and only a fresh resolve can
+        // rebuild it. Reusing a captured context would make the retry fail the
+        // same way.
+        const workspace = resolveModuleWorkspaceContext(args.db, args.projectPath);
+        const workspaceEpoch = computeWorkspaceEpochFingerprint(
+            args.db,
+            workspace.expandedIdentities,
+        );
         const provider = readAuthorizedClaimMemorySnapshot(args.db, {
             authorizedIdentities: workspace.expandedIdentities,
             ownIdentities: workspace.ownIdentities,
             sharedCategories: workspace.shareCategories ?? [],
             workspaceEpoch,
+            // Names the identities `workspaceEpoch` was derived from so the
+            // provider recomputes the fingerprint at publication time instead of
+            // echoing it back. Without this, a revocation landing between the
+            // resolve above and this read is undetectable, and a claim from a
+            // no-longer-authorized project reaches the module mirror.
+            ...(workspace.expandedIdentities.length === 0
+                ? {}
+                : { workspaceIdentities: workspace.expandedIdentities }),
             ...(args.nowMs === undefined ? {} : { nowMs: args.nowMs }),
         });
         if (!provider) continue;
@@ -2678,6 +2693,11 @@ export async function drainClaimEffectPrefix(args: {
     let deliveredEffects = 0;
     let lastEffectId = 0;
     let reachedReceipt = false;
+    // Projects the target mutation touches. Delivery order is per project, so a
+    // target only needs its own projects' unacknowledged prefix. Draining every
+    // project would make one mutation wait on unrelated history and, past
+    // `maxReceipts`, fail after the write already committed.
+    let scopedProjectIds: number[] | null = null;
 
     if (args.throughReceiptId !== undefined) {
         const targetEffects = claimEffectRows(args.db, args.throughReceiptId);
@@ -2695,7 +2715,15 @@ export async function drainClaimEffectPrefix(args: {
             lastEffectId = targetEffects.at(-1)?.id ?? 0;
             return { deliveredReceipts, deliveredEffects, lastEffectId, reachedReceipt };
         }
+        const targetProjectIds = [...new Set(targetEffects.map((effect) => effect.projectId))];
+        if (targetProjectIds.length > 0) scopedProjectIds = targetProjectIds;
     }
+
+    const scopeClause =
+        scopedProjectIds === null
+            ? ""
+            : ` AND effects.project_id IN (${scopedProjectIds.map(() => "?").join(", ")})`;
+    const scopeParams = scopedProjectIds ?? [];
 
     while (deliveredReceipts < maxReceipts) {
         const first = args.db
@@ -2704,10 +2732,10 @@ export async function drainClaimEffectPrefix(args: {
                    FROM claim_operation_effects AS effects
                    LEFT JOIN claim_outbox_consumer_checkpoints AS checkpoint
                      ON checkpoint.consumer = ? AND checkpoint.project_id = effects.project_id
-                  WHERE effects.id > COALESCE(checkpoint.acked_effect_id, 0)
+                  WHERE effects.id > COALESCE(checkpoint.acked_effect_id, 0)${scopeClause}
                   ORDER BY effects.id LIMIT 1`,
             )
-            .get(args.consumer) as { id: number; receiptId: number } | undefined;
+            .get(args.consumer, ...scopeParams) as { id: number; receiptId: number } | undefined;
         if (!first) break;
 
         const receipt = args.db

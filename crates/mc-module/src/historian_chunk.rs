@@ -585,14 +585,16 @@ fn historian_claim_block(store: &McStore, expected: Option<&SnapshotVector>) -> 
     if canonical_snapshot_vector(&vector).ok() != canonical_snapshot_vector(expected).ok() {
         return String::new();
     }
+    // A row the module cannot render is skipped on its own; failing the whole
+    // collection would blank the historian's project memory because of a single
+    // archived or attribute-incomplete row.
     let Some(claims) = store
         .list_claim_mirror(&before.database_incarnation_id, None)
         .ok()
-        .and_then(|rows| {
+        .map(|rows| {
             rows.iter()
-                .map(MirroredClaimMemory::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()
+                .filter_map(|row| MirroredClaimMemory::try_from(row).ok())
+                .collect::<Vec<_>>()
         })
     else {
         return String::new();
@@ -729,7 +731,13 @@ pub fn assemble_historian_firing(
         chunk.chunk.start_index as i64,
         &compartments,
     );
-    let memory_block = if cfg!(test) && config.claim_snapshot_vector.is_none() {
+    // The claim mirror holds every workspace-authorized claim, including shared
+    // foreign-project ones, so a project with cross-session memory disabled
+    // contributes no project-memory block at all. The prompt's own
+    // memory-disabled toggle governs extraction, not what context is shown.
+    let memory_block = if !config.memory_enabled {
+        String::new()
+    } else if cfg!(test) && config.claim_snapshot_vector.is_none() {
         let memories = store.load_active_memories(&config.project_path, now_ms)?;
         render_historian_memory_block(&memories)
     } else {

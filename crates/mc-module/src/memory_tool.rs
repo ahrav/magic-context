@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde_json::Value;
+
 use mc_store::{
     claim_mirror::{ClaimMirrorError, CommittedClaimMirrorRow},
     ClaimIntentRecord, McStore, McStoreError, StoredCompartmentSearchRow, StoredMemoryFull,
@@ -111,6 +113,7 @@ impl From<ClaimMirrorError> for MemoryToolError {
 pub fn list_committed_claims(
     store: &McStore,
     public_claim_ids: &BTreeSet<String>,
+    category: Option<&str>,
     limit: usize,
 ) -> Result<Vec<CommittedClaimMirrorRow>, MemoryToolError> {
     let Some(state) = store.claim_mirror_state()? else {
@@ -121,6 +124,13 @@ pub fn list_committed_claims(
         .into_iter()
         .filter(|row| {
             public_claim_ids.is_empty() || public_claim_ids.contains(&row.public_claim_id)
+        })
+        // Category narrowing precedes truncation so a requested category is not
+        // crowded out of the limit by rows the caller did not ask for.
+        .filter(|row| {
+            category.is_none_or(|category| {
+                row.attributes.get("category").and_then(Value::as_str) == Some(category)
+            })
         })
         .take(limit)
         .collect())

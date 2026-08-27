@@ -1958,34 +1958,78 @@ fn claim_state_vector(state: &mc_store::claim_mirror::ClaimMirrorState) -> Snaps
     }
 }
 
+/// Separate "no claim data applies" from a genuine storage failure.
+///
+/// Fencing and not-seeded outcomes are ordinary states the composer handles by
+/// omitting claim memory. A storage failure must reach the caller instead, so
+/// the pass surfaces an error and retries rather than committing an m0 that
+/// silently holds no claim content.
+fn claim_mirror_read_outcome<T>(
+    result: Result<T, mc_store::claim_mirror::ClaimMirrorError>,
+) -> Result<Option<T>, McStoreError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(mc_store::claim_mirror::ClaimMirrorError::Store(error)) => Err(error.into()),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The mirrored claims that apply to this request, with the vector they were
+/// read at.
+///
+/// `Ok(None)` means no claim data applies: the request carries no enabled claim
+/// lane, or the mirror moved while it was being read. A store failure is an
+/// error instead of `Ok(None)`, because a HARD pass that treats it as "no claim
+/// memory" freezes an m0 with no claim content and commits no vector, so the
+/// omission persists for the whole epoch rather than being retried.
 fn claim_snapshot_for_context(
     store: &McStore,
     ctx: &ProducerContext<'_>,
-) -> Option<(SnapshotVector, Vec<MirroredClaimMemory>)> {
-    let lane = ctx.claim_lane?;
-    let expected = lane.enabled.then_some(lane.snapshot_vector.as_ref()?)?;
-    let before = store.claim_mirror_state().ok()??;
+) -> Result<Option<(SnapshotVector, Vec<MirroredClaimMemory>)>, McStoreError> {
+    let Some(lane) = ctx.claim_lane else {
+        return Ok(None);
+    };
+    let Some(expected) = lane
+        .enabled
+        .then_some(lane.snapshot_vector.as_ref())
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let Some(before) = claim_mirror_read_outcome(store.claim_mirror_state())?.flatten() else {
+        return Ok(None);
+    };
     let before_vector = claim_state_vector(&before);
-    if canonical_snapshot_vector(&before_vector).ok()?
-        != canonical_snapshot_vector(expected).ok()?
-    {
-        return None;
+    let (Ok(before_canonical), Ok(expected_canonical)) = (
+        canonical_snapshot_vector(&before_vector),
+        canonical_snapshot_vector(expected),
+    ) else {
+        return Ok(None);
+    };
+    if before_canonical != expected_canonical {
+        return Ok(None);
     }
-    let claims = store
-        .list_claim_mirror(&before.database_incarnation_id, None)
-        .ok()?
+    // A row the module cannot render is skipped on its own. Failing the whole
+    // collection turns one archived or attribute-incomplete row into a claim
+    // outage across every project in the mirror, because both callers convert
+    // the collection failure into "no claim memory at all".
+    let Some(rows) =
+        claim_mirror_read_outcome(store.list_claim_mirror(&before.database_incarnation_id, None))?
+    else {
+        return Ok(None);
+    };
+    let claims = rows
         .iter()
-        .map(MirroredClaimMemory::try_from)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    let after = store.claim_mirror_state().ok()??;
+        .filter_map(|row| MirroredClaimMemory::try_from(row).ok())
+        .collect::<Vec<_>>();
+    let Some(after) = claim_mirror_read_outcome(store.claim_mirror_state())?.flatten() else {
+        return Ok(None);
+    };
     let after_vector = claim_state_vector(&after);
-    if canonical_snapshot_vector(&before_vector).ok()?
-        != canonical_snapshot_vector(&after_vector).ok()?
-    {
-        return None;
+    if canonical_snapshot_vector(&after_vector).ok().as_deref() != Some(&before_canonical) {
+        return Ok(None);
     }
-    Some((after_vector, claims))
+    Ok(Some((after_vector, claims)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2012,7 +2056,7 @@ fn revision_signal_for_context(
             timings,
         );
     }
-    let vector = claim_snapshot_for_context(store, ctx).map(|(vector, _)| vector);
+    let vector = claim_snapshot_for_context(store, ctx)?.map(|(vector, _)| vector);
     m1_revision_signal_parts_for_claims_timed(
         store,
         note_project_path,
@@ -2033,7 +2077,7 @@ fn compose_m0_for_context(
     if legacy_memory_compat(ctx) {
         return compose_m0_from_store(store, inputs, estimate_tokens);
     }
-    let snapshot = claim_snapshot_for_context(store, ctx);
+    let snapshot = claim_snapshot_for_context(store, ctx)?;
     let claims = snapshot
         .as_ref()
         .map(|(_, claims)| claims.as_slice())
@@ -2682,11 +2726,22 @@ fn compose_additive_m0(
         estimate_tokens,
     );
     let rendered_memory_ids = selected_memories.iter().map(|memory| memory.id).collect();
-    let claim_snapshot = claim_snapshot_for_context(store, ctx);
-    let selected_claims = claim_snapshot
-        .as_ref()
-        .map(|(_, claims)| trim_claims_to_budget(claims, ctx.memory_budget_tokens, estimate_tokens))
-        .unwrap_or_default();
+    let claim_snapshot = claim_snapshot_for_context(store, ctx)?;
+    // The vector still advances so freshness bookkeeping matches the m0
+    // composer, but a project with memory disabled renders no claim content.
+    // The mirror carries every workspace-authorized claim, including shared
+    // foreign-project ones, so rendering it here would inject facts the project
+    // opted out of.
+    let selected_claims = if ctx.memory_enabled {
+        claim_snapshot
+            .as_ref()
+            .map(|(_, claims)| {
+                trim_claims_to_budget(claims, ctx.memory_budget_tokens, estimate_tokens)
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let rendered_revision_locators = selected_claims
         .iter()
         .map(|claim| claim.revision_locator.clone())

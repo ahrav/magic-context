@@ -15,6 +15,7 @@ import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
 import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "./claims-backfill";
 import { encodeClaimOperationResult } from "./memory/claim-operation-contract";
+import { ClaimOperationInputError } from "./memory/storage-claim-operations";
 import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
 import {
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
@@ -197,6 +198,26 @@ export async function commitModuleClaimIntent(args: {
                     ),
                 },
             });
+        } else if (prior.state === "context-committed") {
+            // The context write already landed under the previous binding, so this
+            // intent cannot be terminally rejected — only acknowledged, and only
+            // under the binding that staged it. Its effects still reach the mirror
+            // through the outbox consumer, which drains independently of this
+            // coordinator. Leaving the row unresolved instead would block every
+            // later claim-store rebuild and mirror reset, because both count
+            // `staged` and `context-committed` as unresolved.
+            await args.client.claimIntentAck({
+                sessionId: args.sessionId,
+                projectRoot: args.projectRoot,
+                request: {
+                    protocolVersion: args.request.protocolVersion,
+                    binding: prior.binding,
+                    command: prior.command,
+                    requestDigest: prior.requestDigest,
+                    kind: "acknowledged",
+                    resultJson: null,
+                },
+            });
         }
         throw new Error("claim intent belongs to an obsolete context incarnation or authority");
     }
@@ -210,7 +231,33 @@ export async function commitModuleClaimIntent(args: {
         throw new Error("claim intent was terminally rejected");
     }
 
-    const commit = args.commitContext();
+    let commit: ContextClaimCommit;
+    try {
+        commit = args.commitContext();
+    } catch (error) {
+        // A caller-input rejection is deterministic: the same stable tool-call ID
+        // reproduces it on every retry, so the staged row would never resolve and
+        // would block claim-store rebuilds forever. Terminalize it and let the
+        // caller see the original error. Any other failure may be transient, so
+        // the row stays staged and a retry can still commit it.
+        if (error instanceof ClaimOperationInputError && staged.intent.state === "staged") {
+            await args.client.claimIntentAck({
+                sessionId: args.sessionId,
+                projectRoot: args.projectRoot,
+                request: {
+                    protocolVersion: args.request.protocolVersion,
+                    binding: staged.intent.binding,
+                    command: staged.intent.command,
+                    requestDigest: staged.intent.requestDigest,
+                    kind: "terminal-rejected",
+                    resultJson: terminalClaimResult(
+                        `context rejected the request: ${error.message}`,
+                    ),
+                },
+            });
+        }
+        throw error;
+    }
     if (
         commit.producer !== args.request.command.producer ||
         commit.operationKey !== args.request.command.operationKey

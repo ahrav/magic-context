@@ -19,7 +19,11 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { type ContextClaimCommit, commitModuleClaimIntent } from "./context-authority";
 import { computeClaimOperationRequestDigest } from "./memory/claim-operation-contract";
-import { createProjectMemoryClaim, runClaimOperation } from "./memory/storage-claim-operations";
+import {
+    ClaimOperationInputError,
+    createProjectMemoryClaim,
+    runClaimOperation,
+} from "./memory/storage-claim-operations";
 import { ensureProject } from "./memory/storage-claims";
 import { runMigrations } from "./migrations";
 import { createClaimMemorySchema } from "./storage-claim-memory-schema";
@@ -64,6 +68,8 @@ interface DurableModuleState {
 interface AttemptOptions {
     cut?: CrashCut;
     failContext?: boolean;
+    /** Reject inside `commitContext` the way a caller-input defect does. */
+    failContextWithInputError?: boolean;
     request?: Record<string, unknown>;
     binding?: ClaimIntentBinding;
 }
@@ -315,6 +321,11 @@ async function runAttempt(args: {
             request,
         },
         commitContext: () => {
+            if (options.failContextWithInputError) {
+                throw new ClaimOperationInputError(
+                    "create requires non-empty content and category",
+                );
+            }
             if (options.failContext) throw new Error("injected context commit failure");
             const commit = commitContext(
                 args.db,
@@ -512,6 +523,71 @@ describe("U5 claim intent crash recovery", () => {
             }),
         ).rejects.toThrow("obsolete context incarnation or authority");
 
+        expect(f.state.intents.get(commandKey({ producer: PRODUCER, operationKey }))?.state).toBe(
+            "terminal-rejected",
+        );
+        expect(receiptCount(f.db, operationKey)).toBe(0);
+        expect(f.state.effectCommits.size).toBe(0);
+    });
+    test("binding change resolves a context-committed intent instead of stranding it", async () => {
+        const operationKey = "binding-change-after-context-commit";
+        const f = fixture(operationKey);
+        // Crash inside settlement: the context write and its context-committed
+        // acknowledgement are durable, but the final acknowledgement never runs.
+        await expect(
+            runAttempt({
+                db: f.db,
+                state: f.state,
+                operationKey,
+                target: f.target,
+                applications: f.applications,
+                options: { cut: "after-mirror-group-commit" },
+            }),
+        ).rejects.toThrow("injected crash after-mirror-group-commit");
+        expect(f.state.intents.get(commandKey({ producer: PRODUCER, operationKey }))?.state).toBe(
+            "context-committed",
+        );
+
+        // The authority binding moves before the retry. The intent cannot be
+        // terminally rejected because its context effects are already durable, so
+        // it must be acknowledged under the binding that staged it.
+        await expect(
+            runAttempt({
+                db: f.db,
+                state: f.state,
+                operationKey,
+                target: f.target,
+                applications: f.applications,
+                options: {
+                    binding: { ...binding, authorityGeneration: binding.authorityGeneration + 1 },
+                },
+            }),
+        ).rejects.toThrow("obsolete context incarnation or authority");
+
+        // An unresolved intent counts against claim-store rebuild and mirror reset,
+        // so leaving it in context-committed would block both permanently.
+        expect(f.state.intents.get(commandKey({ producer: PRODUCER, operationKey }))?.state).toBe(
+            "acknowledged",
+        );
+        expect(receiptCount(f.db, operationKey)).toBe(1);
+    });
+
+    test("a caller-input rejection terminalizes the staged intent so retries cannot wedge", async () => {
+        const operationKey = "context-input-rejection";
+        const f = fixture(operationKey);
+        await expect(
+            runAttempt({
+                db: f.db,
+                state: f.state,
+                operationKey,
+                target: f.target,
+                applications: f.applications,
+                options: { failContextWithInputError: true },
+            }),
+        ).rejects.toThrow("create requires non-empty content and category");
+
+        // The same stable tool-call ID reproduces the rejection on every retry, so a
+        // row left staged would never resolve and would block claim-store rebuilds.
         expect(f.state.intents.get(commandKey({ producer: PRODUCER, operationKey }))?.state).toBe(
             "terminal-rejected",
         );
