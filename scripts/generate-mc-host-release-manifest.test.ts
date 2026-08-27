@@ -463,6 +463,10 @@ describe("platform floors", () => {
             // Above the floor on its first component, so the ordering check returns
             // early: the component's shape has to be validated regardless.
             "999garbage.0",
+            // A separator with nothing after it is not a suffix; `compareDotted`
+            // reads the digits and ignores the dangling separator.
+            "4.18-",
+            "4.18_",
             "5",
             "4.18-rc1",
             "4.18.0-rc2",
@@ -480,7 +484,7 @@ describe("platform floors", () => {
                 `kernel=${kernel} must not clear the floor`,
             ).toEqual({ supported: false, reason: "unsupported_platform" });
         }
-        for (const glibc of ["999garbage", "2.28-pre", "2.28-beta3"]) {
+        for (const glibc of ["999garbage", "2.28-pre", "2.28-beta3", "2.28+"]) {
             expect(
                 evaluatePlatform(contract, {
                     os: "linux",

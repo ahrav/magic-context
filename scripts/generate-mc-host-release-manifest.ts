@@ -1291,7 +1291,10 @@ export function meetsDottedFloor(probe: unknown, floor: string): boolean {
     // floor actually compares are constrained; beyond its precision live `el8` and
     // `x86_64`, which are not version numbers at all.
     for (let i = 0; i < floorParts.length; i++) {
-        if (!/^\d+(?:[-+._~].*)?$/.test(parts[i] ?? "")) return false;
+        // `.+`, not `.*`: a separator with nothing after it (`4.18-`, `2.28+`) is not
+        // a suffix, and `compareDotted` would read the digits and ignore the dangling
+        // separator entirely.
+        if (!/^\d+(?:[-+._~].+)?$/.test(parts[i] ?? "")) return false;
     }
     const ordering = compareDotted(probe, floor);
     if (Number.isNaN(ordering) || ordering < 0) return false;
