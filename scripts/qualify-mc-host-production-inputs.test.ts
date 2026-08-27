@@ -442,6 +442,10 @@ describe("immutable input fail-closed rules", () => {
             "artifacts.example.test",
             "cdn.localhost",
             "files.example.com",
+            // `URL.hostname` brackets an IPv6 literal, so the bare `::1` entry in
+            // the list would never match without normalizing first.
+            "[::1]",
+            "127.0.0.1",
         ]) {
             const root = freshRoot();
             installProductionManifest(root, (manifest) => {
@@ -802,6 +806,15 @@ describe("immutable input fail-closed rules", () => {
                 (cargo) =>
                     `${cargo.replace(/^ort = .*$/m, "")}\n[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = ["load-dynamic", "download-binaries"]\n`,
                 /ort feature download-binaries .* outside the qualified closure/,
+            ],
+            [
+                // A multiline array inside a subtable. Its lines sit below top
+                // level, so skipping them truncates `features = [` and the feature
+                // check reports a valid manifest as unreadable instead of reading
+                // the forbidden entry.
+                (cargo) =>
+                    `${cargo.replace(/^ort = .*$/m, "")}\n[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = [\n    "load-dynamic",\n    "tensorrt",\n]\n`,
+                /ort feature tensorrt .* outside the qualified closure/,
             ],
             [
                 // A target-specific subtable, which Cargo unifies into the Linux

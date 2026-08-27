@@ -1278,7 +1278,9 @@ function validateQualifiedArtifact(
     // lock naming one records provenance that cannot be acted on. Allowed in
     // `test-fixture` mode, which is what the committed fixtures use.
     if (mode === "production") {
-        const host = sourceUrl.hostname.toLowerCase();
+        // `URL.hostname` brackets an IPv6 literal, so `[::1]` would never equal the
+        // `::1` entry in the list it is meant to match.
+        const host = sourceUrl.hostname.toLowerCase().replace(/^\[|\]$/g, "");
         const reserved = RESERVED_SOURCE_HOST_SUFFIXES.find(
             (suffix) => host === suffix || host.endsWith(`.${suffix}`),
         );
@@ -1814,8 +1816,9 @@ function dependencyDeclarations(
             if (char === "{" || char === "[") depth++;
             else if (char === "}" || char === "]") depth--;
         }
-        if (!atTopLevel) continue;
-        const header = /^\[([^\]]+)\]$/.exec(trimmed);
+        // A `[...]` line is only a section header at top level; inside a multiline
+        // array it is array syntax.
+        const header = atTopLevel ? /^\[([^\]]+)\]$/.exec(trimmed) : null;
         if (header !== null) {
             if (!closeSubtable()) return null;
             section = header[1] ?? "";
@@ -1828,10 +1831,14 @@ function dependencyDeclarations(
             }
             continue;
         }
+        // Accumulate the whole subtable, nested array lines included: skipping them
+        // for being below top level would truncate `features = [` into an entry the
+        // feature check then reports as unreadable, rejecting a valid manifest.
         if (open !== null) {
             if (trimmed !== "") open.body.push(trimmed);
             continue;
         }
+        if (!atTopLevel) continue;
         const assignment = /^(.*?)=/.exec(trimmed);
         if (assignment === null) continue;
         const isDependencyTable = dependencyTable.test(section);
