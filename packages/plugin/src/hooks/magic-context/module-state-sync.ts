@@ -1934,10 +1934,22 @@ function claimMirrorNotSeeded(error: unknown): boolean {
 
 function suppressClaimMirror(
     state: ModuleStateSyncState,
+    sessionId: string,
     error: unknown,
 ): ModuleClaimMirrorSyncResult {
-    state.claimMirrorSuppressed = true;
     const reason = error instanceof Error ? error.message : String(error);
+    // Suppression persists until the lane recovers and the caller discards this
+    // result, so without this a suppressed mirror is invisible: Rust transforms
+    // render no project memories and report nothing. Logged on entry into
+    // suppression rather than on every pass, so a lane that cannot recover
+    // reports its reason once instead of per transform.
+    if (state.claimMirrorSuppressed !== true) {
+        sessionLog(
+            sessionId,
+            `claim mirror suppressed; Rust transforms omit project memories until it recovers: ${reason}`,
+        );
+    }
+    state.claimMirrorSuppressed = true;
     return { status: "suppressed", reason };
 }
 
@@ -1961,7 +1973,11 @@ export async function syncModuleClaimMirror(args: {
         nowMs: args.pass.nowMs,
     });
     if (!snapshot)
-        return suppressClaimMirror(args.state, new Error("claim provider snapshot moved"));
+        return suppressClaimMirror(
+            args.state,
+            args.pass.sessionId,
+            new Error("claim provider snapshot moved"),
+        );
     const claimMirrorReplace = args.client.claimMirrorReplace;
     const claimMirrorApply = args.client.claimMirrorApply;
     const client: Required<Pick<ModuleStateSyncClient, "claimMirrorReplace" | "claimMirrorApply">> =
@@ -1980,11 +1996,15 @@ export async function syncModuleClaimMirror(args: {
             });
             return { status: "active", seeded: true, appliedReceipts: 0 };
         } catch (error) {
-            return suppressClaimMirror(args.state, error);
+            return suppressClaimMirror(args.state, args.pass.sessionId, error);
         }
     }
     if (!args.state.claimMirrorVector) {
-        return suppressClaimMirror(args.state, new Error("claim mirror host vector is missing"));
+        return suppressClaimMirror(
+            args.state,
+            args.pass.sessionId,
+            new Error("claim mirror host vector is missing"),
+        );
     }
 
     let appliedReceipts = 0;
@@ -2048,7 +2068,11 @@ export async function syncModuleClaimMirror(args: {
                 nowMs: args.pass.nowMs,
             });
             if (!reseed)
-                return suppressClaimMirror(args.state, new Error("claim provider snapshot moved"));
+                return suppressClaimMirror(
+                    args.state,
+                    args.pass.sessionId,
+                    new Error("claim provider snapshot moved"),
+                );
             try {
                 await publishClaimMirrorSnapshot({
                     client,
@@ -2059,10 +2083,10 @@ export async function syncModuleClaimMirror(args: {
                 });
                 return { status: "active", seeded: true, appliedReceipts };
             } catch (reseedError) {
-                return suppressClaimMirror(args.state, reseedError);
+                return suppressClaimMirror(args.state, args.pass.sessionId, reseedError);
             }
         }
-        return suppressClaimMirror(args.state, error);
+        return suppressClaimMirror(args.state, args.pass.sessionId, error);
     }
 }
 
