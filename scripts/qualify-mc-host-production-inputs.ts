@@ -1303,14 +1303,20 @@ function validateQualifiedArtifact(
     );
     if (
         typeof artifact.source !== "string" ||
-        !artifact.source.startsWith("https://") ||
-        artifact.source.endsWith("/")
+        !artifact.source.startsWith("https://")
     ) {
         fail(`inputs.${key}: source must be an https URL naming one artifact`);
     }
     // Compare per path segment so a mutable ref is caught in any position.
     // The host is excluded deliberately: only the path names the revision.
     const sourceUrl = parseSourceUrl(key, artifact.source);
+    // Judged on the parsed path rather than the spelling. A dot segment moves the
+    // trailing slash out of the string — `…/<digest>/model.onnx/..` parses to
+    // `/…/<digest>/` — and the digest survives as a segment, so the
+    // content-address check below still passed a URL naming a directory.
+    if (sourceUrl.pathname.endsWith("/")) {
+        fail(`inputs.${key}: source must be an https URL naming one artifact`);
+    }
     if (sourceUrl.username !== "" || sourceUrl.password !== "") {
         fail(
             `inputs.${key}: source must not embed URL credentials (userinfo is copied into the committed lock)`,
@@ -1985,9 +1991,30 @@ function structuralDelta(
 function dottedKeyTouches(keyText: string, names: readonly RegExp[]): boolean {
     const normalized = normalizeTableHeader(keyText);
     if (!normalized.includes(".")) return false;
-    return normalized
-        .split(".")
-        .some((part) => names.some((name) => name.test(part.trim())));
+    return splitDottedKey(normalized).some((part) => {
+        const name = resolveTomlName(part);
+        // A component this scan cannot read cannot be ruled out as one of `names`:
+        // `"patch"."crates-io"."ort" = { path = "fake-ort" }` declares the override
+        // table under a quoted spelling Cargo resolves, and testing the raw
+        // component against a bare-name pattern matched nothing. Callers use this to
+        // refuse an assignment they cannot attribute, so unreadable answers yes.
+        if (name === null) return true;
+        return names.some((candidate) => candidate.test(name));
+    });
+}
+
+/**
+ * The components of a normalized dotted key path, each resolved to the name Cargo
+ * will see, or `null` when any component uses a spelling this scan refuses.
+ */
+function resolveDottedPath(normalized: string): string[] | null {
+    const resolved: string[] = [];
+    for (const part of splitDottedKey(normalized)) {
+        const name = resolveTomlName(part);
+        if (name === null) return null;
+        resolved.push(name);
+    }
+    return resolved;
 }
 
 /**
@@ -2094,6 +2121,16 @@ function tomlStringTokens(entry: string): string[] | null {
 }
 
 /**
+ * A resolved table-path component naming a dependency table Cargo unifies features
+ * from: the base table, or its dev, build, and target-specific variants.
+ *
+ * Matched against one resolved component rather than the raw path, since a header
+ * component is a TOML key and `["dependencies"]` names the same table as
+ * `[dependencies]`.
+ */
+const DEPENDENCY_TABLE = /^(?:dev-|build-)?dependencies$/;
+
+/**
  * One dependency declaration, resolved to the crate Cargo will actually fetch.
  */
 interface DependencyDeclaration {
@@ -2137,7 +2174,6 @@ function dependencyDeclarations(
 ): DependencyDeclaration[] | null {
     const lines = cargo.split("\n").map(stripTomlComments);
     const declarations: DependencyDeclaration[] = [];
-    const dependencyTable = /(?:^|\.)(?:dev-|build-)?dependencies$/;
     // `[dependencies.ort]` and `[target.'cfg(...)'.dependencies.ort]` declare a
     // crate through a subtable rather than an inline value, so the crate name is in
     // the header and its keys are ordinary assignments beneath it. Accumulate those
@@ -2156,24 +2192,41 @@ function dependencyDeclarations(
         return true;
     };
     let section = "";
+    let inDependencyTable = false;
     let depth = 0;
     const stringState = { multiline: null as string | null };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
-        const atTopLevel = depth === 0;
+        // A line that starts inside an open multi-line string is not structure: a
+        // `poison = """\n[package.metadata.decoy]\n"""` value would otherwise read as
+        // a real header and close the dependency subtable early, dropping every key
+        // Cargo still counts below it — `features` included — from the scanned entry.
+        const atTopLevel = depth === 0 && stringState.multiline === null;
         depth += structuralDelta(line, stringState);
         // A `[...]` line is only a section header at top level; inside a multiline
         // array it is array syntax.
         const header = atTopLevel ? /^\[([^\]]+)\]$/.exec(trimmed) : null;
         if (header !== null) {
             if (!closeSubtable()) return null;
-            section = normalizeTableHeader(header[1] ?? "");
-            const subtable = /^(.*)\.([^.]+)$/.exec(section);
-            const parent = subtable?.[1] ?? "";
-            if (subtable !== null && dependencyTable.test(parent)) {
-                const key = resolveTomlName(subtable[2] ?? "");
-                if (key === null) return null;
-                open = { section: parent, key, body: [] };
+            // Resolved before it is classified: a header component is a TOML key, so
+            // `["dependencies"]` and `[target.'cfg(...)'."dependencies"]` name the
+            // ordinary dependency tables Cargo unifies features from. Testing the raw
+            // suffix attributed them elsewhere and every declaration inside — a
+            // renamed `ort` among them — went unexamined.
+            const parts = resolveDottedPath(normalizeTableHeader(header[1] ?? ""));
+            if (parts === null) return null;
+            section = parts.join(".");
+            const last = parts[parts.length - 1] ?? "";
+            inDependencyTable = DEPENDENCY_TABLE.test(last);
+            if (
+                parts.length >= 2 &&
+                DEPENDENCY_TABLE.test(parts[parts.length - 2] ?? "")
+            ) {
+                open = {
+                    section: parts.slice(0, -1).join("."),
+                    key: last,
+                    body: [],
+                };
             }
             continue;
         }
@@ -2187,7 +2240,6 @@ function dependencyDeclarations(
         if (!atTopLevel) continue;
         const keyText = assignmentKeyText(trimmed);
         if (keyText === null) continue;
-        const isDependencyTable = dependencyTable.test(section);
         const key = resolveTomlName(keyText);
         if (key === null) {
             // A dotted assignment creates its own table:
@@ -2197,7 +2249,7 @@ function dependencyDeclarations(
             // scan either way, so a key that mentions `dependencies` refuses the file
             // rather than being skipped as unrelated.
             if (
-                isDependencyTable ||
+                inDependencyTable ||
                 dottedKeyTouches(keyText, [/^[^.]*dependencies$/])
             ) {
                 return null;
@@ -2206,10 +2258,10 @@ function dependencyDeclarations(
         }
         const entry = joinInlineEntry(lines, index);
         if (entry === null) {
-            if (isDependencyTable) return null;
+            if (inDependencyTable) return null;
             continue;
         }
-        const crate = isDependencyTable
+        const crate = inDependencyTable
             ? resolveRenamedCrate(key, entry)
             : key;
         if (crate === null) return null;
@@ -2518,12 +2570,26 @@ function assertNoForbiddenFeatureForwarding(
     const stringState = { multiline: null as string | null };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
-        const atTopLevel = depth === 0;
+        // A line that starts inside an open multi-line string is not structure: its
+        // content would otherwise read as a real header and reattribute every line
+        // after it, which is enough to move a declaration out of the table this scan
+        // is examining.
+        const atTopLevel = depth === 0 && stringState.multiline === null;
         depth += structuralDelta(line, stringState);
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
-            section = normalizeTableHeader(header[1] ?? "");
+            // Resolved before it is compared, for the reason the dependency scan
+            // resolves its own headers: a header component is a TOML key, so
+            // `["features"]` names the same table as `[features]`, and comparing the
+            // raw text left the whole forwarding table unexamined.
+            const parts = resolveDottedPath(normalizeTableHeader(header[1] ?? ""));
+            if (parts === null) {
+                fail(
+                    `${MC_HOST_CARGO_TOML_PATH} declares a table header this qualifier cannot read, so a forbidden feature forwarding cannot be ruled out`,
+                );
+            }
+            section = parts.join(".");
             continue;
         }
         const keyText = assignmentKeyText(trimmed);
@@ -2643,18 +2709,24 @@ function assertNoQualifiedCrateOverride(
     };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
-        const atTopLevel = depth === 0;
+        // A line that starts inside an open multi-line string is not structure: its
+        // content would otherwise read as a real header and reattribute every line
+        // after it, which is enough to move a declaration out of the table this scan
+        // is examining.
+        const atTopLevel = depth === 0 && stringState.multiline === null;
         depth += structuralDelta(line, stringState);
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
             closeSubtable();
-            const parts = splitDottedKey(normalizeTableHeader(header[1] ?? ""));
-            // An unreadable first component cannot be ruled out as `patch` or
-            // `replace`: `["\u0072eplace"."ort:2.0.0-rc.13"]` spells the override
-            // table in a way Cargo resolves and this scan does not.
-            const root = resolveTomlName(parts[0] ?? "");
-            if (root === null) unreadable();
+            // Resolved before it is compared: a header component is a TOML key, so
+            // `["\u0072eplace"."ort:2.0.0-rc.13"]` and `["patch"."crates-io"."ort"]`
+            // spell the override tables in ways Cargo resolves and a raw comparison
+            // does not, leaving the whole table unattributed and unexamined. An
+            // unreadable component cannot be ruled out as one of them.
+            const parts = resolveDottedPath(normalizeTableHeader(header[1] ?? ""));
+            if (parts === null) unreadable();
+            const root = parts[0] ?? "";
             override = root === "patch" || root === "replace" ? root : null;
             if (override === null) continue;
             // `[patch.<registry>]` and `[replace]` hold one assignment per overridden
@@ -2663,8 +2735,7 @@ function assertNoQualifiedCrateOverride(
                 (override === "patch" && parts.length >= 3) ||
                 (override === "replace" && parts.length >= 2);
             if (!subtable) continue;
-            const last = resolveTomlName(parts[parts.length - 1] ?? "");
-            if (last === null) unreadable();
+            const last = parts[parts.length - 1] ?? "";
             // A `[replace]` subtable is keyed by a package-ID spec, a `[patch]` one by
             // the crate name.
             const named = override === "replace" ? replacedCrateName(last) : last;

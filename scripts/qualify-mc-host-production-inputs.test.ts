@@ -382,8 +382,26 @@ describe("immutable input fail-closed rules", () => {
         }
     });
 
-    test("an unparseable source URL fails with the tool's framing", () => {
-        // `startsWith("https://")` does not imply parseability; a raw
+    test("a source whose normalized path is a directory is rejected", () => {
+        // A dot segment moves the trailing slash out of the spelling: the raw string
+        // ends in `..`, while `new URL()` normalizes the path to the parent
+        // directory. The content-address check still passes because the digest
+        // survives as a segment, so the URL qualified as one artifact while naming
+        // a directory.
+        for (const suffix of ["/..", "/.", "/%2e%2e", "/"]) {
+            const root = freshRoot();
+            installProductionManifest(root, (manifest) => {
+                const digest = manifest.inputs.model_onnx.sha256;
+                manifest.inputs.model_onnx.source =
+                    `https://models.mchost-release.io/m/resolve/${digest}/model.onnx${suffix}`;
+            });
+            expect(() => generate(root, { check: false })).toThrow(
+                /source must be an https URL naming one artifact/,
+            );
+        }
+    });
+
+    test("an unparseable source URL fails with the tool's framing", () => {        // `startsWith("https://")` does not imply parseability; a raw
         // `TypeError: Invalid URL` would lose the consistent failure prefix.
         const root = freshRoot();
         const manifest = fixtureManifest();
@@ -901,6 +919,17 @@ describe("immutable input fail-closed rules", () => {
                 /dotted override assignment this qualifier cannot attribute/,
             ],
             [
+                // A dotted key's components are TOML keys too, so `"patch"` names the
+                // same table as `patch`. Testing the still-quoted component against a
+                // bare-name pattern matched nothing and the override went unnoticed.
+                '"patch"."crates-io"."ort" = { path = "fake-ort" }\n',
+                /dotted override assignment this qualifier cannot attribute/,
+            ],
+            [
+                "'replace'.'ort:2.0.0-rc.13' = { path = \"fake-ort\" }\n",
+                /dotted override assignment this qualifier cannot attribute/,
+            ],
+            [
                 '[replace]\n"ort:2.0.0-rc.13" = { path = "../vendored-ort" }\n',
                 /overrides ort, so the build would not resolve/,
             ],
@@ -1178,6 +1207,21 @@ describe("immutable input fail-closed rules", () => {
                 /forwards ort\/cuda, which is outside the qualified closure/,
             ],
             [
+                // And so is a quoted table name: `["features"]` is the same table, so
+                // comparing the raw header left the whole forwarding table unexamined
+                // while Cargo still reported `default = ["ort/cuda"]`.
+                (cargo) => `${cargo}\n["features"]\ndefault = ["ort/cuda"]\n`,
+                /forwards ort\/cuda, which is outside the qualified closure/,
+            ],
+            [
+                // Header eligibility from bracket depth alone let a line inside a
+                // multi-line string read as a real header, moving the section away
+                // from `features` so every forwarding after it went unread.
+                (cargo) =>
+                    `${cargo}\n[features]\npoison = ["""\n[package.metadata.decoy]\n"""]\ndefault = ["ort/cuda"]\n`,
+                /forwards ort\/cuda, which is outside the qualified closure/,
+            ],
+            [
                 // An escaped basic string decodes to the same value, so a scan that
                 // cannot decode it must refuse rather than skip it.
                 (cargo) =>
@@ -1232,6 +1276,31 @@ describe("immutable input fail-closed rules", () => {
                 (cargo) =>
                     `${cargo}\n[target . 'cfg(target_os = "linux")' . dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
+            ],
+            [
+                // A header component is a TOML key, so `"dependencies"` names the
+                // ordinary dependency table. Cargo reports the target entry's `cuda`
+                // feature either way; classifying the section from the raw suffix
+                // recorded the rename as an unrelated crate, leaving the safe base
+                // entry as the only `ort` declaration.
+                (cargo) =>
+                    `${cargo}\n[target.'cfg(target_os = "linux")'."dependencies"]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
+            ],
+            [
+                (cargo) =>
+                    `${cargo}\n['dev-dependencies']\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
+            ],
+            [
+                // Header eligibility was decided from bracket depth alone, so a line
+                // inside a multi-line string read as a real header and closed the
+                // dependency subtable early. Cargo keeps every key below it in the
+                // entry — `features` included — so the forbidden capability was
+                // simply absent from what the scan examined.
+                (cargo) =>
+                    `${cargo.replace(/^ort = .*$/m, "")}\n[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\npoison = """\n[package.metadata.decoy]\n"""\nfeatures = ["cuda"]\n`,
+                /ort feature cuda .* is outside the qualified closure/,
             ],
             [
                 // A multi-line string spans lines, so quote state cannot reset per
