@@ -74,7 +74,7 @@ const PACKAGE_NAME = "@cortexkit/pi-magic-context";
 // to `@earendil-works/pi-coding-agent`. Magic Context's peerDependency targets
 // the new scope, so older Pi installs cannot load this extension.
 const MIN_PI_VERSION = "0.74.0";
-const ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"];
+const ROW_COUNT_TABLES = ["tags", "compartments", "claims", "notes", "dream_runs"];
 
 type CheckStatus = "pass" | "warn" | "fail" | "info";
 

@@ -4904,7 +4904,7 @@ pub fn get_db_health(db_path: &PathBuf) -> DbHealth {
     if exists {
         if let Ok(conn) = open_readonly(db_path) {
             let tables = [
-                "memories",
+                "claims",
                 "compartments",
                 "session_facts",
                 "notes",
