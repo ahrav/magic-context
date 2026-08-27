@@ -56,6 +56,11 @@ const RETIRED_MODULE_PATHS = [
 
 const SOURCE_ROOTS = [
     "packages/plugin/src",
+    // Executable experiment and benchmark scripts run against a real database,
+    // so retired SQL here corrupts results rather than failing to compile. One
+    // such script wrapped its `memory_fts` query in a catch that returned an
+    // empty array, reporting zero recall instead of a missing table.
+    "packages/plugin/scripts",
     "packages/pi-plugin/src",
     "packages/cli/src",
     "packages/dashboard/src",
@@ -64,6 +69,19 @@ const SOURCE_ROOTS = [
     "crates",
 ] as const;
 const SOURCE_EXTENSION = /\.(?:ts|tsx|js|mjs|rs)$/;
+
+/**
+ * The retrieval-benchmark fixture store, which still creates and writes the
+ * retired `memories` and `memory_embeddings` tables.
+ *
+ * It is exempt from the retired-SQL rule alone, not from the scan: the corpus it
+ * seeds is evaluated through `unifiedSearch`, which runs no memory source, so the
+ * fixture cannot be pointed at a claim-backed equivalent until that retrieval
+ * path exists. Naming the one path keeps the exemption greppable and keeps every
+ * other file under `packages/plugin/scripts` covered.
+ */
+const RETRIEVAL_BENCHMARK_MEMORY_FIXTURE =
+    "packages/plugin/scripts/retrieval-benchmark/memory-vector-store.ts";
 
 interface SourceRule {
     name: string;
@@ -81,6 +99,7 @@ const SOURCE_RULES: readonly SourceRule[] = [
         name: "retired project-memory SQL object",
         pattern:
             /\b(?:FROM|JOIN|INTO|UPDATE|TABLE|ON|DELETE\s+FROM)\s+(?:main\.)?(?:memories(?:_fts(?:_\w+)?)?|mc_memories|mc_memory_mappings|memory_(?:fts(?:_\w+)?|embeddings|stats|verifications|mutation_log|mutations)|legacy_memory_claims|claims?_backfill_\w+|claim_compatibility_\w+)\b/,
+        appliesTo: (path) => path !== RETRIEVAL_BENCHMARK_MEMORY_FIXTURE,
     },
     {
         name: "retired numeric project-memory wire key",
