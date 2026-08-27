@@ -476,6 +476,10 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
 struct Reservations {
     pending: usize,
     tasks: usize,
+    /// Checked sum of every module's declared bound on concurrently parked
+    /// general-class handler tasks. Not a carve-out — validated against the
+    /// general task pool so declared parking can never consume every slot.
+    general_task_holds: usize,
     retained_bytes: u64,
 }
 
@@ -500,6 +504,7 @@ fn build_target_index(
     let mut reservations = Reservations {
         pending: 0,
         tasks: 0,
+        general_task_holds: 0,
         retained_bytes: 0,
     };
     let mut target_entries: Vec<(Box<str>, Vec<TargetKind>, RouteClass)> =
@@ -552,6 +557,12 @@ fn build_target_index(
             .checked_add(declaration.reserved_handler_tasks)
             .ok_or_else(|| {
                 HostError::InitFailed("reserved handler-task sum overflows".to_owned())
+            })?;
+        reservations.general_task_holds = reservations
+            .general_task_holds
+            .checked_add(declaration.general_task_hold_bound)
+            .ok_or_else(|| {
+                HostError::InitFailed("general handler-task hold sum overflows".to_owned())
             })?;
         reservations.retained_bytes = reservations
             .retained_bytes
@@ -669,6 +680,19 @@ pub async fn run<H: McHostHandler>(
         return Err(HostError::InitFailed(
             "reserved handler tasks leave no general handler-task slot".to_owned(),
         ));
+    }
+    // Declared long-parked general tasks (for example Synapse's running
+    // query plus its FIFO waiters) draw on the general pool. If they could
+    // fill it, one module's waiting traffic would starve every other route,
+    // so the sum must leave at least one free general task slot.
+    let general_task_slots = config.limits.max_handler_tasks - reservations.tasks;
+    if reservations.general_task_holds >= general_task_slots {
+        return Err(HostError::InitFailed(format!(
+            "declared parked handler tasks ({}) leave no free general handler-task slot \
+             ({general_task_slots} available); lower max_waiting_queries or raise \
+             max_handler_tasks",
+            reservations.general_task_holds
+        )));
     }
     // Bounded during serialization, not after: an over-limit manifest must be
     // refused without ever materializing a full copy of its catalog.

@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::raw_client::{self, Discovered, RawFrame};
@@ -21,6 +21,7 @@ use mc_host::{
 
 pub const ROOT: &str = "/workspace/project";
 pub const BUDGET: Duration = Duration::from_secs(5);
+type EngineGate = Arc<(Mutex<bool>, Condvar)>;
 
 pub fn test_lane() -> LaneInfo {
     LaneInfo {
@@ -43,7 +44,9 @@ pub struct DeterministicEngine {
     pub delay: Mutex<Duration>,
     pub calls: AtomicUsize,
     pub texts_embedded: AtomicUsize,
+    pub call_texts: Mutex<Vec<String>>,
     pub fail_next: Mutex<Option<InferenceError>>,
+    gate: Mutex<Option<EngineGate>>,
 }
 
 impl DeterministicEngine {
@@ -53,7 +56,9 @@ impl DeterministicEngine {
             delay: Mutex::new(Duration::ZERO),
             calls: AtomicUsize::new(0),
             texts_embedded: AtomicUsize::new(0),
+            call_texts: Mutex::new(Vec::new()),
             fail_next: Mutex::new(None),
+            gate: Mutex::new(None),
         })
     }
 
@@ -63,6 +68,18 @@ impl DeterministicEngine {
 
     pub fn fail_next(&self, error: InferenceError) {
         *self.fail_next.lock().expect("fail lock") = Some(error);
+    }
+
+    pub fn block_calls(&self) -> EngineGate {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        *self.gate.lock().expect("gate lock") = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub fn release_calls(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, wake) = &**gate;
+        *released.lock().expect("release lock") = true;
+        wake.notify_all();
     }
 
     pub fn vector_for(&self, text: &str) -> Vec<f32> {
@@ -84,6 +101,18 @@ impl DeterministicEngine {
 impl EmbeddingEngine for DeterministicEngine {
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.call_texts
+            .lock()
+            .expect("call text lock")
+            .extend(texts.iter().map(|text| (*text).to_owned()));
+        let gate = self.gate.lock().expect("gate lock").clone();
+        if let Some(gate) = gate {
+            let (released, wake) = &*gate;
+            let mut released = released.lock().expect("release lock");
+            while !*released {
+                released = wake.wait(released).expect("release wait");
+            }
+        }
         let delay = *self.delay.lock().expect("delay lock");
         if !delay.is_zero() {
             std::thread::sleep(delay);
@@ -115,10 +144,7 @@ impl CompositeComponent for EchoPrimary {
 
     async fn handle(&self, ctx: RequestCtx) -> RequestOutcome {
         let Ok(mut body) = ctx.reserve_output(ctx.body.len()).await else {
-            return RequestOutcome::Error {
-                code: "internal_error".to_owned(),
-                message: "reservation failed".to_owned(),
-            };
+            return RequestOutcome::error("internal_error", "reservation failed");
         };
         body.extend_from_slice(&ctx.body)
             .expect("reservation matches body");
@@ -337,5 +363,10 @@ pub fn ready_component(
     engine: Arc<DeterministicEngine>,
     limits: SynapseLimits,
 ) -> SynapseComponent {
-    SynapseComponent::ready_with_engine(test_lane(), engine, limits)
+    let mut lane = test_lane();
+    lane.recommended_rows = lane
+        .recommended_rows
+        .min(u32::try_from(limits.max_batch_items).unwrap_or(u32::MAX));
+    SynapseComponent::ready_with_engine(lane, engine, limits)
+        .expect("test Synapse limits must be valid")
 }

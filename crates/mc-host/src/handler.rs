@@ -94,6 +94,16 @@ pub struct ResourceDeclaration {
     /// example Broca's 64 MiB replay budget). An accounting reservation
     /// subtracted from ingress; the module enforces its own internal budget.
     pub retained_resident_bytes: u64,
+    /// Upper bound on general-class handler tasks this module can hold
+    /// concurrently parked on internal admission (for example Synapse's
+    /// one running query plus its FIFO waiters, each awaiting a lane permit
+    /// inside its handler task until the request deadline). Not a carve-out:
+    /// the tasks still draw on the general pool. Startup checked-sums these
+    /// bounds and refuses a configuration whose parked tasks could consume
+    /// every general slot, which would let one module's waiting traffic
+    /// starve every other route of dispatch capacity. Zero declares no
+    /// long-parked general tasks.
+    pub general_task_hold_bound: usize,
     /// The permit class every route bound to this module dispatches under.
     pub route_class: RouteClass,
 }
@@ -207,10 +217,39 @@ pub enum RequestOutcome {
     /// items.
     Response { body: OutputBuffer, binary: bool },
     /// Application failure; the host emits one canonical `Error` terminal.
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+        /// Advisory delay before retrying this operation.
+        retry_after_ms: Option<u64>,
+    },
     /// Stream items were emitted through [`RequestCtx::stream`]; the host
     /// emits the `StreamEnd` terminal.
     Streamed,
+}
+
+impl RequestOutcome {
+    /// Constructs an error without retry timing metadata.
+    pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Error {
+            code: code.into(),
+            message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+
+    /// Constructs an error with an advisory retry delay.
+    pub fn error_retry_after(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retry_after_ms: u64,
+    ) -> Self {
+        Self::Error {
+            code: code.into(),
+            message: message.into(),
+            retry_after_ms: Some(retry_after_ms),
+        }
+    }
 }
 
 impl std::fmt::Debug for RequestOutcome {
@@ -224,10 +263,15 @@ impl std::fmt::Debug for RequestOutcome {
                 .field("body", body)
                 .field("binary", binary)
                 .finish(),
-            Self::Error { code, message } => f
+            Self::Error {
+                code,
+                message,
+                retry_after_ms,
+            } => f
                 .debug_struct("Error")
                 .field("code_len", &code.len())
                 .field("message_len", &message.len())
+                .field("retry_after_ms", retry_after_ms)
                 .finish(),
             Self::Streamed => f.write_str("Streamed"),
         }

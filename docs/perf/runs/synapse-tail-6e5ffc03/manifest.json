@@ -1,0 +1,75 @@
+{
+  "schema": "synapse-tail-u7-partial-v1",
+  "status": "INCOMPLETE",
+  "commit": "6e5ffc03ab166b7e91f4fc5f7062cbf17bdbf2a5",
+  "artifact": "target/release/examples/synapse_perf",
+  "engine": "inline delayed deterministic engine",
+  "process_arrangement": "generator and SUT in one process; SUT on named host threads",
+  "ktd9_owner_acceptance": "accepted by the current user request and recorded in the frozen contract",
+  "pilot": {
+    "start_utc": "2026-08-26T19:10:34.965608Z",
+    "end_utc": "2026-08-26T19:12:13.315402Z",
+    "wall_span_seconds": 98.350,
+    "fixed_descriptive_blocks": 2,
+    "hold_seconds": 1,
+    "candidate_a_k_levels": [1, 2],
+    "randomization_seed": null,
+    "randomized_treatment_order_collected": false
+  },
+  "policy": {
+    "repository_performance_policy": null,
+    "minimum_detectable_effect": null,
+    "power_target": null,
+    "interpretation": "fixed descriptive pilot only"
+  },
+  "policy_parity": {
+    "result": "PASS for constants inspected before pilot",
+    "plugin_attempt_limit": 4,
+    "harness_attempt_limit": 4,
+    "retry_jitter_window": "[base, 3*base)",
+    "poll_initial_delay_ms": "[1, 2)",
+    "poll_multiplier": 1.6,
+    "poll_min_delay_ms": 10,
+    "poll_default_delay_ms": 50,
+    "plugin_source": "packages/plugin/src/features/magic-context/memory/embedding-synapse.ts",
+    "harness_source": "crates/mc-host/tests/support/perf_measurement.rs"
+  },
+  "beads_states": {
+    "magic-context-18r": "OPEN",
+    "magic-context-chj": "OPEN",
+    "magic-context-ioi": "OPEN",
+    "magic-context-c50.8": "IN_PROGRESS"
+  },
+  "dependencies": {
+    "pr_41_open_loop_baseline": "landed as ccfe6569",
+    "production_bundle_run": "not run; U8 only and magic-context-c50.8 remains in progress"
+  },
+  "evidence": {
+    "pilot_ndjson_files_with_summary": 40,
+    "admissible_repetitions": 36,
+    "invalid_repetitions": 20,
+    "logical_ledgers_valid_for_all_summaries": true,
+    "raw_row_counts_match_all_summaries": true,
+    "checksum_manifest": "SHA256SUMS"
+  },
+  "blocker": {
+    "selection": "none",
+    "reason": "The release harness cannot produce an admissible frozen R3 matrix without instrumentation changes.",
+    "conditions": [
+      "Service-time samples are not emitted and the summary omits mean S, so open-loop 1/S levels cannot be derived from retained evidence.",
+      "At injected delay near zero, engine service p50 is 0.242-4.378 microseconds while observed closed-loop logical throughput is only 147-14900 per second. An in-process scheduled generator cannot realize the resulting 0.25x-2x 1/S rates without millions of tasks and missed slots.",
+      "The executable marks any repetition with more than 1 percent non-completion invalid, while required overload cells intentionally measure terminal rejection above that level. Pilot hygiene-only cells at 1/S were invalid at 10.0-18.5 percent rejection despite valid ledgers.",
+      "K values above 2 fail startup scratch validation, leaving the frozen feasible levels {1,2}."
+    ]
+  },
+  "usl_gate": "USL not applicable — fewer than five repetitions with CIs; the six-level closed-loop treatment matrix was not collected"
+  ,
+  "verification": {
+    "cargo_test_mc_host": "PASS: 245 unit tests plus integration and doc-test suites; expected ignored soak/role tests remain ignored",
+    "plugin_bun_test": "PASS: 5481 passed, 0 failed",
+    "plugin_typecheck": "PASS",
+    "plugin_lint": "PASS with 5 pre-existing warnings and 2 configuration infos outside U7 artifacts",
+    "cargo_clippy_mc_host": "PASS",
+    "sha256_manifest": "PASS"
+  }
+}
