@@ -744,3 +744,32 @@ jobs:
           name: incident-pool-ts
           path: packages/e2e-tests/artifacts/incident-pool-ts-report.json
           if-no-files-found: warn
+
+  historian-eval-deterministic:
+    name: Historian eval lane (deterministic)
+    runs-on: ubuntu-latest
+    needs: [check-plugin]
+    # Contract lint, scorer tests, and the mutation battery run per-PR with
+    # no live model calls and no credentials (R14). Live scenario runs are
+    # scheduled/dispatched via historian-eval.yml only.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Run historian-eval unit coverage
+        run: bun run --cwd packages/e2e-tests test:historian-eval-unit
+
+      - name: Freeze lint over the dev corpus
+        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --lint
+
+      - name: Run the invalid-state mutation battery
+        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
