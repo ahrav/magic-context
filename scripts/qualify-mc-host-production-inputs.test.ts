@@ -810,6 +810,21 @@ describe("immutable input fail-closed rules", () => {
                 // closure can be checked, so whichever is validated first reports.
                 /must be declared exactly once/,
             ],
+            [
+                // A dependency key is not a crate name. Cargo resolves this to the
+                // same `ort` and unifies its features with the ordinary entry, so
+                // comparing keys leaves it unexamined.
+                (cargo) =>
+                    `${cargo}\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
+            ],
+            [
+                // A rename whose `package` value cannot be read must refuse the
+                // file rather than be attributed to its key.
+                (cargo) =>
+                    `${cargo}\nort_alias = { package = "o\\u0072t", version = "=2.0.0-rc.13" }\n`,
+                /must be declared exactly once/,
+            ],
         ];
         for (const [mutate, error] of cases) {
             const root = freshRoot();

@@ -1611,26 +1611,6 @@ function stripTomlComments(line: string): string {
 }
 
 /**
- * Extract one crate's complete inline dependency entry from the `[dependencies]`
- * table of `Cargo.toml`, across however many lines its inline table spans, with
- * comments removed.
- *
- * Returns `null` unless the crate is declared exactly once in the whole file and
- * that declaration is in `[dependencies]`. Section tracking is the load-bearing
- * part: a bare textual search for `ort = ` would validate a decoy assignment
- * under an unrelated table such as `[package.metadata.qualification]` and never
- * reach the real dependency. Requiring uniqueness covers the other direction, so
- * a second declaration under `[target.'cfg(...)'.dependencies]` cannot contribute
- * features this check never sees. `null` also covers the absent, unbalanced, and
- * `[dependencies.<crate>]` section forms; callers must fail closed on it rather
- * than read it as "declares nothing".
- *
- * This is a scan, not a TOML parser. Every shape it cannot account for fails, so
- * being wrong costs a false rejection with an actionable message rather than a
- * false qualification. Brace and bracket counting suffices because Cargo
- * dependency values are versions, paths, and URLs, none of which contain them.
- */
-/**
  * Resolve a TOML key as written to the name Cargo will see, or `null` when this
  * scan cannot say.
  *
@@ -1640,6 +1620,9 @@ function stripTomlComments(line: string): string {
  * entirely, which is how a target-specific entry with an accelerator feature could
  * go unexamined while the base entry validated cleanly. Callers must treat `null`
  * as an unreadable dependency table.
+ *
+ * Also used for a renamed dependency's `package = "..."` value, which is a TOML
+ * string with the same spellings and the same reason to refuse an unreadable one.
  */
 function tomlKeyName(raw: string): string | null {
     const key = raw.trim();
@@ -1657,30 +1640,47 @@ function tomlKeyName(raw: string): string | null {
 }
 
 /**
- * Extract one crate's complete inline dependency entry from the `[dependencies]`
- * table of `Cargo.toml`, across however many lines its inline table spans, with
- * comments removed.
+ * One dependency declaration, resolved to the crate Cargo will actually fetch.
+ */
+interface DependencyDeclaration {
+    /** The table it appeared in, e.g. `dependencies` or `target.'cfg(...)'.dependencies`. */
+    section: string;
+    /** `package = "..."` when the dependency is renamed, otherwise the key. */
+    crate: string;
+    /** The complete inline entry, comments stripped, joined onto one line. */
+    entry: string;
+}
+
+/**
+ * Enumerate every dependency declaration in `Cargo.toml`, resolved to the crate
+ * each one actually names.
  *
- * Returns `null` unless the crate is declared exactly once in the whole file and
- * that declaration is in `[dependencies]`. Section tracking is the load-bearing
- * part: a bare textual search for `ort = ` would validate a decoy assignment
- * under an unrelated table such as `[package.metadata.qualification]` and never
- * reach the real dependency. Requiring uniqueness covers the other direction, so
- * a second declaration under `[target.'cfg(...)'.dependencies]` cannot contribute
- * features this check never sees, and an undecodable key in any dependency table
- * is refused rather than skipped — a declaration this scan cannot read is exactly
- * the one that must not pass unexamined. `null` also covers the absent, unbalanced,
- * and `[dependencies.<crate>]` section forms; callers must fail closed on it rather
- * than read it as "declares nothing".
+ * The resolved identity is the point. A dependency key is not a crate name: Cargo
+ * lets `ort_cuda = { package = "ort", features = ["cuda"] }` declare the same crate
+ * under another key and unifies its features with the ordinary `ort` entry, so a
+ * scan comparing keys would leave that declaration unexamined while the safe entry
+ * validated cleanly.
+ *
+ * Returns `null` when any dependency table holds a key or a `package` value this
+ * scan cannot read. That refusal is deliberate: a declaration whose identity is
+ * unreadable is exactly the one that must not pass unexamined, so the whole file is
+ * rejected rather than a subset validated. `null` also covers an unbalanced entry.
+ *
+ * Section tracking covers every table Cargo unifies features from — base, dev,
+ * build, and target-specific — and deliberately reads declarations outside them
+ * too, so a decoy under `[package.metadata.qualification]` is attributed to its own
+ * section rather than mistaken for a dependency.
  *
  * This is a scan, not a TOML parser. Every shape it cannot account for fails, so
  * being wrong costs a false rejection with an actionable message rather than a
  * false qualification. Brace and bracket counting suffices because Cargo
  * dependency values are versions, paths, and URLs, none of which contain them.
  */
-function inlineDependencyEntry(cargo: string, crate: string): string | null {
+function dependencyDeclarations(
+    cargo: string,
+): DependencyDeclaration[] | null {
     const lines = cargo.split("\n").map(stripTomlComments);
-    const starts: number[] = [];
+    const declarations: DependencyDeclaration[] = [];
     let section = "";
     let depth = 0;
     for (const [index, line] of lines.entries()) {
@@ -1698,28 +1698,39 @@ function inlineDependencyEntry(cargo: string, crate: string): string | null {
         }
         const assignment = /^(.*?)=/.exec(trimmed);
         if (assignment === null) continue;
-        // Every table Cargo unifies features from, not just the base one.
         const isDependencyTable = /(?:^|\.)(?:dev-|build-)?dependencies$/.test(
             section,
         );
-        const name = tomlKeyName(assignment[1] ?? "");
-        if (name === null) {
-            // An unreadable key in a dependency table could be this crate. Refusing
-            // the whole file is the only answer that cannot be wrong in the unsafe
-            // direction.
+        const key = tomlKeyName(assignment[1] ?? "");
+        if (key === null) {
             if (isDependencyTable) return null;
             continue;
         }
-        if (name !== crate) continue;
-        // Any declaration outside `[dependencies]` still counts, so a decoy or a
-        // target-specific duplicate is reported as ambiguity rather than ignored.
-        starts.push(section === "dependencies" ? index : -1);
+        const entry = joinInlineEntry(lines, index);
+        if (entry === null) {
+            if (isDependencyTable) return null;
+            continue;
+        }
+        let crate = key;
+        if (isDependencyTable && /(?:^|[\s,{])package\s*=/.test(entry)) {
+            const renamed = /(?:^|[\s,{])package\s*=\s*("[^"\\]*"|'[^']*')/.exec(
+                entry,
+            );
+            const resolved = tomlKeyName(renamed?.[1] ?? "");
+            if (resolved === null) return null;
+            crate = resolved;
+        }
+        declarations.push({ section, crate, entry });
     }
-    if (starts.length !== 1 || starts[0] === -1) return null;
-    const start = starts[0] as number;
+    return declarations;
+}
+
+/** Join the inline entry starting at `index` onto one line, or `null` when its
+ *  braces and brackets never balance. */
+function joinInlineEntry(lines: string[], index: number): string | null {
     const collected: string[] = [];
-    depth = 0;
-    for (let i = start; i < lines.length; i++) {
+    let depth = 0;
+    for (let i = index; i < lines.length; i++) {
         const line = lines[i] ?? "";
         collected.push(line.trim());
         for (const char of line) {
@@ -1729,6 +1740,27 @@ function inlineDependencyEntry(cargo: string, crate: string): string | null {
         if (depth <= 0) return collected.join(" ");
     }
     return null;
+}
+
+/**
+ * Extract `crate`'s complete inline dependency entry from the `[dependencies]`
+ * table of `Cargo.toml`.
+ *
+ * Returns `null` unless the crate is declared exactly once in the whole file — by
+ * resolved identity, so a rename counts — and that declaration is in
+ * `[dependencies]`. Requiring uniqueness is what stops a second declaration under
+ * a target-specific table, or under another key via `package`, contributing
+ * features this check never sees. `null` also covers the absent, unreadable, and
+ * `[dependencies.<crate>]` section forms; callers must fail closed on it rather
+ * than read it as "declares nothing".
+ */
+function inlineDependencyEntry(cargo: string, crate: string): string | null {
+    const declarations = dependencyDeclarations(cargo);
+    if (declarations === null) return null;
+    const matches = declarations.filter((d) => d.crate === crate);
+    if (matches.length !== 1) return null;
+    const only = matches[0] as DependencyDeclaration;
+    return only.section === "dependencies" ? only.entry : null;
 }
 
 /**
