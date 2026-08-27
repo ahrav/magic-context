@@ -117,6 +117,21 @@ fn fsync_preserving_storage<Fd: rustix::fd::AsFd>(
     })
 }
 
+/// Whether an I/O error means the destination cannot accept more bytes.
+///
+/// A per-user quota is exhaustion the caller can act on exactly like a full
+/// filesystem — free space, do not reinstall — and the capacity preflight cannot
+/// see it, since `statvfs` reports the filesystem's free blocks rather than the
+/// caller's remaining quota.
+fn is_storage_exhausted(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code)
+            if code == rustix::io::Errno::NOSPC.raw_os_error()
+                || code == rustix::io::Errno::DQUOT.raw_os_error()
+    )
+}
+
 /// One file inside a generation manifest. Paths are relative, contain no
 /// parent segments, and are unique and sorted in the canonical encoding.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -678,11 +693,27 @@ impl GenerationStore {
             Mode::from_raw_mode(0o700),
         )
         .map_err(|e| match e {
-            rustix::io::Errno::NOSPC => GenerationError::InsufficientStorage,
+            rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT => {
+                GenerationError::InsufficientStorage
+            }
             _ => invalid("staging temp creation failed"),
         })?;
+        // The mkdir mode is umask-filtered, and a directory left without owner
+        // bits cannot be opened by its owner at all — so the open below would
+        // fail and report the temp as insecure. `mkdirat` does not tolerate
+        // EEXIST here, so its success proves this call created the entry and the
+        // pathname chmod cannot be redirected through a planted symlink.
+        rustix::fs::chmodat(
+            &self.generations_fd,
+            temp_name.as_str(),
+            Mode::from_raw_mode(0o700),
+            AtFlags::empty(),
+        )
+        .map_err(|_| invalid("staging temp chmod failed"))?;
         let temp_fd = open_child_dir(&self.generations_fd, &temp_name)
             .ok_or_else(|| invalid("staging temp failed security checks"))?;
+        rustix::fs::fchmod(&temp_fd, Mode::from_raw_mode(0o700))
+            .map_err(|_| invalid("staging temp chmod failed"))?;
         Ok((temp_name, temp_fd))
     }
 
@@ -765,9 +796,20 @@ impl GenerationStore {
             return Ok(());
         }
         // Occupied digest target.
-        if self.validate(digest).is_ok() {
-            let _ = remove_tree(&self.generations_fd, temp_name);
-            return Ok(());
+        match self.validate(digest) {
+            // A valid occupant is already this generation: keep it, drop the temp.
+            Ok(_) => {
+                let _ = remove_tree(&self.generations_fd, temp_name);
+                return Ok(());
+            }
+            // An unknown manifest schema is quarantined, not corrupt. Repairing
+            // it would exchange and then delete bytes the store promises to
+            // preserve, so the mutation is abandoned instead — the same rule
+            // `prune` applies through `is_quarantined_schema`.
+            Err(GenerationError::UnsupportedStateSchema) => {
+                return Err(GenerationError::UnsupportedStateSchema);
+            }
+            Err(_) => {}
         }
         if protected.contains(digest) {
             return Err(invalid("corrupt digest target is protected"));
@@ -914,7 +956,9 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
         dir_path.push_str(component);
         match mkdirat(temp_fd, dir_path.as_str(), Mode::from_raw_mode(0o700)) {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(rustix::io::Errno::NOSPC) => return Err(GenerationError::InsufficientStorage),
+            Err(rustix::io::Errno::NOSPC) | Err(rustix::io::Errno::DQUOT) => {
+                return Err(GenerationError::InsufficientStorage)
+            }
             Err(_) => return Err(invalid("staging directory creation failed")),
         }
     }
@@ -926,7 +970,7 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
         Mode::from_raw_mode(mode),
     )
     .map_err(|e| match e {
-        rustix::io::Errno::NOSPC => GenerationError::InsufficientStorage,
+        rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT => GenerationError::InsufficientStorage,
         _ => invalid("staging output creation failed"),
     })?;
     rustix::fs::fchmod(&dest_fd, Mode::from_raw_mode(mode))
@@ -951,7 +995,7 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
         }
         hasher.update(&buf[..n]);
         write_all_fd(&dest_fd, &buf[..n]).map_err(|e| {
-            if e.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()) {
+            if is_storage_exhausted(&e) {
                 GenerationError::InsufficientStorage
             } else {
                 invalid("staging output write failed")
@@ -998,12 +1042,12 @@ fn write_new_file(
         Mode::from_raw_mode(mode),
     )
     .map_err(|e| match e {
-        rustix::io::Errno::NOSPC => GenerationError::InsufficientStorage,
+        rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT => GenerationError::InsufficientStorage,
         _ => invalid("file creation failed"),
     })?;
     rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode)).map_err(|_| invalid("file chmod failed"))?;
     write_all_fd(&fd, bytes).map_err(|e| {
-        if e.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()) {
+        if is_storage_exhausted(&e) {
             GenerationError::InsufficientStorage
         } else {
             invalid("file write failed")
@@ -1800,6 +1844,41 @@ mod tests {
                 & 0o777,
             0o755,
             "the symlink target's mode must be untouched"
+        );
+    }
+
+    /// An unknown manifest schema at an occupied digest is quarantined, not
+    /// corrupt: promotion must abandon the mutation rather than exchange the
+    /// directory away and delete it.
+    #[test]
+    fn a_quarantined_digest_occupant_is_never_repaired() {
+        let root = tempfile::tempdir().expect("root");
+        let src = tempfile::tempdir().expect("src");
+        let store = store_at(root.path());
+        let digest = stage_default(&store, src.path());
+        let manifest = store
+            .root()
+            .join(GENERATIONS_DIR_NAME)
+            .join(&digest)
+            .join(GENERATION_MANIFEST_NAME);
+
+        // Schema 2 decodes as an unknown schema: preserved, never repaired.
+        let quarantined = br#"{"schema":2,"unknown_future_field":true}"#;
+        std::fs::write(&manifest, quarantined).expect("quarantine the occupant");
+
+        // Staging the same sources produces the same digest, so promotion lands
+        // on the quarantined occupant. It is deliberately not in `protected`:
+        // the quarantine rule alone must stop the repair.
+        let err = match store.stage_and_promote(&sources_in(src.path()), &meta(), &BTreeSet::new())
+        {
+            Ok(_) => panic!("a quarantined occupant must not be repaired"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, GenerationError::UnsupportedStateSchema));
+        assert_eq!(
+            std::fs::read(&manifest).expect("occupant still there"),
+            quarantined,
+            "quarantined bytes must be preserved exactly"
         );
     }
 }

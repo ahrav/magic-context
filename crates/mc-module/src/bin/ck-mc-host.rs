@@ -643,8 +643,13 @@ fn start_phase(
             };
         }
         if Instant::now() >= deadline {
+            // A child that exited before publishing — a rejected envelope or a
+            // failed post-fork step — leaves a coherent `stopped` observation.
+            // Reporting that as `wedged` would claim fence incoherence and emit
+            // failed lifecycle checks with no daemon left to inspect.
             let state = match probe().map(|observed| observed.state) {
                 Ok(LifecycleState::Starting) => "starting",
+                Ok(LifecycleState::Stopped) => "stopped",
                 _ => "wedged",
             };
             return StartOutcome {
@@ -718,10 +723,8 @@ const fn build_target() -> Option<&'static str> {
 /// comparison is against content the digest already binds.
 fn generation_identity_matches(
     manifest: &mc_host::generation::GenerationManifest,
+    target: &str,
 ) -> Result<(), (&'static str, &'static str)> {
-    let Some(target) = build_target() else {
-        return Err(("stopped", "unsupported_platform"));
-    };
     if manifest.target != target {
         return Err(("stopped", "native_payload_invalid"));
     }
@@ -736,11 +739,16 @@ fn generation_identity_matches(
 /// closed — U9 records `production_qualified:false`, so no supported flow
 /// can stage a production payload today.
 fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static str, &'static str)> {
+    // Platform support is decided before any payload state is inspected. The
+    // contract orders `unsupported_platform` ahead of `native_payload_missing`
+    // in its failing-reason precedence, and on an unsupported target a fresh
+    // data root would otherwise report a missing payload and tell the user to
+    // install one that cannot run here.
+    let Some(target) = build_target() else {
+        return Err(("stopped", "unsupported_platform"));
+    };
     match payload_dir {
         Some(dir) => {
-            let Some(target) = build_target() else {
-                return Err(("stopped", "unsupported_platform"));
-            };
             let store = GenerationStore::open(None).map_err(|e| generation_failure(&e))?;
             let mut protected = BTreeSet::new();
             if let Ok(mc_host::generation::CurrentProfile::Current(current)) = store.read_current()
@@ -768,7 +776,7 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
             let validated = store
                 .validate(&digest)
                 .map_err(|e| generation_failure(&e))?;
-            generation_identity_matches(&validated.manifest)?;
+            generation_identity_matches(&validated.manifest, target)?;
             Ok(digest)
         }
         None => {
@@ -780,7 +788,7 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
                     let validated = store
                         .validate(&digest)
                         .map_err(|e| generation_failure(&e))?;
-                    generation_identity_matches(&validated.manifest)?;
+                    generation_identity_matches(&validated.manifest, target)?;
                     Ok(digest)
                 }
                 mc_host::generation::CurrentProfile::Absent => {
