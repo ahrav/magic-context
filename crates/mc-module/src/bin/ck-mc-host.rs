@@ -1174,17 +1174,27 @@ fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
     let stop_committed = match observed.state {
         LifecycleState::Running => {
             // The stop is irreversible and the successor start needs a budget of
-            // its own. Preflight validation can consume most of the aggregate on
-            // slow storage, and committing a stop that `start_phase` will then
-            // refuse to follow produces `stop_committed:true` with no successor —
-            // an outage manufactured by a deadline rather than by any on-disk
-            // state. Refusing here leaves the daemon serving with both bits
-            // false, and retrying is the correct remediation.
-            if outer.saturating_duration_since(Instant::now()) < phase_cap(SPAWN_PUBLICATION_AUTH) {
-                return DaemonResult::new(command, false, "running", "lifecycle_busy")
-                    .with_effects(effects(false, false));
-            }
-            match stop_phase(&runtime, outer) {
+            // its own, so the successor's phase is *reserved* out of the
+            // aggregate rather than merely checked once: the stop is given
+            // `outer` minus that reservation, so no amount of time spent
+            // acknowledging or observing the teardown can consume it. Checking a
+            // snapshot and then handing the stop the full aggregate would let a
+            // shutdown that acknowledges near the deadline leave the old daemon
+            // stopped with `start_phase` refusing to spawn — an outage
+            // manufactured by a deadline rather than by any on-disk state.
+            //
+            // When the reservation cannot be met the restart is refused with the
+            // daemon still serving and both effect bits false; retrying is the
+            // contract remediation for `lifecycle_busy`, and a refused restart is
+            // recoverable where a committed stop with no successor is not.
+            let stop_deadline = match outer.checked_sub(phase_cap(SPAWN_PUBLICATION_AUTH)) {
+                Some(deadline) if deadline > Instant::now() => deadline,
+                _ => {
+                    return DaemonResult::new(command, false, "running", "lifecycle_busy")
+                        .with_effects(effects(false, false));
+                }
+            };
+            match stop_phase(&runtime, stop_deadline) {
                 (_, Ok(())) => true,
                 // Pre-acknowledgement failure: no start attempt, both bits false.
                 (false, Err((state, reason))) => {

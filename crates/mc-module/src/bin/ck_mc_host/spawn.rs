@@ -153,7 +153,11 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
         .map_err(|_| SpawnError("executable stat failed"))?;
     // SAFETY: geteuid never fails and has no memory effects.
     let euid = unsafe { libc::geteuid() };
-    if !exe_meta.is_file() || exe_meta.uid() != euid {
+    // An other-writable executable is trusted by nobody: any principal on the
+    // host could rewrite the inode before or after the descriptor is retained,
+    // and `fexecve` would then run those bytes as this user. No supported install
+    // layout produces one, so rejecting it cannot refuse a legitimate launcher.
+    if !exe_meta.is_file() || exe_meta.uid() != euid || exe_meta.mode() & 0o002 != 0 {
         return Err(SpawnError("executable failed identity checks"));
     }
     let exe_fd = relocate_above_stderr(OwnedFd::from(exe))?;

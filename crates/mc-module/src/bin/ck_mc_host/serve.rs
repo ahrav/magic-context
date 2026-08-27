@@ -267,18 +267,31 @@ pub fn run() -> Result<(), &'static str> {
     let shutdown = CancellationToken::new();
     runtime.block_on(async {
         let signal_shutdown = shutdown.clone();
-        // Installed before the host future starts. Creating the stream inside
-        // the spawned task races `mc_host::run`: a SIGTERM arriving before
+        // Installed before the host future starts. Creating a stream inside the
+        // spawned task races `mc_host::run`: a signal arriving before
         // registration takes the default disposition and kills the daemon
         // outright, so the runtime never observes the cancellation and the
         // fenced teardown in `mc_host::run` never runs. An installation failure
         // is also fatal to the shutdown path, so it fails startup here rather
         // than panicking a detached task and leaving `run` serving with no
-        // SIGTERM handling and nothing reporting it.
-        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|_| "SIGTERM handler installation failed")?;
+        // signal handling and nothing reporting it.
+        //
+        // SIGINT is handled alongside SIGTERM: the spawn path resets every
+        // inherited disposition to its default, so an interrupt from an operator
+        // or a process supervisor would otherwise terminate the daemon without
+        // draining routes and components.
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|_| "SIGTERM handler installation failed")?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|_| "SIGINT handler installation failed")?;
         let signal_task = tokio::spawn(async move {
-            if signal.recv().await.is_some() {
+            let received = tokio::select! {
+                signal = terminate.recv() => signal,
+                signal = interrupt.recv() => signal,
+            };
+            if received.is_some() {
                 signal_shutdown.cancel();
             }
         });
