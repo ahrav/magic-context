@@ -746,7 +746,12 @@ function writeEvidenceChain(
     });
 }
 
-function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJsonValue {
+/**
+ * Canonical provenance shape for claim-operation request digests. Shared with
+ * the typed anti-memory writer so both digest the same field set; a field
+ * added to `ClaimEvidenceProvenance` must land here exactly once.
+ */
+export function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJsonValue {
     return {
         extractor: provenance.extractor,
         extractorRunId: provenance.extractorRunId,
@@ -1028,6 +1033,12 @@ export interface CreateProjectMemoryClaimInput {
     userInferred?: boolean;
     requestScope?: string;
     nowMs?: number;
+    /**
+     * Set only by the typed anti-memory writer (`storage-anti-memory.ts`).
+     * The stage refuses `REJECTED_APPROACH` rows without it so no generic
+     * caller can mint an anti-memory revision that lacks its payload row.
+     */
+    antiMemoryWriter?: boolean;
 }
 
 export interface ProducerIdentity {
@@ -1098,6 +1109,11 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
     nowMs: number,
 ): ClaimOperationStageOutcome {
     const attributes = resolveAttributes(input);
+    if (attributes.category === ANTI_MEMORY_CATEGORY && input.antiMemoryWriter !== true) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory creation is refused; use the typed anti-memory API",
+        );
+    }
     const normalizedHash = computeNormalizedHash(input.dedupText ?? input.content);
     const holder = db
         .prepare(
@@ -1205,11 +1221,6 @@ export function createProjectMemoryClaim(
     producer: ProducerIdentity,
     input: CreateProjectMemoryClaimInput,
 ): ClaimOperationRunResult {
-    if (input.category === ANTI_MEMORY_CATEGORY) {
-        throw new ClaimOperationInputError(
-            "generic anti-memory creation is refused; use the typed anti-memory API",
-        );
-    }
     const attributes = resolveAttributes(input);
     const envelope: ClaimOperationEnvelope = {
         ...producer,
@@ -1250,6 +1261,14 @@ export interface ReviseProjectMemoryClaimInput {
     userInferred?: boolean;
     requestScope?: string;
     nowMs?: number;
+    /**
+     * Set only by the typed anti-memory writer (`storage-anti-memory.ts`).
+     * The stage refuses `REJECTED_APPROACH` revisions without it: a generic
+     * revise would advance the current revision with no
+     * `claim_anti_memory_revision_payloads` row, permanently breaking the
+     * typed reader for that claim (the payload table is append-only).
+     */
+    antiMemoryWriter?: boolean;
 }
 
 /** Transaction-local domain stage for composition inside one outer claim operation. */
@@ -1280,6 +1299,15 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         sharing: input.sharing ?? current.sharing,
         expiresAt: input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
     };
+    if (
+        (current.category === ANTI_MEMORY_CATEGORY ||
+            nextAttributes.category === ANTI_MEMORY_CATEGORY) &&
+        input.antiMemoryWriter !== true
+    ) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory revision is refused; use the typed anti-memory API",
+        );
+    }
     if (
         (current.category === ANTI_MEMORY_CATEGORY) !==
         (nextAttributes.category === ANTI_MEMORY_CATEGORY)
@@ -1405,13 +1433,6 @@ export function reviseProjectMemoryClaim(
     producer: ProducerIdentity,
     input: ReviseProjectMemoryClaimInput,
 ): ClaimOperationRunResult {
-    const claim = getProjectMemoryClaimByPublicId(db, input.token.publicClaimId);
-    const current = claim ? readRevisionAttributes(db, claim.currentRevisionId) : null;
-    if (input.category === ANTI_MEMORY_CATEGORY || current?.category === ANTI_MEMORY_CATEGORY) {
-        throw new ClaimOperationInputError(
-            "generic anti-memory revision is refused; use the typed anti-memory API",
-        );
-    }
     const envelope: ClaimOperationEnvelope = {
         ...producer,
         requestDigest: computeClaimOperationRequestDigest({

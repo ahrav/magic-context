@@ -48,7 +48,6 @@ import type { MemoryScope } from "./types.ts";
 
 export type ProjectMemorySurface =
     | "auto_inject"
-    | "auto_search"
     | "explicit_search"
     | "maintenance_hygiene"
     | "maintenance_verification";
@@ -167,6 +166,19 @@ function resolveCandidates(
         throw new ClaimOperationInputError(
             "current-state reads require public locators or an authorized project set",
         );
+    }
+    // Anti-memory is only reachable through explicit search; filtering it in
+    // the candidate query keeps the hot automatic surfaces from paying full
+    // hydration for rows `surfaceDecision` (the authoritative check, kept as
+    // defence in depth) would discard anyway.
+    if ((request.surface ?? "explicit_search") !== "explicit_search") {
+        clauses.push(
+            `NOT EXISTS (
+                SELECT 1 FROM claim_memory_revision_attributes attrs
+                 WHERE attrs.revision_id = claims.current_revision_id
+                   AND attrs.category = ?)`,
+        );
+        bindings.push(ANTI_MEMORY_CATEGORY);
     }
     return db
         .prepare(
@@ -368,6 +380,14 @@ function surfaceDecision(
     if (item.expiresAt !== null && item.expiresAt <= nowMs) {
         return { eligible: false, label: null };
     }
+    // Rejected approaches are reachable only through explicit search. Every
+    // other surface — automatic injection AND the dreamer maintenance lanes —
+    // must never see them: a maintenance curate pass that consumes one can
+    // re-create its content under a positive category, laundering a rejected
+    // approach back into auto-injected memory.
+    if (item.category === ANTI_MEMORY_CATEGORY && surface !== "explicit_search") {
+        return { eligible: false, label: null };
+    }
     const facts = item.dispositions;
     if (item.policy.hardHidden || facts.contradicted || facts.quarantined || facts.rejected) {
         return { eligible: false, label: null };
@@ -387,13 +407,9 @@ function surfaceDecision(
     // provider has to agree, or an older process still attached to the database
     // keeps auto-injecting content it cannot reason about.
     const versionUnsupported = item.policy.policyVersion > CLAIM_POLICY_VERSION;
-    if (surface === "auto_inject" || surface === "auto_search") {
+    if (surface === "auto_inject") {
         return {
-            eligible:
-                item.category !== ANTI_MEMORY_CATEGORY &&
-                !versionUnsupported &&
-                item.policy.autoEligible &&
-                !softHidden,
+            eligible: !versionUnsupported && item.policy.autoEligible && !softHidden,
             label: null,
         };
     }

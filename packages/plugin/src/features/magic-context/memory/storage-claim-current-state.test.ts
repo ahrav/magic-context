@@ -147,7 +147,7 @@ describe("current-state provider: hydration", () => {
 });
 
 describe("current-state provider: anti-memory surface exclusion", () => {
-    test("denies automatic surfaces while preserving explicit search", () => {
+    test("denies every non-explicit surface while preserving explicit search", () => {
         const ctx = setup();
         try {
             const positive = createClaimOp(ctx, "positive", "Positive fact.");
@@ -168,7 +168,15 @@ describe("current-state provider: anti-memory surface exclusion", () => {
             );
             const antiId = publicIdOf(anti);
 
-            for (const surface of ["auto_inject", "auto_search"] as const) {
+            // The maintenance lanes feed the dreamer curate/verify pipeline,
+            // which re-creates content it consumes; a rejected approach that
+            // reaches them can be laundered back into positive memory, so the
+            // exclusion must cover every surface except explicit search.
+            for (const surface of [
+                "auto_inject",
+                "maintenance_hygiene",
+                "maintenance_verification",
+            ] as const) {
                 const automatic = readProjectMemoryCurrentState(ctx.db, {
                     projectIds: [ctx.projectId],
                     surface,

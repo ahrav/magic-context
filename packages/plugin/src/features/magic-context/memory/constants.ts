@@ -1,4 +1,4 @@
-import type { AntiMemoryCategory, MemoryCategory, WritableMemoryCategory } from "./types";
+import type { AntiMemoryCategory, MemoryCategory } from "./types";
 
 /**
  * The v2 world taxonomy — the only categories agents may WRITE today. Exposed
@@ -14,12 +14,12 @@ export const V2_MEMORY_CATEGORIES = [
     "NAMING",
 ] as const satisfies readonly MemoryCategory[];
 
+/**
+ * Rejected approaches live outside the writable taxonomy on purpose: the
+ * generic claim operations refuse this category, and the only write path is
+ * the typed API in `storage-anti-memory.ts`.
+ */
 export const ANTI_MEMORY_CATEGORY = "REJECTED_APPROACH" as const satisfies AntiMemoryCategory;
-
-export const WRITABLE_MEMORY_CATEGORIES = [
-    ...V2_MEMORY_CATEGORIES,
-    ANTI_MEMORY_CATEGORY,
-] as const satisfies readonly WritableMemoryCategory[];
 
 export const PROMOTABLE_CATEGORIES: MemoryCategory[] = [
     // v2 world taxonomy (what the historian emits today)

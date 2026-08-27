@@ -66,6 +66,9 @@ function seedBareAntiClaim(
                     projectId,
                     category: "REJECTED_APPROACH",
                     content,
+                    // Bypasses the typed anti-memory API on purpose: these
+                    // tests exercise the schema triggers directly.
+                    antiMemoryWriter: true,
                     provenance: {
                         sourceLocator: `test://${operationKey}`,
                         sourceContent: content,

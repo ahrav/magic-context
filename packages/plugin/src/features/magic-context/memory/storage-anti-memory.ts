@@ -10,11 +10,12 @@ import {
     ClaimOperationInputError,
     type ClaimOperationRunResult,
     type ProducerIdentity,
+    provenanceRequestShape,
     runClaimOperation,
     stageCreateProjectMemoryClaimInCurrentTransaction,
     stageReviseProjectMemoryClaimInCurrentTransaction,
 } from "./storage-claim-operations";
-import { ClaimGraphCorruptionError, sha256Utf8Hex } from "./storage-claims";
+import { ClaimGraphCorruptionError } from "./storage-claims";
 
 export const ANTI_MEMORY_DEFAULT_TTL_MS = 90 * 24 * 60 * 60 * 1_000;
 
@@ -140,19 +141,6 @@ function antiMemoryDedupText(payload: StoredAntiMemoryPayload): string {
     return JSON.stringify([payload.trigger, payload.rejectedStrategy]);
 }
 
-function provenanceDigestShape(provenance: ClaimEvidenceProvenance) {
-    return {
-        extractor: provenance.extractor,
-        extractorRunId: provenance.extractorRunId,
-        extractorVersion: provenance.extractorVersion,
-        independenceKey: provenance.independenceKey,
-        sourceContentDigest: sha256Utf8Hex(provenance.sourceContent),
-        sourceLocator: provenance.sourceLocator,
-        sourceSessionId: provenance.sourceSessionId ?? null,
-        sourceTrustClass: provenance.sourceTrustClass ?? null,
-    };
-}
-
 function payloadDigestShape(payload: StoredAntiMemoryPayload) {
     return { ...payload };
 }
@@ -205,7 +193,7 @@ export function createAntiMemory(
                 operation: "create-anti-memory",
                 payload: payloadDigestShape(payload),
                 projectId: input.projectId,
-                provenance: provenanceDigestShape(input.provenance),
+                provenance: provenanceRequestShape(input.provenance),
                 requestScope: input.requestScope ?? null,
             }),
         },
@@ -225,6 +213,7 @@ export function createAntiMemory(
                     actor: input.actor,
                     requestScope: input.requestScope,
                     nowMs,
+                    antiMemoryWriter: true,
                 },
                 nowMs,
             );
@@ -261,6 +250,14 @@ function reviseWithPayload(
         payload: StoredAntiMemoryPayload;
         expiresAt?: number;
         operation: "revise-anti-memory" | "extend-anti-memory-ttl";
+        /**
+         * Runs inside the staged callback, after the operation-key receipt
+         * lookup. Validation that compares against current state (e.g. the
+         * TTL forward-progress check) must live here, not before
+         * `runClaimOperation`: a pre-transaction check would reject an honest
+         * replay whose receipt should short-circuit instead.
+         */
+        validateStage?: () => void;
     },
 ): ClaimOperationRunResult {
     const content = renderAntiMemoryContent(args.payload);
@@ -275,12 +272,13 @@ function reviseWithPayload(
                 expiresAt: args.expiresAt ?? null,
                 operation: args.operation,
                 payload: payloadDigestShape(args.payload),
-                provenance: provenanceDigestShape(args.input.provenance),
+                provenance: provenanceRequestShape(args.input.provenance),
                 requestScope: args.input.requestScope ?? null,
                 token: args.input.token,
             }),
         },
         () => {
+            args.validateStage?.();
             const staged = stageReviseProjectMemoryClaimInCurrentTransaction(
                 db,
                 {
@@ -292,6 +290,7 @@ function reviseWithPayload(
                     actor: args.input.actor,
                     requestScope: args.input.requestScope,
                     nowMs,
+                    antiMemoryWriter: true,
                 },
                 nowMs,
             );
@@ -331,14 +330,23 @@ export function extendAntiMemoryTtl(
     }
     const current = readAntiMemory(db, input.token.publicClaimId);
     if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
-    if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
-        throw new ClaimOperationInputError("anti-memory TTL extension must move expiry forward");
-    }
     return reviseWithPayload(db, producer, {
         input,
         payload: current.payload,
         expiresAt: input.expiresAt,
         operation: "extend-anti-memory-ttl",
+        // Checked inside the stage: after a successful apply the stored expiry
+        // equals the request's, so a pre-transaction check would throw on an
+        // honest same-operation-key retry that must replay its receipt.
+        validateStage: () => {
+            const latest = readAntiMemory(db, input.token.publicClaimId);
+            if (latest === null) throw new ClaimOperationInputError("unknown anti-memory claim");
+            if (latest.expiresAt === null || input.expiresAt <= latest.expiresAt) {
+                throw new ClaimOperationInputError(
+                    "anti-memory TTL extension must move expiry forward",
+                );
+            }
+        },
     });
 }
 
@@ -364,13 +372,30 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
               WHERE public.public_id = ?`,
         )
         .get(publicClaimId) as
-        | (Omit<AntiMemoryRecord, "publicClaimId" | "revisionLocator" | "payload"> &
-              StoredAntiMemoryPayload & { trigger: string | null })
+        | (Omit<
+              AntiMemoryRecord,
+              "publicClaimId" | "revisionLocator" | "payload" | "memoryScope" | "sharing"
+          > &
+              StoredAntiMemoryPayload & {
+                  trigger: string | null;
+                  memoryScope: string;
+                  sharing: string;
+              })
         | undefined;
     if (!row || row.category !== ANTI_MEMORY_CATEGORY) return null;
     if (row.trigger === null) {
         throw new ClaimGraphCorruptionError(
             `anti-memory ${publicClaimId} current revision has no payload row`,
+        );
+    }
+    // Anti-memory is project-private by construction; a stored row that says
+    // otherwise means some path mutated scope or sharing around the typed
+    // writer. Fail closed instead of masking the violated invariant with
+    // hardcoded values.
+    if (row.memoryScope !== "project" || row.sharing !== "private") {
+        throw new ClaimGraphCorruptionError(
+            `anti-memory ${publicClaimId} must be project-private but stores ` +
+                `scope=${row.memoryScope} sharing=${row.sharing}`,
         );
     }
     const payload: StoredAntiMemoryPayload = {
@@ -398,8 +423,8 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
         category: ANTI_MEMORY_CATEGORY,
         normalizedHash: row.normalizedHash,
         importance: row.importance,
-        memoryScope: "project",
-        sharing: "private",
+        memoryScope: row.memoryScope,
+        sharing: row.sharing,
         expiresAt: row.expiresAt,
         payload,
     };

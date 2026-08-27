@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createDirectTestDatabase } from "../test-database";
+import { computeClaimOperationRequestDigest } from "./claim-operation-contract";
 import {
     createAgentAntiMemory,
     createAntiMemory,
@@ -14,6 +15,8 @@ import {
     computeProjectMemoryMutationToken,
     mergeProjectMemoryClaims,
     reviseProjectMemoryClaim,
+    runClaimOperation,
+    stageReviseProjectMemoryClaimInCurrentTransaction,
 } from "./storage-claim-operations";
 import { ensureProject } from "./storage-claims";
 
@@ -200,6 +203,116 @@ describe("anti-memory typed operations", () => {
             expect(afterExtension?.expiresAt).toBe(extendedTo);
             expect(afterExtension?.payload).toEqual(afterRevision?.payload);
             expect(afterExtension?.normalizedHash).toBe(hash);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("replays an identical TTL extension instead of rejecting the retry", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-replay");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            const token = computeProjectMemoryMutationToken(db, publicClaimId);
+            const extendInput = {
+                token,
+                expiresAt: 200 * DAY_MS,
+                provenance: provenance("extend"),
+                actor: "verifier",
+                nowMs: 20,
+            };
+            const first = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(first.outcome).toBe("applied");
+            expect(first.replayed).toBe(false);
+
+            // The stored expiry now equals the request's, so a pre-transaction
+            // forward-progress check would throw here; the receipt must win.
+            const retry = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(retry.outcome).toBe("applied");
+            expect(retry.replayed).toBe(true);
+            expect(readAntiMemory(db, publicClaimId)?.expiresAt).toBe(200 * DAY_MS);
+
+            // A fresh operation that does not move expiry forward still fails.
+            expect(() =>
+                extendAntiMemoryTtl(
+                    db,
+                    { producer: "test", operationKey: "extend-again" },
+                    {
+                        ...extendInput,
+                        token: computeProjectMemoryMutationToken(db, publicClaimId),
+                        provenance: provenance("extend-again"),
+                    },
+                ),
+            ).toThrow(/move expiry forward/);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses a generic staging revise so a payload-less revision cannot be minted", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-stage-guard");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 1,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            // Mimics an in-transaction maintenance caller (dreamer curate /
+            // classify / verify) that reaches the stage function directly,
+            // bypassing the typed anti-memory API.
+            expect(() =>
+                runClaimOperation(
+                    db,
+                    {
+                        producer: "test",
+                        operationKey: "stage-bypass",
+                        requestDigest: computeClaimOperationRequestDigest({
+                            operationKey: "stage-bypass",
+                        }),
+                    },
+                    () =>
+                        stageReviseProjectMemoryClaimInCurrentTransaction(
+                            db,
+                            {
+                                token: computeProjectMemoryMutationToken(db, publicClaimId),
+                                content: "rewritten by a generic maintenance pass",
+                                provenance: provenance("stage-bypass"),
+                                actor: "dreamer",
+                            },
+                            2,
+                        ),
+                    2,
+                ),
+            ).toThrow(/anti-memory/);
+            // The typed reader must still work: no payload-less revision landed.
+            expect(readAntiMemory(db, publicClaimId)?.revision).toBe(1);
         } finally {
             closeQuietly(db);
         }
