@@ -967,12 +967,27 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
             dir_path.push('/');
         }
         dir_path.push_str(component);
-        match mkdirat(temp_fd, dir_path.as_str(), Mode::from_raw_mode(0o700)) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        let created = match mkdirat(temp_fd, dir_path.as_str(), Mode::from_raw_mode(0o700)) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::EXIST) => false,
             Err(rustix::io::Errno::NOSPC) | Err(rustix::io::Errno::DQUOT) => {
                 return Err(GenerationError::InsufficientStorage)
             }
             Err(_) => return Err(invalid("staging directory creation failed")),
+        };
+        // The mkdir mode is umask-filtered here too, and an intermediate left
+        // without owner execute cannot be traversed — so the destination `openat`
+        // below would fail on a nested path like `bin/tool`. Normalized only when
+        // this call created the component, so the pathname chmod cannot be
+        // redirected through something already sitting at that name.
+        if created {
+            rustix::fs::chmodat(
+                temp_fd,
+                dir_path.as_str(),
+                Mode::from_raw_mode(0o700),
+                AtFlags::empty(),
+            )
+            .map_err(|_| invalid("staging directory chmod failed"))?;
         }
     }
     let mode = if spec.executable { 0o700 } else { 0o600 };

@@ -43,6 +43,10 @@ const STOP_TEARDOWN: Duration = Duration::from_secs(10);
 /// before reporting `lifecycle_busy`.
 const TRANSITION_SETTLE: Duration = Duration::from_secs(5);
 const REPROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// Bound on the best-effort close that follows a proven handshake. It exists only
+/// so a stalled peer cannot hang the phase; expiring it never changes an
+/// authentication verdict the handshake already settled.
+const CLOSE_GRACE: Duration = Duration::from_millis(500);
 
 /// Dev/test-only phase-cap override in milliseconds, clamped to the outer
 /// aggregate. Lengthens the spawn/publication/auth and teardown phase caps
@@ -403,15 +407,20 @@ impl Runtime {
         }
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
-            tokio::time::timeout(remaining, async {
-                let client = Client::connect(&path).await.ok()?;
-                let _ = client.close().await;
-                Some(())
-            })
-            .await
-            .ok()
-            .flatten()
-            .is_some()
+            // Only the handshake is bounded by the phase deadline. A completed
+            // handshake *is* the authenticated-transport proof, so the close that
+            // follows is best-effort cleanup and must not be able to withdraw it:
+            // `close` carries its own longer deadline than this phase cap, so
+            // folding it into the same timeout let a healthy daemon under slow
+            // teardown report `authentication_failed`. It is still bounded, so a
+            // stalled peer cannot hang the phase.
+            match tokio::time::timeout(remaining, Client::connect(&path)).await {
+                Ok(Ok(client)) => {
+                    let _ = tokio::time::timeout(CLOSE_GRACE, client.close()).await;
+                    true
+                }
+                _ => false,
+            }
         })
     }
 
@@ -562,6 +571,7 @@ fn start_phase(
     preresolved: Option<String>,
     anchor: &NamespaceAnchor,
     outer: Instant,
+    stop_committed: bool,
 ) -> StartOutcome {
     let fail = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
@@ -586,11 +596,19 @@ fn start_phase(
     }
 
     // Generation resolution stages and hashes every payload file synchronously
-    // and can outlast the aggregate on slow storage. Spawning after the budget
-    // is gone would report `startup_timeout` to the caller while a daemon comes
-    // up behind it, so the spawn is refused instead. Resolution already
-    // succeeded, so the generation check passes.
-    if Instant::now() >= outer {
+    // and can outlast the aggregate on slow storage. With nothing committed,
+    // spawning past the budget would report `startup_timeout` to the caller while
+    // a daemon comes up behind it, so the spawn is refused instead and the caller
+    // can retry cleanly. Resolution already succeeded, so the generation check
+    // passes.
+    //
+    // Once a stop is committed the trade inverts: the spawn is the only path back
+    // to service, and refusing it would turn an overrun into an outage. The
+    // deadline must never be the reason a committed stop has no successor, so the
+    // aggregate is allowed to overrun rather than the daemon left down. The
+    // pre-stop reservation in `cmd_restart` is what keeps that overrun rare;
+    // post-stop staging is unbounded work that no reservation can size.
+    if !stop_committed && Instant::now() >= outer {
         return StartOutcome {
             ok: false,
             state: "stopped",
@@ -695,6 +713,14 @@ fn start_phase(
 fn preflight_generation(
     payload_dir: Option<&Path>,
 ) -> Result<Option<String>, (&'static str, &'static str)> {
+    // Platform support is pre-existing state like any other, so it is decided
+    // here rather than inside the post-stop resolution: otherwise
+    // `restart --payload-dir` on an unsupported target commits the stop and only
+    // then reports `unsupported_platform`, which is an outage produced by a
+    // condition that was knowable before anything was touched.
+    if build_target().is_none() {
+        return Err(("stopped", "unsupported_platform"));
+    }
     match payload_dir {
         // Dev staging prunes, stages, and promotes, so it must stay after the
         // stop; only its read-only source enumeration is preflighted.
@@ -945,7 +971,7 @@ fn cmd_start(payload_dir: Option<&Path>) -> DaemonResult {
         LifecycleState::Stopped => {
             // Nothing is running, so there is no stop to sequence against:
             // resolution happens inside the start.
-            let outcome = start_phase(&runtime, payload_dir, None, &anchor, outer);
+            let outcome = start_phase(&runtime, payload_dir, None, &anchor, outer, false);
             start_outcome_result(command, outcome, None)
         }
     }
@@ -1212,7 +1238,14 @@ fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
         // Nothing was running, so there is no stop to commit.
         _ => false,
     };
-    let outcome = start_phase(&runtime, payload_dir, preresolved, &anchor, outer);
+    let outcome = start_phase(
+        &runtime,
+        payload_dir,
+        preresolved,
+        &anchor,
+        outer,
+        stop_committed,
+    );
     let start_committed = outcome.ok;
     start_outcome_result(
         command,
