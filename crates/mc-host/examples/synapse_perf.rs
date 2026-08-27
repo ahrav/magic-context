@@ -445,26 +445,35 @@ struct RoutedWire {
     /// Correlations whose caller gave up (attempt timeout) but whose
     /// terminal may still arrive. Without this, a late terminal looks
     /// like an unknown correlation, poisons `reader_error`, and kills
-    /// every other in-flight call in the repetition. FIFO-bounded at
-    /// [`TOMBSTONE_CAP`]: the oldest tombstone is evicted first, and a
-    /// tombstone is consumed when its late terminal arrives.
+    /// every other in-flight call in the repetition.
+    ///
+    /// Never evicted, only consumed when its late terminal arrives. A cap with
+    /// FIFO eviction cannot be sized safely: the harness accepts rates where a
+    /// single saturated cell times out more calls than any fixed bound, and
+    /// evicting a still-live entry converts an expected late reply into a fatal
+    /// unknown correlation that poisons the wire for every unrelated request.
+    /// Residency is therefore bounded by the calls that genuinely never receive
+    /// a terminal, at one `u64` each.
     ///
     /// Ordering protocol, which both sides must follow so a live
     /// correlation is never absent from both maps at once: the giving-up
-    /// caller pushes here *before* removing its `pending` entry, and the
+    /// caller inserts here *before* removing its `pending` entry, and the
     /// reader checks `pending` *before* checking here.
-    tombstones: Mutex<std::collections::VecDeque<u64>>,
+    tombstones: Mutex<std::collections::BTreeSet<u64>>,
     next_corr: AtomicU64,
     channel: u16,
     epoch: u32,
     origin: Instant,
     reader_error: Mutex<Option<String>>,
+    /// Frames whose write completed after the caller's deadline.
+    ///
+    /// `write_all` is not cancel-safe, so a frame that starts just inside the
+    /// deadline is always finished rather than abandoned mid-stream. That work
+    /// still reaches the host after the deadline the harness recorded as
+    /// expired, which perturbs later load, so it is counted and invalidates the
+    /// repetition rather than being silently tolerated.
+    overdeadline_writes: AtomicU64,
 }
-
-/// Upper bound on retained timed-out correlations, sized at the largest
-/// plausible in-flight population (open-loop tasks awaiting replies) so
-/// the set cannot grow without bound across a long repetition.
-const TOMBSTONE_CAP: usize = 4096;
 
 enum WireCallError {
     Timeout {
@@ -504,12 +513,13 @@ impl RoutedWire {
         let wire = Arc::new(Self {
             writer: Mutex::new(writer),
             pending: Mutex::new(HashMap::new()),
-            tombstones: Mutex::new(std::collections::VecDeque::new()),
+            tombstones: Mutex::new(std::collections::BTreeSet::new()),
             next_corr: AtomicU64::new(1_000_000),
             channel,
             epoch,
             origin,
             reader_error: Mutex::new(None),
+            overdeadline_writes: AtomicU64::new(0),
         });
         let reader_wire = Arc::clone(&wire);
         tokio::spawn(async move {
@@ -529,6 +539,10 @@ impl RoutedWire {
     /// own observations on the same axis as recorded sends and terminals.
     fn origin(&self) -> Instant {
         self.origin
+    }
+
+    fn overdeadline_writes(&self) -> u64 {
+        self.overdeadline_writes.load(Ordering::Relaxed)
     }
 
     /// Position of `at` on the same wire clock [`Self::elapsed_ns`] reports,
@@ -594,6 +608,15 @@ impl RoutedWire {
                     "send correlation {corr}: {error}"
                 )));
             }
+            // Socket backpressure can hold this write past the deadline it
+            // started inside. Abandoning it is not an option — a partial frame
+            // desynchronizes the shared connection for every other in-flight
+            // request — so the crossing is recorded instead. The host executes
+            // work the harness has already accounted as expired, which perturbs
+            // later load, so a repetition that does this is not admissible.
+            if Instant::now() >= deadline {
+                self.overdeadline_writes.fetch_add(1, Ordering::Relaxed);
+            }
             (corr, rx, sent_ns)
         };
         match tokio::time::timeout_at(deadline.into(), rx).await {
@@ -618,16 +641,22 @@ impl RoutedWire {
                 // concurrently finds neither, reports an unknown correlation,
                 // and poisons the shared connection for every other in-flight
                 // logical request over an expected late terminal.
-                let mut tombstones = self.tombstones.lock().await;
-                if tombstones.len() >= TOMBSTONE_CAP {
-                    tombstones.pop_front();
-                }
-                tombstones.push_back(corr);
-                drop(tombstones);
+                self.tombstones.lock().await.insert(corr);
                 // A terminal that already consumed the sender leaves this
-                // tombstone unclaimed; FIFO eviction at [`TOMBSTONE_CAP`]
-                // bounds that residue.
+                // tombstone unclaimed. That residue is bounded by the calls
+                // that never receive a terminal at all, which is why nothing is
+                // evicted: an eviction cannot tell a stale entry from a live
+                // one, and getting it wrong poisons the whole wire.
                 self.pending.lock().await.remove(&corr);
+                // The reader can fail between this call's health check and its
+                // `pending` insert, leaving a sender nothing will ever settle.
+                // That expires as an ordinary attempt timeout, so without this
+                // re-check a disconnected wire is indistinguishable from
+                // workload censoring — and if it is the last call of the
+                // repetition, nothing else ever observes the stored error.
+                if let Some(error) = self.reader_error.lock().await.clone() {
+                    return Err(WireCallError::Transport(error));
+                }
                 Err(WireCallError::Timeout {
                     sent_ns,
                     terminal_ns: self.elapsed_ns(),
@@ -678,9 +707,7 @@ async fn read_terminals(
             // A terminal for a correlation whose caller already timed out
             // is expected wire traffic, not corruption: consume the
             // tombstone and discard the frame silently.
-            let mut tombstones = wire.tombstones.lock().await;
-            if let Some(position) = tombstones.iter().position(|corr| *corr == frame.corr) {
-                tombstones.remove(position);
+            if wire.tombstones.lock().await.remove(&frame.corr) {
                 continue;
             }
             return Err(format!("terminal for unknown correlation {}", frame.corr));
@@ -1875,6 +1902,11 @@ struct Summary {
     /// `fatal_errors` (still part of the fatal gate), counted separately
     /// so analysis can distinguish connection loss from harness defects.
     connection_loss_errors: u64,
+    /// Frames whose write finished after the caller's deadline. See
+    /// [`RoutedWire::overdeadline_writes`]: any nonzero value means the host ran
+    /// work the harness had already accounted as expired, so the repetition is
+    /// inadmissible.
+    overdeadline_writes: u64,
     fatal_errors: Vec<String>,
 }
 
@@ -2147,6 +2179,7 @@ async fn run(
         task_window_start_ns: task_window.as_ref().map(|window| window.observed_start_ns),
         task_window_end_ns: task_window.as_ref().map(|window| window.observed_end_ns),
         connection_loss_errors,
+        overdeadline_writes: ctx.wire.overdeadline_writes(),
         fatal_errors,
     };
     drop(ctx);
@@ -2280,14 +2313,26 @@ fn main() {
                 .poll_distribution
                 .as_ref()
                 .is_some_and(|polls| polls.max > MAX_POLLS_PER_LOGICAL);
+            // An empty measured window is internally consistent — the ledger
+            // balances, censoring divides to zero, and no missed-slot gate
+            // applies to closed loop — so nothing above rejects it. A cell with
+            // no measured request carries no estimate at all and must not be
+            // consumable as admissible evidence. A closed-loop repetition
+            // reaches this state whenever every request it opened fell in the
+            // warmup prefix or spanned the whole hold.
+            let empty_window = summary.ledger.offered == 0
+                || summary.logical_latency.is_none()
+                || summary.service_time.is_none();
             if !summary.ledger.valid
                 || !summary.fatal_errors.is_empty()
                 || summary.missed_slots != 0
                 || censoring_invalid
                 || poll_ceiling_exceeded
+                || summary.overdeadline_writes != 0
+                || empty_window
             {
                 eprintln!(
-                    "synapse_perf failed: invalid repetition (ledger={}, fatal={}, missed_slots={}, censored_per_mille={:.3}, poll_max={} vs ceiling {})",
+                    "synapse_perf failed: invalid repetition (ledger={}, fatal={}, missed_slots={}, censored_per_mille={:.3}, poll_max={} vs ceiling {}, overdeadline_writes={}, measured_offered={})",
                     summary.ledger.valid,
                     summary.fatal_errors.len(),
                     summary.missed_slots,
@@ -2296,7 +2341,9 @@ fn main() {
                         .poll_distribution
                         .as_ref()
                         .map_or(0, |polls| polls.max),
-                    MAX_POLLS_PER_LOGICAL
+                    MAX_POLLS_PER_LOGICAL,
+                    summary.overdeadline_writes,
+                    summary.ledger.offered
                 );
                 std::process::exit(1);
             }
@@ -2385,12 +2432,13 @@ mod tests {
         let wire = Arc::new(RoutedWire {
             writer: Mutex::new(writer),
             pending: Mutex::new(HashMap::new()),
-            tombstones: Mutex::new(std::collections::VecDeque::new()),
+            tombstones: Mutex::new(std::collections::BTreeSet::new()),
             next_corr: AtomicU64::new(1),
             channel: 7,
             epoch: 3,
             origin: Instant::now(),
             reader_error: Mutex::new(None),
+            overdeadline_writes: AtomicU64::new(0),
         });
         let mut callers = tokio::task::JoinSet::new();
         for _ in 0..CALLERS {

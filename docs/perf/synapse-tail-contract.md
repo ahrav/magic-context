@@ -89,6 +89,15 @@ be told apart from one measured under the warmup prefix or drained after the
 boundary, and `S`, its coefficient of variation, and the capacity estimate built
 on them would describe a different cohort than the logical and attempt ledgers.
 
+A sample is classified by its start alone. A call that begins inside the measured
+span is work that span generated, and its duration is a complete observation even
+when it completes after the boundary; excluding boundary-spanning calls would
+drop the longest ones and truncate the right tail of `S`, biasing the mean and
+coefficient of variation downward and the capacity upward. Because `started_ns`
+and `service_ns` are both retained, the completion instant is derivable, so an
+analysis that wants a different boundary rule can apply it to the raw evidence
+without recollection.
+
 ### Timing boundaries
 
 - Open-loop generation uses scheduled-send timing. Logical-request latency is

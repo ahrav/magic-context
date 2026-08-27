@@ -57,3 +57,5 @@ and `magic-context-ioi` remain OPEN; every queue model here assumes c = 1.
 ## Warmup re-analysis
 
 The original analysis missed the frozen first-10%-of-hold warmup exclusion. A post-hoc timestamp re-analysis of the retained raw evidence applied that pre-collection rule without recollection; headline directions, candidate zero terminal blocking, A/A medians, and K=1 feasibility remain intact, so the provisional `a+c` K=1 selection is unchanged.
+
+That re-analysis is approximate, not exact. This epoch's harness never emitted its hold origin, so the script reconstructs it from the earliest observed start, which cannot precede the true origin. Both boundaries therefore sit later than frozen by the startup delay, admitting some startup interval as measured and an equal tail of post-boundary sends. See `docs/perf/runs/synapse-tail-881be45b/report.md`, "Boundary reconstruction is approximate". Exact application requires recollection with the boundaries emitted.

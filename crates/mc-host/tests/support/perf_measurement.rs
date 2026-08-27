@@ -373,9 +373,22 @@ impl WindowClass {
 /// The duration alone is not sufficient evidence: without a start instant a
 /// consumer cannot tell a call made under the warmup prefix, or one drained
 /// after the window closed, from one served inside the measured span.
+///
+/// Classified by `started_ns` alone, deliberately. A call that begins inside the
+/// measured span is work that span generated, and its duration is a complete
+/// observation of service time even when it finishes after the boundary.
+/// Excluding boundary-spanning calls instead — `started_ns + service_ns` beyond
+/// the window end — would drop the longest calls from `S`, truncating its right
+/// tail and biasing the mean and coefficient of variation downward and the
+/// derived capacity upward. That is the same right-censoring error that keeps
+/// unsettled requests out of the latency percentiles, applied in the direction
+/// that silently flatters the system, so start-based classification is the
+/// conservative rule here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceSample {
-    /// When the engine call began, on the harness wire clock.
+    /// When the engine call began, on the harness wire clock. The completion
+    /// instant is `started_ns + service_ns`, so a consumer that wants a
+    /// different boundary rule can derive it without a second field.
     pub started_ns: u64,
     /// Wall time the engine call occupied.
     pub service_ns: u64,

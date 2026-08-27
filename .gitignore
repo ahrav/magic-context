@@ -117,6 +117,12 @@ docs/fork-hardening-audit.md
 # can then audit which artifact produced a decision, and verify a local bundle
 # against committed hashes, even though it cannot hold the samples themselves.
 docs/perf/runs/*/*/
+# ...but analysis code is not bulk evidence. A committed report that rests on a
+# post-hoc correction is only auditable if the script implementing it ships too,
+# so the code is retained while its multi-megabyte outputs are not.
+!docs/perf/runs/*/analysis/
+docs/perf/runs/*/analysis/*
+!docs/perf/runs/*/analysis/*.py
 
 # Standalone dashboard DB adapter build artifacts
 packages/dashboard/db-adapter/target/

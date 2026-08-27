@@ -173,6 +173,30 @@ amplification, terminal rejection and timeout, deadline success, goodput,
 poll distribution, and permit wait. Every post-warmup logical and attempt
 ledger reconciles. Raw warmup rows remain in their original NDJSON files.
 
+### Boundary reconstruction is approximate
+
+The reconstruction above is not an exact application of the frozen rule, and the
+retained rows cannot make it one. The `881be45b` harness took the closed-loop
+hold origin as `Instant::now()` before spawning its workers
+(`let end = Instant::now() + Duration::from_secs(seconds)`) and never emitted it,
+so no `hold_window_start_ns` exists in this bundle. The script therefore
+substitutes the earliest observed start — `min(actual_first_send_ns)` for closed
+loop — which cannot precede the true origin: workers still have to be spawned and
+reach the socket first.
+
+The error has a known sign. Both the 10% cutoff and the effective hold end land
+later than the frozen boundaries by that startup delay, so some startup interval
+is classified as measured rather than warmup, and an equal tail of post-boundary
+sends is admitted. Open-loop cells are unaffected in the same way, since
+`scheduled_start_ns` is an intended schedule rather than an observation.
+
+Read this section as an approximate correction that leaves the headline
+directions, A/A medians, and K=1 feasibility intact, not as evidence that the
+frozen exclusion was applied exactly. Applying it exactly requires recollection
+with the boundaries emitted, which later harness versions do
+(`hold_window_start_ns`, `warmup_end_ns`, `hold_window_end_ns`, and a per-row
+`window` class).
+
 ### Comparison
 
 `analysis/warmup_reanalysis.json` contains the original and corrected result
