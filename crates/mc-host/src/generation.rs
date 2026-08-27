@@ -397,22 +397,38 @@ impl GenerationStore {
         // the requested data root.
         let root_fd = secure_runtime_dir(&root)?;
         validate_lifecycle_root_fd(&root_fd, &root)?;
-        match mkdirat(&root_fd, GENERATIONS_DIR_NAME, Mode::from_raw_mode(0o700)) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        let created = match mkdirat(&root_fd, GENERATIONS_DIR_NAME, Mode::from_raw_mode(0o700)) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::EXIST) => false,
             Err(e) => return Err(io_err("mkdir_generations", &root, e).into()),
+        };
+        // mkdir modes are filtered by umask, which can leave a freshly created
+        // directory with no owner bits — and a 0700 directory cannot even be
+        // opened by its owner, so the mode must be restored by pathname before
+        // the descriptor exists. That pathname `chmodat` follows symlinks, so it
+        // runs only when this call created the entry: `mkdirat` succeeding proves
+        // a real directory is at that name and nothing else can be. An existing
+        // entry is never chmodded, so a symlink planted at `generations` cannot
+        // redirect the mode change onto its target before the no-follow open
+        // below rejects the store.
+        if created {
+            rustix::fs::chmodat(
+                &root_fd,
+                GENERATIONS_DIR_NAME,
+                Mode::from_raw_mode(0o700),
+                AtFlags::empty(),
+            )
+            .map_err(|e| io_err("chmod_generations", &root, e))?;
         }
-        // mkdir modes are filtered by umask, so a restrictive umask can leave a
-        // freshly created directory unreadable to its owner. Normalize through
-        // the pathname we just created, then pin and validate the real object.
-        rustix::fs::chmodat(
-            &root_fd,
-            GENERATIONS_DIR_NAME,
-            Mode::from_raw_mode(0o700),
-            AtFlags::empty(),
-        )
-        .map_err(|e| io_err("chmod_generations", &root, e))?;
         let generations_fd = open_child_dir(&root_fd, GENERATIONS_DIR_NAME)
             .ok_or_else(|| invalid("generations directory failed security checks"))?;
+        if created {
+            // Pin the mode through the descriptor now that one exists, so the
+            // final state is set on the object we validated rather than on a
+            // name.
+            rustix::fs::fchmod(&generations_fd, Mode::from_raw_mode(0o700))
+                .map_err(|e| io_err("fchmod_generations", &root, e))?;
+        }
         Ok(Self {
             root,
             root_fd,
@@ -1121,11 +1137,7 @@ fn walk_generation_tree(
     prefix: &str,
     found: &mut BTreeSet<String>,
 ) -> Result<(), GenerationError> {
-    let names = {
-        let dup = rustix::io::dup(dir).map_err(|_| invalid("generation directory dup failed"))?;
-        let std_dir = std::fs::File::from(dup);
-        read_dir_names(&std_dir)?
-    };
+    let names = read_dir_names(dir)?;
     for name in names {
         let rel = if prefix.is_empty() {
             name.clone()
@@ -1164,11 +1176,7 @@ fn remove_tree(parent: &OwnedFd, name: &str) -> Result<(), GenerationError> {
     let Some(dir) = open_child_dir_for_removal(parent, name) else {
         return Err(invalid("removal target failed security checks"));
     };
-    let names: Vec<String> = {
-        let dup = rustix::io::dup(&dir).map_err(|_| invalid("directory dup failed"))?;
-        let std_dir = std::fs::File::from(dup);
-        read_dir_names(&std_dir)?
-    };
+    let names = read_dir_names(&dir)?;
     for child in names {
         remove_tree(&dir, &child)?;
     }
@@ -1176,21 +1184,27 @@ fn remove_tree(parent: &OwnedFd, name: &str) -> Result<(), GenerationError> {
     Ok(())
 }
 
-fn read_dir_names(dir_file: &std::fs::File) -> Result<Vec<String>, GenerationError> {
-    use std::os::fd::AsRawFd;
-    // `read_dir` needs a path; /proc/self/fd resolves the already validated
-    // open directory description without re-walking the pathname.
-    let path = format!("/proc/self/fd/{}", dir_file.as_raw_fd());
-    let entries = std::fs::read_dir(path).map_err(|_| invalid("directory listing failed"))?;
+/// Lists the entry names of an already-validated open directory.
+///
+/// `fdopendir` enumerates the open directory description itself, so the listing
+/// cannot be redirected by a pathname replacement after validation, and unlike
+/// a `/proc/self/fd` round-trip it needs no procfs — the lifecycle root's own
+/// validation path runs on every supported platform, not only Linux. `.` and
+/// `..` are dropped: they are artifacts of the directory representation, not
+/// entries a caller can act on.
+fn read_dir_names(dir: &OwnedFd) -> Result<Vec<String>, GenerationError> {
+    let borrowed = rustix::fs::Dir::read_from(dir).map_err(|_| invalid("directory open failed"))?;
     let mut names = Vec::new();
-    for entry in entries {
+    for entry in borrowed {
         let entry = entry.map_err(|_| invalid("directory listing failed"))?;
-        names.push(
-            entry
-                .file_name()
-                .into_string()
-                .map_err(|_| invalid("directory entry name is not unicode"))?,
-        );
+        let raw = entry.file_name().to_bytes();
+        if raw == b"." || raw == b".." {
+            continue;
+        }
+        let name = std::str::from_utf8(raw)
+            .map_err(|_| invalid("directory entry name is not unicode"))?
+            .to_owned();
+        names.push(name);
     }
     Ok(names)
 }
@@ -1757,5 +1771,35 @@ mod tests {
             panic!("an insecure generations directory must fail closed");
         };
         assert!(matches!(err, GenerationError::NativePayloadInvalid { .. }));
+    }
+
+    /// Opening a store whose `generations` name is a symlink must fail closed
+    /// without touching the link's target. The umask normalization is by
+    /// pathname, so it may only run when `mkdirat` proved it created the entry.
+    #[test]
+    fn a_symlinked_generations_name_is_rejected_without_mutating_its_target() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::create_dir(&victim).expect("victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+        let lifecycle = root.path().join("cortexkit").join("lifecycle");
+        std::fs::create_dir_all(&lifecycle).expect("lifecycle root");
+        std::os::unix::fs::symlink(&victim, lifecycle.join(GENERATIONS_DIR_NAME)).expect("symlink");
+
+        let Err(err) = GenerationStore::open(Some(root.path())) else {
+            panic!("a symlinked generations name must fail closed");
+        };
+        assert!(matches!(err, GenerationError::NativePayloadInvalid { .. }));
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("victim still there")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the symlink target's mode must be untouched"
+        );
     }
 }

@@ -568,6 +568,21 @@ fn start_phase(
         return fail("wedged", "wedged");
     }
 
+    // Generation resolution stages and hashes every payload file synchronously
+    // and can outlast the aggregate on slow storage. Spawning after the budget
+    // is gone would report `startup_timeout` to the caller while a daemon comes
+    // up behind it, so the spawn is refused instead. Resolution already
+    // succeeded, so the generation check passes.
+    if Instant::now() >= outer {
+        return StartOutcome {
+            ok: false,
+            state: "stopped",
+            reason: "startup_timeout",
+            daemon_ver: None,
+            generation_check: Some(("pass", "healthy")),
+        };
+    }
+
     let envelope = serve::StartupEnvelope {
         schema: 1,
         // The library owns the managed layout; deriving the data root by

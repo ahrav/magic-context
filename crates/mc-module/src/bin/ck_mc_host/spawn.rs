@@ -40,7 +40,8 @@ fn cvt(ret: libc::c_int, what: &'static str) -> Result<libc::c_int, SpawnError> 
 }
 
 /// Opens the owner-only daemon log, refusing hostile shapes: no symlink
-/// following, regular file only, owned by this UID, owner-only mode.
+/// following, regular file only, single hard link, owned by this UID,
+/// owner-only mode.
 fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
     let file = OpenOptions::new()
         .append(true)
@@ -54,7 +55,11 @@ fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
         .map_err(|_| SpawnError("daemon log stat failed"))?;
     // SAFETY: geteuid never fails and has no memory effects.
     let euid = unsafe { libc::geteuid() };
-    if !meta.is_file() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
+    // `nlink == 1` is part of the predicate, matching the managed state files:
+    // a second hard link at this name is another file that the daemon would
+    // append all of its stdout and stderr to, and that the normalization below
+    // would re-mode through the shared inode.
+    if !meta.is_file() || meta.nlink() != 1 || meta.uid() != euid || meta.mode() & 0o077 != 0 {
         return Err(SpawnError("daemon log failed security checks"));
     }
     // The create mode is filtered by the process umask, which can strip owner
