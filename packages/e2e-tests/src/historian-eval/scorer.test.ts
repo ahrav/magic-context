@@ -11,6 +11,7 @@ import type { Database } from "../../../plugin/src/shared/sqlite";
 import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 import type { HistorianEvalScenario } from "./contract";
+import { scenarioFingerprint } from "./contract";
 import { buildMockHistorianOutput, type MockHistorianFact } from "../mock-historian";
 import type { HistorianEvalRunRecord, HistorianRunArtifact, InjectedClaimRecord, ProbeExchange } from "./runner";
 import { RUN_RECORD_SCHEMA } from "./runner";
@@ -163,7 +164,7 @@ function makeRecord(
     return {
         schema: RUN_RECORD_SCHEMA,
         scenarioId: scenario.id,
-        scenarioFingerprint: "0".repeat(64),
+        scenarioFingerprint: scenarioFingerprint(scenario),
         sessionId: SESSION_ID,
         projectIdentity: PROJECT_IDENTITY,
         nowMs: fixture.nowMs,
@@ -174,8 +175,14 @@ function makeRecord(
             parserImpl: "ts",
             chunkTokenBudget: null,
         },
-        expectedHistorianRuns: 1,
-        historianRuns: [goldenRun()],
+        // Mirror what the runner produces: exactly the declared number of runs,
+        // indexed 1..N. `scoreRunRecord` rejects a record whose own inventory
+        // disagrees with the scenario, so an under-populated fixture would be
+        // testing the integrity gate rather than the verdict under test.
+        expectedHistorianRuns: scenario.trigger.expectedHistorianRuns,
+        historianRuns: Array.from({ length: scenario.trigger.expectedHistorianRuns }, (_, index) =>
+            goldenRun({ runIndex: index + 1 }),
+        ),
         authoredTurnOrdinals: [
             [1, 2],
             [3, 4],
@@ -190,6 +197,16 @@ function makeRecord(
         error: null,
         ...overrides,
     };
+}
+
+/**
+ * `validScenario` with no probes, for tests isolating the facts/structural
+ * tier from the probe tier. Expressed as a scenario that declares no probes
+ * rather than a record whose exchanges were deleted: `scoreRunRecord` rejects
+ * the latter as a truncated artifact.
+ */
+function probeFreeScenario(base: HistorianEvalScenario = validScenario()): HistorianEvalScenario {
+    return { ...base, probes: [] };
 }
 
 describe("scoreRawOutput (layered raw-output seam)", () => {
@@ -275,6 +292,37 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         expect(result.score.verdict).toBe("PASS");
     });
 
+    test("captured artifact replays only against the ordinals the historian actually saw", () => {
+        // The runner prepends filler turns and appends padding, so a real
+        // chunk sits well past the authored transcript's ordinal space. The
+        // authored-only default must reject that output, and the recorded
+        // chunk range must accept it — otherwise a captured
+        // HistorianRunArtifact.rawOutput cannot be replayed or mutated.
+        const scenario = validScenario();
+        const shifted = buildMockHistorianOutput({
+            compartments: [{ start: 21, end: 28, title: "Session cache decision", body: "Chose the in-process LRU cache over Redis; capacity 4096." }],
+            facts: goldFacts(),
+        });
+
+        const againstAuthoredSpace = scoreRawOutput(shifted, scenario);
+        expect(againstAuthoredSpace.stage).toBe("validation-rejected");
+
+        const againstRecordedChunk = scoreRawOutput(shifted, scenario, {
+            chunkStartOrdinal: 21,
+            chunkEndOrdinal: 28,
+        });
+        expect(againstRecordedChunk.stage).toBe("scored");
+        if (againstRecordedChunk.stage !== "scored") return;
+        expect(againstRecordedChunk.score.verdict).toBe("PASS");
+        expect(againstRecordedChunk.score.recall).toBe(1);
+    });
+
+    test("a chunk range supplied half-way is a caller error, not a silent authored-space fallback", () => {
+        expect(() => scoreRawOutput(goldenRawOutput(), validScenario(), { chunkStartOrdinal: 21 })).toThrow(
+            /chunkStartOrdinal and chunkEndOrdinal must be supplied together/,
+        );
+    });
+
     test("raw output failing validation is a stage outcome, not a crash", () => {
         const scenario = validScenario();
         const overlapping = buildMockHistorianOutput({
@@ -327,10 +375,8 @@ describe("scoreRunRecord", () => {
     test("gold fact absent from the injection read scores FAIL:recall", () => {
         const fixture = makeSnapshot({ facts: goldFacts().slice(0, 1) });
         try {
-            const scenario = validScenario();
+            const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            // Keep probe answers consistent so only recall fails.
-            record.probes = [];
             const score = scoreRunRecord(record, scenario);
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toEqual(["recall"]);
@@ -361,9 +407,8 @@ describe("scoreRunRecord", () => {
             },
         });
         try {
-            const scenario = validScenario();
+            const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            record.probes = [];
             const score = scoreRunRecord(record, scenario);
             // Not visible on the injection read, so no false-authoritative match (R3/KTD1).
             expect(score.falseAuthoritativeMatches).toEqual([]);
@@ -382,9 +427,8 @@ describe("scoreRunRecord", () => {
             ],
         });
         try {
-            const scenario = validScenario();
+            const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            record.probes = [];
             const score = scoreRunRecord(record, scenario);
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toContain("structural");
@@ -397,11 +441,13 @@ describe("scoreRunRecord", () => {
     test("healing evidence violation (final run kept provisional boundary) scores FAIL:structural", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
-            const scenario = validScenario();
+            const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario, {
-                historianRuns: [goldenRun({ emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 })],
+                historianRuns: [
+                    goldenRun(),
+                    goldenRun({ runIndex: 2, emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 }),
+                ],
             });
-            record.probes = [];
             const score = scoreRunRecord(record, scenario);
             expect(score.failReasons).toContain("structural");
             expect(score.structuralFindings.some((finding) => finding.includes("healing"))).toBe(true);
@@ -413,11 +459,10 @@ describe("scoreRunRecord", () => {
     test("unhealed discard on the final run scores FAIL:structural", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
-            const scenario = validScenario();
+            const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [goldenRun(), goldenRun({ runIndex: 2, discardedLast: true })],
             });
-            record.probes = [];
             const score = scoreRunRecord(record, scenario);
             expect(score.failReasons).toContain("structural");
         } finally {
@@ -428,14 +473,13 @@ describe("scoreRunRecord", () => {
     test("all historian attempts invalid scores FAIL:invalid-output (KTD4)", () => {
         const fixture = makeSnapshot({ facts: [] });
         try {
-            const scenario = validScenario();
+            const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ status: "failed", failureReason: "validation failed", rawOutput: "garbage" }),
                     goldenRun({ runIndex: 2, status: "failed", failureReason: "validation failed", rawOutput: "garbage" }),
                 ],
             });
-            record.probes = [];
             const score = scoreRunRecord(record, scenario);
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toEqual(["invalid-output"]);
@@ -473,9 +517,8 @@ describe("scoreRunRecord", () => {
             expiresAt: pinnedNowMs + 60_000,
         });
         try {
-            const scenario = validScenario();
+            const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario);
-            record.probes = [];
             const first = scoreRunRecord(record, scenario);
             const second = scoreRunRecord(record, scenario);
             expect(first.verdict).toBe("PASS");
@@ -589,6 +632,125 @@ describe("scoreRunRecord", () => {
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toEqual(["recall"]);
             expect(score.probeVerdicts.some((verdict) => verdict.outcome === "error-trimmed")).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+    test("a record paired with a different scenario is ERROR, never a misattributed verdict", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord({ ...record, scenarioId: "hse-some-other-scenario" }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-scenario-mismatch");
+            expect(score.recall).toBeNull();
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a record whose scenario was edited after the run is ERROR (fingerprint mismatch)", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const edited: HistorianEvalScenario = { ...scenario, title: `${scenario.title} (reworded)` };
+            const score = scoreRunRecord(record, edited);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-scenario-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a truncated run inventory is ERROR, not a PASS off the retained snapshot", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // The scenario declares two runs; keep only the first, as a
+            // hand-copied or interrupted artifact would.
+            const truncated = { ...record, historianRuns: record.historianRuns.slice(0, 1) };
+            const score = scoreRunRecord(truncated, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-runs-incomplete");
+
+            const noRuns = { ...record, historianRuns: [] };
+            expect(scoreRunRecord(noRuns, scenario).errorReason).toBe("record-runs-incomplete");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a record missing a declared probe exchange is ERROR, not a PASS that skipped the probe", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            expect(scoreRunRecord(record, scenario).verdict).toBe("PASS");
+
+            const dropped = { ...record, probes: record.probes.slice(0, record.probes.length - 1) };
+            const droppedScore = scoreRunRecord(dropped, scenario);
+            expect(droppedScore.verdict).toBe("ERROR");
+            expect(droppedScore.errorReason).toBe("record-probes-incomplete");
+
+            const duplicated = { ...record, probes: [...record.probes, record.probes[0]] };
+            expect(scoreRunRecord(duplicated, scenario).errorReason).toBe("record-probes-incomplete");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an unreadable snapshot is an ERROR for that scenario, not a thrown lane abort", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(
+                { ...record, contextDbSnapshotPath: join(fixture.dbPath, "..", "absent-snapshot.sqlite") },
+                scenario,
+            );
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("unreadable-snapshot");
+            expect(score.recall).toBeNull();
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an earlier run's discard stays unhealed when the later run fails validation", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            // Run 1 published while dropping its provisional tail; run 2 then
+            // failed, so the dropped range was never re-derived. The final row
+            // reports no discard of its own, and the record is not
+            // all-attempts-invalid, so only a per-run check catches it.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ discardedLast: true }),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation failed" }),
+                ],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.failReasons).toContain("structural");
+            expect(score.structuralFindings.some((finding) => finding.includes("run 1 discarded"))).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an earlier run's discard healed by a later successful run raises no finding", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [goldenRun({ discardedLast: true }), goldenRun({ runIndex: 2, status: "success" })],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.structuralFindings).toEqual([]);
+            expect(score.verdict).toBe("PASS");
         } finally {
             fixture.cleanup();
         }

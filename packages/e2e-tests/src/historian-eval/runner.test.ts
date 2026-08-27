@@ -12,7 +12,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseScenario, type HistorianEvalScenario } from "./contract";
 import { buildMockHistorianOutput } from "../mock-historian";
-import { extractAnswerEnvelope, findOrdinalRange, runScenario, type ScriptedHistorianMode } from "./runner";
+import {
+    extractAnswerEnvelope,
+    findOrdinalRange,
+    runScenario,
+    stripInjectedBlocks,
+    type ScriptedHistorianMode,
+} from "./runner";
 import { scoreRunRecord } from "./scorer";
 import { goldFacts, validScenarioRaw } from "./test-support";
 
@@ -87,6 +93,58 @@ describe("findOrdinalRange", () => {
         expect(
             findOrdinalRange({ messages: [{ role: "user", content: "<new_messages> [4] no header </new_messages>" }] }),
         ).toBeNull();
+    });
+});
+
+describe("stripInjectedBlocks", () => {
+    test("drops injected blocks so only raw history is searched for a gold-range leak", () => {
+        const payload = [
+            "<project-memory>Session cache capacity is 4096 entries.</project-memory>",
+            "<session-history>Chose the in-process LRU cache over Redis.</session-history>",
+            "<ctx-search-hint>capacity, cache backend</ctx-search-hint>",
+            "Wrap-up housekeeping note 1.",
+        ].join("\n");
+        const stripped = stripInjectedBlocks(payload);
+        // A historian summary may restate an authored sentence verbatim. That
+        // is not the raw message surviving the splice, so it must not read as a
+        // leak.
+        expect(stripped).not.toContain("4096");
+        expect(stripped).not.toContain("in-process LRU cache");
+        expect(stripped).toContain("Wrap-up housekeeping note 1.");
+    });
+
+    test("leaves raw history untouched, including an unclosed block", () => {
+        expect(stripInjectedBlocks("Also set the cache capacity to 4096 entries.")).toContain("4096");
+        // A block truncated by budget trimming keeps its contents in the
+        // searched text: the gate stays able to over-report, never under-report.
+        expect(stripInjectedBlocks("<project-memory>capacity is 4096")).toContain("4096");
+    });
+});
+
+describe("runScenario (live-mode preflight)", () => {
+    test("a live route on another provider is a harness failure, not an authentication failure mid-run", async () => {
+        const { dir, cleanup } = tempArtifactDir();
+        try {
+            const record = await runScenario(singleRunScenario(), {
+                mode: {
+                    kind: "live",
+                    apiKey: "sk-not-a-real-key",
+                    historianModel: "openai/gpt-5",
+                    probeModel: { providerID: "google", modelID: "gemini-3-pro" },
+                },
+                artifactDir: dir,
+            });
+            // boot() exports the single apiKey as ANTHROPIC_API_KEY only, so
+            // these routes would reach their providers uncredentialed and record
+            // an authentication failure as though the models had been evaluated.
+            expect(record.error?.reason).toBe("harness-failure");
+            expect(record.error?.detail).toContain("historianModel");
+            expect(record.error?.detail).toContain("probeModel.providerID");
+            // Live-mode artifacts are redacted before hitting disk.
+            expect(readFileSync(join(dir, "run-record.json"), "utf8")).not.toContain("sk-not-a-real-key");
+        } finally {
+            cleanup();
+        }
     });
 });
 

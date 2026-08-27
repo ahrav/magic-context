@@ -93,6 +93,7 @@ export type RunErrorReason =
     | "run-never-fired"
     | "probe-envelope-malformed"
     | "probe-gold-uncovered"
+    | "probe-tool-use"
     | "harness-failure";
 
 export interface RunRecordError {
@@ -210,8 +211,22 @@ class RunAbort extends Error {
     }
 }
 
+/**
+ * Marker-based historian request detection, scoped to `body.system`.
+ *
+ * Scoping matters: the `<new_messages>` tag also travels inside ordinary
+ * main-agent traffic — an authored transcript that discusses prompt shapes, a
+ * probe prompt, or an echoed repair payload all carry it in `messages`, and
+ * every later request retains it in history. Keying off message content there
+ * would route a main-agent turn into `historianResponse`, consuming a scripted
+ * historian output (script-drift) or tripping the live-mode `fallback-engaged`
+ * abort. The system marker alone is sufficient and is how the existing lanes
+ * route historian traffic (tests/pi-long-running-session.test.ts,
+ * tests/compaction-off.test.ts). If the marker ever stops appearing, historian
+ * requests fall through to the poison default and surface as a loud
+ * script-drift ERROR rather than silently misrouting.
+ */
 function isHistorianRequest(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
     const system = body.system;
     if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
     if (Array.isArray(system)) {
@@ -301,11 +316,132 @@ export function extractAnswerEnvelope(text: string | null): string | null {
     return answer.length > 0 ? answer : null;
 }
 
+/**
+ * Blocks the plugin splices into a request: materialized history, rendered
+ * claim memory, the mural, and the auto-search hint. Their contents are
+ * historian-authored or claim-derived, never the raw messages the injection
+ * splice is responsible for removing.
+ */
+const INJECTED_BLOCK_TAGS = [
+    "session-history",
+    "session-history-since",
+    "new-compartments",
+    "project-memory",
+    "memory-mural",
+    "user-profile",
+    "ctx-search-hint",
+] as const;
+
+/**
+ * Drop injected Magic Context blocks so what remains is raw history.
+ *
+ * A block whose closing tag was lost to budget trimming does not match and its
+ * contents stay in the searched text; that keeps the leak gate conservative
+ * (it can still over-report, never under-report).
+ */
+export function stripInjectedBlocks(text: string): string {
+    let remaining = text;
+    for (const tag of INJECTED_BLOCK_TAGS) {
+        remaining = remaining.replace(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, "g"), "\n");
+    }
+    return remaining;
+}
+
+/** Ids of the messages in a session-messages response. */
+function messageIds(messages: unknown): string[] {
+    if (!Array.isArray(messages)) return [];
+    const ids: string[] = [];
+    for (const message of messages) {
+        const direct = (message as { id?: unknown })?.id;
+        const nested = (message as { info?: { id?: unknown } })?.info?.id;
+        const id = typeof nested === "string" ? nested : typeof direct === "string" ? direct : null;
+        if (id !== null) ids.push(id);
+    }
+    return ids;
+}
+
+/**
+ * Tool invocations recorded in messages absent from `known`.
+ *
+ * OpenCode records a tool call as a message part whose `type` carries "tool".
+ * The name key has moved between SDK versions, so an invocation whose name
+ * cannot be read reports as `<unnamed>` rather than being dropped — the gate
+ * cares that a tool ran at all.
+ */
+function toolInvocationsInNewMessages(messages: unknown, known: ReadonlySet<string>): string[] {
+    if (!Array.isArray(messages)) return [];
+    const names = new Set<string>();
+    for (const message of messages) {
+        const direct = (message as { id?: unknown })?.id;
+        const nested = (message as { info?: { id?: unknown } })?.info?.id;
+        const id = typeof nested === "string" ? nested : typeof direct === "string" ? direct : null;
+        if (id !== null && known.has(id)) continue;
+        const parts = (message as { parts?: unknown })?.parts;
+        if (!Array.isArray(parts)) continue;
+        for (const part of parts) {
+            const type = (part as { type?: unknown })?.type;
+            if (typeof type !== "string" || !type.includes("tool")) continue;
+            const candidate = part as { tool?: unknown; toolName?: unknown; name?: unknown };
+            const name = [candidate.tool, candidate.toolName, candidate.name].find(
+                (value): value is string => typeof value === "string" && value.length > 0,
+            );
+            names.add(name ?? "<unnamed>");
+        }
+    }
+    return [...names].sort();
+}
+
+/**
+ * Concrete checkout SHA for the system-version tuple, resolved once per
+ * process. A recorded `unknown` cannot identify the code that produced a live
+ * artifact or be compared across system changes, so callers that omit
+ * `repoCommitSha` get the real checkout; `unknown` survives only where git
+ * cannot answer (exported tree, tarball checkout).
+ */
+let cachedRepoCommitSha: string | null = null;
+function resolveRepoCommitSha(): string {
+    if (cachedRepoCommitSha !== null) return cachedRepoCommitSha;
+    let sha = "unknown";
+    try {
+        const result = Bun.spawnSync(["git", "rev-parse", "HEAD"], { stdout: "pipe", stderr: "ignore" });
+        const candidate = result.success ? result.stdout.toString().trim() : "";
+        if (/^[0-9a-f]{40}$/.test(candidate)) sha = candidate;
+    } catch {
+        sha = "unknown";
+    }
+    cachedRepoCommitSha = sha;
+    return sha;
+}
+
+/**
+ * Both live routes must resolve to Anthropic.
+ *
+ * `boot` exports the single `apiKey` as `ANTHROPIC_API_KEY`, so a model on any
+ * other provider reaches it with no credential and the run records an
+ * authentication failure as though the models had been evaluated. Refusing the
+ * mode up front turns that into a `harness-failure` ERROR naming the offending
+ * route, which is the R6-correct attribution.
+ */
+function assertLiveProvidersCredentialed(mode: LiveHistorianMode): void {
+    const routes: Array<{ label: string; providerId: string }> = [
+        { label: "historianModel", providerId: mode.historianModel.split("/")[0] ?? "" },
+        { label: "probeModel.providerID", providerId: mode.probeModel.providerID },
+    ];
+    const offenders = routes.filter((route) => route.providerId !== "anthropic");
+    if (offenders.length > 0) {
+        throw new Error(
+            `historian-eval: live mode exports only ANTHROPIC_API_KEY, so every live route must use the anthropic provider; ` +
+                `${offenders.map((route) => `${route.label} resolves to "${route.providerId || "<empty>"}"`).join(", ")}`,
+        );
+    }
+}
+
 class ScenarioRunner {
     private harness: TestHarness | null = null;
     private embedMock: MockProvider | null = null;
     private historianMarkerMockHits = 0;
     private capturedChildIds = new Set<string>();
+    private seenProbeMessageIds = new Set<string>();
     private probeResponseQueue: string[] = [];
     private turnScripts: Array<{ prompt: string; response: MockResponse; hits: number }> = [];
     private historianScriptExhausted = false;
@@ -441,7 +577,7 @@ class ScenarioRunner {
     private systemTuple(): SystemVersionTuple {
         const mode = this.options.mode;
         return {
-            repoCommitSha: this.options.repoCommitSha ?? "unknown",
+            repoCommitSha: this.options.repoCommitSha ?? resolveRepoCommitSha(),
             historianModelId: mode.kind === "live" ? mode.historianModel : "scripted-mock",
             probeModelId:
                 mode.kind === "live" ? `${mode.probeModel.providerID}/${mode.probeModel.modelID}` : "scripted-mock",
@@ -548,6 +684,7 @@ class ScenarioRunner {
 
     private async boot(): Promise<TestHarness> {
         const mode = this.options.mode;
+        if (mode.kind === "live") assertLiveProvidersCredentialed(mode);
         // Dedicated deterministic embedding endpoint (KTD9): fire-and-forget
         // embedding dispatch must never race teardown against a real network.
         this.embedMock = new MockProvider();
@@ -898,8 +1035,15 @@ class ScenarioRunner {
                     !this.capturedChildIds.has(child.id),
             )
             .sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0));
+        // Claim every candidate up front, not one per loop iteration. The loop
+        // returns on the newest child that yields text, so marking inside it
+        // leaves the older repair-attempt children eligible; a later run that
+        // creates no capturable child of its own would then adopt one of them
+        // and record another run's output as its `rawOutput`.
         for (const child of candidates) {
             this.capturedChildIds.add(child.id as string);
+        }
+        for (const child of candidates) {
             const messagesRes = await harness.client.session.messages({ path: { id: child.id as string } });
             const messages = messagesRes.data;
             const text = extractLatestAssistantText(messages) ?? extractLatestHistorianReasoning(messages);
@@ -932,13 +1076,23 @@ class ScenarioRunner {
      * Silent no-op promotion (R6): facts were emitted but no claim ever
      * reached the store. That is a plumbing loss (empty promotion directory,
      * skipped unanchored promotion on every run), not historian quality.
+     *
+     * Runs that discarded their provisional last compartment are excluded:
+     * production skips that pass's unanchored promotion outright
+     * (`skipUnanchoredPromotion` in compartment-runner-incremental), deferring
+     * the range to a healing run, so their emitted facts are expected to reach
+     * no claim. Counting them would report a deliberate deferral as a plumbing
+     * loss and, for a scenario declaring only that run, replace the structural
+     * unhealed-discard FAIL the scorer derives from the same evidence.
      */
     private assertPromotionNotSilentlySkipped(
         harness: TestHarness,
         sessionId: string,
         runs: HistorianRunArtifact[],
     ): void {
-        const totalFacts = runs.reduce((sum, run) => sum + run.factsEmitted, 0);
+        const totalFacts = runs
+            .filter((run) => !run.discardedLast)
+            .reduce((sum, run) => sum + run.factsEmitted, 0);
         if (totalFacts === 0) return;
         try {
             const row = harness
@@ -965,6 +1119,10 @@ class ScenarioRunner {
      */
     private async driveProbes(harness: TestHarness, sessionId: string): Promise<ProbeExchange[]> {
         const exchanges = this.collectedProbes;
+        // Watermark the transcript phase's messages so the per-probe tool-use
+        // gate inspects only what the probe turns themselves add.
+        const seed = await harness.client.session.messages({ path: { id: sessionId } });
+        for (const id of messageIds(seed.data)) this.seenProbeMessageIds.add(id);
         for (const probe of this.scenario.probes) {
             exchanges.push(await this.driveProbe(harness, sessionId, probe));
         }
@@ -975,18 +1133,35 @@ class ScenarioRunner {
         this.assertProbeGoldCovered(harness, sessionId, probe);
         const requestCountBefore = harness.mock.requests().length;
 
-        let answerRaw = await this.askProbe(harness, sessionId, buildProbePrompt(probe));
+        const first = await this.askProbe(harness, sessionId, buildProbePrompt(probe));
+        let answerRaw = first.answerRaw;
+        const toolNames = new Set(first.toolNames);
         let reAsked = false;
         if (answerRaw === null) {
             reAsked = true;
-            answerRaw = await this.askProbe(
+            const retry = await this.askProbe(
                 harness,
                 sessionId,
                 `Your previous reply had no valid <answer></answer> envelope. ${buildProbePrompt(probe)}`,
             );
+            answerRaw = retry.answerRaw;
+            for (const name of retry.toolNames) toolNames.add(name);
             if (answerRaw === null) {
                 throw new RunAbort("probe-envelope-malformed", `probe ${probe.id} answered without a valid envelope twice`);
             }
+        }
+
+        // A probe that retrieved anything is no longer a hidden probe: the
+        // production main-agent prompt encourages `ctx_search`/`ctx_expand` for
+        // prior context, and those reach the compartment-covered history the
+        // splice just removed. Its answer would then prove nothing about what
+        // the injected payload carried, so an invocation invalidates the
+        // measurement rather than earning a score.
+        if (toolNames.size > 0) {
+            throw new RunAbort(
+                "probe-tool-use",
+                `probe ${probe.id} invoked ${[...toolNames].join(", ")}; a retrieved answer does not measure the injected payload`,
+            );
         }
 
         const payloadText = this.capturedProbePayload(harness, requestCountBefore);
@@ -1000,7 +1175,11 @@ class ScenarioRunner {
         };
     }
 
-    private async askProbe(harness: TestHarness, sessionId: string, prompt: string): Promise<string | null> {
+    private async askProbe(
+        harness: TestHarness,
+        sessionId: string,
+        prompt: string,
+    ): Promise<{ answerRaw: string | null; toolNames: string[] }> {
         const mode = this.options.mode;
         if (mode.kind === "scripted") {
             const next = this.probeResponseQueue.shift();
@@ -1018,14 +1197,29 @@ class ScenarioRunner {
             });
         }
         const messagesRes = await harness.client.session.messages({ path: { id: sessionId } });
-        return extractAnswerEnvelope(extractLatestAssistantText(messagesRes.data));
+        const toolNames = toolInvocationsInNewMessages(messagesRes.data, this.seenProbeMessageIds);
+        for (const id of messageIds(messagesRes.data)) this.seenProbeMessageIds.add(id);
+        return {
+            answerRaw: extractAnswerEnvelope(extractLatestAssistantText(messagesRes.data)),
+            toolNames,
+        };
     }
 
-    /** Gold claims a probe's leakage/coverage gates must protect (KTD6). */
+    /**
+     * The gold claim a probe's leakage/coverage gates must protect (KTD6).
+     *
+     * Every probe type carries exactly one gold reference — `expectedClaimRef`
+     * for claim-id, `sourceClaimRef` for exact and multiple-choice — and
+     * `parseScenario` proves it resolves. Resolving it here matches how the
+     * scorer resolves the probe's backing claim, so the gates cover exactly
+     * what this probe's answer depends on. Returning every gold claim instead
+     * would make one unrelated historian omission ERROR a probe whose own
+     * backing range is compartment-covered; that omission is recall evidence
+     * and the facts tier already scores it.
+     */
     private probeGoldClaims(probe: Probe): typeof this.scenario.gold.expectedClaims {
-        return probe.answerType === "claim-id"
-            ? this.scenario.gold.expectedClaims.filter((claim) => claim.id === probe.expectedClaimRef)
-            : this.scenario.gold.expectedClaims;
+        const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
+        return this.scenario.gold.expectedClaims.filter((claim) => claim.id === reference);
     }
 
     /**
@@ -1094,14 +1288,22 @@ class ScenarioRunner {
      * Gold-fact-bearing raw ranges must not survive in the probe payload.
      * The gate is scoped to gold ranges: an uncovered non-gold tail (the
      * epilogue and harness-owned kick turns) is allowed to remain raw.
+     *
+     * Injected Magic Context blocks are excluded before the search. They carry
+     * historian-authored summaries and claim text, and a summary may legitimately
+     * restate an authored sentence verbatim — most likely for a short factual
+     * assistant reply. Searching them too would convert a correct splice into a
+     * `gold-range-leak` ERROR on summarization wording alone. What remains after
+     * stripping is the raw message text the splice is responsible for removing.
      */
     private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null): void {
         if (payloadText === null) return;
+        const rawHistory = stripInjectedBlocks(payloadText);
         for (const claim of this.probeGoldClaims(probe)) {
             for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
                 const authored = this.scenario.transcript.turns[turn];
                 for (const raw of [authored.user, authored.assistant]) {
-                    if (payloadText.includes(raw)) {
+                    if (rawHistory.includes(raw)) {
                         throw new RunAbort(
                             "gold-range-leak",
                             `probe ${probe.id}: raw transcript text of gold turn ${turn} survived in the probe payload`,

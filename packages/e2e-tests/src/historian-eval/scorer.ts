@@ -31,6 +31,7 @@ import {
     matchesGold,
     normalizeContent,
     predicateMatches,
+    scenarioFingerprint,
     type ExpectedClaim,
     type HistorianEvalScenario,
     type Probe,
@@ -124,12 +125,20 @@ function scoreFacts(
 function structuralFindingsFromRows(
     rows: Array<{ startMessage: number; endMessage: number }>,
     minCount: number,
+    priorCoverage: { startMessage: number; endMessage: number } | null = null,
 ): string[] {
     const findings: string[] = [];
     // Production-precondition self-check (R9): the same invariant production
     // enforces before publishing — ordinals strictly increasing, ranges
     // non-overlapping, coverage contiguous.
-    const storedError = validateStoredCompartments(rows);
+    //
+    // Contiguity is a whole-session property, so a replay of one chunk that
+    // starts past ordinal 1 needs the coverage its earlier runs already
+    // published; without it the invariant reports a gap that is not a property
+    // of the output under test. `priorCoverage` stands in for exactly that, and
+    // is excluded from the count check so gold's `minCount` still measures only
+    // the compartments this output produced.
+    const storedError = validateStoredCompartments(priorCoverage === null ? rows : [priorCoverage, ...rows]);
     if (storedError !== null) findings.push(`stored-compartments: ${storedError}`);
     if (rows.length < minCount) {
         findings.push(`compartment-count: ${rows.length} persisted, gold requires at least ${minCount}`);
@@ -139,18 +148,27 @@ function structuralFindingsFromRows(
 
 /**
  * Boundary-healing evidence (R9/KTD3), scored from recorded per-run numbers.
- * A discarded provisional compartment on the FINAL run means the dropped
- * range's facts were never re-derived; a kept multi-compartment boundary
- * whose lookahead margin is inside the healing slack means the forced-keep
- * escape hatch (forbidden for facts-scored scenarios) or equivalent skipped
- * healing.
+ *
+ * A discarded provisional compartment is healed only by a LATER SUCCESSFUL run
+ * re-deriving the dropped range, so every run is inspected rather than the last
+ * row alone: run 1 discarding and run 2 then failing validation leaves the
+ * dropped range's facts never re-derived while the final row itself reports no
+ * discard, and the record is not all-attempts-invalid either. A kept
+ * multi-compartment boundary whose lookahead margin is inside the healing slack
+ * means the forced-keep escape hatch (forbidden for facts-scored scenarios) or
+ * equivalent skipped healing.
  */
 function healingFindings(record: HistorianEvalRunRecord): string[] {
-    const finalRun = record.historianRuns[record.historianRuns.length - 1];
+    const runs = record.historianRuns;
+    const finalRun = runs[runs.length - 1];
     if (!finalRun) return [];
     const findings: string[] = [];
-    if (finalRun.discardedLast) {
-        findings.push("healing: final run discarded its provisional last compartment and no later run healed it");
+    for (const [index, run] of runs.entries()) {
+        if (!run.discardedLast) continue;
+        if (runs.slice(index + 1).some((later) => later.status === "success")) continue;
+        findings.push(
+            `healing: run ${run.runIndex} discarded its provisional last compartment and no later successful run healed it`,
+        );
     }
     if (
         !finalRun.discardedLast &&
@@ -270,15 +288,33 @@ function assembleScore(args: {
     };
 }
 
-/** Synthetic single chunk covering the whole authored transcript. */
-function syntheticChunk(scenario: HistorianEvalScenario): HistorianValidationChunk {
-    const messageCount = scenario.transcript.turns.length * 2;
+/**
+ * Single chunk for the raw-output seam.
+ *
+ * The default covers the authored transcript, which is the ordinal space
+ * crafted mutation inputs are written against. `range` exists because the
+ * runner's real chunk is NOT in that space: harness-owned filler turns shift
+ * every authored ordinal, and post-epilogue padding extends the transcript, so
+ * replaying a captured `HistorianRunArtifact.rawOutput` needs the ordinals the
+ * historian actually saw (`chunkStartOrdinal`/`chunkEndOrdinal` on the same
+ * artifact). Validating a captured output against the authored-only space
+ * rejects its compartments as outside the chunk.
+ */
+function syntheticChunk(
+    scenario: HistorianEvalScenario,
+    range: { startOrdinal: number; endOrdinal: number } | null,
+): HistorianValidationChunk {
+    const startIndex = range?.startOrdinal ?? 1;
+    const endIndex = range?.endOrdinal ?? scenario.transcript.turns.length * 2;
+    if (startIndex < 1 || endIndex < startIndex) {
+        throw new Error(`historian-eval scorer: invalid chunk ordinal range ${startIndex}-${endIndex}`);
+    }
     return {
-        startIndex: 1,
-        endIndex: messageCount,
-        lines: Array.from({ length: messageCount }, (_, index) => ({
-            ordinal: index + 1,
-            messageId: `msg-${index + 1}`,
+        startIndex,
+        endIndex,
+        lines: Array.from({ length: endIndex - startIndex + 1 }, (_, index) => ({
+            ordinal: startIndex + index,
+            messageId: `msg-${startIndex + index}`,
         })),
         toolOnlyRanges: [],
         completedToolArcs: [],
@@ -294,14 +330,27 @@ const RAW_OUTPUT_PROJECT_IDENTITY = "dir:/historian-eval/raw-output";
  * rejection is a stage outcome the mutation battery asserts on; it never
  * appears as a live scenario verdict (live all-attempts-invalid is
  * FAIL:invalid-output via `scoreRunRecord`).
+ *
+ * Pass `chunkStartOrdinal`/`chunkEndOrdinal` when replaying a captured
+ * artifact; see `syntheticChunk` for why the recorded ordinals are required
+ * there and the authored-transcript default is not.
  */
 export function scoreRawOutput(
     rawOutput: string,
     scenario: HistorianEvalScenario,
-    options: { nowMs?: number } = {},
+    options: { nowMs?: number; chunkStartOrdinal?: number; chunkEndOrdinal?: number } = {},
 ): RawOutputStageResult {
     const nowMs = options.nowMs ?? Date.now();
-    const chunk = syntheticChunk(scenario);
+    const hasRange = options.chunkStartOrdinal !== undefined || options.chunkEndOrdinal !== undefined;
+    if (hasRange && (options.chunkStartOrdinal === undefined || options.chunkEndOrdinal === undefined)) {
+        throw new Error("historian-eval scorer: chunkStartOrdinal and chunkEndOrdinal must be supplied together");
+    }
+    const chunk = syntheticChunk(
+        scenario,
+        hasRange
+            ? { startOrdinal: options.chunkStartOrdinal as number, endOrdinal: options.chunkEndOrdinal as number }
+            : null,
+    );
     const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, chunk, [], 1);
     if (!validated.ok) {
         return { stage: "validation-rejected", error: validated.error };
@@ -343,7 +392,11 @@ export function scoreRawOutput(
             score: assembleScore({
                 scenarioId: scenario.id,
                 facts: scoreFacts(scenario, visible),
-                structuralFindings: structuralFindingsFromRows(rows, scenario.gold.compartments.minCount),
+                structuralFindings: structuralFindingsFromRows(
+                    rows,
+                    scenario.gold.compartments.minCount,
+                    chunk.startIndex > 1 ? { startMessage: 1, endMessage: chunk.startIndex - 1 } : null,
+                ),
                 probeVerdicts: [],
                 allAttemptsInvalid: false,
             }),
@@ -372,6 +425,86 @@ function errorScore(scenarioId: string, reason: string, detail: string | null): 
     };
 }
 
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Reject a record that is not this scenario's, or whose own run inventory is
+ * incomplete, before any gold is compared.
+ *
+ * Scoring reads gold from `scenario` and the claim surface from the record's
+ * snapshot. Nothing otherwise ties the two together, so a record paired with a
+ * different — or since-edited — scenario yields a plausible verdict, reported
+ * under `record.scenarioId`, that measures neither. The run inventory is
+ * checked for the same reason: records are copied, truncated, and hand-edited
+ * after they leave the runner, where the `run-never-fired` guard can no longer
+ * reach them, and a record missing a declared run would otherwise be scored
+ * from whatever its retained snapshot happens to contain.
+ */
+function recordIntegrityError(
+    record: HistorianEvalRunRecord,
+    scenario: HistorianEvalScenario,
+): ScenarioScore | null {
+    if (record.scenarioId !== scenario.id) {
+        return errorScore(
+            record.scenarioId,
+            "record-scenario-mismatch",
+            `run record names scenario ${record.scenarioId}, scored against ${scenario.id}`,
+        );
+    }
+    const fingerprint = scenarioFingerprint(scenario);
+    if (record.scenarioFingerprint !== fingerprint) {
+        return errorScore(
+            record.scenarioId,
+            "record-scenario-mismatch",
+            `run record fingerprint ${record.scenarioFingerprint} does not match scenario ${scenario.id} (${fingerprint})`,
+        );
+    }
+    if (record.expectedHistorianRuns !== scenario.trigger.expectedHistorianRuns) {
+        return errorScore(
+            record.scenarioId,
+            "record-scenario-mismatch",
+            `run record declares ${record.expectedHistorianRuns} historian run(s); scenario declares ${scenario.trigger.expectedHistorianRuns}`,
+        );
+    }
+    const indices = record.historianRuns.map((run) => run.runIndex);
+    const expected = Array.from({ length: record.expectedHistorianRuns }, (_, index) => index + 1);
+    if (indices.length !== expected.length || indices.some((index, position) => index !== expected[position])) {
+        return errorScore(
+            record.scenarioId,
+            "record-runs-incomplete",
+            `run record declares ${record.expectedHistorianRuns} historian run(s) but carries indices [${indices.join(", ")}]`,
+        );
+    }
+    return null;
+}
+
+/**
+ * Every declared probe must have exactly one recorded exchange.
+ *
+ * Verdicts are built by mapping the RECORDED exchanges, so a truncated list
+ * silently drops a declared hidden probe — leaving no failing verdict and a
+ * scenario that PASSes without that probe ever being evaluated — and a
+ * duplicated one double-weights a single answer. Comparing sorted id lists
+ * rejects both.
+ */
+function probeCoverageError(
+    record: HistorianEvalRunRecord,
+    scenario: HistorianEvalScenario,
+): ScenarioScore | null {
+    const declared = scenario.probes.map((probe) => probe.id).sort();
+    const recorded = record.probes.map((exchange) => exchange.probeId).sort();
+    if (declared.length !== recorded.length || declared.some((id, index) => id !== recorded[index])) {
+        return errorScore(
+            record.scenarioId,
+            "record-probes-incomplete",
+            `scenario declares probes [${declared.join(", ")}]; run record carries [${recorded.join(", ")}]`,
+        );
+    }
+    return null;
+}
+
 /**
  * Score a run record produced by the replay runner. ERROR-flagged records
  * propagate their reason with no rates computed (R6). A live historian
@@ -382,6 +515,9 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
     if (record.error !== null) {
         return errorScore(record.scenarioId, record.error.reason, record.error.detail);
     }
+    const integrityError = recordIntegrityError(record, scenario);
+    if (integrityError !== null) return integrityError;
+
     const allAttemptsInvalid =
         record.historianRuns.length > 0 && record.historianRuns.every((run) => run.status === "failed");
     if (allAttemptsInvalid) {
@@ -402,17 +538,46 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         });
     }
 
-    const db = openTestDb(record.contextDbSnapshotPath, { readonly: true });
+    // Checked after the all-invalid branch: nothing was published there, so the
+    // runner records no probe exchanges by design.
+    const coverageError = probeCoverageError(record, scenario);
+    if (coverageError !== null) return coverageError;
+
+    // Snapshot storage is external run evidence and fails independently of
+    // historian quality — a record copied without its SQLite file, a path that
+    // moved, a truncated image. That is an infrastructure ERROR for this
+    // scenario, not an exception that aborts every remaining scenario in the
+    // lane.
+    let db: ReturnType<typeof openTestDb>;
     try {
-        const visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
+        db = openTestDb(record.contextDbSnapshotPath, { readonly: true });
+    } catch (error) {
+        return errorScore(
+            record.scenarioId,
+            "unreadable-snapshot",
+            `context DB snapshot ${record.contextDbSnapshotPath} could not be opened: ${errorMessage(error)}`,
+        );
+    }
+    try {
+        let visible: InjectedClaimRecord[] | null;
+        let rows: Array<{ startMessage: number; endMessage: number }>;
+        try {
+            visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
+            rows = db
+                .prepare(
+                    "SELECT start_message AS startMessage, end_message AS endMessage FROM compartments WHERE session_id = ? ORDER BY sequence ASC",
+                )
+                .all(record.sessionId) as Array<{ startMessage: number; endMessage: number }>;
+        } catch (error) {
+            return errorScore(
+                record.scenarioId,
+                "unreadable-snapshot",
+                `context DB snapshot ${record.contextDbSnapshotPath} could not be queried: ${errorMessage(error)}`,
+            );
+        }
         if (visible === null) {
             return errorScore(record.scenarioId, "stale-snapshot", "claim snapshot stale after the injection read's retry");
         }
-        const rows = db
-            .prepare(
-                "SELECT start_message AS startMessage, end_message AS endMessage FROM compartments WHERE session_id = ? ORDER BY sequence ASC",
-            )
-            .all(record.sessionId) as Array<{ startMessage: number; endMessage: number }>;
 
         const probesById = new Map(scenario.probes.map((probe) => [probe.id, probe]));
         const probeVerdicts = record.probes.map((exchange) => {

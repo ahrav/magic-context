@@ -29,8 +29,16 @@ export const LANE_VERIFIER = "historian-eval-lane";
 
 /**
  * Record a `verified` outcome for every active claim under the identity.
- * Returns the number of claims verified. Throws when the maintenance read
- * itself reports stale — a fresh lane environment cannot legitimately race.
+ * Returns the number of claims verified.
+ *
+ * Throws when the maintenance read reports stale, and when any verification
+ * resolves to something other than `applied`. A fresh single-writer lane
+ * environment cannot legitimately race, so `stale` or `noop` means the bridge
+ * itself did not do its job: the claim stays at CANDIDATE maturity, the
+ * visibility policy keeps it off the `auto_inject` surface the scorer reads,
+ * and the missing claim lands as FAIL:recall against the historian. Failing
+ * loudly instead routes it through the runner as a `harness-failure` ERROR,
+ * which is the R6-correct attribution for a bridge fault.
  */
 export function verifyAllActiveClaims(db: Database, projectIdentity: string, nowMs: number): number {
     const projectIds = resolveProjectIdsForIdentities(db, [projectIdentity]);
@@ -57,7 +65,12 @@ export function verifyAllActiveClaims(db: Database, projectIdentity: string, now
                 nowMs,
             },
         );
-        if (result.outcome === "applied") verified += 1;
+        if (result.outcome !== "applied") {
+            throw new Error(
+                `historian-eval verification bridge: claim ${item.revisionLocator} not verified (outcome ${result.outcome})`,
+            );
+        }
+        verified += 1;
     }
     return verified;
 }
