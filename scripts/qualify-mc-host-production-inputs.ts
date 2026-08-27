@@ -1991,6 +1991,48 @@ function dottedKeyTouches(keyText: string, names: readonly RegExp[]): boolean {
 }
 
 /**
+ * Split a normalized dotted key path into its components, on the dots outside
+ * quotes only.
+ *
+ * A quoted component may contain dots of its own: `[replace."ort:2.0.0-rc.13"]` is
+ * a two-component path whose second component is one package-ID spec, and a plain
+ * `split(".")` shreds it into five whose last is `13"`. Bare Cargo table names carry
+ * no dots, which is why only the version-bearing `[replace]` key needs this.
+ */
+function splitDottedKey(normalized: string): string[] {
+    const parts: string[] = [];
+    let current = "";
+    let quote: string | null = null;
+    let escaped = false;
+    for (const char of normalized) {
+        if (quote !== null) {
+            current += char;
+            if (quote === '"') {
+                if (escaped) escaped = false;
+                else if (char === "\\") escaped = true;
+                else if (char === '"') quote = null;
+            } else if (char === "'") {
+                quote = null;
+            }
+            continue;
+        }
+        if (char === '"' || char === "'") {
+            quote = char;
+            current += char;
+            continue;
+        }
+        if (char === ".") {
+            parts.push(current);
+            current = "";
+            continue;
+        }
+        current += char;
+    }
+    parts.push(current);
+    return parts;
+}
+
+/**
  * Resolve a TOML key or string value as written to the name Cargo will see, or
  * `null` when this scan cannot say. Used for dependency keys, a renamed
  * dependency's `package` value, and forwarded feature values in `[features]` —
@@ -2183,6 +2225,44 @@ function resolveRenamedCrate(key: string, entry: string): string | null {
     if (!tomlKeyPattern("package", "").test(entry)) return key;
     const renamed = tomlKeyPattern("package", `("[^"\\\\]*"|'[^']*')`).exec(entry);
     return resolveTomlName(renamed?.[1] ?? "");
+}
+
+/**
+ * A package-ID spec, as `[replace]` keys are written: an optional source, then the
+ * package name and version.
+ *
+ * The version must not reach a path, fragment, or query separator, which is what
+ * keeps a source URL from matching with `https` as its name.
+ */
+const PACKAGE_ID_SPEC = /^([A-Za-z0-9_-]+)(?:[@:][^/#?]*)?$/;
+
+/**
+ * The crate a `[replace]` key names, or `null` when this scan cannot say.
+ *
+ * A `[replace]` key is a package-ID spec rather than a bare crate name, and Cargo
+ * accepts several spellings of one: `ort:2.0.0-rc.13`, the modern
+ * `ort@2.0.0-rc.13`, and a source URL carrying the package in its fragment
+ * (`https://github.com/pykeio/ort#ort:2.0.0-rc.13`). Cutting the spec at its first
+ * `:` reads only the first — the `@` form keeps its version attached and the URL
+ * form reduces to `https`, so both were compared against the qualified crates under
+ * a name no crate has and passed as overrides of something unrelated.
+ *
+ * A spec that never writes its package down — a bare source URL, or one whose
+ * fragment holds only a version, where Cargo derives the name from the source
+ * itself — returns `null` so the caller refuses the manifest instead of guessing.
+ */
+function replacedCrateName(spec: string): string | null {
+    const trimmed = spec.trim();
+    const bare = PACKAGE_ID_SPEC.exec(trimmed);
+    if (bare !== null) return bare[1] ?? null;
+    const hash = trimmed.indexOf("#");
+    if (hash === -1) return null;
+    const fragment = PACKAGE_ID_SPEC.exec(trimmed.slice(hash + 1).trim());
+    const named = fragment?.[1];
+    // A fragment may hold a version instead of a package (`…/ort#2.0.0-rc.13`),
+    // which leaves the name implicit in the source this scan does not resolve.
+    if (named === undefined || !/^[A-Za-z_]/.test(named)) return null;
+    return named;
 }
 
 /** Join the inline entry starting at `index` onto one line, or `null` when its
@@ -2520,7 +2600,11 @@ function assertNoQualifiedCrateOverride(
             `${WORKSPACE_CARGO_TOML_PATH} is required to rule out an override of the qualified crates`,
         );
     }
-    const unreadable = (): never =>
+    // Annotated rather than inferred: a call only narrows away the `null` the
+    // checks below refuse when the callee is a const of an explicit `never`-returning
+    // type, so without the annotation the compiler stops enforcing exactly the
+    // refusals this scan depends on.
+    const unreadable: () => never = () =>
         fail(
             `${WORKSPACE_CARGO_TOML_PATH} declares an override this qualifier cannot read, so the qualified crate identities cannot be ruled out`,
         );
@@ -2532,14 +2616,19 @@ function assertNoQualifiedCrateOverride(
         }
     };
     const lines = readFileSync(path, "utf8").split("\n").map(stripTomlComments);
-    let section = "";
+    // Which override table the scan is inside, resolved rather than matched against
+    // the header text: a table name is a TOML key, so `["replace"]` and
+    // `[replace]` are the same table and Cargo applies both. Comparing the text left
+    // every quoted or escaped spelling unattributed and therefore unexamined.
+    let override: "patch" | "replace" | null = null;
     let depth = 0;
     const stringState = { multiline: null as string | null };
-    // `[patch.<registry>.<crate>]` names its crate in the header, and its `package`
-    // rename would be an assignment inside the body, so the verdict cannot be reached
-    // until the body ends. Deciding it from assignment lines instead read `path` as
-    // the crate name and only reached the header's crate on a non-assignment line —
-    // so a subtable that ran to EOF without a trailing blank line was never checked.
+    // `[patch.<registry>.<crate>]` and `[replace.<package-id>]` name their crate in
+    // the header, and a `package` rename would be an assignment inside the body, so
+    // the verdict cannot be reached until the body ends. Deciding it from assignment
+    // lines instead read `path` as the crate name and only reached the header's crate
+    // on a non-assignment line — so a subtable that ran to EOF without a trailing
+    // blank line was never checked.
     let openCrate: string | null = null;
     let openBody: string[] = [];
     const closeSubtable = (): void => {
@@ -2560,22 +2649,34 @@ function assertNoQualifiedCrateOverride(
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
             closeSubtable();
-            section = normalizeTableHeader(header[1] ?? "");
-            const parts = section.split(".");
-            if (parts[0] === "patch" && parts.length >= 3) {
-                const named = resolveTomlName(parts[parts.length - 1] ?? "");
-                if (named === null) unreadable();
-                openCrate = named;
-            }
+            const parts = splitDottedKey(normalizeTableHeader(header[1] ?? ""));
+            // An unreadable first component cannot be ruled out as `patch` or
+            // `replace`: `["\u0072eplace"."ort:2.0.0-rc.13"]` spells the override
+            // table in a way Cargo resolves and this scan does not.
+            const root = resolveTomlName(parts[0] ?? "");
+            if (root === null) unreadable();
+            override = root === "patch" || root === "replace" ? root : null;
+            if (override === null) continue;
+            // `[patch.<registry>]` and `[replace]` hold one assignment per overridden
+            // crate; a longer path names the crate in its own subtable.
+            const subtable =
+                (override === "patch" && parts.length >= 3) ||
+                (override === "replace" && parts.length >= 2);
+            if (!subtable) continue;
+            const last = resolveTomlName(parts[parts.length - 1] ?? "");
+            if (last === null) unreadable();
+            // A `[replace]` subtable is keyed by a package-ID spec, a `[patch]` one by
+            // the crate name.
+            const named = override === "replace" ? replacedCrateName(last) : last;
+            if (named === null) unreadable();
+            openCrate = named;
             continue;
         }
         if (openCrate !== null) {
             if (trimmed !== "") openBody.push(trimmed);
             continue;
         }
-        // `[patch.<registry>]` and the legacy `[replace]` hold one assignment per
-        // overridden crate.
-        if (!/^(?:patch(?:\.|$)|replace(?:\.|$))/.test(section)) {
+        if (override === null) {
             // `patch.crates-io.ort = { path = "fake-ort" }` is an override declared
             // without a header, including before `[workspace]`.
             const dotted = assignmentKeyText(trimmed);
@@ -2593,14 +2694,15 @@ function assertNoQualifiedCrateOverride(
         if (keyText === null) continue;
         const key = resolveTomlName(keyText);
         if (key === null) unreadable();
-        // A `[replace]` key is a package-ID spec (`"ort:2.0.0-rc.13"`), not a bare
-        // name, so the crate is the part before the version.
+        // A `[replace]` key is a package-ID spec, not a bare crate name.
+        const crate = override === "replace" ? replacedCrateName(key) : key;
+        if (crate === null) unreadable();
         const entry = joinInlineEntry(lines, index);
         if (entry === null) unreadable();
         // A patch entry renames the same way a dependency does:
         // `ort_fork = { package = "ort", path = "..." }` overrides `ort`, so the key
         // is not the crate.
-        const resolved = resolveRenamedCrate(key.split(":")[0] ?? key, entry);
+        const resolved = resolveRenamedCrate(crate, entry);
         if (resolved === null) unreadable();
         reject(resolved);
     }

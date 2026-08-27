@@ -904,6 +904,67 @@ describe("immutable input fail-closed rules", () => {
                 '[replace]\n"ort:2.0.0-rc.13" = { path = "../vendored-ort" }\n',
                 /overrides ort, so the build would not resolve/,
             ],
+            [
+                // The same replacement in subtable form. Cargo deserializes the
+                // header's package-ID spec and applies the replacement; a scan that
+                // opens subtables only under `patch` reads this body as an override
+                // of a crate named `path`.
+                '[replace."ort:2.0.0-rc.13"]\npath = "../vendored-ort"\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                // Subtable form running to EOF, for the same reason the `patch` case
+                // above carries one: the verdict must not depend on a trailing line.
+                '[replace."ort:2.0.0-rc.13"]\npath = "../vendored-ort"',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                // `name@version` is the modern package-ID spelling and Cargo accepts
+                // it here. Cutting the spec at its first `:` leaves the version
+                // attached, so the override reads as one of an unrelated crate.
+                '[replace]\n"ort@2.0.0-rc.13" = { path = "../vendored-ort" }\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                '[replace."ort@2.0.0-rc.13"]\npath = "../vendored-ort"\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                // A spec may name its source as a URL and the package in the
+                // fragment. Cutting at the first `:` reduces this one to `https`.
+                '[replace]\n"https://github.com/pykeio/ort#ort:2.0.0-rc.13" = { path = "../vendored-ort" }\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                // Literal-string spellings of the same key.
+                "[replace.'ort:2.0.0-rc.13']\npath = \"../vendored-ort\"\n",
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                // A URL spec whose fragment holds only a version leaves Cargo to
+                // derive the package from the source, which this scan cannot follow.
+                '[replace."https://github.com/pykeio/ort#2.0.0-rc.13"]\npath = "../vendored-ort"\n',
+                /declares an override this qualifier cannot read/,
+            ],
+            [
+                // Table names are TOML keys, so they may be quoted. Comparing the
+                // header text left every quoted spelling unattributed and therefore
+                // unexamined, for `replace` and `patch` alike.
+                '["replace"."ort:2.0.0-rc.13"]\npath = "../vendored-ort"\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                '["patch"."crates-io"."ort"]\npath = "../vendored-ort"\n',
+                /overrides ort, so the build would not resolve/,
+            ],
+            [
+                "[patch.crates-io.'fastembed']\npath = \"../vendored-fastembed\"\n",
+                /overrides fastembed, so the build would not resolve/,
+            ],
+            [
+                '[patch.crates-io]\n"ort" = { path = "../vendored-ort" }\n',
+                /overrides ort, so the build would not resolve/,
+            ],
         ];
         for (const [patch, error] of cases) {
             const root = freshRoot();
@@ -916,17 +977,25 @@ describe("immutable input fail-closed rules", () => {
             expect(() => generate(root, { check: false })).toThrow(error);
         }
 
-        // An override of an unrelated crate is not this check's business.
-        const unrelated = freshRoot();
-        installProductionManifest(unrelated);
-        const rootManifest = join(unrelated, "Cargo.toml");
-        writeFileSync(
-            rootManifest,
-            `${readFileSync(rootManifest, "utf8")}\n[patch.crates-io]\nserde = { path = "../vendored-serde" }\n`,
-        );
-        expect(generate(unrelated, { check: false }).productionQualified).toBe(
-            true,
-        );
+        // An override of an unrelated crate is not this check's business, in the
+        // subtable spellings as much as the inline ones — the point of resolving the
+        // header is to attribute the override, not to reject every one on sight.
+        for (const override of [
+            '[patch.crates-io]\nserde = { path = "../vendored-serde" }\n',
+            '[replace."serde:1.0.0"]\npath = "../vendored-serde"\n',
+            '[patch.crates-io."serde"]\npath = "../vendored-serde"\n',
+        ]) {
+            const unrelated = freshRoot();
+            installProductionManifest(unrelated);
+            const rootManifest = join(unrelated, "Cargo.toml");
+            writeFileSync(
+                rootManifest,
+                `${readFileSync(rootManifest, "utf8")}\n${override}`,
+            );
+            expect(
+                generate(unrelated, { check: false }).productionQualified,
+            ).toBe(true);
+        }
     });
 
     test("a forbidden ORT capability in Cargo.toml fails production closed", () => {
