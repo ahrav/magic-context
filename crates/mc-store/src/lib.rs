@@ -1330,6 +1330,60 @@ pub const LATEST_MIGRATION_VERSION: u32 = {
     latest
 };
 
+/// Lowest `mc_cache` version this binary can adopt without reinterpreting an
+/// older schema.
+///
+/// [`MIGRATIONS`] is a single consolidated bootstrap, not an incremental chain:
+/// its statements compose the whole schema from an empty `main`. The runner in
+/// `cortexkit-store` applies any bundled version above the highest recorded one,
+/// so a store carrying pre-cutover history would run that bootstrap against a
+/// populated schema and fail on the first `CREATE TABLE`. Such a store is
+/// classified and refused before the runner sees it.
+const OLDEST_ADOPTABLE_MIGRATION_VERSION: u32 = LATEST_MIGRATION_VERSION;
+
+/// Highest `mc_cache` migration recorded in `store.db`, or `None` when the
+/// namespace has no history: a fresh file, or one predating the version table.
+fn recorded_mc_cache_version(inner: &SqliteStore) -> Result<Option<u32>, McStoreError> {
+    Ok(inner.with_conn(|conn| {
+        let tracked: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.sqlite_schema
+                  WHERE type = 'table' AND name = 'cortexkit_schema_version'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !tracked {
+            return Ok(None);
+        }
+        let recorded: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM cortexkit_schema_version WHERE namespace = ?1",
+            [NS],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(recorded).ok().filter(|version| *version > 0))
+    })?)
+}
+
+/// Refuse a `store.db` whose `mc_cache` history predates the consolidated
+/// bootstrap, before the migration runner can apply that bootstrap over it.
+///
+/// The alternative is the runner's raw `table mc_cache_state already exists`,
+/// which names a symptom rather than the family, and leaves an operator with no
+/// stated action. Old version ranges are not supported inputs
+/// (`docs/migration-version-lanes.md`), so this refuses rather than migrating.
+fn refuse_pre_cutover_store(inner: &SqliteStore) -> Result<(), McStoreError> {
+    match recorded_mc_cache_version(inner)? {
+        Some(recorded) if recorded < OLDEST_ADOPTABLE_MIGRATION_VERSION => {
+            Err(McStoreError::PreCutoverModuleStore {
+                recorded_version: recorded,
+                bootstrap_version: OLDEST_ADOPTABLE_MIGRATION_VERSION,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
 /// Deletes only content twins, then rekeys remaining route rows and their mutation/note
 /// companions. The authority predicate is repeated on every statement so a binding is
@@ -3306,6 +3360,12 @@ pub enum ModuleStateSyncError {
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
+    /// `store.db` carries `mc_cache` history older than the consolidated
+    /// bootstrap, so this binary cannot adopt it and does not migrate it.
+    PreCutoverModuleStore {
+        recorded_version: u32,
+        bootstrap_version: u32,
+    },
     /// The on-disk row_version moved under us (a concurrent writer committed first).
     /// The caller re-loads and re-steps.
     CasConflict {
@@ -3388,6 +3448,15 @@ impl std::fmt::Display for McStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             McStoreError::Store(e) => write!(f, "store: {e}"),
+            McStoreError::PreCutoverModuleStore {
+                recorded_version,
+                bootstrap_version,
+            } => write!(
+                f,
+                "module store predates the claims cutover: store.db records mc_cache schema v{recorded_version}, and this binary composes v{bootstrap_version} from an empty schema. \
+                 It is not migrated or reinterpreted. Stop every Magic Context process, move or delete store.db (and its -wal/-shm siblings) to let this binary compose a new one; \
+                 project memory lives in context.db and is unaffected."
+            ),
             McStoreError::CasConflict { expected, found } => {
                 write!(f, "cas conflict: expected {expected:?}, found {found}")
             }
@@ -4801,6 +4870,7 @@ impl McStore {
                 },
             )
         })?;
+        refuse_pre_cutover_store(&inner)?;
         inner.migrate(NS, MIGRATIONS)?;
         // Per-pass statements run through prepare_cached; the rusqlite default cache
         // holds 16 statements, which the hot set alone exceeds. 128 keeps every hot
@@ -16011,6 +16081,77 @@ mod tests {
         assert_eq!(LATEST_MIGRATION_VERSION, shipped_max);
         assert_eq!(
             store.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION
+        );
+    }
+
+    #[test]
+    fn pre_cutover_module_store_is_refused_by_family_not_by_ddl_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        // A store written by a pre-cutover binary: `mc_cache` history below the
+        // consolidated bootstrap, with that history's first table already present.
+        // The migration runner would apply the bootstrap over it and fail on
+        // `CREATE TABLE mc_cache_state`, naming a symptom instead of the family.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 );
+                 CREATE TABLE mc_cache_state (
+                     session_id   TEXT PRIMARY KEY,
+                     row_version  INTEGER NOT NULL,
+                     core_state   TEXT NOT NULL,
+                     meta         TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            for version in 1..OLDEST_ADOPTABLE_MIGRATION_VERSION {
+                conn.execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, version],
+                )
+                .unwrap();
+            }
+        }
+
+        let error = match McStore::open(&descriptor(dir.path())) {
+            Ok(_) => panic!("expected a pre-cutover family refusal, got an open store"),
+            Err(error) => error,
+        };
+        match error {
+            McStoreError::PreCutoverModuleStore {
+                recorded_version,
+                bootstrap_version,
+            } => {
+                assert_eq!(recorded_version, OLDEST_ADOPTABLE_MIGRATION_VERSION - 1);
+                assert_eq!(bootstrap_version, OLDEST_ADOPTABLE_MIGRATION_VERSION);
+            }
+            other => panic!("expected a pre-cutover family refusal, got {other}"),
+        }
+    }
+
+    #[test]
+    fn fresh_and_current_module_stores_open_without_a_pre_cutover_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        // Fresh: no version history at all.
+        let first = McStore::open(&descriptor).unwrap();
+        assert_eq!(
+            first.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION
+        );
+        drop(first);
+        // Reopen: history now records exactly the bootstrap this binary composes,
+        // which the refusal must not mistake for pre-cutover history.
+        let second = McStore::open(&descriptor).unwrap();
+        assert_eq!(
+            second.module_store_schema_version().unwrap(),
             LATEST_MIGRATION_VERSION
         );
     }

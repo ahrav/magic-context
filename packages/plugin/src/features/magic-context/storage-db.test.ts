@@ -468,6 +468,31 @@ describe("storage-db direct format", () => {
             expect(fileDigest(dbPath)).toBe(before);
         });
 
+        it("#when an exactly-current family carries a newer fence #then still reports a fence rejection", () => {
+            const dir = makeTempDir("storage-db-current-newer-fence-");
+            const dbPath = join(dir, "context.db");
+            // Bootstrapped by this build, so the marker, manifest digest and object
+            // inventory all match and classification returns `current`. The fence row
+            // is then the only evidence that a newer binary owns the family, which is
+            // exactly what an object-name inventory cannot see.
+            expect(openDatabase(dbPath)).not.toBeNull();
+            closeDatabase();
+            const bumped = new Database(dbPath);
+            bumped
+                .prepare(
+                    "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, 'future fence', 0)",
+                )
+                .run(LATEST_SUPPORTED_VERSION + 1);
+            bumped.close();
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getSchemaFenceRejection()).toEqual({
+                persistedVersion: LATEST_SUPPORTED_VERSION + 1,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+            });
+            expect(getFormatRefusal()).toBeNull();
+        });
+
         it("#when the file is not a database #then throws so callers fail closed", () => {
             const dir = makeTempDir("storage-db-not-a-db-");
             const dbPath = join(dir, "context.db");

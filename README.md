@@ -279,7 +279,11 @@ Magic Context also writes to a few other locations:
 
 ## Development
 
-**Requirements:** [Bun](https://bun.sh) ≥ 1.0
+**Requirements:** [Bun](https://bun.sh) ≥ 1.3.14
+
+Storage refuses to open below that floor: the runtime gate needs a SQLite build
+that resets the WAL safely, and Bun exposes one from 1.3.14 onward. The floor
+lives in `MIN_SUPPORTED_BUN_VERSION` (`packages/plugin/src/shared/sqlite.ts`).
 
 ```sh
 bun install         # Install dependencies

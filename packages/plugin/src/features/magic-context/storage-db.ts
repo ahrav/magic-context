@@ -640,12 +640,19 @@ function bootstrapUnderWriteLock(
     return classifyDatabaseFormatFamily(inspectDatabaseForClassification(db, dbPath), expected);
 }
 
-function recordFormatRefusal(
+/**
+ * Refuse a database carrying a persisted fence or marker epoch newer than this
+ * binary reads, recording the fence-rejection latch. Returns true when refused.
+ *
+ * Every family reaches this check, accepted or not: the exact object inventory
+ * proves shape, never vintage, so a database whose objects match this build can
+ * still carry a fence only a newer binary understands.
+ */
+function refuseNewerSchemaFence(
     db: Database,
     dbPath: string,
-    classification: FormatFamilyClassification,
     latestSupportedVersion: number,
-): void {
+): boolean {
     let persistedVersion = 0;
     try {
         persistedVersion = getPersistedSchemaVersion(db);
@@ -659,17 +666,29 @@ function recordFormatRefusal(
     // a family a newer binary legitimately owns.
     const marker = readDirectFormatMarker(db);
     const persistedEpoch = marker.status === "present" ? marker.marker.formatEpoch : 0;
-    if (persistedVersion > latestSupportedVersion || persistedEpoch > DIRECT_FORMAT_EPOCH) {
-        lastSchemaFenceRejection = { persistedVersion, supportedVersion: latestSupportedVersion };
-        const lane =
-            persistedEpoch > DIRECT_FORMAT_EPOCH
-                ? `format epoch ${persistedEpoch} (this binary reads epoch ${DIRECT_FORMAT_EPOCH})`
-                : `format lane v${persistedVersion} (max v${latestSupportedVersion})`;
-        log(
-            `[magic-context] storage fatal: refusing to open ${dbPath}; its ${lane} is newer than this binary supports. A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart. Do not reset this database: a newer binary owns it.`,
-        );
-        return;
+    if (persistedVersion <= latestSupportedVersion && persistedEpoch <= DIRECT_FORMAT_EPOCH) {
+        return false;
     }
+    lastSchemaFenceRejection = { persistedVersion, supportedVersion: latestSupportedVersion };
+    const lane =
+        persistedEpoch > DIRECT_FORMAT_EPOCH
+            ? `format epoch ${persistedEpoch} (this binary reads epoch ${DIRECT_FORMAT_EPOCH})`
+            : `format lane v${persistedVersion} (max v${latestSupportedVersion})`;
+    log(
+        `[magic-context] storage fatal: refusing to open ${dbPath}; its ${lane} is newer than this binary supports. A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart. Do not reset this database: a newer binary owns it.`,
+    );
+    return true;
+}
+
+function recordFormatRefusal(
+    db: Database,
+    dbPath: string,
+    classification: FormatFamilyClassification,
+    latestSupportedVersion: number,
+): void {
+    if (refuseNewerSchemaFence(db, dbPath, latestSupportedVersion)) return;
+    const marker = readDirectFormatMarker(db);
+    const persistedEpoch = marker.status === "present" ? marker.marker.formatEpoch : 0;
     lastFormatRefusal = { family: classification.family, reasons: classification.reasons };
     // A digest-only mismatch at the same epoch cannot be direction-typed from a
     // hash, so this must not assert the family is garbage.
@@ -748,6 +767,14 @@ function openDirectDatabase(
         }
         if (classification.family !== "current") {
             recordFormatRefusal(db, dbPath, classification, latestSupportedVersion);
+            closeQuietly(db);
+            return null;
+        }
+        // The fence is checked on the accepted path too, not only on refusal.
+        // Object-name identity cannot see a fence a newer binary moved without
+        // renaming anything, so skipping this here would leave the one family
+        // that reaches real queries as the only one never proving its vintage.
+        if (refuseNewerSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
             return null;
         }
