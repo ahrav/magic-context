@@ -843,6 +843,18 @@ describe("immutable input fail-closed rules", () => {
                     )}\n[features]\nnever-enabled = ["ort_dep/tensorrt"]\n`,
                 /forwards ort_dep\/tensorrt, which is outside the qualified closure/,
             ],
+            [
+                // A TOML literal string is a valid spelling of the same forwarding.
+                (cargo) => `${cargo}\n[features]\nbypass = ['ort/cuda']\n`,
+                /forwards ort\/cuda, which is outside the qualified closure/,
+            ],
+            [
+                // An escaped basic string decodes to the same value, so a scan that
+                // cannot decode it must refuse rather than skip it.
+                (cargo) =>
+                    `${cargo}\n[features]\nbypass = ["ort/c\\u0075da"]\n`,
+                /\[features\] table .* holds a string this qualifier cannot read/,
+            ],
         ];
         for (const [mutate, error] of cases) {
             const root = freshRoot();
@@ -952,6 +964,51 @@ describe("oracle evidence hook", () => {
             manifest.oracle.host[field] = value;
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).not.toThrow();
+        }
+    });
+
+    test("an oracle without a recorded pass cannot qualify", () => {
+        // Every other oracle field describes how the run was configured. A run
+        // that failed, or never happened, produces the same parameters, so
+        // presence must not read as success.
+        const cases: [(o: any) => void, RegExp][] = [
+            [
+                (o) => {
+                    o.result = "fail";
+                },
+                /recorded result must be "pass"/,
+            ],
+            [
+                (o) => {
+                    delete o.result;
+                },
+                /oracle: missing key result/,
+            ],
+            [
+                (o) => {
+                    o.vectors_compared = o.expected_vectors - 1;
+                },
+                /compared 7 vectors, expected 8/,
+            ],
+            [
+                (o) => {
+                    o.observed_max_error = o.tolerance * 2;
+                },
+                /observed_max_error must be a finite value/,
+            ],
+            [
+                (o) => {
+                    o.observed_max_error = -1;
+                },
+                /observed_max_error must be a finite value/,
+            ],
+        ];
+        for (const [mutate, error] of cases) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            mutate(manifest.oracle);
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(error);
         }
     });
 

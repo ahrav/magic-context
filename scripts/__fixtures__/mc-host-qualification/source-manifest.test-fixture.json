@@ -107,7 +107,10 @@
     },
     "expected_vectors": 8,
     "tolerance": 0.01,
-    "network_access": "none"
+    "network_access": "none",
+    "result": "pass",
+    "vectors_compared": 8,
+    "observed_max_error": 0.004
   },
   "harnesses": {
     "opencode": {

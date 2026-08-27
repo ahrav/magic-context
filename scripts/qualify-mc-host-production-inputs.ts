@@ -1131,6 +1131,12 @@ export interface OracleEvidence {
     expected_vectors: number;
     tolerance: number;
     network_access: string;
+    /** The recorded outcome. Only `"pass"` qualifies. */
+    result: string;
+    /** Vectors actually compared; must equal `expected_vectors`. */
+    vectors_compared: number;
+    /** Worst per-vector deviation observed; must be within `tolerance`. */
+    observed_max_error: number;
 }
 
 export interface SourceManifest {
@@ -1361,6 +1367,9 @@ export function checkOracleEvidence(
             "expected_vectors",
             "tolerance",
             "network_access",
+            "result",
+            "vectors_compared",
+            "observed_max_error",
         ],
         "oracle",
     );
@@ -1422,6 +1431,34 @@ export function checkOracleEvidence(
     }
     if (oracle.network_access !== "none") {
         fail("oracle: recorded network access must be none");
+    }
+    // Everything above describes how the oracle was *run*. None of it says the
+    // comparison passed, and a run that failed or never happened produces exactly
+    // the same parameters — so without a recorded outcome, presence was being read
+    // as success. Canonical regeneration cannot close that, because the outcome is
+    // absent from the source it regenerates from.
+    if (oracle.result !== "pass") {
+        fail(
+            `oracle: recorded result must be "pass" (got ${JSON.stringify(oracle.result)})`,
+        );
+    }
+    if (oracle.vectors_compared !== oracle.expected_vectors) {
+        fail(
+            `oracle: compared ${JSON.stringify(oracle.vectors_compared)} vectors, expected ${oracle.expected_vectors}`,
+        );
+    }
+    // A pass means every vector came in within tolerance, so the worst deviation
+    // observed is the claim that has to hold. `<=` matches the tolerance's own
+    // inclusive reading, and a negative or non-finite value is not a deviation.
+    if (
+        typeof oracle.observed_max_error !== "number" ||
+        !Number.isFinite(oracle.observed_max_error) ||
+        oracle.observed_max_error < 0 ||
+        oracle.observed_max_error > oracle.tolerance
+    ) {
+        fail(
+            `oracle: observed_max_error must be a finite value in [0, ${oracle.tolerance}]`,
+        );
     }
 }
 
@@ -1611,8 +1648,10 @@ function stripTomlComments(line: string): string {
 }
 
 /**
- * Resolve a TOML key as written to the name Cargo will see, or `null` when this
- * scan cannot say.
+ * Resolve a TOML key or string value as written to the name Cargo will see, or
+ * `null` when this scan cannot say. Used for dependency keys, a renamed
+ * dependency's `package` value, and forwarded feature values in `[features]` —
+ * all three are the same three spellings with the same reason to refuse a fourth.
  *
  * `null` is a refusal, not an absence. A quoted key is a basic string and may
  * carry escapes — `"o\u0072t"` is `ort` to Cargo — so a scan that treats any
@@ -1620,11 +1659,8 @@ function stripTomlComments(line: string): string {
  * entirely, which is how a target-specific entry with an accelerator feature could
  * go unexamined while the base entry validated cleanly. Callers must treat `null`
  * as an unreadable dependency table.
- *
- * Also used for a renamed dependency's `package = "..."` value, which is a TOML
- * string with the same spellings and the same reason to refuse an unreadable one.
  */
-function tomlKeyName(raw: string): string | null {
+function resolveTomlName(raw: string): string | null {
     const key = raw.trim();
     // Bare keys: letters, digits, underscore, dash.
     if (/^[A-Za-z0-9_-]+$/.test(key)) return key;
@@ -1637,6 +1673,39 @@ function tomlKeyName(raw: string): string | null {
     // Anything else — an escaped basic string, a dotted key, a spelling not
     // covered above — is refused rather than guessed at.
     return null;
+}
+
+/**
+ * Every TOML string token in `entry`, quotes included, or `null` when one is
+ * unterminated.
+ *
+ * Returned with quotes so `resolveTomlName` can apply the same refuse-the-fourth-
+ * spelling rule it applies to keys: a basic string carrying escapes is refused
+ * rather than decoded, which is what keeps `["ort/c\u0075da"]` from reading as an
+ * unrecognized value and slipping past the forwarding filter.
+ */
+function tomlStringTokens(entry: string): string[] | null {
+    const tokens: string[] = [];
+    for (let i = 0; i < entry.length; i++) {
+        const quote = entry[i];
+        if (quote !== '"' && quote !== "'") continue;
+        let j = i + 1;
+        let escaped = false;
+        for (; j < entry.length; j++) {
+            const char = entry[j];
+            if (quote === "'") {
+                if (char === "'") break;
+                continue;
+            }
+            if (escaped) escaped = false;
+            else if (char === "\\") escaped = true;
+            else if (char === '"') break;
+        }
+        if (j >= entry.length) return null;
+        tokens.push(entry.slice(i, j + 1));
+        i = j;
+    }
+    return tokens;
 }
 
 /**
@@ -1703,7 +1772,7 @@ function dependencyDeclarations(
         const isDependencyTable = /(?:^|\.)(?:dev-|build-)?dependencies$/.test(
             section,
         );
-        const key = tomlKeyName(assignment[1] ?? "");
+        const key = resolveTomlName(assignment[1] ?? "");
         if (key === null) {
             if (isDependencyTable) return null;
             continue;
@@ -1718,7 +1787,7 @@ function dependencyDeclarations(
             const renamed = /(?:^|[\s,{])package\s*=\s*("[^"\\]*"|'[^']*')/.exec(
                 entry,
             );
-            const resolved = tomlKeyName(renamed?.[1] ?? "");
+            const resolved = resolveTomlName(renamed?.[1] ?? "");
             if (resolved === null) return null;
             crate = resolved;
         }
@@ -1978,8 +2047,19 @@ function assertNoForbiddenFeatureForwarding(
                 `the [features] table in ${MC_HOST_CARGO_TOML_PATH} holds an entry this qualifier cannot read`,
             );
         }
-        for (const quoted of entry.match(/"[^"\\]*"/g) ?? []) {
-            const value = quoted.slice(1, -1);
+        const tokens = tomlStringTokens(entry);
+        if (tokens === null) {
+            fail(
+                `the [features] table in ${MC_HOST_CARGO_TOML_PATH} holds an unterminated string`,
+            );
+        }
+        for (const token of tokens) {
+            const value = resolveTomlName(token);
+            if (value === null) {
+                fail(
+                    `the [features] table in ${MC_HOST_CARGO_TOML_PATH} holds a string this qualifier cannot read (${token})`,
+                );
+            }
             // `dep?/feature` is the weak form; both forward the same capability.
             const forward = /^([A-Za-z0-9_-]+)\??\/(.+)$/.exec(value);
             const key = forward?.[1];
