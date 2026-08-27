@@ -1222,6 +1222,16 @@ describe("immutable input fail-closed rules", () => {
                 /forwards ort\/cuda, which is outside the qualified closure/,
             ],
             [
+                // A multi-line string's closing delimiter may sit behind a `#`, which
+                // is content there. Stripping comments per line deleted that close, so
+                // the string state stayed open and every table after it was read as
+                // string body — including this Linux-only entry Cargo resolves with
+                // the `cuda` feature.
+                (cargo) =>
+                    `[package.metadata.decoy]\nvalue = """\n# """\n\n${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
+            ],
+            [
                 // An escaped basic string decodes to the same value, so a scan that
                 // cannot decode it must refuse rather than skip it.
                 (cargo) =>

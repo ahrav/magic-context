@@ -1787,6 +1787,69 @@ const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
 ];
 
 /**
+ * Walk `line`'s characters that lie outside TOML strings, carrying multi-line
+ * string state across lines.
+ *
+ * One walk serves both the comment stripper and the nesting counter, because they
+ * have to agree on what a string is. When they did not, the stripper removed a
+ * closing `"""` that sat behind a `#` and the counter then read the rest of the file
+ * as string body — the two answers were derived from separate scans, so nothing
+ * forced them to match.
+ *
+ * `visit` is called with each unquoted character and its offset; returning `false`
+ * stops the walk, which is how the stripper reports the comment it found. The state
+ * is the caller's because a multi-line string's close may be lines away.
+ */
+function scanUnquoted(
+    line: string,
+    state: { multiline: string | null },
+    visit: (char: string, index: number) => boolean,
+): void {
+    let index = 0;
+    while (index < line.length) {
+        if (state.multiline !== null) {
+            const close = line.indexOf(state.multiline, index);
+            if (close === -1) return;
+            index = close + state.multiline.length;
+            state.multiline = null;
+            continue;
+        }
+        const rest = line.slice(index);
+        const opener = rest.startsWith('"""')
+            ? '"""'
+            : rest.startsWith("'''")
+              ? "'''"
+              : null;
+        if (opener !== null) {
+            state.multiline = opener;
+            index += opener.length;
+            continue;
+        }
+        const char = line[index] as string;
+        if (char === '"' || char === "'") {
+            // Single-line string: consume to its close, honouring escapes in a basic
+            // string. An unterminated one ends at the line.
+            let scan = index + 1;
+            let escaped = false;
+            for (; scan < line.length; scan++) {
+                const inner = line[scan];
+                if (char === "'") {
+                    if (inner === "'") break;
+                    continue;
+                }
+                if (escaped) escaped = false;
+                else if (inner === "\\") escaped = true;
+                else if (inner === '"') break;
+            }
+            index = scan + 1;
+            continue;
+        }
+        if (!visit(char, index)) return;
+        index++;
+    }
+}
+
+/**
  * Strip TOML comments from one line, leaving `#` inside a quoted value alone.
  *
  * Comments are the one place a `Cargo.toml` can contain text that reads exactly
@@ -1795,25 +1858,36 @@ const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
  * Cargo resolves whatever the real key says. Removing them before any comparison
  * closes that for every check at once, rather than per pattern.
  *
- * Basic strings only. TOML literal strings (`'...'`) and multi-line strings do
- * not appear in Cargo dependency declarations, and treating one as unquoted would
- * only truncate the entry into a rejection.
+ * Multi-line-string aware, and the state is the caller's for that reason. A closing
+ * delimiter may sit behind a `#` — `value = """` then `# """` is a valid value whose
+ * second line begins with one — and stripping that line in isolation deleted the
+ * close, leaving every scan's string state open for the rest of the file. With the
+ * eligibility rule that a line inside a string is not structure, that silently
+ * skipped every table after it.
  */
-function stripTomlComments(line: string): string {
-    let inString = false;
-    let escaped = false;
-    for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-        if (inString) {
-            if (escaped) escaped = false;
-            else if (char === "\\") escaped = true;
-            else if (char === '"') inString = false;
-            continue;
-        }
-        if (char === '"') inString = true;
-        else if (char === "#") return line.slice(0, i);
-    }
-    return line;
+function stripTomlComments(
+    line: string,
+    state: { multiline: string | null },
+): string {
+    let comment = -1;
+    scanUnquoted(line, state, (char, index) => {
+        if (char !== "#") return true;
+        comment = index;
+        return false;
+    });
+    return comment === -1 ? line : line.slice(0, comment);
+}
+
+/**
+ * Split `cargo` into comment-stripped lines.
+ *
+ * One state object threaded across the whole file, since a multi-line string spans
+ * lines. `Array.map(stripTomlComments)` cannot express this: `map` passes the index
+ * as the second argument, which would silently become the state.
+ */
+function tomlLines(cargo: string): string[] {
+    const state = { multiline: null as string | null };
+    return cargo.split("\n").map((line) => stripTomlComments(line, state));
 }
 
 /**
@@ -1924,53 +1998,11 @@ function structuralDelta(
     state: { multiline: string | null },
 ): number {
     let delta = 0;
-    let index = 0;
-    while (index < line.length) {
-        // Inside a multi-line string nothing counts until its closing delimiter, and
-        // that delimiter may be lines away — which is why the state is the caller's,
-        // not this function's. A per-line reset let a bracket inside such a string
-        // count as structure and put the shared depth permanently wrong.
-        if (state.multiline !== null) {
-            const close = line.indexOf(state.multiline, index);
-            if (close === -1) return delta;
-            index = close + state.multiline.length;
-            state.multiline = null;
-            continue;
-        }
-        const rest = line.slice(index);
-        const opener = rest.startsWith('"""')
-            ? '"""'
-            : rest.startsWith("'''")
-              ? "'''"
-              : null;
-        if (opener !== null) {
-            state.multiline = opener;
-            index += opener.length;
-            continue;
-        }
-        const char = line[index] as string;
-        if (char === '"' || char === "'") {
-            // Single-line string: consume to its close, honouring escapes in a basic
-            // string. An unterminated one ends at the line.
-            let scan = index + 1;
-            let escaped = false;
-            for (; scan < line.length; scan++) {
-                const inner = line[scan];
-                if (char === "'") {
-                    if (inner === "'") break;
-                    continue;
-                }
-                if (escaped) escaped = false;
-                else if (inner === "\\") escaped = true;
-                else if (inner === '"') break;
-            }
-            index = scan + 1;
-            continue;
-        }
+    scanUnquoted(line, state, (char) => {
         if (char === "{" || char === "[") delta++;
         else if (char === "}" || char === "]") delta--;
-        index++;
-    }
+        return true;
+    });
     return delta;
 }
 
@@ -2172,7 +2204,7 @@ interface DependencyDeclaration {
 function dependencyDeclarations(
     cargo: string,
 ): DependencyDeclaration[] | null {
-    const lines = cargo.split("\n").map(stripTomlComments);
+    const lines = tomlLines(cargo);
     const declarations: DependencyDeclaration[] = [];
     // `[dependencies.ort]` and `[target.'cfg(...)'.dependencies.ort]` declare a
     // crate through a subtable rather than an inline value, so the crate name is in
@@ -2564,7 +2596,7 @@ function assertNoForbiddenFeatureForwarding(
             .map((declaration) => declaration.key),
     );
     if (keys.size === 0) return;
-    const lines = cargo.split("\n").map(stripTomlComments);
+    const lines = tomlLines(cargo);
     let section = "";
     let depth = 0;
     const stringState = { multiline: null as string | null };
@@ -2681,7 +2713,7 @@ function assertNoQualifiedCrateOverride(
             );
         }
     };
-    const lines = readFileSync(path, "utf8").split("\n").map(stripTomlComments);
+    const lines = tomlLines(readFileSync(path, "utf8"));
     // Which override table the scan is inside, resolved rather than matched against
     // the header text: a table name is a TOML key, so `["replace"]` and
     // `[replace]` are the same table and Cargo applies both. Comparing the text left
