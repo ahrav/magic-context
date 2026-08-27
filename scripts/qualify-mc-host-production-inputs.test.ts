@@ -103,6 +103,26 @@ function installManifest(root: string, manifest: any): void {
 const STAGED_PRODUCTION_INPUT_DIR = "opt/mc-host-inputs";
 
 /**
+ * Point every source at a resolvable host. The committed fixtures name RFC 2606
+ * `.invalid` hosts, which production mode rejects because they can never serve an
+ * artifact, so a production-mode test aimed at any other rule has to clear that one
+ * first — as a real production manifest would.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
+function useResolvableSources(manifest: any): void {
+    for (const artifact of Object.values(manifest.inputs) as {
+        source?: string;
+    }[]) {
+        if (typeof artifact.source === "string") {
+            artifact.source = artifact.source.replace(
+                /\.example\.invalid\b/,
+                ".mchost-release.io",
+            );
+        }
+    }
+}
+
+/**
  * Replace every declared digest with a distinct non-blacklisted value. Production
  * mode denies the committed fixture digests outright, which fires before the path
  * rules, so a test targeting a path rule must not carry those digests.
@@ -133,7 +153,12 @@ function installProductionManifest(
     // the digests computed from them, exactly as a real qualifying host would.
     for (const [key, artifact] of Object.entries(manifest.inputs) as [
         string,
-        { verify_local_path: string; sha256: string; size_bytes: number },
+        {
+            verify_local_path: string;
+            sha256: string;
+            size_bytes: number;
+            source: string;
+        },
     ][]) {
         const target = join(stagedDir, basename(artifact.verify_local_path));
         const bytes = Buffer.from(`staged production stand-in for ${key}\n`);
@@ -141,6 +166,13 @@ function installProductionManifest(
         artifact.verify_local_path = target;
         artifact.sha256 = createHash("sha256").update(bytes).digest("hex");
         artifact.size_bytes = bytes.length;
+        // The fixtures name RFC 2606 `.invalid` hosts, which production mode
+        // rejects because they can never serve an artifact. A production manifest
+        // must name a resolvable host, exactly as a real one would.
+        artifact.source = artifact.source.replace(
+            /\.example\.invalid\b/,
+            ".mchost-release.io",
+        );
     }
     mutate?.(manifest);
     installManifest(root, manifest);
@@ -401,6 +433,32 @@ describe("immutable input fail-closed rules", () => {
         }
     });
 
+    test("reserved source hosts cannot qualify for production", () => {
+        // The committed fixtures name RFC 2606 `.invalid` hosts. Leaving one in a
+        // production manifest records provenance nobody can retrieve, so the lock
+        // would claim an artifact origin that cannot exist.
+        for (const host of [
+            "models.example.invalid",
+            "artifacts.example.test",
+            "cdn.localhost",
+            "files.example.com",
+        ]) {
+            const root = freshRoot();
+            installProductionManifest(root, (manifest) => {
+                manifest.inputs.model_onnx.source =
+                    `https://${host}/rev/abc123/model.onnx`;
+            });
+            expect(() => generate(root, { check: false })).toThrow(
+                /source host .* is reserved/,
+            );
+        }
+
+        // Test-fixture mode keeps using them, which is what the fixtures are.
+        const fixture = freshRoot();
+        installManifest(fixture, fixtureManifest());
+        expect(() => generate(fixture, { check: false })).not.toThrow();
+    });
+
     test("placeholder hashes are rejected", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
@@ -420,6 +478,7 @@ describe("immutable input fail-closed rules", () => {
         const relocated = freshRoot();
         const byHash = fixtureManifest();
         byHash.mode = "production";
+        useResolvableSources(byHash);
         const staged = join(relocated, "opt/relocated-inputs");
         mkdirSync(staged, { recursive: true });
         cpSync(join(repoRoot, FIXTURE_DIR, "artifacts"), staged, {
@@ -442,6 +501,7 @@ describe("immutable input fail-closed rules", () => {
         const inPlace = freshRoot();
         const byPath = fixtureManifest();
         byPath.mode = "production";
+        useResolvableSources(byPath);
         unblacklistDigests(byPath);
         for (const artifact of Object.values(byPath.inputs) as {
             verify_local_path: string;
@@ -587,6 +647,7 @@ describe("immutable input fail-closed rules", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.mode = "production";
+        useResolvableSources(manifest);
         unblacklistDigests(manifest);
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).toThrow(
@@ -735,13 +796,18 @@ describe("immutable input fail-closed rules", () => {
                 /declares a features list this qualifier cannot read/,
             ],
             [
-                // The section form puts the crate's keys on lines this text scan
-                // cannot attribute to it, so it must be rejected outright.
+                // The subtable form is a valid Cargo spelling, so it must be
+                // checked rather than refused: its keys are the same ones the
+                // inline table carries, just under a header.
                 (cargo) =>
-                    cargo.replace(
-                        /^ort = .*$/m,
-                        '[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = ["load-dynamic"]',
-                    ),
+                    `${cargo.replace(/^ort = .*$/m, "")}\n[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = ["load-dynamic", "download-binaries"]\n`,
+                /ort feature download-binaries .* outside the qualified closure/,
+            ],
+            [
+                // A target-specific subtable, which Cargo unifies into the Linux
+                // build's feature set while the base entry stays clean.
+                (cargo) =>
+                    `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies.ort]\nversion = "=2.0.0-rc.13"\nfeatures = ["cuda"]\n`,
                 /ort must be declared exactly once/,
             ],
             [
@@ -1667,6 +1733,7 @@ describe("verify-path resolution", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.mode = "production";
+        useResolvableSources(manifest);
         unblacklistDigests(manifest);
 
         // Real bytes live in a developer cache; the manifest names an

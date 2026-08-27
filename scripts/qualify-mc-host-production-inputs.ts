@@ -967,6 +967,27 @@ const CREDENTIAL_QUERY_SUBSTRINGS = [
     "authorization",
 ];
 const CREDENTIAL_QUERY_EXACT = new Set(["sig", "auth", "key", "pwd", "sas"]);
+/**
+ * Host names reserved by RFC 2606 and RFC 6761, plus loopback. None of them can
+ * resolve to a server holding a production artifact, so a production lock naming
+ * one records provenance nobody can act on — including the `example.invalid` hosts
+ * the committed test fixtures use, which is exactly the value that must not reach a
+ * production manifest by being left in place.
+ *
+ * Matched on the host and its parent suffixes, so `models.example.invalid` lands.
+ */
+const RESERVED_SOURCE_HOST_SUFFIXES = [
+    "invalid",
+    "test",
+    "example",
+    "localhost",
+    "local",
+    "example.com",
+    "example.net",
+    "example.org",
+    "127.0.0.1",
+    "::1",
+];
 
 function isCredentialQueryName(name: string): boolean {
     const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -1252,6 +1273,20 @@ function validateQualifiedArtifact(
         fail(
             `inputs.${key}: source must not embed URL credentials (userinfo is copied into the committed lock)`,
         );
+    }
+    // A reserved name can never identify a retrievable artifact, so a production
+    // lock naming one records provenance that cannot be acted on. Allowed in
+    // `test-fixture` mode, which is what the committed fixtures use.
+    if (mode === "production") {
+        const host = sourceUrl.hostname.toLowerCase();
+        const reserved = RESERVED_SOURCE_HOST_SUFFIXES.find(
+            (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+        );
+        if (reserved !== undefined) {
+            fail(
+                `inputs.${key}: source host ${host} is reserved (${reserved}) and can never serve a production artifact`,
+            );
+        }
     }
     for (const [name] of sourceUrl.searchParams) {
         if (isCredentialQueryName(name)) {
@@ -1752,6 +1787,24 @@ function dependencyDeclarations(
 ): DependencyDeclaration[] | null {
     const lines = cargo.split("\n").map(stripTomlComments);
     const declarations: DependencyDeclaration[] = [];
+    const dependencyTable = /(?:^|\.)(?:dev-|build-)?dependencies$/;
+    // `[dependencies.ort]` and `[target.'cfg(...)'.dependencies.ort]` declare a
+    // crate through a subtable rather than an inline value, so the crate name is in
+    // the header and its keys are ordinary assignments beneath it. Accumulate those
+    // into the same entry shape an inline table produces — `version = "..."`,
+    // `default-features = false`, `features = [...]`, `package = "..."` — so every
+    // check downstream applies to both spellings unchanged.
+    let open: { section: string; key: string; body: string[] } | null = null;
+    const closeSubtable = (): boolean => {
+        if (open === null) return true;
+        const { section: parent, key, body } = open;
+        open = null;
+        const entry = body.join(" ");
+        const crate = resolveRenamedCrate(key, entry);
+        if (crate === null) return false;
+        declarations.push({ section: parent, key, crate, entry });
+        return true;
+    };
     let section = "";
     let depth = 0;
     for (const [index, line] of lines.entries()) {
@@ -1764,14 +1817,24 @@ function dependencyDeclarations(
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
+            if (!closeSubtable()) return null;
             section = header[1] ?? "";
+            const subtable = /^(.*)\.([^.]+)$/.exec(section);
+            const parent = subtable?.[1] ?? "";
+            if (subtable !== null && dependencyTable.test(parent)) {
+                const key = resolveTomlName(subtable[2] ?? "");
+                if (key === null) return null;
+                open = { section: parent, key, body: [] };
+            }
+            continue;
+        }
+        if (open !== null) {
+            if (trimmed !== "") open.body.push(trimmed);
             continue;
         }
         const assignment = /^(.*?)=/.exec(trimmed);
         if (assignment === null) continue;
-        const isDependencyTable = /(?:^|\.)(?:dev-|build-)?dependencies$/.test(
-            section,
-        );
+        const isDependencyTable = dependencyTable.test(section);
         const key = resolveTomlName(assignment[1] ?? "");
         if (key === null) {
             if (isDependencyTable) return null;
@@ -1782,18 +1845,22 @@ function dependencyDeclarations(
             if (isDependencyTable) return null;
             continue;
         }
-        let crate = key;
-        if (isDependencyTable && /(?:^|[\s,{])package\s*=/.test(entry)) {
-            const renamed = /(?:^|[\s,{])package\s*=\s*("[^"\\]*"|'[^']*')/.exec(
-                entry,
-            );
-            const resolved = resolveTomlName(renamed?.[1] ?? "");
-            if (resolved === null) return null;
-            crate = resolved;
-        }
+        const crate = isDependencyTable
+            ? resolveRenamedCrate(key, entry)
+            : key;
+        if (crate === null) return null;
         declarations.push({ section, key, crate, entry });
     }
+    if (!closeSubtable()) return null;
     return declarations;
+}
+
+/** The crate a declaration resolves to: `package = "..."` when renamed, else the
+ *  key. `null` when a `package` value is present but unreadable. */
+function resolveRenamedCrate(key: string, entry: string): string | null {
+    if (!/(?:^|[\s,{])package\s*=/.test(entry)) return key;
+    const renamed = /(?:^|[\s,{])package\s*=\s*("[^"\\]*"|'[^']*')/.exec(entry);
+    return resolveTomlName(renamed?.[1] ?? "");
 }
 
 /** Join the inline entry starting at `index` onto one line, or `null` when its
@@ -1877,8 +1944,23 @@ function assertPinnedCrateFeatures(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} declares a features list this qualifier cannot read`,
         );
     }
-    for (const raw of declared?.[1]?.split(",") ?? []) {
-        const feature = raw.trim().replace(/^["']|["']$/g, "").toLowerCase();
+    // Same string rule as the `[features]` forwarding scan: stripping quotes is not
+    // reading a TOML string, and `"c\u0075da"` decodes to a forbidden feature that
+    // an undecoded substring test cannot see.
+    const tokens = tomlStringTokens(declared?.[1] ?? "");
+    if (tokens === null) {
+        fail(
+            `${crate} in ${MC_HOST_CARGO_TOML_PATH} declares a features list holding an unterminated string`,
+        );
+    }
+    for (const token of tokens) {
+        const resolved = resolveTomlName(token);
+        if (resolved === null) {
+            fail(
+                `${crate} in ${MC_HOST_CARGO_TOML_PATH} declares a feature this qualifier cannot read (${token})`,
+            );
+        }
+        const feature = resolved.toLowerCase();
         if (feature.length === 0) continue;
         const forbidden = FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS.find((hint) =>
             feature.includes(hint),
