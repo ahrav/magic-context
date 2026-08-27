@@ -646,10 +646,16 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
 
     // A 10-second window: warmup ends at 1s, the window closes at 10s.
     let window = HoldWindow::new(0, 10);
+    // Method and disposition move together: `embed.result` is always a poll and
+    // no other method ever is, which `validate_synapse_ledgers` enforces.
     let attempt = |logical_id, attempt_id, send_ns: u64, disposition| AttemptRecord {
         logical_id,
         attempt_id,
-        method: SynapseMethod::Result,
+        method: if disposition == AttemptDisposition::Poll {
+            SynapseMethod::Result
+        } else {
+            SynapseMethod::Batch
+        },
         disposition,
         code: None,
         retry_after_ms: None,
@@ -748,6 +754,75 @@ fn attempts_follow_their_request_so_the_per_request_ledger_reconciles() {
         "{:?}",
         broken.errors
     );
+}
+
+#[test]
+fn a_result_attempt_recorded_as_a_success_is_rejected() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod,
+    };
+
+    // The corruption shape the count checks alone cannot see: an `embed.result`
+    // row recorded as a success lands in `successes` instead of `polls`, so a
+    // logical row claiming zero polls still reconciles on both totals while the
+    // published poll distribution — and the ceiling that gates on it — is
+    // understated.
+    let logical = vec![LogicalRecord {
+        logical_id: 1,
+        scheduled_start_ns: Some(0),
+        actual_first_send_ns: 0,
+        terminal_ns: 2,
+        latency_ns: 2,
+        disposition: LogicalDisposition::Completed,
+        terminal_code: None,
+        attempts: 2,
+        polls: 0,
+        window: WindowClass::Measured,
+    }];
+    let attempt = |attempt_id, method, disposition| AttemptRecord {
+        logical_id: 1,
+        attempt_id,
+        method,
+        disposition,
+        code: None,
+        retry_after_ms: None,
+        actual_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        window: WindowClass::Measured,
+    };
+    let attempts = vec![
+        attempt(1, SynapseMethod::Batch, AttemptDisposition::Success),
+        attempt(2, SynapseMethod::Result, AttemptDisposition::Success),
+    ];
+
+    let ledger = validate_synapse_ledgers(&logical, &attempts);
+    // Both totals balance, which is why the invariant has to be checked on its
+    // own rather than inferred from the counts.
+    assert_eq!(ledger.attempts, 2);
+    assert_eq!(ledger.polls, 0);
+    assert!(!ledger.valid);
+    assert!(
+        ledger
+            .errors
+            .iter()
+            .any(|error| error.contains("every embed.result attempt is a poll")),
+        "{:?}",
+        ledger.errors
+    );
+
+    // The mirror case: a poll disposition on a non-poll method.
+    let mislabelled = vec![
+        attempt(1, SynapseMethod::Batch, AttemptDisposition::Success),
+        attempt(2, SynapseMethod::Query, AttemptDisposition::Poll),
+    ];
+    let ledger = validate_synapse_ledgers(&logical, &mislabelled);
+    assert!(!ledger.valid);
+    assert!(ledger
+        .errors
+        .iter()
+        .any(|error| error.contains("no other method is")));
 }
 
 #[test]

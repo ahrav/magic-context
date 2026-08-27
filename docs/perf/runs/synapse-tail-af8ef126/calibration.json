@@ -18,7 +18,7 @@
         "block": 1
       },
       "argv": [
-        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "<repo>/target/release/examples/synapse_perf",
         "--variant",
         "hygiene-only",
         "--arm",
@@ -36,7 +36,7 @@
         "--concurrency",
         "1"
       ],
-      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "cwd": "<repo>",
       "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
       "started_utc": "2026-08-26T19:45:41.774810Z",
       "ended_utc": "2026-08-26T19:45:42.892039Z",
@@ -62,7 +62,7 @@
         "block": 1
       },
       "argv": [
-        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "<repo>/target/release/examples/synapse_perf",
         "--variant",
         "hygiene-only",
         "--arm",
@@ -80,7 +80,7 @@
         "--concurrency",
         "1"
       ],
-      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "cwd": "<repo>",
       "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
       "started_utc": "2026-08-26T19:45:42.895352Z",
       "ended_utc": "2026-08-26T19:45:44.012819Z",
@@ -106,7 +106,7 @@
         "block": 2
       },
       "argv": [
-        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "<repo>/target/release/examples/synapse_perf",
         "--variant",
         "hygiene-only",
         "--arm",
@@ -124,7 +124,7 @@
         "--concurrency",
         "1"
       ],
-      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "cwd": "<repo>",
       "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
       "started_utc": "2026-08-26T19:45:44.014456Z",
       "ended_utc": "2026-08-26T19:45:45.131971Z",
@@ -150,7 +150,7 @@
         "block": 2
       },
       "argv": [
-        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "<repo>/target/release/examples/synapse_perf",
         "--variant",
         "hygiene-only",
         "--arm",
@@ -168,7 +168,7 @@
         "--concurrency",
         "1"
       ],
-      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "cwd": "<repo>",
       "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
       "started_utc": "2026-08-26T19:45:45.135336Z",
       "ended_utc": "2026-08-26T19:45:46.302810Z",

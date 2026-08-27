@@ -120,3 +120,13 @@ unchecked and `magic-context-c50.8` remains in progress.
   warnings and two configuration notices outside this evidence unit.
 - `cargo clippy -p mc-host`: passed.
 - `sha256sum -c SHA256SUMS`: passed after final report generation.
+
+## Post-collection redaction
+
+The collection host's name in `environment.txt` was replaced with `<redacted: collection host>`
+when this bundle moved into version control in a public repository. The
+`SHA256SUMS` entries for those two files were recomputed; every other digest,
+including every raw sample, is original. The commit, artifact hash, kernel,
+architecture, and toolchain versions needed to reproduce a cell are all retained.
+`analyze.py`, `select.py`, and `run_matrix.py` are unaltered, so they remain the
+scripts that produced this evidence.

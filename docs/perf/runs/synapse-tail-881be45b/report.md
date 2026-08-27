@@ -197,6 +197,48 @@ with the boundaries emitted, which later harness versions do
 (`hold_window_start_ns`, `warmup_end_ns`, `hold_window_end_ns`, and a per-row
 `window` class).
 
+### Post-collection redaction and retained-tooling limits
+
+Two kinds of alteration and non-alteration are recorded here so a reader knows
+exactly what in this bundle is original.
+
+Redacted after collection, when the bundle moved from local-only into version
+control in a public repository: the collection host's name in `environment.txt`
+and the absolute working-directory and executable paths in `calibration.json`,
+replaced by `<redacted: collection host>` and `<repo>`. Neither is needed to
+reproduce a cell — the commit, artifact hash, kernel, architecture, and toolchain
+versions that identify the environment are all retained. The `SHA256SUMS` entries
+for those two files were recomputed so the manifest stays self-consistent; every
+other entry, including every raw sample file, is the original digest and still
+verifies against an unmodified local bundle.
+
+Not altered: `analyze.py`, `select.py`, and `run_matrix.py` are the scripts that
+produced this evidence, so they are retained exactly as run even where review
+found defects in them. Three are known and material to how far this run's numbers
+can be pushed:
+
+- `analyze.py` derives phase completeness from the number of status files without
+  binding each status record one-to-one to a planned schedule entry, so a
+  duplicated status record together with a missing planned position would not be
+  caught by the completeness check.
+- `select.py` averages candidate and hygiene-only rows independently rather than
+  joining them by `block`, so a contrast in `analysis/contrasts.csv` can be an
+  unpaired aggregate. This run has treatment cells with a single valid block,
+  where that is the case.
+- `analysis/valid-cell-summaries.csv` — the input `select.py` consumes — is written
+  from the unfiltered raw summaries, so the selection inputs, the contrast table,
+  and the queue objective were all computed *before* the warm-state exclusion.
+  Combined with the approximate boundary reconstruction above, this means the
+  warmup re-analysis confirms the direction and practical separation of the
+  selection rather than recomputing the selection under the frozen rule.
+
+`run_matrix.py` also writes into `raw` and phase directories it never creates, so
+re-running it from a clean checkout needs those directories made first.
+
+Together these are why the `a+c` K=1 selection is recorded as provisional. Putting
+it on exact post-exclusion, block-paired selection inputs requires a new epoch
+with the boundaries emitted, not a re-analysis of this one.
+
 ### Comparison
 
 `analysis/warmup_reanalysis.json` contains the original and corrected result

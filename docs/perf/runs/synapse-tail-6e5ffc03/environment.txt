@@ -1,7 +1,7 @@
 captured_utc=2026-08-26T19:14:24Z
 commit=6e5ffc03ab166b7e91f4fc5f7062cbf17bdbf2a5
 short_commit=6e5ffc03
-hostname=dev-dsk-ahrav-2b-a030d1dc.us-west-2.amazon.com
+hostname=<redacted: collection host>
 kernel=Linux 6.12.100-125.179.amzn2023.aarch64 #1 SMP Mon Aug 10 22:44:02 UTC 2026 aarch64
 machine=aarch64
 rustc=rustc 1.94.1 (e408947bf 2026-03-25);binary: rustc;commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1;commit-date: 2026-03-25;host: aarch64-unknown-linux-gnu;release: 1.94.1;LLVM version: 21.1.8;

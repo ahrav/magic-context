@@ -666,6 +666,21 @@ pub fn validate_synapse_ledgers(
         if !attempt_ids.insert(attempt.attempt_id) {
             errors.push(format!("duplicate attempt_id {}", attempt.attempt_id));
         }
+        // `Poll` and `embed.result` must imply each other. The count checks
+        // above cannot catch a violation on their own: an `embed.result` row
+        // recorded as `Success` moves into `successes` instead of `polls`, and a
+        // logical row claiming zero polls then reconciles, so the repetition
+        // reports valid while publishing an understated poll distribution — the
+        // exact quantity the poll ceiling gates on.
+        let is_poll = attempt.disposition == AttemptDisposition::Poll;
+        if (attempt.method == SynapseMethod::Result) != is_poll {
+            errors.push(format!(
+                "attempt {} is {} with disposition {:?}: every embed.result attempt is a poll and no other method is",
+                attempt.attempt_id,
+                attempt.method.wire_name(),
+                attempt.disposition
+            ));
+        }
         if !logical_ids.contains(&attempt.logical_id) {
             errors.push(format!(
                 "attempt {} references unknown logical_id {}",
