@@ -74,15 +74,17 @@ export interface MockHistorianFact {
      */
     category: string;
     /**
-     * Fact body. Must be single-line, where "line" is ECMAScript's definition:
-     * the production parser reads facts one bullet line at a time
+     * Fact body. Must be non-empty, trimmed, and single-line, where "line" is
+     * ECMAScript's definition. The production parser reads facts one bullet line
+     * at a time as `unescapeXml(match.trim())` and drops empty results
      * (`FACT_ITEM_REGEX` in compartment-parser.ts), and its `m` flag treats all
      * four line terminators — LF, CR, U+2028, U+2029 — as line breaks while `.`
-     * refuses to cross them. So any of the four either drops the continuation (an
+     * refuses to cross them. So a line break either drops the continuation (an
      * unprefixed line matches nothing) or, if the continuation starts with `* `,
-     * promotes it to a separate fact. Either way the parsed fact set differs from
-     * the authored one, and a mutation or scoring test silently exercises the
-     * wrong input.
+     * promotes it to a separate fact; padding round-trips shorter than authored;
+     * and blank content vanishes. Every case gives a parsed fact set different
+     * from the authored one, so a mutation or scoring test would silently
+     * exercise the wrong input.
      */
     content: string;
 }
@@ -132,6 +134,16 @@ export function buildMockHistorianOutput(options: MockHistorianOutputOptions): s
         if (/[\r\n\u2028\u2029]/.test(fact.content)) {
             throw new Error(
                 `buildMockHistorianOutput: fact content must be single-line: ${JSON.stringify(fact.content)}`,
+            );
+        }
+        // The production parser reads each item as `unescapeXml(match.trim())` and
+        // discards it when the result is empty, so padded content round-trips
+        // shorter than authored and blank content vanishes from the fact set
+        // entirely — the same silent authored-vs-parsed divergence as an embedded
+        // line break, reached a different way.
+        if (fact.content.length === 0 || fact.content !== fact.content.trim()) {
+            throw new Error(
+                `buildMockHistorianOutput: fact content must be non-empty and trimmed: ${JSON.stringify(fact.content)}`,
             );
         }
         const bucket = factsByCategory.get(fact.category) ?? [];

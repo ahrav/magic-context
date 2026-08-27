@@ -493,10 +493,10 @@ describe("lintScenario", () => {
     test("headroom lint measures the ballast the harnesses actually send", () => {
         const scenario = validScenario();
         const blocks = renderedTranscriptBlocks(scenario);
-        // `TestHarness.ballast(tokens)` and its pi/rust twins take no seed, so
-        // every turn must carry the default-seed bytes. A per-turn seed rotation
-        // here would measure a transcript no runner produces — and because the
-        // word bank's words differ in length, it would measure a different size.
+        // `ballastProse` takes only a token count, and `TestHarness.ballast` plus
+        // its pi/rust twins forward exactly that, so every turn must carry these
+        // bytes. Pinned because the lint measuring bytes no runner sends is the
+        // failure this rendering exists to prevent.
         const harnessBallast = ballastProse(scenario.trigger.ballastTokensPerTurn);
         expect(harnessBallast.length).toBeGreaterThan(0);
         expect(blocks.filter((block) => block.includes(harnessBallast))).toHaveLength(

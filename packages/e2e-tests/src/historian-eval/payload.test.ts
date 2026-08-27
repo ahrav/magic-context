@@ -82,6 +82,20 @@ describe("buildMockHistorianOutput", () => {
         }
     });
 
+    test("fact content that is blank or padded throws instead of round-tripping changed", () => {
+        // The parser reads each item as `unescapeXml(match.trim())` and drops
+        // empty results, so padding round-trips shorter than authored and blank
+        // content vanishes from the fact set.
+        for (const content of ["", " ", "  padded  ", "trailing "]) {
+            expect(() =>
+                buildMockHistorianOutput({
+                    compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
+                    facts: [{ category: "ARCHITECTURE", content }],
+                }),
+            ).toThrow(/must be non-empty and trimmed/);
+        }
+    });
+
     test("single-line fact content round-trips byte-for-byte through the parser", () => {
         const content = "Sessions use the in-process LRU cache; capacity 4096.";
         const parsed = parseCompartmentOutput(
