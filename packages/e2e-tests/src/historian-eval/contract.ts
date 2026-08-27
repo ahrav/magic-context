@@ -409,6 +409,17 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         probes.map((probe) => probe.id),
         `${label}.probes`,
     );
+    // Same argument as the gold identity checks: a probe copied verbatim under a
+    // new id asks one question twice, and every aggregate over probe accuracy
+    // then weights that behavior double. See `probeIdentity` for what counts as
+    // the same question.
+    unique(
+        probes.map((probe) => {
+            const { ask, claimRef } = probeIdentity(probe);
+            return canonicalJson([ask, claimRef]);
+        }),
+        `${label}.probes.identity`,
+    );
     const expectedClaimIds = new Set(expectedClaims.map((claim) => claim.id));
     for (const probe of probes) {
         // Every probe type now carries exactly one gold reference, so there is no
@@ -432,63 +443,124 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
 }
 
 /**
- * Scenario identity: canonical fingerprint over the semantic payload plus the
- * scenario's name (id and title), which is what approvals and tombstones bind
- * to. Trigger pressure is harness-owned (R5/KTD3) and excluded, except the
- * declared run count, which is scenario semantics (a run that never fires
- * is ERROR).
+ * Scenario identity: canonical fingerprint over everything authored — the
+ * semantic payload plus the scenario's name (id and title) — which is what
+ * approvals and tombstones bind to. Trigger pressure is harness-owned (R5/KTD3)
+ * and excluded, except the declared run count, which is scenario semantics (a
+ * run that never fires is ERROR).
  */
 export function scenarioFingerprint(scenario: HistorianEvalScenario): string {
     return canonicalFingerprint({
-        ...scenarioSemanticPayload(scenario),
+        schema: scenario.schema,
         id: scenario.id,
         title: scenario.title,
-    });
-}
-
-/**
- * What the scenario actually evaluates, with its NAME removed: no id, no title.
- * Copying a scenario and relabelling it changes `scenarioFingerprint` — that is
- * the point of an identity — so the release's uniqueness guard cannot be built
- * on it. Two entries agreeing here drive the same transcript against the same
- * golds and probes, so keeping both double-weights one evaluation in every
- * aggregate the release reports.
- */
-function scenarioSemanticPayload(scenario: HistorianEvalScenario): Record<string, unknown> {
-    return {
-        schema: scenario.schema,
         families: scenario.families,
         transcript: scenario.transcript,
         expectedHistorianRuns: scenario.trigger.expectedHistorianRuns,
         gold: scenario.gold,
         probes: scenario.probes,
+    });
+}
+
+/**
+ * What the scenario actually evaluates, with everything that is only a LABEL
+ * removed: no scenario id or title, no contract-local `exp-*`, `abs-*`, or
+ * `probe-*` ids, and set-like arrays reordered.
+ *
+ * Every one of those is a way to spell the same evaluation differently.
+ * `scenarioFingerprint` covers them all — that is what makes it an identity —
+ * so the release's duplicate guard cannot be built on it: a copy that renames
+ * the scenario, renumbers its expectations and probes, rewrites the probe
+ * references to match, and permutes the arrays runs the identical transcript
+ * against the identical checks, and keeping both double-weights one evaluation
+ * in every aggregate the release reports.
+ *
+ * Probe references are therefore resolved to the referenced claim's own id-free
+ * semantics, which is what makes the renumbering invisible here.
+ * `transcript.turns` is deliberately left ordered: turn order is meaning, not
+ * presentation.
+ */
+function scenarioDuplicateKey(scenario: HistorianEvalScenario): Record<string, unknown> {
+    const claimById = new Map(scenario.gold.expectedClaims.map((claim) => [claim.id, claim]));
+    const claimSemantics = (claim: ExpectedClaim): Record<string, unknown> => ({
+        category: claim.category,
+        predicate: claim.predicate,
+        sourceTurnRange: claim.sourceTurnRange,
+    });
+    const referencedClaim = (id: string): Record<string, unknown> => {
+        const claim = claimById.get(id);
+        // `parseScenario` rejects dangling references, so this resolves for every
+        // parsed scenario; the guard keeps it total for a hand-built value.
+        // Thrown rather than routed through `fail` so the undefined is narrowed
+        // away — `fail` is destructured, which puts it outside control-flow
+        // analysis of never-returning calls.
+        if (claim === undefined) {
+            throw new HistorianEvalContractError(["releaseTuple.scenarios.semantic: dangling-reference"]);
+        }
+        return claimSemantics(claim);
+    };
+    return {
+        schema: scenario.schema,
+        families: canonicalOrder(scenario.families),
+        transcript: scenario.transcript,
+        expectedHistorianRuns: scenario.trigger.expectedHistorianRuns,
+        compartments: scenario.gold.compartments,
+        expectedClaims: canonicalOrder(scenario.gold.expectedClaims.map(claimSemantics)),
+        expectedAbsent: canonicalOrder(
+            scenario.gold.expectedAbsent.map((absent) => ({ family: absent.family, predicate: absent.predicate })),
+        ),
+        probes: canonicalOrder(
+            scenario.probes.map((probe) => {
+                const { ask, claimRef } = probeIdentity(probe);
+                return { ...ask, claim: referencedClaim(claimRef) };
+            }),
+        ),
     };
 }
 
 function scenarioSemanticFingerprint(scenario: HistorianEvalScenario): string {
-    // Set-like arrays are reordered before hashing. `canonicalJson` preserves
-    // array order by contract, so without this a copied scenario evades the
-    // duplicate guard by permuting `families`, either gold array, or `probes` —
-    // it runs the same transcript and checks, and the release would double-weight
-    // it. `transcript.turns` is deliberately left alone: turn order is meaning,
-    // not presentation.
-    return canonicalFingerprint({
-        ...scenarioSemanticPayload(scenario),
-        families: canonicalOrder(scenario.families),
-        gold: {
-            ...scenario.gold,
-            expectedClaims: canonicalOrder(scenario.gold.expectedClaims),
-            expectedAbsent: canonicalOrder(scenario.gold.expectedAbsent),
+    return canonicalFingerprint(scenarioDuplicateKey(scenario));
+}
+
+/**
+ * A probe split into what it asks (id-free: the question, the answer that
+ * counts, and for multiple choice the option set) and which gold claim backs it.
+ *
+ * Two probes agreeing on both are one question asked twice, which overweights
+ * that behavior in probe accuracy however the scorer aggregates — so `ask` plus
+ * `claimRef` is the within-scenario uniqueness key. The duplicate-scenario guard
+ * reuses `ask` and swaps `claimRef` for the referenced claim's semantics, so the
+ * two views cannot drift apart.
+ *
+ * Question, gold answer, and choices are normalized because incidental
+ * whitespace and case are not a different question. Choices are sorted because
+ * their order is presentation. The backing claim is part of the key: a probe
+ * backed by a different claim is a different probe.
+ */
+function probeIdentity(probe: Probe): { ask: Record<string, unknown>; claimRef: string } {
+    if (probe.answerType === "claim-id") {
+        return {
+            ask: { answerType: probe.answerType, question: normalizeContent(probe.question) },
+            claimRef: probe.expectedClaimRef,
+        };
+    }
+    return {
+        ask: {
+            answerType: probe.answerType,
+            question: normalizeContent(probe.question),
+            goldAnswer: normalizeContent(probe.goldAnswer),
+            ...(probe.answerType === "multiple-choice"
+                ? { choices: probe.choices.map(normalizeContent).sort() }
+                : {}),
         },
-        probes: canonicalOrder(scenario.probes),
-    });
+        claimRef: probe.sourceClaimRef,
+    };
 }
 
 /**
  * Order-independent view of a set-like array: entries sorted by their own
  * canonical serialization, so the result depends on the entries and not on the
- * order they were authored in. Sorting by serialization rather than by `id`
- * keeps the normalization honest if a copy also renumbers its ids.
+ * order they were authored in.
  */
 function canonicalOrder<T>(entries: readonly T[]): T[] {
     return [...entries]
@@ -809,7 +881,16 @@ export function parseManifest(raw: unknown, label = "manifest"): ReleaseManifest
     // the intended behavior. One actor holding both seats collapses them into a
     // single judgement while the manifest still presents two, so the manifest
     // would overstate the review the release actually received.
-    if (privacy.approver === goldIntent.approver) fail(`${label}.approvals: approver-not-independent`);
+    //
+    // Compared through `normalizeContent`, not verbatim: the string validator
+    // preserves the authored value, so `"alice"` and `" Alice "` are two
+    // spellings of one actor and an exact comparison would let them pass. The
+    // lane does not impose an approver-identifier format instead — handles,
+    // emails, and directory ids are all org-specific — so it normalizes what it
+    // is given rather than legislating the shape.
+    if (normalizeContent(privacy.approver) === normalizeContent(goldIntent.approver)) {
+        fail(`${label}.approvals: approver-not-independent`);
+    }
     const expectedFingerprint = releaseApprovalFingerprint({ releaseVersion, releaseTuple, tombstones });
     for (const approval of [privacy, goldIntent]) {
         if (approval.releaseFingerprint !== expectedFingerprint) {

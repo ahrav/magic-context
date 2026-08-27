@@ -282,6 +282,37 @@ describe("parseScenario", () => {
         expect(() => parseScenario(raw)).toThrow(/probes\[2\]: fields-invalid/);
     });
 
+    test("a probe copied verbatim under a new id rejects", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Same question, same gold answer, same backing claim: one question asked
+        // twice, which double-weights that behavior in probe accuracy.
+        probes.push({ ...probes[0], id: "probe-capacity-again" });
+        expect(() => parseScenario(raw)).toThrow(/probes\.identity: duplicate/);
+    });
+
+    test("probe identity ignores incidental spelling and choice order", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        probes.push({
+            id: "probe-store-again",
+            question: "  Which   CACHE backs sessions? ",
+            answerType: "multiple-choice",
+            choices: ["in-process lru", "REDIS"],
+            goldAnswer: "in-process lru",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).toThrow(/probes\.identity: duplicate/);
+    });
+
+    test("two probes asking the same question of different claims stay distinct", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        probes.push({ ...probes[0], id: "probe-capacity-of-lru", sourceClaimRef: "exp-lru-cache" });
+        // The backing claim is part of the identity, so this is a different probe.
+        expect(parseScenario(raw).probes).toHaveLength(4);
+    });
+
     test("run budget above two rejects (KTD3)", () => {
         const raw = validScenarioRaw();
         (raw.trigger as Record<string, unknown>).expectedHistorianRuns = 3;
@@ -509,6 +540,32 @@ describe("release tuple and manifest", () => {
         expect(() => buildReleaseTuple([a, reordered])).not.toThrow();
     });
 
+    test("renumbering contract-local ids does not hide a copied scenario", () => {
+        const a = validScenario();
+        const rawCopy = validScenarioRaw();
+        rawCopy.id = "hse-auth-rejected-redis-renumbered";
+        rawCopy.title = "The same evaluation with every local id renamed";
+        // `exp-*`, `abs-*`, and `probe-*` are labels, not semantics. Renaming them
+        // and rewriting the probe references leaves the evaluation identical.
+        const renames: Record<string, string> = {
+            "exp-lru-cache": "exp-a1",
+            "exp-cache-capacity": "exp-a2",
+            "abs-redis-active": "abs-b1",
+            "probe-capacity": "probe-c1",
+            "probe-store": "probe-c2",
+            "probe-claim": "probe-c3",
+        };
+        const renamed = JSON.parse(
+            JSON.stringify(rawCopy).replace(
+                new RegExp(Object.keys(renames).join("|"), "g"),
+                (match) => renames[match],
+            ),
+        );
+        const copy = parseScenario(renamed);
+        expect(copy.gold.expectedClaims[0].id).toBe("exp-a1");
+        expect(() => buildReleaseTuple([a, copy])).toThrow(/releaseTuple\.scenarios\.semantic: duplicate/);
+    });
+
     test("release tuple rejects duplicate scenario ids and duplicated scenarios", () => {
         const a = validScenario();
         const rawSameIdDifferentContent = validScenarioRaw();
@@ -593,24 +650,30 @@ describe("release tuple and manifest", () => {
 
     test("one actor cannot hold both governance seats", () => {
         const tuple = buildReleaseTuple([validScenario()]);
-        const releaseFingerprint = releaseApprovalFingerprint({
-            releaseVersion: "v1",
-            releaseTuple: tuple,
-            tombstones: [],
-        });
-        // Privacy and gold-intent are two different reviews; one approver
-        // collapses them while the manifest still presents two.
-        const sameActor = {
-            schema: MANIFEST_SCHEMA,
-            releaseVersion: "v1",
-            releaseTuple: tuple,
-            approvals: {
-                privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint },
-                goldIntent: { kind: "gold-intent", approver: "operator-a", releaseFingerprint },
-            },
-            tombstones: [],
-        };
-        expect(() => parseManifest(sameActor)).toThrow(/approver-not-independent/);
+        // Trivially different spellings are the same actor: the string validator
+        // preserves the authored value, so an exact comparison would pass them.
+        for (const [privacyApprover, goldApprover] of [
+            ["operator-a", "operator-a"],
+            ["alice", " alice "],
+            ["Alice", "alice"],
+        ]) {
+            const releaseFingerprint = releaseApprovalFingerprint({
+                releaseVersion: "v1",
+                releaseTuple: tuple,
+                tombstones: [],
+            });
+            const sameActor = {
+                schema: MANIFEST_SCHEMA,
+                releaseVersion: "v1",
+                releaseTuple: tuple,
+                approvals: {
+                    privacy: { kind: "privacy", approver: privacyApprover, releaseFingerprint },
+                    goldIntent: { kind: "gold-intent", approver: goldApprover, releaseFingerprint },
+                },
+                tombstones: [],
+            };
+            expect(() => parseManifest(sameActor)).toThrow(/approver-not-independent/);
+        }
     });
 
     test("privacy and sanitizer versions must be the ones the lane implements", () => {
