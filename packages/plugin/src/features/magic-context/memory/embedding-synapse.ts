@@ -279,10 +279,7 @@ function pendingPollDelay(
     now: number,
 ): number | null {
     if (parsed.done === true || (hasVectors && parsed.next_cursor != null)) return null;
-    const cap = Math.max(
-        SYNAPSE_POLL_MIN_DELAY_MS,
-        readRetryAfter(parsed) ?? state.defaultDelayMs,
-    );
+    const cap = Math.max(SYNAPSE_POLL_MIN_DELAY_MS, readRetryAfter(parsed) ?? state.defaultDelayMs);
     state.nextDelayMs = Math.max(
         SYNAPSE_POLL_MIN_DELAY_MS,
         state.nextDelayMs * SYNAPSE_POLL_DELAY_MULTIPLIER,
