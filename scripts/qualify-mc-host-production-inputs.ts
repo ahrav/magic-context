@@ -2569,23 +2569,6 @@ export function generate(
     // lock, so verify bytes in write mode and only on explicit request in
     // --check mode.
     const verifyBytes = options.verifyBytes ?? !options.check;
-    if (verifyBytes && manifest.mode === "production") {
-        // Byte verification is the qualifying host's operation, so it is the one
-        // place the pinned harness runtime can be bound to a real interpreter rather
-        // than copied into the lock as an assertion. Deliberately not in `--check`:
-        // that has to stay portable, which is what lets CI guard the committed lock
-        // from any runner.
-        //
-        // Bun only. Node and npm would have to be spawned to be identified, and the
-        // lock pins them as ranges (`24.x`, `11.x`) rather than exact versions, so
-        // there is nothing here to compare them against.
-        const running = process.versions?.bun;
-        if (running !== QUALIFICATION_PINS.harness_runtimes.bun) {
-            fail(
-                `production byte verification must run under the pinned Bun ${QUALIFICATION_PINS.harness_runtimes.bun} (running ${String(running)})`,
-            );
-        }
-    }
     if (verifyBytes) {
         for (const key of INPUT_KEYS) {
             const artifact = manifest.inputs[key];
@@ -2864,6 +2847,31 @@ export function requireQualificationEvidence(
     };
 }
 
+/**
+ * Assert the interpreter running a qualifying pass is the pinned Bun.
+ *
+ * `harness_runtimes` is otherwise copied into the lock as an assertion nothing
+ * corroborates. Binding it to the real interpreter is only meaningful where the
+ * qualification actually happens — the host holding the artifacts, which is the host
+ * asked to verify bytes.
+ *
+ * Enforced at the CLI boundary, not inside `generate`. `generate` is driven by tests
+ * over synthetic roots and by CI's portable drift check, and a host-environment
+ * assertion buried in it would make both depend on the runner's Bun — which is
+ * exactly the failure this function's placement exists to avoid.
+ *
+ * Bun only: the lock pins Node and npm as ranges (`24.x`, `11.x`), so there is no
+ * exact value to compare, and identifying them would mean spawning each interpreter.
+ */
+export function assertPinnedQualifyingRuntime(running: string | undefined): void {
+    const pinned = QUALIFICATION_PINS.harness_runtimes.bun;
+    if (running !== pinned) {
+        fail(
+            `byte verification must run under the pinned Bun ${pinned} (running ${String(running)})`,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI.
 // ---------------------------------------------------------------------------
@@ -2884,6 +2892,16 @@ function main(): void {
         process.exit(2);
     }
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+    // Byte verification is the qualifying host's operation, so it is the one place
+    // the pinned harness runtime is bound to a real interpreter.
+    if (verifyBytes) {
+        try {
+            assertPinnedQualifyingRuntime(process.versions?.bun);
+        } catch (error) {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exit(1);
+        }
+    }
     // `--check` reports drift and prints the verdict; it exits 0 over unqualified
     // inputs on purpose, because the committed manifest is deliberately unqualified
     // until release engineering records the real bytes, and CI has to stay green in

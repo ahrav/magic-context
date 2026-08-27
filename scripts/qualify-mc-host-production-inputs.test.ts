@@ -22,6 +22,7 @@ import {
     checkOracleEvidence,
     evaluateBrocaRun,
     generate,
+    assertPinnedQualifyingRuntime,
     OUTPUT_PATHS,
     QUALIFICATION_PINS,
     renderArgumentVariant,
@@ -1997,24 +1998,6 @@ describe("verify-path resolution", () => {
         );
     });
 
-    test("production byte verification binds the pinned Bun runtime", () => {
-        // The pins are copied into the lock as assertions. Byte verification is the
-        // qualifying host's operation, so it is where one of them can be bound to a
-        // real interpreter — and where `--check` must not, since that has to stay
-        // portable for CI.
-        const root = freshRoot();
-        installProductionManifest(root);
-        generate(root, { check: false });
-        // The suite runs under the pinned Bun, so the bound check passes here; the
-        // point of the test is that the binding exists on this path and not on the
-        // portable one.
-        expect(Bun.version).toBe(QUALIFICATION_PINS.harness_runtimes.bun);
-        expect(() =>
-            generate(root, { check: true, verifyBytes: true }),
-        ).not.toThrow();
-        expect(generate(root, { check: true }).drift).toEqual([]);
-    });
-
     test("a missing tiny-fixture manifest fails closed", () => {
         const root = freshRoot();
         installManifest(root, fixtureManifest());
@@ -2069,5 +2052,21 @@ describe("release prerequisite (CLI)", () => {
         });
         expect(drift.status).toBe(0);
         expect(drift.stdout).toContain("production_qualified false");
+    });
+});
+
+describe("qualifying-runtime binding", () => {
+    test("only the pinned Bun may verify bytes", () => {
+        // Checked as a predicate over an explicit value, not against whatever Bun
+        // happens to run the suite: an assertion about the host belongs at the CLI
+        // boundary, and putting it inside `generate` made every production-mode test
+        // and CI's portable drift check depend on the runner's version.
+        const pinned = QUALIFICATION_PINS.harness_runtimes.bun;
+        expect(() => assertPinnedQualifyingRuntime(pinned)).not.toThrow();
+        for (const running of ["1.2.14", "1.4.0", undefined]) {
+            expect(() => assertPinnedQualifyingRuntime(running)).toThrow(
+                /byte verification must run under the pinned Bun/,
+            );
+        }
     });
 });
