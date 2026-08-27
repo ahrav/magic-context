@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import { ANTI_MEMORY_CATEGORY } from "./constants";
 
 export function autoSearchHintFragmentsStillEligible(
     _db: Database,
@@ -20,6 +21,24 @@ export function autoSearchHintFragmentsStillEligible(
  * `revisionExpr` and `nowExpr` are caller-supplied SQL expressions, never user
  * input; every call site passes a literal column reference or bind placeholder.
  */
+/**
+ * SQL predicate: this revision is an anti-memory row.
+ *
+ * Shared so the reader filter and the maintenance gate counters cannot drift
+ * apart. They must agree: a gate that counts a claim its reader will not return
+ * is backlog the scheduler can never drain, and it reopens the work forever.
+ * The category is a compile-time constant, never caller input, so it is
+ * interpolated rather than bound — callers compose this into larger fragments
+ * whose bindings they own.
+ */
+export function antiMemoryClaimSql(revisionExpr: string): string {
+    return `EXISTS (
+        SELECT 1 FROM claim_memory_revision_attributes anti_attrs
+        WHERE anti_attrs.revision_id = ${revisionExpr}
+          AND anti_attrs.category = '${ANTI_MEMORY_CATEGORY}'
+    )`;
+}
+
 export function uniformlyAbsentClaimSql(revisionExpr: string, nowExpr: string): string {
     return `(
         COALESCE((

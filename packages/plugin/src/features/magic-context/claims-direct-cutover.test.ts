@@ -8,8 +8,8 @@ import { createDirectTestDatabase } from "./test-database";
 const REPO_ROOT = existsSync(resolve(process.cwd(), "packages", "plugin"))
     ? process.cwd()
     : resolve(process.cwd(), "../..");
-const INVENTORY_COUNT = 356;
-const INVENTORY_SHA256 = "3e7d8236eb784932ddc2d991ffabea97a96e91521c733038ceb6b112eddb8fc8";
+const INVENTORY_COUNT = 361;
+const INVENTORY_SHA256 = "f68787e374938276a514f8bade0c10c2b9187a2f4cf55cc261daefbee0ba1883";
 
 const REQUIRED_DIRECT_OBJECTS = [
     "mc_format_marker",
@@ -230,8 +230,8 @@ describe("U8 direct claims cutover gate", () => {
                     .all(),
             ).toEqual([
                 { type: "index", count: 93 },
-                { type: "table", count: 121 },
-                { type: "trigger", count: 138 },
+                { type: "table", count: 122 },
+                { type: "trigger", count: 142 },
                 { type: "view", count: 4 },
             ]);
             for (const required of REQUIRED_DIRECT_OBJECTS) expect(names).toContain(required);

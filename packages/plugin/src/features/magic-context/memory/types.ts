@@ -20,7 +20,6 @@ export type MemoryCategory =
     | "KNOWN_ISSUES";
 
 export type AntiMemoryCategory = "REJECTED_APPROACH";
-export type WritableMemoryCategory = MemoryCategory | AntiMemoryCategory;
 
 export type MemoryStatus = "active" | "permanent" | "archived";
 export type MemoryScope = "project" | "ecosystem" | "universe";

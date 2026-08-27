@@ -497,19 +497,47 @@ function fail(message: string): never {
     throw new Error(`mc-host release contract: ${message}`);
 }
 
-function assertExactKeys(
-    obj: Record<string, unknown>,
+/**
+ * Build an exact-key asserter: the returned function requires an object to carry
+ * every key in `keys`, permits any key in `optional`, and rejects anything else,
+ * naming the first offending key.
+ *
+ * `subject` is the calling module's error prefix. The same assertion guards
+ * in-source contract literals here and operator-authored manifests in the U9
+ * qualifier, and an operator editing a source manifest must not be told the
+ * release contract is at fault, so each module binds its own reporter rather
+ * than sharing one prefix.
+ */
+export function exactKeysAsserter(
+    subject: string,
+): (
+    obj: unknown,
     keys: string[],
     where: string,
-): void {
-    const actual = Object.keys(obj).sort();
-    const expected = [...keys].sort();
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-        fail(
-            `${where} keys must be exactly ${expected.join(", ")}; got ${actual.join(", ")}`,
-        );
-    }
+    optional?: string[],
+) => void {
+    const reject = (message: string): never => {
+        throw new Error(`${subject}: ${message}`);
+    };
+    return (obj, keys, where, optional = []): void => {
+        if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+            reject(`${where} must be an object`);
+        }
+        // SAFETY: `obj` is a non-null, non-array object after the guard, and only
+        // its own enumerable keys are read.
+        const record = obj as Record<string, unknown>;
+        for (const key of Object.keys(record)) {
+            if (!keys.includes(key) && !optional.includes(key)) {
+                reject(`${where}: unknown key ${key}`);
+            }
+        }
+        for (const key of keys) {
+            if (!(key in record)) reject(`${where}: missing key ${key}`);
+        }
+    };
 }
+
+const assertExactKeys = exactKeysAsserter("mc-host release contract");
 
 function compareSemver(a: string, b: string): number {
     const pa = a.split(".").map(Number);
@@ -1204,8 +1232,12 @@ export interface PlatformProbe {
  * counts as 0 (conservative: it can only fail the floor, never satisfy it).
  * Floors themselves are validated as clean dotted versions; a malformed
  * floor yields NaN so `>= 0` checks fail closed.
+ *
+ * Exported so the input qualifier gates its oracle host against these same
+ * floors with this same comparator; two implementations could disagree about
+ * whether a host clears a floor.
  */
-function compareDotted(probe: string, floor: string): number {
+export function compareDotted(probe: string, floor: string): number {
     const floorParts = floor.split(".").map(Number);
     const probeParts = probe.split(".").map((part) => {
         const digits = /^\d+/.exec(part);
@@ -1218,6 +1250,68 @@ function compareDotted(probe: string, floor: string): number {
         if (dp !== df) return dp - df;
     }
     return 0;
+}
+
+/**
+ * True when `probe` is at or above the dotted `floor`.
+ *
+ * `compareDotted` alone is not that predicate. It reads each component's leading
+ * digit run and scores a missing or non-numeric component as 0, which admits two
+ * kinds of value that do not actually clear a floor:
+ *
+ *   - Values shorter than the floor, compared as if their absent components were
+ *     zeros, so one high component decides the result alone: `999garbage` clears
+ *     `4.18` without ever naming a minor version.
+ *   - Prerelease builds, whose marker is discarded: `4.18-rc1` scores exactly
+ *     equal to `4.18` even though a release candidate precedes it.
+ *
+ * So one digit-led component per floor component is required, and at equality a
+ * prerelease marker disqualifies. A numeric release suffix means the opposite of a
+ * prerelease — `2.28-236.el8` is 2.28 plus patches — so the two are separated by
+ * the marker, not by shape, and the marker only counts while the version is still
+ * exactly at the floor: components are scanned until one beyond the floor's
+ * precision carries a non-zero number, the point the version has genuinely moved
+ * past it. `4.18.0-rc2` is therefore rejected and `4.18.1-rc2` is not.
+ *
+ * Both the U8 platform gate and the U9 oracle-host check call this. That is the
+ * point: sharing only `compareDotted` let the qualifier add these guards while
+ * `evaluatePlatform` kept a bare `>= 0`, so the two disagreed about the same host
+ * — exactly what sharing the comparator was meant to prevent.
+ */
+export function meetsDottedFloor(probe: unknown, floor: string): boolean {
+    if (typeof probe !== "string" || probe.length === 0) return false;
+    const parts = probe.split(".");
+    const floorParts = floor.split(".");
+    if (parts.length < floorParts.length) return false;
+    // Shape, not just a leading digit. `compareDotted` reads the digit run and
+    // discards the rest, so `999garbage` scores 999 and a component that is digits
+    // welded to letters passes as a version. Require digits, then either nothing or
+    // a separator before whatever follows — which is every real distro spelling
+    // (`0-513`, `28-236`) and none of the malformed ones. Only the components the
+    // floor actually compares are constrained; beyond its precision live `el8` and
+    // `x86_64`, which are not version numbers at all.
+    for (let i = 0; i < floorParts.length; i++) {
+        // `.+`, not `.*`: a separator with nothing after it (`4.18-`, `2.28+`) is not
+        // a suffix, and `compareDotted` would read the digits and ignore the dangling
+        // separator entirely.
+        if (!/^\d+(?:[-+._~].+)?$/.test(parts[i] ?? "")) return false;
+    }
+    const ordering = compareDotted(probe, floor);
+    if (Number.isNaN(ordering) || ordering < 0) return false;
+    if (ordering !== 0) return true;
+    for (const [index, part] of parts.entries()) {
+        if (index >= floorParts.length) {
+            const leading = /^\d*/.exec(part)?.[0] ?? "";
+            if (Number(leading || "0") > 0) break;
+        }
+        // Every separator the shape check above admits, not just `-` and `.`:
+        // `4.18~rc1` and `13.5_rc1` are prereleases too, and accepting a separator
+        // in one regex while the other ignores it is how they slipped through.
+        if (/^\d*[-+._~]?(?:rc|pre|alpha|beta|dev|snapshot)/i.test(part)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /** Evaluate a host probe against the contract's platform capability table. */
@@ -1241,16 +1335,10 @@ export function evaluatePlatform(
             (p) => p.target === "linux-x64-gnu",
         );
         if (linux === undefined || !("kernel_min" in linux)) return unsupported;
-        if (
-            probe.kernel === undefined ||
-            !(compareDotted(probe.kernel, linux.kernel_min) >= 0)
-        ) {
+        if (!meetsDottedFloor(probe.kernel, linux.kernel_min)) {
             return unsupported;
         }
-        if (
-            probe.glibc === undefined ||
-            !(compareDotted(probe.glibc, linux.glibc_min) >= 0)
-        ) {
+        if (!meetsDottedFloor(probe.glibc, linux.glibc_min)) {
             return unsupported;
         }
         if (probe.procfsSelfFdExec !== true) return unsupported;
@@ -1272,10 +1360,7 @@ export function evaluatePlatform(
             (p) => p.target === target,
         );
         if (mac === undefined || !("os_min" in mac)) return unsupported;
-        if (
-            probe.osVersion === undefined ||
-            !(compareDotted(probe.osVersion, mac.os_min) >= 0)
-        ) {
+        if (!meetsDottedFloor(probe.osVersion, mac.os_min)) {
             return unsupported;
         }
         // Each macOS row requires `capabilities.dev_fd_exec`, the Darwin

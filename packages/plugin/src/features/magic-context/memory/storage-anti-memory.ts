@@ -9,12 +9,16 @@ import {
     type ClaimEvidenceProvenance,
     ClaimOperationInputError,
     type ClaimOperationRunResult,
+    DEFAULT_MEMORY_IMPORTANCE,
     type ProducerIdentity,
+    provenanceRequestShape,
     runClaimOperation,
     stageCreateProjectMemoryClaimInCurrentTransaction,
     stageReviseProjectMemoryClaimInCurrentTransaction,
+    tokenRequestShape,
+    validateProjectMemoryMutationToken,
 } from "./storage-claim-operations";
-import { ClaimGraphCorruptionError, sha256Utf8Hex } from "./storage-claims";
+import { ClaimGraphCorruptionError } from "./storage-claims";
 
 export const ANTI_MEMORY_DEFAULT_TTL_MS = 90 * 24 * 60 * 60 * 1_000;
 
@@ -96,6 +100,13 @@ function requiredText(value: unknown, field: string): string {
 
 function optionalText(value: unknown, field: string): string | null {
     if (value === undefined || value === null) return null;
+    // The payload columns are `CHECK (col IS NULL OR length(trim(col)) > 0)`, so
+    // an absent optional field has exactly one legal stored form: NULL. A
+    // blank string is the same absence spelled differently — model-generated
+    // payloads routinely emit `""` for a field they have nothing to say about —
+    // and rejecting it would fail the whole write over a value the schema and
+    // the renderer both treat as "not present".
+    if (typeof value === "string" && value.trim().length === 0) return null;
     return requiredText(value, field);
 }
 
@@ -138,19 +149,6 @@ export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
 
 function antiMemoryDedupText(payload: StoredAntiMemoryPayload): string {
     return JSON.stringify([payload.trigger, payload.rejectedStrategy]);
-}
-
-function provenanceDigestShape(provenance: ClaimEvidenceProvenance) {
-    return {
-        extractor: provenance.extractor,
-        extractorRunId: provenance.extractorRunId,
-        extractorVersion: provenance.extractorVersion,
-        independenceKey: provenance.independenceKey,
-        sourceContentDigest: sha256Utf8Hex(provenance.sourceContent),
-        sourceLocator: provenance.sourceLocator,
-        sourceSessionId: provenance.sourceSessionId ?? null,
-        sourceTrustClass: provenance.sourceTrustClass ?? null,
-    };
 }
 
 function payloadDigestShape(payload: StoredAntiMemoryPayload) {
@@ -202,10 +200,18 @@ export function createAntiMemory(
             ...producer,
             requestDigest: computeClaimOperationRequestDigest({
                 actor: input.actor,
+                // Importance lands in the persisted revision attributes, so it
+                // is part of the request: leaving it out lets a second call
+                // that reuses the operation key with a different importance
+                // replay the first receipt and silently drop the new value
+                // instead of raising ClaimOperationKeyReuseError. Digest the
+                // resolved value so an omitted importance and an explicit
+                // default stay one request.
+                importance: input.importance ?? DEFAULT_MEMORY_IMPORTANCE,
                 operation: "create-anti-memory",
                 payload: payloadDigestShape(payload),
                 projectId: input.projectId,
-                provenance: provenanceDigestShape(input.provenance),
+                provenance: provenanceRequestShape(input.provenance),
                 requestScope: input.requestScope ?? null,
             }),
         },
@@ -225,6 +231,7 @@ export function createAntiMemory(
                     actor: input.actor,
                     requestScope: input.requestScope,
                     nowMs,
+                    antiMemoryWriter: true,
                 },
                 nowMs,
             );
@@ -258,13 +265,30 @@ function reviseWithPayload(
     producer: ProducerIdentity,
     args: {
         input: Omit<ReviseAntiMemoryInput, "payload">;
-        payload: StoredAntiMemoryPayload;
+        /**
+         * Produces the payload for the new revision. Runs inside the staged
+         * callback, so only after the operation-key receipt lookup misses.
+         * Every read of current state and every check against it belongs here:
+         * a pre-transaction read or comparison would reject an honest replay
+         * whose receipt should short-circuit instead — for a TTL extension the
+         * stored expiry already equals the request's, and the claim may have
+         * moved on or gone away entirely since the first attempt.
+         */
+        resolvePayload: () => StoredAntiMemoryPayload;
+        /**
+         * The payload as the caller *requested* it, or null for an operation
+         * that supplies none. What gets stored can be state read back from the
+         * current revision; folding that into the request digest would make an
+         * idempotent retry diverge as soon as an unrelated revision changed
+         * the payload in between, raising `ClaimOperationKeyReuseError`
+         * instead of replaying the receipt. The digest describes the request,
+         * never the row.
+         */
+        digestPayload: StoredAntiMemoryPayload | null;
         expiresAt?: number;
         operation: "revise-anti-memory" | "extend-anti-memory-ttl";
     },
 ): ClaimOperationRunResult {
-    const content = renderAntiMemoryContent(args.payload);
-    const dedupText = antiMemoryDedupText(args.payload);
     const nowMs = args.input.nowMs ?? Date.now();
     return runClaimOperation(
         db,
@@ -274,31 +298,34 @@ function reviseWithPayload(
                 actor: args.input.actor,
                 expiresAt: args.expiresAt ?? null,
                 operation: args.operation,
-                payload: payloadDigestShape(args.payload),
-                provenance: provenanceDigestShape(args.input.provenance),
+                payload:
+                    args.digestPayload === null ? null : payloadDigestShape(args.digestPayload),
+                provenance: provenanceRequestShape(args.input.provenance),
                 requestScope: args.input.requestScope ?? null,
-                token: args.input.token,
+                token: tokenRequestShape(args.input.token),
             }),
         },
         () => {
+            const payload = args.resolvePayload();
             const staged = stageReviseProjectMemoryClaimInCurrentTransaction(
                 db,
                 {
                     token: args.input.token,
-                    content,
-                    dedupText,
+                    content: renderAntiMemoryContent(payload),
+                    dedupText: antiMemoryDedupText(payload),
                     ...(args.expiresAt === undefined ? {} : { expiresAt: args.expiresAt }),
                     provenance: args.input.provenance,
                     actor: args.input.actor,
                     requestScope: args.input.requestScope,
                     nowMs,
+                    antiMemoryWriter: true,
                 },
                 nowMs,
             );
             if (staged.kind === "effects") {
                 const revised = staged.effects.find((effect) => effect.changeKind === "upsert");
                 if (revised?.revisionId != null) {
-                    insertPayload(db, revised.revisionId, revised.claimId, args.payload, nowMs);
+                    insertPayload(db, revised.revisionId, revised.claimId, payload, nowMs);
                 }
             }
             return staged;
@@ -312,11 +339,16 @@ export function reviseAntiMemory(
     producer: ProducerIdentity,
     input: ReviseAntiMemoryInput,
 ): ClaimOperationRunResult {
-    const current = readAntiMemory(db, input.token.publicClaimId);
-    if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
+    const payload = normalizePayload(input.payload);
     return reviseWithPayload(db, producer, {
         input,
-        payload: normalizePayload(input.payload),
+        resolvePayload: () => {
+            if (readAntiMemory(db, input.token.publicClaimId) === null) {
+                throw new ClaimOperationInputError("unknown anti-memory claim");
+            }
+            return payload;
+        },
+        digestPayload: payload,
         operation: "revise-anti-memory",
     });
 }
@@ -329,14 +361,31 @@ export function extendAntiMemoryTtl(
     if (!Number.isSafeInteger(input.expiresAt)) {
         throw new ClaimOperationInputError("anti-memory expiry must be a safe integer");
     }
-    const current = readAntiMemory(db, input.token.publicClaimId);
-    if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
-    if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
-        throw new ClaimOperationInputError("anti-memory TTL extension must move expiry forward");
-    }
     return reviseWithPayload(db, producer, {
         input,
-        payload: current.payload,
+        // An extension carries no payload of its own: it re-states the current
+        // one. Reading it here, inside the stage, keeps both the read and the
+        // forward-progress check off the replay path.
+        resolvePayload: () => {
+            const current = readAntiMemory(db, input.token.publicClaimId);
+            if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
+            // Judge forward progress only for a caller whose token is still
+            // current. A superseded token means a concurrent extension already
+            // won, and its expiry can legitimately sit beyond this request's —
+            // forward progress from the caller's own snapshot. That race is the
+            // contract's zero-effect `stale` outcome, which the stage below
+            // produces; throwing here would relabel it a caller defect and
+            // record no receipt at all.
+            if (validateProjectMemoryMutationToken(db, input.token).ok) {
+                if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
+                    throw new ClaimOperationInputError(
+                        "anti-memory TTL extension must move expiry forward",
+                    );
+                }
+            }
+            return current.payload;
+        },
+        digestPayload: null,
         expiresAt: input.expiresAt,
         operation: "extend-anti-memory-ttl",
     });
@@ -364,13 +413,30 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
               WHERE public.public_id = ?`,
         )
         .get(publicClaimId) as
-        | (Omit<AntiMemoryRecord, "publicClaimId" | "revisionLocator" | "payload"> &
-              StoredAntiMemoryPayload & { trigger: string | null })
+        | (Omit<
+              AntiMemoryRecord,
+              "publicClaimId" | "revisionLocator" | "payload" | "memoryScope" | "sharing"
+          > &
+              StoredAntiMemoryPayload & {
+                  trigger: string | null;
+                  memoryScope: string;
+                  sharing: string;
+              })
         | undefined;
     if (!row || row.category !== ANTI_MEMORY_CATEGORY) return null;
     if (row.trigger === null) {
         throw new ClaimGraphCorruptionError(
             `anti-memory ${publicClaimId} current revision has no payload row`,
+        );
+    }
+    // Anti-memory is project-private by construction; a stored row that says
+    // otherwise means some path mutated scope or sharing around the typed
+    // writer. Fail closed instead of masking the violated invariant with
+    // hardcoded values.
+    if (row.memoryScope !== "project" || row.sharing !== "private") {
+        throw new ClaimGraphCorruptionError(
+            `anti-memory ${publicClaimId} must be project-private but stores ` +
+                `scope=${row.memoryScope} sharing=${row.sharing}`,
         );
     }
     const payload: StoredAntiMemoryPayload = {
@@ -398,8 +464,8 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
         category: ANTI_MEMORY_CATEGORY,
         normalizedHash: row.normalizedHash,
         importance: row.importance,
-        memoryScope: "project",
-        sharing: "private",
+        memoryScope: row.memoryScope,
+        sharing: row.sharing,
         expiresAt: row.expiresAt,
         payload,
     };
