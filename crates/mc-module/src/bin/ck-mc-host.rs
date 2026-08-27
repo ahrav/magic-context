@@ -230,14 +230,14 @@ impl DaemonResult {
 enum Command {
     Version,
     ReleaseInfo,
-    Probe,
+    Status,
     Start { payload_dir: Option<PathBuf> },
     Stop,
     Restart { payload_dir: Option<PathBuf> },
     Serve,
 }
 
-const USAGE: &str = "usage: ck-mc-host <serve|start|stop|restart|probe|release-info> [--payload-dir <dir>] | --version";
+const USAGE: &str = "usage: ck-mc-host <serve|start|stop|restart|status|release-info> [--payload-dir <dir>] | --version";
 
 fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
     let mut iter = args.iter();
@@ -271,7 +271,9 @@ fn parse_args(args: &[std::ffi::OsString]) -> Result<Command, String> {
     match first {
         "--version" => Ok(Command::Version),
         "release-info" => Ok(Command::ReleaseInfo),
-        "probe" => Ok(Command::Probe),
+        // `probe` is the historical spelling of the contract's `status`
+        // command; both resolve to the same observation.
+        "status" | "probe" => Ok(Command::Status),
         "start" => Ok(Command::Start { payload_dir }),
         "stop" => Ok(Command::Stop),
         "restart" => Ok(Command::Restart { payload_dir }),
@@ -388,17 +390,28 @@ impl Runtime {
     }
 
     /// One bounded authenticated connect (bearer handshake) then close.
-    /// `Ok(true)` is the transport-authenticated success signal.
-    fn authenticate(&self, publication: &Path) -> bool {
+    /// `true` is the transport-authenticated success signal.
+    ///
+    /// Bounded by the caller's phase deadline, not just by the client's own
+    /// handshake timeout: an existing publication whose endpoint is unreachable
+    /// or whose handshake stalls would otherwise let one attempt run past the
+    /// phase's hard cap while the lifecycle transaction lock is still held.
+    fn authenticate(&self, publication: &Path, deadline: Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
-            match Client::connect(&path).await {
-                Ok(client) => {
-                    let _ = client.close().await;
-                    true
-                }
-                Err(_) => false,
-            }
+            tokio::time::timeout(remaining, async {
+                let client = Client::connect(&path).await.ok()?;
+                let _ = client.close().await;
+                Some(())
+            })
+            .await
+            .ok()
+            .flatten()
+            .is_some()
         })
     }
 
@@ -473,12 +486,19 @@ fn daemon_version_compatible(daemon_ver: &str) -> bool {
 /// `running` with a contract-conforming publication is `healthy` (ok:true).
 /// No connection is dialed: probe stays purely observational, so `proof`
 /// and readiness stay null and `versions.daemon` is publication-diagnostic.
+///
+/// The emitted `command` is `status`, the contracted name for these row
+/// semantics. The release contract fixes a closed command union of `start`,
+/// `stop`, `restart`, `status`, and `doctor`, so a `probe` command would be
+/// rejected by every consumer validating against the embedded contract. `probe`
+/// remains an accepted CLI spelling of the same operation.
 fn cmd_probe() -> DaemonResult {
+    let command = "status";
     let observed = match probe() {
         Ok(observed) => observed,
         Err(error) => {
             let (state, reason) = instance_failure(&error);
-            return DaemonResult::new("probe", false, state, reason);
+            return DaemonResult::new(command, false, state, reason);
         }
     };
     let state = probe_state(observed.state);
@@ -492,7 +512,7 @@ fn cmd_probe() -> DaemonResult {
             LifecycleState::Wedged => (false, "wedged"),
         },
     };
-    let mut result = DaemonResult::new("probe", ok, state, reason);
+    let mut result = DaemonResult::new(command, ok, state, reason);
     result.versions.daemon = publication_daemon_ver(&observed);
     result
 }
@@ -561,7 +581,14 @@ fn start_phase(
         opencode: None,
         pi: None,
     };
-    let envelope_bytes = serde_json::to_vec(&envelope).expect("envelope serializes");
+    let envelope_bytes = match serde_json::to_vec(&envelope) {
+        Ok(bytes) => bytes,
+        // A Unix data root may hold bytes that are not valid UTF-8, which the
+        // JSON envelope cannot represent. That is an operational failure of this
+        // command, not a reason to abandon the single required result object
+        // after generation staging has already run.
+        Err(_) => return fail("stopped", "internal_error"),
+    };
     let log_path = match daemon_log_path() {
         Ok(path) => path,
         Err(_) => return fail("stopped", "internal_error"),
@@ -578,7 +605,7 @@ fn start_phase(
         Err(_) => return fail("stopped", "internal_error"),
     };
     loop {
-        if publication.exists() && runtime.authenticate(&publication) {
+        if publication.exists() && runtime.authenticate(&publication, deadline) {
             let observed = probe().ok();
             let daemon_ver = observed.as_ref().and_then(publication_daemon_ver);
             if let Some(daemon_ver) = &daemon_ver {
@@ -644,6 +671,51 @@ fn preflight_generation(
     }
 }
 
+/// This build's payload target, in the release contract's platform spelling.
+///
+/// The contract enumerates `platforms.supported[].target`; staging commits one
+/// of those names into every manifest, and selection compares against it. A
+/// single definition keeps the value the staging path writes and the value the
+/// selection path requires from drifting apart.
+const fn build_target() -> Option<&'static str> {
+    if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    )) {
+        Some("linux-x64-gnu")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("darwin-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("darwin-x64")
+    } else {
+        None
+    }
+}
+
+/// Confirms a validated generation was staged by this release for this target.
+///
+/// `validate` proves a generation is internally coherent, not that it belongs
+/// to the running binary. An upgrade or a copied data directory can leave a
+/// structurally valid generation from another release or platform as the
+/// current selection; without this check the new daemon would accept and
+/// advertise that payload. Both fields are committed by the manifest, so the
+/// comparison is against content the digest already binds.
+fn generation_identity_matches(
+    manifest: &mc_host::generation::GenerationManifest,
+) -> Result<(), (&'static str, &'static str)> {
+    let Some(target) = build_target() else {
+        return Err(("stopped", "unsupported_platform"));
+    };
+    if manifest.target != target {
+        return Err(("stopped", "native_payload_invalid"));
+    }
+    if manifest.release_contract_sha256 != release_contract::RELEASE_CONTRACT_SHA256 {
+        return Err(("stopped", "native_payload_invalid"));
+    }
+    Ok(())
+}
+
 /// Dev/test mode stages the explicit payload directory; production mode
 /// requires an existing fully valid current generation and otherwise fails
 /// closed — U9 records `production_qualified:false`, so no supported flow
@@ -651,6 +723,9 @@ fn preflight_generation(
 fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static str, &'static str)> {
     match payload_dir {
         Some(dir) => {
+            let Some(target) = build_target() else {
+                return Err(("stopped", "unsupported_platform"));
+            };
             let store = GenerationStore::open(None).map_err(|e| generation_failure(&e))?;
             let mut protected = BTreeSet::new();
             if let Ok(mc_host::generation::CurrentProfile::Current(current)) = store.read_current()
@@ -664,7 +739,7 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
                 .map_err(|e| generation_failure(&e))?;
             let sources = payload_sources(dir)?;
             let meta = StageMeta {
-                target: "linux-x64-gnu".to_owned(),
+                target: target.to_owned(),
                 release_contract_sha256: release_contract::RELEASE_CONTRACT_SHA256.to_owned(),
                 // Dev/test staging is explicitly unqualified (U9): the value
                 // is a self-describing marker, not a placeholder hash in a
@@ -675,9 +750,10 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
                 .stage_and_promote(&sources, &meta, &protected)
                 .map_err(|e| generation_failure(&e))?;
             // Complete revalidation of the promoted generation before spawn.
-            store
+            let validated = store
                 .validate(&digest)
                 .map_err(|e| generation_failure(&e))?;
+            generation_identity_matches(&validated.manifest)?;
             Ok(digest)
         }
         None => {
@@ -686,9 +762,10 @@ fn resolve_generation(payload_dir: Option<&Path>) -> Result<String, (&'static st
                 .ok_or(("stopped", "native_payload_missing"))?;
             match store.read_current().map_err(|e| generation_failure(&e))? {
                 mc_host::generation::CurrentProfile::Current(digest) => {
-                    store
+                    let validated = store
                         .validate(&digest)
                         .map_err(|e| generation_failure(&e))?;
+                    generation_identity_matches(&validated.manifest)?;
                     Ok(digest)
                 }
                 mc_host::generation::CurrentProfile::Absent => {
@@ -794,7 +871,8 @@ fn cmd_start(payload_dir: Option<&Path>) -> DaemonResult {
                 Ok(path) => path,
                 Err(_) => return DaemonResult::new(command, false, "running", "internal_error"),
             };
-            if !runtime.authenticate(&publication) {
+            let auth_deadline = phase_deadline(outer, phase_cap(SPAWN_PUBLICATION_AUTH));
+            if !runtime.authenticate(&publication, auth_deadline) {
                 return DaemonResult::new(command, false, "running", "authentication_failed");
             }
             let daemon_ver = publication_daemon_ver(&observed);
@@ -1126,7 +1204,7 @@ fn real_main() -> i32 {
             println!("{}", release_contract::RELEASE_CONTRACT_JSON);
             0
         }
-        Command::Probe => emit(cmd_probe()),
+        Command::Status => emit(cmd_probe()),
         Command::Start { payload_dir } => {
             spawn::ignore_sigpipe();
             emit(cmd_start(payload_dir.as_deref()))
@@ -1207,7 +1285,9 @@ mod tests {
                 payload_dir: Some(_)
             })
         ));
-        assert!(matches!(parse_args(&os(&["probe"])), Ok(Command::Probe)));
+        assert!(matches!(parse_args(&os(&["status"])), Ok(Command::Status)));
+        // `probe` is the accepted historical spelling of the same command.
+        assert!(matches!(parse_args(&os(&["probe"])), Ok(Command::Status)));
         assert!(matches!(
             parse_args(&os(&["--version"])),
             Ok(Command::Version)

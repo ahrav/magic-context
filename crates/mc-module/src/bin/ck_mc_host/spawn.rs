@@ -57,6 +57,17 @@ fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
     if !meta.is_file() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
         return Err(SpawnError("daemon log failed security checks"));
     }
+    // The create mode is filtered by the process umask, which can strip owner
+    // bits and leave a newly created log at 0000. That passes the check above,
+    // because only group and other bits are tested, and the already-open
+    // descriptor still writes — but the next start or restart cannot reopen the
+    // log and fails before spawning. Normalize through the descriptor we just
+    // validated as our own, never through the pathname.
+    // SAFETY: `file` is a live owned descriptor validated above as a regular
+    // file we own; fchmod has no memory effects.
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
+        return Err(SpawnError("daemon log chmod failed"));
+    }
     Ok(OwnedFd::from(file))
 }
 
@@ -83,12 +94,43 @@ fn relocate_above_stderr(fd: OwnedFd) -> Result<OwnedFd, SpawnError> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// Highest descriptor number the pre-5.9 close fallback must reach.
+///
+/// `close_range` closes an open-ended range in one call; the fallback loop
+/// cannot, so its ceiling has to come from the process limit rather than a
+/// guessed constant. A supervisor or shell that hands this launcher a
+/// high-numbered non-CLOEXEC socket, pipe, lock, or sensitive file would
+/// otherwise leak it into a long-lived daemon and keep that resource alive
+/// indefinitely. Resolved before `fork` so the child does nothing but close.
+fn close_fallback_ceiling() -> libc::c_int {
+    // Descriptor numbers are bounded by RLIMIT_NOFILE's soft limit, so closing
+    // up to it covers every descriptor that can exist. RLIM_INFINITY and absurd
+    // limits are clamped: the loop must terminate in bounded time.
+    const CLAMP: u64 = 1 << 20;
+    const FLOOR: u64 = 8192;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the caller-provided struct and has no other
+    // memory effects.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
+        return FLOOR as libc::c_int;
+    }
+    // `rlim_t` widths differ across the supported targets, so the comparison is
+    // done in u64 regardless of the local alias.
+    #[allow(clippy::unnecessary_cast)]
+    let soft = limit.rlim_cur as u64;
+    soft.clamp(FLOOR, CLAMP) as libc::c_int
+}
+
 /// Forks a fully detached `ck-mc-host serve` daemon and writes the bounded
 /// startup envelope to its stdin pipe. The child: new session, owner-only
-/// umask, cwd `/`, stdin from the envelope pipe, stdout/stderr appended to
-/// the owner-only log, every other inherited descriptor closed, empty
-/// environment, and `fexecve` of the retained verified executable fd — the
-/// pathname is never re-resolved after validation.
+/// umask, cwd `/`, default signal dispositions with no signals blocked, stdin
+/// from the envelope pipe, stdout/stderr appended to the owner-only log, every
+/// other inherited descriptor closed, empty environment, and `fexecve` of the
+/// retained verified executable fd — the pathname is never re-resolved after
+/// validation.
 ///
 /// Success here proves only that the spawn was issued; the caller must wait
 /// on publication evidence, never on the child PID.
@@ -138,11 +180,27 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
     // Minimal environment: serve takes every input from the envelope.
     let envp: [*const libc::c_char; 1] = [std::ptr::null()];
     let root = CString::new("/").expect("static path");
+    let close_ceiling = close_fallback_ceiling();
+    // Empty signal mask for the child. `exec` resets caught signals to their
+    // default disposition but preserves both ignored dispositions and the
+    // blocked-signal mask, so a launcher invoked with SIGCHLD ignored would give
+    // the daemon a disposition that auto-reaps Broca subprocesses before Tokio
+    // can wait for them, and a launcher invoked with SIGTERM blocked would give
+    // it a daemon that never observes its own termination signal.
+    let mut empty_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: sigemptyset initializes the caller-provided set and has no other
+    // memory effects.
+    unsafe {
+        libc::sigemptyset(&mut empty_mask);
+    }
+    // Highest signal number to reset, resolved before fork so the child makes
+    // no library call that could consult allocator or lock state.
+    let max_signal = libc::SIGRTMAX();
 
     // SAFETY: fork with a multithreaded parent; the child performs only
-    // async-signal-safe operations (setsid/umask/chdir/signal/dup2/fcntl/
-    // close_range/close/fexecve/_exit) before exec, on descriptors and
-    // buffers prepared above.
+    // async-signal-safe operations (setsid/umask/chdir/signal/sigprocmask/
+    // dup2/fcntl/close_range/close/fexecve/_exit) before exec, on descriptors
+    // and buffers prepared above.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(SpawnError("fork failed"));
@@ -154,9 +212,15 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
             libc::setsid();
             libc::umask(0o077);
             libc::chdir(root.as_ptr());
-            // The parent ignores SIGPIPE for its own envelope write; the
-            // daemon must not inherit that through exec.
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            // Restore every signal to its default disposition and unblock all
+            // signals: the daemon must start from a known signal state rather
+            // than inheriting whatever the launcher's invoker had installed.
+            // SIGKILL and SIGSTOP cannot be reset; signal() reports EINVAL for
+            // them, which is harmless here.
+            for signum in 1..=max_signal {
+                libc::signal(signum, libc::SIG_DFL);
+            }
+            libc::sigprocmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut());
             if libc::dup2(pipe_r.as_raw_fd(), 0) < 0
                 || libc::dup2(log_fd.as_raw_fd(), 1) < 0
                 || libc::dup2(log_fd.as_raw_fd(), 2) < 0
@@ -174,11 +238,9 @@ pub fn spawn_detached(log_path: &Path, envelope: &[u8]) -> Result<(), SpawnError
             }
             // Close every other inherited descriptor. close_range needs
             // kernel >= 5.9; the plan floor is 4.18, so fall back to a
-            // bounded close loop. ponytail: 8192 covers any descriptor this
-            // short-lived CLI can have open; raise if the CLI ever holds
-            // more.
+            // bounded close loop up to the process descriptor limit.
             if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0 {
-                for fd in 4..8192 {
+                for fd in 4..=close_ceiling {
                     libc::close(fd);
                 }
             }

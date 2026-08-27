@@ -275,6 +275,13 @@ pub async fn open_synapse_route_rejection(client: &mut raw_client::RawClient) ->
             Err(code) if code == "module_reloading" && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // A transient reload code that never settled is a harness timeout,
+            // not the permanent rejection this returns. Falling through to the
+            // arm below would hand `module_reloading` back to the caller as if
+            // the route had been permanently refused for that reason.
+            Err(code) if code == "module_reloading" => {
+                panic!("synapse route still reloading at the rejection deadline")
+            }
             Err(code) => return code,
         }
     }

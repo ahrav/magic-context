@@ -393,6 +393,65 @@ impl Drop for InstanceGuard {
     }
 }
 
+/// Traverses an existing managed directory path without following symlinks
+/// and without creating anything. `Ok(None)` means a component is absent, so
+/// the subtree has not been created yet; an `Err` means a component that does
+/// exist is not replacement-proof or not ours.
+///
+/// Observational callers need this distinction: mapping an insecure or
+/// unreadable component onto the same answer as an absent one would let
+/// hostile persisted state be reported as "nothing installed yet", which
+/// prescribes the wrong remediation and hides the shape that caused it. Every
+/// component is resolved relative to the previous pinned descriptor, so no
+/// intermediate symlink can redirect the traversal after the anchor is taken.
+pub(crate) fn open_secure_dir_existing(dir_path: &Path) -> Result<Option<OwnedFd>, InstanceError> {
+    let mut current = open_safe_anchor(dir_path)
+        .map_err(|e| io_err("open_anchor", dir_path, e))?
+        .ok_or_else(|| InstanceError::Insecure {
+            what: "managed directory ancestor",
+            path: dir_path.to_path_buf(),
+        })?;
+    let mut walked = if dir_path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::new()
+    };
+    let names = normal_components(dir_path).ok_or_else(|| InstanceError::Insecure {
+        what: "managed directory path",
+        path: dir_path.to_path_buf(),
+    })?;
+    if names.is_empty() {
+        return Err(InstanceError::Insecure {
+            what: "managed directory path",
+            path: dir_path.to_path_buf(),
+        });
+    }
+    let last = names.len() - 1;
+    for (index, name) in names.into_iter().enumerate() {
+        walked.push(name);
+        let next = match openat(&current, name, HARDENED_DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(e) => return Err(io_err("open_component", &walked, e)),
+        };
+        // Same intermediate rule as the creating traversal: a component another
+        // principal can rename or swap can redirect the pathname after we pin
+        // ours. The final component is left to the caller's own predicate.
+        if index != last {
+            let stat =
+                rustix::fs::fstat(&next).map_err(|e| io_err("fstat_component", &walked, e))?;
+            if !is_safe_ancestor(&stat) {
+                return Err(InstanceError::Insecure {
+                    what: "managed directory ancestor",
+                    path: walked.clone(),
+                });
+            }
+        }
+        current = next;
+    }
+    Ok(Some(current))
+}
+
 /// Traverses and validates the runtime path without following symlinks,
 /// normalizing newly created components to 0700. Returns a pinned descriptor
 /// for the final directory after validating its ownership and mode.
@@ -640,6 +699,7 @@ pub(crate) const S_IFMT: u32 = 0o170000;
 const S_ISVTX: u32 = 0o1000;
 pub(crate) const S_IFDIR: u32 = 0o040000;
 pub(crate) const S_IFREG: u32 = 0o100000;
+pub(crate) const S_IFLNK: u32 = 0o120000;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {

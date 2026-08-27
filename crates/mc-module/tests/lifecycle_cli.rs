@@ -181,7 +181,7 @@ fn probe_on_empty_root_reports_stopped_without_mutation() {
     let out = run(&data, &["probe"]);
     assert_eq!(out.code, 1);
     let value = out.json();
-    assert_result(&value, "probe", false, "stopped", "not_running");
+    assert_result(&value, "status", false, "stopped", "not_running");
     assert_eq!(value["remediation"], "run_daemon_start");
     assert_eq!(value["effects"], Value::Null);
     assert!(
@@ -314,7 +314,7 @@ fn quarantined_record_is_classified_alike_by_every_command() {
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).expect("record mode");
 
     for (args, command, state) in [
-        (vec!["probe"], "probe", "stopped"),
+        (vec!["probe"], "status", "stopped"),
         (vec!["start"], "start", "stopped"),
         (vec!["stop"], "stop", "stopped"),
         (vec!["restart"], "restart", "stopped"),
@@ -391,7 +391,7 @@ async fn restart_preflights_the_successor_before_committing_the_stop() {
     // The daemon is still serving: the publication still authenticates.
     let out = run(&data, &["probe"]);
     assert_eq!(out.code, 0);
-    assert_result(&out.json(), "probe", true, "running", "healthy");
+    assert_result(&out.json(), "status", true, "running", "healthy");
     let publication = mc_host::runtime_dir_path(Some(&data))
         .expect("runtime dir")
         .join(mc_host::CONNECTION_FILE_NAME);
@@ -440,10 +440,11 @@ async fn full_dev_mode_lifecycle_roundtrip() {
         .expect("published daemon authenticates");
     client.close().await.expect("client closes");
 
-    // probe: running and healthy.
-    let out = run(&data, &["probe"]);
+    // status: running and healthy. The contracted verb; `probe` above covers
+    // the historical spelling of the same command.
+    let out = run(&data, &["status"]);
     assert_eq!(out.code, 0);
-    assert_result(&out.json(), "probe", true, "running", "healthy");
+    assert_result(&out.json(), "status", true, "running", "healthy");
 
     // Second start: compatible incarnation already running, no respawn.
     let out = run(&data, &["start", "--payload-dir", payload_arg]);
