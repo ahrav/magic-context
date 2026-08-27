@@ -151,6 +151,51 @@ describe("pure format-family classification", () => {
         expect(classification.reasons).toContain("unregistered schema object: memories");
     });
 
+    it("refuses the prior direct format after the anti-memory component changes identity", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const current = inspectDatabaseForClassification(db);
+            if (current.marker.status !== "present") throw new Error("missing current marker");
+            const antiMemoryObjects = new Set([
+                "claim_anti_memory_payloads_append_only_delete",
+                "claim_anti_memory_payloads_append_only_insert_collision",
+                "claim_anti_memory_payloads_append_only_update",
+                "claim_anti_memory_payloads_category_guard",
+                "claim_anti_memory_revision_payloads",
+            ]);
+            const { markerDigest: _currentDigest, ...currentMarker } = current.marker.marker;
+            const priorMarker = {
+                ...currentMarker,
+                componentManifestDigest:
+                    "7006b7e53e06ae463b46963c125a7b6629238d19c90b37e6c81db133b1be7767",
+            };
+            const prior: FormatFamilyInspection = {
+                ...current,
+                schemaObjectNames: current.schemaObjectNames.filter(
+                    (name) => !antiMemoryObjects.has(name),
+                ),
+                marker: {
+                    status: "present",
+                    marker: {
+                        ...priorMarker,
+                        markerDigest: computeMarkerDigest(priorMarker),
+                    },
+                },
+            };
+
+            const classification = classifyDatabaseFormatFamily(prior, EXPECTED);
+            expect(classification.family).toBe("unsupported");
+            expect(classification.reasons).toContain(
+                "marker component manifest digest does not match this build's manifest",
+            );
+            expect(classification.reasons).toContain(
+                "missing registered schema object: claim_anti_memory_revision_payloads",
+            );
+        } finally {
+            db.close();
+        }
+    });
+
     it("refuses a malformed marker before any other verdict", () => {
         const { db } = createDirectTestDatabase();
         try {

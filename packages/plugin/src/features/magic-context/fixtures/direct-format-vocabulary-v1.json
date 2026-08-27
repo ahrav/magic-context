@@ -85,6 +85,16 @@
                 ]
             },
             {
+                "name": "anti-memory",
+                "dependsOn": [
+                    "claims-evidence",
+                    "claim-memory"
+                ],
+                "provides": [
+                    "claim_anti_memory_revision_payloads"
+                ]
+            },
+            {
                 "name": "session-runtime",
                 "dependsOn": [],
                 "provides": [
@@ -177,18 +187,23 @@
         ]
     },
     "goldens": {
-        "manifestDigest": "7006b7e53e06ae463b46963c125a7b6629238d19c90b37e6c81db133b1be7767",
+        "manifestDigest": "964f452a8f77427a31338c16da26bfda3bdabd333f68a2ca3ccfdb95e050f9f0",
         "marker": {
             "formatEpoch": 1,
             "databaseIncarnationId": "00112233445566778899aabbccddeeff",
-            "componentManifestDigest": "7006b7e53e06ae463b46963c125a7b6629238d19c90b37e6c81db133b1be7767",
+            "componentManifestDigest": "964f452a8f77427a31338c16da26bfda3bdabd333f68a2ca3ccfdb95e050f9f0",
             "createdAtMs": 1755900000000,
-            "markerDigest": "c64a00f228d0bf89626f64beaaef5135a7c225fcf8ea940bd99d5f953c618125"
+            "markerDigest": "353686dc2f5ceb0cb733cca7290f8286c93443b6111f0908b0d6f4937ca340a2"
         },
         "schemaObjectNames": [
             "authority_capture_bounds",
             "authority_managed",
             "authority_repair_pending",
+            "claim_anti_memory_payloads_append_only_delete",
+            "claim_anti_memory_payloads_append_only_insert_collision",
+            "claim_anti_memory_payloads_append_only_update",
+            "claim_anti_memory_payloads_category_guard",
+            "claim_anti_memory_revision_payloads",
             "claim_applicability_assertions_anchor_project_guard",
             "claim_applicability_assertions_append_only_delete",
             "claim_applicability_assertions_append_only_insert_collision",

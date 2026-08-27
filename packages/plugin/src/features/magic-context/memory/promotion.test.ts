@@ -48,6 +48,26 @@ function count(database: Database, table: string): number {
 }
 
 describe("claim-native historian promotion", () => {
+    it("never promotes the rejected-approach category", () => {
+        db = createClaimReaderTestDatabase();
+        const refs = promoteSessionFactsDurable(
+            db,
+            "ses-anti",
+            PROJECT,
+            [
+                {
+                    category: "REJECTED_APPROACH" as never,
+                    content: "Rejected Redis for session caching.",
+                },
+            ],
+            identity(),
+        );
+
+        expect(refs).toEqual([]);
+        expect(count(db, "claims")).toBe(0);
+        expect(count(db, "claim_anti_memory_revision_payloads")).toBe(0);
+    });
+
     it("creates one inference-tainted claim with a public locator", () => {
         db = createClaimReaderTestDatabase();
         const refs = promoteSessionFactsDurable(

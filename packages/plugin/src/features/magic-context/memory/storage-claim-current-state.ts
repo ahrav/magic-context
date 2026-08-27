@@ -32,6 +32,7 @@ import {
     CLAIM_POLICY_VERSION,
     explicitSearchLabelFromFields,
 } from "./claim-visibility-policy.ts";
+import { ANTI_MEMORY_CATEGORY } from "./constants.ts";
 import {
     type ApplicabilityAssertionRecord,
     readCurrentApplicabilityAssertions,
@@ -41,7 +42,7 @@ import {
     computeProjectMemoryMutationToken,
 } from "./storage-claim-operations.ts";
 import { readActiveDispositions } from "./storage-claim-policy.ts";
-import { uniformlyAbsentClaimSql } from "./storage-claim-visibility.ts";
+import { antiMemoryClaimSql, uniformlyAbsentClaimSql } from "./storage-claim-visibility.ts";
 import { ClaimGraphCorruptionError, resolveProjectId } from "./storage-claims.ts";
 import type { MemoryScope } from "./types.ts";
 
@@ -165,6 +166,13 @@ function resolveCandidates(
         throw new ClaimOperationInputError(
             "current-state reads require public locators or an authorized project set",
         );
+    }
+    // Anti-memory is only reachable through explicit search; filtering it in
+    // the candidate query keeps the hot automatic surfaces from paying full
+    // hydration for rows `surfaceDecision` (the authoritative check, kept as
+    // defence in depth) would discard anyway.
+    if ((request.surface ?? "explicit_search") !== "explicit_search") {
+        clauses.push(`NOT ${antiMemoryClaimSql("claims.current_revision_id")}`);
     }
     return db
         .prepare(
@@ -364,6 +372,14 @@ function surfaceDecision(
     nowMs: number,
 ): { eligible: boolean; label: string | null } {
     if (item.expiresAt !== null && item.expiresAt <= nowMs) {
+        return { eligible: false, label: null };
+    }
+    // Rejected approaches are reachable only through explicit search. Every
+    // other surface — automatic injection AND the dreamer maintenance lanes —
+    // must never see them: a maintenance curate pass that consumes one can
+    // re-create its content under a positive category, laundering a rejected
+    // approach back into auto-injected memory.
+    if (item.category === ANTI_MEMORY_CATEGORY && surface !== "explicit_search") {
         return { eligible: false, label: null };
     }
     const facts = item.dispositions;
@@ -659,6 +675,7 @@ export function countProjectMemoryClaims(
                JOIN claim_memory_lifecycle_heads heads ON heads.claim_id = claims.id
               WHERE claims.project_id IN (${request.projectIds.map(() => "?").join(", ")})
                 AND heads.state IN (${lifecycleStates.map(() => "?").join(", ")})
+                AND NOT ${antiMemoryClaimSql("claims.current_revision_id")}
                 AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`,
         )
         .get(...request.projectIds, ...lifecycleStates) as { cnt: number } | undefined;
