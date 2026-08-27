@@ -37,6 +37,25 @@ pub(crate) const MEMORY_CATEGORY_ORDER: [&str; 5] = [
     "NAMING",
 ];
 
+pub(crate) const POSITIVE_MEMORY_CATEGORIES: [&str; 12] = [
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+    "USER_DIRECTIVES",
+    "USER_PREFERENCES",
+    "CONFIG_DEFAULTS",
+    "ARCHITECTURE_DECISIONS",
+    "ENVIRONMENT",
+    "WORKFLOW_RULES",
+    "KNOWN_ISSUES",
+];
+
+pub(crate) fn is_positive_memory_category(category: &str) -> bool {
+    POSITIVE_MEMORY_CATEGORIES.contains(&category)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirroredClaimMemory {
     pub public_claim_id: String,
@@ -48,24 +67,55 @@ pub struct MirroredClaimMemory {
     pub provenance_label: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirroredClaimMemoryError {
+    Inactive {
+        public_claim_id: String,
+    },
+    MissingCategory {
+        public_claim_id: String,
+    },
+    NonPositiveCategory {
+        public_claim_id: String,
+        category: String,
+    },
+    MissingImportance {
+        public_claim_id: String,
+    },
+}
+
 impl TryFrom<&CommittedClaimMirrorRow> for MirroredClaimMemory {
-    type Error = String;
+    type Error = MirroredClaimMemoryError;
 
     fn try_from(row: &CommittedClaimMirrorRow) -> Result<Self, Self::Error> {
         if row.lifecycle != ClaimMirrorLifecycle::Active {
-            return Err(format!("claim {} is not active", row.public_claim_id));
+            return Err(MirroredClaimMemoryError::Inactive {
+                public_claim_id: row.public_claim_id.clone(),
+            });
         }
         let category = row
             .attributes
             .get("category")
             .and_then(serde_json::Value::as_str)
             .filter(|category| !category.is_empty())
-            .ok_or_else(|| format!("claim {} category is missing", row.public_claim_id))?;
+            .ok_or_else(|| MirroredClaimMemoryError::MissingCategory {
+                public_claim_id: row.public_claim_id.clone(),
+            })?;
+        // Native surfaces have no warning renderer. Only positive categories cross this
+        // boundary so warning records stay silent instead of being rendered as facts.
+        if !is_positive_memory_category(category) {
+            return Err(MirroredClaimMemoryError::NonPositiveCategory {
+                public_claim_id: row.public_claim_id.clone(),
+                category: category.to_string(),
+            });
+        }
         let importance = row
             .attributes
             .get("importance")
             .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| format!("claim {} importance is missing", row.public_claim_id))?;
+            .ok_or_else(|| MirroredClaimMemoryError::MissingImportance {
+                public_claim_id: row.public_claim_id.clone(),
+            })?;
         Ok(Self {
             public_claim_id: row.public_claim_id.clone(),
             revision_locator: row.revision_locator.clone(),
@@ -288,4 +338,76 @@ pub fn render_new_compartments(
         "<new-compartments>\n{}\n</new-compartments>",
         bodies.join("\n\n")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mc_core::claim_operation::sha256_hex_utf8;
+    use serde_json::json;
+
+    fn mirrored_row(category: Option<&str>) -> CommittedClaimMirrorRow {
+        let content = "Keep this project fact.";
+        let content_digest = sha256_hex_utf8(content);
+        let mut attributes = json!({ "importance": 80 });
+        if let Some(category) = category {
+            attributes["category"] = json!(category);
+        }
+        CommittedClaimMirrorRow {
+            public_claim_id: "mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            project_id: 41,
+            revision_locator: format!("mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/r1/{content_digest}"),
+            content: content.to_string(),
+            content_digest,
+            attributes,
+            lifecycle: ClaimMirrorLifecycle::Active,
+            applicability: json!({}),
+            policy: json!({}),
+            provenance_label: None,
+            project_generation: 1,
+            policy_generation: 1,
+        }
+    }
+
+    #[test]
+    fn positive_categories_render_and_non_positive_categories_are_typed_rejections() {
+        for category in POSITIVE_MEMORY_CATEGORIES {
+            let claim = MirroredClaimMemory::try_from(&mirrored_row(Some(category)))
+                .expect("positive category must render");
+            assert_eq!(claim.category, category);
+        }
+
+        assert!(matches!(
+            MirroredClaimMemory::try_from(&mirrored_row(Some("REJECTED_APPROACH"))),
+            Err(MirroredClaimMemoryError::NonPositiveCategory { category, .. })
+                if category == "REJECTED_APPROACH"
+        ));
+        assert!(matches!(
+            MirroredClaimMemory::try_from(&mirrored_row(Some("FUTURE_NEGATIVE_CATEGORY"))),
+            Err(MirroredClaimMemoryError::NonPositiveCategory { category, .. })
+                if category == "FUTURE_NEGATIVE_CATEGORY"
+        ));
+        assert!(matches!(
+            MirroredClaimMemory::try_from(&mirrored_row(None)),
+            Err(MirroredClaimMemoryError::MissingCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn positive_category_vocabulary_matches_typescript() {
+        let source =
+            include_str!("../../../packages/plugin/src/features/magic-context/memory/constants.ts");
+        let priority = source
+            .split("export const CATEGORY_PRIORITY")
+            .nth(1)
+            .and_then(|tail| tail.split("];").next())
+            .expect("TypeScript CATEGORY_PRIORITY array");
+        let typescript_categories = priority
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('"'))
+            .filter_map(|line| line.split('"').next())
+            .collect::<Vec<_>>();
+
+        assert_eq!(typescript_categories, POSITIVE_MEMORY_CATEGORIES);
+    }
 }
