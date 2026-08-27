@@ -472,6 +472,27 @@ describe("oracle evidence hook", () => {
         ).toBe(true);
     });
 
+    test("real host version strings agree with the platform gate", () => {
+        // `compareDotted` exists to read these spellings; a format pre-filter
+        // here would reject hosts that `evaluatePlatform` accepts on the same
+        // floors, which is the disagreement the shared comparator prevents.
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        manifest.oracle.host.kernel = "4.18.0-513.el8.x86_64";
+        manifest.oracle.host.glibc = "2.28-236.el8";
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).not.toThrow();
+
+        // Below the floor still fails closed.
+        const low = freshRoot();
+        const lowManifest = fixtureManifest();
+        lowManifest.oracle.host.kernel = "2.6.32-696.el6.x86_64";
+        installManifest(low, lowManifest);
+        expect(() => generate(low, { check: false })).toThrow(
+            /host must meet the exact minimum Linux floor/,
+        );
+    });
+
     test("mismatched oracle evidence is rejected", () => {
         const contract = buildContract();
         const base = fixtureManifest().oracle;

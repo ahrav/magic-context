@@ -1298,10 +1298,15 @@ export function checkOracleEvidence(
     }
     // Same comparator the U8 platform gate uses against these same floors, so
     // the qualifier and `evaluatePlatform` cannot disagree on a host version.
-    // Real hosts report three-component versions (kernel `5.15.0`), which a
-    // strict `major.minor` match would reject outright.
+    // No format pre-filter: `compareDotted` exists precisely to read the messy
+    // strings real hosts report (`uname -r` gives `4.18.0-513.el8.x86_64`,
+    // glibc gives `2.28-236.el8`), taking each segment's leading digit run and
+    // counting a segment with no leading digits as 0. A pre-filter rejecting
+    // those spellings would make this gate disagree with the platform gate on
+    // the same host. Unreadable values still fail closed: they compare as 0 and
+    // cannot reach a floor, and a malformed floor yields NaN.
     const versionAtLeast = (value: unknown, floor: string): boolean => {
-        if (typeof value !== "string" || !/^\d+(\.\d+)*$/.test(value)) {
+        if (typeof value !== "string" || value.length === 0) {
             return false;
         }
         const ordering = compareDotted(value, floor);
