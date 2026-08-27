@@ -411,4 +411,116 @@ describe("anti-memory typed operations", () => {
             closeQuietly(db);
         }
     });
+    test("replays a TTL extension retry after an unrelated revision changed the payload", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-replay-drift");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            const extendInput = {
+                token: computeProjectMemoryMutationToken(db, publicClaimId),
+                expiresAt: 200 * DAY_MS,
+                provenance: provenance("extend"),
+                actor: "verifier",
+                nowMs: 20,
+            };
+            const first = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(first.replayed).toBe(false);
+
+            // An unrelated revise moves the stored payload away from the bytes
+            // the extension happened to re-state.
+            reviseAntiMemory(
+                db,
+                { producer: "test", operationKey: "revise" },
+                {
+                    token: computeProjectMemoryMutationToken(db, publicClaimId),
+                    payload: payload("Redis adds operational cost and a new failure domain"),
+                    provenance: provenance("revise"),
+                    actor: "curator",
+                    nowMs: 30,
+                },
+            );
+
+            // The extension request itself never carried a payload, so its
+            // digest must not have drifted with the row: this retry replays
+            // rather than raising ClaimOperationKeyReuseError.
+            const retry = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(retry.replayed).toBe(true);
+            expect(retry.outcome).toBe("applied");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses an operation-key reuse that changes only importance", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-importance-digest");
+            const request = {
+                projectId,
+                payload: payload(),
+                provenance: provenance("create"),
+                actor: "dreamer",
+                nowMs: 10,
+            };
+            createAntiMemory(db, { producer: "test", operationKey: "create" }, request);
+
+            // Importance reaches the persisted attributes, so a different
+            // importance is a different request: replaying the first receipt
+            // would silently drop the new value.
+            expect(() =>
+                createAntiMemory(
+                    db,
+                    { producer: "test", operationKey: "create" },
+                    { ...request, importance: 90 },
+                ),
+            ).toThrow(/already committed for a different request digest/);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("normalizes blank optional payload fields to null instead of rejecting them", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-blank-optional");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: { ...payload(), saferAlternative: "", preconditions: "   " },
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const record = readAntiMemory(db, publicIdOf(created));
+
+            expect(record?.payload.saferAlternative).toBeNull();
+            expect(record?.payload.preconditions).toBeNull();
+            // A blank optional is absence, so the renderer omits its line.
+            expect(record?.content).not.toContain("Safer alternative");
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });

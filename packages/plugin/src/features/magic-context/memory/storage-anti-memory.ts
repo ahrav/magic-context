@@ -9,11 +9,13 @@ import {
     type ClaimEvidenceProvenance,
     ClaimOperationInputError,
     type ClaimOperationRunResult,
+    DEFAULT_MEMORY_IMPORTANCE,
     type ProducerIdentity,
     provenanceRequestShape,
     runClaimOperation,
     stageCreateProjectMemoryClaimInCurrentTransaction,
     stageReviseProjectMemoryClaimInCurrentTransaction,
+    tokenRequestShape,
 } from "./storage-claim-operations";
 import { ClaimGraphCorruptionError } from "./storage-claims";
 
@@ -97,6 +99,13 @@ function requiredText(value: unknown, field: string): string {
 
 function optionalText(value: unknown, field: string): string | null {
     if (value === undefined || value === null) return null;
+    // The payload columns are `CHECK (col IS NULL OR length(trim(col)) > 0)`, so
+    // an absent optional field has exactly one legal stored form: NULL. A
+    // blank string is the same absence spelled differently — model-generated
+    // payloads routinely emit `""` for a field they have nothing to say about —
+    // and rejecting it would fail the whole write over a value the schema and
+    // the renderer both treat as "not present".
+    if (typeof value === "string" && value.trim().length === 0) return null;
     return requiredText(value, field);
 }
 
@@ -190,6 +199,14 @@ export function createAntiMemory(
             ...producer,
             requestDigest: computeClaimOperationRequestDigest({
                 actor: input.actor,
+                // Importance lands in the persisted revision attributes, so it
+                // is part of the request: leaving it out lets a second call
+                // that reuses the operation key with a different importance
+                // replay the first receipt and silently drop the new value
+                // instead of raising ClaimOperationKeyReuseError. Digest the
+                // resolved value so an omitted importance and an explicit
+                // default stay one request.
+                importance: input.importance ?? DEFAULT_MEMORY_IMPORTANCE,
                 operation: "create-anti-memory",
                 payload: payloadDigestShape(payload),
                 projectId: input.projectId,
@@ -247,7 +264,18 @@ function reviseWithPayload(
     producer: ProducerIdentity,
     args: {
         input: Omit<ReviseAntiMemoryInput, "payload">;
+        /** Payload written to the new revision. */
         payload: StoredAntiMemoryPayload;
+        /**
+         * The payload as the caller *requested* it, or null for an operation
+         * that supplies none. `payload` above is what gets stored, which for a
+         * TTL extension is state read back from the current revision — folding
+         * that into the request digest would make an idempotent retry diverge
+         * as soon as an unrelated revision changed the payload in between,
+         * raising `ClaimOperationKeyReuseError` instead of replaying the
+         * receipt. The digest must describe the request, not the row.
+         */
+        digestPayload: StoredAntiMemoryPayload | null;
         expiresAt?: number;
         operation: "revise-anti-memory" | "extend-anti-memory-ttl";
         /**
@@ -271,10 +299,11 @@ function reviseWithPayload(
                 actor: args.input.actor,
                 expiresAt: args.expiresAt ?? null,
                 operation: args.operation,
-                payload: payloadDigestShape(args.payload),
+                payload:
+                    args.digestPayload === null ? null : payloadDigestShape(args.digestPayload),
                 provenance: provenanceRequestShape(args.input.provenance),
                 requestScope: args.input.requestScope ?? null,
-                token: args.input.token,
+                token: tokenRequestShape(args.input.token),
             }),
         },
         () => {
@@ -313,9 +342,11 @@ export function reviseAntiMemory(
 ): ClaimOperationRunResult {
     const current = readAntiMemory(db, input.token.publicClaimId);
     if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
+    const payload = normalizePayload(input.payload);
     return reviseWithPayload(db, producer, {
         input,
-        payload: normalizePayload(input.payload),
+        payload,
+        digestPayload: payload,
         operation: "revise-anti-memory",
     });
 }
@@ -333,6 +364,7 @@ export function extendAntiMemoryTtl(
     return reviseWithPayload(db, producer, {
         input,
         payload: current.payload,
+        digestPayload: null,
         expiresAt: input.expiresAt,
         operation: "extend-anti-memory-ttl",
         // Checked inside the stage: after a successful apply the stored expiry

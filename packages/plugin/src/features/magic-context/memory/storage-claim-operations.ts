@@ -764,7 +764,14 @@ export function provenanceRequestShape(provenance: ClaimEvidenceProvenance): Can
     };
 }
 
-function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue {
+/**
+ * Project a mutation token onto the exact fields that identify the request.
+ * Digesting a caller's token object directly would fold in any extra property
+ * it happens to carry, so two spellings of the same token — one built here,
+ * one round-tripped through JSON by a retrying caller — would digest
+ * differently and turn an honest replay into `ClaimOperationKeyReuseError`.
+ */
+export function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue {
     return {
         applicabilityHeadsDigest: token.applicabilityHeadsDigest,
         contentDigest: token.contentDigest,
@@ -788,8 +795,16 @@ export interface ProjectMemoryAttributes {
     expiresAt: number | null;
 }
 
+/**
+ * Importance applied when a create request omits it. Exported so typed writers
+ * that build their own request digests can digest the same resolved value this
+ * module persists, keeping an omitted importance and an explicit `50` one
+ * request rather than two.
+ */
+export const DEFAULT_MEMORY_IMPORTANCE = 50;
+
 const DEFAULT_ATTRIBUTES: Omit<ProjectMemoryAttributes, "category"> = {
-    importance: 50,
+    importance: DEFAULT_MEMORY_IMPORTANCE,
     memoryScope: "project",
     sharing: "private",
     expiresAt: null,
@@ -1317,8 +1332,17 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         );
     }
     const contentUnchanged = sha256Utf8Hex(nextContent) === claim.contentDigest;
+    const normalizedHash = computeNormalizedHash(input.dedupText ?? nextContent);
+    // `dedupText` decouples deduplication identity from display content, so a
+    // revision can leave the content bytes and every attribute untouched and
+    // still move the claim to a different (project, category, hash) slot. That
+    // has to count as a change: the early return skips the revision append, so
+    // `normalized_hash` would keep the superseded preimage in both the
+    // attributes row and the current head, and the duplicate check for the new
+    // identity would never run.
     const unchanged =
         contentUnchanged &&
+        normalizedHash === current.normalizedHash &&
         nextAttributes.category === current.category &&
         nextAttributes.importance === current.importance &&
         nextAttributes.memoryScope === current.memoryScope &&
@@ -1327,7 +1351,6 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
     if (unchanged) {
         return attachEvidenceStage(db, claim, input.provenance, nowMs);
     }
-    const normalizedHash = computeNormalizedHash(input.dedupText ?? nextContent);
     assertNoLiveDuplicate(db, {
         projectId: claim.projectId,
         category: nextAttributes.category,
