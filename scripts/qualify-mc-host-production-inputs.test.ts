@@ -241,6 +241,20 @@ describe("immutable input fail-closed rules", () => {
         }
     });
 
+    test("an unparseable source URL fails with the tool's framing", () => {
+        // `startsWith("https://")` does not imply parseability; a raw
+        // `TypeError: Invalid URL` would lose the consistent failure prefix.
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        // An unterminated IPv6 bracket is unparseable; a space in the path is
+        // only percent-encoded, so it would not exercise the catch.
+        manifest.inputs.model_onnx.source = "https://[invalid/model.onnx";
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).toThrow(
+            /inputs\.model_onnx: source is not a parseable URL/,
+        );
+    });
+
     test("placeholder hashes are rejected", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
@@ -398,6 +412,18 @@ describe("oracle evidence hook", () => {
         const contract = buildContract();
         const base = fixtureManifest().oracle;
         const cases: [(o: typeof base) => void, RegExp][] = [
+            [
+                // A mis-cased nested key must be reported as an unknown key,
+                // not fall through as an absent version.
+                (o) => {
+                    o.host = {
+                        target: o.host.target,
+                        Kernel: o.host.kernel,
+                        glibc: o.host.glibc,
+                    } as unknown as typeof o.host;
+                },
+                /oracle\.host/,
+            ],
             [
                 (o) => {
                     o.execution_provider = "cuda";

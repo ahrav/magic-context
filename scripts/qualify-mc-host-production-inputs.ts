@@ -1145,7 +1145,15 @@ function validateQualifiedArtifact(
     }
     // Compare per path segment so a mutable ref is caught in any position.
     // The host is excluded deliberately: only the path names the revision.
-    for (const segment of new URL(artifact.source).pathname.split("/")) {
+    // `startsWith("https://")` does not imply parseability, so a malformed URL
+    // is reported through `fail` rather than escaping as a raw `TypeError`.
+    let sourcePath: string;
+    try {
+        sourcePath = new URL(artifact.source).pathname;
+    } catch {
+        fail(`inputs.${key}: source is not a parseable URL`);
+    }
+    for (const segment of sourcePath.split("/")) {
         if (MUTABLE_SOURCE_REFS.has(segment)) {
             fail(
                 `inputs.${key}: mutable source identity (${segment} ref) is rejected`,
@@ -1239,6 +1247,14 @@ export function checkOracleEvidence(
     );
     if (linux === undefined || !("kernel_min" in linux))
         fail("oracle: U8 contract lacks the linux floor");
+    // Nested exactness matters here: an unknown or mis-cased key (`Kernel`)
+    // would otherwise read as absent and be reported as a version failure
+    // rather than as the typo it is.
+    assertExactKeys(
+        oracle.host,
+        ["target", "kernel", "glibc"],
+        "oracle.host",
+    );
     if (oracle.host?.target !== "linux-x64-gnu") {
         fail("oracle: the offline oracle must run on the linux-x64-gnu lane");
     }
