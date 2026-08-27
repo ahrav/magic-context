@@ -1130,6 +1130,32 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
         expect(accepted.u8Digest).toBe(generated.u8Digest);
     });
 
+    test("the gate re-hashes real artifacts when asked", () => {
+        // The lock records each artifact's sha256 but deliberately not its
+        // host-specific verify path, so the gate cannot hash bytes on its own.
+        // A build running on the qualifying host can demand it.
+        const root = freshRoot();
+        installProductionManifest(root);
+        generate(root, { check: false });
+        expect(() =>
+            requireQualificationEvidence(root, { verifyBytes: true }),
+        ).not.toThrow();
+
+        const bytesPath = join(
+            root,
+            STAGED_PRODUCTION_INPUT_DIR,
+            "model.onnx",
+        );
+        writeFileSync(bytesPath, "swapped after qualification\n");
+
+        // Every digest in the committed description still agrees; only the
+        // artifact bytes changed, which the default portable gate cannot see.
+        expect(() => requireQualificationEvidence(root)).not.toThrow();
+        expect(() =>
+            requireQualificationEvidence(root, { verifyBytes: true }),
+        ).toThrow(/inputs\.model_onnx: byte size/);
+    });
+
     test("stripped lock rows cannot pass the gate", () => {
         // Every marker check reads only a `qualified` flag or a version's type,
         // so a lock whose rows keep nothing but those markers satisfies all of
