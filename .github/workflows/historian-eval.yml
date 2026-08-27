@@ -1,0 +1,88 @@
+# Historian structural eval lane: live scenario runs (task magic-context-x4l.11).
+#
+# Scheduled or operator-dispatched ONLY (R14): each scenario costs up to four
+# live historian invocations plus one cheap probe-answer call per probe. The
+# deterministic parts (contract lint, scorer tests, mutation battery) run
+# per-PR inside ci.yml with no credentials.
+#
+# Flake triage on a red scheduled run = re-dispatch; each run is an
+# independent report (no repeat-count machinery).
+name: historian-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: Corpus to run (release directory or dev split)
+        type: choice
+        options:
+          - dev
+          - releases/v1
+        default: dev
+  schedule:
+    # Weekly, offset from the retrieval-benchmark schedule.
+    - cron: "41 4 * * 2"
+
+permissions:
+  contents: read
+
+jobs:
+  live-lane:
+    runs-on: ubuntu-latest
+    # Worst case: ~30 scenarios x (two historian runs + repair + probes) on a
+    # live model.
+    timeout-minutes: 240
+    concurrency:
+      group: historian-eval-live
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Install opencode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Build the plugin the harness loads
+        run: bun run --cwd packages/plugin build
+
+      - name: Run the live lane
+        env:
+          NODE_ENV: ""
+          ANTHROPIC_API_KEY: ${{ secrets.HISTORIAN_EVAL_ANTHROPIC_API_KEY }}
+          HISTORIAN_EVAL_MODEL: anthropic/claude-sonnet-4-5
+          HISTORIAN_EVAL_PROBE_MODEL: anthropic/claude-haiku-4-5
+          # Input flows through env, never template interpolation, and is
+          # validated against the closed corpus set below: interpolating
+          # `inputs.*` into shell source would let a crafted dispatch value
+          # execute with the API key in scope.
+          CORPUS_INPUT: ${{ inputs.scenarios }}
+        # Schedule runs carry no inputs; default to the dev split until the
+        # operator freezes releases/v1 (then flip the default here and in the
+        # dispatch input above).
+        run: |
+          case "${CORPUS_INPUT:-dev}" in
+            dev)         SELECT_FLAG=--scenarios; SELECT_PATH=packages/e2e-tests/historian-eval/dev ;;
+            releases/v1) SELECT_FLAG=--release;   SELECT_PATH=packages/e2e-tests/historian-eval/releases/v1 ;;
+            *) echo "unknown corpus: $CORPUS_INPUT" >&2; exit 1 ;;
+          esac
+          bun packages/e2e-tests/scripts/run-historian-eval.ts --live "$SELECT_FLAG" "$SELECT_PATH" \
+            --report packages/e2e-tests/artifacts/historian-eval-report.json
+
+      - name: Archive the lane report and run records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historian-eval-report
+          path: packages/e2e-tests/artifacts/
+          if-no-files-found: warn
