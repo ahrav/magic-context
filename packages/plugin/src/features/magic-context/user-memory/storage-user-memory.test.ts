@@ -1,21 +1,20 @@
 import { describe, expect, it } from "bun:test";
-import { Database } from "../../../shared/sqlite";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import type { Database } from "../../../shared/sqlite";
+import { createDirectTestDatabase } from "../test-database";
 import {
     deleteUserMemoryCandidates,
     getActiveUserMemories,
+    getUserMemoryCandidateProjectIdentities,
     getUserMemoryCandidates,
     insertUserMemory,
     insertUserMemoryCandidates,
     pruneExpiredUserMemoryCandidates,
     USER_MEMORY_CANDIDATE_TTL_MS,
+    updateUserMemoryContent,
 } from "./storage-user-memory";
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 
@@ -46,6 +45,79 @@ describe("user-memory provenance", () => {
                 sourceCompartmentEnd: 9,
             },
         ]);
+        db.close();
+    });
+
+    it("merges update provenance before candidates are consumed", () => {
+        const db = freshDb();
+        insertUserMemoryCandidates(db, [
+            { content: "first", sessionId: "s1", sourceCompartmentStart: 1 },
+            { content: "second", sessionId: "s2", sourceCompartmentStart: 2 },
+        ]);
+        const [first, second] = getUserMemoryCandidates(db);
+        const memoryId = insertUserMemory(db, "Initial profile", [first.id]);
+
+        db.transaction(() => {
+            updateUserMemoryContent(db, memoryId, "Updated profile", [second.id]);
+            deleteUserMemoryCandidates(db, [first.id, second.id]);
+        })();
+
+        expect(getActiveUserMemories(db)[0]).toMatchObject({
+            content: "Updated profile",
+            sourceCandidateIds: [first.id, second.id],
+            sourceProvenance: [
+                {
+                    candidateId: first.id,
+                    sessionId: "s1",
+                    sourceCompartmentStart: 1,
+                    sourceCompartmentEnd: null,
+                },
+                {
+                    candidateId: second.id,
+                    sessionId: "s2",
+                    sourceCompartmentStart: 2,
+                    sourceCompartmentEnd: null,
+                },
+            ],
+        });
+        db.close();
+    });
+
+    it("rolls profile promotion, merge, and dismissal back with the outer transaction", () => {
+        const db = freshDb();
+        insertUserMemoryCandidates(db, [{ content: "candidate", sessionId: "s1" }]);
+        const [candidate] = getUserMemoryCandidates(db);
+        const memoryId = insertUserMemory(db, "Initial profile", []);
+
+        expect(() =>
+            db.transaction(() => {
+                insertUserMemory(db, "Promoted profile", [candidate.id]);
+                updateUserMemoryContent(db, memoryId, "Updated profile", [candidate.id]);
+                deleteUserMemoryCandidates(db, [candidate.id]);
+                throw new Error("rollback");
+            })(),
+        ).toThrow("rollback");
+
+        expect(getActiveUserMemories(db).map((memory) => memory.content)).toEqual([
+            "Initial profile",
+        ]);
+        expect(getUserMemoryCandidates(db)).toHaveLength(1);
+        db.close();
+    });
+
+    it("resolves candidate project identities without changing the candidate store", () => {
+        const db = freshDb();
+        insertUserMemoryCandidates(db, [{ content: "candidate", sessionId: "s1" }]);
+        const [candidate] = getUserMemoryCandidates(db);
+        db.prepare(
+            `INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+             VALUES ('s1', 'opencode', 'git:one', 1), ('s1', 'pi', 'git:one', 1)`,
+        ).run();
+
+        expect(getUserMemoryCandidateProjectIdentities(db, [candidate.id])).toEqual(
+            new Map([[candidate.id, ["git:one"]]]),
+        );
+        expect(getUserMemoryCandidates(db)).toHaveLength(1);
         db.close();
     });
 

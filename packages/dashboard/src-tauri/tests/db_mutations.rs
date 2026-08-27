@@ -77,7 +77,7 @@ fn create_schema(conn: &Connection) {
             memory_block_ids TEXT DEFAULT '',
             cached_m0_bytes BLOB,
             cached_m1_bytes BLOB,
-            cached_m0_max_memory_mutation_id INTEGER
+            cached_m0_max_mutation_id INTEGER
         );
         CREATE TABLE memory_mutation_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -446,7 +446,7 @@ fn routine_memory_mutation_does_not_clear_memory_block_caches() {
     let id = insert_memory(&conn, "git:project-a", "active");
     conn.execute(
         "INSERT INTO session_meta
-           (session_id, session_facts_version, memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_memory_mutation_id)
+           (session_id, session_facts_version, memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_mutation_id)
          VALUES ('s1', 0, 'cached-body', '1,2,3', X'010203', X'040506', 42)",
         [],
     )
@@ -456,7 +456,7 @@ fn routine_memory_mutation_does_not_clear_memory_block_caches() {
 
     let row: (String, String, Vec<u8>, Vec<u8>, i64) = conn
         .query_row(
-            "SELECT memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_memory_mutation_id FROM session_meta WHERE session_id = 's1'",
+            "SELECT memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_mutation_id FROM session_meta WHERE session_id = 's1'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
@@ -526,7 +526,7 @@ fn invalidate_all_memory_block_caches_clears_m0_m1_and_mutation_cursor() {
     let conn = make_db();
     conn.execute(
         "INSERT INTO session_meta
-           (session_id, session_facts_version, memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_memory_mutation_id)
+           (session_id, session_facts_version, memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_mutation_id)
          VALUES ('s1', 0, 'cached-body', '1,2,3', X'010203', X'040506', 42)",
         [],
     )
@@ -537,7 +537,7 @@ fn invalidate_all_memory_block_caches_clears_m0_m1_and_mutation_cursor() {
     assert_eq!(affected, 1);
     let row: SessionCacheRow = conn
         .query_row(
-            "SELECT memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_memory_mutation_id FROM session_meta WHERE session_id = 's1'",
+            "SELECT memory_block_cache, memory_block_ids, cached_m0_bytes, cached_m1_bytes, cached_m0_max_mutation_id FROM session_meta WHERE session_id = 's1'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )

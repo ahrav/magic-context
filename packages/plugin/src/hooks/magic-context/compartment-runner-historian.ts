@@ -60,8 +60,12 @@ const HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redact
  * Historian output still passes the compartment parser and validator before publication;
  * shared extractors remain text-only so fail-closed dreamer manifest parsers never accept
  * a model's private reasoning as normal task output.
+ *
+ * Exported so the historian eval lane's replay runner captures the same
+ * artifact production validated (a reasoning-only payload must yield the same
+ * text) instead of maintaining a second extractor.
  */
-function extractLatestHistorianReasoning(messages: unknown): string | null {
+export function extractLatestHistorianReasoning(messages: unknown): string | null {
     if (!Array.isArray(messages)) return null;
 
     const latest = messages

@@ -15,8 +15,8 @@ import {
     getWrapupInProgressState,
     incrementHistorianFailure,
 } from "../../features/magic-context/storage";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { executeContextRecompWithResult, registerActiveCompartmentRun } from "./compartment-runner";
 import { createLiveSessionState, type LiveSessionState } from "./live-session-state";
@@ -24,8 +24,7 @@ import { setRawMessageProvider } from "./read-session-chunk";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
 
 function createDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

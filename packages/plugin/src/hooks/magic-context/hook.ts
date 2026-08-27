@@ -15,6 +15,7 @@ import type { createCompactionHandler } from "../../features/magic-context/compa
 import {
     applyMirrorPage,
     chainMirrorDomainSync,
+    commitModuleClaimIntent,
     disposeModuleNoteEvaluationBridges,
     ensureContextStoreUuid,
     getMirrorCursor,
@@ -61,10 +62,11 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import {
-    getMigrationOnOpenRefusal,
+    getFormatRefusal,
     getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
+import { readDirectFormatMarker } from "../../features/magic-context/storage-format-epoch";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
@@ -98,7 +100,13 @@ import {
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { dropSlot } from "./lkg-slot";
+import {
+    drainClaimEffectPrefix,
+    MODULE_CLAIM_EFFECTS_CONSUMER,
+    proveClaimOperationDurable,
+} from "./module-state-sync";
 import { McHostModuleTransport } from "./module-transport";
+import { CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION } from "./module-wire";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -251,40 +259,26 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 reason,
             );
             notifyMagicContextDisabled(deps.client, reason);
-            const migration = getMigrationOnOpenRefusal();
-            const blockingProcesses =
-                migration?.blockingProcesses ??
-                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
-                [];
+            const formatRefusal = getFormatRefusal();
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",
-                reason:
-                    migration && (blockingProcesses.length > 0 || migration.unreadableFile)
-                        ? {
-                              kind: "migration_guard",
-                              persistedVersion: migration.persistedVersion,
-                              supportedVersion: migration.supportedVersion,
-                              blockingProcesses,
-                              ...(migration.unreadableFile
-                                  ? { unreadableFile: migration.unreadableFile }
-                                  : {}),
-                              ...(migration.unreadableArm
-                                  ? { unreadableArm: migration.unreadableArm }
-                                  : {}),
-                          }
-                        : fence
-                          ? {
-                                kind: "schema_fence",
-                                persistedVersion: fence.persistedVersion,
-                                supportedVersion: fence.supportedVersion,
-                            }
-                          : {
-                                kind: "storage_failure",
-                                cause: migration?.unreadableFile
-                                    ? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-                                    : reason,
-                            },
+                reason: formatRefusal
+                    ? {
+                          kind: "format_refusal",
+                          family: formatRefusal.family,
+                          reasons: formatRefusal.reasons,
+                      }
+                    : fence
+                      ? {
+                            kind: "schema_fence",
+                            persistedVersion: fence.persistedVersion,
+                            supportedVersion: fence.supportedVersion,
+                        }
+                      : {
+                            kind: "storage_failure",
+                            cause: reason,
+                        },
             });
             return null;
         }
@@ -489,7 +483,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         })(),
         historianTwoPass: deps.config.historian?.two_pass === true,
-        runMigration: deps.config.memory?.enabled !== false && !!deps.config.historian?.model,
         // Option C privacy gate: behavioral observation candidates are collected
         // during historian runs only when the user has SCHEDULED the
         // review-user-memories task (schedule != ""). Replaces the v1
@@ -738,7 +731,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
-    const rustMemorySyncRequestedSessions = new Set<string>();
     // Build the same subc-backed client for the TS recovery arm. Constructing the
     // transport is inert; it connects only if a marker actually needs draining.
     const authorityRecoveryModuleClient =
@@ -756,6 +748,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 authoritySeed: (args) => transport.authoritySeed(args),
                 authorityDrain: (args) => transport.authorityDrain(args),
                 mirrorPull: (args) => transport.mirrorPull(args),
+                // The claim lanes are optional on the interface but mandatory in
+                // rust transform mode: this object *is* `rustModeModuleClient`
+                // there. Omitting them makes every ctx_memory mutation fail its
+                // availability guard and leaves the mirror sync reporting
+                // `unavailable`, so the whole claim feature is inert.
+                claimIntentStage: (args) => transport.claimIntentStage(args),
+                claimIntentInspect: (args) => transport.claimIntentInspect(args),
+                claimIntentAck: (args) => transport.claimIntentAck(args),
+                claimEffectsApply: (args) => transport.claimEffectsApply(args),
+                claimMirrorReplace: (args) => transport.claimMirrorReplace(args),
+                claimMirrorApply: (args) => transport.claimMirrorApply(args),
                 getCompartmentsAfter: async (sessionId, afterSequence) => {
                     const response = await transport.call({
                         sessionId,
@@ -807,7 +810,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
-    const runModuleDomainSync = async (domain: "memories" | "notes"): Promise<void> => {
+    const runModuleDomainSync = async (domain: "notes"): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
         for (;;) {
             const cursor = getMirrorCursor(db, domain);
@@ -823,10 +826,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Chained process-globally per (store, domain): several plugin instances
     // can share this database file, and interleaved pulls throw a cursor
     // mismatch in applyMirrorPage.
-    const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> =>
+    const syncModuleDomain = (domain: "notes"): Promise<void> =>
         chainMirrorDomainSync(db, domain, () => runModuleDomainSync(domain));
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
-    const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
@@ -903,43 +905,91 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       return response;
                   },
                   memory: async ({
-                      commandId,
                       sessionId,
                       projectRoot,
-                      memoryProject,
-                      action,
-                      content,
-                      category,
-                      ids,
-                      reason,
+                      projectPath,
+                      producer,
+                      operationKey,
+                      intentRequest,
+                      commitContext,
                   }) => {
-                      const response = await rustModeModuleClient.call({
+                      const marker = readDirectFormatMarker(db);
+                      if (marker.status !== "present") {
+                          throw new Error("claim intent requires a valid context format marker");
+                      }
+                      if (!rustModeModuleClient.authorityStatus) {
+                          throw new Error("claim intent requires memory authority status");
+                      }
+                      const status = await rustModeModuleClient.authorityStatus({
+                          context_store_uuid: ensureContextStoreUuid(db),
+                          project: projectPath,
+                          projectRoot,
+                          domain: "memories",
+                      });
+                      if (status.authority?.state !== "MODULE") {
+                          throw Object.assign(
+                              new Error("memory authority is not accepting intents"),
+                              {
+                                  code: "authority_draining",
+                              },
+                          );
+                      }
+                      const claimIntentStage = rustModeModuleClient.claimIntentStage;
+                      const claimIntentInspect = rustModeModuleClient.claimIntentInspect;
+                      const claimIntentAck = rustModeModuleClient.claimIntentAck;
+                      const claimEffectsApply = rustModeModuleClient.claimEffectsApply;
+                      if (
+                          !claimIntentStage ||
+                          !claimIntentInspect ||
+                          !claimIntentAck ||
+                          !claimEffectsApply
+                      ) {
+                          throw new Error("module claim intent protocol is unavailable");
+                      }
+                      return commitModuleClaimIntent({
+                          client: { claimIntentStage, claimIntentInspect, claimIntentAck },
                           sessionId,
                           projectRoot,
-                          method: "ctx_memory",
-                          body: {
-                              name: "ctx_memory",
-                              arguments: {
-                                  ...(commandId ? { command_id: commandId } : {}),
-                                  action,
-                                  content,
-                                  category,
-                                  ids,
-                                  reason,
-                                  memory_project: memoryProject,
+                          request: {
+                              protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
+                              requestEncodingVersion: CLAIM_REQUEST_ENCODING_VERSION,
+                              binding: {
+                                  databaseIncarnationId: marker.marker.databaseIncarnationId,
+                                  formatEpoch: marker.marker.formatEpoch,
+                                  authorityProject: projectPath,
+                                  authorityGeneration: status.authority.generation,
                               },
+                              command: { producer, operationKey },
+                              request: intentRequest,
+                          },
+                          commitContext,
+                          settleContext: async (commit) => {
+                              const proof = proveClaimOperationDurable({
+                                  db,
+                                  producer: commit.producer,
+                                  operationKey: commit.operationKey,
+                                  resultJson: commit.resultJson,
+                              });
+                              await drainClaimEffectPrefix({
+                                  db,
+                                  consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
+                                  throughReceiptId: proof.receiptId,
+                                  deliver: (receipt) =>
+                                      claimEffectsApply({
+                                          sessionId,
+                                          projectRoot,
+                                          request: {
+                                              protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
+                                              consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
+                                              receipt,
+                                          },
+                                      }),
+                              });
                           },
                       });
-                      // Auto-search and local RPC/dashboard reads consume the mirror,
-                      // so publish the module mutation to that read model before return.
-                      await syncModuleMemories();
-                      return response;
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,
-                  memorySync: (sessionId: string) => {
-                      rustMemorySyncRequestedSessions.add(sessionId);
-                  },
               }
             : undefined;
     // Bridges are per resolved project, and sessions can resolve projects other
@@ -1276,7 +1326,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,
         tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
-        rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
         onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
     });
@@ -1329,7 +1378,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             sessionDirectoryBySession.delete(sessionId);
             recompProgressBySession.delete(sessionId);
             internalChildSessions.delete(sessionId);
-            rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
             channel2DirectiveTextBySession.delete(sessionId);
             clearEmbedSessionState(sessionId);

@@ -3,10 +3,9 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { ensureProject } from "../memory/storage-claims";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import { captureGitAnchor, type GitAnchorCapture } from "./git-anchor-reader";
 import {
     anchorRepresentationsFromCapture,
@@ -26,10 +25,8 @@ afterAll(() => {
 });
 
 function openTestDb(): Database {
-    const db = new Database(":memory:");
+    const db = createDirectTestDatabase().db;
     db.exec("PRAGMA foreign_keys=ON");
-    initializeDatabase(db);
-    runMigrations(db);
     return db;
 }
 

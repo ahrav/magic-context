@@ -1,8 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withContentLanguageDirective } from "@magic-context/core/agents/language-directive";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { isMemoryMigrationDone } from "@magic-context/core/features/magic-context/memory/memory-migration";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { isWrapupInProgress } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
@@ -23,7 +21,6 @@ import {
 	signalPiDeferredMaterialization,
 } from "../context-handler";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
-import { runPiMemoryMigration } from "../pi-memory-migration";
 import { createPiHistorianClient } from "../pi-recomp-client-shared";
 import { stagePiRecompMarker } from "../pi-recomp-marker";
 import { isPiRecompInFlight, spawnPiRecompRun } from "../pi-recomp-runner";
@@ -136,103 +133,26 @@ export function registerCtxSessionUpgradeCommand(
 				? `${ctx.model.provider}/${ctx.model.id}`
 				: undefined;
 
-			// Migration runs only when memory is enabled — parity with OpenCode,
-			// whose orchestrator gates on `runMigration = memory.enabled !== false
-			// && historian.model` (recomp-orchestrator drives migration off that
-			// flag, NOT unconditionally). With memory disabled there is no memory
-			// pool to re-organize, so re-categorizing would be a no-op at best and
-			// could touch a pool the user opted out of at worst.
-			const migrationEnabled = currentDeps.memoryEnabled;
-
-			const runMigration = async (): Promise<string> => {
-				if (!migrationEnabled) {
-					return "Memory migration skipped (memory disabled).";
-				}
-				// runPiMemoryMigration further self-gates via its own
-				// once-per-project / empty-pool / USER_* guards.
-				try {
-					const outcome = await runPiMemoryMigration({
-						db: currentDeps.db,
-						runner: currentDeps.runner,
-						primaryModel: sessionMainModel,
-						model: currentDeps.historianModel as string,
-						fallbackModels: currentDeps.historianFallbacks,
-						timeoutMs: currentDeps.historianTimeoutMs,
-						thinkingLevel: currentDeps.historianThinkingLevel,
-						directory: ctx.cwd,
-						allowHomeProject: currentDeps.allowHomeProject,
-						sessionId,
-						userMemoriesEnabled: currentDeps.userMemoriesEnabled,
-						language: currentDeps.language,
-					});
-					return outcome.summary;
-				} catch (error) {
-					return `Memory migration skipped (error): ${describeError(error).brief}`;
-				}
-			};
-
 			// ── Guard: already-upgraded session (parity with OpenCode) ──────────
 			// No upgradable compartments → don't run a wasteful/risky full recomp.
-			//   • none + migration already done → no-op "already upgraded"
-			//   • none + migration still pending → migration only (skip recomp)
 			if (upgradableCount === 0) {
-				const projectPath = resolveProjectIdentityForSession(
-					ctx.cwd,
-					currentDeps.allowHomeProject,
-				);
-				if (!projectPath) return;
-				// migrationPending mirrors OpenCode: only pending when memory is
-				// enabled AND the project hasn't been migrated yet.
-				const migrationPending =
-					migrationEnabled &&
-					!isMemoryMigrationDone(currentDeps.db, projectPath);
-				if (!migrationPending) {
-					sendCtxStatusMessage(pi, {
-						title: "/ctx-session-upgrade",
-						text: [
-							"## Session Upgrade — Already Up To Date",
-							"",
-							compartments.length === 0
-								? "This session has no compartment history to upgrade yet."
-								: "This session's compartments are already in the current format.",
-						].join("\n"),
-						level: "info",
-					});
-					return;
-				}
-				// Compartments current but project memories never migrated — run
-				// migration only. Detached so the single migration LLM call doesn't
-				// block the Pi REPL either (parity with the full-recomp path below).
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-session-upgrade",
-					text: "## Session Upgrade\n\nCompartments are already current. Re-organizing project memories. This may take a while.",
+					text: [
+						"## Session Upgrade — Already Up To Date",
+						"",
+						compartments.length === 0
+							? "This session has no compartment history to upgrade yet."
+							: "This session's compartments are already in the current format.",
+					].join("\n"),
 					level: "info",
-				});
-				spawnPiRecompRun({
-					sessionId,
-					provider: {
-						readMessages: () => readPiSessionMessages(ctx),
-					} satisfies RawMessageProvider,
-					onStatusChange: () =>
-						updateStatusLine(ctx, {
-							db: currentDeps.db,
-							projectIdentity: ctx.cwd,
-						}),
-					work: async () => {
-						const summary = await runMigration();
-						sendCtxStatusMessage(pi, {
-							title: "/ctx-session-upgrade",
-							text: ["## Session Upgrade — Complete", "", summary].join("\n"),
-							level: "info",
-						});
-					},
 				});
 				return;
 			}
 
 			sendCtxStatusMessage(pi, {
 				title: "/ctx-session-upgrade",
-				text: "## Session Upgrade\n\nRebuilding compartments into the v2 format and re-organizing project memories. This may take a while.",
+				text: "## Session Upgrade\n\nRebuilding compartments into the v2 format. This may take a while.",
 				level: "info",
 			});
 
@@ -358,9 +278,6 @@ export function registerCtxSessionUpgradeCommand(
 					signalPiDeferredHistoryRefresh(sessionId);
 					signalPiDeferredMaterialization(sessionId);
 
-					// Step 2 — memory migration (once per project, idempotent).
-					const migrationSummary = await runMigration();
-
 					sendCtxStatusMessage(pi, {
 						title: "/ctx-session-upgrade",
 						text: [
@@ -369,7 +286,6 @@ export function registerCtxSessionUpgradeCommand(
 							upgradableCount > 0
 								? `Rebuilt ${upgradableCount} legacy compartment${upgradableCount === 1 ? "" : "s"} into the v2 format.`
 								: "Rebuilt this session's compartments into the v2 format.",
-							migrationSummary ? `\n${migrationSummary}` : "",
 							"",
 							recompResult.message,
 						].join("\n"),

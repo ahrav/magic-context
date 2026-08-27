@@ -21,11 +21,9 @@ export {
     embedCommitRowsForProject,
     embedCompartmentWindowsDetailedForProject,
     embedItemsForProject,
-    embedMemoriesDetailedForProject,
     embedShadowTextForProject,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
-    embedUnembeddedMemoriesForProject,
     enqueueShadowEmbeddingItems,
     flushShadowEmbeddingBacklog,
     getPrimaryEmbeddingMeasurementCohort,
@@ -207,15 +205,6 @@ export function _resetEmbeddingConfigForTests(): void {
     initializeEmbedding(DEFAULT_EMBEDDING_CONFIG);
 }
 
-export async function ensureEmbeddingModel(): Promise<boolean> {
-    const currentProvider = getOrCreateProvider();
-    if (!currentProvider) {
-        return false;
-    }
-
-    return currentProvider.initialize();
-}
-
 export async function embedText(
     text: string,
     signal?: AbortSignal,
@@ -231,10 +220,6 @@ export async function embedText(
     }
 
     return currentProvider.embed(text, signal, purpose);
-}
-
-export function getEmbeddingModelId(): string {
-    return getOrCreateProvider()?.modelId ?? "off";
 }
 
 export { cosineSimilarity };

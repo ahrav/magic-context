@@ -23,7 +23,7 @@
 import { extractCompleteManifestBody } from "../dreamer/manifest-parser";
 
 export interface CompressCuesPromptMemory {
-    id: number;
+    id: string;
     category: string;
     importance: number;
     content: string;
@@ -45,7 +45,7 @@ export const COMPRESS_CUES_SYSTEM_PROMPT = `You compress project memories into m
 - A cue is mnemonic shorthand, not prose. Prefer one to three distinctive tokens plus a relation. Use the symbols → ← ⊘ ∵ ≺ ≻ ∅ ∀ when they are shorter than words.
 - Preserve exact identifiers, paths, commands, flags, versions, filenames, hashes, and code tokens VERBATIM. These are the anchor — never abbreviate or paraphrase them.
 - Per-cue hard budget (in characters): ${CUE_BUDGET_HIGH} when importance >= 70, else ${CUE_BUDGET_LOW}. Exceeding the budget makes the cue unusable, so compress harder rather than overrun.
-- Never put a source memory id (e.g. #7863) in a cue.
+- Never put a source claim id (e.g. mcm_0123abcd...) in a cue.
 - XML-escape &, <, >, and quotes in cue text (&amp; &lt; &gt; &quot;).
 - A PROHIBITION must mark the excluded thing as ⊘thing followed IMMEDIATELY by a terse parenthesized mechanism, e.g. ⊘cache write (ABI break). Keep parentheses balanced. Positive facts must be phrased WITHOUT trigger words (must not / never / without / instead of / exclude).
 - Do not invent facts, add commentary, or restate the category. Compress only what the memory says.
@@ -53,8 +53,8 @@ export const COMPRESS_CUES_SYSTEM_PROMPT = `You compress project memories into m
 ### Output contract
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <cues>
-<cue id="7863">terse anchor → relation</cue>
-<cue id="8102">⊘cache write (ABI break)</cue>
+<cue id="mcm_00000000000000000000000000000001">terse anchor → relation</cue>
+<cue id="mcm_00000000000000000000000000000002">⊘cache write (ABI break)</cue>
 </cues>
 
 Rules:
@@ -88,7 +88,7 @@ ${renderPool(args.memories)}`;
 }
 
 export interface ParsedCue {
-    id: number;
+    id: string;
     cue: string;
 }
 
@@ -110,9 +110,9 @@ function unescapeXml(value: string): string {
 export function parseCuesManifest(text: string): ParsedCue[] {
     const body = extractCompleteManifestBody(text, "cues");
     const out: ParsedCue[] = [];
-    for (const match of body.matchAll(/<cue\s+id="(\d+)"\s*>([\s\S]*?)<\/cue>/g)) {
-        const id = Number.parseInt(match[1] ?? "", 10);
-        if (!Number.isInteger(id)) continue;
+    for (const match of body.matchAll(/<cue\s+id="([^"]+)"\s*>([\s\S]*?)<\/cue>/g)) {
+        const id = (match[1] ?? "").trim();
+        if (id.length === 0) continue;
         out.push({ id, cue: unescapeXml(match[2] ?? "").trim() });
     }
     return out;

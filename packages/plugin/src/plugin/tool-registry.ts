@@ -155,11 +155,6 @@ export function createToolRegistry(args: {
                   db,
                   resolveProjectPath,
                   ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-                  // Primary agents get the full mutation surface (write/archive/
-                  // update/merge) on memories they can already see (with ids) in
-                  // the injected <project-memory> block. Only `list` (bulk
-                  // enumeration) stays dreamer-only (runtime-gated via
-                  // toolContext.agent in tools.ts).
                   allowedActions: [...CTX_MEMORY_ACTIONS],
                   rustToolBackends,
               })

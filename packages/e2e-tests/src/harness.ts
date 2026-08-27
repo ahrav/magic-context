@@ -37,6 +37,15 @@ export interface TestHarnessOptions {
      * prompts without worrying about scripting every one.
      */
     mockDefault?: MockResponse;
+    /**
+     * Extra environment for the `opencode serve` child. Merged last, so it can
+     * restore a real API key over the fake default. Secret-bearing entries
+     * require the loopback pin below: `assertSecretsBoundToLoopback` in
+     * spawn.ts refuses the pair otherwise.
+     */
+    extraEnv?: SpawnOptions["extraEnv"];
+    /** Serve bind address. Pass "127.0.0.1" whenever extraEnv carries a secret. */
+    hostname?: SpawnOptions["hostname"];
 }
 
 export interface SdkClient {
@@ -53,6 +62,8 @@ export interface SdkClient {
                 agent?: string;
             };
         }) => Promise<{ data?: unknown }>;
+        messages: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
+        children: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
     };
 }
 
@@ -99,6 +110,8 @@ export class TestHarness {
             magicContextConfig: options.magicContextConfig,
             openCodeConfigExtra: options.openCodeConfigExtra,
             modelContextLimit: options.modelContextLimit,
+            extraEnv: options.extraEnv,
+            hostname: options.hostname,
         };
         const opencode = await spawnOpencode(spawnOpts);
 

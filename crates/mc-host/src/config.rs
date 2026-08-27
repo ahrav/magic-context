@@ -80,6 +80,10 @@ pub(crate) const RETAINED_METADATA_RESERVED_BYTES: u64 = 2 * 1024 * 1024;
 /// while staying far below overflow range.
 pub const MAX_CONFIG_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
+/// The SHA-256 of zero bytes.
+pub const UNSTAGED_PAYLOAD_MANIFEST_DIGEST: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 /// Capacity limits for one host incarnation. All limits are independent gates:
 /// exhausting one class never consumes another (protocol §5.1, §8.3).
 #[derive(Debug, Clone)]
@@ -268,6 +272,9 @@ pub struct HostConfig {
     pub data_dir: Option<PathBuf>,
     /// Published as `daemon_ver` and echoed in the auth `ServerProof`.
     pub daemon_ver: String,
+    /// Must be 64 lowercase hex characters; defaults to
+    /// [`UNSTAGED_PAYLOAD_MANIFEST_DIGEST`].
+    pub payload_manifest_digest: String,
     pub init: HostInit,
     pub limits: HostLimits,
     pub timing: HostTiming,
@@ -282,6 +289,7 @@ impl Default for HostConfig {
         Self {
             data_dir: None,
             daemon_ver: format!("mc-host/{}", env!("CARGO_PKG_VERSION")),
+            payload_manifest_digest: UNSTAGED_PAYLOAD_MANIFEST_DIGEST.to_owned(),
             init: HostInit::default(),
             limits: HostLimits::default(),
             timing: HostTiming::default(),
@@ -296,6 +304,11 @@ impl HostConfig {
         self.limits.validate()?;
         if self.daemon_ver.is_empty() {
             return Err(ConfigError::EmptyDaemonVer);
+        }
+        if !crate::lifecycle::is_canonical_payload_digest(&self.payload_manifest_digest) {
+            return Err(ConfigError::InvalidPayloadDigest {
+                len: self.payload_manifest_digest.len(),
+            });
         }
         // Byte arrays serialize as JSON number arrays whose length depends on
         // the values ("0" is one char, "255" is three), so sizing must use
@@ -389,6 +402,10 @@ pub enum ConfigError {
         name: &'static str,
     },
     EmptyDaemonVer,
+    /// Carries only the offending length so diagnostics stay bounded.
+    InvalidPayloadDigest {
+        len: usize,
+    },
     DaemonVerTooLarge {
         auth_message_bytes: usize,
         connection_file_bytes: usize,
@@ -422,6 +439,10 @@ impl std::fmt::Display for ConfigError {
                 MAX_CONFIG_DURATION.as_secs()
             ),
             Self::EmptyDaemonVer => write!(f, "daemon_ver must be nonempty"),
+            Self::InvalidPayloadDigest { len } => write!(
+                f,
+                "payload_manifest_digest must be 64 lowercase hex characters; got {len} bytes"
+            ),
             Self::DaemonVerTooLarge {
                 auth_message_bytes,
                 connection_file_bytes,
@@ -452,6 +473,36 @@ mod tests {
     #[test]
     fn defaults_validate() {
         HostConfig::default().validate().expect("defaults valid");
+    }
+
+    #[test]
+    fn noncanonical_payload_digests_are_rejected() {
+        for digest in [
+            String::new(),
+            "short".to_owned(),
+            "E".repeat(64),
+            "e".repeat(63),
+            "e".repeat(65),
+            format!("sha256:{}", "e".repeat(57)),
+        ] {
+            let config = HostConfig {
+                payload_manifest_digest: digest.clone(),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ConfigError::InvalidPayloadDigest { .. })
+                ),
+                "digest {digest:?} must fail validation"
+            );
+        }
+        HostConfig {
+            payload_manifest_digest: "e".repeat(64),
+            ..Default::default()
+        }
+        .validate()
+        .expect("a canonical digest validates");
     }
 
     #[test]

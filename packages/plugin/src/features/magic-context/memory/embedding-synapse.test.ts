@@ -3,10 +3,8 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McHostCallError } from "../../../shared/mc-host-client";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import {
     createSynapseLedgerPage,
     getSynapseLedgerPage,
@@ -18,6 +16,7 @@ import {
     recordSynapseLedgerJob,
     recordSynapseLedgerRestart,
 } from "../storage-embedding-measurements";
+import { createDirectTestDatabase } from "../test-database";
 import type { DetailedEmbedContext, DetailedEmbedItem } from "./embedding-provider";
 import {
     _resetSynapseClientForTests,
@@ -1097,10 +1096,8 @@ describe("embedItemsDetailed", () => {
     }
 
     function ledgerDb(): Database {
-        const db = new Database(":memory:");
+        const db = createDirectTestDatabase().db;
         db.exec("PRAGMA foreign_keys=ON");
-        initializeDatabase(db);
-        runMigrations(db);
         return db;
     }
 

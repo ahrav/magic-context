@@ -35,7 +35,7 @@ function formatResult(
             ? ` trust=[${boundDynamicField(result.policyLabel)}]`
             : "";
         return [
-            `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${boundDynamicField(result.category)}${source} match=${result.matchType}${policy}`,
+            `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.publicClaimId} category=${boundDynamicField(result.category)}${source} match=${result.matchType}${policy}`,
             boundDynamicField(result.content),
         ].join("\n");
     }

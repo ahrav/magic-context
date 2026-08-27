@@ -15,6 +15,10 @@ import {
     promptSurfaceHashMaterial,
 } from "../../shared/prompt-surface-runtime";
 import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
+import {
+    INTERNAL_OPENCODE_AGENT_SIGNATURES,
+    MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
+} from "./internal-agent-signatures";
 
 import { estimateTokens } from "./read-session-formatting";
 
@@ -46,38 +50,17 @@ export function clearSystemPromptHashSession(
  * their built-in prompts (see `~/Work/OSS/opencode/packages/opencode/src/agent/
  * prompt/{title,summary,compaction}.txt`).
  *
- * These agents:
- *   - "title": runs once on the first user turn against `small_model` to
- *              generate a short session title.
- *   - "summary": pull-request-style description of work done in a session.
- *   - "compaction": OpenCode's own auto-compaction summarizer (orthogonal to
- *                   our historian — fires when users haven't disabled
- *                   `compaction.auto`).
- *
  * Magic Context skips ALL injection (guidance, project docs, user profile,
  * key files, sticky date, hash flush) when these agents fire — they don't
  * benefit from any of it and the extra prompt content is wasted spend on
  * what's typically a small/cheap model running a fixed single-shot job.
  *
- * Detection uses literal substrings rather than fuzzy matching so a small
- * upstream prompt edit doesn't silently disable the skip. If OpenCode ever
- * rewrites these prompts, our injection will resume — that's the correct
- * fail-open behavior (worse than ideal, but not broken).
+ * The signature literals live in `internal-agent-signatures.ts`, shared with
+ * the e2e cache/oracle analysis so both classifiers stay in lockstep.
  */
 function isInternalOpenCodeAgent(systemPromptContent: string): boolean {
-    return (
-        // title.txt opens with this exact line
-        systemPromptContent.includes(
-            "You are a title generator. You output ONLY a thread title.",
-        ) ||
-        // summary.txt opens with this exact line
-        systemPromptContent.includes(
-            "Summarize what was done in this conversation. Write like a pull request description.",
-        ) ||
-        // compaction.txt opens with this exact line
-        systemPromptContent.includes(
-            "You are an anchored context summarization assistant for coding sessions.",
-        )
+    return INTERNAL_OPENCODE_AGENT_SIGNATURES.some((signature) =>
+        systemPromptContent.includes(signature),
     );
 }
 
@@ -94,23 +77,12 @@ function isInternalOpenCodeAgent(systemPromptContent: string): boolean {
  * content on pass 1 with zero timing dependency. Memory-migration loads the
  * historian agent prompt, so the historian opener covers it.
  *
- * Literal substrings (not fuzzy) so an upstream prompt edit fails open (resumes
- * injection) rather than silently mis-detecting.
+ * The signature literals live in `internal-agent-signatures.ts`, shared with
+ * the e2e cache/oracle analysis so both classifiers stay in lockstep.
  */
 export function isMagicContextInternalAgent(systemPromptContent: string): boolean {
-    return (
-        // HISTORIAN_AGENT (also used by memory-migration)
-        systemPromptContent.includes(
-            "You are Historian — the hippocampus of a long-running coding agent.",
-        ) ||
-        // Every dreamer task prompt (generic base + curate / maintain-docs /
-        // review-user-memories / primer-investigator) shares this identity phrase,
-        // so one substring covers them all even though their openers differ.
-        systemPromptContent.includes("for the magic-context system") ||
-        // SIDEKICK_SYSTEM_PROMPT
-        systemPromptContent.includes(
-            "You are Sidekick, a focused memory-retrieval subagent for an AI coding assistant.",
-        )
+    return MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES.some((signature) =>
+        systemPromptContent.includes(signature),
     );
 }
 

@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { setProjectMemoryClaimLifecycle } from "../../features/magic-context/memory/storage-claim-operations";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
-import { Database } from "../../shared/sqlite";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { injectM0M1, type M0M1State } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
@@ -13,9 +14,7 @@ const SESSION_ID = "ses_mural_inject";
 const PROJECT_ID = "git:mural-project";
 
 function makeDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     getOrCreateSessionMeta(db, SESSION_ID);
     return db;
 }
@@ -39,6 +38,16 @@ function imageUrl(messages: MessageLike[]): string | undefined {
             | { url?: string }
             | undefined
     )?.url;
+}
+
+/** Concatenated text of the prepended synthetic m[0] head message. */
+function headText(messages: MessageLike[]): string {
+    return (
+        messages[0]?.parts
+            .filter((part) => (part as { type?: string }).type === "text")
+            .map((part) => (part as { text?: string }).text ?? "")
+            .join("\n") ?? ""
+    );
 }
 
 function replaceCurrentManifest(db: Database, content = "current mural"): string {
@@ -315,6 +324,81 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             expect((messages[0]?.parts[0] as { text?: string })?.text).not.toContain(
                 "<memory-mural>",
             );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("publishes no mural image and no marker when the claim snapshot went stale", () => {
+        const db = makeDb();
+        try {
+            const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
+            const claim = seedProjectMemoryClaim(db, {
+                projectIdentity: PROJECT_ID,
+                content: "Claim whose cue the mural draws.",
+                category: "ARCHITECTURE",
+            });
+
+            // Fold with a mural so both the marker and the image payload are cached
+            // against this claim snapshot.
+            const foldMessages: MessageLike[] = [];
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                messages: foldMessages,
+                state,
+                projectPath: PROJECT_ID,
+                isCacheBustingPass: true,
+                mural: muralOption(),
+                memoryInjectionBudgetTokens: 8_000,
+                historyBudgetTokens: 60_000,
+            });
+            expect(imageUrl(foldMessages)).toBe(FAKE_MURAL_DATA_URL);
+            expect(headText(foldMessages)).toContain("<memory-mural>");
+            expect(headText(foldMessages)).toContain("<project-memory>");
+
+            // Withdraw the claim after the mural was cached, so the next pass must fold.
+            setProjectMemoryClaimLifecycle(
+                db,
+                { producer: "test", operationKey: "mural-stale-archive" },
+                { token: claim.token, state: "archived", actor: "user:test" },
+            );
+
+            // A sibling writer keeps landing claims, so every materialize attempt loses
+            // the staleness check and the pass falls back to replaying the cached m[0]
+            // — which still carries the mural marker and the cached image payload.
+            let concurrentClaims = 0;
+            const staleMessages: MessageLike[] = [];
+            const stale = injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                messages: staleMessages,
+                state,
+                projectPath: PROJECT_ID,
+                isCacheBustingPass: true,
+                mural: muralOption(),
+                memoryInjectionBudgetTokens: 8_000,
+                historyBudgetTokens: 60_000,
+                beforePhase3ForTest: () => {
+                    concurrentClaims += 1;
+                    seedProjectMemoryClaim(db, {
+                        projectIdentity: PROJECT_ID,
+                        content: `Concurrent claim ${concurrentClaims}.`,
+                        category: "ARCHITECTURE",
+                    });
+                },
+            });
+            expect(stale.materializationContentionRetryExhausted).toBe(true);
+
+            // The publication fence withholds the claim text, so every other
+            // claim-derived representation must obey it too: no image part, no
+            // marker promising one, and no cached payload left to replay.
+            const staleText = headText(staleMessages);
+            expect(staleText).not.toContain("<project-memory>");
+            expect(staleText).not.toContain("<memory-mural>");
+            expect(imageUrl(staleMessages)).toBeUndefined();
+            expect(state.cachedM0MuralDataUrl ?? null).toBeNull();
+            expect(state.cachedM0MuralHash ?? null).toBeNull();
         } finally {
             closeQuietly(db);
         }

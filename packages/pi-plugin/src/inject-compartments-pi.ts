@@ -25,23 +25,16 @@
  *     historyRefreshSessions signal.
  */
 
+import { renderClaimMemoryBlock } from "@magic-context/core/features/magic-context/memory/claim-memory-render";
 import {
-	reconcileCompatibilityVerifications,
-	seedLateCompatibilityRevisions,
-} from "@magic-context/core/features/magic-context/claim-policy-backfill";
+	canonicalSnapshotVector,
+	type SnapshotVector,
+} from "@magic-context/core/features/magic-context/memory/claim-operation-contract";
 import {
-	bindMemoriesToCurrentRevision,
-	exactMemoryContentDigests,
-	filterMemoriesByPolicy,
-	sessionMemoryBlockStillEligible,
-} from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
-import {
-	getMaxMemoryIdForProjects,
-	getMemoriesByProject,
-	getMemoriesByProjects,
-} from "@magic-context/core/features/magic-context/memory/storage-memory";
-import type { Memory } from "@magic-context/core/features/magic-context/memory/types";
+	type ProjectMemoryClaimSnapshot,
+	readProjectMemorySnapshotVector,
+	snapshotVectorChanges,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-current-state";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import {
@@ -51,15 +44,12 @@ import {
 	GLOBAL_USER_PROFILE_PROJECT_PATH,
 	getCompartments,
 	getMaxM0MutationId,
-	getMaxMemoryMutationId,
-	getMaxMemoryMutationIdForProjects,
-	getMemoryMutationsForRender,
-	getMemoryMutationsForRenderByProjects,
 	getOrCreateSessionMeta,
 	getProjectState,
 	persistCachedM0,
 	readProjectDocsCanonical,
 } from "@magic-context/core/features/magic-context/storage";
+import { DIRECT_FORMAT_EPOCH } from "@magic-context/core/features/magic-context/storage-format-epoch";
 import {
 	getActiveUserMemories,
 	type UserMemory,
@@ -69,7 +59,6 @@ import {
 	expandWorkspaceIdentitySetWithAliases,
 	resolveWorkspaceIdentitySet,
 	resolveWorkspaceShareCategories,
-	sourceNameForMemory,
 } from "@magic-context/core/features/magic-context/workspaces";
 import {
 	COMPARTMENT_RENDER_EPOCH,
@@ -83,14 +72,14 @@ import {
 	renderDecayedCompartments,
 } from "@magic-context/core/hooks/magic-context/decay-render";
 import {
+	type ClaimLaneSnapshot,
 	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
-	type MemoryRenderOptions,
-	renderMemoryBlockV2,
+	readClaimLaneSnapshot,
 	stripMemoryMuralBlock,
-	trimMemoriesToBudgetV2,
+	stripProjectMemoryBlock,
+	trimClaimLane,
 	trimUserMemoriesToBudget,
-	trimWorkspaceMemoriesToBudgetV2,
 	type WorkspaceRenderContext,
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 
@@ -312,7 +301,6 @@ export const __test = {
 
 const PI_M1_PLACEHOLDER =
 	"<session-history-since>(no new content since last materialization)</session-history-since>";
-const MAX_FORCED_MEMORIES_PER_DELTA = 10;
 // Pi uses a STATIC upgrade-state marker, intentionally diverging from OpenCode's
 // dynamic getUpgradeState(db, sessionId). OpenCode flips this per-session when a
 // `/ctx-session-upgrade` recomp transitions legacy→v2, forcing an m[0] refold.
@@ -332,7 +320,8 @@ interface FrozenM0Inputs {
 	docs: PiProjectDocsRender;
 	markers: PiM0SnapshotMarkers;
 	compartments: PiCompartment[];
-	memories: Memory[];
+	claims: ProjectMemoryClaimSnapshot[];
+	claimLane: ClaimLaneSnapshot;
 	userProfile: UserMemory[];
 	workspace: WorkspaceRenderContext;
 }
@@ -475,33 +464,12 @@ function resolveWorkspaceRenderContextPi(
 	};
 }
 
-function sourceNamesForPiMemories(args: {
-	memories: readonly Memory[];
-	projectPath?: string;
-	workspace: WorkspaceRenderContext;
-}): Map<number, string> | undefined {
-	if (!args.projectPath || !args.workspace.isWorkspaced) return undefined;
-	const names = new Map<number, string>();
-	for (const memory of args.memories) {
-		const source = sourceNameForMemory(
-			memory.projectPath,
-			args.projectPath,
-			args.workspace.identities,
-			args.workspace.namesByIdentity,
-			args.workspace.canonicalIdentityByStoredPath,
-		);
-		if (source) names.set(memory.id, source);
-	}
-	return names.size > 0 ? names : undefined;
-}
-
 export interface PiM0SnapshotMarkers {
+	claimFormatEpoch: number;
+	claimSnapshotVector: SnapshotVector;
+	renderedRevisionLocators: string[];
 	maxCompartmentSeq: number;
-	maxMemoryId: number;
 	maxMutationId: number;
-	maxMemoryMutationId: number;
-	projectMemoryEpoch: number;
-	workspaceFingerprint: string | null;
 	projectUserProfileVersion: number;
 	projectDocsHash: string;
 	sessionFactsVersion: number;
@@ -800,6 +768,55 @@ function setCachedBoundary(
 	).run(boundary, sessionId);
 }
 
+function isPiGenerationRecord(value: unknown): value is Record<string, number> {
+	return (
+		value !== null &&
+		typeof value === "object" &&
+		Object.entries(value).every(
+			([key, generation]) =>
+				/^\d+$/.test(key) && Number.isSafeInteger(generation),
+		)
+	);
+}
+
+function parsePiSnapshotVector(raw: string | null): SnapshotVector | null {
+	if (raw === null) return null;
+	try {
+		const value = JSON.parse(raw) as Record<string, unknown>;
+		if (
+			value.vectorVersion !== 1 ||
+			typeof value.databaseIncarnationId !== "string" ||
+			typeof value.workspaceEpoch !== "string" ||
+			!isPiGenerationRecord(value.projectGenerations) ||
+			!isPiGenerationRecord(value.policyGenerations)
+		) {
+			return null;
+		}
+		return {
+			vectorVersion: 1,
+			databaseIncarnationId: value.databaseIncarnationId,
+			workspaceEpoch: value.workspaceEpoch,
+			projectGenerations: value.projectGenerations,
+			policyGenerations: value.policyGenerations,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function parsePiRevisionLocators(raw: string | null): string[] | null {
+	if (raw === null) return null;
+	try {
+		const value = JSON.parse(raw) as unknown;
+		return Array.isArray(value) &&
+			value.every((item) => typeof item === "string")
+			? value
+			: null;
+	} catch {
+		return null;
+	}
+}
+
 function getCachedMarkers(
 	db: ContextDatabase,
 	state: PiM0M1State,
@@ -807,12 +824,18 @@ function getCachedMarkers(
 ): PiM0SnapshotMarkers | null {
 	const meta = getOrCreateSessionMeta(db, state.sessionId);
 	if (!meta.cachedM0Bytes) return null;
+	const claimSnapshotVector = parsePiSnapshotVector(
+		meta.cachedM0ClaimSnapshotVector,
+	);
+	const renderedRevisionLocators = parsePiRevisionLocators(
+		meta.cachedM0RenderedRevisionLocators,
+	);
 	if (
+		meta.cachedM0ClaimFormatEpoch === null ||
+		claimSnapshotVector === null ||
+		renderedRevisionLocators === null ||
 		meta.cachedM0MaxCompartmentSeq === null ||
-		meta.cachedM0MaxMemoryId === null ||
 		meta.cachedM0MaxMutationId === null ||
-		meta.cachedM0MaxMemoryMutationId === null ||
-		meta.cachedM0ProjectMemoryEpoch === null ||
 		meta.cachedM0ProjectUserProfileVersion === null ||
 		meta.cachedM0ProjectDocsHash === null ||
 		meta.cachedM0SessionFactsVersion === null ||
@@ -849,12 +872,11 @@ function getCachedMarkers(
 		return null;
 	}
 	return {
+		claimFormatEpoch: meta.cachedM0ClaimFormatEpoch,
+		claimSnapshotVector,
+		renderedRevisionLocators,
 		maxCompartmentSeq,
-		maxMemoryId: meta.cachedM0MaxMemoryId,
 		maxMutationId: meta.cachedM0MaxMutationId,
-		maxMemoryMutationId: meta.cachedM0MaxMemoryMutationId,
-		projectMemoryEpoch: meta.cachedM0ProjectMemoryEpoch,
-		workspaceFingerprint: meta.cachedM0WorkspaceFingerprint,
 		projectUserProfileVersion: meta.cachedM0ProjectUserProfileVersion,
 		projectDocsHash: meta.cachedM0ProjectDocsHash,
 		sessionFactsVersion: meta.cachedM0SessionFactsVersion,
@@ -881,19 +903,6 @@ function lastBaselineEndMessageId(
 		: null;
 }
 
-function readCurrentMarkers(
-	db: ContextDatabase,
-	state: PiM0M1State,
-	projectDocsHash?: string,
-): PiM0SnapshotMarkers {
-	return readCurrentMarkersFromCompartments(
-		db,
-		state,
-		getRenderableCompartmentsPi(db, state),
-		projectDocsHash,
-	);
-}
-
 function readCurrentMarkersFromCompartments(
 	db: ContextDatabase,
 	state: PiM0M1State,
@@ -902,23 +911,24 @@ function readCurrentMarkersFromCompartments(
 ): PiM0SnapshotMarkers {
 	const memPath = memoryProjectPath(state);
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
-	const maxMemoryId = memPath
-		? workspace.isWorkspaced
-			? getMaxMemoryIdForProjects(
-					db,
-					workspace.expandedIdentities,
-					workspace.ownIdentities,
-					workspace.shareCategories,
-				)
-			: getMaxMemoryIdForProjects(db, [memPath])
-		: 0;
-	const projectState = memPath ? getProjectState(db, memPath) : undefined;
+	const claimLane = readClaimLaneSnapshot({
+		db,
+		projectPath: memPath,
+		workspace,
+	});
+	if (claimLane === null) {
+		throw new PiMaterializeContentionError("claim snapshot kept moving");
+	}
+	const claims = trimClaimLane(
+		claimLane,
+		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+		workspace,
+	);
 	const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
 	return {
-		// reduce, not Math.max(...spread): a project with very many
-		// compartments/memories (100K+) blows the call-stack arg limit and
-		// throws RangeError, breaking m[0]/m[1] rendering for that session.
-		// OpenCode uses SQL COALESCE(MAX(id),0) with no such limit.
+		claimFormatEpoch: DIRECT_FORMAT_EPOCH,
+		claimSnapshotVector: claimLane.snapshotVector,
+		renderedRevisionLocators: claims.map((item) => item.revisionLocator),
 		maxCompartmentSeq:
 			compartments.length > 0
 				? compartments.reduce(
@@ -927,20 +937,7 @@ function readCurrentMarkersFromCompartments(
 						EMPTY_MAX_COMPARTMENT_SEQ,
 					)
 				: EMPTY_MAX_COMPARTMENT_SEQ,
-		maxMemoryId,
 		maxMutationId: getMaxM0MutationId(db, state.sessionId) ?? 0,
-		maxMemoryMutationId: memPath
-			? workspace.isWorkspaced
-				? (getMaxMemoryMutationIdForProjects(
-						db,
-						workspace.expandedIdentities,
-					) ?? 0)
-				: (getMaxMemoryMutationId(db, memPath) ?? 0)
-			: 0,
-		projectMemoryEpoch: projectState?.projectMemoryEpoch ?? 0,
-		workspaceFingerprint: workspace.isWorkspaced
-			? computeWorkspaceEpochFingerprint(db, workspace.identities)
-			: null,
 		projectUserProfileVersion: globalState?.projectUserProfileVersion ?? 0,
 		projectDocsHash:
 			projectDocsHash ?? readProjectDocsForPiM0(state).canonicalHash,
@@ -1101,28 +1098,20 @@ export function mustMaterializePi(
 		);
 	}
 	if (
-		current.workspaceFingerprint !== null ||
-		(meta.cachedM0WorkspaceFingerprint ?? null) !== null
-	) {
-		if (
-			current.workspaceFingerprint !==
-			(meta.cachedM0WorkspaceFingerprint ?? null)
-		) {
-			return piMaterializeMismatch(
-				"project_memory_change",
-				"workspaceFingerprint",
-				meta.cachedM0WorkspaceFingerprint ?? null,
-				current.workspaceFingerprint,
-			);
-		}
-	} else if (
-		current.projectMemoryEpoch !== (meta.cachedM0ProjectMemoryEpoch ?? 0)
+		current.claimFormatEpoch !== DIRECT_FORMAT_EPOCH ||
+		current.claimSnapshotVector === undefined ||
+		current.renderedRevisionLocators === undefined ||
+		meta.cachedM0ClaimFormatEpoch !== current.claimFormatEpoch ||
+		meta.cachedM0ClaimSnapshotVector !==
+			canonicalSnapshotVector(current.claimSnapshotVector) ||
+		meta.cachedM0RenderedRevisionLocators !==
+			JSON.stringify([...current.renderedRevisionLocators].sort())
 	) {
 		return piMaterializeMismatch(
 			"project_memory_change",
-			"projectMemoryEpoch",
-			meta.cachedM0ProjectMemoryEpoch ?? 0,
-			current.projectMemoryEpoch,
+			"claimSnapshotVector",
+			meta.cachedM0ClaimSnapshotVector,
+			canonicalSnapshotVector(current.claimSnapshotVector as SnapshotVector),
 		);
 	}
 	// Use !== (not >), matching OpenCode mustMaterialize: a max-id that DECREASES
@@ -1143,11 +1132,6 @@ export function mustMaterializePi(
 	// the render path), folded into m[0] only on a HARD bust.
 	// project_user_profile_version is also NOT a trigger: additive user-profile
 	// rides the m[1] <new-user-profile> delta.
-	// maxMemoryId is deliberately NOT a materialization trigger (parity with
-	// OpenCode): new memories are additive and surface in m[1] via the
-	// maxMemoryId watermark, so they must not bust the m[0] cache. Memory
-	// mutations use cachedM0MaxMemoryMutationId as an m[1] reconcile cursor,
-	// not as a materialization trigger; keep it out of this trigger set.
 	// projectDocsHash is also NOT a trigger: docs-only edits ride along until a
 	// natural HARD fold, which reads fresh docs and persists the hash matching the
 	// bytes it rendered.
@@ -1173,74 +1157,35 @@ export function renderM0Pi(
 	db: ContextDatabase,
 	projectDocs = readProjectDocsForPiM0(state).renderedBlock,
 	decayPressureMultiplier = 1,
-	// Atomic-snapshot override: when materializeM0Pi reads markers + memories in
-	// one transaction, it passes the SAME memory set here so the rendered m[0]
-	// can't include a memory whose id is above the persisted maxMemoryId watermark
-	// (which would duplicate it across the m[0]/m[1] split). Mirrors OpenCode,
-	// where renderM0 takes memories as a parameter rather than re-reading.
-	memoriesOverride?: Memory[],
+	claimsOverride?: ProjectMemoryClaimSnapshot[],
 	compartmentsOverride?: PiCompartment[],
 	userProfileOverride?: UserMemory[],
 	workspaceOverride?: WorkspaceRenderContext,
 	/** Optional mural wire options (HARD fold only). When vision-capable, emits
 	 *  the `<memory-mural>` marker block; the PNG rides as a separate image part. */
 	mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string },
+	claimLaneOverride?: ClaimLaneSnapshot | null,
 ): string {
 	const memPath = memoryProjectPath(state);
 	const workspace =
 		workspaceOverride ?? resolveWorkspaceRenderContextPi(state, db);
-	const allMemories =
-		memoriesOverride ??
-		filterMemoriesByPolicy(
-			db,
-			memPath
-				? workspace.isWorkspaced
-					? getMemoriesByProjects(
-							db,
-							workspace.expandedIdentities,
-							["active", "permanent"],
-							Date.now(),
-							workspace.ownIdentities,
-							workspace.shareCategories,
-						)
-					: getMemoriesByProject(db, memPath, ["active", "permanent"])
-				: [],
-			"auto_inject",
-		).memories;
-	// Use the V2 trim + render helpers (shared with OpenCode) so both harnesses
-	// emit the same category-grouped `#id: fact` bytes and use the same
-	// permanent-first / importance-DESC selection. A divergent shape here would
-	// put different bytes on the wire between OpenCode and Pi.
-	// Always trim with the default memory-budget fallback (matching OpenCode),
-	// not gated on a truthy injectionBudgetTokens — an unset budget must NOT mean
-	// "render every memory untrimmed", which would grow m[0] without bound.
-	const memoryRenderOptions: MemoryRenderOptions = {
-		sourceNameByMemoryId: sourceNamesForPiMemories({
-			memories: allMemories,
-			projectPath: memPath,
-			workspace,
-		}),
-	};
-	const memories =
-		allMemories.length > 0
-			? workspace.isWorkspaced
-				? trimWorkspaceMemoriesToBudgetV2(
-						state.sessionId,
-						allMemories,
-						state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-						workspace,
-						memoryRenderOptions,
-					).renderOrder
-				: trimMemoriesToBudgetV2(
-						state.sessionId,
-						allMemories,
-						state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-					).renderOrder
-			: allMemories;
-	const memoryBlock =
-		memories.length > 0
-			? renderMemoryBlockV2(memories, "project-memory", memoryRenderOptions)
-			: undefined;
+	const claimLane =
+		claimLaneOverride ??
+		(memPath
+			? readClaimLaneSnapshot({ db, projectPath: memPath, workspace })
+			: null);
+	const claims =
+		claimsOverride ??
+		(claimLane === null
+			? []
+			: trimClaimLane(
+					claimLane,
+					state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+					workspace,
+				));
+	const memoryBlock = renderClaimMemoryBlock(claims, "project-memory", {
+		sourceNameByClaimId: claimLane?.sourceNameByClaimId,
+	});
 	// v2: decay-render compartments via the shared module (same validated curve
 	// as OpenCode). Facts are NOT rendered (v2 faithful: facts = promoted
 	// memories, surfaced via memoryBlock / <project-memory>).
@@ -1300,40 +1245,6 @@ export function renderM0Pi(
 	return sections.join("\n\n").trim();
 }
 
-function renderedMemoryIdsForPi(
-	state: PiM0M1State,
-	memories: readonly Memory[],
-	workspace?: WorkspaceRenderContext,
-	db?: ContextDatabase,
-): number[] {
-	if (memories.length === 0) return [];
-	const resolvedWorkspace =
-		workspace ?? (db ? resolveWorkspaceRenderContextPi(state, db) : undefined);
-	const renderOptions: MemoryRenderOptions = resolvedWorkspace
-		? {
-				sourceNameByMemoryId: sourceNamesForPiMemories({
-					memories,
-					projectPath: memoryProjectPath(state),
-					workspace: resolvedWorkspace,
-				}),
-			}
-		: {};
-	const trimmed = resolvedWorkspace?.isWorkspaced
-		? trimWorkspaceMemoriesToBudgetV2(
-				state.sessionId,
-				[...memories],
-				state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-				resolvedWorkspace,
-				renderOptions,
-			)
-		: trimMemoriesToBudgetV2(
-				state.sessionId,
-				[...memories],
-				state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-			);
-	return trimmed.renderOrder.map((memory) => memory.id);
-}
-
 /** Raised when the m[0] snapshot changed between the read-markers phase and the
  *  persist phase (a concurrent writer — sibling Pi/OpenCode process sharing the
  *  same SQLite DB, or the historian — mutated state mid-materialization). Caught
@@ -1367,87 +1278,75 @@ function readFrozenM0InputsPi(
 	docs = readProjectDocsForPiM0(state),
 	memoryCutoff?: number,
 ): FrozenM0Inputs {
-	// Read every render source and its corresponding watermark as one short DB
-	// transaction. Rendering happens later, but m[0] bytes and m[1] watermarks now
-	// share the same frozen compartments/memories/user-profile set; a concurrent
-	// writer cannot make m[0] include rows that m[1] still considers "new".
 	const memPath = memoryProjectPath(state);
-	const read = db.transaction(() => {
-		const workspace = resolveWorkspaceRenderContextPi(state, db);
-		const compartments = getRenderableCompartmentsPi(db, state);
-		const memories = filterMemoriesByPolicy(
-			db,
-			memPath
-				? workspace.isWorkspaced
-					? getMemoriesByProjects(
-							db,
-							workspace.expandedIdentities,
-							["active", "permanent"],
-							memoryCutoff,
-							workspace.ownIdentities,
-							workspace.shareCategories,
-						)
-					: getMemoriesByProject(
-							db,
-							memPath,
-							["active", "permanent"],
-							memoryCutoff,
-						)
-				: [],
-			"auto_inject",
-		).memories;
-		const userProfile = safeGetActiveUserMemoriesPi(db);
-		const projectState = memPath ? getProjectState(db, memPath) : undefined;
-		const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
-		const markers: PiM0SnapshotMarkers = {
-			maxCompartmentSeq: compartments.reduce(
-				(max, compartment) =>
-					compartment.sequence > max ? compartment.sequence : max,
-				EMPTY_MAX_COMPARTMENT_SEQ,
-			),
-			maxMemoryId: memPath
-				? workspace.isWorkspaced
-					? getMaxMemoryIdForProjects(
-							db,
-							workspace.expandedIdentities,
-							workspace.ownIdentities,
-							workspace.shareCategories,
-						)
-					: getMaxMemoryIdForProjects(db, [memPath])
-				: 0,
-			maxMutationId: getMaxM0MutationId(db, state.sessionId) ?? 0,
-			maxMemoryMutationId: memPath
-				? workspace.isWorkspaced
-					? (getMaxMemoryMutationIdForProjects(
-							db,
-							workspace.expandedIdentities,
-						) ?? 0)
-					: (getMaxMemoryMutationId(db, memPath) ?? 0)
-				: 0,
-			projectMemoryEpoch: projectState?.projectMemoryEpoch ?? 0,
-			workspaceFingerprint: workspace.isWorkspaced
-				? computeWorkspaceEpochFingerprint(db, workspace.identities)
-				: null,
-			projectUserProfileVersion: globalState?.projectUserProfileVersion ?? 0,
-			projectDocsHash: docs.canonicalHash,
-			sessionFactsVersion: getSessionFactsVersion(db, state.sessionId),
-			materializedAt: memoryCutoff ?? Date.now(),
-			upgradeState: `${PI_M0_UPGRADE_STATE}:${
-				compartments.some((c) => c.legacy === 1) ? "legacy" : "ready"
-			}`,
-			compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
-			lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
-			systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
-			modelKey: piModelRefToCanonical(
-				(state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
-			),
-			projectIdentity: state.projectIdentity,
-			muralEnabled: state.muralEnabled === true,
-			renderBudgetIdentity: renderBudgetIdentityPi(state),
-		};
-		return { docs, markers, compartments, memories, userProfile, workspace };
+	const workspace = resolveWorkspaceRenderContextPi(state, db);
+	const compartments = getRenderableCompartmentsPi(db, state);
+	const claimLane = readClaimLaneSnapshot({
+		db,
+		projectPath: memPath,
+		workspace,
+		nowMs: memoryCutoff,
 	});
-	return read();
+	if (claimLane === null) {
+		throw new PiMaterializeContentionError("claim snapshot kept moving");
+	}
+	const claims = trimClaimLane(
+		claimLane,
+		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+		workspace,
+	);
+	const userProfile = safeGetActiveUserMemoriesPi(db);
+	const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
+	const markers: PiM0SnapshotMarkers = {
+		claimFormatEpoch: DIRECT_FORMAT_EPOCH,
+		claimSnapshotVector: claimLane.snapshotVector,
+		renderedRevisionLocators: claims.map((item) => item.revisionLocator),
+		maxCompartmentSeq: compartments.reduce(
+			(max, compartment) =>
+				compartment.sequence > max ? compartment.sequence : max,
+			EMPTY_MAX_COMPARTMENT_SEQ,
+		),
+		maxMutationId: getMaxM0MutationId(db, state.sessionId) ?? 0,
+		projectUserProfileVersion: globalState?.projectUserProfileVersion ?? 0,
+		projectDocsHash: docs.canonicalHash,
+		sessionFactsVersion: getSessionFactsVersion(db, state.sessionId),
+		materializedAt: memoryCutoff ?? Date.now(),
+		upgradeState: `${PI_M0_UPGRADE_STATE}:${
+			compartments.some((c) => c.legacy === 1) ? "legacy" : "ready"
+		}`,
+		compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+		lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
+		systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
+		modelKey: piModelRefToCanonical(
+			(state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
+		),
+		projectIdentity: state.projectIdentity,
+		muralEnabled: state.muralEnabled === true,
+		renderBudgetIdentity: renderBudgetIdentityPi(state),
+	};
+	const freshVector = readProjectMemorySnapshotVector(
+		db,
+		claimLane.projectIds,
+		claimLane.workspaceEpoch,
+	);
+	if (
+		snapshotVectorChanges(claimLane.snapshotVector, freshVector).length > 0 ||
+		canonicalSnapshotVector(markers.claimSnapshotVector) !==
+			canonicalSnapshotVector(claimLane.snapshotVector)
+	) {
+		throw new PiMaterializeContentionError(
+			"claim snapshot changed before render",
+		);
+	}
+	return {
+		docs,
+		markers,
+		compartments,
+		claims,
+		claimLane,
+		userProfile,
+		workspace,
+	};
 }
 
 function renderFreshM0PiNonPersisted(
@@ -1456,53 +1355,17 @@ function renderFreshM0PiNonPersisted(
 ): {
 	m0: string;
 	snapshotMarkers: PiM0SnapshotMarkers;
-	renderedMemoryIds: number[];
+	renderedRevisionLocators: string[];
 } {
 	const docs = readProjectDocsForPiM0(state);
 	const cachedMaterializedAt =
 		getOrCreateSessionMeta(db, state.sessionId).cachedM0MaterializedAt ?? 0;
-	// Same stabilized rebuild discipline as the OpenCode fallback: this path
-	// publishes WITHOUT the phase-3 persist-time marker check that guards
-	// materializeM0Pi, so a quarantine, rejection, or rewrite landing after
-	// the frozen read transaction closes would still render the old bytes.
-	// Re-read until the memory epoch (workspace fingerprint when foreign rows
-	// are in scope) is unchanged across the read; fail closed with an empty
-	// pool on exhaustion.
-	const memPath = memoryProjectPath(state);
-	const fallbackStabilityMarker = (): string => {
-		const workspace = resolveWorkspaceRenderContextPi(state, db);
-		return workspace.isWorkspaced
-			? `ws:${computeWorkspaceEpochFingerprint(db, workspace.identities)}`
-			: `ep:${(memPath ? getProjectState(db, memPath) : undefined)?.projectMemoryEpoch ?? 0}`;
-	};
-	let frozen: FrozenM0Inputs | undefined;
-	let fallbackPoolStable = !memPath;
-	for (let attempt = 0; attempt < 2 && !fallbackPoolStable; attempt += 1) {
-		const markerAtLoad = fallbackStabilityMarker();
-		frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
-		frozen.memories = bindMemoriesToCurrentRevision(db, frozen.memories);
-		fallbackPoolStable = fallbackStabilityMarker() === markerAtLoad;
-	}
-	if (frozen === undefined) {
-		frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
-	}
-	if (!fallbackPoolStable) {
-		logSession(
-			state.sessionId,
-			"pi fallback m0 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
-		);
-		frozen.memories = [];
-	}
-	// CACHE STABILITY: materializedAt feeds the m[1] expiry cutoff. It must be
-	// stable across consecutive fallback passes, so reuse the last persisted value
-	// (or 0 when no cached baseline exists) rather than live Date.now().
+	const frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
 	frozen.markers.materializedAt = cachedMaterializedAt;
 	const historyBudget =
 		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
 	const memoryBudget =
 		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	// Fresh fallback is a last-resort HARD-equivalent render: resolve mural once
-	// so the non-persisted pair still carries the image when the feature is on.
 	const mural = resolveMuralForM0Pi(
 		state,
 		db,
@@ -1510,18 +1373,21 @@ function renderFreshM0PiNonPersisted(
 		memoryBudget,
 	);
 	rememberPiMural(state.sessionId, mural);
+	const render = (claims: ProjectMemoryClaimSnapshot[], dpm: number): string =>
+		renderM0Pi(
+			state,
+			db,
+			docs.renderedBlock,
+			dpm,
+			claims,
+			frozen.compartments,
+			frozen.userProfile,
+			frozen.workspace,
+			mural,
+			frozen.claimLane,
+		);
 	let dpm = 1;
-	let m0 = renderM0Pi(
-		state,
-		db,
-		docs.renderedBlock,
-		dpm,
-		frozen.memories,
-		frozen.compartments,
-		frozen.userProfile,
-		frozen.workspace,
-		mural,
-	);
+	let m0 = render(frozen.claims, dpm);
 	let attempts = 0;
 	while (
 		historyBudget > 0 &&
@@ -1529,28 +1395,26 @@ function renderFreshM0PiNonPersisted(
 		attempts < 3
 	) {
 		dpm *= 1.15;
-		m0 = renderM0Pi(
-			state,
-			db,
-			docs.renderedBlock,
-			dpm,
-			frozen.memories,
-			frozen.compartments,
-			frozen.userProfile,
-			frozen.workspace,
-			mural,
-		);
+		m0 = render(frozen.claims, dpm);
 		attempts += 1;
+	}
+	const freshVector = readProjectMemorySnapshotVector(
+		db,
+		frozen.claimLane.projectIds,
+		frozen.claimLane.workspaceEpoch,
+	);
+	if (
+		snapshotVectorChanges(frozen.claimLane.snapshotVector, freshVector).length >
+		0
+	) {
+		m0 = render([], dpm);
+		frozen.markers.claimSnapshotVector = freshVector;
+		frozen.markers.renderedRevisionLocators = [];
 	}
 	return {
 		m0,
 		snapshotMarkers: frozen.markers,
-		renderedMemoryIds: renderedMemoryIdsForPi(
-			state,
-			frozen.memories,
-			frozen.workspace,
-			db,
-		),
+		renderedRevisionLocators: frozen.markers.renderedRevisionLocators ?? [],
 	};
 }
 
@@ -1561,7 +1425,7 @@ export function materializeM0Pi(
 	m0: string;
 	m1: string;
 	snapshotMarkers: PiM0SnapshotMarkers;
-	renderedMemoryIds: number[];
+	renderedRevisionLocators: string[];
 } {
 	// Phase 1 (no lock): read markers + render. Rendering can be slow, so we do
 	// it OUTSIDE the write lock to keep the BEGIN IMMEDIATE critical section tiny.
@@ -1570,14 +1434,11 @@ export function materializeM0Pi(
 	const frozen = readFrozenM0InputsPi(state, db, docs, foldMaterializedAt);
 	const snapshotMarkers = frozen.markers;
 
-	const snapshotMemories = frozen.memories;
+	const snapshotClaims = frozen.claims;
 	const snapshotCompartments = frozen.compartments;
 	const snapshotUserProfile = frozen.userProfile;
-	const renderedMemoryIds = renderedMemoryIdsForPi(
-		state,
-		snapshotMemories,
-		frozen.workspace,
-		db,
+	const renderedRevisionLocators = snapshotClaims.map(
+		(item) => item.revisionLocator,
 	);
 	// On-demand mural: runs INSIDE the HARD fold only (not on defers). Explicit
 	// test-supplied `state.mural` wins; otherwise resolve from muralEnabled +
@@ -1604,11 +1465,12 @@ export function materializeM0Pi(
 		db,
 		docs.renderedBlock,
 		decayPressureMultiplier,
-		snapshotMemories,
+		snapshotClaims,
 		snapshotCompartments,
 		snapshotUserProfile,
 		frozen.workspace,
 		mural,
+		frozen.claimLane,
 	);
 	const historyBudget =
 		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
@@ -1624,11 +1486,12 @@ export function materializeM0Pi(
 			db,
 			docs.renderedBlock,
 			decayPressureMultiplier,
-			snapshotMemories,
+			snapshotClaims,
 			snapshotCompartments,
 			snapshotUserProfile,
 			frozen.workspace,
 			mural,
+			frozen.claimLane,
 		);
 		attempts += 1;
 	}
@@ -1648,56 +1511,68 @@ export function materializeM0Pi(
 		throw error;
 	}
 	try {
-		const current = readCurrentMarkers(db, state, phase3ProjectDocsHash);
-		// maxMemoryId deliberately EXCLUDED (parity with OpenCode materializeM0):
-		// additive memory writes don't bump projectMemoryEpoch and must NOT bust
-		// m[0] — they surface in m[1] via the persisted maxMemoryId watermark. The
-		// memory-mutation cursor IS included because a materialization pass must
-		// reconcile every non-additive memory change up to its persisted cursor.
-		const memoryEpochStale =
-			current.workspaceFingerprint !== null ||
-			snapshotMarkers.workspaceFingerprint !== null
-				? current.workspaceFingerprint !== snapshotMarkers.workspaceFingerprint
-				: current.projectMemoryEpoch !== snapshotMarkers.projectMemoryEpoch;
+		const claimLane = frozen.claimLane;
+		if (claimLane === undefined) {
+			throw new PiMaterializeContentionError("missing frozen claim lane");
+		}
+		const currentWorkspace = resolveWorkspaceRenderContextPi(state, db);
+		const currentWorkspaceEpoch =
+			currentWorkspace.identities.length === 0
+				? "project-memory-disabled"
+				: computeWorkspaceEpochFingerprint(db, currentWorkspace.identities);
+		const freshVector = readProjectMemorySnapshotVector(
+			db,
+			claimLane.projectIds,
+			currentWorkspaceEpoch,
+		);
+		const currentCompartments = getRenderableCompartmentsPi(db, state);
+		const currentMaxCompartmentSeq = currentCompartments.reduce(
+			(max, compartment) =>
+				compartment.sequence > max ? compartment.sequence : max,
+			EMPTY_MAX_COMPARTMENT_SEQ,
+		);
+		const currentUpgradeState = `${PI_M0_UPGRADE_STATE}:${
+			currentCompartments.some((compartment) => compartment.legacy === 1)
+				? "legacy"
+				: "ready"
+		}`;
+		const currentProfileVersion =
+			getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)
+				?.projectUserProfileVersion ?? 0;
 		const stale =
-			memoryEpochStale ||
-			current.projectUserProfileVersion !==
-				snapshotMarkers.projectUserProfileVersion ||
-			current.maxCompartmentSeq !== snapshotMarkers.maxCompartmentSeq ||
-			current.maxMutationId !== snapshotMarkers.maxMutationId ||
-			current.maxMemoryMutationId !== snapshotMarkers.maxMemoryMutationId ||
-			current.projectIdentity !== snapshotMarkers.projectIdentity ||
-			// Inert today (both harnesses pin sessionFactsVersion to 0 — facts are
-			// retired in v2), but kept for structural parity with OpenCode
-			// materializeM0 so the two stale checks can't silently drift if either
-			// harness ever revives the field.
-			current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion ||
-			current.upgradeState !== snapshotMarkers.upgradeState;
+			snapshotVectorChanges(claimLane.snapshotVector, freshVector).length > 0 ||
+			currentProfileVersion !== snapshotMarkers.projectUserProfileVersion ||
+			currentMaxCompartmentSeq !== snapshotMarkers.maxCompartmentSeq ||
+			(getMaxM0MutationId(db, state.sessionId) ?? 0) !==
+				snapshotMarkers.maxMutationId ||
+			state.projectIdentity !== snapshotMarkers.projectIdentity ||
+			getSessionFactsVersion(db, state.sessionId) !==
+				snapshotMarkers.sessionFactsVersion ||
+			currentUpgradeState !== snapshotMarkers.upgradeState ||
+			phase3ProjectDocsHash !== snapshotMarkers.projectDocsHash;
 		if (stale) {
 			db.exec("ROLLBACK");
 			throw new PiMaterializeContentionError("snapshot changed before persist");
 		}
 		snapshotMarkers.materializedAt = foldMaterializedAt;
 
-		const m1Render = renderM1PiWithMetadata(
-			state,
-			db,
-			snapshotMarkers,
-			renderedMemoryIds,
-		);
+		const m1Render = renderM1PiWithMetadata(state, db, snapshotMarkers, []);
 		const m1Bytes = Buffer.from(m1Render.text, "utf8");
 
 		persistCachedM0(db, state.sessionId, {
 			m0Bytes,
 			muralDataUrl: frozenMuralDataUrl,
 			muralHash: frozenMuralHash,
-			projectMemoryEpoch: snapshotMarkers.projectMemoryEpoch,
-			workspaceFingerprint: snapshotMarkers.workspaceFingerprint,
+			claimFormatEpoch: DIRECT_FORMAT_EPOCH,
+			claimSnapshotVector: canonicalSnapshotVector(
+				frozen.claimLane.snapshotVector,
+			),
+			renderedRevisionLocators: JSON.stringify(
+				[...renderedRevisionLocators].sort(),
+			),
 			projectUserProfileVersion: snapshotMarkers.projectUserProfileVersion,
 			maxCompartmentSeq: snapshotMarkers.maxCompartmentSeq,
-			maxMemoryId: snapshotMarkers.maxMemoryId,
 			maxMutationId: snapshotMarkers.maxMutationId,
-			maxMemoryMutationId: snapshotMarkers.maxMemoryMutationId,
 			m1Bytes,
 			projectDocsHash: snapshotMarkers.projectDocsHash,
 			materializedAt: snapshotMarkers.materializedAt,
@@ -1712,30 +1587,12 @@ export function materializeM0Pi(
 			modelKey: snapshotMarkers.modelKey,
 			projectIdentity: snapshotMarkers.projectIdentity,
 		});
-		// Persist the rendered-memory identity in the SAME transaction as the m[0]
-		// snapshot (parity with OpenCode materializeM0). `memory_block_ids` /
-		// `memory_block_count` are otherwise written only by the dead legacy v1
-		// path, so they'd stay frozen at the last legacy value — wrong sidebar
-		// "Injected" count AND a stale ctx_search hide-already-visible filter after
-		// any memory change (e.g. migration delete+reinserts with new ids).
-		// Hashes ride the same record (OpenCode parity): the replay gate in
-		// injectM0M1Pi proves the cached block against current policy AND the
-		// exact rendered bytes, so a rewrite-in-place that keeps the id
-		// eligible cannot replay superseded content.
-		const renderedHashById = new Map(
-			snapshotMemories.map((memory) => [
-				memory.id,
-				sha256Utf8Hex(memory.content),
-			]),
-		);
 		db.prepare(
 			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ? WHERE session_id = ?",
 		).run(
-			renderedMemoryIds.length,
-			JSON.stringify(renderedMemoryIds),
-			JSON.stringify(
-				renderedMemoryIds.map((id) => renderedHashById.get(id) ?? ""),
-			),
+			renderedRevisionLocators.length,
+			JSON.stringify([...renderedRevisionLocators].sort()),
+			JSON.stringify(snapshotClaims.map((item) => item.contentDigest)),
 			state.sessionId,
 		);
 
@@ -1760,7 +1617,7 @@ export function materializeM0Pi(
 			m0,
 			m1: m1Render.text,
 			snapshotMarkers,
-			renderedMemoryIds,
+			renderedRevisionLocators,
 		};
 	} catch (error) {
 		try {
@@ -1781,7 +1638,7 @@ export function materializeM0PiWithRetry(
 	m0: string;
 	m1: string;
 	snapshotMarkers: PiM0SnapshotMarkers;
-	renderedMemoryIds: number[];
+	renderedRevisionLocators: string[];
 } {
 	let lastError: PiMaterializeContentionError | null = null;
 	for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -1798,114 +1655,6 @@ export function materializeM0PiWithRetry(
 	);
 }
 
-function renderMemoryUpdatesBlockPi(args: {
-	db: ContextDatabase;
-	projectPath: string;
-	workspace: WorkspaceRenderContext;
-	afterId: number;
-	renderedMemoryIds: readonly number[];
-	eligibleMemoryIds: ReadonlySet<number>;
-}): { block: string; count: number; forcedMemoryIds: number[] } {
-	const renderedIds = new Set(args.renderedMemoryIds);
-	const mutations = args.workspace.isWorkspaced
-		? getMemoryMutationsForRenderByProjects(
-				args.db,
-				args.workspace.expandedIdentities,
-				args.afterId,
-				args.renderedMemoryIds,
-			)
-		: getMemoryMutationsForRender(
-				args.db,
-				args.projectPath,
-				args.afterId,
-				args.renderedMemoryIds,
-			);
-	if (mutations.length === 0) {
-		return { block: "", count: 0, forcedMemoryIds: [] };
-	}
-
-	// Bind content-carrying mutations to the claim revision the policy
-	// read evaluated: a held-open pre-v86 compatibility writer can rewrite the
-	// target after the eligibility load without bumping the policy epoch, so
-	// the materialization stability check cannot reject the mixed snapshot. A
-	// mutation whose bytes no longer match the claim's current revision is
-	// dropped; the successor reaches the prompt only through a policy-checked
-	// snapshot rebuild.
-	const oracleDigests = exactMemoryContentDigests(
-		args.db,
-		mutations
-			.filter((mutation) => mutation.newContent !== null)
-			.map((mutation) => mutation.targetMemoryId),
-	);
-	const boundMutations = mutations.filter(
-		(mutation) =>
-			mutation.newContent === null ||
-			oracleDigests.get(mutation.targetMemoryId) ===
-				sha256Utf8Hex(mutation.newContent),
-	);
-	if (boundMutations.length === 0) {
-		return { block: "", count: 0, forcedMemoryIds: [] };
-	}
-
-	const forcedIds = new Set<number>();
-	const lines = [
-		"These memories changed since the snapshot below — trust these:",
-	];
-	for (const mutation of boundMutations) {
-		if (mutation.mutationType === "superseded") {
-			const replacementId = mutation.supersededById;
-			if (
-				replacementId !== null &&
-				!renderedIds.has(replacementId) &&
-				args.eligibleMemoryIds.has(replacementId)
-			) {
-				forcedIds.add(replacementId);
-			}
-			if (!renderedIds.has(mutation.targetMemoryId)) continue;
-			if (replacementId !== null && args.eligibleMemoryIds.has(replacementId)) {
-				lines.push(
-					`  <superseded id="${mutation.targetMemoryId}" by="${replacementId}"/>`,
-				);
-			} else {
-				lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
-			}
-			continue;
-		}
-
-		if (!renderedIds.has(mutation.targetMemoryId)) {
-			if (
-				mutation.visibilityChanged &&
-				args.eligibleMemoryIds.has(mutation.targetMemoryId)
-			) {
-				forcedIds.add(mutation.targetMemoryId);
-			}
-			continue;
-		}
-		if (!args.eligibleMemoryIds.has(mutation.targetMemoryId)) {
-			lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
-			continue;
-		}
-		if (mutation.visibilityChanged && mutation.newContent === null) continue;
-		if (mutation.mutationType === "update") {
-			lines.push(
-				`  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`,
-			);
-			continue;
-		}
-		lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
-	}
-
-	const forcedMemoryIds = [...forcedIds]
-		.sort((left, right) => left - right)
-		.slice(0, MAX_FORCED_MEMORIES_PER_DELTA);
-	if (lines.length === 1) return { block: "", count: 0, forcedMemoryIds };
-	return {
-		block: `<memory-updates>\n${lines.join("\n")}\n</memory-updates>`,
-		count: lines.length - 1,
-		forcedMemoryIds,
-	};
-}
-
 interface RenderM1PiResult {
 	text: string;
 	memoryUpdateCount: number;
@@ -1915,131 +1664,41 @@ function renderM1PiWithMetadata(
 	state: PiM0M1State,
 	db: ContextDatabase,
 	markers: PiM0SnapshotMarkers,
-	renderedMemoryIds: readonly number[],
-	// The compartment set the CALLER will use to advance the persisted trim
-	// boundary. When provided, the new-compartments filter renders from this
-	// exact set instead of a fresh live read — so a compartment can never be
-	// rendered into m[1] while the boundary advances from a different (older)
-	// snapshot, which would leave its raw messages in the tail too (duplication).
-	// Omitted by callers that don't advance the boundary (e.g. renderM1Pi probe).
+	_renderedRevisionLocators: readonly string[],
 	compartmentsOverride?: readonly PiCompartment[],
 ): RenderM1PiResult {
-	const sections: string[] = [];
+	if (markers.claimSnapshotVector === undefined) {
+		throw new PiMaterializeContentionError("missing claim snapshot vector");
+	}
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
-
-	const memPath = memoryProjectPath(state);
-	// Stabilized rebuild: this pool is loaded independently of the M0
-	// snapshot (the non-persisted fallback pair has no phase-3 marker check
-	// downstream), so bind the bytes to their current revisions and require
-	// the memory epoch/workspace fingerprint to hold across the load; fail
-	// closed with an empty pool on exhaustion.
-	const m1StabilityMarker = (): string =>
-		workspace.isWorkspaced
-			? `ws:${computeWorkspaceEpochFingerprint(db, workspace.identities)}`
-			: `ep:${(memPath ? getProjectState(db, memPath) : undefined)?.projectMemoryEpoch ?? 0}`;
-	let eligibleMemories: Memory[] = [];
-	let m1PoolStable = !memPath;
-	for (let attempt = 0; attempt < 2 && !m1PoolStable; attempt += 1) {
-		const markerAtLoad = m1StabilityMarker();
-		eligibleMemories = bindMemoriesToCurrentRevision(
-			db,
-			filterMemoriesByPolicy(
-				db,
-				memPath
-					? workspace.isWorkspaced
-						? getMemoriesByProjects(
-								db,
-								workspace.expandedIdentities,
-								["active", "permanent"],
-								markers.materializedAt,
-								workspace.ownIdentities,
-								workspace.shareCategories,
-							)
-						: getMemoriesByProject(
-								db,
-								memPath,
-								["active", "permanent"],
-								markers.materializedAt,
-							)
-					: [],
-				"auto_inject",
-			).memories,
-		);
-		m1PoolStable = m1StabilityMarker() === markerAtLoad;
-	}
-	if (!m1PoolStable) {
-		logSession(
-			state.sessionId,
-			"pi m1 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
-		);
-		eligibleMemories = [];
-	}
-	const eligibleMemoryIds = new Set(
-		eligibleMemories.map((memory) => memory.id),
+	const workspaceEpoch =
+		workspace.identities.length === 0
+			? "project-memory-disabled"
+			: computeWorkspaceEpochFingerprint(db, workspace.identities);
+	const freshVector = readProjectMemorySnapshotVector(
+		db,
+		Object.keys(markers.claimSnapshotVector.projectGenerations).map(Number),
+		workspaceEpoch,
 	);
-	const memoryUpdates = memPath
-		? renderMemoryUpdatesBlockPi({
-				db,
-				projectPath: memPath,
-				workspace,
-				afterId: markers.maxMemoryMutationId,
-				renderedMemoryIds,
-				eligibleMemoryIds,
-			})
-		: { block: undefined as string | undefined, count: 0, forcedMemoryIds: [] };
-	if (memoryUpdates.block) sections.push(memoryUpdates.block);
+	if (
+		snapshotVectorChanges(markers.claimSnapshotVector, freshVector).length > 0
+	) {
+		throw new PiMaterializeContentionError(
+			"claim snapshot changed before m1 render",
+		);
+	}
 
+	const sections: string[] = [];
 	const newCompartments = (
 		compartmentsOverride ?? getRenderableCompartmentsPi(db, state)
 	).filter((compartment) => compartment.sequence > markers.maxCompartmentSeq);
 	if (newCompartments.length > 0) {
-		// New compartments are newest deltas → always render at P1 (full fidelity).
 		const body = newCompartments
 			.map((compartment) => renderCompartmentAtTier(compartment, 1))
 			.join("\n\n");
 		sections.push(`<new-compartments>\n${body}\n</new-compartments>`);
 	}
 
-	const forcedMemoryIds = new Set(memoryUpdates.forcedMemoryIds);
-	const newMemories = eligibleMemories.filter(
-		(memory) =>
-			memory.id > markers.maxMemoryId && !forcedMemoryIds.has(memory.id),
-	);
-	// Trim ordinary new memories to 25% of the budget, but always include eligible
-	// memories referenced by a supersede operation. Such a replacement may have an
-	// ID at or below the first marker's maximum while still not appearing in the
-	// memories already rendered.
-	const memoryBudget =
-		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	const memoryRenderOptions: MemoryRenderOptions = {
-		sourceNameByMemoryId: sourceNamesForPiMemories({
-			memories: eligibleMemories,
-			projectPath: memPath,
-			workspace,
-		}),
-	};
-	const trimmedNewMemories = trimMemoriesToBudgetV2(
-		state.sessionId,
-		newMemories,
-		Math.max(1, Math.floor(memoryBudget * 0.25)),
-		memoryRenderOptions,
-	).renderOrder;
-	const deltaMemories = [
-		...trimmedNewMemories,
-		...eligibleMemories.filter((memory) => forcedMemoryIds.has(memory.id)),
-	];
-	const newMemoriesBlock = renderMemoryBlockV2(
-		deltaMemories,
-		"new-memories",
-		memoryRenderOptions,
-	);
-	if (newMemoriesBlock) sections.push(newMemoriesBlock);
-
-	// new-user-profile delta: when the global user-profile version advanced since
-	// this m[0] baseline was materialized, surface the current profile under a
-	// <new-user-profile> wrapper so freshly promoted user memories reach the agent
-	// in m[1] before the next m[0] materialization folds them into the baseline.
-	// Trimmed to 25% of the user-profile budget (matches OpenCode renderM1).
 	const currentUserProfileVersion =
 		getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)
 			?.projectUserProfileVersion ?? 0;
@@ -2059,18 +1718,13 @@ function renderM1PiWithMetadata(
 	}
 
 	if (sections.length === 0) {
-		return {
-			text: PI_M1_PLACEHOLDER,
-			memoryUpdateCount: memoryUpdates.count,
-		};
+		return { text: PI_M1_PLACEHOLDER, memoryUpdateCount: 0 };
 	}
-	// Join with "\n" (single newline) to match OpenCode renderM1 exactly — the
-	// m[1] delta bytes must be identical across harnesses.
 	return {
 		text: state.compactionOff
 			? `<knowledge-updates>\n${sections.join("\n")}\n</knowledge-updates>`
 			: `<session-history-since>\n${sections.join("\n")}\n</session-history-since>`,
-		memoryUpdateCount: memoryUpdates.count,
+		memoryUpdateCount: 0,
 	};
 }
 
@@ -2078,9 +1732,10 @@ export function renderM1Pi(
 	state: PiM0M1State,
 	db: ContextDatabase,
 	markers: PiM0SnapshotMarkers,
-	renderedMemoryIds: readonly number[] = [],
+	renderedRevisionLocators: readonly string[] = [],
 ): string {
-	return renderM1PiWithMetadata(state, db, markers, renderedMemoryIds).text;
+	return renderM1PiWithMetadata(state, db, markers, renderedRevisionLocators)
+		.text;
 }
 
 interface CachedPiM0M1Row {
@@ -2088,13 +1743,12 @@ interface CachedPiM0M1Row {
 	cached_m0_mural_data_url: string | null;
 	cached_m0_mural_hash: string | null;
 	cached_m1_bytes: Buffer | Uint8Array | null;
-	cached_m0_project_memory_epoch: number | null;
-	cached_m0_workspace_fingerprint: string | null;
+	cached_m0_claim_format_epoch: number | null;
+	cached_m0_claim_snapshot_vector: string | null;
+	cached_m0_rendered_revision_locators: string | null;
 	cached_m0_project_user_profile_version: number | null;
 	cached_m0_max_compartment_seq: number | null;
-	cached_m0_max_memory_id: number | null;
 	cached_m0_max_mutation_id: number | null;
-	cached_m0_max_memory_mutation_id: number | null;
 	cached_m0_project_docs_hash: string | null;
 	cached_m0_materialized_at: number | null;
 	cached_m0_session_facts_version: number | null;
@@ -2103,7 +1757,6 @@ interface CachedPiM0M1Row {
 	cached_m0_model_key: string | null;
 	cached_m0_project_identity: string | null;
 	cached_m0_last_baseline_end_message_id: string | null;
-	memory_block_ids: string | null;
 }
 
 function toCachedBuffer(value: Buffer | Uint8Array): Buffer {
@@ -2120,17 +1773,6 @@ function bufferEqualsNullable(
 	return toCachedBuffer(left).equals(toCachedBuffer(right));
 }
 
-function parseMemoryBlockIds(raw: string | null): number[] {
-	if (!raw) return [];
-	try {
-		const parsed = JSON.parse(raw) as unknown;
-		if (!Array.isArray(parsed)) return [];
-		return parsed.filter((value): value is number => typeof value === "number");
-	} catch {
-		return [];
-	}
-}
-
 function readCachedPiM0M1Row(
 	db: ContextDatabase,
 	sessionId: string,
@@ -2139,13 +1781,12 @@ function readCachedPiM0M1Row(
 		.prepare(
 			`SELECT cached_m0_bytes, cached_m0_mural_data_url,
 					cached_m0_mural_hash, cached_m1_bytes,
-					cached_m0_project_memory_epoch,
-					cached_m0_workspace_fingerprint,
+					cached_m0_claim_format_epoch,
+					cached_m0_claim_snapshot_vector,
+					cached_m0_rendered_revision_locators,
 					cached_m0_project_user_profile_version,
 					cached_m0_max_compartment_seq,
-					cached_m0_max_memory_id,
 					cached_m0_max_mutation_id,
-					cached_m0_max_memory_mutation_id,
 					cached_m0_project_docs_hash,
 					cached_m0_materialized_at,
 					cached_m0_session_facts_version,
@@ -2153,8 +1794,7 @@ function readCachedPiM0M1Row(
 					cached_m0_system_hash,
 					cached_m0_model_key,
 					cached_m0_project_identity,
-					cached_m0_last_baseline_end_message_id,
-					memory_block_ids
+					cached_m0_last_baseline_end_message_id
 			   FROM session_meta
 			  WHERE session_id = ?`,
 		)
@@ -2169,25 +1809,30 @@ function markersFromCachedPiRow(
 	const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(
 		row.cached_m0_upgrade_state,
 	);
-	if (row.cached_m0_project_memory_epoch === null) return null;
+	const claimSnapshotVector = parsePiSnapshotVector(
+		row.cached_m0_claim_snapshot_vector,
+	);
+	const renderedRevisionLocators = parsePiRevisionLocators(
+		row.cached_m0_rendered_revision_locators,
+	);
+	if (row.cached_m0_claim_format_epoch === null) return null;
+	if (claimSnapshotVector === null || renderedRevisionLocators === null)
+		return null;
 	if (row.cached_m0_project_user_profile_version === null) return null;
 	if (row.cached_m0_max_compartment_seq === null) return null;
-	if (row.cached_m0_max_memory_id === null) return null;
 	if (row.cached_m0_max_mutation_id === null) return null;
-	if (row.cached_m0_max_memory_mutation_id === null) return null;
 	if (row.cached_m0_session_facts_version === null) return null;
 	if (row.cached_m0_materialized_at === null) return null;
 	if (row.cached_m0_upgrade_state === null) return null;
 	return {
+		claimFormatEpoch: row.cached_m0_claim_format_epoch,
+		claimSnapshotVector,
+		renderedRevisionLocators,
 		maxCompartmentSeq: normalizeCachedMaxCompartmentSeq(
 			row.cached_m0_max_compartment_seq,
 			compartmentsForNormalization,
 		),
-		maxMemoryId: row.cached_m0_max_memory_id,
 		maxMutationId: row.cached_m0_max_mutation_id,
-		maxMemoryMutationId: row.cached_m0_max_memory_mutation_id,
-		projectMemoryEpoch: row.cached_m0_project_memory_epoch,
-		workspaceFingerprint: row.cached_m0_workspace_fingerprint,
 		projectUserProfileVersion: row.cached_m0_project_user_profile_version,
 		projectDocsHash: row.cached_m0_project_docs_hash ?? "",
 		materializedAt: row.cached_m0_materialized_at,
@@ -2220,13 +1865,19 @@ function cachedPiRowMatchesSnapshot(args: {
 	if (!rowMarkers) return false;
 	return (
 		bufferEqualsNullable(args.row.cached_m0_bytes, args.m0Bytes) &&
-		rowMarkers.projectMemoryEpoch === args.markers.projectMemoryEpoch &&
+		rowMarkers.claimFormatEpoch === args.markers.claimFormatEpoch &&
+		rowMarkers.claimSnapshotVector !== undefined &&
+		args.markers.claimSnapshotVector !== undefined &&
+		canonicalSnapshotVector(rowMarkers.claimSnapshotVector) ===
+			canonicalSnapshotVector(args.markers.claimSnapshotVector) &&
+		JSON.stringify([...(rowMarkers.renderedRevisionLocators ?? [])].sort()) ===
+			JSON.stringify(
+				[...(args.markers.renderedRevisionLocators ?? [])].sort(),
+			) &&
 		rowMarkers.projectUserProfileVersion ===
 			args.markers.projectUserProfileVersion &&
 		rowMarkers.maxCompartmentSeq === args.markers.maxCompartmentSeq &&
-		rowMarkers.maxMemoryId === args.markers.maxMemoryId &&
 		rowMarkers.maxMutationId === args.markers.maxMutationId &&
-		rowMarkers.maxMemoryMutationId === args.markers.maxMemoryMutationId &&
 		// Project-docs hash is inert for CAS decisions: byte-different m[0] rows
 		// fail the buffer compare above, while hash-only drift with identical bytes
 		// must still refresh m[1] against the current cached prefix.
@@ -2241,15 +1892,7 @@ function cachedPiRowMatchesSnapshot(args: {
 		piModelRefToCanonical(rowMarkers.modelKey ?? "") ===
 			piModelRefToCanonical(args.markers.modelKey ?? "") &&
 		(rowMarkers.projectIdentity ?? null) ===
-			(args.markers.projectIdentity ?? null) &&
-		// Workspace fingerprint (parity with OpenCode cachedRowMatchesState):
-		// projectMemoryEpoch above only tracks THIS session's own project, but a
-		// FOREIGN member's epoch bump changes the workspace fingerprint without
-		// touching this session's epoch. Without this compare, a sibling row
-		// materialized under different workspace membership would pass the CAS and
-		// be adopted with the wrong union baseline.
-		(rowMarkers.workspaceFingerprint ?? null) ===
-			(args.markers.workspaceFingerprint ?? null)
+			(args.markers.projectIdentity ?? null)
 	);
 }
 
@@ -2372,7 +2015,7 @@ function softRefreshCachedM1Pi(args: {
 			args.state,
 			args.db,
 			markers,
-			parseMemoryBlockIds(row.memory_block_ids),
+			markers.renderedRevisionLocators ?? [],
 			// Render new compartments from the SAME snapshot the boundary advances
 			// from below, so a concurrent sibling publish can't put a compartment
 			// in m[1] while its raw messages stay in the tail.
@@ -2481,50 +2124,12 @@ export function injectM0M1Pi(
 	entryIds?: readonly (string | undefined)[],
 	recomputeM1ThisPass = false,
 ): PiM0M1InjectionResult {
-	// A held-open v85 writer can append compatibility verification events or
-	// whole revisions at any time, not just before startup. Run the same
-	// guarded probes as the OpenCode injection lane before any cache replay:
-	// a reconciled event bumps the project epoch this pass observes, and an
-	// unseeded revision kicks the bounded async seeder. Both are watermark/
-	// anti-join guarded (one probe each when idle) and must not fail the
-	// injection.
-	try {
-		reconcileCompatibilityVerifications(db);
-	} catch (error) {
-		logSession(
-			state.sessionId,
-			`compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
-	try {
-		seedLateCompatibilityRevisions(db);
-	} catch (error) {
-		logSession(
-			state.sessionId,
-			`late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
 	// One compartment snapshot for the WHOLE decision: the materialize decision
 	// and every cached-marker reload below normalize against this same set, so a
 	// concurrent count change can't flip markers to null mid-decision and escape
 	// the guarded fallback (TOCTOU).
 	const currentCompartments = getRenderableCompartmentsPi(db, state);
 	let decision = mustMaterializePi(state, db, currentCompartments);
-	// Publication-time policy gate (OpenCode parity): the cache decision
-	// consumed the epoch it read, so a quarantine that never bumps it — or
-	// one landing after the marker read — would replay the recorded block.
-	// The ids and exact digests persisted at materialize time are re-proved
-	// against current policy and current revisions; any mismatch (including
-	// a missing hash record) fails closed into a fresh materialization.
-	if (
-		!decision.value &&
-		!sessionMemoryBlockStillEligible(db, state.sessionId)
-	) {
-		decision = {
-			value: true,
-			reason: "cached memory block no longer policy-backed",
-		};
-	}
 	if (decision.value) {
 		const mismatch = decision.mismatch
 			? ` mismatch=${JSON.stringify(decision.mismatch)}`
@@ -2541,7 +2146,7 @@ export function injectM0M1Pi(
 	let contentionExhausted = false;
 	let memoryUpdateCount = 0;
 	let m1Recomputed = false;
-	let freshFallbackRenderedMemoryIds: number[] | null = null;
+	let freshFallbackRenderedRevisionLocators: string[] | null = null;
 
 	if (decision.value) {
 		// On contention exhaustion, reuse the cached m[0]/m[1] pair rather than
@@ -2578,7 +2183,7 @@ export function injectM0M1Pi(
 				const fresh = renderFreshM0PiNonPersisted(state, db);
 				m0 = fresh.m0;
 				markers = fresh.snapshotMarkers;
-				freshFallbackRenderedMemoryIds = fresh.renderedMemoryIds;
+				freshFallbackRenderedRevisionLocators = fresh.renderedRevisionLocators;
 				contentionExhausted = true;
 				logSession(
 					state.sessionId,
@@ -2613,7 +2218,7 @@ export function injectM0M1Pi(
 				const fresh = renderFreshM0PiNonPersisted(state, db);
 				m0 = fresh.m0;
 				markers = fresh.snapshotMarkers;
-				freshFallbackRenderedMemoryIds = fresh.renderedMemoryIds;
+				freshFallbackRenderedRevisionLocators = fresh.renderedRevisionLocators;
 				contentionExhausted = true;
 				logSession(
 					state.sessionId,
@@ -2635,13 +2240,8 @@ export function injectM0M1Pi(
 
 	if (materialized) {
 		// m[1] was rendered and persisted atomically inside materializeM0Pi.
-	} else if (contentionExhausted && freshFallbackRenderedMemoryIds) {
-		const freshM1 = renderM1PiWithMetadata(
-			state,
-			db,
-			markers,
-			freshFallbackRenderedMemoryIds,
-		);
+	} else if (contentionExhausted && freshFallbackRenderedRevisionLocators) {
+		const freshM1 = renderM1PiWithMetadata(state, db, markers, []);
 		m1 = freshM1.text;
 		memoryUpdateCount = freshM1.memoryUpdateCount;
 		m1Recomputed = true;
@@ -2757,12 +2357,46 @@ export function injectM0M1Pi(
 	const skippedVisibleMessages = boundaryId
 		? trimPiMessagesToBoundary(piMessages, entryIds, boundaryId)
 		: 0;
+	const publishWorkspace = resolveWorkspaceRenderContextPi(state, db);
+	const publishedVector = markers.claimSnapshotVector;
+	const publishWorkspaceEpoch =
+		publishWorkspace.identities.length === 0
+			? "project-memory-disabled"
+			: computeWorkspaceEpochFingerprint(db, publishWorkspace.identities);
+	const claimLaneMoved =
+		publishedVector === undefined ||
+		snapshotVectorChanges(
+			publishedVector,
+			readProjectMemorySnapshotVector(
+				db,
+				Object.keys(publishedVector?.projectGenerations ?? {}).map(Number),
+				publishWorkspaceEpoch,
+			),
+		).length > 0;
+	if (claimLaneMoved) {
+		m0 = stripProjectMemoryBlock(m0);
+		// The mural is a picture of the same claim lane: it renders public claim
+		// ids, categories, and cue text drawn from the snapshot this fence just
+		// declared stale. Withholding only the text would leave those cues legible
+		// in the image, so drop the cached wire payload and its hash too. Safe to
+		// clear rather than merely skip: the payload is frozen alongside
+		// claimSnapshotVector in one cached m[0] row, so a moved vector means this
+		// image can never be published again. The next pass folds on the same
+		// vector change and re-derives it from the project-level mural render,
+		// which reuses the stored PNG whenever the cue text is unchanged.
+		rememberPiMuralPayload(state.sessionId, null, null);
+		db.prepare(
+			"UPDATE session_meta SET memory_block_count = 0, memory_block_ids = '[]', memory_block_hashes = '[]' WHERE session_id = ?",
+		).run(state.sessionId);
+	}
 	const muralWire = m0.includes("<memory-mural>")
 		? muralForWire(state.sessionId)
 		: undefined;
-	// A legacy row with no paired payload cannot replay its old image part. Since
-	// that omission already changes provider-visible bytes, remove the false text
-	// claiming an image follows and keep the fallback internally consistent.
+	// Runs after the staleness fence so one predicate covers both cases: a legacy
+	// row with no paired payload that cannot replay its old image part, and a stale
+	// snapshot whose payload was just dropped above. Since that omission already
+	// changes provider-visible bytes, remove the false text claiming an image
+	// follows and keep the fallback internally consistent.
 	if (!muralWire) m0 = stripMemoryMuralBlock(m0);
 	prependM0M1Messages(piMessages, m0, m1, muralWire);
 	logSession(
@@ -2770,19 +2404,12 @@ export function injectM0M1Pi(
 		`injected m[0]/m[1] into Pi messages (${m0.length} + ${m1.length} bytes, materialized=${materialized}${decision.reason ? ` reason=${decision.reason}` : ""})`,
 	);
 	const memPath = memoryProjectPath(state);
-	const workspace = resolveWorkspaceRenderContextPi(state, db);
-	const memoryCount = memPath
-		? workspace.isWorkspaced
-			? getMemoriesByProjects(
-					db,
-					workspace.expandedIdentities,
-					["active", "permanent"],
-					Date.now(),
-					workspace.ownIdentities,
-					workspace.shareCategories,
-				).length
-			: getMemoriesByProject(db, memPath, ["active", "permanent"]).length
-		: 0;
+	const claimLane = readClaimLaneSnapshot({
+		db,
+		projectPath: memPath,
+		workspace: publishWorkspace,
+	});
+	const memoryCount = claimLane?.items.length ?? 0;
 	return {
 		injected: true,
 		compartmentCount: currentCompartments.length,

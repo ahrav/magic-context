@@ -1,7 +1,10 @@
-import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
+import {
+    renderClaimMemoryBlock,
+    trimClaimSnapshotsToBudget,
+} from "../../features/magic-context/memory/claim-memory-render";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { extractM0Block } from "./decay-render";
-import { renderMemoryBlockV2, trimMemoriesToBudgetV2 } from "./inject-compartments";
+import { readProjectClaimLaneSnapshot } from "./inject-compartments";
 import { estimateTokens } from "./read-session-formatting";
 
 /**
@@ -47,13 +50,7 @@ export function computeM0BlockTokens(
         compartmentTokensOverride?: number;
     },
 ): M0BlockTokens {
-    const {
-        m0Text,
-        projectIdentity,
-        injectionBudgetTokens,
-        memoryBlockCount,
-        compartmentTokensOverride,
-    } = args;
+    const { m0Text, projectIdentity, injectionBudgetTokens, compartmentTokensOverride } = args;
 
     const docsBlock = extractM0Block(m0Text, "project-docs");
     const docsTokens = docsBlock ? estimateTokens(docsBlock) : 0;
@@ -61,12 +58,25 @@ export function computeM0BlockTokens(
     const profileBlock = extractM0Block(m0Text, "user-profile");
     const profileTokens = profileBlock ? estimateTokens(profileBlock) : 0;
 
-    let memoryTokens = 0;
-    let memoryFromM0 = false;
     const memoryBlock = extractM0Block(m0Text, "project-memory");
-    if (memoryBlock) {
-        memoryTokens = estimateTokens(memoryBlock);
-        memoryFromM0 = true;
+    let memoryTokens = memoryBlock ? estimateTokens(memoryBlock) : 0;
+    if (!memoryBlock && projectIdentity) {
+        try {
+            const snapshot = readProjectClaimLaneSnapshot(db, projectIdentity);
+            if (snapshot) {
+                const selected = trimClaimSnapshotsToBudget(
+                    snapshot.items,
+                    injectionBudgetTokens ?? 8_000,
+                    { sourceNameByClaimId: snapshot.sourceNameByClaimId },
+                ).selected;
+                const rendered = renderClaimMemoryBlock(selected, "project-memory", {
+                    sourceNameByClaimId: snapshot.sourceNameByClaimId,
+                });
+                memoryTokens = rendered ? estimateTokens(rendered) : 0;
+            }
+        } catch {
+            memoryTokens = 0;
+        }
     }
 
     const muralTokens = m0Text.includes("<memory-mural>") ? 1_521 : 0;
@@ -109,21 +119,6 @@ export function computeM0BlockTokens(
             }
         } catch {
             // compartments table may not exist
-        }
-    }
-
-    // Memory cold-start fallback: render on-demand with the SAME v2 path the
-    // injection uses so the reading matches what WILL be injected.
-    if (!memoryFromM0 && memoryBlockCount > 0 && projectIdentity) {
-        try {
-            const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
-            const selected = injectionBudgetTokens
-                ? trimMemoriesToBudgetV2(sessionId, memories, injectionBudgetTokens).renderOrder
-                : memories;
-            const block = renderMemoryBlockV2(selected);
-            memoryTokens = block ? estimateTokens(block) : 0;
-        } catch {
-            memoryTokens = 0;
         }
     }
 

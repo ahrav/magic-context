@@ -638,7 +638,10 @@ pub async fn run<H: McHostHandler>(
     let guard = {
         let mut acquired = None;
         for attempt in 0..crate::instance::LOCK_RETRY_ATTEMPTS {
-            match InstanceGuard::acquire(config.data_dir.as_deref()) {
+            match InstanceGuard::acquire(
+                config.data_dir.as_deref(),
+                &config.payload_manifest_digest,
+            ) {
                 Ok(guard) => {
                     acquired = Some(guard);
                     break;

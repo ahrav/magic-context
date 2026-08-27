@@ -75,14 +75,15 @@ for (const r of db
     });
 }
 
-// Memory rows carry the identity only; they contribute source counts (and can
-// surface identities that never got a session binding, e.g. imported pools).
+// Claim rows carry the identity through `projects`; they contribute source
+// counts (and can surface identities that never got a session binding, e.g.
+// imported pools).
 for (const r of db
     .prepare(
-        "SELECT DISTINCT project_path AS identity FROM memories WHERE project_path LIKE 'git:%' OR project_path LIKE 'dir:%'",
+        "SELECT DISTINCT projects.canonical_identity AS identity FROM claims JOIN projects ON projects.id = claims.project_id WHERE projects.canonical_identity LIKE 'git:%' OR projects.canonical_identity LIKE 'dir:%'",
     )
     .all() as Array<{ identity: string }>) {
-    // Memory-only rows have no harness root to inspect, so recognize the same
+    // Claim-only rows have no harness root to inspect, so recognize the same
     // canonical-home dir: identity directly.
     if (r.identity === homeIdentity) continue;
     rows.push({ identity: r.identity, root: null, source: "memory_rows" });
@@ -102,7 +103,7 @@ for (const row of rows) {
 const memoryCounts = new Map<string, number>();
 for (const r of db
     .prepare(
-        "SELECT project_path AS identity, COUNT(*) AS n FROM memories WHERE project_path LIKE 'git:%' OR project_path LIKE 'dir:%' GROUP BY project_path",
+        "SELECT projects.canonical_identity AS identity, COUNT(*) AS n FROM claims JOIN projects ON projects.id = claims.project_id WHERE projects.canonical_identity LIKE 'git:%' OR projects.canonical_identity LIKE 'dir:%' GROUP BY projects.canonical_identity",
     )
     .all() as Array<{ identity: string; n: number }>) {
     memoryCounts.set(r.identity, r.n);

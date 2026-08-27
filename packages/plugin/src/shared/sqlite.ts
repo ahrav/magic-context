@@ -201,7 +201,7 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
             const stmt = super.prepare(sql);
             for (const method of ["run", "get", "all"] as const) {
                 const original = stmt[method].bind(stmt);
-                stmt[method] = (...args: unknown[]): unknown =>
+                stmt[method] = (...args: unknown[]): ReturnType<typeof original> =>
                     args.length === 1 && Array.isArray(args[0])
                         ? original(...args[0])
                         : original(...args);
@@ -215,47 +215,74 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
             const self = this as any;
             const execute = (
                 mode: "" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE",
-                receiver: unknown,
-                args: unknown[],
-            ) => {
+                receiver: ThisParameterType<F>,
+                args: Parameters<F>,
+            ): ReturnType<F> => {
                 const nested = self.isTransaction === true;
                 self.exec(nested ? `SAVEPOINT ${SAVEPOINT}` : `BEGIN${mode ? ` ${mode}` : ""}`);
                 try {
-                    const result = fn.apply(receiver, args);
+                    // SAFETY: Parameters<F> and ThisParameterType<F> preserve fn's call contract.
+                    const result = fn.apply(receiver, args) as ReturnType<F>;
                     self.exec(nested ? `RELEASE ${SAVEPOINT}` : "COMMIT");
                     return result;
                 } catch (error) {
-                    if (nested) {
-                        // ROLLBACK TO unwinds the savepoint's changes but leaves
-                        // it on the stack; RELEASE then pops it (better-sqlite3
-                        // does both).
-                        self.exec(`ROLLBACK TO ${SAVEPOINT}`);
-                        self.exec(`RELEASE ${SAVEPOINT}`);
-                    } else {
-                        self.exec("ROLLBACK");
+                    // RAISE(ROLLBACK) can end the transaction before control
+                    // returns here. Cleanup errors must not replace `error`.
+                    if (self.isTransaction === true) {
+                        if (nested) {
+                            try {
+                                self.exec("ROLLBACK TO mc_tx_sp");
+                                if (self.isTransaction === true) self.exec("RELEASE mc_tx_sp");
+                            } catch {
+                                // Rollback failures must not replace the callback exception.
+                            }
+                        } else {
+                            try {
+                                self.exec("ROLLBACK");
+                            } catch {
+                                // Rollback failures must not replace the callback exception.
+                            }
+                        }
                     }
                     throw error;
                 }
             };
-            const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+            const wrapped = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("", this, args);
             };
-            wrapped.default = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.default = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("", this, args);
             };
-            wrapped.deferred = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.deferred = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("DEFERRED", this, args);
             };
-            wrapped.immediate = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.immediate = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("IMMEDIATE", this, args);
             };
-            wrapped.exclusive = function (this: unknown, ...args: unknown[]): unknown {
+            wrapped.exclusive = function (
+                this: ThisParameterType<F>,
+                ...args: Parameters<F>
+            ): ReturnType<F> {
                 return execute("EXCLUSIVE", this, args);
             };
+            // SAFETY: attached mode methods match better-sqlite3's transaction wrapper contract.
             return wrapped as unknown as F;
         }
     }
 
+    // SAFETY: NodeSqliteDatabase implements the BetterSqlite3 constructor surface used here.
     return NodeSqliteDatabase as unknown as typeof BetterSqlite3;
 }
 
@@ -277,34 +304,13 @@ export type Database = BetterSqlite3.Database;
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
-const claimCompatStateTableCache = new WeakMap<Database, true>();
-
-// Module mirror transactions must hold BOTH the module-authority privilege
-// and the v84 claims-write capability (KTD6): the two guards live in separate
-// tables so TypeScript claim writers never gain module authority, but a
-// privileged mirror write on a migrated-v84 database would otherwise trip the
-// semantic memory guards. A negative table probe is never cached because a
-// sibling process can migrate the shared file after this handle opened.
-// Exported as the single v84 schema probe: `hasMemoryClaimsCompatSchema`
-// delegates here so both callers share one positive-only cache.
-export function hasClaimCompatibilityWriteState(db: Database): boolean {
-    if (claimCompatStateTableCache.get(db)) return true;
-    const present = Boolean(
-        db
-            .prepare(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_compatibility_write_state'",
-            )
-            .get(),
-    );
-    if (present) claimCompatStateTableCache.set(db, true);
-    return present;
-}
 
 /**
  * True while the connection holds an open transaction. bun:sqlite and
  * better-sqlite3 expose `inTransaction`; node:sqlite exposes `isTransaction`.
  */
 export function isInTransaction(db: Database): boolean {
+    // SAFETY: this assertion permits probing transaction-state properties absent from Database.
     const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
     return candidate.inTransaction === true || candidate.isTransaction === true;
 }
@@ -334,20 +340,9 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
         db.prepare(
             "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
         ).run();
-        const claimsCapable = hasClaimCompatibilityWriteState(db);
-        if (claimsCapable) {
-            db.prepare(
-                "INSERT INTO claim_compatibility_write_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
-            ).run();
-        }
         const result = operation();
         if (previousDepth === 0) {
             db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
-            if (claimsCapable) {
-                db.prepare(
-                    "UPDATE claim_compatibility_write_state SET enabled = 0 WHERE id = 1",
-                ).run();
-            }
         }
         if (nested) {
             db.exec(`RELEASE ${savepoint}`);
@@ -371,4 +366,167 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
         }
         throw error;
     }
+}
+
+// ---------------------------------------------------------------------------
+// U1 direct-cutover groundwork (KTD2, R17): off-path SQLite source probe and
+// connection-contract verification. Pure helpers plus one off-path opener —
+// nothing here is wired into the production open path yet (U8 activates it).
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimum SQLite release whose WAL machinery carries the wal-reset fix
+ * (https://www.sqlite.org/wal.html#walresetbug, fixed in 3.47.1). Writers on
+ * an older source may corrupt a shared WAL family and must not open it.
+ */
+export const SQLITE_WAL_RESET_SAFE_MIN_VERSION = "3.47.1";
+
+/** Node floor whose node:sqlite ships a WAL-reset-safe SQLite (KTD2). */
+export const MIN_SUPPORTED_NODE_VERSION = "24.15.0";
+
+/** Bun floor whose bun:sqlite ships a WAL-reset-safe SQLite (KTD2). */
+export const MIN_SUPPORTED_BUN_VERSION = "1.3.14";
+
+/** `sqlite_source_id()` shape: `YYYY-MM-DD HH:MM:SS <commit hash>`. */
+const SQLITE_SOURCE_ID_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [0-9a-f]{40,64}$/;
+
+export interface SqliteEngineIdentity {
+    readonly sqliteVersion: string;
+    readonly sqliteSourceId: string;
+}
+
+/** Read `sqlite_version()` / `sqlite_source_id()` from an open connection. */
+export function readSqliteEngineIdentity(db: Database): SqliteEngineIdentity {
+    const row = db
+        .prepare("SELECT sqlite_version() AS version, sqlite_source_id() AS source_id")
+        .get() as { version: string; source_id: string };
+    return { sqliteVersion: String(row.version), sqliteSourceId: String(row.source_id) };
+}
+
+/**
+ * Probe the runtime's SQLite engine off-path: a throwaway in-memory
+ * connection, never the real database file, so an unsafe engine is detected
+ * before it can touch a shared WAL family.
+ */
+export function probeSqliteEngineIdentityOffPath(): SqliteEngineIdentity {
+    const probe = new Database(":memory:");
+    try {
+        return readSqliteEngineIdentity(probe);
+    } finally {
+        probe.close();
+    }
+}
+
+/** Parse a dotted version into numeric parts; null when not parseable. */
+function parseDottedVersion(version: string): number[] | null {
+    const match = version.trim().match(/^(\d+)\.(\d+)(?:\.(\d+))?/);
+    if (!match) return null;
+    return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
+}
+
+export function isVersionAtLeast(candidate: string, floor: string): boolean {
+    const left = parseDottedVersion(candidate);
+    const right = parseDottedVersion(floor);
+    if (!left || !right) return false;
+    for (let index = 0; index < 3; index += 1) {
+        if (left[index] !== right[index]) return left[index] > right[index];
+    }
+    return true;
+}
+
+export interface SqliteRuntimeGateInput extends SqliteEngineIdentity {
+    readonly runtime: SqliteRuntime;
+    /** `process.versions.bun` or `process.versions.node`. */
+    readonly runtimeVersion: string;
+}
+
+export interface SqliteRuntimeGateResult {
+    readonly ok: boolean;
+    readonly reasons: readonly string[];
+}
+
+/**
+ * Pure WAL-reset-safety gate (KTD2). The engine identity is authoritative:
+ * a wrapper or runtime version alone never passes, and an unknown
+ * `sqlite_source_id()` fails closed because the source cannot be proven safe.
+ */
+export function evaluateSqliteRuntimeGate(input: SqliteRuntimeGateInput): SqliteRuntimeGateResult {
+    const reasons: string[] = [];
+    const runtimeFloor =
+        input.runtime === "Bun" ? MIN_SUPPORTED_BUN_VERSION : MIN_SUPPORTED_NODE_VERSION;
+    if (!isVersionAtLeast(input.runtimeVersion, runtimeFloor)) {
+        reasons.push(
+            `${input.runtime} ${input.runtimeVersion} is below the supported floor ${runtimeFloor}`,
+        );
+    }
+    if (!isVersionAtLeast(input.sqliteVersion, SQLITE_WAL_RESET_SAFE_MIN_VERSION)) {
+        reasons.push(
+            `SQLite ${input.sqliteVersion} predates the WAL-reset fix in ${SQLITE_WAL_RESET_SAFE_MIN_VERSION}`,
+        );
+    }
+    if (!SQLITE_SOURCE_ID_PATTERN.test(input.sqliteSourceId)) {
+        reasons.push(
+            `sqlite_source_id() '${input.sqliteSourceId}' is not a recognized SQLite source identity`,
+        );
+    }
+    return { ok: reasons.length === 0, reasons };
+}
+
+/** Gather the live gate input for the current runtime (off-path probe). */
+export function collectSqliteRuntimeGateInput(): SqliteRuntimeGateInput {
+    const runtime = detectSqliteRuntime();
+    const runtimeVersion =
+        runtime === "Bun" ? (process.versions.bun ?? "0.0.0") : (process.versions.node ?? "0.0.0");
+    return { runtime, runtimeVersion, ...probeSqliteEngineIdentityOffPath() };
+}
+
+export interface SqliteConnectionContractExpectations {
+    /** Require `journal_mode=wal`; false for in-memory or non-WAL scratch databases. */
+    readonly expectWal: boolean;
+    readonly minBusyTimeoutMs?: number;
+    /** Allowed `PRAGMA synchronous` levels; OFF (0) is never acceptable for writers. */
+    readonly allowedSynchronous?: readonly number[];
+}
+
+/**
+ * Verify the per-connection contract (R17) after PRAGMAs are applied and
+ * before application writes: foreign keys enforced, WAL actually activated,
+ * a busy timeout installed, and a declared synchronous mode. Returns every
+ * violation; callers fail closed on a nonempty list.
+ */
+export function verifySqliteConnectionContract(
+    db: Database,
+    expectations: SqliteConnectionContractExpectations,
+): string[] {
+    const violations: string[] = [];
+    const foreignKeys = Number(
+        (db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number }).foreign_keys,
+    );
+    if (foreignKeys !== 1) violations.push("foreign_keys is disabled");
+    const journalMode = String(
+        (db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode,
+    ).toLowerCase();
+    if (expectations.expectWal && journalMode !== "wal") {
+        violations.push(`journal_mode is '${journalMode}', expected 'wal'`);
+    }
+    const busyTimeoutMs = Number(
+        (db.prepare("PRAGMA busy_timeout").get() as { timeout: number }).timeout,
+    );
+    const minBusyTimeoutMs = expectations.minBusyTimeoutMs ?? 1;
+    if (!Number.isFinite(busyTimeoutMs) || busyTimeoutMs < minBusyTimeoutMs) {
+        violations.push(
+            `busy_timeout ${busyTimeoutMs}ms is below the required ${minBusyTimeoutMs}ms`,
+        );
+    }
+    const synchronous = Number(
+        (db.prepare("PRAGMA synchronous").get() as { synchronous: number }).synchronous,
+    );
+    // 1=NORMAL, 2=FULL, 3=EXTRA; 0=OFF forfeits WAL durability guarantees.
+    const allowedSynchronous = expectations.allowedSynchronous ?? [1, 2, 3];
+    if (!allowedSynchronous.includes(synchronous)) {
+        violations.push(
+            `synchronous mode ${synchronous} is not in the declared set [${allowedSynchronous.join(", ")}]`,
+        );
+    }
+    return violations;
 }

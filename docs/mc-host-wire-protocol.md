@@ -121,11 +121,13 @@ The host additionally maintains `${dataDir}/cortexkit/run/mc-host-lifecycle.json
   "phase": "running",
   "launch_id": "<32 lowercase hex>",
   "daemon_id": "<32 lowercase hex>",
-  "payload_manifest_digest": "",
+  "payload_manifest_digest": "<64 lowercase hex>",
   "pid": 4242,
   "written_at_ms": 1755838080000
 }
 ```
+
+`payload_manifest_digest` is the canonical 64-character lowercase-hex payload manifest digest. Exactly one other value is accepted: the empty string, which is the pre-coordination legacy shape written by releases that predate the digest and is read as a legacy record rather than a current one. Any other value is corruption and the record is rejected as malformed.
 
 `phase` is `starting` (after lock acquisition, before publication), `running` (after publication), or `stopping` (from graceful-shutdown step 1). `pid` is display metadata only: no reader may signal it, infer liveness from it, or authorize anything with it. Record cleanup is fenced by matching launch and daemon identity and runs under the instance lock before lock release, mirroring publication cleanup.
 

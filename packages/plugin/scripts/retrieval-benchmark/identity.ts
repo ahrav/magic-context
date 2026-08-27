@@ -13,7 +13,7 @@
 import {
     PHYSICAL_LOCATOR_KINDS,
     parsePhysicalResultLocator,
-} from "../../src/features/magic-context/search-result-locator";
+} from "./physical-locator";
 import { canonicalFingerprint } from "./canonical-json";
 import type { CorpusDocument } from "./contract";
 

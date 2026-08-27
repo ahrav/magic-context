@@ -2,122 +2,84 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { getMemoriesByProject, insertMemory, setMemoryClassification } from "../memory";
 import {
-    recordDispositionEventInCurrentTransaction,
-    refreshEffectivePolicyInCurrentTransaction,
-} from "../memory/storage-claim-policy";
-import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "../memory/storage-claims";
+    type ProjectMemoryClaimSnapshot,
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "../memory/storage-claim-current-state";
 import {
-    getCurrentMemoryClaimByLegacyMemoryId,
-    runInMemoryClaimsWriteTransaction,
-    updateMemoryVerificationWithClaimsInCurrentTransaction,
-} from "../memory/storage-memory-claims";
-import type { Memory } from "../memory/types";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+    createClaimReaderTestDatabase,
+    type SeededProjectMemoryClaim,
+    seedProjectMemoryClaim,
+} from "../test-claim-database";
 import { ensureMuralRendered, muralCoverageGate } from "./render-trigger";
 import { resolveMural } from "./resolve-mural";
 import { getMural } from "./storage-mural";
-import { computeCueContentHash, setMuralCue } from "./storage-mural-cues";
-
-function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
-    return db;
-}
+import { setClaimMuralCue } from "./storage-mural-cues";
 
 /** The gated pool `ensureMuralRendered` builds a mural from. */
-function muralPool(db: Database, projectIdentity: string) {
-    return filterMemoriesByPolicy(
-        db,
-        getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
-        "auto_inject",
-    ).memories;
+function muralPool(db: Database, projectIdentity: string): ProjectMemoryClaimSnapshot[] {
+    const result = readProjectMemoryCurrentState(db, {
+        projectIds: resolveProjectIdsForIdentities(db, [projectIdentity]),
+        surface: "auto_inject",
+    });
+    if (result.status !== "ok") throw new Error("mural pool read was stale");
+    return result.items;
 }
 
-/** Promote a memory to VERIFIED so it passes the auto_inject policy gate. */
-function verifyMemory(db: Database, memoryId: number): void {
-    runInMemoryClaimsWriteTransaction(db, () =>
-        updateMemoryVerificationWithClaimsInCurrentTransaction(
-            db,
-            {
-                producer: "mural-test",
-                operationKey: `verify:${memoryId}`,
-                requestDigest: sha256Utf8Hex(`verify:${memoryId}`),
-            },
-            { memoryId, verificationStatus: "verified" },
-        ),
-    );
-}
-
-/**
- * Insert a memory, classify its importance, give it a hash-current cue, and
- * verify it.
- *
- * The mural is an automatic injection channel, so it renders only rows that
- * pass the `auto_inject` policy gate (effective VERIFIED+). A freshly inserted
- * memory projects as CANDIDATE and is correctly invisible to the mural, so the
- * verification step is what makes these fixtures represent a renderable pool.
- */
-function seedCuedMemory(
+/** Seed one claim with a cue keyed to its current revision locator. */
+function seedCuedClaim(
     db: Database,
     project: string,
-    category: Memory["category"],
+    category: string,
     content: string,
     importance: number,
-): Memory {
-    const memory = insertMemory(db, {
-        projectPath: project,
-        category,
+): SeededProjectMemoryClaim {
+    const claim = seedProjectMemoryClaim(db, {
+        projectIdentity: project,
         content,
-        sourceSessionId: "s",
+        category,
+        importance,
     });
-    setMemoryClassification(db, memory.id, { importance });
-    verifyMemory(db, memory.id);
-    setMuralCue(
-        db,
-        memory.projectPath,
-        memory.id,
-        `cue-${memory.id}`,
-        computeCueContentHash(content),
-    );
-    return memory;
+    setClaimMuralCue(db, {
+        publicClaimId: claim.publicClaimId,
+        revisionLocator: claim.revisionLocator,
+        cue: `cue-${claim.publicClaimId.slice(0, 12)}`,
+    });
+    return claim;
 }
 
-/** A verified (policy-eligible) memory with no mural cue. */
-function seedUncuedMemory(
-    db: Database,
-    project: string,
-    category: Memory["category"],
-    content: string,
-): Memory {
-    const memory = insertMemory(db, {
-        projectPath: project,
-        category,
-        content,
-        sourceSessionId: "s",
-    });
-    verifyMemory(db, memory.id);
-    return memory;
+function quarantineClaim(db: Database, claim: SeededProjectMemoryClaim): void {
+    const row = db
+        .prepare(
+            `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+               FROM claim_public_ids
+               JOIN claims ON claims.id = claim_public_ids.claim_id
+              WHERE claim_public_ids.public_id = ?`,
+        )
+        .get(claim.publicClaimId) as { revisionId: number; projectId: number };
+    db.transaction(() => {
+        db.prepare(
+            `INSERT INTO claim_disposition_events
+                (revision_id, project_id, disposition, action, actor, policy_version, recorded_at)
+             VALUES (?, ?, 'quarantined', 'assert', 'user:test', 1, ?)`,
+        ).run(row.revisionId, row.projectId, Date.now());
+        db.prepare(
+            "UPDATE claim_effective_policy SET hard_hidden = 1, auto_eligible = 0, explicit_eligible = 0 WHERE revision_id = ?",
+        ).run(row.revisionId);
+    }).immediate();
 }
 
 describe("resolveMural", () => {
-    test("keeps the claim-backed projection reader shape and bytes unchanged", () => {
-        const db = freshDb();
+    test("resolves claim entries with canonical locators and no legacy memory read", () => {
+        const db = createClaimReaderTestDatabase();
         try {
-            const project = "git:u6-mural-reader";
+            const project = "git:u3-mural-reader";
             const content = "mural projection bytes: café";
-            const memory = seedCuedMemory(db, project, "ARCHITECTURE", content, 73);
-            expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(content);
+            const claim = seedCuedClaim(db, project, "ARCHITECTURE", content, 73);
 
-            // The pool is policy-filtered by the CALLER (that read touches
-            // claim tables by design); the assertion below is that the mural
-            // resolver itself stays a memories-only reader.
             const pool = muralPool(db, project);
             const statements: string[] = [];
             const originalPrepare = db.prepare.bind(db);
@@ -132,22 +94,18 @@ describe("resolveMural", () => {
                 db.prepare = originalPrepare;
             }
 
-            const expected = [
+            expect(entries).toEqual([
                 {
-                    id: memory.id,
+                    publicClaimId: claim.publicClaimId,
+                    revisionLocator: claim.revisionLocator,
                     category: "ARCHITECTURE",
                     importance: 73,
-                    cue: `cue-${memory.id}`,
+                    cue: `cue-${claim.publicClaimId.slice(0, 12)}`,
                 },
-            ];
-            expect(entries).toEqual(expected);
-            expect(Buffer.from(JSON.stringify(entries))).toEqual(
-                Buffer.from(JSON.stringify(expected)),
-            );
-            expect(statements.some((sql) => /\bmemories\b/i.test(sql))).toBeTrue();
+            ]);
             expect(
                 statements.some((sql) =>
-                    /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql),
+                    /\bmemories\b|\bmemory_stats\b|\bmemory_verifications\b/i.test(sql),
                 ),
             ).toBeFalse();
         } finally {
@@ -156,24 +114,22 @@ describe("resolveMural", () => {
     });
 
     test("selects only the overflow complement of the budget trim", () => {
-        const db = freshDb();
+        const db = createClaimReaderTestDatabase();
         try {
             const project = "git:p";
-            // A tiny budget so almost everything overflows. Seed enough memories
-            // that the trim keeps a few and drops the rest.
-            const ids: number[] = [];
+            const ids: string[] = [];
             for (let i = 0; i < 30; i++) {
-                const m = seedCuedMemory(
+                const claim = seedCuedClaim(
                     db,
                     project,
                     "ARCHITECTURE",
                     `memory number ${i} with enough text to cost tokens in the budget accounting`,
                     50,
                 );
-                ids.push(m.id);
+                ids.push(claim.publicClaimId);
             }
             const entries = resolveMural(db, project, 200, muralPool(db, project));
-            // Some memories fit the 200-token budget (excluded from the mural),
+            // Some claims fit the 200-token budget (excluded from the mural),
             // the rest overflow (included). So the mural is a strict subset.
             expect(entries.length).toBeGreaterThan(0);
             expect(entries.length).toBeLessThan(ids.length);
@@ -182,70 +138,86 @@ describe("resolveMural", () => {
         }
     });
 
-    test("excludes memories with no cue or a stale cue (absent until compressed)", () => {
-        const db = freshDb();
+    test("excludes claims with no cue, a locator-stale cue, or an old renderer epoch", () => {
+        const db = createClaimReaderTestDatabase();
         try {
             const project = "git:p";
-            // One cued, one un-cued, both overflow under a tiny budget.
-            const cued = seedCuedMemory(db, project, "ARCHITECTURE", "cued fact here", 50);
-            const unCued = insertMemory(db, {
-                projectPath: project,
-                category: "ARCHITECTURE",
+            const cued = seedCuedClaim(db, project, "ARCHITECTURE", "cued fact here", 50);
+            const unCued = seedProjectMemoryClaim(db, {
+                projectIdentity: project,
                 content: "uncompressed fact",
-                sourceSessionId: "s",
-            });
-            setMemoryClassification(db, unCued.id, { importance: 50 });
-            // A stale cue: hash points at different content.
-            const stale = insertMemory(db, {
-                projectPath: project,
                 category: "ARCHITECTURE",
-                content: "current content",
-                sourceSessionId: "s",
+                importance: 50,
             });
-            setMemoryClassification(db, stale.id, { importance: 50 });
-            setMuralCue(
-                db,
-                stale.projectPath,
-                stale.id,
-                "stale cue",
-                computeCueContentHash("OLD content"),
-            );
+            // The cue below uses a locator that is not current.
+            const stale = seedProjectMemoryClaim(db, {
+                projectIdentity: project,
+                content: "current content",
+                category: "ARCHITECTURE",
+                importance: 50,
+            });
+            setClaimMuralCue(db, {
+                publicClaimId: stale.publicClaimId,
+                revisionLocator: `${stale.publicClaimId}/r1/${"0".repeat(64)}`,
+                cue: "stale cue",
+            });
+            // Current locator, older renderer epoch.
+            const oldEpoch = seedProjectMemoryClaim(db, {
+                projectIdentity: project,
+                content: "old renderer epoch content",
+                category: "ARCHITECTURE",
+                importance: 50,
+            });
+            setClaimMuralCue(db, {
+                publicClaimId: oldEpoch.publicClaimId,
+                revisionLocator: oldEpoch.revisionLocator,
+                cue: "old epoch cue",
+            });
+            db.prepare(
+                `UPDATE claim_mural_cues SET renderer_epoch = renderer_epoch + 1
+                  WHERE claim_id = (SELECT claim_id FROM claim_public_ids WHERE public_id = ?)`,
+            ).run(oldEpoch.publicClaimId);
 
             const entries = resolveMural(db, project, 1, muralPool(db, project));
-            const idsOut = entries.map((entry) => entry.id);
-            expect(idsOut).toContain(cued.id);
-            expect(idsOut).not.toContain(unCued.id);
-            expect(idsOut).not.toContain(stale.id);
+            const idsOut = entries.map((entry) => entry.publicClaimId);
+            expect(idsOut).toContain(cued.publicClaimId);
+            expect(idsOut).not.toContain(unCued.publicClaimId);
+            expect(idsOut).not.toContain(stale.publicClaimId);
+            expect(idsOut).not.toContain(oldEpoch.publicClaimId);
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("orders by category band, then importance DESC, then id ASC (append-stable)", () => {
-        const db = freshDb();
+    test("orders by category band, then importance DESC, then public claim id ASC", () => {
+        const db = createClaimReaderTestDatabase();
         try {
             const project = "git:p";
-            // NAMING sorts after ARCHITECTURE; within a band, higher importance
-            // first, then lower id first.
-            const archLow = seedCuedMemory(db, project, "ARCHITECTURE", "arch low imp", 40);
-            const archHigh = seedCuedMemory(db, project, "ARCHITECTURE", "arch high imp", 90);
-            const naming = seedCuedMemory(db, project, "NAMING", "naming fact", 90);
+            const archLow = seedCuedClaim(db, project, "ARCHITECTURE", "arch low imp", 40);
+            const archHigh = seedCuedClaim(db, project, "ARCHITECTURE", "arch high imp", 90);
+            const naming = seedCuedClaim(db, project, "NAMING", "naming fact", 90);
 
             const entries = resolveMural(db, project, 1, muralPool(db, project));
-            const order = entries.map((entry) => entry.id);
+            const order = entries.map((entry) => entry.publicClaimId);
             // ARCHITECTURE band first (high before low), then NAMING band.
-            expect(order.indexOf(archHigh.id)).toBeLessThan(order.indexOf(archLow.id));
-            expect(order.indexOf(archLow.id)).toBeLessThan(order.indexOf(naming.id));
-
-            // Append-stability: inserting a NEW same-band, same-importance memory
-            // (a higher id) must land AFTER the existing one, never reshuffle it.
-            const archHigh2 = seedCuedMemory(db, project, "ARCHITECTURE", "arch high 2", 90);
-            const after = resolveMural(db, project, 1, muralPool(db, project)).map(
-                (entry) => entry.id,
+            expect(order.indexOf(archHigh.publicClaimId)).toBeLessThan(
+                order.indexOf(archLow.publicClaimId),
             );
-            expect(after.indexOf(archHigh.id)).toBeLessThan(after.indexOf(archHigh2.id));
-            // The pre-existing relative order (archHigh before archLow) is intact.
-            expect(after.indexOf(archHigh.id)).toBeLessThan(after.indexOf(archLow.id));
+            expect(order.indexOf(archLow.publicClaimId)).toBeLessThan(
+                order.indexOf(naming.publicClaimId),
+            );
+
+            // Claims with equal importance within a category band sort by
+            // public claim ID ascending.
+            const archHigh2 = seedCuedClaim(db, project, "ARCHITECTURE", "arch high 2", 90);
+            const after = resolveMural(db, project, 1, muralPool(db, project)).map(
+                (entry) => entry.publicClaimId,
+            );
+            const expectedPair = [archHigh.publicClaimId, archHigh2.publicClaimId].sort();
+            expect(after.filter((id) => expectedPair.includes(id))).toEqual(expectedPair);
+            expect(after.indexOf(archHigh.publicClaimId)).toBeLessThan(
+                after.indexOf(archLow.publicClaimId),
+            );
         } finally {
             closeQuietly(db);
         }
@@ -261,17 +233,19 @@ describe("mural coverage gate", () => {
     });
 
     test("skips rendering and explains a near-empty cue pool", () => {
-        const db = freshDb();
+        const db = createClaimReaderTestDatabase();
         try {
             const project = "git:coverage-gate";
             for (let i = 0; i < 40; i++) {
                 if (i < 10) {
-                    seedCuedMemory(db, project, "ARCHITECTURE", `cued fact ${i}`, 50);
+                    seedCuedClaim(db, project, "ARCHITECTURE", `cued fact ${i}`, 50);
                 } else {
-                    // Uncued but still policy-eligible: coverage is measured
-                    // over the pool the mural may actually render, so these
-                    // must pass the auto_inject gate to dilute it.
-                    seedUncuedMemory(db, project, "ARCHITECTURE", `uncued fact ${i}`);
+                    seedProjectMemoryClaim(db, {
+                        projectIdentity: project,
+                        content: `uncued fact ${i}`,
+                        category: "ARCHITECTURE",
+                        importance: 50,
+                    });
                 }
             }
             const result = ensureMuralRendered(db, project, 1);
@@ -283,14 +257,14 @@ describe("mural coverage gate", () => {
         }
     });
 
-    test("a quarantined memory is excluded from the mural pool and its image", () => {
-        const db = freshDb();
+    test("a quarantined claim is excluded from the mural pool and its image", () => {
+        const db = createClaimReaderTestDatabase();
         try {
             const project = "git:mural-policy";
             for (let i = 0; i < 6; i++) {
-                seedCuedMemory(db, project, "ARCHITECTURE", `visible mural fact ${i}`, 50);
+                seedCuedClaim(db, project, "ARCHITECTURE", `visible mural fact ${i}`, 50);
             }
-            const hidden = seedCuedMemory(
+            const hidden = seedCuedClaim(
                 db,
                 project,
                 "ARCHITECTURE",
@@ -300,37 +274,19 @@ describe("mural coverage gate", () => {
             // The mural is an image, so absence has to be asserted on the
             // resolved entries: a hard-hidden row must never reach the render.
             const before = resolveMural(db, project, 1, muralPool(db, project));
-            expect(before.map((entry) => entry.id)).toContain(hidden.id);
+            expect(before.map((entry) => entry.publicClaimId)).toContain(hidden.publicClaimId);
 
-            const link = getCurrentMemoryClaimByLegacyMemoryId(db, hidden.id);
-            if (!link) throw new Error("expected a claim link for the seeded memory");
-            runInMemoryClaimsWriteTransaction(db, () => {
-                recordDispositionEventInCurrentTransaction(db, {
-                    revisionId: link.revisionId,
-                    projectId: link.projectId,
-                    disposition: "quarantined",
-                    action: "assert",
-                    actor: "host",
-                });
-                refreshEffectivePolicyInCurrentTransaction(db, link.revisionId);
-                return undefined;
-            });
+            quarantineClaim(db, hidden);
 
             const after = resolveMural(db, project, 1, muralPool(db, project));
-            expect(after.map((entry) => entry.id)).not.toContain(hidden.id);
-            // And the injection path agrees: the PERSISTED manifest is the
-            // artifact later renders serve from, so absence must hold on its
-            // stored memory ids, not just on a fresh resolver pass.
+            expect(after.map((entry) => entry.publicClaimId)).not.toContain(hidden.publicClaimId);
+            // The PERSISTED manifest is the artifact later renders serve
+            // from, so absence must hold on its stored claim ids too.
             const rendered = ensureMuralRendered(db, project, 1);
             expect(rendered.hasMural).toBe(true);
             const persisted = getMural(db, project);
             if (!persisted) throw new Error("expected a persisted mural manifest");
-            expect(persisted.memoryIds).not.toContain(hidden.id);
-            expect(
-                resolveMural(db, project, 1, muralPool(db, project)).some(
-                    (entry) => entry.id === hidden.id,
-                ),
-            ).toBe(false);
+            expect(persisted.memoryIds).not.toContain(hidden.publicClaimId);
         } finally {
             closeQuietly(db);
         }
@@ -339,11 +295,11 @@ describe("mural coverage gate", () => {
 
 describe("ensureMuralRendered (on-demand render + change detection)", () => {
     test("first render stores a row; unchanged pool does not re-render", () => {
-        const db = freshDb();
+        const db = createClaimReaderTestDatabase();
         try {
             const project = "git:p";
             for (let i = 0; i < 25; i++) {
-                seedCuedMemory(
+                seedCuedClaim(
                     db,
                     project,
                     "ARCHITECTURE",
@@ -371,15 +327,13 @@ describe("ensureMuralRendered (on-demand render + change detection)", () => {
     });
 
     test("an empty cue pool yields no mural (m0 omits the block)", () => {
-        const db = freshDb();
+        const db = createClaimReaderTestDatabase();
         try {
-            // Memories exist but none are cued → resolveMural returns [].
             const project = "git:p";
-            insertMemory(db, {
-                projectPath: project,
-                category: "ARCHITECTURE",
+            seedProjectMemoryClaim(db, {
+                projectIdentity: project,
                 content: "uncompressed",
-                sourceSessionId: "s",
+                category: "ARCHITECTURE",
             });
             const result = ensureMuralRendered(db, project, 1);
             expect(result.hasMural).toBe(false);
@@ -390,18 +344,61 @@ describe("ensureMuralRendered (on-demand render + change detection)", () => {
     });
 
     test("a changed cue pool re-renders with a new content hash", () => {
-        const db = freshDb();
+        const db = createClaimReaderTestDatabase();
         try {
             const project = "git:p";
             for (let i = 0; i < 25; i++) {
-                seedCuedMemory(db, project, "ARCHITECTURE", `fact ${i} padding words here now`, 50);
+                seedCuedClaim(db, project, "ARCHITECTURE", `fact ${i} padding words here now`, 50);
             }
             const first = ensureMuralRendered(db, project, 100);
-            // Add a new cued overflow memory → resolved text changes → re-render.
-            seedCuedMemory(db, project, "NAMING", "a brand new naming cue entry appears", 90);
+            // A new cued overflow claim changes the resolved text and
+            // triggers re-rendering.
+            seedCuedClaim(db, project, "NAMING", "a brand new naming cue entry appears", 90);
             const second = ensureMuralRendered(db, project, 100);
             expect(second.rerendered).toBe(true);
             expect(second.contentHash).not.toBe(first.contentHash);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a generation change during render discards the snapshot", () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const project = "git:mural-stale";
+            for (let i = 0; i < 20; i++) {
+                seedCuedClaim(
+                    db,
+                    project,
+                    "ARCHITECTURE",
+                    `stale-check fact ${i} with padding words to overflow`,
+                    50,
+                );
+            }
+            // Writing during the coverage cue-state read creates a
+            // claim-generation race before post-render revalidation.
+            const originalPrepare = db.prepare.bind(db);
+            let fired = false;
+            db.prepare = ((sql: string) => {
+                if (!fired && /claim_mural_cues/.test(sql)) {
+                    fired = true;
+                    db.prepare = originalPrepare;
+                    seedProjectMemoryClaim(db, {
+                        projectIdentity: project,
+                        content: "concurrent write moving the generation",
+                        category: "NAMING",
+                    });
+                }
+                return originalPrepare(sql);
+            }) as typeof db.prepare;
+            let result: ReturnType<typeof ensureMuralRendered>;
+            try {
+                result = ensureMuralRendered(db, project, 100);
+            } finally {
+                db.prepare = originalPrepare;
+            }
+            expect(result.hasMural).toBe(false);
+            expect(result.skipReason).toBe("memory pool changed during render");
         } finally {
             closeQuietly(db);
         }

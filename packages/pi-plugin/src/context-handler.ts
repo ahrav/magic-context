@@ -36,7 +36,6 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { revalidateEnforcementArtifacts } from "@magic-context/core/features/magic-context/claim-policy-backfill";
 import {
 	acquireCompartmentLease,
 	COMPARTMENT_LEASE_RENEWAL_MS,
@@ -45,6 +44,7 @@ import {
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
+import { revalidateEnforcementArtifacts } from "@magic-context/core/features/magic-context/memory/enforcement-artifact-revalidation";
 import {
 	resolveProjectIdentityForSession,
 	resolveProjectRootDirectory,
@@ -139,7 +139,6 @@ import {
 	resolveExecuteThreshold,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
-import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
 	markNoteNudgeDelivered,
 	onNoteTrigger,
@@ -2189,6 +2188,9 @@ export function registerPiContextHandler(
 				const removed = trimPiMessagesToCachedBoundary(
 					options.db,
 					sessionId,
+					// SAFETY: Pi AgentMessage and plugin-core messages share the
+					// id and role fields trimPiMessagesToCachedBoundary reads;
+					// TypeScript cannot unify types from different packages.
 					event.messages as unknown as Parameters<
 						typeof trimPiMessagesToCachedBoundary
 					>[2],
@@ -3055,8 +3057,6 @@ export function registerPiContextHandler(
 							scoreThreshold: options.autoSearch.scoreThreshold,
 							minPromptChars: options.autoSearch.minPromptChars,
 							projectPath: projectIdentity,
-							visibleMemoryIds:
-								getVisibleMemoryIds(options.db, sessionId) ?? null,
 						},
 					});
 				} catch (err) {
@@ -3101,6 +3101,9 @@ export function registerPiContextHandler(
 				) {
 					const isCacheBustingForTodo =
 						isCacheBusting || result.executedWorkThisPass;
+					// SAFETY: Pi AgentMessage and plugin-core messages share the
+					// fields injectSyntheticTodowriteForPi reads and returns;
+					// TypeScript cannot unify types from different packages.
 					outputMessages = injectSyntheticTodowriteForPi({
 						db: options.db,
 						sessionId,

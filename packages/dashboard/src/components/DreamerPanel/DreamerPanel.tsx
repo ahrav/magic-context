@@ -5,7 +5,6 @@ import {
   getAvailableModels,
   getConfig,
   getDreamerProjects,
-  getDreamRunMemoryChanges,
   getDreamRuns,
   getDreamState,
   getProjects,
@@ -17,10 +16,8 @@ import { jsoncErrorMessage, parseJsonc, patchDreamerTasksJsonc } from "../../lib
 import type {
   DreamerProject,
   DreamerProjectTask,
-  DreamMemoryChange,
   DreamRun,
   DreamRunMemoryChanges,
-  DreamRunMemoryDetail,
   DreamRunTask,
   ProjectInfo,
 } from "../../lib/types";
@@ -68,26 +65,6 @@ function formatDuration(ms: number): string {
 function formatTaskLabel(name: string): string {
   // The registry/dream-run task name is "evaluate-smart-notes"; show it tidily.
   return name === "evaluate-smart-notes" ? "smart notes" : name;
-}
-
-function MemoryChangeGroup(props: { label: string; items: DreamMemoryChange[] }) {
-  return (
-    <Show when={props.items.length > 0}>
-      <div class="dream-run-memory-group">
-        <div class="dream-run-memory-group-label">
-          {props.label} ({props.items.length})
-        </div>
-        <For each={props.items}>
-          {(m) => (
-            <div class="dream-run-memory-item">
-              <span class="dream-run-memory-cat">{m.category}</span>
-              <span class="dream-run-memory-content">{m.content}</span>
-            </div>
-          )}
-        </For>
-      </div>
-    </Show>
-  );
 }
 
 // Show input/output directly rather than a single "total". The total summed
@@ -209,52 +186,6 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
         return next;
       });
     }
-  };
-
-  // Lazy per-run memory-change detail (which memories were written/archived/
-  // merged), fetched on first expand and cached by run id. The run row stores
-  // only counts; this reconstructs the actual memories via a time-window query.
-  const [expandedRun, setExpandedRun] = createSignal<number | null>(null);
-  const [memoryDetails, setMemoryDetails] = createSignal<Record<number, DreamRunMemoryDetail>>({});
-  const [memoryErrors, setMemoryErrors] = createSignal<Record<number, string>>({});
-  const [loadingDetail, setLoadingDetail] = createSignal<number | null>(null);
-
-  const loadRunDetail = async (runId: number) => {
-    setLoadingDetail(runId);
-    setMemoryErrors((prev) => {
-      const { [runId]: _removed, ...rest } = prev;
-      return rest;
-    });
-    try {
-      const detail = await getDreamRunMemoryChanges(runId);
-      setMemoryDetails((prev) => ({ ...prev, [runId]: detail }));
-    } catch (e) {
-      // Record the failure per run so the panel can show WHY it's empty and,
-      // crucially, NOT silently re-fire the failing call on every re-expand.
-      // The error sentinel gates the auto-fetch; the user retries explicitly.
-      setMemoryErrors((prev) => ({
-        ...prev,
-        [runId]: e instanceof Error ? e.message : String(e),
-      }));
-    } finally {
-      setLoadingDetail((cur) => (cur === runId ? null : cur));
-    }
-  };
-
-  const toggleRunDetail = (runId: number) => {
-    if (expandedRun() === runId) {
-      setExpandedRun(null);
-      return;
-    }
-    setExpandedRun(runId);
-    if (!memoryDetails()[runId] && !memoryErrors()[runId] && loadingDetail() !== runId) {
-      void loadRunDetail(runId);
-    }
-  };
-
-  const retryRunDetail = (runId: number) => {
-    if (loadingDetail() === runId) return;
-    void loadRunDetail(runId);
   };
 
   const refreshAll = () => {
@@ -685,12 +616,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                       };
                       return (
                         <>
-                          <tr
-                            class={
-                              memChanged() ? "dream-run-flat-row clickable" : "dream-run-flat-row"
-                            }
-                            onClick={() => memChanged() && toggleRunDetail(run.id)}
-                          >
+                          <tr class="dream-run-flat-row">
                             <td>{formatDateTime(run.started_at)}</td>
                             <td>{task() ? formatTaskLabel(task().name) : "—"}</td>
                             <td>
@@ -714,10 +640,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                             <td>{task() ? formatTaskBacklog(task()) : "—"}</td>
                             <td>
                               <Show when={memChanged()} fallback="—">
-                                <span class="dream-run-flat-mem">
-                                  {expandedRun() === run.id ? "▾ " : "▸ "}
-                                  {memSummary()}
-                                </span>
+                                <span class="dream-run-flat-mem">{memSummary()}</span>
                               </Show>
                             </td>
                             <td
@@ -727,52 +650,6 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                               {taskDetail().text ?? "—"}
                             </td>
                           </tr>
-                          <Show when={expandedRun() === run.id && memChanged()}>
-                            <tr class="dream-run-flat-detail-row">
-                              <td colspan="9">
-                                <Show
-                                  when={memoryDetails()[run.id]}
-                                  fallback={
-                                    <div class="dream-run-memory-detail-empty">
-                                      <Show
-                                        when={memoryErrors()[run.id]}
-                                        fallback={
-                                          loadingDetail() === run.id
-                                            ? "Loading…"
-                                            : "No detail available."
-                                        }
-                                      >
-                                        {(message) => (
-                                          <span class="dream-run-memory-detail-error">
-                                            Failed to load memory changes: {message()}{" "}
-                                            <button
-                                              type="button"
-                                              class="dream-run-memory-detail-retry"
-                                              disabled={loadingDetail() === run.id}
-                                              onClick={() => retryRunDetail(run.id)}
-                                            >
-                                              Retry
-                                            </button>
-                                          </span>
-                                        )}
-                                      </Show>
-                                    </div>
-                                  }
-                                >
-                                  {(detail) => (
-                                    <div class="dream-run-memory-detail">
-                                      <MemoryChangeGroup label="Written" items={detail().written} />
-                                      <MemoryChangeGroup label="Merged" items={detail().merged} />
-                                      <MemoryChangeGroup
-                                        label="Archived"
-                                        items={detail().archived}
-                                      />
-                                    </div>
-                                  )}
-                                </Show>
-                              </td>
-                            </tr>
-                          </Show>
                         </>
                       );
                     }}
@@ -921,26 +798,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
 
                                   <Show when={hasMemoryChanges(run.memory_changes_json)}>
                                     <div class="dream-run-memory-section">
-                                      <button
-                                        type="button"
-                                        class="dream-run-memory-title"
-                                        style={{
-                                          cursor: "pointer",
-                                          background: "none",
-                                          border: "none",
-                                          color: "inherit",
-                                          font: "inherit",
-                                          padding: "0",
-                                          display: "flex",
-                                          "align-items": "center",
-                                          gap: "6px",
-                                        }}
-                                        onClick={() => toggleRunDetail(run.id)}
-                                        title="Show which memories changed"
-                                      >
-                                        <span>{expandedRun() === run.id ? "▾" : "▸"}</span>
-                                        <span>Memory Changes</span>
-                                      </button>
+                                      <div class="dream-run-memory-title">Memory Changes</div>
                                       <div class="dream-run-memory-grid">
                                         <Show when={(run.memory_changes_json?.written ?? 0) > 0}>
                                           <div class="dream-run-memory-pill">
@@ -967,54 +825,6 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                                           </div>
                                         </Show>
                                       </div>
-                                      <Show when={expandedRun() === run.id}>
-                                        <Show
-                                          when={memoryDetails()[run.id]}
-                                          fallback={
-                                            <div class="dream-run-memory-detail-empty">
-                                              <Show
-                                                when={memoryErrors()[run.id]}
-                                                fallback={
-                                                  loadingDetail() === run.id
-                                                    ? "Loading…"
-                                                    : "No detail available."
-                                                }
-                                              >
-                                                {(message) => (
-                                                  <span class="dream-run-memory-detail-error">
-                                                    Failed to load memory changes: {message()}{" "}
-                                                    <button
-                                                      type="button"
-                                                      class="dream-run-memory-detail-retry"
-                                                      disabled={loadingDetail() === run.id}
-                                                      onClick={() => retryRunDetail(run.id)}
-                                                    >
-                                                      Retry
-                                                    </button>
-                                                  </span>
-                                                )}
-                                              </Show>
-                                            </div>
-                                          }
-                                        >
-                                          {(detail) => (
-                                            <div class="dream-run-memory-detail">
-                                              <MemoryChangeGroup
-                                                label="Written"
-                                                items={detail().written}
-                                              />
-                                              <MemoryChangeGroup
-                                                label="Merged"
-                                                items={detail().merged}
-                                              />
-                                              <MemoryChangeGroup
-                                                label="Archived"
-                                                items={detail().archived}
-                                              />
-                                            </div>
-                                          )}
-                                        </Show>
-                                      </Show>
                                     </div>
                                   </Show>
                                 </section>
