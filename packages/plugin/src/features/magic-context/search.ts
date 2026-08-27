@@ -2241,7 +2241,16 @@ async function executeUnifiedSearch(args: {
             parent: rootId,
             dependsOn: fusionSpan ? [fusionSpan.id] : [],
         }) ?? null;
-    const results = fused.slice(0, limit);
+    const reservedAntiMemory =
+        (options.memoryPolicySurface ?? "explicit_search") === "auto_search"
+            ? antiMemoryResults[0]
+            : undefined;
+    const results = reservedAntiMemory
+        ? [
+              ...fused.filter((result) => result !== reservedAntiMemory).slice(0, limit - 1),
+              reservedAntiMemory,
+          ].sort(compareUnifiedResults)
+        : fused.slice(0, limit);
     topKSpan?.end("ok", { candidatesIn: fused.length, candidatesOut: results.length });
     if (trace) {
         trace.notApplicable("reranking", "unified", rootId);

@@ -10,6 +10,7 @@ const rawMessagesBySession = new Map<
     Array<{ ordinal: number; id: string; role: string; parts: unknown[] }>
 >();
 
+import { packAutoSearchHint } from "../../hooks/magic-context/auto-search-hint";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     chunkCanonicalText,
@@ -367,6 +368,55 @@ describe("unifiedSearch", () => {
                 },
             ),
         ).toEqual([]);
+    });
+
+    it("reserves an auto-search slot for anti-memory before the global limit", async () => {
+        const project = "git:anti-global-limit";
+        const anti = seedAntiMemory(db, project, "global-limit");
+        const query =
+            "session caching alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma";
+        rawMessagesBySession.set(
+            "session-anti-limit",
+            Array.from({ length: 12 }, (_, index) => ({
+                ordinal: index + 1,
+                id: `strong-${index}`,
+                role: "assistant",
+                parts: [{ type: "text", text: `${query} candidate ${index}` }],
+            })),
+        );
+        ensureMessagesIndexed(db, "session-anti-limit", readMessages);
+        const options = {
+            limit: 3,
+            sources: ["memory", "message"] as Array<"memory" | "message">,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages,
+        };
+
+        const automatic = await unifiedSearch(db, "session-anti-limit", project, query, {
+            ...options,
+            memoryPolicySurface: "auto_search",
+        });
+        expect(automatic).toHaveLength(3);
+        expect(automatic.filter((result) => result.source === "message")).toHaveLength(2);
+        expect(automatic.find((result) => result.source === "anti_memory")).toMatchObject({
+            publicClaimId: anti.publicClaimId,
+        });
+
+        const packed = packAutoSearchHint(automatic);
+        expect(packed.delivered[0]).toMatchObject({
+            source: "anti_memory",
+            publicClaimId: anti.publicClaimId,
+        });
+        expect(packed.text).toContain("⚠ Previously rejected: Redis");
+
+        const explicit = await unifiedSearch(db, "session-anti-limit", project, query, {
+            ...options,
+            limit: 4,
+            memoryPolicySurface: "explicit_search",
+        });
+        expect(explicit).toHaveLength(4);
+        expect(explicit.every((result) => result.source === "message")).toBe(true);
     });
 
     it("embeds anti-memory query and passages through one project provider and fails open", async () => {
