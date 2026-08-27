@@ -895,11 +895,11 @@ impl GenerationStore {
             CurrentProfile::Quarantined => return Err(GenerationError::UnsupportedStateSchema),
         }
         let mut report = PruneReport::default();
-        let entries: Vec<String> = std::fs::read_dir(self.root.join(GENERATIONS_DIR_NAME))
-            .map_err(|_| invalid("generations directory read failed"))?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect();
+        // Enumerated through the pinned descriptor, not the canonical pathname:
+        // every removal below acts on `generations_fd`, so selecting names from a
+        // re-resolved path would let a replacement directory holding chosen names
+        // drive deletions inside the retained store.
+        let entries = read_dir_names(&self.generations_fd)?;
         for name in entries {
             if let Some(_rest) = name.strip_prefix(STAGING_TEMP_PREFIX) {
                 remove_tree(&self.generations_fd, &name)?;

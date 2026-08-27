@@ -664,27 +664,36 @@ fn start_phase(
         Err(_) => return resolved_but_failed("stopped", "internal_error"),
     };
     loop {
+        // Authentication alone does not prove *this* root has a serving daemon: a
+        // still-valid publication left in the runtime directory authenticates
+        // whichever endpoint it names, which need not be the child being waited
+        // on. A coherent `Running` probe is the local evidence that a lock-held
+        // incarnation exists here, and the daemon publishes only after taking its
+        // fences, so requiring it costs nothing on the success path.
         if publication.exists() && runtime.authenticate(&publication, deadline) {
-            let observed = probe().ok();
-            let daemon_ver = observed.as_ref().and_then(publication_daemon_ver);
-            if let Some(daemon_ver) = &daemon_ver {
-                if !daemon_version_compatible(daemon_ver) {
+            if let Ok(observed) = probe() {
+                if observed.state == LifecycleState::Running {
+                    let daemon_ver = publication_daemon_ver(&observed);
+                    if let Some(daemon_ver) = &daemon_ver {
+                        if !daemon_version_compatible(daemon_ver) {
+                            return StartOutcome {
+                                ok: false,
+                                state: "running",
+                                reason: "incompatible_daemon",
+                                daemon_ver: Some(daemon_ver.clone()),
+                                generation_check: Some(("pass", "healthy")),
+                            };
+                        }
+                    }
                     return StartOutcome {
-                        ok: false,
+                        ok: true,
                         state: "running",
-                        reason: "incompatible_daemon",
-                        daemon_ver: Some(daemon_ver.clone()),
+                        reason: "started",
+                        daemon_ver,
                         generation_check: Some(("pass", "healthy")),
                     };
                 }
             }
-            return StartOutcome {
-                ok: true,
-                state: "running",
-                reason: "started",
-                daemon_ver,
-                generation_check: Some(("pass", "healthy")),
-            };
         }
         if Instant::now() >= deadline {
             // A child that exited before publishing — a rejected envelope or a
@@ -731,10 +740,27 @@ fn preflight_generation(
         return Err(("stopped", "unsupported_platform"));
     }
     match payload_dir {
-        // Dev staging prunes, stages, and promotes, so it must stay after the
-        // stop; only its read-only source enumeration is preflighted.
+        // Dev staging prunes, stages, and promotes, so the mutation must stay
+        // after the stop. Everything read-only about it is preflighted here: the
+        // source tree, and the destination store's own state. A quarantined or
+        // insecure store fails staging just as surely as a bad source tree does,
+        // and it is observable under the lock we already hold, so discovering it
+        // after the stop would commit an outage for a condition that was knowable
+        // beforehand.
         Some(dir) => {
             payload_sources(dir)?;
+            // No-create probe: an absent store is fine, staging creates it.
+            if let Some(store) =
+                GenerationStore::open_probe(None).map_err(|e| generation_failure(&e))?
+            {
+                match store.read_current().map_err(|e| generation_failure(&e))? {
+                    mc_host::generation::CurrentProfile::Quarantined => {
+                        return Err(("stopped", "unsupported_state_schema"));
+                    }
+                    mc_host::generation::CurrentProfile::Absent
+                    | mc_host::generation::CurrentProfile::Current(_) => {}
+                }
+            }
             Ok(None)
         }
         // Production resolution is entirely read-only, so it runs in full
