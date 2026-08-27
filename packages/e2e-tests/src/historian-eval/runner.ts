@@ -21,37 +21,58 @@ import {
     extractLatestAssistantText,
 } from "../../../plugin/src/shared/assistant-message-extractor";
 import { extractLatestHistorianReasoning } from "../../../plugin/src/hooks/magic-context/compartment-runner-historian";
-import {
-    readAuthorizedClaimMemorySnapshot,
-} from "../../../plugin/src/features/magic-context/memory/claim-memory-render";
 import { hasClaimMemoryFragment } from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
 import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import { createClaimMemorySchema } from "../../../plugin/src/features/magic-context/storage-claim-memory-schema";
+import {
+    INTERNAL_OPENCODE_AGENT_SIGNATURES,
+    MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
+} from "../../../plugin/src/hooks/magic-context/internal-agent-signatures";
 import { openTestDb } from "../test-db";
 import { TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
-    ballastText,
-    predicateMatches,
+    matchesGold,
     scenarioFingerprint,
     type HistorianEvalScenario,
     type Probe,
 } from "./contract";
+import { ballastProse } from "../ballast";
 import { deriveProtectedTailTokenTarget } from "../../../plugin/src/hooks/magic-context/protected-tail-boundary";
 import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
 } from "../../../plugin/src/hooks/magic-context/derive-budgets";
+import { readInjectedClaims, type InjectedClaimRecord } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
+
+export type { InjectedClaimRecord } from "./claim-read";
 
 export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v1";
 
 /**
+ * The canonical internal-agent signature containing `needle`. Request routing
+ * keys off production's exported signature list rather than a local copy, so a
+ * prompt rewording surfaces as a loud module-load failure here instead of
+ * silently misrouting every scenario into script-drift ERRORs.
+ */
+function requireSignature(signatures: readonly string[], needle: string): string {
+    const found = signatures.find((signature) => signature.includes(needle));
+    if (found === undefined) {
+        throw new Error(`historian-eval: no internal-agent signature contains "${needle}"`);
+    }
+    return found;
+}
+
+/**
  * Marker-based historian request detection (pattern proven by
  * tests/historian-success.test.ts). The historian's system prompt carries
- * this phrase; its user content carries the `<new_messages>` block.
+ * this signature line; its user content carries the `<new_messages>` block.
  */
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
+const HISTORIAN_SYSTEM_MARKER = requireSignature(MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES, "Historian");
+
+/** OpenCode's auxiliary title-generation agent, from the canonical signature list. */
+const TITLE_SYSTEM_MARKER = requireSignature(INTERNAL_OPENCODE_AGENT_SIGNATURES, "title generator");
 
 /** Build turns before the spike; the v3 protected-tail boundary needs mass. */
 const MIN_BUILD_TURNS = 10;
@@ -96,14 +117,6 @@ export interface HistorianRunArtifact {
     factsEmitted: number;
     chunkStartOrdinal: number | null;
     chunkEndOrdinal: number | null;
-}
-
-export interface InjectedClaimRecord {
-    publicClaimId: string;
-    revisionLocator: string;
-    content: string;
-    category: string;
-    revision: number;
 }
 
 export interface ProbeExchange {
@@ -219,7 +232,7 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
 function isTitleRequest(body: Record<string, unknown>): boolean {
     const system = body.system;
     const text = typeof system === "string" ? system : JSON.stringify(system ?? "");
-    return text.includes("title generator");
+    return text.includes(TITLE_SYSTEM_MARKER);
 }
 
 /**
@@ -249,13 +262,22 @@ function allUserText(body: Record<string, unknown>): string {
     return chunks.join("\n");
 }
 
-/** Ordinal range the historian request covers, parsed from `<new_messages>`. */
-function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
+/**
+ * Ordinal range the historian request covers, parsed from the `Messages X-Y:`
+ * chunk header inside `<new_messages>`. `buildCompartmentAgentPrompt` places
+ * the pre-formatted `inputSource` immediately after the opening tag, so the
+ * first header match after the marker is authoritative. Scanning for bare
+ * `[N]` ordinals instead would let bracketed numbers in authored transcript
+ * text or an echoed repair payload corrupt the range and misattribute the
+ * resulting validation failure to the historian (R6).
+ */
+export function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const text = JSON.stringify(body.messages ?? "");
-    if (!text.includes("<new_messages>")) return null;
-    const ordinals = [...text.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
-    if (ordinals.length === 0) return null;
-    return { start: Math.min(...ordinals), end: Math.max(...ordinals) };
+    const markerIndex = text.indexOf("<new_messages>");
+    if (markerIndex === -1) return null;
+    const header = /Messages (\d+)-(\d+):/.exec(text.slice(markerIndex));
+    if (!header) return null;
+    return { start: Number(header[1]), end: Number(header[2]) };
 }
 
 function buildProbePrompt(probe: Probe): string {
@@ -287,6 +309,7 @@ class ScenarioRunner {
     private probeResponseQueue: string[] = [];
     private turnScripts: Array<{ prompt: string; response: MockResponse; hits: number }> = [];
     private historianScriptExhausted = false;
+    private historianRangeUnparseable = false;
     // Partial evidence accumulated as the scenario progresses, so an ERROR
     // record still carries whatever the run produced before the abort (R6).
     private collectedRuns: HistorianRunArtifact[] = [];
@@ -369,8 +392,22 @@ class ScenarioRunner {
             probes: this.collectedProbes,
             verifiedClaimCount: 0,
             contextDbSnapshotPath: snapshotPath,
-            error,
+            // Harness-failure details splice in child stdout/stderr verbatim;
+            // scrub the live credential before the record hits disk.
+            error: { reason: error.reason, detail: this.redactSecrets(error.detail) },
         };
+    }
+
+    /**
+     * Strip the live-mode API key from text destined for durable artifacts
+     * (run records, persisted server logs). The live child process holds the
+     * real key in its environment, and harness error messages and server
+     * stderr are captured unfiltered.
+     */
+    private redactSecrets(text: string): string {
+        const mode = this.options.mode;
+        if (mode.kind !== "live" || mode.apiKey.length === 0) return text;
+        return text.replaceAll(mode.apiKey, "[REDACTED]");
     }
 
     private fillerCount(): number {
@@ -608,8 +645,20 @@ class ScenarioRunner {
             this.historianScriptExhausted = true;
             return { text: POISON_TEXT, usage: { input_tokens: 100, output_tokens: 10 } };
         }
-        const range = findOrdinalRange(body) ?? { start: 1, end: 1 };
-        const text = typeof next === "function" ? next(range) : next;
+        let text: string;
+        if (typeof next === "function") {
+            const range = findOrdinalRange(body);
+            if (range === null) {
+                // A range-taking script cannot cover an unparseable chunk; an
+                // invented range would fail validation and masquerade as
+                // FAIL:invalid-output, so flag it as drift instead (R6).
+                this.historianRangeUnparseable = true;
+                return { text: POISON_TEXT, usage: { input_tokens: 100, output_tokens: 10 } };
+            }
+            text = next(range);
+        } else {
+            text = next;
+        }
         return {
             text,
             usage: { input_tokens: 500, output_tokens: 200, cache_creation_input_tokens: 500 },
@@ -644,7 +693,7 @@ class ScenarioRunner {
             await this.scriptedTurn(
                 harness,
                 sessionId,
-                `Routine progress update. ${ballastText(this.scenario.trigger.ballastTokensPerTurn, index)}`,
+                `Routine progress update. ${ballastProse(this.scenario.trigger.ballastTokensPerTurn)}`,
                 { text: "Noted; continuing with routine work.", usage },
             );
         }
@@ -652,7 +701,7 @@ class ScenarioRunner {
             await this.scriptedTurn(
                 harness,
                 sessionId,
-                `${turn.user} ${ballastText(this.scenario.trigger.ballastTokensPerTurn, fillerCount + index)}`,
+                `${turn.user} ${ballastProse(this.scenario.trigger.ballastTokensPerTurn)}`,
                 { text: turn.assistant, usage },
             );
         }
@@ -663,7 +712,7 @@ class ScenarioRunner {
             await this.scriptedTurn(
                 harness,
                 sessionId,
-                `Wrap-up housekeeping note ${index + 1}. ${ballastText(this.scenario.trigger.ballastTokensPerTurn, paddingBase + index)}`,
+                `Wrap-up housekeeping note ${index + 1}. ${ballastProse(this.scenario.trigger.ballastTokensPerTurn)}`,
                 { text: "Housekeeping acknowledged.", usage },
             );
         }
@@ -692,7 +741,7 @@ class ScenarioRunner {
         await this.scriptedTurn(
             harness,
             sessionId,
-            `Continuing. ${ballastText(trigger.ballastTokensPerTurn, 100 + runIndex)}`,
+            `Continuing. ${ballastProse(trigger.ballastTokensPerTurn)}`,
             {
                 text: "Acknowledged.",
                 usage: {
@@ -862,6 +911,12 @@ class ScenarioRunner {
     private assertNoScriptDrift(harness: TestHarness): void {
         if (this.historianScriptExhausted) {
             throw new RunAbort("script-drift", "historian request arrived after the scripted output queue was exhausted");
+        }
+        if (this.historianRangeUnparseable) {
+            throw new RunAbort(
+                "script-drift",
+                "historian request carried no parseable `Messages X-Y:` chunk header for a range-taking scripted output",
+            );
         }
         const unconsumed = this.turnScripts.filter((entry) => entry.hits === 0).length;
         if (unconsumed > 0) {
@@ -1084,25 +1139,12 @@ class ScenarioRunner {
         const identity = resolveProjectIdentity(harness.opencode.env.workdir);
         const db = openTestDb(harness.contextDbPath(), { readonly: true });
         try {
-            const snapshot = readAuthorizedClaimMemorySnapshot(db, {
-                authorizedIdentities: [identity],
-                ownIdentities: [identity],
-                sharedCategories: [],
-                workspaceEpoch: `historian-eval:${this.scenario.id}`,
-                nowMs,
-            });
-            if (snapshot === null) {
+            const injectedClaims = readInjectedClaims(db, identity, this.scenario.id, nowMs);
+            if (injectedClaims === null) {
                 throw new RunAbort("stale-snapshot", "claim snapshot remained stale after the injection read's retry");
             }
-            const injectedClaims = snapshot.items.map((item) => ({
-                publicClaimId: item.publicClaimId,
-                revisionLocator: item.revisionLocator,
-                content: item.content,
-                category: item.category,
-                revision: item.revision,
-            }));
             const perGoldPredicate = this.scenario.gold.expectedClaims.map((claim) => {
-                const matching = snapshot.items.filter((item) => predicateMatches(claim.predicate, item.content));
+                const matching = injectedClaims.filter((item) => matchesGold(claim, item));
                 return {
                     expectedClaimId: claim.id,
                     claimCount: matching.length,
@@ -1136,9 +1178,13 @@ class ScenarioRunner {
         await Bun.sleep(250);
         try {
             // Server logs are run evidence: infra ERRORs are diagnosed from
-            // them without re-running the scenario.
+            // them without re-running the scenario. Redacted: a live child
+            // holds the real API key in its environment.
             if (this.harness !== null) {
-                writeFileSync(join(this.options.artifactDir, "opencode-stderr.log"), this.harness.opencode.stderr());
+                writeFileSync(
+                    join(this.options.artifactDir, "opencode-stderr.log"),
+                    this.redactSecrets(this.harness.opencode.stderr()),
+                );
             }
         } catch {
             // ignore

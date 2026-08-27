@@ -4,16 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "../../../plugin/src/features/magic-context/compartment-storage";
 import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-context/memory/promotion";
-import { readAuthorizedClaimMemorySnapshot } from "../../../plugin/src/features/magic-context/memory/claim-memory-render";
 import { createProjectMemoryClaim } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../../plugin/src/features/magic-context/memory/storage-claims";
-import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
-import { createClaimMemorySchema } from "../../../plugin/src/features/magic-context/storage-claim-memory-schema";
-import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
-import { Database } from "../../../plugin/src/shared/sqlite";
+import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
+import type { Database } from "../../../plugin/src/shared/sqlite";
+import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 import type { HistorianEvalScenario } from "./contract";
-import { buildHistorianPayload, type PayloadFact } from "./payload";
+import { buildMockHistorianOutput, type MockHistorianFact } from "../mock-historian";
 import type { HistorianEvalRunRecord, HistorianRunArtifact, InjectedClaimRecord, ProbeExchange } from "./runner";
 import { RUN_RECORD_SCHEMA } from "./runner";
 import {
@@ -43,7 +41,7 @@ interface SnapshotFixture {
  * path, and the injected set read through the real injection surface.
  */
 function makeSnapshot(args: {
-    facts: PayloadFact[];
+    facts: MockHistorianFact[];
     compartments?: Array<{ start: number; end: number }>;
     nowMs?: number;
     /** When set, facts are created with this expiry instead of the promotion path. */
@@ -52,10 +50,7 @@ function makeSnapshot(args: {
 }): SnapshotFixture {
     const dir = mkdtempSync(join(tmpdir(), "historian-eval-scorer-"));
     const dbPath = join(dir, "context-db-snapshot.sqlite");
-    const db = new Database(dbPath);
-    initializeDatabase(db);
-    runMigrations(db);
-    db.transaction(() => createClaimMemorySchema(db)).immediate();
+    const { db } = createDirectTestDatabase({ path: dbPath });
     const nowMs = args.nowMs ?? Date.now();
     const compartments = args.compartments ?? [{ start: 1, end: 8 }];
     appendCompartments(
@@ -112,20 +107,7 @@ function makeSnapshot(args: {
     }
     verifyAllActiveClaims(db, PROJECT_IDENTITY, nowMs);
     args.mutate?.(db);
-    const snapshot = readAuthorizedClaimMemorySnapshot(db, {
-        authorizedIdentities: [PROJECT_IDENTITY],
-        ownIdentities: [PROJECT_IDENTITY],
-        sharedCategories: [],
-        workspaceEpoch: "historian-eval:test",
-        nowMs,
-    });
-    const injectedClaims = (snapshot?.items ?? []).map((item) => ({
-        publicClaimId: item.publicClaimId,
-        revisionLocator: item.revisionLocator,
-        content: item.content,
-        category: item.category,
-        revision: item.revision,
-    }));
+    const injectedClaims = readInjectedClaims(db, PROJECT_IDENTITY, "test", nowMs) ?? [];
     return {
         dbPath,
         nowMs,
@@ -295,7 +277,7 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
 
     test("raw output failing validation is a stage outcome, not a crash", () => {
         const scenario = validScenario();
-        const overlapping = buildHistorianPayload({
+        const overlapping = buildMockHistorianOutput({
             compartments: [
                 { start: 1, end: 5, title: "A", body: "a" },
                 { start: 4, end: 8, title: "B", body: "b" },
@@ -304,6 +286,26 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         });
         const result = scoreRawOutput(overlapping, scenario);
         expect(result.stage).toBe("validation-rejected");
+    });
+
+    test("provisional last compartment inside the healing slack is discarded and skips promotion, as production would", () => {
+        const scenario = validScenario();
+        const messageCount = scenario.transcript.turns.length * 2;
+        const output = buildMockHistorianOutput({
+            compartments: [
+                { start: 1, end: messageCount - 4, title: "Kept", body: "kept" },
+                { start: messageCount - 3, end: messageCount, title: "Provisional tail", body: "tail" },
+            ],
+            facts: goldFacts(),
+        });
+        const result = scoreRawOutput(output, scenario);
+        expect(result.stage).toBe("scored");
+        if (result.stage !== "scored") return;
+        // Lookahead margin 0 <= healing slack: production discards the tail
+        // and skips unanchored promotion for the pass, so no gold fact may
+        // score as visible.
+        expect(result.score.recall).toBe(0);
+        expect(result.score.failReasons).toContain("recall");
     });
 });
 
@@ -540,6 +542,53 @@ describe("scoreRunRecord", () => {
             const report = buildLaneReport([score]);
             expect(report.runFatal).toBe(true);
             expect(laneExitCode(report)).toBe(2);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a trimmed probe never converts an independent recall FAIL into ERROR (R6/R7)", () => {
+        const base = validScenario();
+        const scenario: HistorianEvalScenario = {
+            ...base,
+            gold: {
+                ...base.gold,
+                expectedClaims: [
+                    ...base.gold.expectedClaims,
+                    {
+                        id: "exp-never-promoted",
+                        category: "CONSTRAINTS",
+                        predicate: { kind: "normalized-substring", value: "a constraint no run ever promoted" },
+                        sourceTurnRange: [1, 1],
+                    },
+                ],
+            },
+        };
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const record = makeRecord(fixture, scenario);
+            // Trim the capacity claim out of the probe's injected set and
+            // answer wrongly (a trimmed probe), while a different gold claim
+            // is missing from the visible set (recall < 1). Recall evidence
+            // comes from the facts read, independent of the probe tier, so
+            // the trimmed probe must not swallow it into an ERROR.
+            const trimmedLocator = fixture.injectedClaims.find((claim) => claim.content.includes("4096"))
+                ?.revisionLocator;
+            record.probes = record.probes.map((exchange) =>
+                exchange.probeId === "probe-capacity"
+                    ? {
+                          ...exchange,
+                          answerRaw: "wrong",
+                          injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
+                              (locator) => locator !== trimmedLocator,
+                          ),
+                      }
+                    : exchange,
+            );
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("FAIL");
+            expect(score.failReasons).toEqual(["recall"]);
+            expect(score.probeVerdicts.some((verdict) => verdict.outcome === "error-trimmed")).toBe(true);
         } finally {
             fixture.cleanup();
         }

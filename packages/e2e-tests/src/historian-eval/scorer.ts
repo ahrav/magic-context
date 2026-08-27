@@ -18,23 +18,24 @@
 
 import {
     HISTORIAN_BOUNDARY_HEALING_SLACK,
+    shouldDiscardLastHistorianCompartment,
     validateHistorianOutput,
     validateStoredCompartments,
     type HistorianValidationChunk,
 } from "../../../plugin/src/hooks/magic-context/compartment-runner-validation";
 import { appendCompartments } from "../../../plugin/src/features/magic-context/compartment-storage";
-import { readAuthorizedClaimMemorySnapshot } from "../../../plugin/src/features/magic-context/memory/claim-memory-render";
 import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-context/memory/promotion";
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
-import type { Database } from "../../../plugin/src/shared/sqlite";
 import { openTestDb } from "../test-db";
 import {
+    matchesGold,
     normalizeContent,
     predicateMatches,
     type ExpectedClaim,
     type HistorianEvalScenario,
     type Probe,
 } from "./contract";
+import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 import type {
     HistorianEvalRunRecord,
@@ -79,13 +80,6 @@ export type RawOutputStageResult =
     | { stage: "validation-rejected"; error: string }
     | { stage: "scored"; score: ScenarioScore };
 
-interface VisibleClaim {
-    publicClaimId: string;
-    revisionLocator: string;
-    content: string;
-    category: string;
-}
-
 interface FactsScore {
     precision: number | null;
     recall: number | null;
@@ -97,20 +91,21 @@ interface FactsScore {
 }
 
 /**
- * Facts precision/recall against gold, keyed by category + content
- * predicate (R7), plus the separately-reported false-authoritative check
- * (R8). Operates on the injection-visible claim set only: soft-hidden
- * (stale/disputed/superseded) claims never reach this list, which is what
- * makes R3's supersession rule checkable at the scored surface.
+ * Facts precision/recall against gold, keyed by the shared `matchesGold`
+ * rule (category + content predicate, R7), plus the separately-reported
+ * false-authoritative check (R8; `ExpectedAbsent` carries no category, so
+ * that check is predicate-only by construction). Operates on the
+ * injection-visible claim set only: soft-hidden (stale/disputed/superseded)
+ * claims never reach this list, which is what makes R3's supersession rule
+ * checkable at the scored surface.
  */
-function scoreFacts(scenario: HistorianEvalScenario, visible: readonly VisibleClaim[]): FactsScore {
+function scoreFacts(
+    scenario: HistorianEvalScenario,
+    visible: ReadonlyArray<{ category: string; content: string }>,
+): FactsScore {
     const expected = scenario.gold.expectedClaims;
-    const matchedExpected = expected.filter((claim) =>
-        visible.some((item) => item.category === claim.category && predicateMatches(claim.predicate, item.content)),
-    );
-    const matchedVisible = visible.filter((item) =>
-        expected.some((claim) => item.category === claim.category && predicateMatches(claim.predicate, item.content)),
-    );
+    const matchedExpected = expected.filter((claim) => visible.some((item) => matchesGold(claim, item)));
+    const matchedVisible = visible.filter((item) => expected.some((claim) => matchesGold(claim, item)));
     const falseAuthoritativeMatches = scenario.gold.expectedAbsent
         .filter((absent) => visible.some((item) => predicateMatches(absent.predicate, item.content)))
         .map((absent) => absent.id)
@@ -124,23 +119,6 @@ function scoreFacts(scenario: HistorianEvalScenario, visible: readonly VisibleCl
         visibleClaimsTotal: visible.length,
         falseAuthoritativeMatches,
     };
-}
-
-function readVisibleClaims(db: Database, projectIdentity: string, epoch: string, nowMs: number): VisibleClaim[] | null {
-    const snapshot = readAuthorizedClaimMemorySnapshot(db, {
-        authorizedIdentities: [projectIdentity],
-        ownIdentities: [projectIdentity],
-        sharedCategories: [],
-        workspaceEpoch: epoch,
-        nowMs,
-    });
-    if (snapshot === null) return null;
-    return snapshot.items.map((item) => ({
-        publicClaimId: item.publicClaimId,
-        revisionLocator: item.revisionLocator,
-        content: item.content,
-        category: item.category,
-    }));
 }
 
 function structuralFindingsFromRows(
@@ -189,9 +167,7 @@ function healingFindings(record: HistorianEvalRunRecord): string[] {
 
 /** Resolve a gold expected-claim reference to concrete injected claims. */
 function claimsMatchingGold(claim: ExpectedClaim, items: readonly InjectedClaimRecord[]): InjectedClaimRecord[] {
-    return items.filter(
-        (item) => item.category === claim.category && predicateMatches(claim.predicate, item.content),
-    );
+    return items.filter((item) => matchesGold(claim, item));
 }
 
 /**
@@ -257,12 +233,15 @@ function assembleScore(args: {
     if (structuralFindings.length > 0) failReasons.add("structural");
     if (probeVerdicts.some((verdict) => verdict.outcome === "fail")) failReasons.add("probe");
 
-    // Trimmed-by-injection-budget outranks probe-derived FAILs — charging an
-    // injection-budget loss to the historian would violate R6 — but never a
-    // false-authoritative match: that evidence comes from the facts read,
-    // independent of any probe, and is always run-fatal (R8/KTD8).
+    // Trimmed-by-injection-budget outranks probe-derived FAILs ONLY —
+    // charging an injection-budget loss to the historian would violate R6.
+    // Every fail reason derived from evidence independent of the probe tier
+    // stands: false-authoritative (always run-fatal, R8/KTD8), recall,
+    // structural, and invalid-output all come from the facts read or the
+    // persisted rows, so a trimmed probe must not convert them to ERROR.
     const trimmed = probeVerdicts.find((verdict) => verdict.outcome === "error-trimmed");
-    if (trimmed !== undefined && !failReasons.has("false-authoritative")) {
+    const onlyProbeDerivedFails = [...failReasons].every((reason) => reason === "probe");
+    if (trimmed !== undefined && onlyProbeDerivedFails) {
         return {
             ...errorScore(
                 scenarioId,
@@ -322,47 +301,40 @@ export function scoreRawOutput(
     options: { nowMs?: number } = {},
 ): RawOutputStageResult {
     const nowMs = options.nowMs ?? Date.now();
-    const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, syntheticChunk(scenario), [], 1);
+    const chunk = syntheticChunk(scenario);
+    const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, chunk, [], 1);
     if (!validated.ok) {
         return { stage: "validation-rejected", error: validated.error };
     }
 
+    // Mirror production's publish gating (compartment-runner-incremental):
+    // a provisional last compartment inside the healing slack is discarded
+    // and unanchored promotion is skipped for the whole pass, so this seam
+    // persists exactly what production would persist. Without the mirror, a
+    // crafted output production would strip scores as if it published.
+    const discardLast = shouldDiscardLastHistorianCompartment(validated.compartments, chunk);
+    const persisted = discardLast ? validated.compartments.slice(0, -1) : validated.compartments;
+
     const db = createClaimReaderTestDatabase();
     try {
-        appendCompartments(
-            db,
-            RAW_OUTPUT_SESSION_ID,
-            validated.compartments.map((compartment) => ({
-                sequence: compartment.sequence,
-                startMessage: compartment.startMessage,
-                endMessage: compartment.endMessage,
-                startMessageId: compartment.startMessageId,
-                endMessageId: compartment.endMessageId,
-                title: compartment.title,
-                content: compartment.content,
-                p1: compartment.p1,
-                p2: compartment.p2,
-                p3: compartment.p3,
-                p4: compartment.p4,
-                importance: compartment.importance,
-                episodeType: compartment.episodeType,
-            })),
-        );
-        promoteSessionFactsDurable(db, RAW_OUTPUT_SESSION_ID, RAW_OUTPUT_PROJECT_IDENTITY, validated.facts, {
-            producer: "test-historian",
-            runId: `${RAW_OUTPUT_SESSION_ID}:${nowMs}`,
-            leaseKey: `compartment:${RAW_OUTPUT_SESSION_ID}`,
-            leaseGeneration: "historian-eval",
-            batchId: "raw-output",
-        });
-        verifyAllActiveClaims(db, RAW_OUTPUT_PROJECT_IDENTITY, nowMs);
+        appendCompartments(db, RAW_OUTPUT_SESSION_ID, persisted);
+        if (!discardLast) {
+            promoteSessionFactsDurable(db, RAW_OUTPUT_SESSION_ID, RAW_OUTPUT_PROJECT_IDENTITY, validated.facts, {
+                producer: "test-historian",
+                runId: `${RAW_OUTPUT_SESSION_ID}:${nowMs}`,
+                leaseKey: `compartment:${RAW_OUTPUT_SESSION_ID}`,
+                leaseGeneration: "historian-eval",
+                batchId: "raw-output",
+            });
+            verifyAllActiveClaims(db, RAW_OUTPUT_PROJECT_IDENTITY, nowMs);
+        }
 
-        const visible = readVisibleClaims(db, RAW_OUTPUT_PROJECT_IDENTITY, `historian-eval:${scenario.id}`, nowMs);
+        const visible = readInjectedClaims(db, RAW_OUTPUT_PROJECT_IDENTITY, scenario.id, nowMs);
         if (visible === null) {
             // A fresh single-writer temp DB cannot legitimately be stale.
             throw new Error("historian-eval scorer: temp-DB claim snapshot unexpectedly stale");
         }
-        const rows = validated.compartments.map((compartment) => ({
+        const rows = persisted.map((compartment) => ({
             startMessage: compartment.startMessage,
             endMessage: compartment.endMessage,
         }));
@@ -432,12 +404,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
 
     const db = openTestDb(record.contextDbSnapshotPath, { readonly: true });
     try {
-        const visible = readVisibleClaims(
-            db,
-            record.projectIdentity,
-            `historian-eval:${record.scenarioId}`,
-            record.nowMs,
-        );
+        const visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
         if (visible === null) {
             return errorScore(record.scenarioId, "stale-snapshot", "claim snapshot stale after the injection read's retry");
         }

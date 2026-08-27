@@ -619,6 +619,20 @@ export function predicateMatches(predicate: ContentPredicate, content: string): 
 }
 
 /**
+ * Whether an injection-visible claim satisfies a gold expected-claim: same
+ * category AND content predicate match. The one gold↔claim match rule shared
+ * by the runner's per-gold evidence counts and the scorer's facts
+ * precision/recall, so run-record evidence and scored verdicts agree on which
+ * claims count as gold.
+ */
+export function matchesGold(
+    claim: Pick<ExpectedClaim, "category" | "predicate">,
+    item: { category: string; content: string },
+): boolean {
+    return item.category === claim.category && predicateMatches(claim.predicate, item.content);
+}
+
+/**
  * Whether `content` states `value` as a COMPLETE value rather than merely
  * containing its characters.
  *

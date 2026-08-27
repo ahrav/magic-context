@@ -11,8 +11,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseScenario, type HistorianEvalScenario } from "./contract";
-import { buildHistorianPayload } from "./payload";
-import { extractAnswerEnvelope, runScenario, type ScriptedHistorianMode } from "./runner";
+import { buildMockHistorianOutput } from "../mock-historian";
+import { extractAnswerEnvelope, findOrdinalRange, runScenario, type ScriptedHistorianMode } from "./runner";
 import { scoreRunRecord } from "./scorer";
 import { goldFacts, validScenarioRaw } from "./test-support";
 
@@ -32,7 +32,7 @@ function singleRunScenario(): HistorianEvalScenario {
 /** Scripted historian output covering exactly the requested chunk. */
 function coveringOutput(facts = goldFacts()): ScriptedHistorianMode["outputs"][number] {
     return (range) =>
-        buildHistorianPayload({
+        buildMockHistorianOutput({
             compartments: [
                 {
                     start: range.start,
@@ -63,6 +63,30 @@ describe("extractAnswerEnvelope", () => {
         expect(extractAnswerEnvelope("no envelope here")).toBeNull();
         expect(extractAnswerEnvelope("<answer>  </answer>")).toBeNull();
         expect(extractAnswerEnvelope(null)).toBeNull();
+    });
+});
+
+describe("findOrdinalRange", () => {
+    test("parses the chunk header, ignoring bracketed numbers in transcript or repair content", () => {
+        const body = {
+            messages: [
+                {
+                    role: "user",
+                    content:
+                        "Messages 1-2: decoy before the block\n\n<new_messages>\n\nMessages 3-42:\n\n" +
+                        "[3] user: see item [7] and array[2024] notes\n\n</new_messages>\n\n" +
+                        "Previous invalid output mentioned [999].",
+                },
+            ],
+        };
+        expect(findOrdinalRange(body)).toEqual({ start: 3, end: 42 });
+    });
+
+    test("returns null without a new_messages block or without the chunk header", () => {
+        expect(findOrdinalRange({ messages: [{ role: "user", content: "Messages 1-2: no marker" }] })).toBeNull();
+        expect(
+            findOrdinalRange({ messages: [{ role: "user", content: "<new_messages> [4] no header </new_messages>" }] }),
+        ).toBeNull();
     });
 });
 
@@ -247,7 +271,7 @@ describe("runScenario (scripted historian)", () => {
                             // boundary-healing heuristic discards it.
                             (range) => {
                                 const mid = Math.floor((range.start + range.end) / 2);
-                                return buildHistorianPayload({
+                                return buildMockHistorianOutput({
                                     compartments: [
                                         { start: range.start, end: mid, title: "First half", body: "first" },
                                         { start: mid + 1, end: range.end, title: "Provisional tail", body: "tail" },
