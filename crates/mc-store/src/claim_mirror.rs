@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mc_core::claim_operation::{
-    canonical_json_encode, canonical_snapshot_vector, is_valid_public_claim_id,
+    canonical_json_encode, canonical_snapshot_vector, is_lower_hex, is_valid_public_claim_id,
     parse_revision_locator, sha256_hex_utf8, SnapshotVector, MAX_SAFE_INTEGER,
 };
 use rusqlite::{params, OptionalExtension};
@@ -21,6 +21,11 @@ use crate::McStore;
 pub const CLAIM_MIRROR_VERSION: u32 = 1;
 /// Version of generation vectors accepted by this mirror.
 pub const CLAIM_MIRROR_VECTOR_VERSION: u32 = 1;
+/// Version of the `claim.mirror.*` facade transport. Independent from
+/// `CLAIM_MIRROR_VERSION` so transport evolution cannot silently reinterpret
+/// snapshot or receipt payloads. Mirrors `CLAIM_MIRROR_PROTOCOL_VERSION` on the
+/// host wire; the host decoder compares it for exact equality.
+pub const CLAIM_MIRROR_PROTOCOL_VERSION: u32 = 1;
 
 /// Authoritative lifecycle stored with a committed claim revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,13 +230,6 @@ impl From<cortexkit_store::StoreError> for ClaimMirrorError {
     }
 }
 
-fn lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 fn valid_project_id(project_id: i64) -> bool {
     (1..=MAX_SAFE_INTEGER).contains(&project_id)
 }
@@ -252,7 +250,7 @@ fn validate_vector(vector: &SnapshotVector) -> Result<BTreeSet<i64>, ClaimMirror
             vector.vector_version
         )));
     }
-    if !lower_hex(&vector.database_incarnation_id, 32) {
+    if !is_lower_hex(&vector.database_incarnation_id, 32) {
         return Err(ClaimMirrorError::Invalid(
             "database incarnation ID must be 32 lowercase hex characters".to_string(),
         ));
@@ -1033,6 +1031,16 @@ impl McStore {
                             effect.public_claim_id
                         ))));
                     }
+                    // A revision locator embeds the content digest, so the same
+                    // revision arriving with a different locator means the same
+                    // revision carries different content. Without this the upsert
+                    // below would silently replace the stored content.
+                    if incoming_revision == *revision && locator != &effect.revision_locator {
+                        return Ok(Err(ClaimMirrorError::Invalid(format!(
+                            "public claim {} revision {} does not match the stored locator",
+                            effect.public_claim_id, incoming_revision
+                        ))));
+                    }
                     if effect.claim.is_none() && locator != &effect.revision_locator {
                         return Ok(Err(ClaimMirrorError::Invalid(format!(
                             "revocation for {} does not match current revision",
@@ -1055,6 +1063,23 @@ impl McStore {
 
             for project_id in &touched {
                 let key = project_id.to_string();
+                // Every retained row in a touched project takes the receipt's
+                // generations, not just the rows an effect names. The host stamps
+                // its full snapshot from the current vector, and row equality
+                // includes these fields, so leaving untouched rows on the previous
+                // generation makes the next full replacement compare unequal and
+                // return `ResetRequired`.
+                tx.execute(
+                    "UPDATE mc_claim_mirror_claims
+                        SET project_generation = ?1, policy_generation = ?2
+                      WHERE database_incarnation_id = ?3 AND project_id = ?4",
+                    params![
+                        group.vector.project_generations[&key],
+                        group.vector.policy_generations[&key],
+                        incarnation,
+                        project_id,
+                    ],
+                )?;
                 tx.execute(
                     "UPDATE mc_claim_mirror_projects
                         SET project_generation = ?1, policy_generation = ?2,

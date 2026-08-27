@@ -36,6 +36,17 @@ pub mod smart_note_evaluation;
 mod tail_hygiene;
 pub mod transform;
 
+/// Generated pre-build release contract (U8). The file is emitted by
+/// `bun scripts/generate-mc-host-release-manifest.ts` into `release/generated/` and
+/// drift-checked with `--check`; it adds no crate dependency edge (in particular no
+/// `mc-host -> mc-module` edge).
+pub mod release_contract {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../release/generated/mc-host-release-contract.rs"
+    ));
+}
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
@@ -498,23 +509,30 @@ impl Drop for TransformDispatchTicket<'_> {
 /// safety fold.
 /// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
 /// category-grouped `#id: fact` format and applies to every serializer profile.
-pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
+/// Sourced from the generated U8 release contract so status and release compatibility
+/// cannot diverge.
+pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = release_contract::MEMORY_RENDER_EPOCH;
 /// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
 /// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
 /// historian-authored titles before placing them inside the session-history wrapper.
-pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
+pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = release_contract::COMPARTMENT_RENDER_EPOCH;
 /// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages. Epoch 2 flips the profile to full-array tail reclaim
 /// (the Thalamus peer retired the byte-splice at U0), so tool-absent sessions gain the
 /// age/pressure tail reclaim they never had; the bump forces one self-coordinated HARD
 /// fold on the first pass under the new binary, per the epoch contract above.
-pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 2;
+pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 =
+    release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC;
 /// Bumps when any active tag overlay changes provider-visible bytes. Epoch 3 freezes
 /// temporal-marker decisions in durable rows instead of deriving them from each request array.
 /// Every change requires one cache-breaking fold before the new overlay can render. Inactive
 /// requests omit the component and retain their identity.
-pub const TAGGER_FEATURE_EPOCH: u32 = 3;
+pub const TAGGER_FEATURE_EPOCH: u32 = release_contract::TAGGER_EPOCH;
+/// The numeric state-sync epoch (U8). Emitted in Magic Context status alongside the
+/// pre-existing boolean `state_sync_deltas` feature signal so compatibility policy can
+/// require the exact epoch instead of a boolean capability bit.
+pub const STATE_SYNC_EPOCH: u32 = release_contract::STATE_SYNC_EPOCH;
 
 /// The module-owned rendered-prefix format epoch for a serializer profile.
 ///
@@ -556,6 +574,14 @@ pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
     } else {
         0
     }
+}
+
+/// Exact-match compatibility check for the numeric state-sync epoch advertised by a
+/// Magic Context status `epochs` object. The boolean `state_sync_deltas` feature
+/// signal alone is insufficient: boolean-only, missing, nonnumeric, stale, and future
+/// values are all incompatible with this release's contract (U8).
+pub fn state_sync_epoch_compatible(epochs: &Value) -> bool {
+    epochs.get("state_sync_epoch").and_then(Value::as_u64) == Some(STATE_SYNC_EPOCH as u64)
 }
 
 /// Storage namespace for the cache-state domain.
@@ -6335,6 +6361,7 @@ impl McHandler {
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
                 "state_sync_deltas": true,
+                "state_sync_epoch": STATE_SYNC_EPOCH,
             },
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
@@ -7849,6 +7876,7 @@ impl McHandler {
                         "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                         "tagger_epoch": TAGGER_FEATURE_EPOCH,
                         "state_sync_deltas": true,
+                        "state_sync_epoch": STATE_SYNC_EPOCH,
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
@@ -7914,6 +7942,7 @@ impl McHandler {
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
                 "state_sync_deltas": true,
+                "state_sync_epoch": STATE_SYNC_EPOCH,
             },
             "storage_versions": storage_versions_block(&store),
         }))
@@ -9655,17 +9684,23 @@ impl McHandler {
         let Some(items) = payload.get("items").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires items");
         };
-        // The requested IDs are the accept predicate's oracle: an attempt is
-        // successful only if its manifest covers exactly these.
+        // The requested claims are the accept predicate's oracle: an attempt
+        // is successful only if its manifest covers exactly these. Identity is
+        // the claim's opaque public ID, which is also what
+        // `CLASSIFY_SYSTEM_PROMPT` asks the model to echo back — a request
+        // parser and a manifest validator that disagreed on the identity type
+        // would reject every attempt the prompt can produce.
         let mut expected_ids: BTreeSet<String> = BTreeSet::new();
         for item in items {
             let Some(public_claim_id) = item.get("public_claim_id").and_then(Value::as_str) else {
-                return invalid_params_error("classify items require public_claim_id");
+                return invalid_params_error("classify items require a public_claim_id string");
             };
             if !mc_core::claim_operation::is_valid_public_claim_id(public_claim_id) {
-                return invalid_params_error("classify items require a valid public_claim_id");
+                return invalid_params_error(
+                    "classify items require a well-formed public_claim_id",
+                );
             }
-            expected_ids.insert(public_claim_id.to_string());
+            expected_ids.insert(public_claim_id.to_owned());
         }
         let Some(models) = payload.get("model_chain").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires model_chain");
@@ -9694,20 +9729,28 @@ impl McHandler {
             model_chain.push(model.to_string());
         }
         // The deadline prevents new producer runs after the caller's supplied
-        // budget expires.
-        let deadline = match payload.get("timeout_ms") {
-            None => None,
-            Some(value) => {
-                let Some(ms) = value.as_u64().filter(|ms| *ms > 0) else {
-                    return invalid_params_error("classify timeout_ms must be a positive integer");
-                };
-                // `Instant + Duration` panics on overflow, so an absurd
-                // budget is a parameter error, not a crashed handler task.
-                let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
-                    return invalid_params_error("classify timeout_ms is out of range");
-                };
-                Some(deadline)
-            }
+        // budget expires, and it is the ONLY bound relating this handler's
+        // work to the caller's transport budget. Without it a single model can
+        // burn CLASSIFY_AWAIT_TIMEOUT on the start, CLASSIFY_AWAIT_TIMEOUT on
+        // the await, and CLASSIFY_RECOVERY_TIMEOUT on the re-drain — 21
+        // minutes — and a full MAX_CLASSIFY_MODEL_CHAIN chain multiplies that
+        // by eight, so the caller's cancel would always land mid-chain,
+        // between a producer run and its purge. Required, not optional: a
+        // payload that omits it is asking for an unbounded billable chain.
+        let deadline = {
+            let Some(ms) = payload
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+            else {
+                return invalid_params_error("classify payload requires a positive timeout_ms");
+            };
+            // `Instant + Duration` panics on overflow, so an absurd
+            // budget is a parameter error, not a crashed handler task.
+            let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
+                return invalid_params_error("classify timeout_ms is out of range");
+            };
+            deadline
         };
 
         // Exactly one execution per (ledger_session, command_id): a
@@ -9761,7 +9804,7 @@ impl McHandler {
         let mut last_error = String::new();
         let mut output = None;
         for (attempt, model) in model_chain.iter().enumerate() {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 last_error =
                     "classify time budget exhausted before starting a producer run".to_string();
                 break;
@@ -9789,7 +9832,7 @@ impl McHandler {
             // Connection and route setup can consume the remaining budget;
             // a send after the promised deadline would start a billable run
             // only to time out its zero-length await immediately.
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 last_error = "classify time budget exhausted during producer startup".to_string();
                 break;
             }
@@ -9971,10 +10014,10 @@ impl McHandler {
         };
         match name {
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
-            "claim.intent.stage" => self.handle_claim_intent_stage(&request),
-            "claim.intent.inspect" => self.handle_claim_intent_inspect(&request),
-            "claim.intent.ack" => self.handle_claim_intent_ack(&request),
-            "claim.effects.apply" => self.handle_claim_effects_apply(&request),
+            "claim.intent.stage" => self.handle_claim_intent_stage(channel, &request),
+            "claim.intent.inspect" => self.handle_claim_intent_inspect(channel, &request),
+            "claim.intent.ack" => self.handle_claim_intent_ack(channel, &request),
+            "claim.effects.apply" => self.handle_claim_effects_apply(channel, &request),
             "claim.mirror.replace" => self.handle_claim_mirror_replace(channel, &request),
             "claim.mirror.apply" => self.handle_claim_mirror_apply(channel, &request),
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
@@ -9985,7 +10028,31 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_intent_stage(&self, request: &Value) -> PreparedOutcome {
+    /// Resolve the daemon-bound route root for a claim facade request.
+    ///
+    /// Every claim handler must go through this. The claim wire carries
+    /// caller-supplied identity (`binding.authorityProject`,
+    /// `binding.databaseIncarnationId`), so the bound route is the only
+    /// trustworthy authority identity on the request.
+    fn claim_route_root(
+        &self,
+        channel: RouteHandle,
+        request_name: &str,
+    ) -> Result<String, PreparedOutcome> {
+        match self.facade_binding(channel) {
+            Ok(binding) => Ok(binding.project_root.to_string_lossy().into_owned()),
+            Err(_) => Err(PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: format!("{request_name} requires a bound facade route"),
+            }),
+        }
+    }
+
+    fn handle_claim_intent_stage(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        let route_root = match self.claim_route_root(channel, "claim.intent.stage") {
+            Ok(route_root) => route_root,
+            Err(outcome) => return outcome,
+        };
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.stage requires arguments");
         };
@@ -9999,7 +10066,7 @@ impl McHandler {
         let Some(store) = self.store() else {
             return store_unavailable_error();
         };
-        match memory_tool::stage_claim_intent(&store, &parsed, now_ms()) {
+        match memory_tool::stage_claim_intent(&store, &route_root, &parsed, now_ms()) {
             Ok(response) => match serde_json::to_value(response) {
                 Ok(value) => respond(value),
                 Err(error) => PreparedOutcome::Error {
@@ -10014,7 +10081,14 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_intent_inspect(&self, request: &Value) -> PreparedOutcome {
+    fn handle_claim_intent_inspect(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.inspect") {
+            return outcome;
+        }
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.inspect requires arguments");
         };
@@ -10045,7 +10119,10 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_intent_ack(&self, request: &Value) -> PreparedOutcome {
+    fn handle_claim_intent_ack(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.ack") {
+            return outcome;
+        }
         let Some(arguments) = request.get("arguments").cloned() else {
             return invalid_params_error("claim.intent.ack requires arguments");
         };
@@ -10073,11 +10150,18 @@ impl McHandler {
         }
     }
 
-    fn handle_claim_effects_apply(&self, request: &Value) -> PreparedOutcome {
+    fn handle_claim_effects_apply(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.effects.apply") {
+            return outcome;
+        }
         let Some(arguments) = request.get("arguments").and_then(Value::as_object) else {
             return invalid_params_error("claim.effects.apply requires arguments");
         };
-        if arguments.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+        if arguments.get("protocolVersion").and_then(Value::as_u64)
+            != Some(u64::from(
+                mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
+            ))
+        {
             return invalid_params_error("claim.effects.apply protocolVersion is unsupported");
         }
         if arguments
@@ -10134,7 +10218,7 @@ impl McHandler {
             previous = id;
         }
         respond(json!({
-            "protocolVersion": 1,
+            "protocolVersion": mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
             "ackedEffectId": previous,
         }))
     }
@@ -10154,7 +10238,12 @@ impl McHandler {
             return invalid_params_error("claim.mirror.replace requires arguments");
         };
         let parsed = match serde_json::from_value::<ClaimMirrorSnapshotRequest>(arguments) {
-            Ok(parsed) if parsed.protocol_version == 1 => parsed,
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
             Ok(_) => {
                 return invalid_params_error("claim.mirror.replace protocolVersion is unsupported")
             }
@@ -10167,7 +10256,7 @@ impl McHandler {
         };
         match store.replace_claim_mirror_snapshot(&parsed.snapshot, now_ms()) {
             Ok(()) => respond(json!({
-                "protocolVersion": 1,
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
                 "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
                 "databaseIncarnationId": parsed.snapshot.vector.database_incarnation_id,
                 "projectCheckpoints": parsed.snapshot.project_checkpoints,
@@ -10187,7 +10276,12 @@ impl McHandler {
             return invalid_params_error("claim.mirror.apply requires arguments");
         };
         let parsed = match serde_json::from_value::<ClaimMirrorReceiptRequest>(arguments) {
-            Ok(parsed) if parsed.protocol_version == 1 => parsed,
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
             Ok(_) => {
                 return invalid_params_error("claim.mirror.apply protocolVersion is unsupported")
             }
@@ -10200,7 +10294,7 @@ impl McHandler {
         };
         match store.apply_claim_mirror_receipt(&parsed.receipt, now_ms()) {
             Ok(result) => respond(json!({
-                "protocolVersion": 1,
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
                 "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
                 "receiptId": parsed.receipt.receipt_id,
                 "replayed": result.replayed,
@@ -10488,6 +10582,23 @@ impl McHandler {
         };
         match action {
             "get" | "list" => {
+                // Bulk enumeration returns every workspace-authorized row, which
+                // can include shared foreign-project claims, so it stays limited
+                // to dreamer maintenance exactly as the host tool contract does.
+                // The registry is module-owned state for child sessions this
+                // handler minted, unlike the client-supplied harness label.
+                if action == "list" {
+                    let bound_session = match self.facade_binding(channel) {
+                        Ok(binding) => binding.session.trim().to_string(),
+                        Err(_) => return session_unresolved_error(),
+                    };
+                    if !self.dreamer_run_registered(&bound_session) {
+                        return tool_error_result(
+                            "Error: list is restricted to dreamer maintenance sessions."
+                                .to_string(),
+                        );
+                    }
+                }
                 let requested = if action == "get" {
                     let mut ids = args
                         .get("publicClaimIds")
@@ -10518,11 +10629,20 @@ impl McHandler {
                     return tool_error_result("Error: malformed public claim ID.".to_string());
                 }
                 let requested = requested.into_iter().collect::<BTreeSet<_>>();
-                let limit = usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100);
-                let rows = match memory_tool::list_committed_claims(&store, &requested, limit) {
-                    Ok(rows) => rows,
-                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                // `limit` narrows enumeration. An explicit `get` names its rows,
+                // so honoring a smaller limit there would silently drop claims the
+                // caller asked for by ID.
+                let limit = if requested.is_empty() {
+                    usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100)
+                } else {
+                    requested.len()
                 };
+                let category = string_arg(&args, "category");
+                let rows =
+                    match memory_tool::list_committed_claims(&store, &requested, category, limit) {
+                        Ok(rows) => rows,
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    };
                 let claims = rows
                     .into_iter()
                     .map(|row| {
@@ -12951,11 +13071,8 @@ fn need_full_sync_response(request: &TransformRequest) -> PreparedOutcome {
     )
 }
 
-fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Duration {
-    match deadline {
-        None => ceiling,
-        Some(deadline) => ceiling.min(deadline.saturating_duration_since(Instant::now())),
-    }
+fn classify_attempt_timeout(ceiling: Duration, deadline: Instant) -> Duration {
+    ceiling.min(deadline.saturating_duration_since(Instant::now()))
 }
 
 /// The accept predicate for one classify attempt: usable output, then a
@@ -25429,6 +25546,224 @@ mod tests {
         assert!(tool_is_error(oversized));
     }
 
+    /// A classify budget large enough that no test's own setup can exhaust it,
+    /// so a payload's shape is what the test proves. Deadline behaviour has its
+    /// own tests with deliberately small budgets.
+    const TEST_CLASSIFY_TIMEOUT_MS: u64 = 600_000;
+
+    async fn dreamer_classify_outcome(
+        producer: &Arc<ProducerState>,
+        payload: Value,
+        command_id: &str,
+    ) -> (Arc<ProducerState>, PreparedOutcome) {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        // A poisoned historian chain proves the classify loop no longer reads
+        // route config models.
+        let mut route_binding = binding_with_harness(route_root, "pi", "ses");
+        route_binding.config.model_chain = vec!["test/route-only-model".to_string()];
+        handler.bind_route(test_route(7), route_binding);
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let outcome = handler
+            .handle_dreamer_run_task(
+                test_route(7),
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": command_id,
+                    "authority_generation": generation,
+                    "payload": payload,
+                }),
+            )
+            .await;
+        (Arc::clone(producer), outcome)
+    }
+
+    /// A well-formed public claim ID, distinct per `seed`.
+    fn test_claim_id(seed: u8) -> String {
+        format!("mcm_{}", format!("{seed:02x}").repeat(16))
+    }
+
+    /// The exact payload `runClassifyThroughModule` sends for a claim-native
+    /// chunk, and the manifest shape `CLASSIFY_SYSTEM_PROMPT` asks for.
+    fn claim_native_payload(claims: &[String], timeout_ms: u64) -> Value {
+        json!({
+            "prompt_body": "classify",
+            "model_chain": ["test/model"],
+            "timeout_ms": timeout_ms,
+            "items": claims.iter().map(|claim| json!({
+                "public_claim_id": claim,
+                "revision_locator": format!("{claim}/r1/{}", "b".repeat(64)),
+                "content_digest": "b".repeat(64),
+                "mutation_token": { "publicClaimId": claim },
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn claim_manifest(claims: &[String]) -> String {
+        let entries: String = claims
+            .iter()
+            .map(|claim| {
+                format!(
+                    "<memory claim=\"{claim}\" importance=\"80\" scope=\"project\" shareable=\"true\"/>"
+                )
+            })
+            .collect();
+        format!("<classify>{entries}</classify>")
+    }
+
+    /// The request parser, the expected-id set, and the manifest validator
+    /// must all speak the claim's public ID. While the parser demanded an
+    /// integer `memory_id`, this payload died at `invalid_params` with zero
+    /// producer starts; while the validator demanded a numeric `id`, the
+    /// manifest the prompt asks for was rejected too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_accepts_claim_native_items_and_manifest() {
+        let claims = [test_claim_id(1), test_claim_id(2)];
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(ProducerOutput {
+                text: claim_manifest(&claims),
+                length_capped: false,
+            }));
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            claim_native_payload(&claims, TEST_CLASSIFY_TIMEOUT_MS),
+            "claim-native",
+        )
+        .await;
+        let response = match outcome {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("a claim-native classify must be accepted: {other:?}"),
+        };
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["manifest_text"], json!(claim_manifest(&claims)));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_rejects_items_that_are_not_claim_identities() {
+        let claim = test_claim_id(1);
+        for items in [
+            // The retired integer identity.
+            json!([{ "memory_id": 7 }]),
+            json!([{ "public_claim_id": 7 }]),
+            json!([{ "public_claim_id": "" }]),
+            json!([{ "public_claim_id": "mcm_short" }]),
+            json!([{ "public_claim_id": &claim[4..] }]),
+        ] {
+            let producer = Arc::new(ProducerState::default());
+            let mut payload = claim_native_payload(&[], TEST_CLASSIFY_TIMEOUT_MS);
+            payload["items"] = items.clone();
+            let (producer, outcome) =
+                dreamer_classify_outcome(&producer, payload, "claim-items-shape").await;
+            match outcome {
+                PreparedOutcome::Error { code, .. } => {
+                    assert_eq!(code, "invalid_params", "items {items}")
+                }
+                other => panic!("expected invalid_params for {items}, got {other:?}"),
+            }
+            assert_eq!(
+                producer.starts.load(Ordering::SeqCst),
+                0,
+                "a rejected identity must never start a run: {items}"
+            );
+        }
+    }
+
+    /// A manifest naming a claim the request never asked about must advance
+    /// the chain, not end it and be ledgered as this command's response.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_rejects_a_manifest_naming_an_unexpected_claim() {
+        let requested = test_claim_id(1);
+        let unexpected = test_claim_id(9);
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            // Covers the requested claim AND one nobody asked about.
+            Ok(ProducerOutput {
+                text: claim_manifest(&[requested.clone(), unexpected]),
+                length_capped: false,
+            }),
+            Ok(ProducerOutput {
+                text: claim_manifest(std::slice::from_ref(&requested)),
+                length_capped: false,
+            }),
+        ]);
+        let mut payload =
+            claim_native_payload(std::slice::from_ref(&requested), TEST_CLASSIFY_TIMEOUT_MS);
+        payload["model_chain"] = json!(["test/unexpected-claim", "test/exact"]);
+        let (producer, outcome) =
+            dreamer_classify_outcome(&producer, payload, "unexpected-claim").await;
+        let response = match outcome {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the chain must recover from an unexpected claim: {other:?}"),
+        };
+        assert_eq!(
+            response["diagnostics"]["model"],
+            json!("test/exact"),
+            "the over-covering manifest must not be the accepted one"
+        );
+        assert_eq!(
+            response["manifest_text"],
+            json!(claim_manifest(&[requested]))
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            producer.purges.lock().unwrap().len(),
+            2,
+            "the rejected attempt's session must be purged before advancing"
+        );
+    }
+
+    /// The payload deadline is the only bound relating this handler's work to
+    /// the caller's transport budget, so a payload without one is refused
+    /// before any billable run rather than granted the 21-minute per-model
+    /// ceiling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_requires_a_positive_timeout_ms() {
+        let claims = [test_claim_id(1)];
+        for timeout in [None, Some(json!(0)), Some(json!(-1)), Some(json!("600000"))] {
+            let producer = Arc::new(ProducerState::default());
+            let mut payload = claim_native_payload(&claims, TEST_CLASSIFY_TIMEOUT_MS);
+            match &timeout {
+                None => {
+                    payload
+                        .as_object_mut()
+                        .expect("payload object")
+                        .remove("timeout_ms");
+                }
+                Some(value) => payload["timeout_ms"] = value.clone(),
+            }
+            let (producer, outcome) =
+                dreamer_classify_outcome(&producer, payload, "deadline-required").await;
+            match outcome {
+                PreparedOutcome::Error { code, message } => {
+                    assert_eq!(code, "invalid_params", "timeout {timeout:?}");
+                    assert!(
+                        message.contains("timeout_ms"),
+                        "the failure must name the missing deadline: {message}"
+                    );
+                }
+                other => panic!("expected invalid_params for {timeout:?}, got {other:?}"),
+            }
+            assert_eq!(
+                producer.starts.load(Ordering::SeqCst),
+                0,
+                "a deadline-less payload must never start a run: {timeout:?}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn missing_or_unknown_serializer_profile_is_typed_and_does_not_write_store() {
         let producer = Arc::new(ProducerState::default());
@@ -29666,5 +30001,273 @@ mod tests {
         assert!(store.load(&session).unwrap().row_version.is_none());
         assert!(store.load_pass_trace(&session).unwrap().is_none());
         assert!(v.get("historian").is_none());
+    }
+    #[test]
+    fn module_status_emits_exact_numeric_state_sync_epoch_alongside_boolean_signal() {
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let outcome = handler.handle_status_value(&json!({"method": "status"}));
+        let PreparedOutcome::Response(bytes) = outcome else {
+            panic!("module status did not respond: {outcome:?}");
+        };
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        let epochs = &status["epochs"];
+        assert_eq!(epochs["state_sync_deltas"], json!(true));
+        assert_eq!(
+            epochs["state_sync_epoch"].as_u64(),
+            Some(release_contract::STATE_SYNC_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["memory_render_epoch"],
+            json!(MEMORY_RENDER_FORMAT_EPOCH)
+        );
+        assert_eq!(
+            epochs["compartment_render_epoch"],
+            json!(COMPARTMENT_RENDER_FORMAT_EPOCH)
+        );
+        assert_eq!(
+            epochs["profile_epoch"],
+            json!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC)
+        );
+        assert_eq!(epochs["tagger_epoch"], json!(TAGGER_FEATURE_EPOCH));
+        assert!(state_sync_epoch_compatible(epochs));
+    }
+}
+
+#[cfg(test)]
+mod release_contract_tests {
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+
+    use crate::{release_contract, state_sync_epoch_compatible};
+
+    fn contract() -> Value {
+        serde_json::from_str(release_contract::RELEASE_CONTRACT_JSON)
+            .expect("generated contract JSON decodes")
+    }
+
+    #[test]
+    fn rust_embedding_decodes_to_the_canonical_contract_and_digest() {
+        let digest = Sha256::digest(release_contract::RELEASE_CONTRACT_JSON.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(digest, release_contract::RELEASE_CONTRACT_SHA256);
+        let contract = contract();
+        assert_eq!(
+            contract["schema"],
+            json!("magic-context.mc-host-release/v1")
+        );
+        assert_eq!(
+            contract["release"]["version"],
+            json!(release_contract::RELEASE_VERSION)
+        );
+        assert_eq!(
+            contract["versions"]["daemon"],
+            json!(release_contract::DAEMON_VERSION)
+        );
+        assert_eq!(
+            contract["versions"]["wire_protocol"].as_u64(),
+            Some(release_contract::WIRE_PROTOCOL_VERSION as u64)
+        );
+    }
+
+    #[test]
+    fn generated_epoch_constants_match_the_decoded_contract_exactly() {
+        let epochs = contract()["epochs"].clone();
+        assert_eq!(
+            epochs["memory_render"].as_u64(),
+            Some(release_contract::MEMORY_RENDER_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["compartment_render"].as_u64(),
+            Some(release_contract::COMPARTMENT_RENDER_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["profile_claude_code_anthropic"].as_u64(),
+            Some(release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC as u64)
+        );
+        assert_eq!(
+            epochs["tagger"].as_u64(),
+            Some(release_contract::TAGGER_EPOCH as u64)
+        );
+        assert_eq!(
+            epochs["state_sync"].as_u64(),
+            Some(release_contract::STATE_SYNC_EPOCH as u64)
+        );
+        assert_eq!(epochs.as_object().unwrap().len(), 5);
+        assert_eq!(
+            crate::MEMORY_RENDER_FORMAT_EPOCH,
+            release_contract::MEMORY_RENDER_EPOCH
+        );
+        assert_eq!(
+            crate::COMPARTMENT_RENDER_FORMAT_EPOCH,
+            release_contract::COMPARTMENT_RENDER_EPOCH
+        );
+        assert_eq!(
+            crate::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+            release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
+        );
+        assert_eq!(crate::TAGGER_FEATURE_EPOCH, release_contract::TAGGER_EPOCH);
+        assert_eq!(crate::STATE_SYNC_EPOCH, release_contract::STATE_SYNC_EPOCH);
+    }
+
+    #[test]
+    fn exact_platform_floors_decode_identically_to_the_typescript_contract() {
+        let contract = contract();
+        let supported = contract["platforms"]["supported"].as_array().unwrap();
+        let linux = supported
+            .iter()
+            .find(|platform| platform["target"] == json!("linux-x64-gnu"))
+            .expect("linux platform row");
+        assert_eq!(linux["kernel_min"], json!("4.18"));
+        assert_eq!(linux["glibc_min"], json!("2.28"));
+        assert_eq!(linux["capabilities"]["procfs_self_fd_exec"], json!(true));
+        assert_eq!(linux["synapse"], json!("certified_cpu"));
+        for target in ["darwin-arm64", "darwin-x64"] {
+            let mac = supported
+                .iter()
+                .find(|platform| platform["target"] == json!(target))
+                .expect("macOS platform row");
+            assert_eq!(mac["os_min"], json!("13.5"));
+            assert_eq!(mac["synapse"], json!("unsupported"));
+            assert_eq!(mac["synapse_reason"], json!("synapse_unsupported"));
+        }
+        assert_eq!(
+            contract["platforms"]["unsupported_reason"],
+            json!("unsupported_platform")
+        );
+    }
+
+    #[test]
+    fn coordination_names_are_version_neutral_and_fixed() {
+        assert_eq!(
+            release_contract::COORDINATION_DIRECTORY,
+            ".mc-host-coordination"
+        );
+        assert_eq!(release_contract::TRANSACTION_LOCK_NAME, "transaction.lock");
+        assert_eq!(release_contract::LIFETIME_LOCK_NAME, "lifetime.lock");
+        // Bind the frozen contract to the constants the daemon actually
+        // locks: the coordination names exist in two authorities (mc-host
+        // cannot depend on the contract-bearing mc-module), and drift
+        // between them is mixed-release lock-splitting — the exact failure
+        // the stable coordination files exist to prevent.
+        assert_eq!(
+            release_contract::COORDINATION_DIRECTORY,
+            mc_host::COORDINATION_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::TRANSACTION_LOCK_NAME,
+            mc_host::TRANSACTION_LOCK_NAME
+        );
+        assert_eq!(
+            release_contract::LIFETIME_LOCK_NAME,
+            mc_host::LIFETIME_LOCK_NAME
+        );
+        let coordination = contract()["coordination"].clone();
+        assert_eq!(
+            coordination["directory"],
+            json!(release_contract::COORDINATION_DIRECTORY)
+        );
+        assert_eq!(
+            coordination["transaction_lock"],
+            json!(release_contract::TRANSACTION_LOCK_NAME)
+        );
+        assert_eq!(
+            coordination["lifetime_lock"],
+            json!(release_contract::LIFETIME_LOCK_NAME)
+        );
+    }
+
+    /// The contract freezes the daemon version, while mc-host derives its
+    /// advertised `daemon_ver` from `CARGO_PKG_VERSION`. Binding them here
+    /// makes a crate version bump force contract regeneration instead of
+    /// shipping a daemon that trips `incompatible_daemon` against its own
+    /// launcher.
+    #[test]
+    fn the_default_daemon_ver_matches_the_frozen_contract() {
+        assert_eq!(
+            mc_host::HostConfig::default().daemon_ver,
+            release_contract::DAEMON_VERSION
+        );
+    }
+
+    #[test]
+    fn pre_build_contract_carries_no_binary_model_or_payload_hashes() {
+        fn assert_no_hashes(value: &Value, path: &str) {
+            match value {
+                Value::String(text) => {
+                    assert!(
+                        !(text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())),
+                        "hash-like value at {path}"
+                    );
+                }
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        assert_no_hashes(item, &format!("{path}[{index}]"));
+                    }
+                }
+                Value::Object(map) => {
+                    for (key, child) in map {
+                        let lowered = key.to_ascii_lowercase();
+                        assert!(
+                            !(lowered.split('_').any(|part| part == "hash"
+                                || part == "digest"
+                                || part.starts_with("sha"))),
+                            "hash-bearing key at {path}.{key}"
+                        );
+                        assert_no_hashes(child, &format!("{path}.{key}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_hashes(&contract(), "$");
+    }
+
+    #[test]
+    fn genesis_stop_provenance_schema_carries_no_legacy_authority() {
+        let schema = contract()["stop_provenance_schema"].clone();
+        assert_eq!(schema["tags"], json!(["genesis", "predecessor"]));
+        assert_eq!(schema["genesis"]["legacy_stop_authority"], json!(false));
+        assert_eq!(schema["predecessor"]["legacy_stop_authority"], json!(true));
+        assert_eq!(
+            schema["genesis"]["required_fields"],
+            json!(["release_version", "tag"])
+        );
+        let forbidden = schema["genesis"]["forbidden_fields"].as_array().unwrap();
+        assert!(forbidden.contains(&json!("payload_manifest_digest")));
+        assert!(forbidden.contains(&json!("legacy_proof_version")));
+    }
+
+    #[test]
+    fn state_sync_epoch_compatibility_requires_the_exact_numeric_epoch() {
+        let current = release_contract::STATE_SYNC_EPOCH;
+        assert!(state_sync_epoch_compatible(&json!({
+            "state_sync_deltas": true,
+            "state_sync_epoch": current,
+        })));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_deltas": true })
+        ));
+        assert!(!state_sync_epoch_compatible(&json!({})));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": true })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": "1" })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": 1.5 })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": -1 })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": current - 1 })
+        ));
+        assert!(!state_sync_epoch_compatible(
+            &json!({ "state_sync_epoch": current + 1 })
+        ));
     }
 }

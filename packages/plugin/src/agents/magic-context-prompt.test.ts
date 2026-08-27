@@ -148,7 +148,7 @@ describe("buildMagicContextSection: memory gating", () => {
             false,
         );
         expect(off).not.toContain("ctx_memory");
-        expect(off).not.toContain("Save to memory proactively");
+        expect(off).not.toContain("Save durable knowledge proactively");
         expect(off).toContain("Use `ctx_search`");
         // no dangling blank line where the block was removed
         expect(off).not.toContain("\n\nUse `ctx_search`");

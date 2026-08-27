@@ -100,7 +100,11 @@ import {
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { dropSlot } from "./lkg-slot";
-import { drainClaimEffectPrefix, proveClaimOperationDurable } from "./module-state-sync";
+import {
+    drainClaimEffectPrefix,
+    MODULE_CLAIM_EFFECTS_CONSUMER,
+    proveClaimOperationDurable,
+} from "./module-state-sync";
 import { McHostModuleTransport } from "./module-transport";
 import { CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION } from "./module-wire";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
@@ -744,6 +748,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 authoritySeed: (args) => transport.authoritySeed(args),
                 authorityDrain: (args) => transport.authorityDrain(args),
                 mirrorPull: (args) => transport.mirrorPull(args),
+                // The claim lanes are optional on the interface but mandatory in
+                // rust transform mode: this object *is* `rustModeModuleClient`
+                // there. Omitting them makes every ctx_memory mutation fail its
+                // availability guard and leaves the mirror sync reporting
+                // `unavailable`, so the whole claim feature is inert.
+                claimIntentStage: (args) => transport.claimIntentStage(args),
+                claimIntentInspect: (args) => transport.claimIntentInspect(args),
+                claimIntentAck: (args) => transport.claimIntentAck(args),
+                claimEffectsApply: (args) => transport.claimEffectsApply(args),
+                claimMirrorReplace: (args) => transport.claimMirrorReplace(args),
+                claimMirrorApply: (args) => transport.claimMirrorApply(args),
                 getCompartmentsAfter: async (sessionId, afterSequence) => {
                     const response = await transport.call({
                         sessionId,
@@ -957,7 +972,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               });
                               await drainClaimEffectPrefix({
                                   db,
-                                  consumer: "rust-module-claims-v1",
+                                  consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
                                   throughReceiptId: proof.receiptId,
                                   deliver: (receipt) =>
                                       claimEffectsApply({
@@ -965,7 +980,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                           projectRoot,
                                           request: {
                                               protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
-                                              consumer: "rust-module-claims-v1",
+                                              consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
                                               receipt,
                                           },
                                       }),

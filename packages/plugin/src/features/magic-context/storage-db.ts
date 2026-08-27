@@ -60,6 +60,13 @@ const persistenceByDatabase = new WeakMap<Database, boolean>();
 const persistenceErrorByDatabase = new WeakMap<Database, string>();
 const pathByDatabase = new WeakMap<Database, string>();
 
+/** Most recent runtime-gate refusal for diagnostics after a null open. */
+let lastRuntimeGateRefusal: SqliteRuntimeGateReport | null = null;
+
+export function consumeLastRuntimeGateRefusal(): SqliteRuntimeGateReport | null {
+    return lastRuntimeGateRefusal;
+}
+
 let lastSchemaFenceRejection: { persistedVersion: number; supportedVersion: number } | null = null;
 
 export interface DatabaseFormatRefusal {
@@ -81,6 +88,7 @@ export function getFormatRefusal(): DatabaseFormatRefusal | null {
 }
 
 export function __resetSchemaFenceStateForTests(): void {
+    lastRuntimeGateRefusal = null;
     lastSchemaFenceRejection = null;
     lastFormatRefusal = null;
 }
@@ -614,17 +622,6 @@ export function __resetExpectedDirectFormatCacheForTests(): void {
     cachedExpectedFormat = null;
 }
 
-let runtimeGateVerified = false;
-
-function ensureSafeSqliteRuntime(): void {
-    if (runtimeGateVerified) return;
-    const report = probeSqliteRuntimeGate();
-    if (!report.ok) {
-        throw new Error(`unsafe SQLite runtime: ${report.reasons.join("; ")}`);
-    }
-    runtimeGateVerified = true;
-}
-
 /**
  * Serialize with any concurrent bootstrapper under BEGIN IMMEDIATE, recheck
  * the family, and create the registered direct format only if the family is
@@ -731,7 +728,14 @@ function openDirectDatabase(
     explicitDbPath: boolean,
     latestSupportedVersion: number,
 ): Database | null {
-    ensureSafeSqliteRuntime();
+    // The WAL-reset-safety gate runs before SQLite can recover a database,
+    // enable WAL, or write the direct format.
+    const runtimeGate = probeSqliteRuntimeGate();
+    if (!runtimeGate.ok) {
+        lastRuntimeGateRefusal = runtimeGate;
+        return null;
+    }
+    lastRuntimeGateRefusal = null;
     const preOpenRefusal = refusePreOpenFamily(dbPath);
     if (preOpenRefusal) {
         lastFormatRefusal = preOpenRefusal;
@@ -780,8 +784,8 @@ function openDirectDatabase(
 /**
  * Open the persistent Magic Context SQLite database.
  *
- * Fails closed: if the database cannot be opened (binary ABI mismatch,
- * unwritable path, corrupted file, unsafe SQLite runtime), this throws.
+ * Fails closed: if the database cannot be opened, it returns a recorded
+ * refusal or throws a fatal open error.
  * Magic Context CANNOT silently fall back to an in-memory database, because:
  *   1. An in-memory DB has no project memories, no historian state, no
  *      tag persistence — features that depend on durable storage become
@@ -792,7 +796,9 @@ function openDirectDatabase(
  *      raw history reach the model and overflow the context window — the
  *      exact failure mode that broke a real test session.
  *
- * Two failure modes, both fail-closed:
+ * Three failure modes, all fail-closed:
+ *   - **Runtime refusal** (the SQLite source cannot safely reset WAL): returns
+ *     `null` before constructing a connection and records the gate report.
  *   - **Format refusal** (the on-disk family is neither the exact current
  *     direct format nor truly pristine, or it carries a newer format fence
  *     than this binary supports): returns `null` with the detail recorded in

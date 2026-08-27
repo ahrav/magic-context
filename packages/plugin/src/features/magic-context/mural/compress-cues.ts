@@ -217,6 +217,7 @@ function selectCandidates(db: Database, projectIdentity: string): CueCandidate[]
         const result = readProjectMemoryCurrentState(db, {
             projectIds,
             workspaceEpoch,
+            workspaceIdentities: [projectIdentity],
             surface: "auto_inject",
         });
         if (result.status === "ok") items = result.items;
@@ -385,6 +386,7 @@ async function compressOneChunk(
             publicClaimIds: chunk.map((candidate) => candidate.item.publicClaimId),
             projectIds,
             workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, [args.projectIdentity]),
+            workspaceIdentities: [args.projectIdentity],
             surface: "auto_inject",
         });
         const currentLocators = new Map(

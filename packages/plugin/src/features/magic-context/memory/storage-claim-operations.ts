@@ -866,25 +866,36 @@ function appendLifecycleEvent(
     );
 }
 
+/**
+ * `exemptClaimIds` names every claim this operation itself is about to move off
+ * the (project, category, hash) coordinate, so its own participants can never
+ * read as the pre-existing owner. A revise or restore exempts one claim; a
+ * merge exempts the target AND its sources, because the sources are still
+ * `active` at check time and only retire later in the same transaction —
+ * without the exemption, merged content that keeps a source's wording (the
+ * common outcome) collides with that source and rejects a legitimate merge.
+ */
 function assertNoLiveDuplicate(
     db: Database,
     args: {
         projectId: number;
         category: string;
         normalizedHash: string;
-        claimId: number;
-        excludedClaimIds?: readonly number[];
+        exemptClaimIds: readonly number[];
     },
 ): void {
-    const excludedClaimIds = args.excludedClaimIds ?? [args.claimId];
-    const placeholders = excludedClaimIds.map(() => "?").join(", ");
+    const exempt = [...new Set(args.exemptClaimIds)];
+    // An empty exemption list must not emit `NOT IN ()`, which SQLite rejects
+    // as a syntax error rather than matching every row.
+    const exemptClause =
+        exempt.length === 0 ? "" : ` AND claim_id NOT IN (${exempt.map(() => "?").join(", ")})`;
     const duplicate = db
         .prepare(
             `SELECT claim_id AS claimId FROM claim_memory_current_heads
               WHERE project_id = ? AND category = ? AND normalized_hash = ?
-                AND lifecycle_state = 'active' AND claim_id NOT IN (${placeholders})`,
+                AND lifecycle_state = 'active'${exemptClause}`,
         )
-        .get(args.projectId, args.category, args.normalizedHash, ...excludedClaimIds) as
+        .get(args.projectId, args.category, args.normalizedHash, ...exempt) as
         | { claimId: number }
         | undefined;
     if (duplicate) {
@@ -973,7 +984,18 @@ function attachEvidenceStage(
         payload: { claim: claimPayloadLocator(claim), kind: "evidence_attached" },
         effects: [
             {
-                effectKey: `evidence:${claim.publicClaimId}:r${claim.revision}`,
+                // The observation identifies the attachment. One receipt can
+                // hold several attachments to the SAME claim and revision — an
+                // autonomous manifest whose entries normalize onto one live
+                // (project, category, hash) slot creates the claim once and
+                // attaches the rest, and an unchanged revise attaches too. A
+                // key of claim plus revision alone repeats across them, and
+                // `claim_operation_effects` enforces UNIQUE (receipt_id,
+                // effect_key) with an append-only trigger, so the second
+                // attachment would abort the whole manifest — including the
+                // unrelated entries in it — and every deterministic retry the
+                // same way.
+                effectKey: `evidence:${claim.publicClaimId}:r${claim.revision}:o${observationId}`,
                 projectId: claim.projectId,
                 claimId: claim.claimId,
                 revisionId: claim.currentRevisionId,
@@ -1246,8 +1268,9 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         sharing: input.sharing ?? current.sharing,
         expiresAt: input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
     };
+    const contentUnchanged = sha256Utf8Hex(nextContent) === claim.contentDigest;
     const unchanged =
-        sha256Utf8Hex(nextContent) === claim.contentDigest &&
+        contentUnchanged &&
         nextAttributes.category === current.category &&
         nextAttributes.importance === current.importance &&
         nextAttributes.memoryScope === current.memoryScope &&
@@ -1261,14 +1284,43 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         projectId: claim.projectId,
         category: nextAttributes.category,
         normalizedHash,
-        claimId: claim.claimId,
+        exemptClaimIds: [claim.claimId],
     });
     const observationId = writeEvidenceChain(db, claim.projectId, input.provenance, nextContent);
+    // A metadata-only revision re-states the current revision's exact bytes, so
+    // every observation supporting those bytes still supports them. Dropping
+    // them would rebuild this revision's trust from the reviser's provenance
+    // alone — `hasExplicitUserEvidence` and `countIndependentEvidenceGroups`
+    // both read `supports` rows per revision — so an importance/scope/sharing
+    // change would reclassify a user-asserted memory down to the reviser's own
+    // maturity and drop it out of the automatic surfaces. A content-changing
+    // revision carries nothing: those observations attest to bytes this
+    // revision replaced. Relations are named rather than copied wholesale so a
+    // future non-supporting relation (a refutation, say) is never re-asserted
+    // as support here, the same discipline the merge path applies to lineage.
+    // Carrying a stamp forward cannot by itself manufacture trust:
+    // `hasExplicitUserEvidence` independently requires a non-first revision to
+    // still hold the claim's first-revision bytes, so model-authored content
+    // never inherits explicit-user standing through this path.
+    const carriedObservationIds = contentUnchanged
+        ? (
+              db
+                  .prepare(
+                      `SELECT observation_id AS observationId FROM claim_evidence
+                        WHERE revision_id = ? AND relation = 'supports'
+                        ORDER BY observation_id`,
+                  )
+                  .all(claim.currentRevisionId) as Array<{ observationId: number }>
+          ).map((row) => row.observationId)
+        : [];
     const appended = appendClaimRevisionInCurrentTransaction(db, {
         claimId: claim.claimId,
         expectedCurrentRevisionId: claim.currentRevisionId,
         content: nextContent,
-        evidence: [{ observationId }],
+        evidence: [...new Set([observationId, ...carriedObservationIds])].map((carried) => ({
+            observationId: carried,
+            relation: "supports" as const,
+        })),
         sourceSessionId: input.provenance.sourceSessionId ?? null,
     });
     if (appended.status !== "applied") {
@@ -1411,7 +1463,7 @@ export function stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
             projectId: claim.projectId,
             category: attributes.category,
             normalizedHash: attributes.normalizedHash,
-            claimId: claim.claimId,
+            exemptClaimIds: [claim.claimId],
         });
     }
     appendLifecycleEvent(db, {
@@ -1530,20 +1582,53 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         );
     }
     const normalizedHash = computeNormalizedHash(mergedContent);
+    // A merge keeps the target's category and terminally retires every source,
+    // so merging across categories destroys the source category's live fact.
+    // Categories partition distinct facts: two similar claims filed under
+    // different categories are not duplicates, one is miscategorized. Rejecting
+    // here — before any staging — is what the pre-cutover `merge_memories`
+    // guaranteed ("cross-category merges are rejected before any store mutation
+    // so a miscategorization cannot silently destroy a distinct fact"), and what
+    // the curator prompt still promises the model. The check belongs to the
+    // operation rather than one caller so every entry point inherits it.
+    const sourceCategories = new Set<string>();
+    for (const source of sources) {
+        const attributes = readRevisionAttributes(db, source.currentRevisionId);
+        if (!attributes) {
+            throw new ClaimGraphCorruptionError(
+                `claim revision ${source.currentRevisionId} has no attributes row; direct-SQL corruption`,
+            );
+        }
+        if (attributes.category !== targetAttributes.category) {
+            sourceCategories.add(attributes.category);
+        }
+    }
+    if (sourceCategories.size > 0) {
+        const found = [targetAttributes.category, ...[...sourceCategories].sort()].join(", ");
+        throw new ClaimOperationInputError(
+            `cross-category merge is refused (${found}); a category boundary separates distinct facts, so archive the redundant claim instead`,
+        );
+    }
     assertNoLiveDuplicate(db, {
         projectId: target.projectId,
         category: targetAttributes.category,
         normalizedHash,
-        claimId: target.claimId,
-        excludedClaimIds: [target.claimId, ...sources.map((source) => source.claimId)],
+        exemptClaimIds: [target.claimId, ...sources.map((source) => source.claimId)],
     });
 
+    // Both evidence relations carry lineage, so both flow into the merged
+    // revision: `supports` covers create/revise/split-produced sources, and
+    // `merged_from` covers a source that is itself merge-produced and so holds
+    // no `supports` row of its own. Naming the relations rather than reading
+    // every row keeps a future non-lineage relation (a refutation, say) from
+    // being silently re-asserted here as merge support; a source carrying only
+    // such a relation instead trips the zero-evidence guard below.
     const sourceObservations = sources.flatMap((source) =>
         (
             db
                 .prepare(
                     `SELECT observation_id AS observationId FROM claim_evidence
-                      WHERE revision_id = ? AND relation = 'supports'
+                      WHERE revision_id = ? AND relation IN ('supports', 'merged_from')
                       ORDER BY observation_id`,
                 )
                 .all(source.currentRevisionId) as Array<{ observationId: number }>
@@ -1554,13 +1639,38 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
             "merge sources carry no supporting evidence; direct-SQL corruption",
         );
     }
+    // A merge that keeps the target's bytes — the default when `mergedContent`
+    // is omitted — leaves the target's own observations still attesting to
+    // exactly this content. Building the revision from source observations alone
+    // dropped that provenance from the live chain: current-state evidence
+    // summaries lost it, and merging this claim again propagated only its source
+    // lineage, so the original attestation was gone for good. Carried as
+    // `supports` because these observations attest the content, while source
+    // observations arrive as `merged_from` lineage. A merge that REPLACES the
+    // bytes carries nothing, for the same reason the source rule gives: those
+    // observations attest to content this revision replaced.
+    const evidence = new Map<number, "supports" | "merged_from">();
+    if (mergedContent === target.content) {
+        for (const row of db
+            .prepare(
+                `SELECT observation_id AS observationId FROM claim_evidence
+                  WHERE revision_id = ? AND relation = 'supports'
+                  ORDER BY observation_id`,
+            )
+            .all(target.currentRevisionId) as Array<{ observationId: number }>) {
+            evidence.set(row.observationId, "supports");
+        }
+    }
+    for (const observationId of sourceObservations) {
+        if (!evidence.has(observationId)) evidence.set(observationId, "merged_from");
+    }
     const appended = appendClaimRevisionInCurrentTransaction(db, {
         claimId: target.claimId,
         expectedCurrentRevisionId: target.currentRevisionId,
         content: mergedContent,
-        evidence: [...new Set(sourceObservations)].map((observationId) => ({
+        evidence: [...evidence].map(([observationId, relation]) => ({
             observationId,
-            relation: "merged_from" as const,
+            relation,
         })),
     });
     if (appended.status !== "applied") {
@@ -1632,6 +1742,12 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         });
         policyRevisionIds.push(source.currentRevisionId);
     }
+    // The target head lands only after every source head is `retired`. The
+    // dedup index over (project, category, normalized_hash) is partial on
+    // `lifecycle_state = 'active'`, so merged content that keeps a source's
+    // wording still collides with that source's live head until it vacates the
+    // coordinate. Retiring first makes the ordering carry the same guarantee
+    // the exemption in `assertNoLiveDuplicate` states.
     upsertCurrentHead(db, {
         claimId: target.claimId,
         projectId: target.projectId,
@@ -1664,9 +1780,11 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
 
 /**
  * Same-project merge (R8): appends one target revision whose evidence links
- * the sources' supporting observations as `merged_from`, records supersedes
- * conflicts, and retires the sources. Trust and approval never transfer —
- * the new target revision opens its own conservative policy subject.
+ * every observation the sources carry as `merged_from` — including the ones a
+ * merge-produced source itself carries as `merged_from`, so lineage survives
+ * repeated merges — records supersedes conflicts, and retires the sources.
+ * Trust and approval never transfer — the new target revision opens its own
+ * conservative policy subject.
  */
 export function mergeProjectMemoryClaims(
     db: Database,
@@ -1913,9 +2031,10 @@ export function readOutboxConsumerCheckpoint(
 }
 
 /**
- * Advance one consumer/project cursor. Regression is rejected, and the
- * acknowledged id must not split a receipt group within the project: a page
- * cannot expose half an operation (KTD13).
+ * Advance one consumer/project cursor. Regression is rejected, the cursor may
+ * not run past the current outbox tail, and the acknowledged id must not split a
+ * receipt group within the project: a page cannot expose half an operation
+ * (KTD13).
  */
 export function advanceOutboxConsumerCheckpointInCurrentTransaction(
     db: Database,
@@ -1928,6 +2047,25 @@ export function advanceOutboxConsumerCheckpointInCurrentTransaction(
     if (args.ackedEffectId < existing) {
         throw new Error(
             `outbox checkpoint for ${args.consumer}/${args.projectId} cannot regress (${existing} -> ${args.ackedEffectId})`,
+        );
+    }
+    // A cursor past the tail claims to have observed effects that do not exist.
+    // Nothing else catches it: the receipt-split query below finds no `pending`
+    // row beyond such an id, so it passes. Left unchecked, once every required
+    // consumer holds a future cursor the prune boundary becomes that future id,
+    // and effects allocated below it afterwards are deleted having never been
+    // published to anyone.
+    //
+    // The tail falls back to the existing cursor rather than zero so a
+    // re-acknowledgement stays idempotent after pruning empties the table — the
+    // acknowledged effects are gone precisely because they were consumed.
+    const tailRow = db.prepare("SELECT MAX(id) AS tail FROM claim_operation_effects").get() as {
+        tail: number | null;
+    };
+    const tail = tailRow.tail ?? existing;
+    if (args.ackedEffectId > tail) {
+        throw new Error(
+            `outbox checkpoint ${args.ackedEffectId} for ${args.consumer}/${args.projectId} is beyond the outbox tail (${tail})`,
         );
     }
     const split = db
@@ -1960,11 +2098,18 @@ export interface ClaimOutboxPruneResult {
 
 /**
  * Consumption-driven outbox retention (KTD13): the prune boundary is the
- * minimum acknowledged effect id across every REQUIRED consumer (a consumer
- * with no checkpoint pins the boundary at zero), and only complete receipt
- * groups at or below the boundary leave. Receipts themselves never leave
- * (R20). Runs inside the caller's write transaction so the enabled=1
- * capability row can never commit.
+ * minimum acknowledged effect id across every REQUIRED consumer paired with
+ * every project the outbox still holds effects for (an absent checkpoint pins
+ * the boundary at zero), and only complete receipt groups at or below the
+ * boundary leave. Receipts themselves never leave (R20). Runs inside the
+ * caller's write transaction so the enabled=1 capability row can never commit.
+ *
+ * The pairing is what makes the boundary sound. Checkpoints are keyed
+ * (consumer, project_id) while the delete below is global over effect ids, so a
+ * consumer-only aggregate reports a boundary derived from the projects it HAS
+ * acknowledged and silently ignores the ones it never checkpointed. A consumer
+ * caught up on one project past another project's effect ids would then prune
+ * effects it never processed.
  */
 export function pruneClaimOperationEffectsInCurrentTransaction(
     db: Database,
@@ -1982,8 +2127,11 @@ export function pruneClaimOperationEffectsInCurrentTransaction(
     for (const consumer of requiredConsumers) {
         const row = db
             .prepare(
-                `SELECT MIN(acked_effect_id) AS acked FROM claim_outbox_consumer_checkpoints
-                  WHERE consumer = ?`,
+                `SELECT MIN(COALESCE(checkpoint.acked_effect_id, 0)) AS acked
+                   FROM (SELECT DISTINCT project_id FROM claim_operation_effects) project
+                   LEFT JOIN claim_outbox_consumer_checkpoints checkpoint
+                     ON checkpoint.consumer = ?
+                    AND checkpoint.project_id = project.project_id`,
             )
             .get(consumer) as { acked: number | null };
         boundary = Math.min(boundary, row.acked ?? 0);

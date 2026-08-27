@@ -12,8 +12,12 @@ export type ImitatedArgRule =
           values: readonly string[];
       }
     | {
+          type: "object";
+          fields: Readonly<Record<string, ImitatedArgRule>>;
+      }
+    | {
           type: "array";
-          items: "string" | "number";
+          items: ImitatedArgRule;
           maxItems?: number;
           values?: readonly string[];
       };
@@ -23,6 +27,24 @@ export type ImitatedArgsSchema = Readonly<Record<string, ImitatedArgRule>>;
 const MAX_DECODED_STRING_LENGTH = 1024 * 1024;
 const MAX_DECODED_ARRAY_ITEMS = 100;
 
+/**
+ * Nested objects must match their declared field set exactly. An undeclared field
+ * would reach the tool unvalidated, and a missing field would let a partial value
+ * (a mutation token short one digest) through to the mutation path.
+ */
+function validObjectField(
+    value: unknown,
+    fields: Readonly<Record<string, ImitatedArgRule>>,
+): boolean {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    const declared = Object.entries(fields);
+    if (Object.keys(record).length !== declared.length) return false;
+    return declared.every(
+        ([field, rule]) => Object.hasOwn(record, field) && validField(record[field], rule),
+    );
+}
+
 function validField(value: unknown, rule: ImitatedArgRule): boolean {
     if (rule === "string") {
         return typeof value === "string" && value.length <= MAX_DECODED_STRING_LENGTH;
@@ -30,16 +52,20 @@ function validField(value: unknown, rule: ImitatedArgRule): boolean {
     if (rule === "number") return typeof value === "number" && Number.isFinite(value);
     if (rule === "boolean") return typeof value === "boolean";
     if (rule.type === "enum") return typeof value === "string" && rule.values.includes(value);
+    if (rule.type === "object") return validObjectField(value, rule.fields);
     if (!Array.isArray(value) || value.length > (rule.maxItems ?? MAX_DECODED_ARRAY_ITEMS)) {
         return false;
     }
     return value.every((item) => {
         if (rule.items === "number") return typeof item === "number" && Number.isFinite(item);
-        return (
-            typeof item === "string" &&
-            item.length <= MAX_DECODED_STRING_LENGTH &&
-            (rule.values === undefined || rule.values.includes(item))
-        );
+        if (rule.items === "string") {
+            return (
+                typeof item === "string" &&
+                item.length <= MAX_DECODED_STRING_LENGTH &&
+                (rule.values === undefined || rule.values.includes(item))
+            );
+        }
+        return validField(item, rule.items);
     });
 }
 

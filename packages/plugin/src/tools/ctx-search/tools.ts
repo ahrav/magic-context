@@ -57,14 +57,14 @@ const ctxSearchArgsShape = {
         .string()
         .optional()
         .describe(
-            "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+            "Search query. Matches against Primers, git commit messages, notes, and raw user/assistant message text. Project-memory claims are NOT text-searchable; a query that is only opaque public claim ids (mcm_<32hex>) or full revision locators resolves those claims directly.",
         ),
     limit: tool.schema.number().optional().describe("Maximum results to return (default: 10)"),
     sources: tool.schema
         .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
         .optional()
         .describe(
-            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
+            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] is accepted but returns nothing: broad project-memory retrieval is disabled until the claim retrieval projection is active. Omit for a broad search across all enabled sources; pass [] to search no sources.',
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
@@ -174,13 +174,26 @@ export async function executeCtxSearch(
     // null for ordinary text so it still searches the corpus. If no
     // locator resolves (foreign hidden, missing) the call falls through
     // to the normal lanes.
+    //
+    // Source restriction binds here too. This path runs BEFORE
+    // `normalizeSources` reaches `unifiedSearch`, so without the check a
+    // locator-shaped query would return claim content under `sources: []`
+    // — documented as searching no sources — or under a restriction naming
+    // only non-memory sources.
+    const requestedSources = normalizeSources(args.sources);
+    const memorySourceAllowed =
+        requestedSources === undefined || requestedSources.includes("memory");
     const locatorShape = parseLocatorShapedQuery(query);
-    if (locatorShape && memoryEnabled) {
+    if (locatorShape && memoryEnabled && memorySourceAllowed) {
         const locatorResults = resolveClaimsByLocatorsForSearch({
             db: deps.db,
             projectPath,
             locators: locatorShape,
-            limit: Math.max(normalizeSearchResultLimit(args.limit), locatorShape.length),
+            // The requested limit applies here exactly as it does to every other
+            // search path. Raising the cap to the locator count let `limit: 1`
+            // with two ids return both, and a long enough locator list slip past
+            // the shared hard ceiling.
+            limit: normalizeSearchResultLimit(args.limit),
             visibleRevisionLocators,
         });
         if (locatorResults !== null) {
@@ -200,7 +213,7 @@ export async function executeCtxSearch(
         readMessages: deps.readMessages,
         maxMessageOrdinal: messageOrdinalCutoff,
         gitCommitsEnabled,
-        sources: normalizeSources(args.sources),
+        sources: requestedSources,
         // Explicit agent search → enable literal-probe multi-query
         // recall for symbol/command/path lookups. Auto-search hints
         // (the hot path) leave this off to protect their latency.

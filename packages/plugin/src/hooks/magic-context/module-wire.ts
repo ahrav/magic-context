@@ -28,6 +28,10 @@ export const CLAIM_INTENT_PROTOCOL_VERSION = 1;
 export const CLAIM_REQUEST_ENCODING_VERSION = 1;
 export const CLAIM_MIRROR_PROTOCOL_VERSION = 1;
 export const CLAIM_MIRROR_VERSION = 1;
+// Byte bound shared with the module's `validate_claim` (`claim_mirror.rs`).
+// Both sides must measure the same unit or a label can pass here and be
+// rejected there, which suppresses the mirror lane.
+export const CLAIM_PROVENANCE_LABEL_MAX_BYTES = 512;
 
 export interface ClaimIntentBinding {
     databaseIncarnationId: string;
@@ -353,13 +357,18 @@ function validateCommittedClaimMirrorRow(
         throw new Error(`${label} generation does not match vector`);
     }
     const provenanceLabel = record.provenanceLabel;
+    // The module validates this bound in BYTES (`claim_mirror.rs` uses `str::len`).
+    // Measuring UTF-16 code units here would admit a label the module then rejects,
+    // which suppresses the whole mirror lane for the workspace.
     if (
         provenanceLabel !== null &&
         (typeof provenanceLabel !== "string" ||
             provenanceLabel.length === 0 ||
-            provenanceLabel.length > 512)
+            Buffer.byteLength(provenanceLabel, "utf8") > CLAIM_PROVENANCE_LABEL_MAX_BYTES)
     ) {
-        throw new Error(`${label}.provenanceLabel must be null or contain 1..=512 characters`);
+        throw new Error(
+            `${label}.provenanceLabel must be null or contain 1..=${CLAIM_PROVENANCE_LABEL_MAX_BYTES} bytes`,
+        );
     }
     return {
         publicClaimId,

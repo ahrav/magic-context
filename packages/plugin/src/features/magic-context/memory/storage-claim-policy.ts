@@ -491,18 +491,44 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
     return row.hasAny ? 1 : 0;
 }
 
-/** Exact explicit-user supporting evidence for this revision. */
+/**
+ * The only producer whose explicit-user observation may grant explicit-user
+ * credit to a revision that changes content. The Tauri dashboard records the
+ * new content as the observation's own `extracted_text`. Mirrored by
+ * `EXPLICIT_USER_REVISION_PRODUCER` in
+ * `packages/dashboard/src-tauri/src/claim_adapter.rs`; the adapter conformance
+ * suite compares both policies' verdicts, so a drift shows up as a maturity
+ * disagreement rather than passing silently.
+ */
+export const EXPLICIT_USER_REVISION_PRODUCER = "dashboard:tauri";
+
+/** Exact explicit-user evidence for this revision. First revisions retain
+ * their stated provenance. Later revisions qualify only when their bytes still
+ * equal the first revision or when the dashboard's explicit-user channel
+ * observed the revision's exact bytes. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
     return (
         db
             .prepare(
                 `SELECT 1 FROM claim_evidence e
              JOIN observations o ON o.id = e.observation_id
+             JOIN claim_revisions cr ON cr.id = e.revision_id
              WHERE e.revision_id = ? AND e.relation = 'supports'
                AND o.source_trust_class = 'explicit_user'
+               AND (
+                   cr.revision = 1
+                   OR cr.content_sha256 = (
+                       SELECT first.content_sha256 FROM claim_revisions first
+                       WHERE first.claim_id = cr.claim_id AND first.revision = 1
+                   )
+                   OR (
+                       o.extractor = ?
+                       AND o.content_sha256 = cr.content_sha256
+                   )
+               )
              LIMIT 1`,
             )
-            .get(revisionId) != null
+            .get(revisionId, EXPLICIT_USER_REVISION_PRODUCER) != null
     );
 }
 

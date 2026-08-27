@@ -104,8 +104,15 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.dreamerPrompt,
-            // Curate emits one host-validated manifest and never mutates storage
-            // directly, so it has no tool surface.
+            // CURATE-ONLY, and ZERO tools. Curate emits one XML manifest; the
+            // host validates it and applies every claim write inside a single
+            // guarded transaction, which is curate's ONLY write path. Granting
+            // ctx_memory would expose list/create/revise/archive/restore/merge
+            // to the model and let a run mutate claims outside that transaction.
+            // It also reads no code (a separate verify task owns memory-vs-code
+            // correctness), so there is no read/grep/bash/aft/ctx_search surface
+            // either. maintain-docs and review-user-memories run on their own
+            // scoped agents below.
             // (Inline literal — kept byte-identical to DREAMER_CURATE_ALLOWED_TOOLS
             // by agent-registration-drift.test.ts; see the module header for why
             // these are not const imports.)
@@ -115,8 +122,10 @@ export function buildHiddenAgentRegistrations(args: {
             maxSteps: 150,
             overrides: args.dreamerOverrides,
             // Lock the curate tool surface: a user dreamer `tools`/`permission`
-            // override must not re-grant bash/write/edit to this unsupervised
-            // memory-hygiene agent. Model/temperature overrides still apply.
+            // override must not grant ANY tool — ctx_memory included — to this
+            // unsupervised memory-hygiene agent, whose writes belong to the
+            // host-applied manifest transaction. Model/temperature overrides
+            // still apply.
             lockPermissions: true,
         },
         {

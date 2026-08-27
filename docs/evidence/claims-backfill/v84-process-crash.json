@@ -1,8 +1,8 @@
 {
   "schemaVersion": "claims-process-crash-evidence/v1",
-  "commitUnderTest": "2a664713cdd2af61f04d18f95f2af1e64fb5cccc",
+  "commitUnderTest": "1e68fc0ce7051d10e2dd4e16c11cbc8b4d5c4d8d",
   "dirtyDiffDigestPolicy": "sha256(sorted U6 implementation path + NUL + full file bytes + NUL); evidence file excluded",
-  "dirtyDiffDigest": "b827aa7ad4549e7f891a05b2bca89ce3dcf6a014d11b0f5a9896a031933f6458",
+  "dirtyDiffDigest": "b7dc208f0a4fcd77a9408442d929de3239e1b55e4a89b26bfcc71b6ebe7b5ec5",
   "implementationFiles": [
     "ARCHITECTURE.md",
     "STRUCTURE.md",
@@ -42,8 +42,8 @@
       "sqliteVersion": "3.53.2"
     },
     "node": {
-      "version": "v24.14.0",
-      "sqliteVersion": "3.51.2"
+      "version": "v24.15.0",
+      "sqliteVersion": "3.51.3"
     }
   },
   "environment": {

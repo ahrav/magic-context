@@ -264,6 +264,8 @@ describe("createCtxSearchTool", () => {
 	});
 
 	it("resolves a locator query directly without calling unifiedSearch (Pi parity)", async () => {
+		// `createTestDb` already installs the claim-memory schema; installing it
+		// again here throws "table claim_public_ids already exists".
 		const db = createTestDb();
 		const { seedProjectMemoryClaim } = await import(
 			"@magic-context/core/features/magic-context/test-claim-database"

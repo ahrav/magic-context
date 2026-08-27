@@ -145,7 +145,13 @@ export function relocateProjectMemoryClaims(
     }
     const relation: ClaimDerivationRelation = input.mode === "move" ? "moved_from" : "copied_from";
     const nowMs = input.nowMs ?? Date.now();
+    // The resolved actor is part of the request identity, as it is for every other
+    // claim mutation. It is written into the target's initial lifecycle event and,
+    // for a move, the source's too, so omitting it here would let the same
+    // producer/operation key replay under a different actor and silently keep the
+    // first actor's audit records instead of reporting an identity conflict.
     const request = {
+        actor: input.actor ?? producer.producer,
         mode: input.mode,
         sourceTokens: input.sourceTokens,
         targetProjectIdentity: input.targetProjectIdentity,

@@ -2,7 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseIncidentCatalog } from "../src/incident-pool/contract";
-import { incidentUnitFiles } from "./run-test-selection";
+import {
+    assertSrcTestsClassified,
+    incidentUnitFiles,
+    prospectiveUnitFiles,
+    standaloneFilesForSelection,
+} from "./run-test-selection";
 import {
     E2E_ROOT,
     filesForMode,
@@ -34,7 +39,7 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
-        expect(validation.files.length).toBe(61);
+        expect(validation.files.length).toBe(62);
         expect(validation.manifest.entries).toHaveLength(
             validation.files.length,
         );
@@ -50,13 +55,13 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(42);
+        expect(ts).toHaveLength(43);
         expect(rust).toHaveLength(32);
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(
-            22,
+            21,
         );
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(20);
-        expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(22);
+        expect(filesForMode(validation, "ts", "pi")).toHaveLength(21);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length);
         expect(filesForMode(validation, "ts", "pi")).not.toContain(
             "tests/pi-todo-synthesis.test.ts",
@@ -162,6 +167,38 @@ describe("mode manifest validator", () => {
                 "scripts/validate-mode-manifest.test.ts",
             ]),
         );
+    });
+
+    it("selects every prospective unit and classifies every src test", () => {
+        expect(prospectiveUnitFiles()).toEqual(
+            expect.arrayContaining([
+                "src/prospective-holdout/contract.test.ts",
+                "src/prospective-holdout/graduation.test.ts",
+                "scripts/prospective-holdout.test.ts",
+            ]),
+        );
+        expect(() => assertSrcTestsClassified()).not.toThrow();
+    });
+
+    it("owns OpenCode oracle units only in TypeScript OpenCode selections", () => {
+        const opencodeOnly = [
+            "src/oracle-arms/presets.test.ts",
+            "src/oracle-arms/scripted-ctx-search.test.ts",
+        ];
+        expect(standaloneFilesForSelection("ts", "opencode")).toEqual(
+            expect.arrayContaining(opencodeOnly),
+        );
+        for (const file of opencodeOnly) {
+            expect(standaloneFilesForSelection("ts", "pi")).not.toContain(file);
+            expect(standaloneFilesForSelection("rust", "all")).not.toContain(file);
+        }
+        for (const files of [
+            standaloneFilesForSelection("ts", "opencode"),
+            standaloneFilesForSelection("ts", "pi"),
+            standaloneFilesForSelection("rust", "all"),
+        ]) {
+            expect(files).toContain("src/oracle-arms/seed-gold-memories.test.ts");
+        }
     });
 
     it("rejects broad-glob green package scripts", () => {

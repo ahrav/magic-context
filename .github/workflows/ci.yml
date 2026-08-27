@@ -67,6 +67,31 @@ jobs:
         working-directory: packages/e2e-tests
         run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
 
+  release-contract-gate:
+    name: mc-host release contract drift gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The contract is committed in four byte-coupled forms (canonical
+      # JSON, the include!-able Rust constants that feed production epoch
+      # values, and two TypeScript embeddings). This is the only gate that
+      # proves they were regenerated together.
+      - name: Check generated release contract for drift
+        run: bun run release:contract:check
+
   shm-crash-recovery:
     name: SHM crash isolation + recovery (Linux, provisional ring tuple)
     runs-on: ubuntu-latest
@@ -276,6 +301,33 @@ jobs:
       - name: Test
         run: bun run --cwd packages/pi-plugin test
 
+  prospective-release-holdout:
+    name: Prospective release holdout contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Prospective holdout unit contracts
+        run: bun run test:prospective-unit
+
+      - name: Authenticate lifecycle-appropriate epoch artifacts
+        run: bun run validate:prospective-holdout
+
+      - name: E2E harness typecheck
+        run: bun run --cwd packages/e2e-tests typecheck
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest
@@ -311,14 +363,19 @@ jobs:
         with:
           bun-version: latest
 
+      # rustfmt and clippy are not in the action's default minimal profile, and
+      # the adapter gate below runs both.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # Frontend-only checks (no Rust/Tauri needed). The key gate is the test
-      # step, which runs config-parity.test.ts — it fails the build if the
-      # plugin config schema gains/renames/removes a field the dashboard's
-      # ConfigEditor coverage manifest doesn't account for, so the form can't
-      # silently drift out of sync with the schema again.
+      # The frontend gate is the test step, which runs config-parity.test.ts —
+      # it fails the build if the plugin config schema gains/renames/removes a
+      # field the dashboard's ConfigEditor coverage manifest doesn't account
+      # for, so the form can't silently drift out of sync with the schema again.
       - name: TypeScript typecheck
         run: bun run --cwd packages/dashboard typecheck
 
@@ -330,6 +387,23 @@ jobs:
 
       - name: Build (frontend)
         run: bun run --cwd packages/dashboard build
+
+      # db-adapter declares its own [workspace], so the root `--workspace`
+      # commands never reach it. It is also the only place claim_adapter.rs and
+      # sqlite_runtime.rs compile under test: src-tauri needs the GTK/WebKit
+      # stack, so this crate re-includes both via #[path] to keep the adapter
+      # testable without a GUI. Skipping it leaves the dashboard's claim
+      # mutation, visibility, and direct-format verification paths uncovered.
+      # `cargo fmt` resolves the workspace from the working directory and walks
+      # up past this crate's own [workspace] to the repository root, which
+      # references the ../commons/* siblings, so the stub provisioning every
+      # other Rust job here performs is required even though this crate's own
+      # dependency graph excludes those crates.
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Dashboard adapter conformance (Rust)
+        run: sh scripts/test-dashboard-adapter.sh
 
   benchmark-retrieval-check:
     name: Benchmark (retrieval, deterministic CI profile)

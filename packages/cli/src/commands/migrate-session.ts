@@ -462,6 +462,19 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
     const dryRun = args.includes("--dry-run");
     const skipConfirm = args.includes("--yes");
 
+    // Re-homing no longer moves or copies memory. Accepting and ignoring the
+    // retired flag would re-home the session while silently skipping the memory
+    // action the caller asked for, so automation still passing it must fail.
+    if (args.some((arg) => arg === "--memories" || arg.startsWith("--memories="))) {
+        console.error(
+            "--memories is no longer supported: re-homing a session leaves claim history unchanged.",
+        );
+        console.error(
+            "Move or copy project memory explicitly with the claim copy/move workflow, then re-run without --memories.",
+        );
+        return 1;
+    }
+
     if (!sessionId) {
         console.error("Missing required flag: --session <id>");
         printMigrateSessionHelp();

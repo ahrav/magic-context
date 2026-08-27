@@ -23,10 +23,10 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
         // hand-maintained list here would silently drop a newly added
         // `scripts/*.test.ts` from the default, host, and incident-unit
         // selections without tripping any guard.
-        ...new Glob("scripts/*.test.ts").scanSync({
+        ...[...new Glob("scripts/*.test.ts").scanSync({
             cwd: root,
             onlyFiles: true,
-        }),
+        })].filter((file) => file !== "scripts/prospective-holdout.test.ts"),
     ].sort();
     if (files.length === 0) throw new Error("incident unit selection is empty");
     return files;
@@ -39,13 +39,38 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
  * as the package's default suite; without this they run nowhere. These need
  * nothing beyond Bun, so every mode can run them.
  */
+export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
+    const files = [
+        ...new Glob("src/prospective-holdout/**/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
+        "scripts/prospective-holdout.test.ts",
+    ].sort();
+    if (files.length === 1) throw new Error("prospective unit selection is empty");
+    return assertPresent(files, root);
+}
+
 export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         "src/cache-analysis.test.ts",
+        "src/oracle-arms/seed-gold-memories.test.ts",
         "src/opencode-runner/spawn.test.ts",
         "src/pi-runner/rpc-client.test.ts",
+        "src/pi-runner/spawn.test.ts",
     ];
     return assertPresent(files, root);
+}
+
+/** OpenCode-only oracle tests that require the TypeScript TestHarness. */
+export function tsOpenCodeStandaloneFiles(root: string = E2E_ROOT): string[] {
+    return assertPresent(
+        [
+            "src/oracle-arms/presets.test.ts",
+            "src/oracle-arms/scripted-ctx-search.test.ts",
+        ],
+        root,
+    );
 }
 
 /**
@@ -76,7 +101,9 @@ export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
     ];
     const claimed = new Set([
         ...incidentUnitFiles(root).filter((file) => file.startsWith("src/")),
+        ...prospectiveUnitFiles(root).filter((file) => file.startsWith("src/")),
         ...standaloneUnitFiles(root),
+        ...tsOpenCodeStandaloneFiles(root),
         ...rustStandaloneFiles(root),
     ]);
     const unclassified = onDisk.filter((file) => !claimed.has(file)).sort();
@@ -111,8 +138,23 @@ export function greenTestFiles(
     return files;
 }
 
+export function standaloneFilesForSelection(
+    mode: Mode,
+    harness: GreenHarness,
+    root: string = E2E_ROOT,
+): string[] {
+    return [
+        ...standaloneUnitFiles(root),
+        ...(mode === "ts" && harness !== "pi"
+            ? tsOpenCodeStandaloneFiles(root)
+            : []),
+        ...(mode === "rust" ? rustStandaloneFiles(root) : []),
+    ];
+}
+
 interface CliArgs {
     incidentUnit: boolean;
+    prospectiveUnit: boolean;
     mode: Mode | null;
     harness: GreenHarness;
     timeoutMs: number;
@@ -121,6 +163,7 @@ interface CliArgs {
 
 function parseArgs(args: string[]): CliArgs {
     let incidentUnit = false;
+    let prospectiveUnit = false;
     let mode: Mode | null = null;
     let harness: GreenHarness = "all";
     let timeoutMs = 120_000;
@@ -129,6 +172,8 @@ function parseArgs(args: string[]): CliArgs {
         const arg = args[index];
         if (arg === "--incident-unit") {
             incidentUnit = true;
+        } else if (arg === "--prospective-unit") {
+            prospectiveUnit = true;
         } else if (arg === "--mode") {
             const value = args[++index];
             if (value !== "ts" && value !== "rust") {
@@ -157,20 +202,21 @@ function parseArgs(args: string[]): CliArgs {
             maxConcurrency = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-test-selection.ts (--incident-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
+                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
             );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
         }
     }
-    if (incidentUnit === (mode !== null)) {
-        throw new Error("select exactly one of --incident-unit or --mode");
+    const selectionCount = Number(incidentUnit) + Number(prospectiveUnit) + Number(mode !== null);
+    if (selectionCount !== 1) {
+        throw new Error("select exactly one of --incident-unit, --prospective-unit, or --mode");
     }
-    if (incidentUnit && harness !== "all") {
-        throw new Error("--harness does not apply to incident unit tests");
+    if ((incidentUnit || prospectiveUnit) && harness !== "all") {
+        throw new Error("--harness does not apply to unit test selections");
     }
-    return { incidentUnit, mode, harness, timeoutMs, maxConcurrency };
+    return { incidentUnit, prospectiveUnit, mode, harness, timeoutMs, maxConcurrency };
 }
 
 async function main(): Promise<number> {
@@ -178,7 +224,9 @@ async function main(): Promise<number> {
     assertSrcTestsClassified();
     const files = args.incidentUnit
         ? incidentUnitFiles()
-        : greenTestFiles(args.mode!, args.harness);
+        : args.prospectiveUnit
+          ? prospectiveUnitFiles()
+          : greenTestFiles(args.mode!, args.harness);
     if (args.mode === "rust") {
         const prerequisite = detectRustPrerequisites();
         if (!prerequisite.ok) {
@@ -191,12 +239,10 @@ async function main(): Promise<number> {
     // The wrapper drives the whole pool in-process, so it runs alone in a
     // second phase. Hermetic standalone units ride the first phase; the
     // Cargo-fixture ones join only when Rust prerequisites were proven above.
-    const standalone = args.incidentUnit
-        ? []
-        : [
-              ...standaloneUnitFiles(),
-              ...(args.mode === "rust" ? rustStandaloneFiles() : []),
-          ];
+    const standalone =
+        args.incidentUnit || args.prospectiveUnit
+            ? []
+            : standaloneFilesForSelection(args.mode!, args.harness);
     const selected = [...files, ...standalone];
     const groups = selected.includes(wrapper)
         ? [selected.filter((file) => file !== wrapper), [wrapper]]

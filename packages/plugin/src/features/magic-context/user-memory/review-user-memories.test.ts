@@ -4,6 +4,7 @@ import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import type { Database } from "../../../shared/sqlite";
 import { dreamerManifestIdentity, readDreamerProjectClaims } from "../dreamer/claim-manifest";
 import { acquireLeaseWithAcquisition, releaseLease } from "../dreamer/lease";
+import { claimEffectMemoryChanges } from "../dreamer/storage-dream-runs";
 import { createDirectTestDatabase } from "../test-database";
 import {
     applyUserMemoryReviewManifest,
@@ -19,6 +20,7 @@ import {
 } from "./storage-user-memory";
 
 const PROJECT = "git:user-memory-review";
+const OTHER_PROJECT = "git:other-project";
 const LEASE = "user-memories";
 
 function freshDb(): Database {
@@ -65,6 +67,23 @@ function reviewClient(text: string, beforeMessages?: () => void) {
     } as never;
 }
 
+function recordingReviewClient(text: string) {
+    const prompts: string[] = [];
+    const client = {
+        session: {
+            create: mock(async () => ({ id: "child-user-memories" })),
+            prompt: mock(async (input: { body?: { parts?: Array<{ text?: string }> } }) => {
+                const promptText = input.body?.parts?.[0]?.text;
+                if (typeof promptText === "string") prompts.push(promptText);
+                return {};
+            }),
+            messages: mock(async () => assistantMessages(text)),
+            delete: mock(async () => ({})),
+        },
+    };
+    return { client: client as never, prompts };
+}
+
 function seedCandidates(db: Database, contents: string[]): number[] {
     contents.forEach((content, index) => {
         const sessionId = `s${index + 1}`;
@@ -86,7 +105,7 @@ describe("reviewUserMemories", () => {
         ]);
         const updateId = insertUserMemory(db, "User likes short answers", []);
         const dismissId = insertUserMemory(db, "User wants verbose digressions", []);
-        const snapshot = captureUserMemoryReviewSnapshot(db);
+        const snapshot = captureUserMemoryReviewSnapshot(db, PROJECT);
         const manifest = parseUserMemoryReviewManifest({
             promote: [
                 {
@@ -128,6 +147,8 @@ describe("reviewUserMemories", () => {
                 identity,
                 snapshot,
                 manifest,
+                // These cases exercise apply/replay atomicity, not corroboration.
+                promotionThreshold: 1,
                 nowMs: 50_000,
             });
 
@@ -141,7 +162,7 @@ describe("reviewUserMemories", () => {
         ).version;
         const second = apply();
 
-        expect(first).toEqual({
+        expect(first).toMatchObject({
             result: {
                 promoted: 1,
                 projectPromoted: 1,
@@ -152,6 +173,10 @@ describe("reviewUserMemories", () => {
             replayed: false,
             staleReason: null,
         });
+        // A project promotion commits a claim, so the outcome has to carry the
+        // effects the dream-run audit records; counts alone lose the claim IDs.
+        expect(first.result.effects.length).toBeGreaterThan(0);
+        expect(claimEffectMemoryChanges(first.result.effects)).not.toBeNull();
         expect(second).toEqual({ ...first, replayed: true });
         expect(getUserMemoryCandidates(db)).toHaveLength(0);
         expect(getActiveUserMemories(db).map((memory) => memory.content)).toEqual([
@@ -198,6 +223,54 @@ describe("reviewUserMemories", () => {
         db.close();
     });
 
+    test("an under-corroborated project promotion is refused", () => {
+        // The threshold only decides whether the review runs; a qualifying
+        // snapshot of three unrelated candidates can still yield a manifest that
+        // promotes one of them, turning a single observation into a durable
+        // project claim the prompt said required recurrence.
+        const db = freshDb();
+        const holderId = "holder-threshold";
+        const acquisition = acquire(db, holderId);
+        const [a, b, c] = seedCandidates(db, [
+            "This project pins the toolchain",
+            "User prefers short explanations",
+            "This project runs focused tests",
+        ]);
+        const snapshot = captureUserMemoryReviewSnapshot(db, PROJECT);
+        const manifest = parseUserMemoryReviewManifest({
+            promote_project: [
+                {
+                    content: "Pin the toolchain.",
+                    category: "PROJECT_RULES",
+                    candidate_ids: [a],
+                },
+            ],
+            consume_candidate_ids: [a, b, c],
+        });
+        const identity = dreamerManifestIdentity({
+            db,
+            holderId,
+            leaseKey: LEASE,
+            task: "review-user-memories",
+            publicClaimIds: [`snapshot:${snapshot.digest}`],
+        });
+
+        expect(() =>
+            applyUserMemoryReviewManifest({
+                db,
+                projectIdentity: PROJECT,
+                holderId,
+                leaseKey: LEASE,
+                expectedLeaseGeneration: acquisition.generation,
+                identity,
+                snapshot,
+                manifest,
+                promotionThreshold: 3,
+            }),
+        ).toThrow(/carries 1 candidate\(s\); 3 are required/);
+        expect(readDreamerProjectClaims(db, PROJECT, "hygiene")).toHaveLength(0);
+    });
+
     test("rolls claim receipt, effect, generation, and profile changes back together", () => {
         const db = freshDb();
         const holderId = "holder-rollback";
@@ -207,7 +280,7 @@ describe("reviewUserMemories", () => {
             "User prefers short explanations",
         ]);
         const updateId = insertUserMemory(db, "Old profile text", []);
-        const snapshot = captureUserMemoryReviewSnapshot(db);
+        const snapshot = captureUserMemoryReviewSnapshot(db, PROJECT);
         const manifest = parseUserMemoryReviewManifest({
             promote_project: [
                 {
@@ -247,6 +320,7 @@ describe("reviewUserMemories", () => {
                 identity,
                 snapshot,
                 manifest,
+                promotionThreshold: 1,
             }),
         ).toThrow("profile update failed");
         expect(readDreamerProjectClaims(db, PROJECT, "hygiene")).toHaveLength(0);
@@ -419,6 +493,142 @@ describe("reviewUserMemories", () => {
         expect(count(db, "claim_project_generations")).toBe(0);
         expect(getActiveUserMemories(db)).toHaveLength(0);
         expect(getUserMemoryCandidates(db)).toHaveLength(1);
+        db.close();
+    });
+
+    test("a project-A run cannot see or consume a project-B-bound candidate", async () => {
+        const db = freshDb();
+        const foreignContent = "Other project pins its toolchain in rust-toolchain.toml";
+        bindSession(db, "sess-a", PROJECT);
+        bindSession(db, "sess-b", OTHER_PROJECT);
+        insertUserMemoryCandidates(db, [
+            { content: "This project requires focused tests before commit", sessionId: "sess-a" },
+        ]);
+        insertUserMemoryCandidates(db, [{ content: foreignContent, sessionId: "sess-b" }]);
+        const [ownCandidate, foreignCandidate] = getUserMemoryCandidates(db).map(
+            (candidate) => candidate.id,
+        );
+
+        // Each project's review scope holds only the candidates it may act on.
+        expect(
+            captureUserMemoryReviewSnapshot(db, PROJECT).candidates.map(
+                (candidate) => candidate.id,
+            ),
+        ).toEqual([ownCandidate]);
+        expect(
+            captureUserMemoryReviewSnapshot(db, OTHER_PROJECT).candidates.map(
+                (candidate) => candidate.id,
+            ),
+        ).toEqual([foreignCandidate]);
+
+        const holderA = "holder-project-a";
+        const acquisitionA = acquire(db, holderA);
+        const reviewA = recordingReviewClient(
+            JSON.stringify({
+                promote_project: [
+                    {
+                        content: "Run focused tests before commit.",
+                        category: "PROJECT_RULES",
+                        candidate_ids: [ownCandidate],
+                    },
+                ],
+                consume_candidate_ids: [ownCandidate],
+            }),
+        );
+        const resultA = await reviewUserMemories({
+            db,
+            client: reviewA.client,
+            projectIdentity: PROJECT,
+            parentSessionId: undefined,
+            sessionDirectory: "/repo/project",
+            holderId: holderA,
+            leaseKey: LEASE,
+            deadline: Date.now() + 60_000,
+            leaseAcquisition: acquisitionA,
+            promotionThreshold: 1,
+        });
+        releaseLease(db, holderA, LEASE);
+
+        // The foreign candidate never reached the model, so it cannot be named
+        // in consume_candidate_ids, and it survives project A's consumption.
+        expect(reviewA.prompts.some((prompt) => prompt.includes(foreignContent))).toBe(false);
+        expect(resultA.candidatesConsumed).toBe(1);
+        expect(getUserMemoryCandidates(db).map((candidate) => candidate.id)).toEqual([
+            foreignCandidate,
+        ]);
+        expect(readDreamerProjectClaims(db, PROJECT, "hygiene")).toHaveLength(1);
+
+        // Project B's own review still finds its observation and promotes it.
+        const holderB = "holder-project-b";
+        const acquisitionB = acquire(db, holderB);
+        const resultB = await reviewUserMemories({
+            db,
+            client: reviewClient(
+                JSON.stringify({
+                    promote_project: [
+                        {
+                            content: "Pin the toolchain in rust-toolchain.toml.",
+                            category: "CONFIG_VALUES",
+                            candidate_ids: [foreignCandidate],
+                        },
+                    ],
+                    consume_candidate_ids: [foreignCandidate],
+                }),
+            ),
+            projectIdentity: OTHER_PROJECT,
+            parentSessionId: undefined,
+            sessionDirectory: "/repo/other-project",
+            holderId: holderB,
+            leaseKey: LEASE,
+            deadline: Date.now() + 60_000,
+            leaseAcquisition: acquisitionB,
+            promotionThreshold: 1,
+        });
+        releaseLease(db, holderB, LEASE);
+
+        expect(resultB.projectPromoted).toBe(1);
+        expect(readDreamerProjectClaims(db, OTHER_PROJECT, "hygiene")).toHaveLength(1);
+        expect(getUserMemoryCandidates(db)).toHaveLength(0);
+        db.close();
+    });
+
+    test("rejects a manifest that names a candidate outside the run's scope", async () => {
+        const db = freshDb();
+        const holderId = "holder-foreign-consume";
+        const acquisition = acquire(db, holderId);
+        bindSession(db, "sess-a", PROJECT);
+        bindSession(db, "sess-b", OTHER_PROJECT);
+        insertUserMemoryCandidates(db, [
+            { content: "This project requires focused tests before commit", sessionId: "sess-a" },
+        ]);
+        insertUserMemoryCandidates(db, [
+            { content: "Other project pins its toolchain", sessionId: "sess-b" },
+        ]);
+        const [ownCandidate, foreignCandidate] = getUserMemoryCandidates(db).map(
+            (candidate) => candidate.id,
+        );
+
+        await expect(
+            reviewUserMemories({
+                db,
+                client: reviewClient(
+                    JSON.stringify({
+                        consume_candidate_ids: [ownCandidate, foreignCandidate],
+                    }),
+                ),
+                projectIdentity: PROJECT,
+                parentSessionId: undefined,
+                sessionDirectory: "/repo/project",
+                holderId,
+                leaseKey: LEASE,
+                deadline: Date.now() + 60_000,
+                leaseAcquisition: acquisition,
+                promotionThreshold: 1,
+            }),
+        ).rejects.toThrow(`review consumes unknown candidate ${foreignCandidate}`);
+
+        expect(getUserMemoryCandidates(db)).toHaveLength(2);
+        expect(count(db, "claim_operation_effects")).toBe(0);
         db.close();
     });
 });

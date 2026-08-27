@@ -24,6 +24,16 @@ export function readAuthorizedClaimMemorySnapshot(
         ownIdentities: readonly string[];
         sharedCategories: readonly string[];
         workspaceEpoch: string;
+        /**
+         * Identities `workspaceEpoch` and the authorization were derived from.
+         * Automatic injection is the surface with the least recourse — nothing
+         * downstream re-checks it — so the provider must recompute the
+         * fingerprint at publication time rather than echo the value above. A
+         * workspace mutation bumps `project_memory_epoch`, not the claim
+         * generation tracked in the vector, so the fingerprint is the only
+         * signal that membership or sharing changed.
+         */
+        workspaceIdentities?: readonly string[];
         nowMs?: number;
     },
 ): AuthorizedClaimMemorySnapshot | null {
@@ -39,6 +49,9 @@ export function readAuthorizedClaimMemorySnapshot(
             surface: "auto_inject",
             lifecycleStates: ["active"],
             workspaceEpoch: args.workspaceEpoch,
+            ...(args.workspaceIdentities === undefined
+                ? {}
+                : { workspaceIdentities: args.workspaceIdentities }),
             ...(args.nowMs === undefined ? {} : { nowMs: args.nowMs }),
         });
         if (result.status === "ok") {

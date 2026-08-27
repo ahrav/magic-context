@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readdirSync, realpathSync, symlinkSync, writeFil
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
 
 export const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 export const PI_PLUGIN_ROOT = join(REPO_ROOT, "packages/pi-plugin");
@@ -74,6 +75,8 @@ export interface PiRunnerOptions {
   modelContextLimit?: number;
   /** Compatibility option from the old spawn-per-turn runner. RPC sessions persist naturally. */
   continueSession?: boolean;
+  /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+  releaseRoot?: VerifiedReleaseRoot;
 }
 
 export type PiSpawnOptions = PiRunnerOptions;
@@ -105,18 +108,37 @@ export function createPiIsolatedEnv(sharedDataDir?: string): PiIsolatedEnv {
   };
 }
 
-export function ensurePluginAvailable(env: PiIsolatedEnv): void {
-  const distEntry = join(PI_PLUGIN_ROOT, "dist", "index.js");
-  if (!existsSync(distEntry)) {
-    throw new Error(`${distEntry} is missing. Run: cd packages/pi-plugin && bun run build`);
+export function ensurePluginAvailable(env: PiIsolatedEnv, releaseRoot?: VerifiedReleaseRoot): void {
+  if (!releaseRoot) {
+    if (!existsSync(join(PI_PLUGIN_ROOT, "dist", "index.js"))) {
+      throw new Error(
+        `${join(PI_PLUGIN_ROOT, "dist", "index.js")} is missing. Run: cd packages/pi-plugin && bun run build`,
+      );
+    }
+    if (!existsSync(env.pluginDir)) symlinkSync(PI_PLUGIN_ROOT, env.pluginDir, "dir");
+    return;
   }
-  if (!existsSync(env.pluginDir)) {
-    symlinkSync(PI_PLUGIN_ROOT, env.pluginDir, "dir");
+  // Pi resolves an extension by reading `pi.extensions` from the `package.json`
+  // inside each `settings.packages` entry, so an entry has to be a package
+  // directory. The release root declares the built entrypoint, not the package
+  // that wraps it, so the entry is a directory built here: the frozen file is
+  // linked in and a manifest points at the link. The bytes Pi loads are still the
+  // release root's; only the wrapper naming them is local.
+  const entrypoint = releaseRootPath(releaseRoot, "piPlugin");
+  if (!existsSync(entrypoint)) {
+    throw new Error(`Pi plugin artifact is missing: ${entrypoint}`);
   }
+  if (existsSync(env.pluginDir)) return;
+  mkdirSync(env.pluginDir, { recursive: true });
+  symlinkSync(entrypoint, join(env.pluginDir, "index.js"), "file");
+  writeFileSync(
+    join(env.pluginDir, "package.json"),
+    `${JSON.stringify({ name: "pi-magic-context", version: "0.0.0", pi: { extensions: ["./index.js"] } }, null, 2)}\n`,
+  );
 }
 
 export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
-  ensurePluginAvailable(env);
+  ensurePluginAvailable(env, opts.releaseRoot);
 
   const settings = {
     packages: [env.pluginDir],

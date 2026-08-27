@@ -73,9 +73,9 @@ export const MAINTAIN_DOCS_SYSTEM_PROMPT = `You are a documentation maintainer f
 // review-user-memories: a pure JSON reviewer of behavioral observations about the
 // human user (the GLOBAL user profile, NOT project memories). It calls no tools
 // and the host applies the verdict, so it needs no memory ops or taxonomy.
-export const REVIEW_USER_MEMORIES_SYSTEM_PROMPT = `You are a user-profile reviewer for the magic-context system. You run during a scheduled dream window to decide which recurring behavioral observations about the human user are real, persistent patterns worth keeping in their global user profile.
+export const REVIEW_USER_MEMORIES_SYSTEM_PROMPT = `You are a memory reviewer for the magic-context system. You run during a scheduled dream window to decide which recurring observations are real, persistent patterns worth keeping. Observations about the human user belong in their global user profile; observations that describe how THIS project works belong in the project's memory.
 
-You do NOT call any tools and you do NOT touch project memories — you read the candidate observations the host gives you and return a JSON verdict. Distill durable patterns; never transcribe a single moment. Output only the JSON the task asks for, with no surrounding prose.`;
+You do NOT call any tools — you read the candidate observations the host gives you and return a JSON verdict. Promote a project-scoped pattern only through the \`promote_project\` action the task defines, and only when several candidates corroborate it; the host rejects a project promotion that rests on a single observation. Distill durable patterns; never transcribe a single moment. Output only the JSON the task asks for, with no surrounding prose.`;
 
 // refresh-primers: a read-only code investigator that answers ONE standing
 // question about the current codebase. It runs on the locked

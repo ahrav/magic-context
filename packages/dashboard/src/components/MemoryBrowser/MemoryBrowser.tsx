@@ -17,11 +17,13 @@ import type { ClaimLifecycleState, ClaimMemory } from "../../lib/types";
 import FilterSelect from "../shared/FilterSelect";
 import {
   type ClaimDraft,
+  isSelectableClaim,
   reconcileClaimSelection,
   reconcileDraft,
   type SelectionEntry,
   selectionState,
   selectionTargets,
+  snapshotErrorFor,
   toggleClaimSelection,
   toggleClaimsSelection,
 } from "./claim-selection";
@@ -69,25 +71,40 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
     offset: 0,
   });
   const [memories, { refetch: refetchMemories }] = createResource(fetchParams, getMemories);
+  // The source stays an OBJECT so it is never nullish: Solid treats a
+  // `undefined`/`null`/`false` source as a disabled resource and skips the
+  // fetcher entirely, which would leave stats unloaded on a project-less mount
+  // while the claim list above still fetches. An absent project is a `project:
+  // undefined` field, which `getMemoryStats` sends as `null` for global stats.
   const [stats, { refetch: refetchStats }] = createResource(
-    () => props.project?.identity ?? (projectFilter() || undefined),
-    (project) => getMemoryStats({ project }),
+    () => ({ project: props.project?.identity ?? (projectFilter() || undefined) }),
+    getMemoryStats,
   );
 
   createEffect(() => {
     const result = memories();
     if (!result) return;
-    if (result.outcome === "stale") {
-      setError(result.staleReasons.join("; ") || "Claim snapshot changed during refresh");
-      return;
-    }
+    // A settled snapshot supersedes the previous staleness report, so a
+    // successful read clears the banner. Leaving it set kept "Claim snapshot
+    // changed during refresh" on screen through every later successful filter
+    // change and refetch — a transient concurrent write looked like a stuck
+    // error until the user started a mutation or remounted the browser.
+    setError(snapshotErrorFor(result));
+    if (result.outcome === "stale") return;
     setVisibleClaims(result.claims);
     setSelected((previous) => reconcileClaimSelection(previous, result.claims));
     setFocusedClaim((previous) => {
       if (!previous) return null;
-      return (
-        result.claims.find((claim) => claim.publicClaimId === previous.publicClaimId) ?? previous
-      );
+      // A settled non-stale snapshot is authoritative about what the current
+      // project, search, and filter scope contains. When it omits the focused
+      // claim the claim has left that scope (archiving it under the Active
+      // filter, or switching project/search), so keeping the old snapshot
+      // would leave the detail panel's edit and Restore controls live against
+      // a claim the list no longer shows. Drafts are keyed by publicClaimId in
+      // a separate signal and reconcile to themselves when the claim is
+      // absent, so an unsaved edit survives and returns if the claim is
+      // focused again.
+      return result.claims.find((claim) => claim.publicClaimId === previous.publicClaimId) ?? null;
     });
     setDrafts((previous) => {
       const next = new Map(previous);
@@ -118,6 +135,7 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
       next.set(claim.publicClaimId, {
         publicClaimId: claim.publicClaimId,
         revisionLocator: claim.revisionLocator,
+        mutationToken: claim.mutationToken,
         text: claim.content,
         revisionAdvanced: false,
       });
@@ -157,8 +175,16 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
     );
 
   const handleContentChange = async (claim: ClaimMemory, content: string) => {
+    // Fence against the revision the draft was started on, not the refreshed
+    // one. A concurrent writer advances `claim` underneath an open editor while
+    // `reconcileDraft` keeps the user's text, so saving with the refreshed token
+    // would pass the fence and overwrite the other revision with text that
+    // predates it. The pinned token makes the adapter report `stale` instead,
+    // and `revisionAdvanced` is already surfaced in the editor.
+    const draft = drafts().get(claim.publicClaimId);
+    const target = claimMutationTarget(draft ?? claim);
     const saved = await handleMutation(
-      () => reviseMemoryContent(claimMutationTarget(claim), operationKey("content"), content),
+      () => reviseMemoryContent(target, operationKey("content"), content),
       "Failed to update content",
     );
     if (saved) {
@@ -186,6 +212,15 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
       setError(cause instanceof Error ? cause.message : String(cause));
       return;
     }
+    // The derived count, not the selection size, decides whether there is
+    // anything to do: every selected claim can be out of view after a filter
+    // change, and `bulk_archive_claims` refuses an empty target list — so
+    // prompting to archive zero and then invoking it would surface a backend
+    // error for a no-op the user never asked for.
+    if (targets.length === 0) {
+      setError("Every selected memory is out of view. Adjust the filter or clear the selection.");
+      return;
+    }
     const confirmed = await ask(
       `Archive ${targets.length} memor${targets.length === 1 ? "y" : "ies"}?`,
       { title: "Confirm Archive", kind: "warning" },
@@ -199,7 +234,14 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
   };
 
   const selectedCount = () => selected().size;
-  const staleSelectedCount = () => [...selected().values()].filter((entry) => entry.stale).length;
+  // "Stale" counts only what actually blocks a bulk action — a drifted claim
+  // still in view. A drifted claim that has left the view is reported as out of
+  // view, matching `selectionTargets`, so the bar never shows a blocker the user
+  // cannot see a checkbox for.
+  const staleSelectedCount = () =>
+    [...selected().values()].filter((entry) => entry.stale && !entry.offScope).length;
+  const offScopeSelectedCount = () =>
+    [...selected().values()].filter((entry) => entry.offScope).length;
   const allVisibleState = () => selectionState(selected(), visibleClaims());
   const draftForFocused = () => {
     const claim = focusedClaim();
@@ -292,6 +334,10 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
             <span class="bulk-action-count">
               {selectedCount()} selected
               <Show when={staleSelectedCount() > 0}> · {staleSelectedCount()} stale</Show>
+              <Show when={offScopeSelectedCount() > 0}>
+                {" "}
+                · {offScopeSelectedCount()} out of view
+              </Show>
             </span>
           </div>
           <div class="bulk-action-right">
@@ -340,15 +386,17 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
                           style={{ width: "100%", "text-align": "left" }}
                         >
                           <span class="memory-card-checkbox">
-                            <input
-                              type="checkbox"
-                              checked={selected().has(claim.publicClaimId)}
-                              onChange={() =>
-                                setSelected((previous) => toggleClaimSelection(previous, claim))
-                              }
-                              onClick={(event) => event.stopPropagation()}
-                              aria-label={`Select memory ${claim.publicClaimId}`}
-                            />
+                            <Show when={isSelectableClaim(claim)}>
+                              <input
+                                type="checkbox"
+                                checked={selected().has(claim.publicClaimId)}
+                                onChange={() =>
+                                  setSelected((previous) => toggleClaimSelection(previous, claim))
+                                }
+                                onClick={(event) => event.stopPropagation()}
+                                aria-label={`Select memory ${claim.publicClaimId}`}
+                              />
+                            </Show>
                           </span>
                           <div class="memory-card-body">
                             <div class="card-title">
@@ -403,6 +451,7 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
                 next.set(claim().publicClaimId, {
                   publicClaimId: claim().publicClaimId,
                   revisionLocator: current?.revisionLocator ?? claim().revisionLocator,
+                  mutationToken: current?.mutationToken ?? claim().mutationToken,
                   text,
                   revisionAdvanced: current?.revisionAdvanced ?? false,
                 });
@@ -412,9 +461,12 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
             onDiscardDraft={() =>
               setDrafts((previous) => {
                 const next = new Map(previous);
+                // Discard rebases onto the current revision, so the pin moves
+                // with it: the user is explicitly abandoning the older base.
                 next.set(claim().publicClaimId, {
                   publicClaimId: claim().publicClaimId,
                   revisionLocator: claim().revisionLocator,
+                  mutationToken: claim().mutationToken,
                   text: claim().content,
                   revisionAdvanced: false,
                 });

@@ -165,7 +165,12 @@ pub fn compute_claim_operation_request_digest(request: &Value) -> Result<String,
     protocol_digest(CLAIM_REQUEST_DIGEST_PROTOCOL, request)
 }
 
-fn is_lower_hex(text: &str, expected_len: usize) -> bool {
+/// True when `text` is exactly `expected_len` lowercase hexadecimal characters.
+///
+/// The claim-operation contract, the intent ledger, and the claim mirror all fence
+/// on identities in this format. They share one definition so a change to the
+/// length or charset cannot leave one layer accepting IDs another rejects.
+pub fn is_lower_hex(text: &str, expected_len: usize) -> bool {
     text.len() == expected_len
         && text
             .bytes()

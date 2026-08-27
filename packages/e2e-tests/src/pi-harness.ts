@@ -4,8 +4,10 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { Database } from "../../plugin/src/shared/sqlite";
+import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "./initialize-context-db";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
+import type { VerifiedReleaseRoot } from "./prospective-holdout/release-root";
 import {
   PiRpcClient,
   type PiMessage,
@@ -24,6 +26,8 @@ export interface PiTestHarnessOptions {
   sharedDataDir?: string;
   /** Optional working directory override before the persistent Pi process starts. */
   workdir?: string;
+  /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+  releaseRoot?: VerifiedReleaseRoot;
 }
 
 const DEFAULT_MOCK_RESPONSE: MockResponse = {
@@ -36,7 +40,14 @@ const DEFAULT_MOCK_RESPONSE: MockResponse = {
   },
 };
 
-function initializeIsolatedContextDb(dataDir: string): void {
+function initializeIsolatedContextDb(
+  dataDir: string,
+  releaseRoot?: VerifiedReleaseRoot,
+): void {
+  if (releaseRoot) {
+    initializeContextDbFromRelease(dataDir, releaseRoot);
+    return;
+  }
   const path = join(dataDir, "cortexkit", "magic-context", "context.db");
   if (existsSync(path)) return;
   mkdirSync(dirname(path), { recursive: true });
@@ -63,13 +74,14 @@ export class PiTestHarness {
     mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
     const env = createPiIsolatedEnv(options.sharedDataDir);
     if (options.workdir) env.workdir = options.workdir;
-    initializeIsolatedContextDb(env.dataDir);
+    initializeIsolatedContextDb(env.dataDir, options.releaseRoot);
     const rpc = new PiRpcClient({
       env,
       mockProviderURL: PiTestHarness.mockBaseURL(mock),
       magicContextConfig: options.magicContextConfig,
       piSettingsExtra: options.piSettingsExtra,
       modelContextLimit: options.modelContextLimit,
+      releaseRoot: options.releaseRoot,
     });
 
     try {
@@ -161,9 +173,7 @@ export class PiTestHarness {
   private static mockBaseURL(mock: MockProvider): string {
     const last = mock.requests()[0];
     if (last) return `http://${last.headers.host}`;
-    // MockProvider doesn't expose baseURL after start; derive it from the Bun server by
-    // reaching through the stable private field shape in tests.
-    // SAFETY: A running MockProvider exposes its Bun server port through private `server.port`.
+    // SAFETY: MockProvider.start stores Bun server under this stable test-only field. commentlint: allow(JUDGE)
     const server = (mock as unknown as { server?: { port?: number } }).server;
     const port = server?.port;
     if (!port) throw new Error("mock provider is not running");

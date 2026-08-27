@@ -208,8 +208,11 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(DREAMER_CLASSIFIER_AGENT)?.maxSteps).toBe(4);
     });
 
-    test("base dreamer (curate) is zero-tool and locked", () => {
+    test("base dreamer (curate) is tool-free and locked", () => {
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual([...DREAMER_CURATE_ALLOWED_TOOLS]);
+        // Curate's only write path is the XML manifest the host applies inside a
+        // guarded transaction, so it holds no tools at all — ctx_memory would let
+        // a run mutate claims outside that transaction.
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual([]);
         expect(byId(DREAMER_AGENT)?.lockPermissions).toBe(true);
         expect(byId(DREAMER_AGENT)?.maxSteps).toBe(150);

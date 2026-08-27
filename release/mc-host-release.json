@@ -1,0 +1,472 @@
+{
+  "cli": {
+    "check_ids": [
+      "artifact.bootstrap",
+      "artifact.current_generation",
+      "artifact.input_qualification",
+      "artifact.native_payload",
+      "compatibility.control",
+      "compatibility.daemon",
+      "compatibility.epochs",
+      "compatibility.modules",
+      "compatibility.proof",
+      "credentials.broca",
+      "filesystem.capacity.bootstrap",
+      "filesystem.capacity.generation",
+      "filesystem.permissions",
+      "filesystem.support",
+      "install.layout",
+      "lifecycle.evidence",
+      "lifecycle.fences",
+      "lifecycle.publication",
+      "platform.support",
+      "readiness.storage",
+      "readiness.synapse",
+      "readiness.transport"
+    ],
+    "check_statuses": [
+      "pass",
+      "fail",
+      "warn",
+      "skip"
+    ],
+    "commands": [
+      "start",
+      "stop",
+      "restart",
+      "status",
+      "doctor"
+    ],
+    "effects": {
+      "fields": [
+        "stop_committed",
+        "start_committed"
+      ],
+      "restart_only": true
+    },
+    "exit_codes": {
+      "ok": 0,
+      "operational_failure": 1,
+      "usage": 2
+    },
+    "readiness_states": {
+      "storage": [
+        "ready",
+        "starting",
+        "unavailable"
+      ],
+      "synapse": [
+        "ready",
+        "starting",
+        "degraded",
+        "unsupported"
+      ],
+      "transport": [
+        "ready",
+        "starting",
+        "unavailable"
+      ]
+    },
+    "reasons": {
+      "failing_by_precedence": [
+        {
+          "id": "internal_error",
+          "remediation": "report_bug"
+        },
+        {
+          "id": "no_data_dir",
+          "remediation": "set_data_directory"
+        },
+        {
+          "id": "unsupported_filesystem",
+          "remediation": "set_data_directory"
+        },
+        {
+          "id": "unsupported_platform",
+          "remediation": "use_supported_platform"
+        },
+        {
+          "id": "unsupported_install_layout",
+          "remediation": "use_supported_install_layout"
+        },
+        {
+          "id": "unsupported_state_schema",
+          "remediation": "align_versions"
+        },
+        {
+          "id": "native_payload_invalid",
+          "remediation": "reinstall_magic_context"
+        },
+        {
+          "id": "native_payload_missing",
+          "remediation": "install_native_payload"
+        },
+        {
+          "id": "insufficient_storage",
+          "remediation": "free_storage"
+        },
+        {
+          "id": "native_probe_unavailable",
+          "remediation": "run_daemon_restart"
+        },
+        {
+          "id": "wedged",
+          "remediation": "inspect_daemon_process"
+        },
+        {
+          "id": "publication_invalid",
+          "remediation": "inspect_daemon_process"
+        },
+        {
+          "id": "publication_stale",
+          "remediation": "inspect_daemon_process"
+        },
+        {
+          "id": "publication_missing",
+          "remediation": "inspect_daemon_process"
+        },
+        {
+          "id": "authentication_failed",
+          "remediation": "inspect_daemon_process"
+        },
+        {
+          "id": "unsupported_proof_version",
+          "remediation": "align_versions"
+        },
+        {
+          "id": "incompatible_control",
+          "remediation": "align_versions"
+        },
+        {
+          "id": "incompatible_daemon",
+          "remediation": "align_versions"
+        },
+        {
+          "id": "incompatible_module",
+          "remediation": "align_versions"
+        },
+        {
+          "id": "incompatible_epochs",
+          "remediation": "align_versions"
+        },
+        {
+          "id": "shutdown_timeout",
+          "remediation": "inspect_daemon_process"
+        },
+        {
+          "id": "startup_timeout",
+          "remediation": "inspect_daemon_process"
+        },
+        {
+          "id": "lifecycle_busy",
+          "remediation": "wait_and_retry"
+        },
+        {
+          "id": "storage_unavailable",
+          "remediation": "inspect_storage"
+        },
+        {
+          "id": "storage_starting",
+          "remediation": "wait_and_retry"
+        },
+        {
+          "id": "synapse_degraded",
+          "remediation": "inspect_synapse"
+        },
+        {
+          "id": "synapse_starting",
+          "remediation": "wait_and_retry"
+        },
+        {
+          "id": "harness_unavailable",
+          "remediation": null,
+          "remediation_from_subreason": true
+        },
+        {
+          "id": "stopping",
+          "remediation": "wait_and_retry"
+        },
+        {
+          "id": "starting",
+          "remediation": "wait_and_retry"
+        },
+        {
+          "id": "not_running",
+          "remediation": "run_daemon_start"
+        }
+      ],
+      "non_failing": [
+        "already_running",
+        "already_stopped",
+        "healthy",
+        "started",
+        "stopped",
+        "synapse_unsupported"
+      ]
+    },
+    "remediations": [
+      "align_versions",
+      "free_storage",
+      "inspect_daemon_process",
+      "inspect_storage",
+      "inspect_synapse",
+      "install_native_payload",
+      "reinstall_magic_context",
+      "report_bug",
+      "restart_with_supported_harness",
+      "run_daemon_restart",
+      "run_daemon_start",
+      "set_data_directory",
+      "use_supported_install_layout",
+      "use_supported_platform",
+      "wait_and_retry"
+    ],
+    "result_schema": "magic-context.daemon/v1",
+    "states": [
+      "unavailable",
+      "stopped",
+      "starting",
+      "running",
+      "stopping",
+      "wedged"
+    ]
+  },
+  "coordination": {
+    "directory": ".mc-host-coordination",
+    "lifetime_lock": "lifetime.lock",
+    "transaction_lock": "transaction.lock"
+  },
+  "credential_fingerprint": {
+    "canonicalization": "harness-provider-name-length-value/1",
+    "domain": "subc-broca-credential-v1"
+  },
+  "epochs": {
+    "compartment_render": 2,
+    "memory_render": 2,
+    "profile_claude_code_anthropic": 2,
+    "state_sync": 1,
+    "tagger": 3
+  },
+  "harness_unavailable": {
+    "reasons_by_precedence": [
+      {
+        "id": "descriptor_absent",
+        "remediation": "restart_with_supported_harness"
+      },
+      {
+        "id": "descriptor_invalid",
+        "remediation": "restart_with_supported_harness"
+      },
+      {
+        "id": "closure_incomplete",
+        "remediation": "restart_with_supported_harness"
+      },
+      {
+        "id": "argument_variant_invalid",
+        "remediation": "restart_with_supported_harness"
+      },
+      {
+        "id": "provider_unsupported",
+        "remediation": null
+      },
+      {
+        "id": "auth_mechanism_unsupported",
+        "remediation": null
+      },
+      {
+        "id": "credential_missing",
+        "remediation": "restart_with_supported_harness"
+      },
+      {
+        "id": "credential_value_too_large",
+        "remediation": "restart_with_supported_harness"
+      },
+      {
+        "id": "credential_row_too_large",
+        "remediation": "restart_with_supported_harness"
+      },
+      {
+        "id": "credential_snapshot_mismatch",
+        "remediation": "restart_with_supported_harness"
+      }
+    ],
+    "row_cap_bytes": 65536,
+    "value_cap_bytes": 16384
+  },
+  "install_layouts": [
+    "bun_physical_link",
+    "compiled_bun_external",
+    "npm_hoisted",
+    "npm_nested"
+  ],
+  "model_lane": {
+    "execution_provider": "cpu",
+    "id": "gte-modernbert-base-f16",
+    "platforms": [
+      "linux-x64-gnu"
+    ],
+    "unsupported": {
+      "darwin-arm64": "synapse_unsupported",
+      "darwin-x64": "synapse_unsupported"
+    }
+  },
+  "packages": {
+    "parents": [
+      "@cortexkit/magic-context",
+      "@cortexkit/opencode-magic-context",
+      "@cortexkit/pi-magic-context"
+    ],
+    "payloads": [
+      "@cortexkit/mc-host-darwin-arm64",
+      "@cortexkit/mc-host-darwin-x64",
+      "@cortexkit/mc-host-linux-x64-gnu"
+    ],
+    "version": "0.38.0"
+  },
+  "platforms": {
+    "supported": [
+      {
+        "capabilities": {
+          "dev_fd_exec": true,
+          "filesystem": [
+            "atomic_same_filesystem_replacement",
+            "cross_process_locks",
+            "file_and_directory_fsync",
+            "local_filesystem",
+            "no_follow_link_semantics",
+            "retained_object_execution"
+          ]
+        },
+        "os_min": "13.5",
+        "synapse": "unsupported",
+        "synapse_reason": "synapse_unsupported",
+        "target": "darwin-arm64"
+      },
+      {
+        "capabilities": {
+          "dev_fd_exec": true,
+          "filesystem": [
+            "atomic_same_filesystem_replacement",
+            "cross_process_locks",
+            "file_and_directory_fsync",
+            "local_filesystem",
+            "no_follow_link_semantics",
+            "retained_object_execution"
+          ]
+        },
+        "os_min": "13.5",
+        "synapse": "unsupported",
+        "synapse_reason": "synapse_unsupported",
+        "target": "darwin-x64"
+      },
+      {
+        "capabilities": {
+          "filesystem": [
+            "atomic_same_filesystem_replacement",
+            "cross_process_locks",
+            "file_and_directory_fsync",
+            "local_filesystem",
+            "no_follow_link_semantics",
+            "retained_object_execution"
+          ],
+          "procfs_self_fd_exec": true
+        },
+        "glibc_min": "2.28",
+        "kernel_min": "4.18",
+        "synapse": "certified_cpu",
+        "target": "linux-x64-gnu"
+      }
+    ],
+    "unsupported_reason": "unsupported_platform"
+  },
+  "proof": {
+    "current_offers": [
+      2
+    ],
+    "current_version": 2,
+    "legacy_stop_only": {
+      "adjacent_release_only": true,
+      "missing_offer_inference": false,
+      "scope": "stop_only",
+      "version": 1
+    },
+    "transcript_fields": [
+      "offers",
+      "selected_version",
+      "daemon_ver",
+      "client_nonce",
+      "server_nonce",
+      "daemon_id"
+    ]
+  },
+  "release": {
+    "id": "mc-host-release",
+    "version": "0.38.0"
+  },
+  "schema": "magic-context.mc-host-release/v1",
+  "stop_provenance_schema": {
+    "genesis": {
+      "forbidden_fields": [
+        "legacy_proof_version",
+        "payload_manifest_digest",
+        "predecessor_daemon_version",
+        "predecessor_manifest",
+        "predecessor_release_version"
+      ],
+      "legacy_stop_authority": false,
+      "required_fields": [
+        "release_version",
+        "tag"
+      ]
+    },
+    "predecessor": {
+      "legacy_stop_authority": true,
+      "required_fields": [
+        "legacy_proof_version",
+        "payload_manifest_digest",
+        "predecessor_daemon_version",
+        "predecessor_manifest",
+        "predecessor_release_version",
+        "release_version",
+        "tag",
+        "target"
+      ]
+    },
+    "tag_field": "tag",
+    "tags": [
+      "genesis",
+      "predecessor"
+    ]
+  },
+  "versions": {
+    "daemon": "mc-host/0.1.0",
+    "modules": {
+      "broca": {
+        "range": {
+          "max_exclusive": "0.2.0",
+          "min_inclusive": "0.1.0"
+        },
+        "version": "0.1.0"
+      },
+      "magic_context": {
+        "range": {
+          "max_exclusive": "0.2.0",
+          "min_inclusive": "0.1.0"
+        },
+        "version": "0.1.0"
+      },
+      "synapse": {
+        "range": {
+          "max_exclusive": "0.2.0",
+          "min_inclusive": "0.1.0"
+        },
+        "version": "0.1.0"
+      }
+    },
+    "supported_daemon_range": {
+      "max_exclusive": "0.2.0",
+      "min_inclusive": "0.1.0"
+    },
+    "wire_protocol": 2
+  }
+}

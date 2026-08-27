@@ -78,7 +78,9 @@ fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
 fn is_well_formed_source_id(source_id: &str) -> bool {
     // `YYYY-MM-DD HH:MM:SS <40-64 hex chars>`
     let bytes = source_id.as_bytes();
-    if bytes.len() < 20 + 40 {
+    // A multi-byte sequence across the stamp boundary is not a timestamp, and
+    // splitting inside one would panic: fail closed instead.
+    if bytes.len() < 20 + 40 || !source_id.is_char_boundary(20) {
         return false;
     }
     let (stamp, hash) = source_id.split_at(20);
@@ -261,28 +263,33 @@ pub fn verify_direct_format(conn: &Connection, db_path: &Path) -> Result<Vec<Str
         }
     }
 
-    let components = fixture["componentManifest"]["components"]
+    // The golden inventory is generated from `computeExpectedDirectFormat()`,
+    // the same authority the TypeScript classifier uses, and pinned by a drift
+    // assertion in `storage-format-epoch.test.ts`. Component `provides` lists
+    // name owning TABLES only — indexes, triggers, and views attribute to their
+    // owner through `sqlite_schema.tbl_name` — so deriving the expectation from
+    // `provides` left every index and trigger outside BOTH sides of this
+    // comparison, and a database missing an invariant-enforcing trigger
+    // verified clean before being opened read-write for claim mutations.
+    let expected_names = fixture["goldens"]["schemaObjectNames"]
         .as_array()
-        .ok_or("direct-format fixture components are invalid")?;
-    let mut expected_objects = BTreeSet::from([DIRECT_FORMAT_MARKER_TABLE.to_string()]);
-    for component in components {
-        for provided in component["provides"]
-            .as_array()
-            .ok_or("direct-format fixture provides list is invalid")?
-        {
-            expected_objects.insert(
-                provided
-                    .as_str()
-                    .ok_or("direct-format fixture object name is invalid")?
-                    .to_string(),
-            );
-        }
+        .ok_or("direct-format fixture golden schema inventory is invalid")?;
+    if expected_names.is_empty() {
+        return Err("direct-format fixture golden schema inventory is empty".to_string());
     }
+    let mut expected_objects: BTreeSet<String> = BTreeSet::new();
+    for name in expected_names {
+        expected_objects.insert(
+            name.as_str()
+                .ok_or("direct-format fixture object name is invalid")?
+                .to_string(),
+        );
+    }
+    // Mirrors `listSchemaObjectNames`: every non-internal object of every type.
+    // SQLite's own bookkeeping (`sqlite_sequence`, `sqlite_autoindex_*`,
+    // `sqlite_stat*`) is engine state rather than registered schema.
     let actual_objects: BTreeSet<String> = conn
-        .prepare(
-            "SELECT name FROM main.sqlite_schema \
-             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
-        )
+        .prepare("SELECT name FROM main.sqlite_schema WHERE name NOT LIKE 'sqlite_%'")
         .and_then(|mut statement| {
             statement
                 .query_map([], |row| row.get(0))?

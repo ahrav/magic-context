@@ -383,18 +383,48 @@ fn u10_scenario_7_delete_and_reseed_require_drained_u5_intents() {
         .replace_claim_mirror_snapshot(&original_snapshot, 1)
         .unwrap();
 
+    let route_root = "/repo/claim-mirror-test";
+    let store_uuid = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
+    let authority_project = "git:claim-mirror-test";
+    // Staging resolves memories authority through the bound route, so drive the
+    // route to MODULE before staging.
+    store
+        .bind_authority_route(store_uuid, authority_project, route_root)
+        .unwrap();
+    let preparing = store
+        .authority_begin_prepare(store_uuid, authority_project, "memories")
+        .unwrap();
+    let authority_generation = store
+        .authority_finish_prepare(
+            store_uuid,
+            authority_project,
+            "memories",
+            preparing.generation,
+            "same",
+            "same",
+            true,
+        )
+        .unwrap()
+        .generation;
+
     let binding = ClaimIntentBinding {
         database_incarnation_id: INCARNATION.to_string(),
         format_epoch: 1,
-        authority_project: "git:claim-mirror-test".to_string(),
-        authority_generation: 1,
+        authority_project: authority_project.to_string(),
+        authority_generation,
     };
     let command = ClaimCommandIdentity {
         producer: "mc-module".to_string(),
         operation_key: "pending-reset".to_string(),
     };
     let staged = store
-        .stage_claim_intent(&binding, &command, &json!({"operation": "update"}), 2)
+        .stage_claim_intent(
+            route_root,
+            &binding,
+            &command,
+            &json!({"operation": "update"}),
+            2,
+        )
         .unwrap();
 
     assert!(matches!(
@@ -484,4 +514,112 @@ fn u10_scenario_8_reseed_reproduces_state_across_restart() {
     let state = reopened.claim_mirror_state().unwrap().unwrap();
     assert_eq!(state.projects[&41].acked_effect_id, 29);
     assert_eq!(state.projects[&42].acked_effect_id, 11);
+}
+
+/// A receipt that names one of several claims still advances the generation
+/// stamps of the project's untouched rows.
+///
+/// The host stamps every claim in a full snapshot from the current vector, and
+/// replacement compares whole rows. Leaving an untouched row on the previous
+/// generation makes the next restart seed differ from durable state, which
+/// returns `ResetRequired` and suppresses the claim lane for a stable workspace
+/// that only committed one ordinary receipt.
+#[test]
+fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let touched = claim(CLAIM_A, 41, 1, "Original claim.", 1);
+    let untouched = claim(CLAIM_B, 41, 1, "Untouched claim.", 1);
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(
+                INCARNATION,
+                &[(41, 1)],
+                &[(41, 0)],
+                vec![touched, untouched.clone()],
+            ),
+            1,
+        )
+        .unwrap();
+
+    let revised = claim(CLAIM_A, 41, 2, "Revised claim.", 2);
+    let receipt = group(
+        9,
+        &[(41, 2)],
+        vec![effect(
+            1,
+            0,
+            41,
+            2,
+            ClaimMirrorChangeKind::Upsert,
+            Some(revised.clone()),
+            &revised,
+        )],
+    );
+    store.apply_claim_mirror_receipt(&receipt, 2).unwrap();
+
+    // The row no effect named carries the receipt's generations.
+    let stored = store.list_claim_mirror(INCARNATION, Some(41)).unwrap();
+    let stored_untouched = stored
+        .iter()
+        .find(|row| row.public_claim_id == CLAIM_B)
+        .expect("untouched claim stays mirrored");
+    assert_eq!(stored_untouched.project_generation, 2);
+    assert_eq!(stored_untouched.policy_generation, 2);
+
+    // The seed a restarting host rebuilds is therefore equivalent, so replacement
+    // succeeds instead of demanding a reset.
+    let reseed = snapshot(
+        INCARNATION,
+        &[(41, 2)],
+        &[(41, 1)],
+        vec![revised, claim(CLAIM_B, 41, 1, "Untouched claim.", 2)],
+    );
+    store.replace_claim_mirror_snapshot(&reseed, 3).unwrap();
+    assert_eq!(
+        store.claim_mirror_state().unwrap().unwrap().projects[&41].project_generation,
+        2
+    );
+}
+
+/// An effect reusing the stored revision with different content is rejected
+/// rather than silently overwriting the row.
+///
+/// A revision locator embeds the content digest, so an equal revision arriving
+/// with a different locator means the same revision carries different content.
+/// Only a strict revision-regression check would let the upsert replace it.
+#[test]
+fn receipt_rejects_equal_revision_carrying_different_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let stored = claim(CLAIM_A, 41, 2, "Stored content.", 1);
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![stored.clone()]),
+            1,
+        )
+        .unwrap();
+
+    let forged = claim(CLAIM_A, 41, 2, "Different content, same revision.", 2);
+    let receipt = group(
+        9,
+        &[(41, 2)],
+        vec![effect(
+            1,
+            0,
+            41,
+            2,
+            ClaimMirrorChangeKind::Upsert,
+            Some(forged.clone()),
+            &forged,
+        )],
+    );
+    assert!(matches!(
+        store.apply_claim_mirror_receipt(&receipt, 2),
+        Err(ClaimMirrorError::Invalid(_))
+    ));
+    assert_eq!(
+        store.list_claim_mirror(INCARNATION, Some(41)).unwrap(),
+        vec![stored]
+    );
 }

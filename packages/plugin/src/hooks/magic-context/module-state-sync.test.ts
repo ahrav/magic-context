@@ -36,6 +36,7 @@ import {
 } from "../../features/magic-context/storage-tags";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
+import { McHostCallError } from "../../shared/mc-host-client";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
