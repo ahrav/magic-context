@@ -167,6 +167,20 @@ frozen rates, including zero-delay 3,000 and 6,000/s. Those positions remain
 retained as invalid evidence in `docs/perf/runs/synapse-tail-af8ef126/`; no rate
 was substituted and no invalid position was replaced.
 
+Collected-evidence annotation, 2026-08-26 (second): the `synapse-tail-881be45b`
+epoch collected the full matrix and provisionally selected `a+c` with K=1, but
+its first analysis omitted the frozen 10% warmup discard. The frozen rule was
+applied post hoc from retained raw timestamps
+(`analysis/warmup_reanalysis.json` in the epoch directory); every headline
+contrast kept its direction and the selection is unchanged. Separately, a
+startup-validation defect found in review under-counted queued-job metadata:
+the corrected validation rejects any positive K at fully default limits, so
+the harness now pins a uniform 8 MiB `max_queued_request_bytes` across every
+arm. Under that budget the feasible K range widens beyond {1, 2}; the exercised
+levels remain K={1, 2} as frozen, K=1 remains the smallest feasible positive
+level, and the runtime admission behavior that produced the collected evidence
+is unaffected because the defect was startup arithmetic only.
+
 Cell order is randomized as complete blocks. One independent block contains
 one repetition of each scheduled cell under one environment and artifact.
 Process restart boundaries and the randomization seed are recorded.
