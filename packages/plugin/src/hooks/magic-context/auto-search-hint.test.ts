@@ -147,21 +147,37 @@ describe("buildAutoSearchHint", () => {
         expect(Buffer.byteLength(bullet ?? "", "utf8")).toBeLessThanOrEqual(MAX_RENDER_FIELD_BYTES);
     });
 
-    it("puts one complete warning first and stays inside the hint budget", () => {
+    it("puts one bounded warning first and stays inside the hint budget", () => {
         const first = antiMemory(`mcm_${"a".repeat(32)}`, "Redis");
         const second = antiMemory(`mcm_${"b".repeat(32)}`, "Memcached");
         const packed = packAutoSearchHint([memory("ordinary fragment"), second, first]);
 
         expect(packed.text).toContain("⚠ Previously rejected: Memcached");
         expect(packed.text).toContain("Reason: it creates split ownership");
-        expect(packed.text).toContain("Safer alternative: use SQLite");
-        expect(packed.text).toContain("Verify before proceeding");
         expect(packed.text).not.toContain("Previously rejected: Redis");
         expect(packed.delivered.filter((result) => result.source === "anti_memory")).toHaveLength(
             1,
         );
         expect(packed.delivered[0]).toBe(second);
         expect(packed.tokenCount).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
+    });
+
+    it("truncates an oversized warning instead of dropping the whole hint", () => {
+        const warning = antiMemory(`mcm_${"c".repeat(32)}`, "x".repeat(20_000));
+        if (warning.source !== "anti_memory") throw new Error("expected anti-memory fixture");
+        warning.rejectionReason = "y".repeat(20_000);
+        warning.saferAlternative = "z".repeat(20_000);
+
+        const packed = packAutoSearchHint([warning], { fragmentCharCap: 220 });
+        expect(packed.text).not.toBeNull();
+        expect(packed.delivered).toEqual([warning]);
+        expect(packed.tokenCount).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
+        expect(
+            packed.text
+                ?.split("\n")
+                .find((line) => line.startsWith("- "))
+                ?.endsWith("…"),
+        ).toBe(true);
     });
 });
 

@@ -12,7 +12,7 @@ import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-opera
 import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import {
-    embedBatch,
+    embedBatchForProject,
     embedText,
     getProjectEmbeddingSnapshot,
     isEmbeddingEnabled,
@@ -1865,7 +1865,6 @@ async function executeUnifiedSearch(args: {
     const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;
     const embeddingEnabled = options.embeddingEnabled ?? true;
     const embedQuery = options.embedQuery ?? embedText;
-    const embedPassages = options.embedPassages ?? embedBatch;
     const isEmbeddingRuntimeEnabled = options.isEmbeddingRuntimeEnabled ?? isEmbeddingEnabled;
     const gitCommitsEnabled = options.gitCommitsEnabled ?? false;
     const activeSources = resolveSources(options.sources);
@@ -1973,6 +1972,18 @@ async function executeUnifiedSearch(args: {
     const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
     const queryContract =
         capturedQuery instanceof Float32Array || capturedQuery === null ? null : capturedQuery;
+    const embedPassages =
+        options.embedPassages ??
+        (async (texts, signal, purpose) => {
+            const batch = await embedBatchForProject(projectPath, texts, signal, purpose);
+            const expectedGeneration = queryContract?.generation ?? embeddingSnapshot?.generation;
+            const expectedModelId = queryContract?.modelId ?? embeddingSnapshot?.modelId;
+            return batch &&
+                batch.generation === expectedGeneration &&
+                batch.modelId === expectedModelId
+                ? batch.vectors
+                : texts.map(() => null);
+        });
     const generationIsCurrent =
         queryContract === null ||
         (embeddingSnapshot !== null && embeddingSnapshot.generation === queryContract.generation);

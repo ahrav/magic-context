@@ -38,3 +38,23 @@ export const CTX_MEMORY_MUTATION_TOKEN_RULE: ImitatedArgRule = {
         policyHeadsDigest: "string",
     },
 };
+
+export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
+    type: "object",
+    fields: {
+        trigger: "string",
+        rejectedStrategy: "string",
+        rejectionReason: "string",
+    },
+    optionalFields: Object.fromEntries(
+        [
+            "saferAlternative",
+            "preconditions",
+            "attemptedApproach",
+            "observedFailure",
+            "rootCause",
+            "recovery",
+            "nonApplicableWhen",
+        ].map((field) => [field, { type: "nullable", value: "string" }]),
+    ),
+};

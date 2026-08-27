@@ -295,15 +295,7 @@ async function verifyOneBatch(
                     if (!text) throw new Error("verify returned no output");
                     rawManifest = text;
                     try {
-                        validateVerifyManifest(
-                            text,
-                            new Set(batch.map((memory) => memory.publicClaimId)),
-                            new Set(
-                                batch
-                                    .filter((memory) => memory.category === ANTI_MEMORY_CATEGORY)
-                                    .map((memory) => memory.publicClaimId),
-                            ),
-                        );
+                        validateVerifyBatch(text, batch);
                     } catch (error) {
                         const providerFailure = providerOutputFailureFromInvalidManifest(
                             messages,
@@ -374,10 +366,20 @@ function freshTarget(db: Database, publicClaimId: string) {
     };
 }
 
-function byCategory(batch: readonly VerifyPromptMemory[], publicClaimId: string): string {
-    const memory = batch.find((candidate) => candidate.publicClaimId === publicClaimId);
-    if (!memory) throw new Error(`verify returned unknown claim ${publicClaimId}`);
-    return memory.category;
+function validateVerifyBatch(
+    manifestText: string,
+    batch: readonly VerifyPromptMemory[],
+): { parsed: ParsedVerifyManifest; byId: Map<string, VerifyPromptMemory> } {
+    const byId = new Map(batch.map((memory) => [memory.publicClaimId, memory]));
+    const filelessIds = new Set(
+        batch
+            .filter((memory) => memory.category === ANTI_MEMORY_CATEGORY)
+            .map((memory) => memory.publicClaimId),
+    );
+    return {
+        parsed: validateVerifyManifest(manifestText, new Set(byId.keys()), filelessIds),
+        byId,
+    };
 }
 
 function stageVerificationItem(
@@ -570,16 +572,9 @@ export async function applyVerifyManifest(
         publicClaimIds: batch.map((memory) => memory.publicClaimId),
     });
     let parsed: ParsedVerifyManifest;
+    let byId: Map<string, VerifyPromptMemory>;
     try {
-        parsed = validateVerifyManifest(
-            manifestText,
-            new Set(batch.map((memory) => memory.publicClaimId)),
-            new Set(
-                batch
-                    .filter((memory) => memory.category === ANTI_MEMORY_CATEGORY)
-                    .map((memory) => memory.publicClaimId),
-            ),
-        );
+        ({ parsed, byId } = validateVerifyBatch(manifestText, batch));
     } catch (error) {
         recordDreamerManifestRejection({
             ...args,
@@ -592,7 +587,8 @@ export async function applyVerifyManifest(
 
     const writes: VerifyWrite[] = [];
     for (const entry of parsed.verified) {
-        const category = byCategory(batch, entry.publicClaimId);
+        const category = byId.get(entry.publicClaimId)?.category;
+        if (!category) throw new Error(`verify returned unknown claim ${entry.publicClaimId}`);
         const normalized =
             category === ANTI_MEMORY_CATEGORY
                 ? { files: [] }
@@ -629,7 +625,8 @@ export async function applyVerifyManifest(
             });
             throw error;
         }
-        const category = byCategory(batch, entry.publicClaimId);
+        const category = byId.get(entry.publicClaimId)?.category;
+        if (!category) throw new Error(`verify returned unknown claim ${entry.publicClaimId}`);
         const normalized =
             category === ANTI_MEMORY_CATEGORY
                 ? { files: [] }
@@ -656,14 +653,15 @@ export async function applyVerifyManifest(
         });
     }
     for (const entry of parsed.archived) {
+        const category = byId.get(entry.publicClaimId)?.category;
+        if (!category) throw new Error(`verify returned unknown claim ${entry.publicClaimId}`);
         writes.push({
             kind: "archive",
             publicClaimId: entry.publicClaimId,
-            category: byCategory(batch, entry.publicClaimId),
+            category,
             reason: entry.reason,
         });
     }
-    const byId = new Map(batch.map((memory) => [memory.publicClaimId, memory]));
     const counts = {
         verified: writes.filter((write) => write.kind === "verify").length,
         updated: writes.filter((write) => write.kind === "update").length,

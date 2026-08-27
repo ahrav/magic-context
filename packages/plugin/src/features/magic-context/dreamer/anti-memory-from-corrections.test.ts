@@ -143,4 +143,34 @@ describe("historian trajectory-correction anti-memory harvest", () => {
             db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
         ).toEqual({ trust: "model_inference" });
     });
+
+    test("harvests a bounded batch and leaves later events pending", () => {
+        db = createClaimReaderTestDatabase();
+        const compartmentId = seedSession(db, "ses-batch", "Unrelated user request");
+        insertCompartmentEvents(
+            db,
+            "ses-batch",
+            Array.from({ length: 101 }, (_, index) => ({
+                kind: "trajectory_correction",
+                atCompartment: 1,
+                fields: correctionFields({ summary: `Correction ${index}` }),
+            })),
+            [compartmentId],
+        );
+
+        const run = () =>
+            db
+                ?.transaction(() =>
+                    harvestAntiMemoriesFromCorrections({
+                        db: db as Database,
+                        projectIdentity: PROJECT,
+                    }),
+                )
+                .immediate();
+        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(101);
+        expect(run()).toMatchObject({ consumed: 100, skipped: 0 });
+        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(1);
+        expect(run()).toMatchObject({ consumed: 1, skipped: 0 });
+        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(0);
+    });
 });

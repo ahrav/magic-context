@@ -14,6 +14,11 @@ export type ImitatedArgRule =
     | {
           type: "object";
           fields: Readonly<Record<string, ImitatedArgRule>>;
+          optionalFields?: Readonly<Record<string, ImitatedArgRule>>;
+      }
+    | {
+          type: "nullable";
+          value: ImitatedArgRule;
       }
     | {
           type: "array";
@@ -35,13 +40,21 @@ const MAX_DECODED_ARRAY_ITEMS = 100;
 function validObjectField(
     value: unknown,
     fields: Readonly<Record<string, ImitatedArgRule>>,
+    optionalFields: Readonly<Record<string, ImitatedArgRule>> = {},
 ): boolean {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
     const record = value as Record<string, unknown>;
     const declared = Object.entries(fields);
-    if (Object.keys(record).length !== declared.length) return false;
-    return declared.every(
-        ([field, rule]) => Object.hasOwn(record, field) && validField(record[field], rule),
+    if (Object.keys(record).some((field) => !(field in fields) && !(field in optionalFields))) {
+        return false;
+    }
+    return (
+        declared.every(
+            ([field, rule]) => Object.hasOwn(record, field) && validField(record[field], rule),
+        ) &&
+        Object.entries(optionalFields).every(
+            ([field, rule]) => !Object.hasOwn(record, field) || validField(record[field], rule),
+        )
     );
 }
 
@@ -52,7 +65,8 @@ function validField(value: unknown, rule: ImitatedArgRule): boolean {
     if (rule === "number") return typeof value === "number" && Number.isFinite(value);
     if (rule === "boolean") return typeof value === "boolean";
     if (rule.type === "enum") return typeof value === "string" && rule.values.includes(value);
-    if (rule.type === "object") return validObjectField(value, rule.fields);
+    if (rule.type === "object") return validObjectField(value, rule.fields, rule.optionalFields);
+    if (rule.type === "nullable") return value === null || validField(value, rule.value);
     if (!Array.isArray(value) || value.length > (rule.maxItems ?? MAX_DECODED_ARRAY_ITEMS)) {
         return false;
     }

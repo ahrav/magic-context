@@ -12,6 +12,7 @@ import { ensureProject } from "../memory/storage-claims";
 import { validateRetrospectiveLearningText } from "./retrospective-learnings";
 
 const CORRECTION_CONSUMER = "dreamer-correction-harvest-v1";
+const CORRECTION_HARVEST_BATCH_SIZE = 100;
 
 export interface CorrectionHarvestResult {
     consumed: number;
@@ -126,6 +127,7 @@ export function harvestAntiMemoriesFromCorrections(args: {
         args.db,
         args.projectIdentity,
         "trajectory_correction",
+        { unconsumedBy: CORRECTION_CONSUMER, limit: CORRECTION_HARVEST_BATCH_SIZE },
     )) {
         const payload = mappedPayload(event);
         const reason = payload ? validationReason(payload) : "missing_warning_core";

@@ -113,7 +113,10 @@ export function getProjectCompartmentEvents(
     db: Database,
     projectIdentity: string,
     kind: string,
+    options: { unconsumedBy?: string; limit?: number } = {},
 ): ProjectCompartmentEvent[] {
+    const limit = options.limit === undefined ? -1 : Math.max(1, Math.min(options.limit, 10_000));
+    const consumer = options.unconsumedBy ?? null;
     const rows = db
         .prepare(
             `SELECT DISTINCT events.id, events.session_id, events.compartment_id, events.kind,
@@ -124,10 +127,16 @@ export function getProjectCompartmentEvents(
                LEFT JOIN compartments
                  ON compartments.id = events.compartment_id
                 AND compartments.session_id = events.session_id
-              WHERE projects.project_path = ? AND events.kind = ?
-              ORDER BY events.id ASC`,
+               WHERE projects.project_path = ? AND events.kind = ?
+                 AND (? IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM claim_operation_receipts receipts
+                      WHERE receipts.producer = ?
+                        AND receipts.operation_key = 'event:' || events.id
+                 ))
+               ORDER BY events.id ASC
+               LIMIT ?`,
         )
-        .all(projectIdentity, kind) as Array<{
+        .all(projectIdentity, kind, consumer, consumer, limit) as Array<{
         id: number;
         session_id: string;
         compartment_id: number | null;

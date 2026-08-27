@@ -746,7 +746,7 @@ function writeEvidenceChain(
     });
 }
 
-function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJsonValue {
+export function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJsonValue {
     return {
         extractor: provenance.extractor,
         extractorRunId: provenance.extractorRunId,
@@ -759,7 +759,7 @@ function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJ
     };
 }
 
-function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue {
+export function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue {
     return {
         applicabilityHeadsDigest: token.applicabilityHeadsDigest,
         contentDigest: token.contentDigest,
@@ -2033,6 +2033,7 @@ export function recordClaimUsage(
         nowMs?: number;
     },
 ): void {
+    if (args.publicClaimIds.length === 0) return;
     const nowMs = args.nowMs ?? Date.now();
     const column = args.kind === "seen" ? "seen_count" : "retrieval_count";
     const stamp = args.kind === "seen" ? "last_seen_at" : "last_retrieved_at";

@@ -52,7 +52,7 @@ function truncate(text: string, limit: number): string {
 function renderFragment(result: UnifiedSearchResult, charCap: number, nowMs: number): string {
     switch (result.source) {
         case "anti_memory":
-            return renderAntiMemoryWarning(result);
+            return truncate(renderAntiMemoryWarning(result), charCap);
         case "memory": {
             const compressed = cavemanCompress(boundDynamicField(result.content), "ultra");
             return truncate(compressed, charCap);

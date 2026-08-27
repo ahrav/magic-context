@@ -19,39 +19,6 @@ export const CTX_MEMORY_DREAMER_ACTIONS = [...CTX_MEMORY_ACTIONS, "list"] as con
 
 export type CtxMemoryAction = (typeof CTX_MEMORY_DREAMER_ACTIONS)[number];
 
-type PositiveWriteCategory =
-    | "PROJECT_RULES"
-    | "ARCHITECTURE"
-    | "CONSTRAINTS"
-    | "CONFIG_VALUES"
-    | "NAMING";
-
-export type CtxMemoryWriteArgs =
-    | {
-          action: "create";
-          category: PositiveWriteCategory;
-          content: string;
-          antiMemory?: never;
-      }
-    | {
-          action: "create";
-          category: "REJECTED_APPROACH";
-          antiMemory: AntiMemoryPayload;
-          content?: never;
-      }
-    | {
-          action: "revise";
-          category?: PositiveWriteCategory;
-          content?: string;
-          antiMemory?: never;
-      }
-    | {
-          action: "revise";
-          category: "REJECTED_APPROACH";
-          antiMemory: AntiMemoryPayload;
-          content?: never;
-      };
-
 export interface CtxMemoryArgs extends ImitatedReducedArgs {
     action?: CtxMemoryAction;
     content?: string;

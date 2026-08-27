@@ -13,6 +13,7 @@ import {
 	executeCtxMemoryClaimAction,
 } from "@magic-context/core/tools/ctx-memory/claim-actions";
 import {
+	CTX_MEMORY_ANTI_MEMORY_RULE,
 	CTX_MEMORY_DESCRIPTION,
 	CTX_MEMORY_MUTATION_TOKEN_RULE,
 } from "@magic-context/core/tools/ctx-memory/constants";
@@ -141,14 +142,7 @@ export function createCtxMemoryTool(
 					action: { type: "enum", values: ALL_ACTIONS },
 					content: "string",
 					category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
-					antiMemory: {
-						type: "object",
-						fields: {
-							trigger: "string",
-							rejectedStrategy: "string",
-							rejectionReason: "string",
-						},
-					},
+					antiMemory: CTX_MEMORY_ANTI_MEMORY_RULE,
 					publicClaimId: "string",
 					publicClaimIds: { type: "array", items: "string", maxItems: 20 },
 					mutationToken: CTX_MEMORY_MUTATION_TOKEN_RULE,

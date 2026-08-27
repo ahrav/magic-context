@@ -19,6 +19,7 @@ import {
     executeCtxMemoryClaimActionWithCommit,
 } from "./claim-actions";
 import {
+    CTX_MEMORY_ANTI_MEMORY_RULE,
     CTX_MEMORY_DESCRIPTION,
     CTX_MEMORY_MUTATION_TOKEN_RULE,
     CTX_MEMORY_TOOL_NAME,
@@ -110,14 +111,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
                     content: "string",
                     category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
-                    antiMemory: {
-                        type: "object",
-                        fields: {
-                            trigger: "string",
-                            rejectedStrategy: "string",
-                            rejectionReason: "string",
-                        },
-                    },
+                    antiMemory: CTX_MEMORY_ANTI_MEMORY_RULE,
                     publicClaimId: "string",
                     publicClaimIds: { type: "array", items: "string", maxItems: 20 },
                     mutationToken: CTX_MEMORY_MUTATION_TOKEN_RULE,

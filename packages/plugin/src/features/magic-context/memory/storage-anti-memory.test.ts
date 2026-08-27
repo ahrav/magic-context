@@ -86,6 +86,26 @@ describe("anti-memory typed operations", () => {
         }
     });
 
+    test("replays an identical create request digest", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const input = {
+                projectId: ensureProject(db, "git:anti-replay"),
+                payload: payload(),
+                provenance: provenance("replay"),
+                actor: "dreamer",
+                nowMs: 1,
+            };
+            const first = createAntiMemory(db, { producer: "test", operationKey: "same" }, input);
+            const replay = createAntiMemory(db, { producer: "test", operationKey: "same" }, input);
+
+            expect(replay.replayed).toBeTrue();
+            expect(publicIdOf(replay)).toBe(publicIdOf(first));
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("deduplicates by normalized trigger and strategy while preserving the first payload", () => {
         const { db } = createDirectTestDatabase();
         try {
@@ -166,18 +186,23 @@ describe("anti-memory typed operations", () => {
                 },
             );
             const publicClaimId = publicIdOf(created);
+            const reviseInput = {
+                token: computeProjectMemoryMutationToken(db, publicClaimId),
+                payload: payload("revised reason"),
+                provenance: provenance("revise"),
+                actor: "dreamer",
+                nowMs: 20,
+            };
             const revised = reviseAntiMemory(
                 db,
                 { producer: "test", operationKey: "revise" },
-                {
-                    token: computeProjectMemoryMutationToken(db, publicClaimId),
-                    payload: payload("revised reason"),
-                    provenance: provenance("revise"),
-                    actor: "dreamer",
-                    nowMs: 20,
-                },
+                reviseInput,
             );
             expect(revised.outcome).toBe("applied");
+            expect(
+                reviseAntiMemory(db, { producer: "test", operationKey: "revise" }, reviseInput)
+                    .replayed,
+            ).toBeTrue();
             const afterRevision = readAntiMemory(db, publicClaimId);
             expect(afterRevision?.revision).toBe(2);
             expect(afterRevision?.payload.rejectionReason).toBe("revised reason");

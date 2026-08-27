@@ -5775,9 +5775,7 @@ function applyNoteNudges(args: {
 	}
 	for (const decision of getAutoSearchHintDecisions(db, sessionId)) {
 		if (decision.decision === "hint") {
-			// A persisted hint replays only while every contributing memory is
-			// still auto_search-eligible: a later policy transition must not
-			// keep serving the fragment through the sticky replay.
+			// Anti-memory warnings never replay from stored hint text.
 			if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
 				continue;
 			}

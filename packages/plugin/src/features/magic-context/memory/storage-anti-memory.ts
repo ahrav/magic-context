@@ -11,11 +11,13 @@ import {
     type ClaimOperationRunResult,
     type ClaimOperationStageOutcome,
     type ProducerIdentity,
+    provenanceRequestShape,
     runClaimOperation,
     stageCreateProjectMemoryClaimInCurrentTransaction,
     stageReviseProjectMemoryClaimInCurrentTransaction,
+    tokenRequestShape,
 } from "./storage-claim-operations";
-import { ClaimGraphCorruptionError, sha256Utf8Hex } from "./storage-claims";
+import { ClaimGraphCorruptionError } from "./storage-claims";
 
 export const ANTI_MEMORY_DEFAULT_TTL_MS = 90 * 24 * 60 * 60 * 1_000;
 
@@ -182,23 +184,6 @@ function antiMemoryDedupText(payload: StoredAntiMemoryPayload): string {
     return JSON.stringify([payload.trigger, payload.rejectedStrategy]);
 }
 
-function provenanceDigestShape(provenance: ClaimEvidenceProvenance) {
-    return {
-        extractor: provenance.extractor,
-        extractorRunId: provenance.extractorRunId,
-        extractorVersion: provenance.extractorVersion,
-        independenceKey: provenance.independenceKey,
-        sourceContentDigest: sha256Utf8Hex(provenance.sourceContent),
-        sourceLocator: provenance.sourceLocator,
-        sourceSessionId: provenance.sourceSessionId ?? null,
-        sourceTrustClass: provenance.sourceTrustClass ?? null,
-    };
-}
-
-function payloadDigestShape(payload: StoredAntiMemoryPayload) {
-    return { ...payload };
-}
-
 function insertPayload(
     db: Database,
     revisionId: number,
@@ -276,9 +261,9 @@ export function createAntiMemory(
             requestDigest: computeClaimOperationRequestDigest({
                 actor: input.actor,
                 operation: "create-anti-memory",
-                payload: payloadDigestShape(payload),
+                payload,
                 projectId: input.projectId,
-                provenance: provenanceDigestShape(input.provenance),
+                provenance: provenanceRequestShape(input.provenance),
                 requestScope: input.requestScope ?? null,
             }),
         },
@@ -319,20 +304,26 @@ function reviseWithPayload(
                 actor: args.input.actor,
                 expiresAt: args.expiresAt ?? null,
                 operation: args.operation,
-                payload: payloadDigestShape(args.payload),
-                provenance: provenanceDigestShape(args.input.provenance),
+                payload: args.payload,
+                provenance: provenanceRequestShape(args.input.provenance),
                 requestScope: args.input.requestScope ?? null,
-                token: args.input.token,
+                token: tokenRequestShape(args.input.token),
             }),
         },
         () =>
-            stageAntiMemoryRevisionInCurrentTransaction(
-                db,
-                args.input,
-                args.payload,
-                args.expiresAt,
-                nowMs,
-            ),
+            args.operation === "revise-anti-memory"
+                ? stageReviseAntiMemoryInCurrentTransaction(
+                      db,
+                      { ...args.input, payload: args.payload },
+                      nowMs,
+                  )
+                : stageAntiMemoryRevisionInCurrentTransaction(
+                      db,
+                      args.input,
+                      args.payload,
+                      args.expiresAt,
+                      nowMs,
+                  ),
         nowMs,
     );
 }
@@ -411,8 +402,6 @@ export function reviseAntiMemory(
     producer: ProducerIdentity,
     input: ReviseAntiMemoryInput,
 ): ClaimOperationRunResult {
-    const current = readAntiMemory(db, input.token.publicClaimId);
-    if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
     return reviseWithPayload(db, producer, {
         input,
         payload: normalizePayload(input.payload),

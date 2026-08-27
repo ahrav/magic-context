@@ -17,7 +17,12 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
-import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
+import {
+    _resetEmbeddingConfigForTests,
+    embedTextForProject,
+    initializeEmbedding,
+} from "./memory/embedding";
+import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import { createAntiMemory, readAntiMemory } from "./memory/storage-anti-memory";
 import * as claimCurrentState from "./memory/storage-claim-current-state";
 import {
@@ -29,6 +34,7 @@ import { ensureProject } from "./memory/storage-claims";
 import { ensureMessagesIndexed } from "./message-index";
 import {
     _resetProjectEmbeddingRegistryForTests,
+    _setTestProviderFactoryForProject,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
 import {
@@ -353,6 +359,52 @@ describe("unifiedSearch", () => {
                 },
             ),
         ).toEqual([]);
+    });
+
+    it("embeds anti-memory query and passages through one project provider and fails open", async () => {
+        const project = "git:anti-project-lane";
+        seedAntiMemory(db, project, "project-lane");
+        const calls: Array<{ kind: "query" | "batch"; purpose?: EmbeddingPurpose }> = [];
+        let failBatch = false;
+        const provider: EmbeddingProvider = {
+            modelId: "local:project-lane",
+            initialize: async () => true,
+            embed: async (_text, _signal, purpose) => {
+                calls.push({ kind: "query", purpose });
+                return new Float32Array([1, 0]);
+            },
+            embedBatch: async (texts, _signal, purpose) => {
+                calls.push({ kind: "batch", purpose });
+                if (failBatch) throw new Error("passage lane unavailable");
+                return texts.map(() => new Float32Array([1, 0]));
+            },
+            dispose: async () => {},
+            isLoaded: () => true,
+        };
+        _setTestProviderFactoryForProject(() => provider);
+        registerEmbeddingProject(db, project);
+
+        const options = {
+            sources: ["memory"] as Array<"memory">,
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search" as const,
+            embedQuery: (text: string, signal?: AbortSignal, purpose?: EmbeddingPurpose) =>
+                embedTextForProject(project, text, signal, purpose),
+            isEmbeddingRuntimeEnabled,
+        };
+        const query = "distributed key-value login acceleration";
+        const semantic = await unifiedSearch(db, "session-anti", project, query, options);
+        expect(semantic[0]).toMatchObject({ source: "anti_memory", matchType: "semantic" });
+        expect(calls).toEqual([
+            { kind: "query", purpose: "query" },
+            { kind: "batch", purpose: "passage" },
+        ]);
+
+        calls.length = 0;
+        failBatch = true;
+        expect(await unifiedSearch(db, "session-anti", project, query, options)).toEqual([]);
+        expect(calls.map((call) => call.kind)).toEqual(["query", "batch"]);
     });
 
     it("labels stale anti-memory only in explicit search and omits expired records", async () => {
