@@ -19,6 +19,7 @@
 
 import { createHash } from "node:crypto";
 import { Database } from "../../shared/sqlite.ts";
+import { ANTI_MEMORY_TABLES, createAntiMemorySchema } from "./storage-anti-memory-schema.ts";
 import {
     addObservationSourceTrustClassColumn,
     CLAIM_APPLICABILITY_TABLES,
@@ -100,6 +101,12 @@ export const CURRENT_SCHEMA_COMPONENTS: readonly RegisteredSchemaComponent[] = [
             "claim_project_generations",
         ],
         create: createClaimMemoryComponentSchema,
+    },
+    {
+        name: "anti-memory",
+        dependsOn: ["claims-evidence", "claim-memory"],
+        provides: ANTI_MEMORY_TABLES,
+        create: createAntiMemorySchema,
     },
     {
         name: "session-runtime",

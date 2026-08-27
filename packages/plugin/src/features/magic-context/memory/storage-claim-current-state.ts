@@ -32,6 +32,7 @@ import {
     CLAIM_POLICY_VERSION,
     explicitSearchLabelFromFields,
 } from "./claim-visibility-policy.ts";
+import { ANTI_MEMORY_CATEGORY } from "./constants.ts";
 import {
     type ApplicabilityAssertionRecord,
     readCurrentApplicabilityAssertions,
@@ -47,6 +48,7 @@ import type { MemoryScope } from "./types.ts";
 
 export type ProjectMemorySurface =
     | "auto_inject"
+    | "auto_search"
     | "explicit_search"
     | "maintenance_hygiene"
     | "maintenance_verification";
@@ -385,9 +387,13 @@ function surfaceDecision(
     // provider has to agree, or an older process still attached to the database
     // keeps auto-injecting content it cannot reason about.
     const versionUnsupported = item.policy.policyVersion > CLAIM_POLICY_VERSION;
-    if (surface === "auto_inject") {
+    if (surface === "auto_inject" || surface === "auto_search") {
         return {
-            eligible: !versionUnsupported && item.policy.autoEligible && !softHidden,
+            eligible:
+                item.category !== ANTI_MEMORY_CATEGORY &&
+                !versionUnsupported &&
+                item.policy.autoEligible &&
+                !softHidden,
             label: null,
         };
     }

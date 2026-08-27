@@ -4,11 +4,13 @@ import { describe, expect, test } from "bun:test";
 
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createAntiMemory } from "../memory/storage-anti-memory";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "../memory/storage-claim-current-state";
+import { ensureProject } from "../memory/storage-claims";
 import {
     createClaimReaderTestDatabase,
     type SeededProjectMemoryClaim,
@@ -287,6 +289,62 @@ describe("mural coverage gate", () => {
             const persisted = getMural(db, project);
             if (!persisted) throw new Error("expected a persisted mural manifest");
             expect(persisted.memoryIds).not.toContain(hidden.publicClaimId);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a verified rejected approach never enters the mural pool", () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const project = "git:mural-anti-memory";
+            for (let i = 0; i < 6; i++) {
+                seedCuedClaim(db, project, "ARCHITECTURE", `visible mural fact ${i}`, 50);
+            }
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "mural-anti" },
+                {
+                    projectId: ensureProject(db, project),
+                    payload: {
+                        trigger: "cache work",
+                        rejectedStrategy: "use Redis",
+                        rejectionReason: "operational burden",
+                    },
+                    provenance: {
+                        sourceLocator: "transcript://mural-anti",
+                        sourceContent: "user rejected Redis",
+                        extractor: "test",
+                        extractorVersion: "1",
+                        extractorRunId: "mural-anti",
+                        independenceKey: "mural-anti",
+                        sourceTrustClass: "explicit_user",
+                    },
+                    actor: "host:user-corroborated",
+                    nowMs: 1,
+                },
+            );
+            const antiId = (created.result.payload as { claim: { publicClaimId: string } }).claim
+                .publicClaimId;
+            const anti = db
+                .prepare(
+                    `SELECT revisions.revision, revisions.content_sha256 AS contentDigest
+                       FROM claim_public_ids public
+                       JOIN claims ON claims.id = public.claim_id
+                       JOIN claim_revisions revisions ON revisions.id = claims.current_revision_id
+                      WHERE public.public_id = ?`,
+                )
+                .get(antiId) as { revision: number; contentDigest: string };
+            setClaimMuralCue(db, {
+                publicClaimId: antiId,
+                revisionLocator: `${antiId}/r${anti.revision}/${anti.contentDigest}`,
+                cue: "rejected Redis",
+            });
+
+            expect(muralPool(db, project).map((item) => item.publicClaimId)).not.toContain(antiId);
+            const rendered = ensureMuralRendered(db, project, 1);
+            expect(rendered.hasMural).toBe(true);
+            expect(getMural(db, project)?.memoryIds).not.toContain(antiId);
         } finally {
             closeQuietly(db);
         }

@@ -55,6 +55,7 @@ import {
     classifyFineTaint,
     TAINT_CLASSIFIER_METHOD,
 } from "./claim-policy.ts";
+import { ANTI_MEMORY_CATEGORY } from "./constants.ts";
 import { computeNormalizedHash } from "./normalize-hash.ts";
 import {
     type ApplicabilityPathsInput,
@@ -974,8 +975,9 @@ function attachEvidenceStage(
     claim: ProjectMemoryClaimRef,
     provenance: ClaimEvidenceProvenance,
     nowMs: number,
+    extractedText: string = claim.content,
 ): ClaimOperationStageOutcome {
-    const observationId = writeEvidenceChain(db, claim.projectId, provenance, claim.content);
+    const observationId = writeEvidenceChain(db, claim.projectId, provenance, extractedText);
     db.prepare(
         "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
     ).run(claim.currentRevisionId, observationId, nowMs);
@@ -1014,6 +1016,8 @@ function attachEvidenceStage(
 export interface CreateProjectMemoryClaimInput {
     projectId: number;
     content: string;
+    /** Optional normalized-hash preimage when display content is not dedup identity. */
+    dedupText?: string;
     category: string;
     importance?: number;
     memoryScope?: MemoryScope;
@@ -1094,7 +1098,7 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
     nowMs: number,
 ): ClaimOperationStageOutcome {
     const attributes = resolveAttributes(input);
-    const normalizedHash = computeNormalizedHash(input.content);
+    const normalizedHash = computeNormalizedHash(input.dedupText ?? input.content);
     const holder = db
         .prepare(
             `SELECT public_id AS publicClaimId FROM claim_memory_current_heads
@@ -1112,7 +1116,7 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
                 `current-head row points at unknown claim ${holder.publicClaimId}`,
             );
         }
-        return attachEvidenceStage(db, claim, input.provenance, nowMs);
+        return attachEvidenceStage(db, claim, input.provenance, nowMs, input.content);
     }
 
     const publicClaimId = generatePublicClaimId();
@@ -1201,6 +1205,11 @@ export function createProjectMemoryClaim(
     producer: ProducerIdentity,
     input: CreateProjectMemoryClaimInput,
 ): ClaimOperationRunResult {
+    if (input.category === ANTI_MEMORY_CATEGORY) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory creation is refused; use the typed anti-memory API",
+        );
+    }
     const attributes = resolveAttributes(input);
     const envelope: ClaimOperationEnvelope = {
         ...producer,
@@ -1208,6 +1217,7 @@ export function createProjectMemoryClaim(
             actor: input.actor,
             attributes: attributesRequestShape(attributes),
             content: input.content,
+            dedupText: input.dedupText ?? null,
             operation: "create-project-memory-claim",
             projectId: input.projectId,
             provenance: provenanceRequestShape(input.provenance),
@@ -1227,6 +1237,8 @@ export function createProjectMemoryClaim(
 export interface ReviseProjectMemoryClaimInput {
     token: ClaimMutationToken;
     content?: string;
+    /** Optional normalized-hash preimage when display content is not dedup identity. */
+    dedupText?: string;
     category?: string;
     importance?: number;
     memoryScope?: MemoryScope;
@@ -1268,6 +1280,14 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         sharing: input.sharing ?? current.sharing,
         expiresAt: input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
     };
+    if (
+        (current.category === ANTI_MEMORY_CATEGORY) !==
+        (nextAttributes.category === ANTI_MEMORY_CATEGORY)
+    ) {
+        throw new ClaimOperationInputError(
+            "anti-memory category conversion is refused; use the typed anti-memory API",
+        );
+    }
     const contentUnchanged = sha256Utf8Hex(nextContent) === claim.contentDigest;
     const unchanged =
         contentUnchanged &&
@@ -1279,7 +1299,7 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
     if (unchanged) {
         return attachEvidenceStage(db, claim, input.provenance, nowMs);
     }
-    const normalizedHash = computeNormalizedHash(nextContent);
+    const normalizedHash = computeNormalizedHash(input.dedupText ?? nextContent);
     assertNoLiveDuplicate(db, {
         projectId: claim.projectId,
         category: nextAttributes.category,
@@ -1385,12 +1405,20 @@ export function reviseProjectMemoryClaim(
     producer: ProducerIdentity,
     input: ReviseProjectMemoryClaimInput,
 ): ClaimOperationRunResult {
+    const claim = getProjectMemoryClaimByPublicId(db, input.token.publicClaimId);
+    const current = claim ? readRevisionAttributes(db, claim.currentRevisionId) : null;
+    if (input.category === ANTI_MEMORY_CATEGORY || current?.category === ANTI_MEMORY_CATEGORY) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory revision is refused; use the typed anti-memory API",
+        );
+    }
     const envelope: ClaimOperationEnvelope = {
         ...producer,
         requestDigest: computeClaimOperationRequestDigest({
             actor: input.actor,
             category: input.category ?? null,
             content: input.content ?? null,
+            dedupText: input.dedupText ?? null,
             expiresAt: input.expiresAt === undefined ? "keep" : input.expiresAt,
             importance: input.importance ?? null,
             memoryScope: input.memoryScope ?? null,
@@ -1581,6 +1609,11 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
             `claim revision ${target.currentRevisionId} has no attributes row; direct-SQL corruption`,
         );
     }
+    if (targetAttributes.category === ANTI_MEMORY_CATEGORY) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory merge is refused; revise or archive it through the typed anti-memory API",
+        );
+    }
     const normalizedHash = computeNormalizedHash(mergedContent);
     // A merge keeps the target's category and terminally retires every source,
     // so merging across categories destroys the source category's live fact.
@@ -1597,6 +1630,11 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         if (!attributes) {
             throw new ClaimGraphCorruptionError(
                 `claim revision ${source.currentRevisionId} has no attributes row; direct-SQL corruption`,
+            );
+        }
+        if (attributes.category === ANTI_MEMORY_CATEGORY) {
+            throw new ClaimOperationInputError(
+                "generic anti-memory merge is refused; revise or archive it through the typed anti-memory API",
             );
         }
         if (attributes.category !== targetAttributes.category) {
