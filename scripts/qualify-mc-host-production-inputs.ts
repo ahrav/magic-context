@@ -69,6 +69,8 @@ export const OUTPUT_PATHS = {
 const RELEASE_CONTRACT_PATH = "release/mc-host-release.json";
 const TINY_FIXTURE_MANIFEST_PATH =
     "crates/mc-host/tests/fixtures/synapse-tiny/manifest.json";
+const QUALIFICATION_FIXTURE_MANIFEST_PATH =
+    "scripts/__fixtures__/mc-host-qualification/source-manifest.test-fixture.json";
 const BUN_LOCK_PATH = "bun.lock";
 const MC_HOST_CARGO_TOML_PATH = "crates/mc-host/Cargo.toml";
 
@@ -918,7 +920,7 @@ const MUTABLE_SOURCE_REFS = new Set([
     "main",
     "master",
     "latest",
-    "HEAD",
+    "head",
     "nightly",
 ]);
 const FIXTURE_OR_CACHE_PATH_PATTERNS = [
@@ -1085,8 +1087,16 @@ function isPlaceholderSha256(hash: string): boolean {
 }
 
 /** Recursively collect every 64-hex value from the committed tiny fixture
- *  manifest so no tiny-fixture artifact byte identity can ever qualify. */
-function tinyFixtureHashBlacklist(rootDir: string): Set<string> {
+ *  manifest so no tiny-fixture artifact byte identity can ever qualify.
+ *
+ *  In production mode the committed qualification-fixture digests join the set.
+ *  The path deny-list alone is spelling-based, so copying those same tiny text
+ *  stand-ins to a directory without `__fixtures__` in its name would otherwise
+ *  let them qualify; blocking the byte identity follows the relocation. */
+function tinyFixtureHashBlacklist(
+    rootDir: string,
+    mode: SourceManifest["mode"],
+): Set<string> {
     const blacklist = new Set<string>();
     const path = join(rootDir, TINY_FIXTURE_MANIFEST_PATH);
     // Required input, not best-effort: a missing manifest would silently empty
@@ -1112,6 +1122,20 @@ function tinyFixtureHashBlacklist(rootDir: string): Set<string> {
         collect(JSON.parse(readFileSync(path, "utf8")));
     } catch {
         fail(`unreadable tiny-fixture manifest at ${TINY_FIXTURE_MANIFEST_PATH}`);
+    }
+    if (mode === "production") {
+        const fixturePath = join(rootDir, QUALIFICATION_FIXTURE_MANIFEST_PATH);
+        // Absent in a consumer checkout that ships no fixtures; only its digests
+        // are being denied, and the path deny-list still covers the in-tree copy.
+        if (existsSync(fixturePath)) {
+            try {
+                collect(JSON.parse(readFileSync(fixturePath, "utf8")));
+            } catch {
+                fail(
+                    `unreadable qualification fixture manifest at ${QUALIFICATION_FIXTURE_MANIFEST_PATH}`,
+                );
+            }
+        }
     }
     return blacklist;
 }
@@ -1153,8 +1177,22 @@ function validateQualifiedArtifact(
     } catch {
         fail(`inputs.${key}: source is not a parseable URL`);
     }
-    for (const segment of sourcePath.split("/")) {
-        if (MUTABLE_SOURCE_REFS.has(segment)) {
+    for (const rawSegment of sourcePath.split("/")) {
+        // `URL.pathname` preserves percent-encoding, so `ma%69n` would survive a
+        // literal comparison while the server still resolves it as `main`.
+        // Decode before comparing, and treat a malformed escape as a rejection
+        // rather than passing the undecodable spelling through.
+        let segment: string;
+        try {
+            segment = decodeURIComponent(rawSegment);
+        } catch {
+            fail(
+                `inputs.${key}: source path segment ${JSON.stringify(rawSegment)} has a malformed percent-escape`,
+            );
+        }
+        // Case-folded: a ref differing only in case is still a moving target,
+        // and no immutable artifact URL needs a segment spelled like one.
+        if (MUTABLE_SOURCE_REFS.has(segment.toLowerCase())) {
             fail(
                 `inputs.${key}: mutable source identity (${segment} ref) is rejected`,
             );
@@ -1320,7 +1358,7 @@ export function validateSourceManifest(
             `source manifest release_version ${m.release_version} does not match the U8 contract ${contract.release.version}`,
         );
     }
-    const blacklist = tinyFixtureHashBlacklist(rootDir);
+    const blacklist = tinyFixtureHashBlacklist(rootDir, m.mode);
     assertExactKeys(m.inputs, [...INPUT_KEYS], "inputs");
     for (const key of INPUT_KEYS) {
         const artifact = m.inputs[key];
@@ -1797,6 +1835,34 @@ export function requireQualificationEvidence(rootDir: string): {
     }
     if (lock.production_qualified !== true) {
         reject("inputs are not production-qualified (lock verdict is not true)");
+    }
+    // `unqualified` and `production_qualified` are summary fields, so an edit
+    // that clears both still leaves the per-row truth behind. Re-derive the
+    // verdict from every row the lock actually carries: any input, the oracle,
+    // or any harness still marked unqualified contradicts the summary.
+    const rows = lock.inputs as
+        | Record<string, { qualified?: unknown }>
+        | undefined;
+    if (rows === null || typeof rows !== "object" || Array.isArray(rows)) {
+        reject(`malformed inputs table in ${OUTPUT_PATHS.lock}`);
+    }
+    for (const key of INPUT_KEYS) {
+        if (rows?.[key]?.qualified !== true) {
+            reject(`lock row inputs.${key} is not qualified`);
+        }
+    }
+    if ((lock.oracle as { qualified?: unknown })?.qualified !== true) {
+        reject("lock row oracle is not qualified");
+    }
+    const harnesses = lock.harnesses as
+        | Record<string, { version?: unknown }>
+        | undefined;
+    for (const name of ["opencode", "pi"] as const) {
+        // A qualified harness records its version as a bare string; an
+        // unqualified one records a `{ qualified: false, reason }` object.
+        if (typeof harnesses?.[name]?.version !== "string") {
+            reject(`lock row harnesses.${name} is not qualified`);
+        }
     }
     return {
         evidence,

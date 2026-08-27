@@ -8,6 +8,7 @@ import {
     symlinkSync,
     writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,11 +32,11 @@ import {
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURE_DIR = "scripts/__fixtures__/mc-host-qualification";
-const FIXTURE_MANIFEST = join(
-    repoRoot,
+const FIXTURE_MANIFEST_RELATIVE = join(
     FIXTURE_DIR,
     "source-manifest.test-fixture.json",
 );
+const FIXTURE_MANIFEST = join(repoRoot, FIXTURE_MANIFEST_RELATIVE);
 const RELEASE_CONTRACT = "release/mc-host-release.json";
 const TINY_MANIFEST =
     "crates/mc-host/tests/fixtures/synapse-tiny/manifest.json";
@@ -59,6 +60,9 @@ function freshRoot(): string {
         // Required input: the qualifier fails closed without it so a missing
         // manifest cannot silently empty the tiny-fixture hash blacklist.
         TINY_MANIFEST,
+        // Present in the real repo, so production qualification must reject its
+        // artifact digests wherever those bytes are relocated to.
+        FIXTURE_MANIFEST_RELATIVE,
     ]) {
         mkdirSync(join(root, dirname(relative)), { recursive: true });
         cpSync(join(repoRoot, relative), join(root, relative));
@@ -92,6 +96,23 @@ function installManifest(root: string, manifest: any): void {
  */
 const STAGED_PRODUCTION_INPUT_DIR = "opt/mc-host-inputs";
 
+/**
+ * Replace every declared digest with a distinct non-blacklisted value. Production
+ * mode denies the committed fixture digests outright, which fires before the path
+ * rules, so a test targeting a path rule must not carry those digests.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
+function unblacklistDigests(manifest: any): void {
+    let n = 0;
+    for (const artifact of Object.values(manifest.inputs) as {
+        sha256: string;
+    }[]) {
+        artifact.sha256 = createHash("sha256")
+            .update(`path-rule probe ${n++}`)
+            .digest("hex");
+    }
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function installProductionManifest(
     root: string,
@@ -101,16 +122,19 @@ function installProductionManifest(
     manifest.mode = "production";
     const stagedDir = join(root, STAGED_PRODUCTION_INPUT_DIR);
     mkdirSync(stagedDir, { recursive: true });
-    cpSync(join(repoRoot, FIXTURE_DIR, "artifacts"), stagedDir, {
-        recursive: true,
-    });
-    for (const artifact of Object.values(manifest.inputs) as {
-        verify_local_path: string;
-    }[]) {
-        artifact.verify_local_path = join(
-            stagedDir,
-            basename(artifact.verify_local_path),
-        );
+    // Deliberately NOT the committed fixture bytes: their digests are denied in
+    // production mode, so a production manifest must carry distinct bytes and
+    // the digests computed from them, exactly as a real qualifying host would.
+    for (const [key, artifact] of Object.entries(manifest.inputs) as [
+        string,
+        { verify_local_path: string; sha256: string; size_bytes: number },
+    ][]) {
+        const target = join(stagedDir, basename(artifact.verify_local_path));
+        const bytes = Buffer.from(`staged production stand-in for ${key}\n`);
+        writeFileSync(target, bytes);
+        artifact.verify_local_path = target;
+        artifact.sha256 = createHash("sha256").update(bytes).digest("hex");
+        artifact.size_bytes = bytes.length;
     }
     mutate?.(manifest);
     installManifest(root, manifest);
@@ -241,6 +265,21 @@ describe("immutable input fail-closed rules", () => {
         }
     });
 
+    test("a percent-encoded mutable ref is rejected", () => {
+        // `URL.pathname` preserves the encoding, so a literal comparison would
+        // miss `ma%69n` even though the server resolves it as `main`.
+        for (const encoded of ["ma%69n", "MAIN", "%4cATEST"]) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.inputs.model_onnx.source =
+                `https://models.example.invalid/m/resolve/${encoded}/model.onnx`;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                /mutable source identity/,
+            );
+        }
+    });
+
     test("an unparseable source URL fails with the tool's framing", () => {
         // `startsWith("https://")` does not imply parseability; a raw
         // `TypeError: Invalid URL` would lose the consistent failure prefix.
@@ -267,22 +306,46 @@ describe("immutable input fail-closed rules", () => {
 
     test("production mode rejects the committed qualification fixtures", () => {
         // The fixture artifacts are tiny text stand-ins named `model.onnx` and
-        // `ort-runtime.so` with `example.invalid` provenance. Flipping the
-        // fixture manifest to production and absolutizing its paths in place
-        // must not let those bytes reach productionQualified.
-        const root = freshRoot();
-        const manifest = fixtureManifest();
-        manifest.mode = "production";
-        for (const artifact of Object.values(manifest.inputs) as {
+        // `ort-runtime.so` with `example.invalid` provenance. Two independent
+        // mechanisms must keep them out of a production lock.
+
+        // 1. By digest, which survives relocating the bytes anywhere.
+        const relocated = freshRoot();
+        const byHash = fixtureManifest();
+        byHash.mode = "production";
+        const staged = join(relocated, "opt/relocated-inputs");
+        mkdirSync(staged, { recursive: true });
+        cpSync(join(repoRoot, FIXTURE_DIR, "artifacts"), staged, {
+            recursive: true,
+        });
+        for (const artifact of Object.values(byHash.inputs) as {
             verify_local_path: string;
         }[]) {
             artifact.verify_local_path = join(
-                root,
+                staged,
+                basename(artifact.verify_local_path),
+            );
+        }
+        installManifest(relocated, byHash);
+        expect(() => generate(relocated, { check: false })).toThrow(
+            /committed tiny fixture bytes can never qualify/,
+        );
+
+        // 2. By path, for bytes carrying digests the blacklist does not know.
+        const inPlace = freshRoot();
+        const byPath = fixtureManifest();
+        byPath.mode = "production";
+        unblacklistDigests(byPath);
+        for (const artifact of Object.values(byPath.inputs) as {
+            verify_local_path: string;
+        }[]) {
+            artifact.verify_local_path = join(
+                inPlace,
                 artifact.verify_local_path,
             );
         }
-        installManifest(root, manifest);
-        expect(() => generate(root, { check: false })).toThrow(
+        installManifest(inPlace, byPath);
+        expect(() => generate(inPlace, { check: false })).toThrow(
             /fixture\/developer-cache verify path \(__fixtures__\)/,
         );
     });
@@ -369,6 +432,7 @@ describe("immutable input fail-closed rules", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.mode = "production";
+        unblacklistDigests(manifest);
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).toThrow(
             /requires an absolute verify path/,
@@ -911,6 +975,44 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
         expect(accepted.u8Digest).toBe(generated.u8Digest);
     });
 
+    test("summary-only lock edits cannot fake a verdict", () => {
+        const root = freshRoot();
+        // One input left unqualified, so the lock carries a false row.
+        const manifest = fixtureManifest();
+        manifest.inputs.model_onnx = {
+            qualified: false,
+            reason: "real model bytes not yet qualified",
+        };
+        installManifest(root, manifest);
+        generate(root, { check: false });
+
+        // Edit the lock's summary fields AND re-point the evidence citation at
+        // the edited bytes, so every digest check still passes. The per-row
+        // truth is what must be believed.
+        const lockPath = join(root, OUTPUT_PATHS.lock);
+        const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+        lock.mode = "production";
+        lock.production_qualified = true;
+        lock.unqualified = [];
+        const lockBytes = `${JSON.stringify(lock, null, 2)}\n`;
+        writeFileSync(lockPath, lockBytes);
+        expect(lock.inputs.model_onnx.qualified).toBe(false);
+
+        const evidencePath = join(root, OUTPUT_PATHS.evidence);
+        const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+        evidence.production_qualified = true;
+        evidence.test_only = false;
+        evidence.unqualified = [];
+        evidence.artifacts.production_inputs_lock.sha256 = createHash("sha256")
+            .update(lockBytes)
+            .digest("hex");
+        writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+
+        expect(() => requireQualificationEvidence(root)).toThrow(
+            /lock row inputs\.\w+ is not qualified/,
+        );
+    });
+
     test("evidence claiming qualification over an unqualified lock is rejected", () => {
         const root = freshRoot();
         // Test-mode manifest => the lock records unqualified inputs.
@@ -938,6 +1040,7 @@ describe("verify-path resolution", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.mode = "production";
+        unblacklistDigests(manifest);
 
         // Real bytes live in a developer cache; the manifest names an
         // innocuous absolute path that is a symlink to them.
