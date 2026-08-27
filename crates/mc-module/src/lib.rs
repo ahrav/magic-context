@@ -59,6 +59,8 @@ use std::time::{Duration, Instant};
 use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
+#[cfg(test)]
+use crate::memory_render::MEMORY_CATEGORY_ORDER as MEMORY_CATEGORIES;
 use crate::smart_note_evaluation::{
     is_valid_smart_note_cron, reduce_smart_note_evaluation, select_smart_note_evaluation_cycle,
     CheckOutcome, CompileOutcome, CompiledCheckArtifact, FallbackOutcome, SmartNoteCycleMode,
@@ -75,22 +77,21 @@ use mc_host::{
     ManifestSnapshot, PrimaryComponent, RequestCtx, RequestOutcome, ResourceDeclaration,
     RouteHandle, RouteIdentity, ShutdownError,
 };
-#[cfg(test)]
-use mc_store::TagNumberRow;
 use mc_store::{
     canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
-    FacadeMutationOutcome, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError,
-    ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
-    ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
-    NoteCasOutcome, NoteConditionCompile, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome,
-    NoteEvalCandidate, NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState,
-    NoteEvalRenewOutcome, NoteEvalSelection, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput,
-    PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
-    RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
-    LATEST_MIGRATION_VERSION,
+    FacadeMutationOutcome, HistorianPhase, MappingUpdate, McStore, McStoreError, ModuleDropSeedRow,
+    ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError, ModuleStateSyncRequest,
+    ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow, NoteCasOutcome,
+    NoteConditionCompile, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome, NoteEvalCandidate,
+    NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState, NoteEvalRenewOutcome,
+    NoteEvalSelection, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
+    PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
 };
+#[cfg(test)]
+use mc_store::{InsertMemoryInput, TagNumberRow};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -130,6 +131,20 @@ use transform::{
     transform_with_projection_cached, HistorianDiagnostics, ProjectionCacheInput,
     SerializedOutputCache, TransformRequest,
 };
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaimMirrorSnapshotRequest {
+    protocol_version: u32,
+    snapshot: mc_store::claim_mirror::ClaimMirrorSnapshot,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaimMirrorReceiptRequest {
+    protocol_version: u32,
+    receipt: mc_store::claim_mirror::ClaimMirrorReceiptGroup,
+}
 
 /// The per-route binding: the project, harness, session-slot value, and fallback render
 /// budget frozen at bind. Transform routes carry the durable session in `session`. Facade
@@ -5230,6 +5245,11 @@ impl McHandler {
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 boundary,
                 memory_enabled: cfg.memory_enabled,
+                claim_snapshot_vector: parsed
+                    .claim_lane
+                    .as_ref()
+                    .filter(|lane| lane.enabled)
+                    .and_then(|lane| lane.snapshot_vector.clone()),
                 auto_promote: cfg.auto_promote,
                 user_memory_collection_enabled: cfg.user_memory_collection_enabled,
                 extraction_free: false,
@@ -5387,6 +5407,11 @@ impl McHandler {
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 boundary: boundary.clone(),
                 memory_enabled: cfg.memory_enabled,
+                claim_snapshot_vector: parsed
+                    .claim_lane
+                    .as_ref()
+                    .filter(|lane| lane.enabled)
+                    .and_then(|lane| lane.snapshot_vector.clone()),
                 auto_promote: cfg.auto_promote,
                 user_memory_collection_enabled: cfg.user_memory_collection_enabled,
                 extraction_free: false,
@@ -8411,6 +8436,7 @@ impl McHandler {
                 },
             );
             let producer_ctx = transform::ProducerContext {
+                claim_lane: parsed.claim_lane.as_ref(),
                 project_path: &project_path,
                 note_project_path: &note_project_path,
                 project_directory: &route_project_root,
@@ -10723,11 +10749,294 @@ impl McHandler {
             }
             "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
+            "claim.intent.stage" => self.handle_claim_intent_stage(channel, &request),
+            "claim.intent.inspect" => self.handle_claim_intent_inspect(channel, &request),
+            "claim.intent.ack" => self.handle_claim_intent_ack(channel, &request),
+            "claim.effects.apply" => self.handle_claim_effects_apply(channel, &request),
+            "claim.mirror.replace" => self.handle_claim_mirror_replace(channel, &request),
+            "claim.mirror.apply" => self.handle_claim_mirror_apply(channel, &request),
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
             "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
             "ctx_note" => self.handle_ctx_note_facade(channel, &request).await,
             _ => unrecognized_request_error(&request),
+        }
+    }
+
+    /// Resolve the daemon-bound route root for a claim facade request.
+    ///
+    /// Every claim handler must go through this. The claim wire carries
+    /// caller-supplied identity (`binding.authorityProject`,
+    /// `binding.databaseIncarnationId`), so the bound route is the only
+    /// trustworthy authority identity on the request.
+    fn claim_route_root(
+        &self,
+        channel: RouteHandle,
+        request_name: &str,
+    ) -> Result<String, PreparedOutcome> {
+        match self.facade_binding(channel) {
+            Ok(binding) => Ok(binding.project_root.to_string_lossy().into_owned()),
+            Err(_) => Err(PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: format!("{request_name} requires a bound facade route"),
+            }),
+        }
+    }
+
+    fn handle_claim_intent_stage(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        let route_root = match self.claim_route_root(channel, "claim.intent.stage") {
+            Ok(route_root) => route_root,
+            Err(outcome) => return outcome,
+        };
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.stage requires arguments");
+        };
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentStageRequest>(arguments)
+        {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim intent stage: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::stage_claim_intent(&store, &route_root, &parsed, now_ms()) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => PreparedOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => PreparedOutcome::Error {
+                code: "claim_intent_stage_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_intent_inspect(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.inspect") {
+            return outcome;
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.inspect requires arguments");
+        };
+        let parsed =
+            match serde_json::from_value::<memory_tool::ClaimIntentInspectRequest>(arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return invalid_params_error(format!(
+                        "invalid claim intent inspection: {error}"
+                    ));
+                }
+            };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::inspect_claim_intents(&store, &parsed) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => PreparedOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => PreparedOutcome::Error {
+                code: "claim_intent_inspect_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_intent_ack(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.ack") {
+            return outcome;
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.ack requires arguments");
+        };
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentAckRequest>(arguments) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim intent ack: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::acknowledge_claim_intent(&store, &parsed, now_ms()) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => PreparedOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => PreparedOutcome::Error {
+                code: "claim_intent_ack_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_effects_apply(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.effects.apply") {
+            return outcome;
+        }
+        let Some(arguments) = request.get("arguments").and_then(Value::as_object) else {
+            return invalid_params_error("claim.effects.apply requires arguments");
+        };
+        if arguments.get("protocolVersion").and_then(Value::as_u64)
+            != Some(u64::from(
+                mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
+            ))
+        {
+            return invalid_params_error("claim.effects.apply protocolVersion is unsupported");
+        }
+        if arguments
+            .get("consumer")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return invalid_params_error("claim.effects.apply consumer is required");
+        }
+        let Some(receipt) = arguments.get("receipt").and_then(Value::as_object) else {
+            return invalid_params_error("claim.effects.apply receipt is required");
+        };
+        let Some(result_json) = receipt.get("resultJson").and_then(Value::as_str) else {
+            return invalid_params_error("claim.effects.apply resultJson is required");
+        };
+        let result = match mc_core::claim_operation::decode_claim_operation_result(result_json) {
+            Ok(result) => result,
+            Err(error) => {
+                return invalid_params_error(format!(
+                    "claim.effects.apply result is invalid: {error}"
+                ));
+            }
+        };
+        let Some(effects) = receipt.get("effects").and_then(Value::as_array) else {
+            return invalid_params_error("claim.effects.apply effects are required");
+        };
+        if effects.is_empty() || effects.len() != result.effects.len() {
+            return invalid_params_error("claim.effects.apply receipt group is incomplete");
+        }
+        let mut previous = 0_u64;
+        for (index, effect) in effects.iter().enumerate() {
+            let Some(effect) = effect.as_object() else {
+                return invalid_params_error("claim.effects.apply effect must be an object");
+            };
+            let Some(id) = effect.get("id").and_then(Value::as_u64) else {
+                return invalid_params_error("claim.effects.apply effect id is required");
+            };
+            if id <= previous {
+                return invalid_params_error("claim.effects.apply effect ids must increase");
+            }
+            let Some(result_effect) = result.effects.get(index) else {
+                return invalid_params_error("claim.effects.apply result effect is missing");
+            };
+            if effect.get("effectKey").and_then(Value::as_str)
+                != Some(result_effect.effect_key.as_str())
+                || effect.get("projectId").and_then(Value::as_i64) != Some(result_effect.project_id)
+                || effect.get("generation").and_then(Value::as_i64)
+                    != Some(result_effect.generation)
+                || effect.get("changeKind").and_then(Value::as_str)
+                    != Some(result_effect.change_kind.as_str())
+            {
+                return invalid_params_error("claim.effects.apply effect disagrees with result");
+            }
+            previous = id;
+        }
+        respond(json!({
+            "protocolVersion": mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
+            "ackedEffectId": previous,
+        }))
+    }
+
+    fn handle_claim_mirror_replace(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        if self.facade_binding(channel).is_err() {
+            return PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: "claim mirror replace requires a bound facade route".to_string(),
+            };
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.mirror.replace requires arguments");
+        };
+        let parsed = match serde_json::from_value::<ClaimMirrorSnapshotRequest>(arguments) {
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
+            Ok(_) => {
+                return invalid_params_error("claim.mirror.replace protocolVersion is unsupported")
+            }
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim mirror snapshot: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match store.replace_claim_mirror_snapshot(&parsed.snapshot, now_ms()) {
+            Ok(()) => respond(json!({
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
+                "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
+                "databaseIncarnationId": parsed.snapshot.vector.database_incarnation_id,
+                "projectCheckpoints": parsed.snapshot.project_checkpoints,
+            })),
+            Err(error) => claim_mirror_error(error, "claim_mirror_replace_failed"),
+        }
+    }
+
+    fn handle_claim_mirror_apply(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if self.facade_binding(channel).is_err() {
+            return PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: "claim mirror apply requires a bound facade route".to_string(),
+            };
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.mirror.apply requires arguments");
+        };
+        let parsed = match serde_json::from_value::<ClaimMirrorReceiptRequest>(arguments) {
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
+            Ok(_) => {
+                return invalid_params_error("claim.mirror.apply protocolVersion is unsupported")
+            }
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim mirror receipt: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match store.apply_claim_mirror_receipt(&parsed.receipt, now_ms()) {
+            Ok(result) => respond(json!({
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
+                "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
+                "receiptId": parsed.receipt.receipt_id,
+                "replayed": result.replayed,
+                "appliedEffectCount": result.applied_effect_count,
+                "ackedEffectId": parsed.receipt.effects.last().map(|effect| effect.effect_id).unwrap_or(0),
+            })),
+            Err(error) => claim_mirror_error(error, "claim_mirror_apply_failed"),
         }
     }
 
@@ -10983,6 +11292,120 @@ impl McHandler {
     }
 
     async fn handle_ctx_memory_facade(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        let Some(args) = facade_arguments(request, &["action"]) else {
+            return invalid_params_error("ctx_memory arguments must be an object");
+        };
+        let Some(action) = string_arg(&args, "action") else {
+            return invalid_params_error("ctx_memory requires an action");
+        };
+        let facade_scope = match self
+            .resolve_facade_scope(channel, Some(&args), "memories", false)
+            .await
+        {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        if !facade_scope.memory_enabled {
+            return tool_error_result("Error: memory is disabled for this project.".to_string());
+        }
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match action {
+            "get" | "list" => {
+                // Bulk enumeration returns every workspace-authorized row, which
+                // can include shared foreign-project claims, so it stays limited
+                // to dreamer maintenance exactly as the host tool contract does.
+                // The registry is module-owned state for child sessions this
+                // handler minted, unlike the client-supplied harness label.
+                if action == "list" {
+                    let bound_session = match self.facade_binding(channel) {
+                        Ok(binding) => binding.session.trim().to_string(),
+                        Err(_) => return session_unresolved_error(),
+                    };
+                    if !self.dreamer_run_registered(&bound_session) {
+                        return tool_error_result(
+                            "Error: list is restricted to dreamer maintenance sessions."
+                                .to_string(),
+                        );
+                    }
+                }
+                let requested = if action == "get" {
+                    let mut ids = args
+                        .get("publicClaimIds")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if let Some(id) = args.get("publicClaimId").and_then(Value::as_str) {
+                        ids.push(id.to_string());
+                    }
+                    ids
+                } else {
+                    Vec::new()
+                };
+                if action == "get" && (requested.is_empty() || requested.len() > 20) {
+                    return tool_error_result(
+                        "Error: get requires 1-20 publicClaimIds.".to_string(),
+                    );
+                }
+                if requested
+                    .iter()
+                    .any(|id| !mc_core::claim_operation::is_valid_public_claim_id(id))
+                {
+                    return tool_error_result("Error: malformed public claim ID.".to_string());
+                }
+                let requested = requested.into_iter().collect::<BTreeSet<_>>();
+                // `limit` narrows enumeration. An explicit `get` names its rows,
+                // so honoring a smaller limit there would silently drop claims the
+                // caller asked for by ID.
+                let limit = if requested.is_empty() {
+                    usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100)
+                } else {
+                    requested.len()
+                };
+                let category = string_arg(&args, "category");
+                let rows =
+                    match memory_tool::list_committed_claims(&store, &requested, category, limit) {
+                        Ok(rows) => rows,
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    };
+                let claims = rows
+                    .into_iter()
+                    .map(|row| {
+                        json!({
+                            "publicClaimId": row.public_claim_id,
+                            "revisionLocator": row.revision_locator,
+                            "content": row.content,
+                            "attributes": row.attributes,
+                            "lifecycle": row.lifecycle,
+                            "provenanceLabel": row.provenance_label,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                mcp_text_result(json!({ "claims": claims }).to_string(), false)
+            }
+            "create" | "revise" | "archive" | "restore" | "merge" => tool_error_result(
+                "Error: claim mutations require the host claim-operation commit path.".to_string(),
+            ),
+            _ => tool_error_result("Error: Unknown ctx_memory action.".to_string()),
+        }
+    }
+
+    // Retained as the pre-claims comparison path for the memory facade; it and its
+    // helper chain compile only under cfg(test). `expect` (not `allow`) flags this
+    // attribute for removal as soon as a caller exists.
+    #[cfg(test)]
+    #[expect(dead_code)]
+    async fn handle_legacy_ctx_memory_facade(
         &self,
         channel: RouteHandle,
         request: &Value,
@@ -14360,6 +14783,21 @@ fn store_unavailable_error() -> PreparedOutcome {
     }
 }
 
+fn claim_mirror_error(
+    error: mc_store::claim_mirror::ClaimMirrorError,
+    fallback_code: &str,
+) -> PreparedOutcome {
+    let code = match &error {
+        mc_store::claim_mirror::ClaimMirrorError::NotSeeded => "claim_mirror_not_seeded",
+        mc_store::claim_mirror::ClaimMirrorError::Invalid(_) => "invalid_params",
+        _ => fallback_code,
+    };
+    PreparedOutcome::Error {
+        code: code.to_string(),
+        message: error.to_string(),
+    }
+}
+
 fn note_evaluation_protocol_retired() -> PreparedOutcome {
     PreparedOutcome::Error {
         code: "protocol_retired".to_string(),
@@ -14894,18 +15332,17 @@ fn enforce_request_byte_cap(body: &[u8]) -> Result<(), PreparedOutcome> {
     Err(invalid_params_error("request body exceeds the 1 MiB limit"))
 }
 const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
+#[cfg(test)]
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_NOTE_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_SHORT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_QUERY_BYTES: usize = 1024;
+#[cfg(test)]
 const MAX_MEMORY_IDS: usize = 100;
 const CTX_EXPAND_BYTE_BUDGET: usize = 15_000 * 4;
 const CTX_EXPAND_MAX_ORDINAL_SPAN: i64 = 10_000;
 const CTX_EXPAND_MAX_ROWS: usize = 64;
 const CTX_EXPAND_TRUNCATION_MARKER: &str = "\n\n[truncated at the ~15,000-token ctx_expand budget]";
-/// Accepted write categories — the canonical V2 taxonomy, single-sourced from the
-/// renderer's category order so the facade and the render path never disagree.
-use crate::memory_render::MEMORY_CATEGORY_ORDER as MEMORY_CATEGORIES;
 
 fn validate_string_cap(
     args: &Map<String, Value>,
@@ -14920,6 +15357,7 @@ fn validate_string_cap(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String> {
     for key in ["id", "target_id"] {
         if let Some(value) = args.get(key) {
@@ -15709,6 +16147,7 @@ fn render_notes(
 }
 
 // The facade never panics on agent input; an absent or malformed id stays a typed tool error.
+#[cfg(test)]
 fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
     if let Some(id) = i64_arg(args, "id") {
         return Some(id);
@@ -15717,6 +16156,7 @@ fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
     ids.first().copied().filter(|_| ids.len() == 1)
 }
 
+#[cfg(test)]
 fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
     let mut ids = Vec::new();
     if let Some(id) = i64_arg(args, "id") {
@@ -15734,6 +16174,7 @@ fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
     ids
 }
 
+#[cfg(test)]
 fn merge_ids(args: &Map<String, Value>) -> Option<(i64, Vec<i64>)> {
     if let Some(target_id) = i64_arg(args, "target_id") {
         let source_ids = args
@@ -15754,11 +16195,13 @@ fn merge_ids(args: &Map<String, Value>) -> Option<(i64, Vec<i64>)> {
     Some((ids[0], ids[1..].to_vec()))
 }
 
+#[cfg(test)]
 fn dedup_i64s(ids: Vec<i64>) -> Vec<i64> {
     let mut seen = HashSet::with_capacity(ids.len());
     ids.into_iter().filter(|id| seen.insert(*id)).collect()
 }
 
+#[cfg(test)]
 fn join_i64s(ids: &[i64]) -> String {
     ids.iter()
         .map(ToString::to_string)
@@ -16518,7 +16961,7 @@ pub fn dev_descriptor_at(data_home: &str) -> StorageDescriptor {
 }
 
 fn ctx_memory_description() -> String {
-    "Save and maintain durable project memories for facts that should stay useful in later turns. Use write for a new standalone fact, update when an existing memory changed, archive when a memory is wrong or obsolete, and merge when several memories describe the same fact. Keep each memory concise and understandable without this chat's surrounding context.".to_string()
+    "Read and maintain durable project-memory claims. Use public claim IDs and exact revision-bound mutation tokens; never use local row IDs. Create standalone facts, revise changed claims, archive or restore lifecycle state, and merge duplicate claims through the host commit path.".to_string()
 }
 
 fn ctx_search_description() -> String {
@@ -16534,55 +16977,51 @@ fn ctx_note_description() -> String {
 }
 
 fn ctx_memory_schema() -> Value {
+    let mutation_token = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "tokenVersion", "publicClaimId", "revision", "contentDigest",
+            "lifecycleSeq", "applicabilityHeadsDigest", "policyHeadsDigest"
+        ],
+        "properties": {
+            "tokenVersion": { "type": "integer", "minimum": 1 },
+            "publicClaimId": { "type": "string", "pattern": "^mcm_[0-9a-f]{32}$" },
+            "revision": { "type": "integer", "minimum": 1 },
+            "contentDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "lifecycleSeq": { "type": "integer", "minimum": 1 },
+            "applicabilityHeadsDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "policyHeadsDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": true,
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["write", "update", "archive", "merge", "get"],
-                "description": "Operation to perform."
+                "enum": ["create", "get", "list", "revise", "archive", "restore", "merge"]
             },
             "category": {
                 "type": "string",
-                "description": "Memory category for a new memory: one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, or NAMING. Required for write."
+                "enum": ["PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALUES", "NAMING"]
             },
-            "content": {
-                "type": "string",
-                "maxLength": 65536,
-                "description": "Standalone memory text. Required for write, update, and merge."
+            "content": { "type": "string", "maxLength": 65536 },
+            "publicClaimId": { "type": "string", "pattern": "^mcm_[0-9a-f]{32}$" },
+            "publicClaimIds": {
+                "type": "array",
+                "maxItems": 20,
+                "items": { "type": "string", "pattern": "^mcm_[0-9a-f]{32}$" }
             },
-            "id": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Single memory id for update or archive."
-            },
-            "ids": {
+            "mutationToken": mutation_token,
+            "mutationTokens": {
                 "type": "array",
                 "maxItems": 100,
-                "items": { "type": "integer", "minimum": 1 },
-                "description": "Memory ids. For update provide exactly one. For archive provide one or more. For merge, the first id is kept and updated, and the remaining ids are superseded. For get provide one to twenty ids."
+                "items": mutation_token
             },
-            "target_id": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Merge form: memory id to keep and update."
-            },
-            "source_ids": {
-                "type": "array",
-                "maxItems": 100,
-                "items": { "type": "integer", "minimum": 1 },
-                "description": "Merge form: memory ids to supersede into target_id."
-            },
-            "reason": {
-                "type": "string",
-                "maxLength": 4096,
-                "description": "Optional short reason for archive."
-            },
-            "memory_project": {
-                "type": "string",
-                "description": "Resolved MC project identity supplied by the host transport."
-            },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "reason": { "type": "string", "maxLength": 4096 },
+            "memory_project": { "type": "string" }
         }
     })
 }
@@ -19262,6 +19701,106 @@ mod tests {
         store
             .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_mirror_facade_is_strict_and_ctx_memory_uses_public_locators() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        handler.bind_route(
+            test_route(7),
+            binding_with_harness(project.to_str().unwrap(), OPENCODE_HARNESS, "ses"),
+        );
+        let public_claim_id = format!("mcm_{}", "b".repeat(32));
+        let content = "facade claim";
+        let digest = mc_core::claim_operation::sha256_hex_utf8(content);
+        let locator = format!("{public_claim_id}/r1/{digest}");
+        let vector = json!({
+            "vectorVersion": 1,
+            "databaseIncarnationId": "a".repeat(32),
+            "workspaceEpoch": "workspace-1",
+            "projectGenerations": {"1": 1},
+            "policyGenerations": {"1": 1},
+        });
+        let snapshot = json!({
+            "mirrorVersion": 1,
+            "vector": vector,
+            "projectCheckpoints": {"1": 0},
+            "claims": [{
+                "publicClaimId": public_claim_id,
+                "projectId": 1,
+                "revisionLocator": locator,
+                "content": content,
+                "contentDigest": digest,
+                "attributes": {
+                    "category": "CONSTRAINTS",
+                    "normalizedHash": "hash",
+                    "importance": 80,
+                    "memoryScope": "project",
+                    "sharing": "private",
+                    "expiresAt": null
+                },
+                "lifecycle": "active",
+                "applicability": {"assertions": []},
+                "policy": {"dispositions": []},
+                "provenanceLabel": "repo",
+                "projectGeneration": 1,
+                "policyGeneration": 1
+            }]
+        });
+        let seeded = tool_body(
+            call_facade(
+                &handler,
+                "claim.mirror.replace",
+                json!({"protocolVersion": 1, "snapshot": snapshot}),
+            )
+            .await,
+        );
+        assert_eq!(seeded["databaseIncarnationId"], "a".repeat(32));
+
+        let read = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({"action": "get", "publicClaimIds": [public_claim_id]}),
+            )
+            .await,
+        );
+        assert!(read.contains(&public_claim_id));
+        assert!(read.contains(&locator));
+        assert!(!read.contains("\"id\""));
+
+        let mut invalid = snapshot.clone();
+        invalid["legacyMaxMemoryId"] = json!(7);
+        let invalid = call_facade(
+            &handler,
+            "claim.mirror.replace",
+            json!({"protocolVersion": 1, "snapshot": invalid}),
+        )
+        .await;
+        assert_eq!(error_code(invalid), "invalid_params");
+        assert_eq!(
+            store
+                .list_claim_mirror(&"a".repeat(32), None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mutation = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({"action": "archive", "publicClaimId": public_claim_id}),
+            )
+            .await,
+        );
+        assert!(mutation.contains("host claim-operation commit path"));
+        assert!(store.get_memory_full(1).unwrap().is_none());
     }
 
     fn synthetic_text(response: &Value, index: usize) -> String {
@@ -26448,10 +26987,11 @@ mod tests {
                     "action",
                     "category",
                     "content",
-                    "id",
-                    "ids",
-                    "target_id",
-                    "source_ids",
+                    "publicClaimId",
+                    "publicClaimIds",
+                    "mutationToken",
+                    "mutationTokens",
+                    "limit",
                     "reason",
                     "memory_project",
                 ],
@@ -32384,6 +32924,7 @@ mod tests {
             &baseline_store,
             &expected_request,
             &transform::ProducerContext {
+                claim_lane: None,
                 project_path: &baseline_project_path,
                 note_project_path: &baseline_project_path,
                 project_directory: &baseline_project_path,
@@ -33181,6 +33722,7 @@ mod tests {
             &store,
             &req,
             &transform::ProducerContext {
+                claim_lane: None,
                 project_path: &project_path_string,
                 note_project_path: &project_path_string,
                 project_directory: &project_path_string,

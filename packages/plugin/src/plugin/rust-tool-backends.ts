@@ -23,18 +23,20 @@ export interface RustNoteToolRequest {
 }
 
 export interface RustMemoryToolRequest {
-    /** Host MCP tool-use id; absent only for legacy THALAMUS callers. */
-    commandId?: string;
+    commandId: string;
     sessionId: string;
     projectRoot: string;
     projectPath: string;
-    /** MC identity; projectRoot stays transport-only. */
-    memoryProject: string;
-    action: "write" | "update" | "archive" | "merge" | "get";
-    content?: string;
-    category?: string;
-    ids?: number[];
-    reason?: string;
+    producer: string;
+    operationKey: string;
+    intentRequest: unknown;
+    commitContext: () => {
+        response: string;
+        producer: string;
+        operationKey: string;
+        requestDigest: string;
+        resultJson: string;
+    };
 }
 
 export function toolCallIdFromContext(context: unknown): string | undefined {
@@ -69,7 +71,7 @@ export interface RustToolBackends {
     /** Route ctx_note only after notes authority reports MODULE. */
     note?: (args: RustNoteToolRequest) => Promise<unknown>;
     /** Route ctx_memory only after memories authority reports MODULE. */
-    memory?: (args: RustMemoryToolRequest) => Promise<unknown>;
+    memory?: (args: RustMemoryToolRequest) => Promise<string>;
     /** Smart-note writes fail closed when the host evaluator cannot send note.evaluate for this project. */
     noteEvaluationAvailable?: (projectPath: string) => boolean;
     memorySync?: (sessionId: string) => void;

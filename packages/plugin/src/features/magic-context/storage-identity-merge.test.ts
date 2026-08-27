@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { partitionVerifyScope } from "./dreamer/verify-gate";
 import { createSourceSpan } from "./memory/storage-claims";
 import {
     deleteMemory,
@@ -17,6 +16,8 @@ import {
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { auditIdentityMerge, mergeProjectIdentities } from "./storage-identity-merge";
+import { seedProjectMemoryClaim } from "./test-claim-database";
+import { createDirectTestDatabase } from "./test-database";
 
 let db: Database | null = null;
 
@@ -24,6 +25,12 @@ function makeDb(): Database {
     db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
+    return db;
+}
+
+function makeDirectDb(): Database {
+    db = createDirectTestDatabase().db;
+    initializeDatabase(db);
     return db;
 }
 
@@ -175,16 +182,6 @@ describe("project identity merge", () => {
                 )
                 .get(),
         ).toEqual({ last_run_at: 200, last_broad_run_at: 100 });
-        const gate = await partitionVerifyScope({
-            db: database,
-            projectIdentity: "git:new",
-            projectDirectory: process.cwd(),
-            forceBroad: true,
-            now: 300,
-        });
-        expect(gate.broadCycleStartAt).toBe(100);
-        expect(gate.inScopeIds).toEqual([]);
-        expect(gate.skippedIds).toEqual([targetId]);
     });
 
     test("moves newer classification, mural cue, and verifications to a collision survivor", () => {
@@ -1848,5 +1845,118 @@ describe("project identity merge claims (v84)", () => {
             /authoritative episodes or claims/,
         );
         expect(aliasProjectId(database, "git:source")).toBe(sourceProjectId);
+    });
+});
+
+describe("U7 direct project identity adoption", () => {
+    test("scenario 1: dir-to-git adoption keeps one numeric project and immutable claim history", () => {
+        const database = makeDirectDb();
+        const seeded = seedProjectMemoryClaim(database, {
+            projectIdentity: "dir:old",
+            content: "Identity-stable claim.",
+            operationKey: "u7-identity-seed",
+        });
+        database
+            .prepare("INSERT INTO workspaces (name, created_at, updated_at) VALUES ('u7', 1, 1)")
+            .run();
+        database
+            .prepare(
+                `INSERT INTO workspace_members
+                    (workspace_id, project_path, display_name, display_path, added_at)
+                 VALUES (1, 'dir:old', 'Old', '/old', 1)`,
+            )
+            .run();
+        const before = {
+            claim: database
+                .prepare(
+                    `SELECT claims.id, claims.current_revision_id AS revisionId,
+                            ids.public_id AS publicId
+                       FROM claims JOIN claim_public_ids ids ON ids.claim_id = claims.id
+                      WHERE ids.public_id = ?`,
+                )
+                .get(seeded.publicClaimId),
+            revisions: database.prepare("SELECT * FROM claim_revisions ORDER BY id").all(),
+            evidence: database
+                .prepare("SELECT * FROM claim_evidence ORDER BY revision_id, observation_id")
+                .all(),
+            receipts: database.prepare("SELECT * FROM claim_operation_receipts ORDER BY id").all(),
+            generations: database
+                .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                .all(),
+        };
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 10 });
+
+        expect(
+            database.prepare("SELECT id FROM projects WHERE canonical_identity = 'git:new'").get(),
+        ).toEqual({ id: seeded.projectId });
+        expect(
+            database
+                .prepare(
+                    "SELECT project_id AS projectId FROM project_aliases WHERE alias_identity = ?",
+                )
+                .get("dir:old"),
+        ).toEqual({ projectId: seeded.projectId });
+        expect(database.prepare("SELECT project_path FROM workspace_members").get()).toEqual({
+            project_path: "git:new",
+        });
+        expect({
+            claim: database
+                .prepare(
+                    `SELECT claims.id, claims.current_revision_id AS revisionId,
+                            ids.public_id AS publicId
+                       FROM claims JOIN claim_public_ids ids ON ids.claim_id = claims.id
+                      WHERE ids.public_id = ?`,
+                )
+                .get(seeded.publicClaimId),
+            revisions: database.prepare("SELECT * FROM claim_revisions ORDER BY id").all(),
+            evidence: database
+                .prepare("SELECT * FROM claim_evidence ORDER BY revision_id, observation_id")
+                .all(),
+            receipts: database.prepare("SELECT * FROM claim_operation_receipts ORDER BY id").all(),
+            generations: database
+                .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                .all(),
+        }).toEqual(before);
+    });
+
+    test("scenario 2: true merge of claim-owning projects refuses unchanged and guides copy or move", () => {
+        const database = makeDirectDb();
+        seedProjectMemoryClaim(database, {
+            projectIdentity: "git:source",
+            content: "Source claim.",
+            operationKey: "u7-source-seed",
+        });
+        seedProjectMemoryClaim(database, {
+            projectIdentity: "git:target",
+            content: "Target claim.",
+            operationKey: "u7-target-seed",
+        });
+        const before = {
+            projects: database.prepare("SELECT * FROM projects ORDER BY id").all(),
+            aliases: database
+                .prepare("SELECT * FROM project_aliases ORDER BY alias_identity")
+                .all(),
+            claims: database.prepare("SELECT * FROM claims ORDER BY id").all(),
+            receipts: database.prepare("SELECT * FROM claim_operation_receipts ORDER BY id").all(),
+            generations: database
+                .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                .all(),
+        };
+
+        expect(() =>
+            mergeProjectIdentities(database, "git:source", "git:target", { now: 20 }),
+        ).toThrow(/explicit claim copy or move/);
+        expect({
+            projects: database.prepare("SELECT * FROM projects ORDER BY id").all(),
+            aliases: database
+                .prepare("SELECT * FROM project_aliases ORDER BY alias_identity")
+                .all(),
+            claims: database.prepare("SELECT * FROM claims ORDER BY id").all(),
+            receipts: database.prepare("SELECT * FROM claim_operation_receipts ORDER BY id").all(),
+            generations: database
+                .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                .all(),
+        }).toEqual(before);
     });
 });

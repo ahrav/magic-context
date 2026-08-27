@@ -11,6 +11,9 @@ import {
 	getSourceContents,
 	getTagsBySession,
 } from "@magic-context/core/features/magic-context/storage";
+import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
 import type { TagTarget } from "@magic-context/core/hooks/magic-context/tag-messages";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -731,6 +734,60 @@ describe("Pi clone state inheritance", () => {
 
 		expect(result?.pendingMarkerMigrated).toBe(true);
 		expect(markerVisibleAtSignal).toBe(true);
+	});
+
+	it("U7 scenario 7: clone copies session runtime without cloning claim history or receipt identity", () => {
+		const database = createDirectTestDatabase().db;
+		openDatabases.push(database);
+		initializeDatabase(database);
+		seedCompartment(database, { sequence: 1, startId: "u1", endId: "a1" });
+		seedTag(database, { tagNumber: 1, messageId: "a1" });
+		seedProjectMemoryClaim(database, {
+			projectIdentity: "git:clone-source",
+			content: "Clone-stable claim.",
+			operationKey: "u7-clone-source",
+			provenance: { sourceSessionId: "source" },
+		});
+		const before = {
+			claims: database.prepare("SELECT * FROM claims ORDER BY id").all(),
+			revisions: database
+				.prepare("SELECT * FROM claim_revisions ORDER BY id")
+				.all(),
+			evidence: database
+				.prepare(
+					"SELECT * FROM claim_evidence ORDER BY revision_id, observation_id",
+				)
+				.all(),
+			receipts: database
+				.prepare("SELECT * FROM claim_operation_receipts ORDER BY id")
+				.all(),
+			derivations: database
+				.prepare("SELECT * FROM claim_derivations ORDER BY id")
+				.all(),
+		};
+
+		const result = copyWithEntries(database, [user("u1"), assistant("a1")]);
+
+		expect(result.kind).toBe("migrated");
+		expect(count(database, "compartments")).toBe(1);
+		expect(count(database, "tags")).toBe(1);
+		expect({
+			claims: database.prepare("SELECT * FROM claims ORDER BY id").all(),
+			revisions: database
+				.prepare("SELECT * FROM claim_revisions ORDER BY id")
+				.all(),
+			evidence: database
+				.prepare(
+					"SELECT * FROM claim_evidence ORDER BY revision_id, observation_id",
+				)
+				.all(),
+			receipts: database
+				.prepare("SELECT * FROM claim_operation_receipts ORDER BY id")
+				.all(),
+			derivations: database
+				.prepare("SELECT * FROM claim_derivations ORDER BY id")
+				.all(),
+		}).toEqual(before);
 	});
 
 	it("fails open with one actionable structured log line", async () => {

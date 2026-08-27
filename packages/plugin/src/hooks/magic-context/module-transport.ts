@@ -24,6 +24,32 @@ import {
     StaleRouteHandleError,
 } from "../../shared/mc-host-client";
 import { isRecord } from "../../shared/record-type-guard";
+import {
+    buildClaimEffectDeliveryWireBody,
+    buildClaimIntentAckWireBody,
+    buildClaimIntentInspectWireBody,
+    buildClaimIntentStageWireBody,
+    buildClaimMirrorReceiptWireBody,
+    buildClaimMirrorSnapshotWireBody,
+    type ClaimEffectDeliveryRequest,
+    type ClaimEffectDeliveryResponse,
+    type ClaimIntentAckRequest,
+    type ClaimIntentAckResponse,
+    type ClaimIntentInspectRequest,
+    type ClaimIntentInspectResponse,
+    type ClaimIntentStageRequest,
+    type ClaimIntentStageResponse,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
+    decodeClaimEffectDeliveryResponse,
+    decodeClaimIntentAckResponse,
+    decodeClaimIntentInspectResponse,
+    decodeClaimIntentStageResponse,
+    decodeClaimMirrorReceiptResponse,
+    decodeClaimMirrorSnapshotResponse,
+} from "./module-wire";
 
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
@@ -455,6 +481,12 @@ export class McHostModuleTransport {
             | "mirror.pull"
             | "ctx_note"
             | "ctx_memory"
+            | "claim.intent.stage"
+            | "claim.intent.inspect"
+            | "claim.intent.ack"
+            | "claim.effects.apply"
+            | "claim.mirror.replace"
+            | "claim.mirror.apply"
             | "note.evaluate"
             | "note.evaluation.register"
             | "note.evaluation.heartbeat"
@@ -765,6 +797,99 @@ export class McHostModuleTransport {
         return { page: response.page as unknown as ChangefeedPage };
     }
 
+    async claimIntentStage(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentStageRequest;
+    }): Promise<ClaimIntentStageResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.stage",
+            body: buildClaimIntentStageWireBody(args.request),
+        });
+        return decodeClaimIntentStageResponse(response, args.request);
+    }
+
+    async claimIntentInspect(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentInspectRequest;
+    }): Promise<ClaimIntentInspectResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.inspect",
+            body: buildClaimIntentInspectWireBody(args.request),
+        });
+        return decodeClaimIntentInspectResponse(response);
+    }
+
+    async claimIntentAck(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentAckRequest;
+    }): Promise<ClaimIntentAckResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.ack",
+            body: buildClaimIntentAckWireBody(args.request),
+        });
+        return decodeClaimIntentAckResponse(response, args.request);
+    }
+
+    async claimEffectsApply(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimEffectDeliveryRequest;
+    }): Promise<ClaimEffectDeliveryResponse> {
+        // The last effect is the delivery checkpoint (same contract as the outbox drain
+        // and the mirror receipt decoder). An effects receipt must carry at least one
+        // effect, so an empty list is an upstream invariant violation, not a zero ack.
+        const expectedEffectId = args.request.receipt.effects.at(-1)?.id;
+        if (expectedEffectId === undefined) {
+            throw new Error(
+                `claim effect receipt ${args.request.receipt.receiptId} has no effects`,
+            );
+        }
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.effects.apply",
+            body: buildClaimEffectDeliveryWireBody(args.request),
+        });
+        return decodeClaimEffectDeliveryResponse(response, expectedEffectId);
+    }
+
+    async claimMirrorReplace(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.mirror.replace",
+            body: buildClaimMirrorSnapshotWireBody(args.request),
+        });
+        return decodeClaimMirrorSnapshotResponse(response, args.request);
+    }
+
+    async claimMirrorApply(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.mirror.apply",
+            body: buildClaimMirrorReceiptWireBody(args.request),
+        });
+        return decodeClaimMirrorReceiptResponse(response, args.request);
+    }
+
     async deleteSession(sessionId: string, projectRoot: string): Promise<void> {
         await this.call({
             sessionId,
@@ -852,7 +977,7 @@ export class McHostModuleTransport {
                 "opening the module route",
             );
             if (
-                routeOpening.closed ||
+                routeOpening?.closed === true ||
                 this.client !== client ||
                 generation !== this.connectionGeneration
             ) {

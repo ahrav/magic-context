@@ -15,6 +15,7 @@
 //! is the slice-4d integration decision, already ruled; the byte render here is pure.
 
 use crate::decay_render::{render_decayed_compartments, DecayRenderCompartment};
+use mc_store::claim_mirror::{ClaimMirrorLifecycle, CommittedClaimMirrorRow};
 use mc_store::{StoredMemory, StoredMemoryMutation, WorkspaceMembership};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -134,6 +135,111 @@ pub fn render_memory_block(
             memory,
             source_name_by_id.get(&memory.id).map(String::as_str),
         ));
+    }
+    if let Some(category) = open_category {
+        lines.push(format!("</{}>", escape_xml_attr(category)));
+    }
+    lines.push(format!("</{wrapper}>"));
+    lines.join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirroredClaimMemory {
+    pub public_claim_id: String,
+    pub revision_locator: String,
+    pub project_id: i64,
+    pub category: String,
+    pub content: String,
+    pub importance: i64,
+    pub provenance_label: Option<String>,
+}
+
+impl TryFrom<&CommittedClaimMirrorRow> for MirroredClaimMemory {
+    type Error = String;
+
+    fn try_from(row: &CommittedClaimMirrorRow) -> Result<Self, Self::Error> {
+        if row.lifecycle != ClaimMirrorLifecycle::Active {
+            return Err(format!("claim {} is not active", row.public_claim_id));
+        }
+        let category = row
+            .attributes
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .filter(|category| !category.is_empty())
+            .ok_or_else(|| format!("claim {} category is missing", row.public_claim_id))?;
+        let importance = row
+            .attributes
+            .get("importance")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| format!("claim {} importance is missing", row.public_claim_id))?;
+        Ok(Self {
+            public_claim_id: row.public_claim_id.clone(),
+            revision_locator: row.revision_locator.clone(),
+            project_id: row.project_id,
+            category: category.to_string(),
+            content: row.content.clone(),
+            importance,
+            provenance_label: row.provenance_label.clone(),
+        })
+    }
+}
+
+fn claim_render_order(left: &MirroredClaimMemory, right: &MirroredClaimMemory) -> Ordering {
+    let left_priority = MEMORY_CATEGORY_ORDER
+        .iter()
+        .position(|category| *category == left.category);
+    let right_priority = MEMORY_CATEGORY_ORDER
+        .iter()
+        .position(|category| *category == right.category);
+    match (left_priority, right_priority) {
+        (Some(left_rank), Some(right_rank)) => left_rank
+            .cmp(&right_rank)
+            .then_with(|| left.public_claim_id.cmp(&right.public_claim_id)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left
+            .category
+            .cmp(&right.category)
+            .then_with(|| left.public_claim_id.cmp(&right.public_claim_id)),
+    }
+}
+
+pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
+    let source = claim
+        .provenance_label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+        .map(|label| format!(" [{}]", escape_xml_content(label)))
+        .unwrap_or_default();
+    let mut end = claim.content.len().min(64 * 1024);
+    while !claim.content.is_char_boundary(end) {
+        end -= 1;
+    }
+    // Indent continuation lines exactly as `render_memory_line` does. Both feed the
+    // same `<project-memory>` block, so an unindented continuation breaks the block's
+    // line structure that m0 byte accounting and the prompt cache depend on.
+    let content = escape_xml_content(&claim.content[..end]).replace('\n', "\n  ");
+    format!("{}{source}: {content}", claim.public_claim_id)
+}
+
+pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) -> String {
+    if claims.is_empty() {
+        return String::new();
+    }
+    let mut ordered = claims.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| claim_render_order(left, right));
+    let mut lines = Vec::with_capacity(claims.len() * 2 + 2);
+    lines.push(format!("<{wrapper}>"));
+    let mut open_category: Option<&str> = None;
+    for claim in ordered {
+        if open_category != Some(claim.category.as_str()) {
+            if let Some(category) = open_category {
+                lines.push(format!("</{}>", escape_xml_attr(category)));
+            }
+            open_category = Some(&claim.category);
+            lines.push(format!("<{}>", escape_xml_attr(&claim.category)));
+        }
+        lines.push(render_claim_memory_line(claim));
     }
     if let Some(category) = open_category {
         lines.push(format!("</{}>", escape_xml_attr(category)));

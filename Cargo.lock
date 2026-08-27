@@ -1420,6 +1420,7 @@ dependencies = [
  "cortexkit-store",
  "cortexkit-store-types",
  "flate2",
+ "mc-core",
  "md5",
  "rusqlite",
  "serde",

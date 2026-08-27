@@ -91,6 +91,18 @@ import {
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import {
     buildPagedModuleTransformPayloads,
+    type ClaimEffectDeliveryRequest,
+    type ClaimEffectDeliveryResponse,
+    type ClaimIntentAckRequest,
+    type ClaimIntentAckResponse,
+    type ClaimIntentInspectRequest,
+    type ClaimIntentInspectResponse,
+    type ClaimIntentStageRequest,
+    type ClaimIntentStageResponse,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
@@ -202,6 +214,36 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         sessionId: string,
         afterSequence: number,
     ): Promise<ModuleCompartmentMirrorResponse>;
+    claimIntentStage?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentStageRequest;
+    }): Promise<ClaimIntentStageResponse>;
+    claimIntentInspect?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentInspectRequest;
+    }): Promise<ClaimIntentInspectResponse>;
+    claimIntentAck?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentAckRequest;
+    }): Promise<ClaimIntentAckResponse>;
+    claimEffectsApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimEffectDeliveryRequest;
+    }): Promise<ClaimEffectDeliveryResponse>;
+    claimMirrorReplace?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse>;
+    claimMirrorApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse>;
 }
 
 interface MessageContentSnapshot {
@@ -792,6 +834,9 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
             authorityMemorySyncSkipLogged: false,
+            claimMirrorSeeded: false,
+            claimMirrorSuppressed: true,
+            claimMirrorVector: null,
             lkgCaptureSequence: 0,
             lkgLastCapturedRowVersion: 0,
             lkgSyncCaptureRequired: false,
@@ -1400,6 +1445,7 @@ function buildTransformBody(args: {
         prompt_surface_guidance_override: args.passInputs.prompt_surface_guidance_override,
         mural: args.passInputs.mural,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
+        claim_lane: args.passInputs.claim_lane,
         auto_search_enabled: args.passInputs.auto_search_enabled === true,
         auto_search_score_threshold: args.passInputs.auto_search_score_threshold,
         auto_search_min_prompt_chars: args.passInputs.auto_search_min_prompt_chars,
@@ -2228,6 +2274,8 @@ export function createRustModeTransform(
                 const getCachedStateSyncCapabilities =
                     options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
+                const claimMirrorReplace = options.moduleClient.claimMirrorReplace;
+                const claimMirrorApply = options.moduleClient.claimMirrorApply;
                 const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
@@ -2237,6 +2285,14 @@ export function createRustModeTransform(
                         stateSyncCapabilities: stateSyncCapabilities
                             ? (capabilityArgs) =>
                                   stateSyncCapabilities.call(options.moduleClient, capabilityArgs)
+                            : undefined,
+                        claimMirrorReplace: claimMirrorReplace
+                            ? (mirrorArgs) =>
+                                  claimMirrorReplace.call(options.moduleClient, mirrorArgs)
+                            : undefined,
+                        claimMirrorApply: claimMirrorApply
+                            ? (mirrorArgs) =>
+                                  claimMirrorApply.call(options.moduleClient, mirrorArgs)
                             : undefined,
                     },
                     state,
@@ -2253,6 +2309,14 @@ export function createRustModeTransform(
             } finally {
                 logStage(sessionId, "stateSync", stateSyncStartedAt, timings);
             }
+            const claimLaneEnabled =
+                state.claimMirrorSeeded === true &&
+                state.claimMirrorSuppressed !== true &&
+                state.claimMirrorVector !== null;
+            passInputs.claim_lane = {
+                enabled: claimLaneEnabled,
+                snapshot_vector: claimLaneEnabled ? state.claimMirrorVector : null,
+            };
             const wireBuildStartedAt = performance.now();
             const encodedInput = encodeOpenCodeMessagesToCk(resolved.annotatedInput);
             timings.wireMessages = wireDelta

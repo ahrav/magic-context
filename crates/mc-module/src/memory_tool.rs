@@ -7,16 +7,26 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde_json::Value;
+
 use mc_store::{
-    McStore, McStoreError, StoredCompartmentSearchRow, StoredMemoryFull, StoredMemorySearchRow,
-    StoredNoteSearchRow,
+    claim_mirror::{ClaimMirrorError, CommittedClaimMirrorRow},
+    ClaimIntentRecord, McStore, McStoreError, StoredCompartmentSearchRow, StoredMemoryFull,
+    StoredMemorySearchRow, StoredNoteSearchRow,
 };
 
+pub use mc_core::claim_operation::{
+    ClaimCommandIdentity, ClaimIntentAckKind, ClaimIntentAckRequest, ClaimIntentAckResponse,
+    ClaimIntentBinding, ClaimIntentInspectRequest, ClaimIntentInspectResponse,
+    ClaimIntentStageRequest, ClaimIntentStageResponse, ClaimIntentState, ClaimIntentWireRecord,
+    CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION,
+};
 pub use mc_store::FOREIGN_VISIBLE_SQL;
 
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),
+    ClaimMirror(ClaimMirrorError),
     EmptyContent,
     EmptyMerge,
     DuplicateSourceId {
@@ -46,12 +56,14 @@ pub enum MemoryToolError {
     /// A `get` call with no ids is an input error distinct from merge validation, so the
     /// message names the read action instead of talking about merge sources.
     EmptyGet,
+    IntentProtocol(String),
 }
 
 impl std::fmt::Display for MemoryToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MemoryToolError::Store(e) => write!(f, "store: {e}"),
+            MemoryToolError::ClaimMirror(e) => write!(f, "claim mirror: {e}"),
             MemoryToolError::EmptyContent => write!(f, "memory content is required"),
             MemoryToolError::EmptyMerge => write!(f, "merge requires at least one source memory"),
             MemoryToolError::DuplicateSourceId { id } => {
@@ -79,6 +91,9 @@ impl std::fmt::Display for MemoryToolError {
                     "'ids' must contain at least one memory ID when action is 'get'"
                 )
             }
+            MemoryToolError::IntentProtocol(reason) => {
+                write!(f, "claim intent protocol: {reason}")
+            }
         }
     }
 }
@@ -88,6 +103,130 @@ impl From<McStoreError> for MemoryToolError {
     fn from(e: McStoreError) -> Self {
         MemoryToolError::Store(e)
     }
+}
+impl From<ClaimMirrorError> for MemoryToolError {
+    fn from(e: ClaimMirrorError) -> Self {
+        MemoryToolError::ClaimMirror(e)
+    }
+}
+
+pub fn list_committed_claims(
+    store: &McStore,
+    public_claim_ids: &BTreeSet<String>,
+    category: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CommittedClaimMirrorRow>, MemoryToolError> {
+    let Some(state) = store.claim_mirror_state()? else {
+        return Ok(Vec::new());
+    };
+    Ok(store
+        .list_claim_mirror(&state.database_incarnation_id, None)?
+        .into_iter()
+        .filter(|row| {
+            public_claim_ids.is_empty() || public_claim_ids.contains(&row.public_claim_id)
+        })
+        // Category narrowing precedes truncation so a requested category is not
+        // crowded out of the limit by rows the caller did not ask for.
+        .filter(|row| {
+            category.is_none_or(|category| {
+                row.attributes.get("category").and_then(Value::as_str) == Some(category)
+            })
+        })
+        .take(limit)
+        .collect())
+}
+
+fn require_intent_protocol(version: u32) -> Result<(), MemoryToolError> {
+    if version == CLAIM_INTENT_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(MemoryToolError::IntentProtocol(format!(
+            "unsupported protocol version {version}"
+        )))
+    }
+}
+
+fn intent_wire_record(record: ClaimIntentRecord) -> ClaimIntentWireRecord {
+    ClaimIntentWireRecord {
+        binding: record.binding,
+        command: record.command,
+        request_digest: record.request_digest,
+        state: record.state,
+        result_json: record.result_json,
+    }
+}
+
+pub fn stage_claim_intent(
+    store: &McStore,
+    route_project_root: &str,
+    request: &ClaimIntentStageRequest,
+    now_ms: i64,
+) -> Result<ClaimIntentStageResponse, MemoryToolError> {
+    require_intent_protocol(request.protocol_version)?;
+    if request.request_encoding_version != CLAIM_REQUEST_ENCODING_VERSION {
+        return Err(MemoryToolError::IntentProtocol(format!(
+            "unsupported request encoding version {}",
+            request.request_encoding_version
+        )));
+    }
+    let outcome = store.stage_claim_intent(
+        route_project_root,
+        &request.binding,
+        &request.command,
+        &request.request,
+        now_ms,
+    )?;
+    Ok(ClaimIntentStageResponse {
+        protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+        replayed: outcome.replayed,
+        intent: intent_wire_record(outcome.record),
+    })
+}
+
+pub fn inspect_claim_intents(
+    store: &McStore,
+    request: &ClaimIntentInspectRequest,
+) -> Result<ClaimIntentInspectResponse, MemoryToolError> {
+    require_intent_protocol(request.protocol_version)?;
+    if request.limit == 0 || request.limit > 10_000 {
+        return Err(MemoryToolError::IntentProtocol(
+            "inspect limit must be in 1..=10000".to_string(),
+        ));
+    }
+    let records = if let Some(command) = &request.command {
+        store
+            .inspect_claim_intent(command)?
+            .filter(|record| !request.unresolved_only || record.state.is_unresolved())
+            .into_iter()
+            .collect()
+    } else {
+        store.list_claim_intents(request.unresolved_only, request.limit as usize)?
+    };
+    Ok(ClaimIntentInspectResponse {
+        protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+        intents: records.into_iter().map(intent_wire_record).collect(),
+    })
+}
+
+pub fn acknowledge_claim_intent(
+    store: &McStore,
+    request: &ClaimIntentAckRequest,
+    now_ms: i64,
+) -> Result<ClaimIntentAckResponse, MemoryToolError> {
+    require_intent_protocol(request.protocol_version)?;
+    let outcome = store.acknowledge_claim_intent(
+        &request.binding,
+        &request.command,
+        &request.request_digest,
+        request.kind,
+        request.result_json.as_deref(),
+        now_ms,
+    )?;
+    Ok(ClaimIntentAckResponse {
+        protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+        replayed: outcome.replayed,
+        intent: intent_wire_record(outcome.record),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -921,5 +1060,99 @@ mod tests {
             get_memories(&store, own, &[]),
             Err(MemoryToolError::EmptyGet)
         ));
+    }
+
+    #[test]
+    fn claim_intent_protocol_is_strict_versioned_and_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let route_root = "/repo/claim-intent-protocol";
+        let store_uuid = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
+        // Staging resolves memories authority through the bound route.
+        store
+            .bind_authority_route(store_uuid, "git:project", route_root)
+            .unwrap();
+        let preparing = store
+            .authority_begin_prepare(store_uuid, "git:project", "memories")
+            .unwrap();
+        let authority_generation = store
+            .authority_finish_prepare(
+                store_uuid,
+                "git:project",
+                "memories",
+                preparing.generation,
+                "same",
+                "same",
+                true,
+            )
+            .unwrap()
+            .generation;
+        let binding = ClaimIntentBinding {
+            database_incarnation_id: "0123456789abcdef0123456789abcdef".to_string(),
+            format_epoch: 1,
+            authority_project: "git:project".to_string(),
+            authority_generation,
+        };
+        let command = ClaimCommandIdentity {
+            producer: "mc-module".to_string(),
+            operation_key: "tool-call-1".to_string(),
+        };
+        let request = ClaimIntentStageRequest {
+            protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+            request_encoding_version: CLAIM_REQUEST_ENCODING_VERSION,
+            binding: binding.clone(),
+            command: command.clone(),
+            request: serde_json::json!({"operation":"create","value":"fact"}),
+        };
+        let staged = stage_claim_intent(&store, route_root, &request, 1).unwrap();
+        assert_eq!(staged.intent.state, ClaimIntentState::Staged);
+        assert!(!staged.replayed);
+        assert!(
+            stage_claim_intent(&store, route_root, &request, 2)
+                .unwrap()
+                .replayed
+        );
+
+        let inspected = inspect_claim_intents(
+            &store,
+            &ClaimIntentInspectRequest {
+                protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+                command: Some(command.clone()),
+                unresolved_only: true,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(inspected.intents, vec![staged.intent.clone()]);
+
+        let result_json = mc_core::claim_operation::canonical_json_encode(&serde_json::json!({
+            "resultEncodingVersion": 1,
+            "outcome": "stale",
+            "staleReason": "authority changed",
+            "payload": null,
+            "effects": [],
+            "generations": {},
+        }))
+        .unwrap();
+        let rejected = acknowledge_claim_intent(
+            &store,
+            &ClaimIntentAckRequest {
+                protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+                binding,
+                command,
+                request_digest: staged.intent.request_digest,
+                kind: ClaimIntentAckKind::TerminalRejected,
+                result_json: Some(result_json),
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(rejected.intent.state, ClaimIntentState::TerminalRejected);
+
+        let mut wire = serde_json::to_value(request).unwrap();
+        wire.as_object_mut()
+            .unwrap()
+            .insert("unknown".to_string(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<ClaimIntentStageRequest>(wire).is_err());
     }
 }

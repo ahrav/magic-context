@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::memory_render::MirroredClaimMemory;
 use mc_store::{StoredCompartment, StoredMemory};
 use serde::Deserialize;
 
@@ -323,6 +324,42 @@ pub fn build_reference_blocks_from_stored(
 ///
 /// This differs from the m0/m1 memory render: the historian needs compact category groups
 /// for fact deduplication, not per-memory ids or update metadata.
+pub fn render_historian_claim_block(claims: &[MirroredClaimMemory]) -> String {
+    let mut by_category: HashMap<&str, Vec<&MirroredClaimMemory>> = HashMap::new();
+    for claim in claims {
+        by_category
+            .entry(claim.category.as_str())
+            .or_default()
+            .push(claim);
+    }
+    let mut sections = Vec::new();
+    for category in HISTORIAN_MEMORY_CATEGORY_PRIORITY {
+        let Some(category_claims) = by_category.get(category) else {
+            continue;
+        };
+        if category_claims.is_empty() {
+            continue;
+        }
+        sections.push(format!("<{category}>"));
+        for claim in category_claims {
+            sections.push(format!(
+                "- {}: {}",
+                claim.public_claim_id,
+                escape_xml_content(&claim.content)
+            ));
+        }
+        sections.push(format!("</{category}>"));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<project-memory>\n{}\n</project-memory>",
+            sections.join("\n")
+        )
+    }
+}
+
 pub fn render_historian_memory_block(memories: &[StoredMemory]) -> String {
     let mut by_category: HashMap<&str, Vec<&StoredMemory>> = HashMap::new();
     for memory in memories {
@@ -477,6 +514,21 @@ mod tests {
     fn xml_escaping_matches_prompt_reference_order() {
         assert_eq!(escape_xml_attr("&\"'<>"), "&amp;&quot;&apos;&lt;&gt;");
         assert_eq!(escape_xml_content("&<>\"'"), "&amp;&lt;&gt;\"'");
+    }
+
+    #[test]
+    fn claim_historian_context_uses_public_identity() {
+        let block = render_historian_claim_block(&[MirroredClaimMemory {
+            public_claim_id: format!("mcm_{}", "a".repeat(32)),
+            revision_locator: format!("mcm_{}/r1/{}", "a".repeat(32), "b".repeat(64)),
+            project_id: 1,
+            category: "CONSTRAINTS".to_string(),
+            content: "Use the public contract.".to_string(),
+            importance: 80,
+            provenance_label: None,
+        }]);
+        assert!(block.contains("mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!block.contains("#1"));
     }
 
     #[test]

@@ -1,8 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
+import type {
+    ClaimEffectDeliveryRequest,
+    ClaimEffectDeliveryResponse,
+    ClaimIntentAckRequest,
+    ClaimIntentAckResponse,
+    ClaimIntentInspectRequest,
+    ClaimIntentInspectResponse,
+    ClaimIntentStageRequest,
+    ClaimIntentStageResponse,
+    ClaimIntentWireRecord,
+} from "../../hooks/magic-context/module-wire";
 import { log } from "../../shared/logger";
 import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
 import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "./claims-backfill";
+import { encodeClaimOperationResult } from "./memory/claim-operation-contract";
+import { ClaimOperationInputError } from "./memory/storage-claim-operations";
 import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
 import {
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
@@ -95,6 +108,207 @@ export interface AuthorityModuleClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }>;
+    claimIntentStage?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentStageRequest;
+    }): Promise<ClaimIntentStageResponse>;
+    claimIntentInspect?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentInspectRequest;
+    }): Promise<ClaimIntentInspectResponse>;
+    claimIntentAck?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentAckRequest;
+    }): Promise<ClaimIntentAckResponse>;
+    claimEffectsApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimEffectDeliveryRequest;
+    }): Promise<ClaimEffectDeliveryResponse>;
+}
+
+export interface ContextClaimCommit {
+    response: string;
+    producer: string;
+    operationKey: string;
+    requestDigest: string;
+    resultJson: string;
+}
+
+function sameIntentBinding(
+    left: ClaimIntentWireRecord["binding"],
+    right: ClaimIntentWireRecord["binding"],
+): boolean {
+    return (
+        left.databaseIncarnationId === right.databaseIncarnationId &&
+        left.formatEpoch === right.formatEpoch &&
+        left.authorityProject === right.authorityProject &&
+        left.authorityGeneration === right.authorityGeneration
+    );
+}
+
+function terminalClaimResult(reason: string): string {
+    return encodeClaimOperationResult({
+        resultEncodingVersion: 1,
+        outcome: "stale",
+        staleReason: reason,
+        payload: null,
+        effects: [],
+        generations: {},
+    });
+}
+
+export async function commitModuleClaimIntent(args: {
+    client: Required<
+        Pick<AuthorityModuleClient, "claimIntentStage" | "claimIntentInspect" | "claimIntentAck">
+    >;
+    sessionId: string;
+    projectRoot: string;
+    request: ClaimIntentStageRequest;
+    commitContext: () => ContextClaimCommit;
+    settleContext: (commit: ContextClaimCommit) => Promise<void>;
+}): Promise<string> {
+    const inspected = await args.client.claimIntentInspect({
+        sessionId: args.sessionId,
+        projectRoot: args.projectRoot,
+        request: {
+            protocolVersion: args.request.protocolVersion,
+            command: args.request.command,
+            unresolvedOnly: false,
+            limit: 1,
+        },
+    });
+    const prior = inspected.intents[0];
+    if (prior && !sameIntentBinding(prior.binding, args.request.binding)) {
+        if (prior.state === "staged") {
+            await args.client.claimIntentAck({
+                sessionId: args.sessionId,
+                projectRoot: args.projectRoot,
+                request: {
+                    protocolVersion: args.request.protocolVersion,
+                    binding: prior.binding,
+                    command: prior.command,
+                    requestDigest: prior.requestDigest,
+                    kind: "terminal-rejected",
+                    resultJson: terminalClaimResult(
+                        "context database incarnation or authority changed",
+                    ),
+                },
+            });
+        } else if (prior.state === "context-committed") {
+            // The context write already landed under the previous binding, so this
+            // intent cannot be terminally rejected — only acknowledged, and only
+            // under the binding that staged it. Its effects still reach the mirror
+            // through the outbox consumer, which drains independently of this
+            // coordinator. Leaving the row unresolved instead would block every
+            // later claim-store rebuild and mirror reset, because both count
+            // `staged` and `context-committed` as unresolved.
+            await args.client.claimIntentAck({
+                sessionId: args.sessionId,
+                projectRoot: args.projectRoot,
+                request: {
+                    protocolVersion: args.request.protocolVersion,
+                    binding: prior.binding,
+                    command: prior.command,
+                    requestDigest: prior.requestDigest,
+                    kind: "acknowledged",
+                    resultJson: null,
+                },
+            });
+        }
+        throw new Error("claim intent belongs to an obsolete context incarnation or authority");
+    }
+
+    const staged = await args.client.claimIntentStage({
+        sessionId: args.sessionId,
+        projectRoot: args.projectRoot,
+        request: args.request,
+    });
+    if (staged.intent.state === "terminal-rejected") {
+        throw new Error("claim intent was terminally rejected");
+    }
+
+    let commit: ContextClaimCommit;
+    try {
+        commit = args.commitContext();
+    } catch (error) {
+        // A caller-input rejection is deterministic: the same stable tool-call ID
+        // reproduces it on every retry, so the staged row would never resolve and
+        // would block claim-store rebuilds forever. Terminalize it and let the
+        // caller see the original error. Any other failure may be transient, so
+        // the row stays staged and a retry can still commit it.
+        if (error instanceof ClaimOperationInputError && staged.intent.state === "staged") {
+            await args.client.claimIntentAck({
+                sessionId: args.sessionId,
+                projectRoot: args.projectRoot,
+                request: {
+                    protocolVersion: args.request.protocolVersion,
+                    binding: staged.intent.binding,
+                    command: staged.intent.command,
+                    requestDigest: staged.intent.requestDigest,
+                    kind: "terminal-rejected",
+                    resultJson: terminalClaimResult(
+                        `context rejected the request: ${error.message}`,
+                    ),
+                },
+            });
+        }
+        throw error;
+    }
+    if (
+        commit.producer !== args.request.command.producer ||
+        commit.operationKey !== args.request.command.operationKey
+    ) {
+        throw new Error("context receipt identity does not match staged claim intent");
+    }
+    if (commit.requestDigest !== staged.intent.requestDigest) {
+        throw new Error("context receipt digest does not match staged claim intent");
+    }
+
+    let intent = staged.intent;
+    if (intent.state === "staged") {
+        const acknowledged = await args.client.claimIntentAck({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            request: {
+                protocolVersion: args.request.protocolVersion,
+                binding: intent.binding,
+                command: intent.command,
+                requestDigest: intent.requestDigest,
+                kind: "context-committed",
+                resultJson: commit.resultJson,
+            },
+        });
+        intent = acknowledged.intent;
+    } else if (intent.resultJson !== commit.resultJson) {
+        throw new Error("module claim intent result differs from durable context receipt");
+    }
+    if (intent.state !== "context-committed" && intent.state !== "acknowledged") {
+        throw new Error(`claim intent did not record context commit: ${intent.state}`);
+    }
+
+    await args.settleContext(commit);
+    if (intent.state !== "acknowledged") {
+        const acknowledged = await args.client.claimIntentAck({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            request: {
+                protocolVersion: args.request.protocolVersion,
+                binding: intent.binding,
+                command: intent.command,
+                requestDigest: intent.requestDigest,
+                kind: "acknowledged",
+                resultJson: null,
+            },
+        });
+        if (acknowledged.intent.state !== "acknowledged") {
+            throw new Error("claim intent settlement was not durable");
+        }
+    }
+    return commit.response;
 }
 
 import type { DrainResult } from "./smart-notes/evaluator-worker";

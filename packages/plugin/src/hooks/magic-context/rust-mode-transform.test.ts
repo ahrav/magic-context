@@ -1273,15 +1273,31 @@ describe("Rust mode authority adapter", () => {
         `);
         let renderedRevisionLocators = [firstClaim.revisionLocator];
         let memorySnapshotVector = firstLane.snapshotVector;
+        const transformClaimLanes: unknown[] = [];
         const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          native_messages: makeMessages(sessionId),
-                          rendered_revision_locators: renderedRevisionLocators,
-                          memory_snapshot_vector: memorySnapshotVector,
-                      }
-                    : { ok: true },
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformClaimLanes.push((body as Record<string, unknown>).claim_lane);
+                return {
+                    native_messages: makeMessages(sessionId),
+                    rendered_revision_locators: renderedRevisionLocators,
+                    memory_snapshot_vector: memorySnapshotVector,
+                };
+            },
+            claimMirrorReplace: async ({ request }) => ({
+                protocolVersion: 1,
+                mirrorVersion: 1,
+                databaseIncarnationId: request.snapshot.vector.databaseIncarnationId,
+                projectCheckpoints: request.snapshot.projectCheckpoints,
+            }),
+            claimMirrorApply: async ({ request }) => ({
+                protocolVersion: 1,
+                mirrorVersion: 1,
+                receiptId: request.receipt.receiptId,
+                replayed: false,
+                appliedEffectCount: request.receipt.effects.length,
+                ackedEffectId: request.receipt.effects.at(-1)?.effectId ?? 0,
+            }),
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
         const run = async () => {
@@ -1290,6 +1306,10 @@ describe("Rust mode authority adapter", () => {
         };
 
         await run();
+        expect(transformClaimLanes.at(-1)).toEqual({
+            enabled: false,
+            snapshot_vector: null,
+        });
         expect(getVisibleRevisionLocators(db, sessionId)).toEqual(
             new Set([firstClaim.revisionLocator]),
         );

@@ -25,6 +25,10 @@ use sha2::{Digest, Sha256};
 
 pub const CLAIM_REQUEST_ENCODING_VERSION: u32 = 1;
 pub const CLAIM_RESULT_ENCODING_VERSION: u32 = 1;
+/// Version of the Rust-host staged-intent protocol. This is independent from
+/// request/result encoding versions so transport evolution cannot silently
+/// reinterpret persisted command bytes.
+pub const CLAIM_INTENT_PROTOCOL_VERSION: u32 = 1;
 
 pub const CLAIM_REQUEST_DIGEST_PROTOCOL: &str = "mc-claim-request-v1";
 pub const CLAIM_MUTATION_TOKEN_DIGEST_PROTOCOL: &str = "mc-claim-mutation-token-v1";
@@ -161,7 +165,12 @@ pub fn compute_claim_operation_request_digest(request: &Value) -> Result<String,
     protocol_digest(CLAIM_REQUEST_DIGEST_PROTOCOL, request)
 }
 
-fn is_lower_hex(text: &str, expected_len: usize) -> bool {
+/// True when `text` is exactly `expected_len` lowercase hexadecimal characters.
+///
+/// The claim-operation contract, the intent ledger, and the claim mirror all fence
+/// on identities in this format. They share one definition so a change to the
+/// length or charset cannot leave one layer accepting IDs another rejects.
+pub fn is_lower_hex(text: &str, expected_len: usize) -> bool {
     text.len() == expected_len
         && text
             .bytes()
@@ -301,7 +310,7 @@ pub fn compute_policy_heads_digest(counts: &PolicyHeadCounts) -> Result<String, 
 /// Publication-freshness state, separate from mutation fencing: database
 /// incarnation, workspace epoch, and per-project claim/policy generations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotVector {
     pub vector_version: u32,
     pub database_incarnation_id: String,
@@ -336,6 +345,138 @@ pub fn compute_snapshot_vector_digest(vector: &SnapshotVector) -> Result<String,
         SNAPSHOT_VECTOR_DIGEST_PROTOCOL,
         &snapshot_vector_value(vector),
     )
+}
+
+/// Stable identity of one semantic claim command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimCommandIdentity {
+    pub producer: String,
+    pub operation_key: String,
+}
+
+/// Context database and authority fence captured when a command is staged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentBinding {
+    pub database_incarnation_id: String,
+    pub format_epoch: i64,
+    pub authority_project: String,
+    pub authority_generation: u64,
+}
+
+/// Durable staged-intent lifecycle. `acknowledged` is transport settlement,
+/// not a second semantic claim state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimIntentState {
+    Staged,
+    ContextCommitted,
+    Acknowledged,
+    TerminalRejected,
+}
+
+impl ClaimIntentState {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "staged" => Some(Self::Staged),
+            "context-committed" => Some(Self::ContextCommitted),
+            "acknowledged" => Some(Self::Acknowledged),
+            "terminal-rejected" => Some(Self::TerminalRejected),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::ContextCommitted => "context-committed",
+            Self::Acknowledged => "acknowledged",
+            Self::TerminalRejected => "terminal-rejected",
+        }
+    }
+
+    pub fn is_unresolved(self) -> bool {
+        matches!(self, Self::Staged | Self::ContextCommitted)
+    }
+}
+
+/// Versioned request used to durably stage a command before context mutation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentStageRequest {
+    pub protocol_version: u32,
+    pub request_encoding_version: u32,
+    pub binding: ClaimIntentBinding,
+    pub command: ClaimCommandIdentity,
+    pub request: Value,
+}
+
+/// Versioned intent inspection. Omitting `command` lists rows in creation order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentInspectRequest {
+    pub protocol_version: u32,
+    pub command: Option<ClaimCommandIdentity>,
+    pub unresolved_only: bool,
+    pub limit: u32,
+}
+
+/// One legal acknowledgement transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimIntentAckKind {
+    ContextCommitted,
+    Acknowledged,
+    TerminalRejected,
+}
+
+/// Versioned acknowledgement. Result bytes are supplied only when recording
+/// `context-committed` or `terminal-rejected`; they must already use canonical
+/// claim-result encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentAckRequest {
+    pub protocol_version: u32,
+    pub binding: ClaimIntentBinding,
+    pub command: ClaimCommandIdentity,
+    pub request_digest: String,
+    pub kind: ClaimIntentAckKind,
+    pub result_json: Option<String>,
+}
+
+/// Shared response row for stage, inspect, and acknowledgement APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentWireRecord {
+    pub binding: ClaimIntentBinding,
+    pub command: ClaimCommandIdentity,
+    pub request_digest: String,
+    pub state: ClaimIntentState,
+    pub result_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentStageResponse {
+    pub protocol_version: u32,
+    pub replayed: bool,
+    pub intent: ClaimIntentWireRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentInspectResponse {
+    pub protocol_version: u32,
+    pub intents: Vec<ClaimIntentWireRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimIntentAckResponse {
+    pub protocol_version: u32,
+    pub replayed: bool,
+    pub intent: ClaimIntentWireRecord,
 }
 
 /// Stored result outcomes.
@@ -396,6 +537,21 @@ fn decode_effect(entry: &Value, index: usize) -> Result<ClaimOperationResultEffe
     let entry = entry.as_object().ok_or_else(|| {
         ContractError::MalformedResult(format!("result effect {index} must be an object"))
     })?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "effectKey",
+        "changeKind",
+        "projectId",
+        "generation",
+        "revisionLocator",
+    ];
+    if let Some(field) = entry
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ContractError::MalformedResult(format!(
+            "result effect {index} contains unknown field {field}"
+        )));
+    }
     let string_field = |field: &str| -> Result<String, ContractError> {
         entry
             .get(field)
@@ -447,6 +603,22 @@ pub fn decode_claim_operation_result(
     let record = parsed
         .as_object()
         .ok_or_else(|| ContractError::MalformedResult("stored result must be an object".into()))?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "resultEncodingVersion",
+        "outcome",
+        "staleReason",
+        "payload",
+        "effects",
+        "generations",
+    ];
+    if let Some(field) = record
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ContractError::MalformedResult(format!(
+            "stored result contains unknown field {field}"
+        )));
+    }
     let version = record
         .get("resultEncodingVersion")
         .and_then(Value::as_u64)
