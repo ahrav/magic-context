@@ -191,6 +191,15 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
             variant.as_str()
         ));
     }
+    if requires_build_id(variant) && HOST_BUILD_ID.is_none() {
+        return Err(format!(
+            "variant {} is defined as pre-change host code, which this binary \
+             cannot select at run time: rebuild the harness at the pinned \
+             pre-change commit with MC_HOST_PERF_BUILD_ID set, so the emitted \
+             evidence names the host it ran against",
+            variant.as_str()
+        ));
+    }
     if let Load::Open { rate, .. } = load {
         rate.checked_mul(seconds)
             .filter(|count| *count > 0)
@@ -207,6 +216,29 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
         seed,
         transport_floor_ns,
     })
+}
+
+/// Identity of the build this binary was compiled from, supplied by the
+/// collection script as `MC_HOST_PERF_BUILD_ID`.
+///
+/// Read at compile time, not run time, because the thing it identifies is the
+/// artifact: the `--variant` axis selects client retry and poll policy plus
+/// admission configuration, and cannot select a different host implementation.
+/// A pre-change host is therefore a different binary, and this is the only field
+/// in the evidence that distinguishes one from another.
+const HOST_BUILD_ID: Option<&str> = option_env!("MC_HOST_PERF_BUILD_ID");
+
+/// Variants whose meaning depends on which host build ran them.
+///
+/// `baseline` and `hygiene-only` are defined by the contract as pre-change host
+/// code, which this binary cannot select at run time. Emitting such a cell from
+/// an unidentified build produces evidence that looks like a host comparison but
+/// is not one, so the run is refused rather than left for a reader to catch.
+fn requires_build_id(variant: SynapseVariant) -> bool {
+    matches!(
+        variant,
+        SynapseVariant::Baseline | SynapseVariant::HygieneOnly
+    )
 }
 
 fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
@@ -435,7 +467,19 @@ struct RoutedWire {
 const TOMBSTONE_CAP: usize = 4096;
 
 enum WireCallError {
-    Timeout { sent_ns: u64, terminal_ns: u64 },
+    Timeout {
+        sent_ns: u64,
+        terminal_ns: u64,
+    },
+    /// The deadline lapsed before any byte reached the socket, so there is no
+    /// send instant and no attempt to record.
+    ///
+    /// Distinct from [`WireCallError::Timeout`] because reporting a call that
+    /// never reached the wire as a timed-out attempt would anchor a logical
+    /// request's latency at a send that did not happen and add a phantom row to
+    /// the attempt ledger. Carries nothing: with no send there is no interval to
+    /// report, and the caller stamps its own terminal instant.
+    ExpiredBeforeSend,
     Transport(String),
 }
 
@@ -493,7 +537,23 @@ impl RoutedWire {
         u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX)
     }
 
-    async fn call(&self, body: Vec<u8>, budget: Duration) -> Result<WireReply, WireCallError> {
+    /// Takes the caller's absolute deadline, not a duration.
+    ///
+    /// Waiting for the shared writer is time the caller's deadline is spending.
+    /// Computing a budget outside this function and arming the timer only after
+    /// the write hands every contended call an effective budget larger than its
+    /// deadline, and a stalled writer an unbounded one — so attempts could
+    /// succeed after their logical deadline, which is exactly the evidence a
+    /// tail study cannot afford to get wrong.
+    ///
+    /// The write itself is deliberately *not* interruptible. `write_all` is not
+    /// cancel-safe: dropping it mid-frame leaves a partial request on the shared
+    /// connection and desynchronizes framing for every other in-flight logical
+    /// request, which no later call can recover from. Instead the wait for the
+    /// writer is bounded and the deadline is re-tested while the lock is held,
+    /// so an expired call never starts a write; once a frame is started it is
+    /// finished.
+    async fn call(&self, body: Vec<u8>, deadline: Instant) -> Result<WireReply, WireCallError> {
         if let Some(error) = self.reader_error.lock().await.clone() {
             return Err(WireCallError::Transport(error));
         }
@@ -502,7 +562,18 @@ impl RoutedWire {
         // socket write must be atomic: allocating outside the writer lock
         // lets two tasks write in inverted correlation order under load.
         let (corr, rx, sent_ns) = {
-            let mut writer = self.writer.lock().await;
+            let Ok(writer) = tokio::time::timeout_at(deadline.into(), self.writer.lock()).await
+            else {
+                return Err(WireCallError::ExpiredBeforeSend);
+            };
+            let mut writer = writer;
+            // The timer above can lose its own race: the lock may be granted at
+            // or after the deadline without the timeout arm being polled first.
+            // Re-testing here is what guarantees no frame is written past the
+            // deadline.
+            if Instant::now() >= deadline {
+                return Err(WireCallError::ExpiredBeforeSend);
+            }
             let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(corr, tx);
@@ -525,7 +596,7 @@ impl RoutedWire {
             }
             (corr, rx, sent_ns)
         };
-        match tokio::time::timeout(budget, rx).await {
+        match tokio::time::timeout_at(deadline.into(), rx).await {
             Ok(Ok((frame, received_ns))) => Ok(WireReply {
                 frame,
                 sent_ns,
@@ -640,6 +711,10 @@ enum CallError {
     Timeout {
         sent_ns: u64,
     },
+    /// The deadline was already spent, so nothing reached the wire and no
+    /// attempt was recorded. The caller terminates the logical request as timed
+    /// out without anchoring a send that never happened.
+    Expired,
     /// Transport loss or an unparsable response. The caller cannot act on it.
     Fatal(String),
 }
@@ -652,11 +727,16 @@ impl RunContext {
         body: Vec<u8>,
         deadline: Instant,
     ) -> Result<(WireReply, serde_json::Value), CallError> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let attempt_id = self.next_attempt.fetch_add(1, Ordering::Relaxed);
-        let result = self.wire.call(body, remaining).await;
+        // The absolute deadline goes all the way down: `RoutedWire::call` bounds
+        // writer acquisition and reply receipt against it, so no part of the
+        // call runs on a budget the caller's deadline has already spent.
+        let result = self.wire.call(body, deadline).await;
+        // Allocated only for a call that reached the wire, so a refused call
+        // leaves no gap-filling id behind and, more importantly, no row.
+        let next_attempt_id = || self.next_attempt.fetch_add(1, Ordering::Relaxed);
         match result {
             Ok(reply) => {
+                let attempt_id = next_attempt_id();
                 let json: serde_json::Value = serde_json::from_slice(&reply.frame.body)
                     .map_err(|error| CallError::Fatal(format!("response JSON: {error}")))?;
                 let code = json["code"].as_str().map(str::to_owned);
@@ -706,6 +786,7 @@ impl RunContext {
                 sent_ns,
                 terminal_ns,
             }) => {
+                let attempt_id = next_attempt_id();
                 self.attempts.lock().await.push(AttemptRecord {
                     logical_id,
                     attempt_id,
@@ -724,6 +805,7 @@ impl RunContext {
                 });
                 Err(CallError::Timeout { sent_ns })
             }
+            Err(WireCallError::ExpiredBeforeSend) => Err(CallError::Expired),
             Err(WireCallError::Transport(error)) => Err(CallError::Fatal(error)),
         }
     }
@@ -860,6 +942,21 @@ async fn execute_query(
                     LogicalDisposition::TimedOut,
                     Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
                     u64::from(attempts),
+                    0,
+                ));
+            }
+            // Nothing reached the wire, so no send to anchor and no attempt to
+            // count: the same terminal the pre-attempt guard above produces.
+            Err(CallError::Expired) => {
+                let now = ctx.wire.elapsed_ns();
+                return Ok(terminal_record(
+                    logical_id,
+                    scheduled_start_ns,
+                    first_send.unwrap_or(now),
+                    now,
+                    LogicalDisposition::TimedOut,
+                    Some("timeout".to_owned()),
+                    u64::from(attempts.saturating_sub(1)),
                     0,
                 ));
             }
@@ -1044,6 +1141,19 @@ async fn execute_batch(
                         polls,
                     ));
                 }
+                Err(CallError::Expired) => {
+                    let now = ctx.wire.elapsed_ns();
+                    return Ok(terminal_record(
+                        logical_id,
+                        scheduled_start_ns,
+                        first_send.unwrap_or(now),
+                        now,
+                        LogicalDisposition::TimedOut,
+                        Some("timeout".to_owned()),
+                        batch_attempts.saturating_sub(1) + polls,
+                        polls,
+                    ));
+                }
                 Err(CallError::Fatal(error)) => return Err(error),
             };
             first_send.get_or_insert(reply.sent_ns);
@@ -1193,6 +1303,20 @@ async fn execute_batch(
                             now,
                             LogicalDisposition::TimedOut,
                             Some(perf_measurement::ATTEMPT_TIMEOUT_CODE.to_owned()),
+                            batch_attempts + polls,
+                            polls,
+                        ));
+                    }
+                    Err(CallError::Expired) => {
+                        let now = ctx.wire.elapsed_ns();
+                        let polls = polls.saturating_sub(1);
+                        return Ok(terminal_record(
+                            logical_id,
+                            scheduled_start_ns,
+                            first_send.expect("batch sent"),
+                            now,
+                            LogicalDisposition::TimedOut,
+                            Some("timeout".to_owned()),
                             batch_attempts + polls,
                             polls,
                         ));
@@ -1706,6 +1830,9 @@ struct Summary {
     /// when it differs. Emitted with the other treatment inputs to keep that
     /// subtraction reproducible from the summary alone.
     transport_floor_ns: u64,
+    /// See [`HOST_BUILD_ID`]. `null` for an unidentified build, which the
+    /// contract admits only for variants that vary client policy alone.
+    host_build_id: Option<&'static str>,
     ledger: perf_measurement::SynapseLedgerSummary,
     attempt_latency: Option<LatencySummary>,
     logical_latency: Option<LatencySummary>,
@@ -1979,6 +2106,7 @@ async fn run(
         max_waiting_queries: opts.max_waiting_queries,
         query_retry_after_ms: opts.query_retry_after_ms,
         transport_floor_ns: opts.transport_floor_ns,
+        host_build_id: HOST_BUILD_ID,
         ledger,
         attempt_latency,
         logical_latency,
@@ -2270,9 +2398,17 @@ mod tests {
             callers.spawn(async move {
                 // The server never replies, so every call resolves as an
                 // attempt timeout after its write; only the write order
-                // matters here.
-                match wire.call(b"{}".to_vec(), Duration::from_millis(1)).await {
+                // matters here. One second is microseconds of loopback writes
+                // away from being generous for 256 contending writers, so the
+                // test still exercises write ordering rather than the pre-send
+                // refusal, and it is also how long the reply wait takes to
+                // expire.
+                let deadline = Instant::now() + Duration::from_secs(1);
+                match wire.call(b"{}".to_vec(), deadline).await {
                     Err(WireCallError::Timeout { .. }) => {}
+                    Err(WireCallError::ExpiredBeforeSend) => {
+                        panic!("the deadline expired before a small loopback write completed")
+                    }
                     Err(WireCallError::Transport(error)) => panic!("transport error: {error}"),
                     Ok(_) => panic!("no reply was sent"),
                 }
@@ -2398,6 +2534,29 @@ mod tests {
         ]))
         .expect_err("B is a loss arm")
         .contains("requires --max-waiting-queries 0"));
+
+        // `baseline` and `hygiene-only` claim pre-change host code, which this
+        // binary cannot select at run time. Without a build id the emitted cell
+        // would look like a host comparison while running the changed host, so
+        // the run is refused. Guarded on the constant because a collection build
+        // legitimately sets it.
+        if HOST_BUILD_ID.is_none() {
+            for variant in ["baseline", "hygiene-only"] {
+                assert!(
+                    parse_opts_from(args(&[
+                        "--variant",
+                        variant,
+                        "--arm",
+                        "query",
+                        "--concurrency",
+                        "1",
+                    ]))
+                    .expect_err("pre-change variants need an identified build")
+                    .contains("pre-change host code"),
+                    "{variant} was accepted from an unidentified build"
+                );
+            }
+        }
 
         let a = parse_opts_from(args(&[
             "--variant",

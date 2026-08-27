@@ -190,6 +190,24 @@ bundle and is the reference arm for every candidate delta. The harness is
 client-faithful retry and poll loops mirror plugin semantics and use the same
 constant set; the shipped plugin does not drive cells.
 
+The `--variant` flag is not what makes a cell pre-change. It selects client
+retry and poll policy together with the admission configuration
+(`max_waiting_queries`); it cannot select a different host implementation,
+because the harness links the `SynapseComponent` of the build it was compiled
+from. A `baseline` or `hygiene-only` cell is therefore only what its name claims
+when the harness itself was built at the pinned pre-change commit, which makes
+every host comparison a two-artifact collection rather than a within-run
+contrast.
+
+Each build carries its identity in `MC_HOST_PERF_BUILD_ID`, compiled in and
+emitted as `host_build_id` on every summary, so a mixed-build collection is
+detectable per cell instead of resting on the operator's `environment.txt` alone.
+The harness refuses to run `baseline` or `hygiene-only` from a build with no
+identity: those are exactly the cells whose meaning depends on which host code
+ran, so producing them unlabelled would yield evidence that reads as a host
+comparison without being one. Cells that vary client policy alone may run
+without an identity, and report `host_build_id: null`.
+
 The pilot froze these fields before treatment collection:
 
 - `INDEPENDENT_BLOCK_COUNT = 2`
@@ -400,6 +418,9 @@ Each collection uses `docs/perf/runs/<name>-<commit>/` and contains at least:
 - a manifest with factors, levels, pilot-frozen fields, randomization seed and
   order, block/restart boundaries, timing conventions, warmup, constants-parity
   result, KTD9 acceptance, and all evidence-gate results;
+- for every `baseline` or `hygiene-only` cell, the `host_build_id` its summaries
+  carry and the pre-change commit that build corresponds to, so the two-artifact
+  host comparison is verifiable from the evidence rather than asserted;
 - raw logical-request, attempt, service-time, and `/proc` samples;
 - invalid repetitions retained with reasons;
 - absolute summaries, ratios, uncertainty, multiplicity results, and the USL

@@ -1,0 +1,232 @@
+{
+  "completed_utc": "2026-08-26T22:15:26.033737Z",
+  "derivation": "mean of retained per-block mean S; capacity=1e9/mean_ns; each factor rate=round_half_up(capacity*factor)",
+  "attempts": [
+    {
+      "phase": "calibration",
+      "sequence": 1,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 5,
+        "k": 0,
+        "seed": 1001,
+        "block": 1
+      },
+      "argv": [
+        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "5",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1001",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "artifact_sha256": "304571f903697540689d755497f098b1db25cd6f7511868c5801abb76665aa66",
+      "started_utc": "2026-08-26T22:15:21.554493Z",
+      "ended_utc": "2026-08-26T22:15:22.671769Z",
+      "duration_seconds": 1.1172982890275307,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00001.ndjson",
+      "stderr": "calibration/raw/00001.stderr"
+    },
+    {
+      "phase": "calibration",
+      "sequence": 2,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 25,
+        "k": 0,
+        "seed": 1001,
+        "block": 1
+      },
+      "argv": [
+        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "25",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1001",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "artifact_sha256": "304571f903697540689d755497f098b1db25cd6f7511868c5801abb76665aa66",
+      "started_utc": "2026-08-26T22:15:22.675167Z",
+      "ended_utc": "2026-08-26T22:15:23.792422Z",
+      "duration_seconds": 1.1172731390106492,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00002.ndjson",
+      "stderr": "calibration/raw/00002.stderr"
+    },
+    {
+      "phase": "calibration",
+      "sequence": 3,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 5,
+        "k": 0,
+        "seed": 1002,
+        "block": 2
+      },
+      "argv": [
+        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "5",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1002",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "artifact_sha256": "304571f903697540689d755497f098b1db25cd6f7511868c5801abb76665aa66",
+      "started_utc": "2026-08-26T22:15:23.794376Z",
+      "ended_utc": "2026-08-26T22:15:24.911470Z",
+      "duration_seconds": 1.117118192021735,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00003.ndjson",
+      "stderr": "calibration/raw/00003.stderr"
+    },
+    {
+      "phase": "calibration",
+      "sequence": 4,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 25,
+        "k": 0,
+        "seed": 1002,
+        "block": 2
+      },
+      "argv": [
+        "/local/home/ahrav/scratch/magic-context/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "25",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1002",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "/local/home/ahrav/scratch/magic-context",
+      "artifact_sha256": "304571f903697540689d755497f098b1db25cd6f7511868c5801abb76665aa66",
+      "started_utc": "2026-08-26T22:15:24.914845Z",
+      "ended_utc": "2026-08-26T22:15:26.032288Z",
+      "duration_seconds": 1.1174595459597185,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00004.ndjson",
+      "stderr": "calibration/raw/00004.stderr"
+    }
+  ],
+  "delays": {
+    "5": {
+      "block_mean_service_ns": [
+        5057359.541237113,
+        5056083.092783505
+      ],
+      "calibration_mean_service_ns": 5056721.31701031,
+      "capacity_per_second": 197.75659707330502,
+      "factors": [
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "rates_per_second": [
+        49,
+        99,
+        148,
+        198,
+        297,
+        396
+      ]
+    },
+    "25": {
+      "block_mean_service_ns": [
+        25059840.375,
+        25059167.05
+      ],
+      "calibration_mean_service_ns": 25059503.7125,
+      "capacity_per_second": 39.90502012620415,
+      "factors": [
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "rates_per_second": [
+        10,
+        20,
+        30,
+        40,
+        60,
+        80
+      ]
+    }
+  }
+}
