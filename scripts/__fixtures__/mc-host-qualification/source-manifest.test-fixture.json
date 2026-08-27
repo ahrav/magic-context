@@ -1,0 +1,135 @@
+{
+  "schema": "magic-context.mc-host-production-input-sources/v1",
+  "mode": "test-fixture",
+  "note": "Fully qualified TEST FIXTURE manifest for scripts/qualify-mc-host-production-inputs.test.ts. The byte artifacts live under scripts/__fixtures__/mc-host-qualification/artifacts and are NOT production inputs; test-fixture mode always emits test_only evidence that requireQualificationEvidence rejects.",
+  "release_version": "0.38.0",
+  "inputs": {
+    "ort_runtime": {
+      "qualified": true,
+      "source": "https://artifacts.example.invalid/onnxruntime/v1.22.0/linux-x64-cpu/7163d84f017b03efe91688c775f817bc86598f094361cab70066a5f601f3f262/libonnxruntime.so",
+      "size_bytes": 52,
+      "sha256": "7163d84f017b03efe91688c775f817bc86598f094361cab70066a5f601f3f262",
+      "provenance": "fixture: CPU-only ONNX Runtime build stand-in",
+      "license": {
+        "spdx": "MIT",
+        "redistribution_approved": true,
+        "approved_by": "fixture-approver"
+      },
+      "verify_local_path": "scripts/__fixtures__/mc-host-qualification/artifacts/ort-runtime.so"
+    },
+    "model_onnx": {
+      "qualified": true,
+      "source": "https://models.example.invalid/gte-modernbert-base-f16/resolve/7b76162eb214679b69ada2511b7bcbc4a3a10e5a4f6975b63151d9e70228fbb9/model.onnx",
+      "size_bytes": 48,
+      "sha256": "7b76162eb214679b69ada2511b7bcbc4a3a10e5a4f6975b63151d9e70228fbb9",
+      "provenance": "fixture: gte-modernbert-base-f16 model stand-in",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "fixture-approver"
+      },
+      "verify_local_path": "scripts/__fixtures__/mc-host-qualification/artifacts/model.onnx"
+    },
+    "tokenizer": {
+      "qualified": true,
+      "source": "https://models.example.invalid/gte-modernbert-base-f16/resolve/ce626902caf146eae1f94b18c3ac4e6afdb3de53543c964a70ec47931567f485/tokenizer.json",
+      "size_bytes": 87,
+      "sha256": "ce626902caf146eae1f94b18c3ac4e6afdb3de53543c964a70ec47931567f485",
+      "provenance": "fixture: tokenizer.json stand-in",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "fixture-approver"
+      },
+      "verify_local_path": "scripts/__fixtures__/mc-host-qualification/artifacts/tokenizer.json"
+    },
+    "config": {
+      "qualified": true,
+      "source": "https://models.example.invalid/gte-modernbert-base-f16/resolve/4fd2d898799ffd2fb86d6876bbc61fee51f15f9084371b6855a7c33baa3f7afe/config.json",
+      "size_bytes": 84,
+      "sha256": "4fd2d898799ffd2fb86d6876bbc61fee51f15f9084371b6855a7c33baa3f7afe",
+      "provenance": "fixture: config.json stand-in",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "fixture-approver"
+      },
+      "verify_local_path": "scripts/__fixtures__/mc-host-qualification/artifacts/config.json"
+    },
+    "special_tokens_map": {
+      "qualified": true,
+      "source": "https://models.example.invalid/gte-modernbert-base-f16/resolve/edb50ff6967f699266556dd0ad34fcc8223862dbfc2c1fc89605886694b47be8/special_tokens_map.json",
+      "size_bytes": 96,
+      "sha256": "edb50ff6967f699266556dd0ad34fcc8223862dbfc2c1fc89605886694b47be8",
+      "provenance": "fixture: special_tokens_map.json stand-in",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "fixture-approver"
+      },
+      "verify_local_path": "scripts/__fixtures__/mc-host-qualification/artifacts/special_tokens_map.json"
+    },
+    "tokenizer_config": {
+      "qualified": true,
+      "source": "https://models.example.invalid/gte-modernbert-base-f16/resolve/ab5bb3f9cf48aaa106425b71ae7669ac7e11fbdf7171a603d8ff6a002c7b15c9/tokenizer_config.json",
+      "size_bytes": 94,
+      "sha256": "ab5bb3f9cf48aaa106425b71ae7669ac7e11fbdf7171a603d8ff6a002c7b15c9",
+      "provenance": "fixture: tokenizer_config.json stand-in",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "fixture-approver"
+      },
+      "verify_local_path": "scripts/__fixtures__/mc-host-qualification/artifacts/tokenizer_config.json"
+    },
+    "corpus": {
+      "qualified": true,
+      "source": "https://artifacts.example.invalid/mc-host/corpus/9e0acccc7df8aa48992d86aa72b07014b86e74e2dd563ca8873788e92fc9d4cc/corpus.json",
+      "size_bytes": 84,
+      "sha256": "9e0acccc7df8aa48992d86aa72b07014b86e74e2dd563ca8873788e92fc9d4cc",
+      "provenance": "fixture: semantic-certification corpus stand-in",
+      "license": {
+        "spdx": "Apache-2.0",
+        "redistribution_approved": true,
+        "approved_by": "fixture-approver"
+      },
+      "verify_local_path": "scripts/__fixtures__/mc-host-qualification/artifacts/corpus.json"
+    }
+  },
+  "oracle": {
+    "model_fingerprint": "8a15e208a378722a889c2c37972e29846a307843d529ad91a4033770a30a97dc",
+    "table_epoch": 1,
+    "execution_provider": "cpu",
+    "host": {
+      "target": "linux-x64-gnu",
+      "kernel": "4.18",
+      "glibc": "2.28",
+      "procfs_self_fd_exec": true
+    },
+    "expected_vectors": 8,
+    "tolerance": 0.01,
+    "network_access": "none",
+    "result": "pass",
+    "vectors_compared": 8,
+    "observed_max_error": 0.004,
+    "bound_inputs": {
+      "config": "4fd2d898799ffd2fb86d6876bbc61fee51f15f9084371b6855a7c33baa3f7afe",
+      "corpus": "9e0acccc7df8aa48992d86aa72b07014b86e74e2dd563ca8873788e92fc9d4cc",
+      "model_onnx": "7b76162eb214679b69ada2511b7bcbc4a3a10e5a4f6975b63151d9e70228fbb9",
+      "ort_runtime": "7163d84f017b03efe91688c775f817bc86598f094361cab70066a5f601f3f262",
+      "special_tokens_map": "edb50ff6967f699266556dd0ad34fcc8223862dbfc2c1fc89605886694b47be8",
+      "tokenizer": "ce626902caf146eae1f94b18c3ac4e6afdb3de53543c964a70ec47931567f485",
+      "tokenizer_config": "ab5bb3f9cf48aaa106425b71ae7669ac7e11fbdf7171a603d8ff6a002c7b15c9"
+    }
+  },
+  "harnesses": {
+    "opencode": {
+      "package": "opencode-ai",
+      "version": "1.0.0"
+    },
+    "pi": {
+      "package": "@earendil-works/pi-coding-agent",
+      "version": "0.80.2"
+    }
+  }
+}

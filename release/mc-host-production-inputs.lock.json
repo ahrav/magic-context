@@ -1,0 +1,175 @@
+{
+  "cold_start_budgets_ms": {
+    "bootstrap_copy": {
+      "hard": 3000,
+      "p95": 1000
+    },
+    "fresh_linux_transport_aggregate": {
+      "hard": 60000,
+      "p95": 25000
+    },
+    "fresh_macos_transport_aggregate": {
+      "hard": 15000,
+      "p95": 5000
+    },
+    "linux_generation_stage": {
+      "hard": 45000,
+      "p95": 20000
+    },
+    "linux_synapse_certification_post_publication": {
+      "hard": 90000,
+      "p95": 45000
+    },
+    "macos_generation_stage": {
+      "hard": 10000,
+      "p95": 3000
+    },
+    "retained_transport": {
+      "hard": 5000,
+      "p95": 2000
+    },
+    "spawn_publication_auth": {
+      "hard": 3000,
+      "p95": 1000
+    },
+    "storage_ready_post_publication": {
+      "hard": 5000,
+      "p95": 2000
+    }
+  },
+  "durability_scope": "process_crash_only",
+  "harness_runtimes": {
+    "bun": "1.3.14",
+    "node": "24.x",
+    "npm": "11.x"
+  },
+  "harnesses": {
+    "opencode": {
+      "package": "opencode-ai",
+      "version": {
+        "qualified": false,
+        "reason": "exact opencode-ai harness version (independent of the @opencode-ai SDK/plugin pins) not yet qualified by release engineering"
+      }
+    },
+    "pi": {
+      "package": "@earendil-works/pi-coding-agent",
+      "version": "0.80.2"
+    }
+  },
+  "inputs": {
+    "config": {
+      "qualified": false,
+      "reason": "production config.json bytes not yet qualified by release engineering"
+    },
+    "corpus": {
+      "qualified": false,
+      "reason": "production semantic-certification corpus bytes not yet qualified by release engineering"
+    },
+    "model_onnx": {
+      "qualified": false,
+      "reason": "production gte-modernbert-base-f16 ONNX bytes not yet qualified by release engineering"
+    },
+    "ort_runtime": {
+      "qualified": false,
+      "reason": "exact CPU-only ONNX Runtime shared-library bytes (loaded via ort 2.0.0-rc.13 dynamic loading) not yet qualified by release engineering"
+    },
+    "special_tokens_map": {
+      "qualified": false,
+      "reason": "production special_tokens_map.json bytes not yet qualified by release engineering"
+    },
+    "tokenizer": {
+      "qualified": false,
+      "reason": "production tokenizer.json bytes not yet qualified by release engineering"
+    },
+    "tokenizer_config": {
+      "qualified": false,
+      "reason": "production tokenizer_config.json bytes not yet qualified by release engineering"
+    }
+  },
+  "install_layouts": [
+    "bun_physical_link",
+    "compiled_bun_external",
+    "npm_hoisted",
+    "npm_nested"
+  ],
+  "mode": "production",
+  "model_lane": {
+    "execution_provider": "cpu",
+    "id": "gte-modernbert-base-f16",
+    "platforms": [
+      "linux-x64-gnu"
+    ]
+  },
+  "oracle": {
+    "qualified": false,
+    "reason": "offline semantic-oracle evidence not yet recorded against real locked ORT/model bytes"
+  },
+  "package_size_limits_bytes": {
+    "@cortexkit/mc-host-darwin-arm64": {
+      "compressed_max": 62914560,
+      "unpacked_max": 157286400
+    },
+    "@cortexkit/mc-host-darwin-x64": {
+      "compressed_max": 62914560,
+      "unpacked_max": 157286400
+    },
+    "@cortexkit/mc-host-linux-x64-gnu": {
+      "compressed_max": 471859200,
+      "unpacked_max": 734003200
+    }
+  },
+  "platform_floors": {
+    "darwin-arm64": {
+      "dev_fd_exec": true,
+      "os_min": "13.5"
+    },
+    "darwin-x64": {
+      "dev_fd_exec": true,
+      "os_min": "13.5"
+    },
+    "linux-x64-gnu": {
+      "glibc_min": "2.28",
+      "kernel_min": "4.18",
+      "procfs_self_fd_exec": true
+    }
+  },
+  "production_qualified": false,
+  "release": {
+    "id": "mc-host-release",
+    "version": "0.38.0"
+  },
+  "release_contract_sha256": "a2f7c195f769d369e4495c55806a1645a4ca575cad351b5f2b7a751d83b8eda4",
+  "rust_runtime": {
+    "fastembed": "6.0.0",
+    "ort": "2.0.0-rc.13",
+    "ort_features": [
+      "api-17",
+      "api-18",
+      "api-19",
+      "api-20",
+      "api-21",
+      "api-22",
+      "api-23",
+      "api-24",
+      "load-dynamic",
+      "ndarray",
+      "preload-dylibs",
+      "std"
+    ],
+    "ort_sys_features": [
+      "disable-linking"
+    ]
+  },
+  "schema": "magic-context.mc-host-production-inputs-lock/v1",
+  "unqualified": [
+    "harnesses.opencode: exact opencode-ai harness version (independent of the @opencode-ai SDK/plugin pins) not yet qualified by release engineering",
+    "inputs.config: production config.json bytes not yet qualified by release engineering",
+    "inputs.corpus: production semantic-certification corpus bytes not yet qualified by release engineering",
+    "inputs.model_onnx: production gte-modernbert-base-f16 ONNX bytes not yet qualified by release engineering",
+    "inputs.ort_runtime: exact CPU-only ONNX Runtime shared-library bytes (loaded via ort 2.0.0-rc.13 dynamic loading) not yet qualified by release engineering",
+    "inputs.special_tokens_map: production special_tokens_map.json bytes not yet qualified by release engineering",
+    "inputs.tokenizer: production tokenizer.json bytes not yet qualified by release engineering",
+    "inputs.tokenizer_config: production tokenizer_config.json bytes not yet qualified by release engineering",
+    "oracle: offline semantic-oracle evidence not yet recorded against real locked ORT/model bytes"
+  ]
+}
