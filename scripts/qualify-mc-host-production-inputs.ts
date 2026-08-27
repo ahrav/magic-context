@@ -1645,6 +1645,8 @@ function tomlKeyName(raw: string): string | null {
 interface DependencyDeclaration {
     /** The table it appeared in, e.g. `dependencies` or `target.'cfg(...)'.dependencies`. */
     section: string;
+    /** The key as declared, which is what Cargo feature forwarding names. */
+    key: string;
     /** `package = "..."` when the dependency is renamed, otherwise the key. */
     crate: string;
     /** The complete inline entry, comments stripped, joined onto one line. */
@@ -1720,7 +1722,7 @@ function dependencyDeclarations(
             if (resolved === null) return null;
             crate = resolved;
         }
-        declarations.push({ section, crate, entry });
+        declarations.push({ section, key, crate, entry });
     }
     return declarations;
 }
@@ -1923,6 +1925,79 @@ function resolveLockedVersion(
     return descriptor.slice(at + 1);
 }
 
+/**
+ * Reject a `[features]` entry that forwards a forbidden capability to a qualified
+ * crate.
+ *
+ * Cargo's feature table enables a dependency's feature with `dep/feature`, so a
+ * closure claim checked only against dependency entries is defeated from the other
+ * side: `[features] default = ["ort/cuda"]` enables CUDA for every build that does
+ * not pass `--no-default-features`, which `build:rust` does not.
+ *
+ * Every entry in the table is scanned, not only the ones reachable from `default`.
+ * A forwarding declared under an unreachable feature name still contradicts the
+ * closure the lock publishes, and feature reachability is exactly the resolution
+ * this scan declines to approximate.
+ *
+ * Forwarding names the dependency *key*, so a renamed dependency forwards under its
+ * rename. The key set therefore comes from the resolved declarations rather than
+ * from the crate names.
+ */
+function assertNoForbiddenFeatureForwarding(
+    cargo: string,
+    declarations: DependencyDeclaration[],
+    crates: readonly string[],
+): void {
+    const keys = new Set(
+        declarations
+            .filter((declaration) => crates.includes(declaration.crate))
+            .map((declaration) => declaration.key),
+    );
+    if (keys.size === 0) return;
+    const lines = cargo.split("\n").map(stripTomlComments);
+    let section = "";
+    let depth = 0;
+    for (const [index, line] of lines.entries()) {
+        const trimmed = line.trim();
+        const atTopLevel = depth === 0;
+        for (const char of line) {
+            if (char === "{" || char === "[") depth++;
+            else if (char === "}" || char === "]") depth--;
+        }
+        if (!atTopLevel) continue;
+        const header = /^\[([^\]]+)\]$/.exec(trimmed);
+        if (header !== null) {
+            section = header[1] ?? "";
+            continue;
+        }
+        if (section !== "features") continue;
+        if (!/=/.test(trimmed)) continue;
+        const entry = joinInlineEntry(lines, index);
+        if (entry === null) {
+            fail(
+                `the [features] table in ${MC_HOST_CARGO_TOML_PATH} holds an entry this qualifier cannot read`,
+            );
+        }
+        for (const quoted of entry.match(/"[^"\\]*"/g) ?? []) {
+            const value = quoted.slice(1, -1);
+            // `dep?/feature` is the weak form; both forward the same capability.
+            const forward = /^([A-Za-z0-9_-]+)\??\/(.+)$/.exec(value);
+            const key = forward?.[1];
+            const feature = forward?.[2]?.toLowerCase();
+            if (key === undefined || feature === undefined) continue;
+            if (!keys.has(key)) continue;
+            const forbidden = FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS.find((hint) =>
+                feature.includes(hint),
+            );
+            if (forbidden !== undefined) {
+                fail(
+                    `the [features] table in ${MC_HOST_CARGO_TOML_PATH} forwards ${value}, which is outside the qualified closure (${forbidden})`,
+                );
+            }
+        }
+    }
+}
+
 /** Repo-pinned identity cross-checks (bun.lock harness versions, Cargo crate pins). */
 function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
     const bunLockPath = join(rootDir, BUN_LOCK_PATH);
@@ -1954,15 +2029,25 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
             fail("crates/mc-host/Cargo.toml is required to qualify the ORT crate pins");
         }
         const cargo = readFileSync(cargoPath, "utf8");
-        assertPinnedCrateFeatures(
+        const qualified = [
+            ["fastembed", RUNTIME_IDENTITY.rust_crates.fastembed],
+            ["ort", RUNTIME_IDENTITY.rust_crates.ort],
+        ] as const;
+        for (const [crate, version] of qualified) {
+            assertPinnedCrateFeatures(cargo, crate, version);
+        }
+        // The dependency entries are only one side of the closure: `[features]` can
+        // forward a capability to the same crates, so both sides are checked.
+        const declarations = dependencyDeclarations(cargo);
+        if (declarations === null) {
+            fail(
+                `${MC_HOST_CARGO_TOML_PATH} holds a dependency declaration this qualifier cannot read`,
+            );
+        }
+        assertNoForbiddenFeatureForwarding(
             cargo,
-            "fastembed",
-            RUNTIME_IDENTITY.rust_crates.fastembed,
-        );
-        assertPinnedCrateFeatures(
-            cargo,
-            "ort",
-            RUNTIME_IDENTITY.rust_crates.ort,
+            declarations,
+            qualified.map(([crate]) => crate),
         );
     }
 }

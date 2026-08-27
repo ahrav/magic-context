@@ -825,6 +825,24 @@ describe("immutable input fail-closed rules", () => {
                     `${cargo}\nort_alias = { package = "o\\u0072t", version = "=2.0.0-rc.13" }\n`,
                 /must be declared exactly once/,
             ],
+            [
+                // The other side of the closure. Cargo's feature table forwards to a
+                // dependency with `dep/feature`, and `default` is on for every build
+                // that does not pass --no-default-features, which `build:rust` does
+                // not.
+                (cargo) => `${cargo}\n[features]\ndefault = ["ort/cuda"]\n`,
+                /\[features\] table .* forwards ort\/cuda, which is outside the qualified closure/,
+            ],
+            [
+                // Scanned whether or not the entry is reachable from `default`, and
+                // under a renamed key, since forwarding names the key.
+                (cargo) =>
+                    `${cargo.replace(
+                        /^ort = /m,
+                        'ort_dep = { package = "ort", version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }\nunused_ort = ',
+                    )}\n[features]\nnever-enabled = ["ort_dep/tensorrt"]\n`,
+                /forwards ort_dep\/tensorrt, which is outside the qualified closure/,
+            ],
         ];
         for (const [mutate, error] of cases) {
             const root = freshRoot();
