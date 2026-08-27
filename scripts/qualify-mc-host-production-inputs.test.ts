@@ -96,6 +96,16 @@ function installManifest(root: string, manifest: any): void {
     );
 }
 
+/** Mirrors the qualifier's JSON-shaped input set, so a staged production artifact
+ *  is loadable rather than merely digest-correct. */
+const JSON_SHAPED_INPUTS: ReadonlySet<string> = new Set([
+    "config",
+    "corpus",
+    "special_tokens_map",
+    "tokenizer",
+    "tokenizer_config",
+]);
+
 /**
  * Where production-mode tests stage artifact bytes. Production qualification
  * denies any verify path under `scripts/__fixtures__`, so a production manifest
@@ -181,7 +191,14 @@ function installProductionManifest(
         },
     ][]) {
         const target = join(stagedDir, basename(artifact.verify_local_path));
-        const bytes = Buffer.from(`staged production stand-in for ${key}\n`);
+        // The JSON inputs must parse: a correct digest over plain text still cannot
+        // be loaded by the runtime, so byte verification rejects it. Distinct
+        // contents per key keep the digests distinct, as real artifacts would be.
+        const bytes = Buffer.from(
+            JSON_SHAPED_INPUTS.has(key)
+                ? `${JSON.stringify({ staged_production_stand_in: key })}\n`
+                : `staged production stand-in for ${key}\n`,
+        );
         writeFileSync(target, bytes);
         artifact.verify_local_path = target;
         artifact.sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -450,6 +467,59 @@ describe("immutable input fail-closed rules", () => {
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).toThrow(
                 /carries a credential and is rejected/,
+            );
+        }
+    });
+
+    test("digest-correct bytes the runtime cannot load are rejected", () => {
+        // Byte identity is not loadability: a plain-text stand-in with a matching
+        // digest would qualify and then fail at bundle load.
+        const root = freshRoot();
+        installProductionManifest(root, (manifest) => {
+            const target = manifest.inputs.tokenizer.verify_local_path;
+            const bytes = Buffer.from("not json at all\n");
+            writeFileSync(target, bytes);
+            manifest.inputs.tokenizer.sha256 = createHash("sha256")
+                .update(bytes)
+                .digest("hex");
+            manifest.inputs.tokenizer.size_bytes = bytes.length;
+        });
+        expect(() => generate(root, { check: false })).toThrow(
+            /inputs\.tokenizer: verified bytes are not parseable JSON/,
+        );
+    });
+
+    test("a production source must name its content", () => {
+        // A denylist of ref names can never be complete, so immutability is required
+        // positively: an unlisted branch reads as immutable only because nobody
+        // thought of it.
+        for (const path of [
+            "/gte-modernbert/resolve/develop/model.onnx",
+            "/gte-modernbert/resolve/v1.2.3/model.onnx",
+            "/gte-modernbert/model.onnx",
+        ]) {
+            const root = freshRoot();
+            installProductionManifest(root, (manifest) => {
+                manifest.inputs.model_onnx.source = `https://models.mchost-release.io${path}`;
+            });
+            expect(() => generate(root, { check: false })).toThrow(
+                /production source must name its content/,
+            );
+        }
+
+        // The artifact's own digest satisfies it, and so does any
+        // content-addressed revision of git-SHA-1 length or longer.
+        for (const segment of ["${sha256}", "a".repeat(40)]) {
+            const root = freshRoot();
+            installProductionManifest(root, (manifest) => {
+                const digest = manifest.inputs.model_onnx.sha256;
+                manifest.inputs.model_onnx.source =
+                    `https://models.mchost-release.io/m/resolve/${
+                        segment === "${sha256}" ? digest : segment
+                    }/model.onnx`;
+            });
+            expect(generate(root, { check: false }).productionQualified).toBe(
+                true,
             );
         }
     });

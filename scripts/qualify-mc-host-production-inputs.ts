@@ -930,6 +930,16 @@ export const INPUT_KEYS = [
     "tokenizer_config",
 ] as const;
 
+/** Inputs whose bytes are JSON. The model and the ORT shared library are not, and
+ *  their internal validity is the runtime bundle validator's to judge. */
+const JSON_SHAPED_INPUTS: ReadonlySet<string> = new Set([
+    "config",
+    "corpus",
+    "special_tokens_map",
+    "tokenizer",
+    "tokenizer_config",
+]);
+
 const APPROVED_SPDX = ["Apache-2.0", "MIT"] as const;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 /**
@@ -988,6 +998,17 @@ const RESERVED_SOURCE_HOST_SUFFIXES = [
     "127.0.0.1",
     "::1",
 ];
+
+/** The decoded path segments of a source URL, refusing a malformed escape. */
+function sourcePathSegments(url: URL): string[] {
+    return url.pathname.split("/").map((raw) => {
+        try {
+            return decodeURIComponent(raw);
+        } catch {
+            return raw;
+        }
+    });
+}
 
 function isCredentialQueryName(name: string): boolean {
     const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -1354,6 +1375,24 @@ function validateQualifiedArtifact(
         // again after decoding so each revealed component is compared on its own.
         for (const token of segment.split(/[\\/]+/)) rejectMutableRef(token);
     }
+    // Immutability by denylist can never be complete: an unlisted branch name like
+    // `develop` reads as immutable simply because nobody thought of it. Production
+    // therefore requires the path to name the content positively — a segment that is
+    // the artifact's own digest, or any content-addressed revision of git-SHA-1
+    // length or longer. The ref denylist stays as defense in depth for both modes,
+    // since a mutable ref alongside a digest is still a manifest worth rejecting.
+    if (mode === "production") {
+        const addressed = sourcePathSegments(sourceUrl).some(
+            (segment) =>
+                segment.toLowerCase() === artifact.sha256 ||
+                /^[0-9a-f]{40,}$/i.test(segment),
+        );
+        if (!addressed) {
+            fail(
+                `inputs.${key}: production source must name its content — no path segment is the artifact digest or a content-addressed revision`,
+            );
+        }
+    }
     // An endpoint can also name its revision in the query string
     // (`/download?ref=main`), and such a URL keeps resolving a moving target
     // however immutable its path looks. Split composite values so a ref buried in
@@ -1671,6 +1710,26 @@ function verifyArtifactBytes(
         fail(
             `inputs.${key}: byte digest does not match the locked sha256 (input bytes changed)`,
         );
+    }
+    // Byte identity is not loadability. Matching the locked digest proves these are
+    // the intended bytes; it says nothing about whether the runtime can parse them,
+    // so a plain-text stand-in with a correct digest qualifies and then fails at
+    // bundle load. Checking the JSON inputs parse is the cheap part of that gap and
+    // catches exactly that case.
+    //
+    // Shape only, deliberately. The schema each file must satisfy lives in the Rust
+    // bundle validator (`crates/mc-host/src/synapse/bundle.rs`), and a second
+    // implementation here would be free to disagree with it — the useful version of
+    // full semantic validation is running that validator over these bytes on the
+    // qualifying host, not restating its rules in TypeScript.
+    if (JSON_SHAPED_INPUTS.has(key)) {
+        try {
+            JSON.parse(readFileSync(path, "utf8"));
+        } catch {
+            fail(
+                `inputs.${key}: verified bytes are not parseable JSON, so the runtime cannot load them`,
+            );
+        }
     }
 }
 
