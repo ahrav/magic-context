@@ -86,6 +86,15 @@ function fail(message: string): never {
  *  failures stay attributed to the file the operator actually edited. */
 const assertExactKeys = exactKeysAsserter("mc-host input qualification");
 
+/**
+ * A required free-text attestation: present, a string, and carrying something a
+ * human wrote. Blank-checking only the length accepts `"   "`, which reads as an
+ * approver or a provenance record in the committed lock while asserting nothing.
+ */
+function isFilledText(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0;
+}
+
 // ---------------------------------------------------------------------------
 // U9 pins (cross-checked against the U8 contract; drift fails closed).
 // ---------------------------------------------------------------------------
@@ -1304,10 +1313,7 @@ function validateQualifiedArtifact(
             `inputs.${key}: committed tiny fixture bytes can never qualify as production inputs`,
         );
     }
-    if (
-        typeof artifact.provenance !== "string" ||
-        artifact.provenance.length === 0
-    ) {
+    if (!isFilledText(artifact.provenance)) {
         fail(`inputs.${key}: provenance is required`);
     }
     const license = artifact.license;
@@ -1324,14 +1330,11 @@ function validateQualifiedArtifact(
     if (license.redistribution_approved !== true) {
         fail(`inputs.${key}: redistribution approval is required`);
     }
-    if (
-        typeof license.approved_by !== "string" ||
-        license.approved_by.length === 0
-    ) {
+    if (!isFilledText(license.approved_by)) {
         fail(`inputs.${key}: license approval must name an approver`);
     }
     const verifyPath = artifact.verify_local_path;
-    if (typeof verifyPath !== "string" || verifyPath.length === 0) {
+    if (!isFilledText(verifyPath)) {
         fail(`inputs.${key}: qualified entries must verify real local bytes`);
     }
     resolveVerifyPath(rootDir, key, verifyPath, mode);
@@ -1497,10 +1500,7 @@ export function validateSourceManifest(
         if (artifact.qualified === true) {
             validateQualifiedArtifact(rootDir, key, artifact, m.mode, blacklist);
         } else if (artifact.qualified === false) {
-            if (
-                typeof artifact.reason !== "string" ||
-                artifact.reason.length === 0
-            ) {
+            if (!isFilledText(artifact.reason)) {
                 fail(`inputs.${key}: unqualified entries must state a reason`);
             }
             assertExactKeys(artifact, ["qualified", "reason"], `inputs.${key}`);
@@ -1528,10 +1528,7 @@ export function validateSourceManifest(
             );
         }
         if (harness.version === null) {
-            if (
-                typeof harness.unqualified_reason !== "string" ||
-                harness.unqualified_reason.length === 0
-            ) {
+            if (!isFilledText(harness.unqualified_reason)) {
                 fail(
                     `harnesses.${name}: an unqualified version must state a reason`,
                 );
@@ -1674,6 +1671,14 @@ function stripTomlComments(line: string): string {
  */
 function inlineDependencyEntry(cargo: string, crate: string): string | null {
     const lines = cargo.split("\n").map(stripTomlComments);
+    // TOML allows any whitespace around `=` and permits a quoted key, so anchor on
+    // the key itself rather than one exact spelling. Detection is what makes the
+    // uniqueness rule below mean anything: a target-specific `ort={ ... }` that
+    // this pattern missed would not be counted, and its features would go
+    // unchecked while the base entry validated cleanly.
+    const keyPattern = new RegExp(
+        `^"?${crate.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")}"?\\s*=`,
+    );
     const starts: number[] = [];
     let section = "";
     for (const [index, line] of lines.entries()) {
@@ -1683,7 +1688,7 @@ function inlineDependencyEntry(cargo: string, crate: string): string | null {
             section = header[1] ?? "";
             continue;
         }
-        if (!trimmed.startsWith(`${crate} = `)) continue;
+        if (!keyPattern.test(trimmed)) continue;
         // Any declaration outside `[dependencies]` still counts, so a decoy or a
         // target-specific duplicate is reported as ambiguity rather than ignored.
         starts.push(section === "dependencies" ? index : -1);

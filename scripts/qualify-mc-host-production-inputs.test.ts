@@ -535,6 +535,54 @@ describe("immutable input fail-closed rules", () => {
         }
     });
 
+    test("whitespace-only attestations are rejected", () => {
+        // A blank string reads as an approver or a provenance record in the
+        // committed lock while asserting nothing, so a length check is not enough.
+        const cases: [(manifest: any) => void, RegExp][] = [
+            [
+                (m) => {
+                    m.inputs.model_onnx.provenance = "   ";
+                },
+                /provenance is required/,
+            ],
+            [
+                (m) => {
+                    m.inputs.model_onnx.license.approved_by = "\t\n ";
+                },
+                /must name an approver/,
+            ],
+            [
+                (m) => {
+                    m.inputs.model_onnx.verify_local_path = "  ";
+                },
+                /must verify real local bytes/,
+            ],
+            [
+                (m) => {
+                    m.inputs.model_onnx = { qualified: false, reason: " " };
+                },
+                /unqualified entries must state a reason/,
+            ],
+            [
+                (m) => {
+                    m.harnesses.pi = {
+                        package: "@earendil-works/pi-coding-agent",
+                        version: null,
+                        unqualified_reason: "  ",
+                    };
+                },
+                /an unqualified version must state a reason/,
+            ],
+        ];
+        for (const [mutate, error] of cases) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            mutate(manifest);
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(error);
+        }
+    });
+
     test("production mode requires absolute verify paths and bun.lock pins", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
@@ -725,6 +773,15 @@ describe("immutable input fail-closed rules", () => {
                         '"load-dynamic", "ndarray", "std", "cuda#notacomment"',
                     ),
                 /ort feature cuda#notacomment .* outside the qualified closure/,
+            ],
+            [
+                // TOML allows any whitespace around `=`, so a target-specific
+                // duplicate spelled `ort={ ... }` must still be counted. Missing it
+                // leaves its accelerator feature unchecked while the base entry
+                // validates cleanly — and Cargo unifies both into the resolved set.
+                (cargo) =>
+                    `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\nort={ version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
             ],
         ];
         for (const [mutate, error] of cases) {
