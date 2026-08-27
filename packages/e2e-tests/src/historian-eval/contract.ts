@@ -23,14 +23,21 @@ import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
 } from "../../../plugin/src/hooks/magic-context/derive-budgets";
+import {
+    compactRole,
+    formatBlock,
+    type ChunkBlock,
+} from "../../../plugin/src/hooks/magic-context/read-session-formatting";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
+import { ballastProse } from "../ballast";
+import { HEX64_RE, makeContractPrimitives } from "../contract-primitives";
 
 export const SCENARIO_SCHEMA = "historian-eval-scenario/v1";
 export const MANIFEST_SCHEMA = "historian-eval-manifest/v1";
 export const RELEASE_VERSION_RE = /^v\d+$/;
 
-export const HEX64_RE = /^[0-9a-f]{64}$/;
+export { HEX64_RE };
 export const SCENARIO_ID_RE = /^hse-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export const EXPECTED_CLAIM_ID_RE = /^exp-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export const EXPECTED_ABSENT_ID_RE = /^abs-[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -68,60 +75,9 @@ export class HistorianEvalContractError extends Error {
     }
 }
 
-function fail(code: string): never {
-    throw new HistorianEvalContractError([code]);
-}
-
-function record(value: unknown, label: string): Record<string, unknown> {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        fail(`${label}: object-required`);
-    }
-    return value as Record<string, unknown>;
-}
-
-function exact(recordValue: Record<string, unknown>, keys: readonly string[], label: string): void {
-    const actual = Object.keys(recordValue).sort();
-    const expected = [...keys].sort();
-    if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-        fail(`${label}: fields-invalid`);
-    }
-}
-
-function string(value: unknown, label: string): string {
-    if (typeof value !== "string" || value.length === 0) fail(`${label}: string-invalid`);
-    return value;
-}
-
-function staticId(value: unknown, label: string, pattern: RegExp): string {
-    const result = string(value, label);
-    if (!pattern.test(result)) fail(`${label}: id-invalid`);
-    return result;
-}
-
-function hex64(value: unknown, label: string): string {
-    const result = string(value, label);
-    if (!HEX64_RE.test(result)) fail(`${label}: fingerprint-invalid`);
-    return result;
-}
-
-export function enumeration<T extends string>(value: unknown, allowed: readonly T[], label: string): T {
-    if (typeof value !== "string" || !allowed.includes(value as T)) fail(`${label}: enum-invalid`);
-    return value as T;
-}
-
-function array(value: unknown, label: string): unknown[] {
-    if (!Array.isArray(value)) fail(`${label}: array-required`);
-    return value;
-}
-
-function integer(value: unknown, label: string, minimum = 0): number {
-    if (!Number.isSafeInteger(value) || (value as number) < minimum) fail(`${label}: integer-invalid`);
-    return value as number;
-}
-
-function unique(values: readonly string[], label: string): void {
-    if (new Set(values).size !== values.length) fail(`${label}: duplicate`);
-}
+const primitives = makeContractPrimitives(HistorianEvalContractError);
+const { fail, record, exact, string, staticId, hex64, array, integer, unique } = primitives;
+export const enumeration = primitives.enumeration;
 
 /** One scripted exchange: the user prompt and the mock main-agent reply. */
 export interface TranscriptTurn {
@@ -232,12 +188,28 @@ function parsePredicate(raw: unknown, label: string): ContentPredicate {
     };
 }
 
+/**
+ * Operational maxima for authored transcripts. The trigger integers are
+ * bounded for the same reason (see `parseTrigger`): the lint renders and
+ * tokenizes the whole transcript, so the multiplied mass — turn count times
+ * per-turn text plus ballast — must be capped before any rendering happens,
+ * or a degenerate artifact hangs lint/CI ahead of every semantic check.
+ */
+export const MAX_TRANSCRIPT_TURNS = 100;
+export const MAX_TURN_TEXT_CHARS = 20_000;
+
+function turnText(value: unknown, label: string): string {
+    const result = string(value, label);
+    if (result.length > MAX_TURN_TEXT_CHARS) fail(`${label}: above-operational-maximum`);
+    return result;
+}
+
 function parseTurn(raw: unknown, label: string): TranscriptTurn {
     const value = record(raw, label);
     exact(value, ["user", "assistant"], label);
     return {
-        user: string(value.user, `${label}.user`),
-        assistant: string(value.assistant, `${label}.assistant`),
+        user: turnText(value.user, `${label}.user`),
+        assistant: turnText(value.assistant, `${label}.assistant`),
     };
 }
 
@@ -377,6 +349,7 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         parseTurn(entry, `${label}.transcript.turns[${index}]`),
     );
     if (turns.length < 2) fail(`${label}.transcript.turns: too-few-turns`);
+    if (turns.length > MAX_TRANSCRIPT_TURNS) fail(`${label}.transcript.turns: above-operational-maximum`);
     const epilogueStartIndex = integer(transcriptValue.epilogueStartIndex, `${label}.transcript.epilogueStartIndex`, 1);
     if (epilogueStartIndex >= turns.length) fail(`${label}.transcript.epilogueStartIndex: out-of-range`);
 
@@ -459,62 +432,37 @@ export function predicateMatches(predicate: ContentPredicate, content: string): 
 }
 
 /**
- * The raw text mass the chunk builder will see for one turn. Mirrors the
- * runner's rendering (authored text plus deterministic ballast) so the
- * freeze lint's headroom check measures what actually reaches the historian.
+ * The raw text mass the chunk builder will see for the transcript. Rendered
+ * with the PRODUCTION `formatBlock` over the block shape the chunk builder
+ * constructs (one block per message, compact roles), and with the SHARED
+ * ballast generator the harnesses send — so the freeze lint's headroom check
+ * measures the same bytes that actually reach the historian, and stays
+ * current when either production renderer or ballast generator changes.
  */
 function renderedTranscriptText(scenario: HistorianEvalScenario): string {
-    const lines: string[] = [];
+    const blocks: ChunkBlock[] = [];
     scenario.transcript.turns.forEach((turn, index) => {
-        lines.push(`[${index * 2 + 1}] user: ${turn.user} ${ballastText(scenario.trigger.ballastTokensPerTurn, index)}`);
-        lines.push(`[${index * 2 + 2}] assistant: ${turn.assistant}`);
+        const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn, index);
+        blocks.push({
+            role: compactRole("user"),
+            startOrdinal: index * 2 + 1,
+            endOrdinal: index * 2 + 1,
+            parts: [ballast ? `${turn.user} ${ballast}` : turn.user],
+            meta: [],
+            commitHashes: [],
+            isToolOnly: false,
+        });
+        blocks.push({
+            role: compactRole("assistant"),
+            startOrdinal: index * 2 + 2,
+            endOrdinal: index * 2 + 2,
+            parts: [turn.assistant],
+            meta: [],
+            commitHashes: [],
+            isToolOnly: false,
+        });
     });
-    return lines.join("\n");
-}
-
-/**
- * Deterministic ballast: same turn index → same bytes, every run (R5).
- * Varied word bank because BPE tokenizers degrade on degenerate repeats;
- * ~4 chars/token keeps the size math stable (see TestHarness.ballast).
- */
-export function ballastText(tokens: number, turnIndex: number): string {
-    if (tokens <= 0) return "";
-    const words = [
-        "boundary",
-        "historian",
-        "compartment",
-        "schedule",
-        "pressure",
-        "tokens",
-        "window",
-        "publish",
-        "transform",
-        "session",
-        "marker",
-        "budget",
-        "eligible",
-        "protected",
-        "ordinal",
-        "snapshot",
-        "replay",
-        "decision",
-        "threshold",
-        "baseline",
-        "measure",
-        "archive",
-        "deliver",
-    ];
-    const target = Math.max(0, Math.round(tokens * 4));
-    const parts: string[] = [];
-    let length = 0;
-    let i = turnIndex % words.length;
-    while (length < target) {
-        const w = words[i % words.length];
-        parts.push(`${w}${i % 17 === 0 ? "." : ""}`);
-        length += w.length + 1;
-        i += 1;
-    }
-    return parts.join(" ");
+    return blocks.map(formatBlock).join("\n");
 }
 
 /**
@@ -554,6 +502,21 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         if (normalizeContent(absent.predicate.value).length === 0) {
             diagnostics.push(`${label}.gold.expectedAbsent.${absent.id}.predicate: empty-after-normalization`);
         }
+        // A forbidden formation that is a normalized substring of a gold
+        // claim's content is a contradiction: any claim satisfying the gold
+        // predicate necessarily trips the absent predicate, so the scenario
+        // is unsatisfiable and would freeze permanently broken.
+        for (const claim of scenario.gold.expectedClaims) {
+            if (predicateMatches(absent.predicate, claim.predicate.value)) {
+                diagnostics.push(`${label}.gold.expectedAbsent.${absent.id}: contradicts-${claim.id}`);
+            }
+        }
+    }
+    // Compartments partition the chunk's messages (one message belongs to
+    // exactly one compartment), so a scenario can never produce more of them
+    // than it has messages; a larger minCount is unsatisfiable forever.
+    if (scenario.gold.compartments.minCount > scenario.transcript.turns.length * 2) {
+        diagnostics.push(`${label}.gold.compartments.minCount: exceeds-message-capacity`);
     }
     const absentFamilies = new Set(scenario.gold.expectedAbsent.map((absent) => absent.family));
     for (const family of scenario.families) {
@@ -602,7 +565,15 @@ export type ApprovalKind = (typeof APPROVAL_KINDS)[number];
 export interface Approval {
     kind: ApprovalKind;
     approver: string;
-    releaseTupleFingerprint: string;
+    /**
+     * Binds the approval to the WHOLE release under review — version, tuple,
+     * and tombstones (see `releaseApprovalFingerprint`) — not just the tuple.
+     * Tombstones are errata governance: were they outside the binding, a
+     * prior release's approvals could be replayed verbatim on a manifest that
+     * drops a tombstone, resurrecting a scenario known to be wrong with no
+     * fresh sign-off.
+     */
+    releaseFingerprint: string;
 }
 
 export interface ReleaseManifest {
@@ -618,21 +589,49 @@ export interface ReleaseManifest {
 }
 
 export function buildReleaseTuple(scenarios: readonly HistorianEvalScenario[]): ReleaseTuple {
+    // Tombstones are keyed by scenario id, so an id shared by two distinct
+    // scenarios would retire both at once; and a duplicated scenario would
+    // shift corpusFingerprint without changing the scored corpus. Both are
+    // authoring mistakes that must fail closed before hashing.
+    unique(
+        scenarios.map((scenario) => scenario.id),
+        "releaseTuple.scenarios.id",
+    );
+    const fingerprints = scenarios.map((scenario) => scenarioFingerprint(scenario));
+    unique(fingerprints, "releaseTuple.scenarios.fingerprint");
     return {
-        corpusFingerprint: canonicalFingerprint(scenarios.map((scenario) => scenarioFingerprint(scenario)).sort()),
+        corpusFingerprint: canonicalFingerprint([...fingerprints].sort()),
         scenarioSchemaVersion: SCENARIO_SCHEMA,
         privacyPolicyVersion: PRIVACY_POLICY_VERSION,
         sanitizerVersion: SANITIZER_VERSION,
     };
 }
 
+/**
+ * The material an approval signs off on: the release version, the tuple, and
+ * the sorted tombstone set. Everything a release states about the corpus and
+ * its errata is inside this fingerprint, so approvals cannot transfer across
+ * releases that differ in any of it.
+ */
+export function releaseApprovalFingerprint(release: {
+    releaseVersion: string;
+    releaseTuple: ReleaseTuple;
+    tombstones: readonly string[];
+}): string {
+    return canonicalFingerprint({
+        releaseVersion: release.releaseVersion,
+        releaseTuple: release.releaseTuple,
+        tombstones: [...release.tombstones].sort(),
+    });
+}
+
 export function parseApproval(raw: unknown, label: string): Approval {
     const value = record(raw, label);
-    exact(value, ["kind", "approver", "releaseTupleFingerprint"], label);
+    exact(value, ["kind", "approver", "releaseFingerprint"], label);
     return {
         kind: enumeration(value.kind, APPROVAL_KINDS, `${label}.kind`),
         approver: string(value.approver, `${label}.approver`),
-        releaseTupleFingerprint: hex64(value.releaseTupleFingerprint, `${label}.releaseTupleFingerprint`),
+        releaseFingerprint: hex64(value.releaseFingerprint, `${label}.releaseFingerprint`),
     };
 }
 
@@ -655,22 +654,22 @@ export function parseManifest(raw: unknown, label = "manifest"): ReleaseManifest
     const releaseVersion = string(root.releaseVersion, `${label}.releaseVersion`);
     if (!RELEASE_VERSION_RE.test(releaseVersion)) fail(`${label}.releaseVersion: version-invalid`);
     const releaseTuple = parseReleaseTuple(root.releaseTuple, `${label}.releaseTuple`);
+    const tombstones = array(root.tombstones, `${label}.tombstones`).map((entry, index) =>
+        staticId(entry, `${label}.tombstones[${index}]`, SCENARIO_ID_RE),
+    );
+    unique(tombstones, `${label}.tombstones`);
     const approvalsValue = record(root.approvals, `${label}.approvals`);
     exact(approvalsValue, ["privacy", "goldIntent"], `${label}.approvals`);
     const privacy = parseApproval(approvalsValue.privacy, `${label}.approvals.privacy`);
     const goldIntent = parseApproval(approvalsValue.goldIntent, `${label}.approvals.goldIntent`);
     if (privacy.kind !== "privacy") fail(`${label}.approvals.privacy.kind: wrong-kind`);
     if (goldIntent.kind !== "gold-intent") fail(`${label}.approvals.goldIntent.kind: wrong-kind`);
-    const tupleFingerprint = canonicalFingerprint(releaseTuple);
+    const expectedFingerprint = releaseApprovalFingerprint({ releaseVersion, releaseTuple, tombstones });
     for (const approval of [privacy, goldIntent]) {
-        if (approval.releaseTupleFingerprint !== tupleFingerprint) {
-            fail(`${label}.approvals.${approval.kind}: stale-or-foreign-tuple`);
+        if (approval.releaseFingerprint !== expectedFingerprint) {
+            fail(`${label}.approvals.${approval.kind}: stale-or-foreign-release`);
         }
     }
-    const tombstones = array(root.tombstones, `${label}.tombstones`).map((entry, index) =>
-        staticId(entry, `${label}.tombstones[${index}]`, SCENARIO_ID_RE),
-    );
-    unique(tombstones, `${label}.tombstones`);
     return {
         schema: MANIFEST_SCHEMA,
         releaseVersion,

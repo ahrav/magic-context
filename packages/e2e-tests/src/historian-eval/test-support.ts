@@ -5,7 +5,7 @@
  */
 
 import { parseScenario, type HistorianEvalScenario } from "./contract";
-import { buildHistorianPayload, type PayloadFact } from "./payload";
+import { buildMockHistorianOutput, type MockHistorianFact } from "../mock-historian";
 
 export function validScenarioRaw(): Record<string, unknown> {
     return {
@@ -96,7 +96,7 @@ export function validScenario(): HistorianEvalScenario {
 }
 
 /** Gold-satisfying facts for `validScenario`. */
-export function goldFacts(): PayloadFact[] {
+export function goldFacts(): MockHistorianFact[] {
     return [
         { category: "ARCHITECTURE", content: "Sessions are cached by the in-process LRU cache; Redis was rejected because it adds an operational dependency." },
         { category: "CONFIG_VALUES", content: "Session cache capacity is 4096 entries." },
@@ -108,9 +108,9 @@ export function goldFacts(): PayloadFact[] {
  * compartment covering the whole synthetic chunk, both gold facts, no
  * forbidden formations.
  */
-export function goldenRawOutput(scenario: HistorianEvalScenario = validScenario(), facts: PayloadFact[] = goldFacts()): string {
+export function goldenRawOutput(scenario: HistorianEvalScenario = validScenario(), facts: MockHistorianFact[] = goldFacts()): string {
     const messageCount = scenario.transcript.turns.length * 2;
-    return buildHistorianPayload({
+    return buildMockHistorianOutput({
         compartments: [
             {
                 start: 1,

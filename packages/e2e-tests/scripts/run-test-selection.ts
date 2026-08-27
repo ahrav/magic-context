@@ -136,7 +136,10 @@ export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
     if (unclassified.length > 0) {
         throw new Error(
             `src test files missing from every selection: ${unclassified.join(", ")}; ` +
-                "add them to standaloneUnitFiles, rustStandaloneFiles, the historian-eval glob, or the incident-unit glob",
+                "add them to standaloneUnitFiles, rustStandaloneFiles, the historian-eval glob, or the incident-unit glob. " +
+                "Harness-booting TS-only tests (e.g. historian-eval runner tests excluded via " +
+                "HISTORIAN_EVAL_HARNESS_TESTS) belong in tsOpenCodeStandaloneFiles — never in " +
+                "standaloneUnitFiles, which joins rust and pi selections",
         );
     }
 }

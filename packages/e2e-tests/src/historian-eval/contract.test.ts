@@ -3,16 +3,18 @@ import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
+    MAX_TRANSCRIPT_TURNS,
+    MAX_TURN_TEXT_CHARS,
     buildReleaseTuple,
     lintScenario,
     normalizeContent,
     parseManifest,
     parseScenario,
     predicateMatches,
+    releaseApprovalFingerprint,
     scenarioFingerprint,
 } from "./contract";
 import { validScenario, validScenarioRaw } from "./test-support";
-import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 
 /** Deep key-order permutation: same semantics, different byte order. */
 function permuteKeys(value: unknown): unknown {
@@ -53,7 +55,7 @@ describe("parseScenario", () => {
         expect(scenarioFingerprint(parseScenario(rerun))).not.toBe(scenarioFingerprint(base));
     });
 
-    test("gold, probes, and families are all inside the fingerprint", () => {
+    test("gold, probes, families, transcript, and epilogue boundary are all inside the fingerprint", () => {
         const base = scenarioFingerprint(validScenario());
         const edits: Array<(raw: Record<string, unknown>) => void> = [
             (raw) => {
@@ -73,6 +75,13 @@ describe("parseScenario", () => {
                 (raw.gold as { expectedAbsent: Array<{ family: string }> }).expectedAbsent[0].family =
                     "assistant-speculation";
             },
+            (raw) => {
+                (raw.transcript as { turns: Array<{ user: string }> }).turns[0].user =
+                    "Should we use Memcached for the session cache?";
+            },
+            (raw) => {
+                (raw.transcript as { epilogueStartIndex: number }).epilogueStartIndex = 2;
+            },
         ];
         for (const edit of edits) {
             const raw = validScenarioRaw();
@@ -84,6 +93,20 @@ describe("parseScenario", () => {
     test("trigger integers reject values above the operational maxima", () => {
         const raw = validScenarioRaw();
         (raw.trigger as Record<string, unknown>).ballastTokensPerTurn = 1_000_000;
+        expect(() => parseScenario(raw)).toThrow(/above-operational-maximum/);
+    });
+
+    test("transcript above the turn-count operational maximum rejects", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: unknown[] }).turns;
+        const template = JSON.stringify(turns[0]);
+        while (turns.length <= MAX_TRANSCRIPT_TURNS) turns.push(JSON.parse(template));
+        expect(() => parseScenario(raw)).toThrow(/above-operational-maximum/);
+    });
+
+    test("turn text above the length operational maximum rejects", () => {
+        const raw = validScenarioRaw();
+        (raw.transcript as { turns: Array<{ user: string }> }).turns[0].user = "x".repeat(MAX_TURN_TEXT_CHARS + 1);
         expect(() => parseScenario(raw)).toThrow(/above-operational-maximum/);
     });
 
@@ -188,6 +211,29 @@ describe("lintScenario", () => {
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics.some((d) => d.includes("probes: empty"))).toBe(true);
     });
+
+    test("rejects an expected-absent predicate that contradicts a gold claim", () => {
+        const raw = validScenarioRaw();
+        // "LRU cache" is a normalized substring of the gold claim
+        // "in-process LRU cache": any content satisfying the gold predicate
+        // necessarily trips the forbidden formation, so the scenario could
+        // never pass once frozen.
+        (raw.gold as { expectedAbsent: Array<{ predicate: { value: string } }> }).expectedAbsent[0].predicate.value =
+            "LRU cache";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.gold.expectedAbsent.abs-redis-active: contradicts-exp-lru-cache",
+        );
+    });
+
+    test("rejects a compartment minCount above the transcript's message capacity", () => {
+        const raw = validScenarioRaw();
+        // 4 turns = 8 messages; compartments partition messages, so 9 can
+        // never be satisfied.
+        (raw.gold as { compartments: { minCount: number } }).compartments.minCount = 9;
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics.some((d) => d.includes("minCount: exceeds-message-capacity"))).toBe(true);
+    });
 });
 
 describe("predicate matching", () => {
@@ -209,27 +255,85 @@ describe("release tuple and manifest", () => {
         expect(buildReleaseTuple([a, b])).toEqual(buildReleaseTuple([b, a]));
     });
 
+    test("release tuple rejects duplicate scenario ids and duplicated scenarios", () => {
+        const a = validScenario();
+        const rawSameIdDifferentContent = validScenarioRaw();
+        (rawSameIdDifferentContent.trigger as Record<string, unknown>).expectedHistorianRuns = 1;
+        const sameId = parseScenario(rawSameIdDifferentContent);
+        expect(() => buildReleaseTuple([a, sameId])).toThrow(/releaseTuple\.scenarios\.id: duplicate/);
+        expect(() => buildReleaseTuple([a, a])).toThrow(/duplicate/);
+    });
+
     test("manifest parses with fingerprint-bound approvals and rejects stale bindings", () => {
         const tuple = buildReleaseTuple([validScenario()]);
-        const tupleFingerprint = canonicalFingerprint(tuple);
-        const manifest = {
-            schema: MANIFEST_SCHEMA,
-            releaseVersion: "v1",
-            releaseTuple: tuple,
-            approvals: {
-                privacy: { kind: "privacy", approver: "operator-a", releaseTupleFingerprint: tupleFingerprint },
-                goldIntent: { kind: "gold-intent", approver: "operator-b", releaseTupleFingerprint: tupleFingerprint },
-            },
-            tombstones: [],
+        const buildManifest = (tombstones: string[]) => {
+            const releaseFingerprint = releaseApprovalFingerprint({
+                releaseVersion: "v1",
+                releaseTuple: tuple,
+                tombstones,
+            });
+            return {
+                schema: MANIFEST_SCHEMA,
+                releaseVersion: "v1",
+                releaseTuple: tuple,
+                approvals: {
+                    privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint },
+                    goldIntent: { kind: "gold-intent", approver: "operator-b", releaseFingerprint },
+                },
+                tombstones,
+            };
         };
+        const manifest = buildManifest(["hse-known-wrong"]);
         expect(parseManifest(manifest).releaseVersion).toBe("v1");
 
         const stale = JSON.parse(JSON.stringify(manifest));
-        stale.approvals.privacy.releaseTupleFingerprint = "0".repeat(64);
-        expect(() => parseManifest(stale)).toThrow(/stale-or-foreign-tuple/);
+        stale.approvals.privacy.releaseFingerprint = "0".repeat(64);
+        expect(() => parseManifest(stale)).toThrow(/stale-or-foreign-release/);
 
         const wrongKind = JSON.parse(JSON.stringify(manifest));
         wrongKind.approvals.privacy.kind = "gold-intent";
         expect(() => parseManifest(wrongKind)).toThrow(/wrong-kind/);
+    });
+
+    test("approvals bind the tombstone set: dropping a tombstone invalidates them", () => {
+        const tuple = buildReleaseTuple([validScenario()]);
+        const releaseFingerprint = releaseApprovalFingerprint({
+            releaseVersion: "v1",
+            releaseTuple: tuple,
+            tombstones: ["hse-known-wrong"],
+        });
+        // Same tuple, same approvals, tombstone silently dropped: the errata
+        // resurrection this binding exists to prevent.
+        const dropped = {
+            schema: MANIFEST_SCHEMA,
+            releaseVersion: "v1",
+            releaseTuple: tuple,
+            approvals: {
+                privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint },
+                goldIntent: { kind: "gold-intent", approver: "operator-b", releaseFingerprint },
+            },
+            tombstones: [],
+        };
+        expect(() => parseManifest(dropped)).toThrow(/stale-or-foreign-release/);
+    });
+
+    test("approvals bind the release version", () => {
+        const tuple = buildReleaseTuple([validScenario()]);
+        const releaseFingerprint = releaseApprovalFingerprint({
+            releaseVersion: "v1",
+            releaseTuple: tuple,
+            tombstones: [],
+        });
+        const bumped = {
+            schema: MANIFEST_SCHEMA,
+            releaseVersion: "v2",
+            releaseTuple: tuple,
+            approvals: {
+                privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint },
+                goldIntent: { kind: "gold-intent", approver: "operator-b", releaseFingerprint },
+            },
+            tombstones: [],
+        };
+        expect(() => parseManifest(bumped)).toThrow(/stale-or-foreign-release/);
     });
 });
