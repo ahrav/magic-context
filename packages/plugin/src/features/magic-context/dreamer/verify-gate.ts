@@ -8,6 +8,7 @@ import {
     resolveGitTopLevel,
     verificationFileExists,
 } from "../memory";
+import { ANTI_MEMORY_CATEGORY } from "../memory/constants";
 import { APPLICABILITY_BASELINE_STREAM_KEY } from "../storage-claim-applicability-schema";
 import { readDreamerProjectClaims } from "./claim-manifest";
 import { runLeaseGuardedWrite } from "./lease";
@@ -93,7 +94,9 @@ export async function partitionVerifyScope(args: {
 }): Promise<VerifyGateResult> {
     const runStartedAt = args.now ?? Date.now();
     const active = readDreamerProjectClaims(args.db, args.projectIdentity, "verification");
-    const candidates = active.filter((claim) => mappedFiles(claim).length > 0);
+    const candidates = active.filter(
+        (claim) => claim.category === ANTI_MEMORY_CATEGORY || mappedFiles(claim).length > 0,
+    );
 
     if (args.forceBroad) {
         const broadCycleStartAt = ensureBroadCycleStart({ ...args, runStartedAt });
@@ -125,7 +128,7 @@ export async function partitionVerifyScope(args: {
             inScope: [],
             inScopeIds: [],
             skippedIds: [],
-            reason: "no file-mapped claims in scope",
+            reason: "no file-mapped claims or anti-memories in scope",
         };
     }
 

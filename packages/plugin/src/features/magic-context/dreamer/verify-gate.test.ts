@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { __resetVerificationPathsForTests, __setVerificationPathsTestHooks } from "../memory";
+import { createAntiMemory } from "../memory/storage-anti-memory";
 import {
     applyProjectMemoryMapping,
     computeProjectMemoryMutationToken,
@@ -57,6 +58,32 @@ function seedClaim(db: Database, content: string, key: string): string {
                 extractorVersion: "1",
                 extractorRunId: "seed",
                 independenceKey: key,
+                sourceTrustClass: "explicit_user",
+            },
+            actor: "user:test",
+        },
+    );
+    return (result.result.payload as { claim: { publicClaimId: string } }).claim.publicClaimId;
+}
+
+function seedAntiMemory(db: Database): string {
+    const result = createAntiMemory(
+        db,
+        { producer: "gate-test", operationKey: "seed-anti" },
+        {
+            projectId: ensureProject(db, PROJECT),
+            payload: {
+                trigger: "session caching",
+                rejectedStrategy: "Redis",
+                rejectionReason: "split ownership",
+            },
+            provenance: {
+                sourceLocator: "test://gate/anti",
+                sourceContent: "Redis rejected",
+                extractor: "test",
+                extractorVersion: "1",
+                extractorRunId: "seed",
+                independenceKey: "anti",
                 sourceTrustClass: "explicit_user",
             },
             actor: "user:test",
@@ -128,6 +155,34 @@ describe("claim-current verify gate", () => {
                 mappedFiles: ["a.ts"],
             });
             expect(gate.inScope[0]?.revisionLocator).toContain(`${mapped}/r1/`);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("includes file-independent anti-memories without widening ordinary claim scope", async () => {
+        const db = freshDb();
+        const dir = projectDir();
+        try {
+            const anti = seedAntiMemory(db);
+            seedClaim(db, "Unmapped ordinary claim.", "ordinary-unmapped");
+            __setVerificationPathsTestHooks({
+                execFile: async () => Promise.reject(new Error("git unavailable")),
+            });
+
+            const gate = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 3_000,
+            });
+
+            expect(gate.inScopeIds).toEqual([anti]);
+            expect(gate.inScope[0]).toMatchObject({
+                publicClaimId: anti,
+                category: "REJECTED_APPROACH",
+                mappedFiles: [],
+            });
         } finally {
             closeQuietly(db);
         }

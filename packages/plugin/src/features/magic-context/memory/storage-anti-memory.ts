@@ -74,6 +74,7 @@ export interface ExtendAntiMemoryTtlInput {
 }
 
 export interface AntiMemoryRecord {
+    claimId: number;
     publicClaimId: string;
     revisionLocator: string;
     revision: number;
@@ -135,6 +136,46 @@ export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
         if (value !== null) lines.push(`${label}: ${value}`);
     }
     return lines.join("\n");
+}
+
+export function parseAntiMemoryContent(content: string): AntiMemoryPayload {
+    const fields = new Map<string, string>();
+    for (const line of content.split(/\r?\n/)) {
+        const separator = line.indexOf(":");
+        if (separator <= 0) throw new ClaimOperationInputError("invalid anti-memory content line");
+        const label = line.slice(0, separator).trim();
+        const value = line.slice(separator + 1).trim();
+        if (fields.has(label)) throw new ClaimOperationInputError(`duplicate anti-memory ${label}`);
+        fields.set(label, value);
+    }
+    const known = new Set([
+        "Trigger",
+        "Rejected strategy",
+        "Rejection reason",
+        "Safer alternative",
+        "Preconditions",
+        "Attempted approach",
+        "Observed failure",
+        "Root cause",
+        "Recovery",
+        "Non-applicable when",
+    ]);
+    for (const label of fields.keys()) {
+        if (!known.has(label))
+            throw new ClaimOperationInputError(`unknown anti-memory field ${label}`);
+    }
+    return normalizePayload({
+        trigger: requiredText(fields.get("Trigger"), "trigger"),
+        rejectedStrategy: requiredText(fields.get("Rejected strategy"), "rejectedStrategy"),
+        rejectionReason: requiredText(fields.get("Rejection reason"), "rejectionReason"),
+        saferAlternative: fields.get("Safer alternative"),
+        preconditions: fields.get("Preconditions"),
+        attemptedApproach: fields.get("Attempted approach"),
+        observedFailure: fields.get("Observed failure"),
+        rootCause: fields.get("Root cause"),
+        recovery: fields.get("Recovery"),
+        nonApplicableWhen: fields.get("Non-applicable when"),
+    });
 }
 
 function antiMemoryDedupText(payload: StoredAntiMemoryPayload): string {
@@ -269,8 +310,6 @@ function reviseWithPayload(
         operation: "revise-anti-memory" | "extend-anti-memory-ttl";
     },
 ): ClaimOperationRunResult {
-    const content = renderAntiMemoryContent(args.payload);
-    const dedupText = antiMemoryDedupText(args.payload);
     const nowMs = args.input.nowMs ?? Date.now();
     return runClaimOperation(
         db,
@@ -286,29 +325,83 @@ function reviseWithPayload(
                 token: args.input.token,
             }),
         },
-        () => {
-            const staged = stageReviseProjectMemoryClaimInCurrentTransaction(
+        () =>
+            stageAntiMemoryRevisionInCurrentTransaction(
                 db,
-                {
-                    token: args.input.token,
-                    content,
-                    dedupText,
-                    ...(args.expiresAt === undefined ? {} : { expiresAt: args.expiresAt }),
-                    provenance: args.input.provenance,
-                    actor: args.input.actor,
-                    requestScope: args.input.requestScope,
-                    nowMs,
-                },
+                args.input,
+                args.payload,
+                args.expiresAt,
                 nowMs,
-            );
-            if (staged.kind === "effects") {
-                const revised = staged.effects.find((effect) => effect.changeKind === "upsert");
-                if (revised?.revisionId != null) {
-                    insertPayload(db, revised.revisionId, revised.claimId, args.payload, nowMs);
-                }
-            }
-            return staged;
+            ),
+        nowMs,
+    );
+}
+
+function stageAntiMemoryRevisionInCurrentTransaction(
+    db: Database,
+    input: Omit<ReviseAntiMemoryInput, "payload">,
+    payload: StoredAntiMemoryPayload,
+    expiresAt: number | undefined,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const staged = stageReviseProjectMemoryClaimInCurrentTransaction(
+        db,
+        {
+            token: input.token,
+            content: renderAntiMemoryContent(payload),
+            dedupText: antiMemoryDedupText(payload),
+            ...(expiresAt === undefined ? {} : { expiresAt }),
+            provenance: input.provenance,
+            actor: input.actor,
+            requestScope: input.requestScope,
+            nowMs,
         },
+        nowMs,
+    );
+    if (staged.kind === "effects") {
+        const revised = staged.effects.find((effect) => effect.changeKind === "upsert");
+        if (revised?.revisionId != null) {
+            insertPayload(db, revised.revisionId, revised.claimId, payload, nowMs);
+        }
+    }
+    return staged;
+}
+
+export function stageReviseAntiMemoryInCurrentTransaction(
+    db: Database,
+    input: ReviseAntiMemoryInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    if (readAntiMemory(db, input.token.publicClaimId) === null) {
+        throw new ClaimOperationInputError("unknown anti-memory claim");
+    }
+    return stageAntiMemoryRevisionInCurrentTransaction(
+        db,
+        input,
+        normalizePayload(input.payload),
+        undefined,
+        nowMs,
+    );
+}
+
+export function stageExtendAntiMemoryTtlInCurrentTransaction(
+    db: Database,
+    input: ExtendAntiMemoryTtlInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    if (!Number.isSafeInteger(input.expiresAt)) {
+        throw new ClaimOperationInputError("anti-memory expiry must be a safe integer");
+    }
+    const current = readAntiMemory(db, input.token.publicClaimId);
+    if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
+    if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
+        throw new ClaimOperationInputError("anti-memory TTL extension must move expiry forward");
+    }
+    return stageAntiMemoryRevisionInCurrentTransaction(
+        db,
+        input,
+        current.payload,
+        input.expiresAt,
         nowMs,
     );
 }
@@ -351,7 +444,7 @@ export function extendAntiMemoryTtl(
 export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryRecord | null {
     const row = db
         .prepare(
-            `SELECT revisions.revision, revisions.content, revisions.content_sha256 AS contentDigest,
+            `SELECT claims.id AS claimId, revisions.revision, revisions.content, revisions.content_sha256 AS contentDigest,
                     attrs.category, attrs.normalized_hash AS normalizedHash,
                     attrs.importance, attrs.memory_scope AS memoryScope, attrs.sharing,
                     attrs.expires_at AS expiresAt,
@@ -392,6 +485,7 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
         nonApplicableWhen: row.nonApplicableWhen,
     };
     return {
+        claimId: row.claimId,
         publicClaimId,
         revisionLocator: formatRevisionLocator({
             publicClaimId,

@@ -4,6 +4,7 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
+import { recordClaimUsage } from "../../features/magic-context/memory/storage-claim-operations";
 import {
     parseLocatorShapedQuery,
     resolveClaimsByLocatorsForSearch,
@@ -57,14 +58,14 @@ const ctxSearchArgsShape = {
         .string()
         .optional()
         .describe(
-            "Search query. Matches against Primers, git commit messages, notes, and raw user/assistant message text. Project-memory claims are NOT text-searchable; a query that is only opaque public claim ids (mcm_<32hex>) or full revision locators resolves those claims directly.",
+            "Search query. Matches rejected-approach warnings, Primers, git commit messages, notes, and raw user/assistant message text. Positive project-memory claims require an opaque public claim id (mcm_<32hex>) or full revision locator.",
         ),
     limit: tool.schema.number().optional().describe("Maximum results to return (default: 10)"),
     sources: tool.schema
         .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
         .optional()
         .describe(
-            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] is accepted but returns nothing: broad project-memory retrieval is disabled until the claim retrieval projection is active. Omit for a broad search across all enabled sources; pass [] to search no sources.',
+            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] searches rejected-approach warnings and resolves exact positive-memory locators; broad positive-memory text retrieval remains disabled. Omit for all enabled sources; pass [] to search no sources.',
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
@@ -155,6 +156,12 @@ export async function executeCtxSearch(
 
     const completeFrom = (results: UnifiedSearchResult[]): CtxSearchExecution => {
         const packed = packSearchResults(query, results, toolContext.sessionID);
+        recordClaimUsage(deps.db, {
+            publicClaimIds: packed.delivered.flatMap((result) =>
+                result.source === "anti_memory" ? [result.publicClaimId] : [],
+            ),
+            kind: "retrieved",
+        });
         return {
             status: "complete",
             text: packed.text,

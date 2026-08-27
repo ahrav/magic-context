@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import {
+    createAntiMemory,
+    readAntiMemory,
+} from "../../features/magic-context/memory/storage-anti-memory";
+import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import * as searchModule from "../../features/magic-context/search";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
@@ -80,6 +85,90 @@ describe("auto-search-runner", () => {
 
             // Three passes on the same user message id → exactly one search call.
             expect(spy).toHaveBeenCalledTimes(1);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("bumps anti-memory usage once after the hint decision commits", async () => {
+        const created = createAntiMemory(
+            db,
+            { producer: "runner-test", operationKey: "anti-warning" },
+            {
+                projectId: ensureProject(db, baseOptions.projectPath),
+                payload: {
+                    trigger: "session caching",
+                    rejectedStrategy: "Redis",
+                    rejectionReason: "split ownership",
+                    saferAlternative: "use SQLite",
+                },
+                provenance: {
+                    sourceLocator: "test://runner/anti",
+                    sourceContent: "Redis rejected",
+                    extractor: "test",
+                    extractorVersion: "1",
+                    extractorRunId: "seed",
+                    independenceKey: "anti",
+                    sourceTrustClass: "explicit_user",
+                },
+                actor: "user:test",
+            },
+        );
+        const publicClaimId = (created.result.payload as { claim: { publicClaimId: string } }).claim
+            .publicClaimId;
+        const anti = readAntiMemory(db, publicClaimId);
+        if (anti === null) throw new Error("missing anti-memory");
+        const warning = {
+            source: "anti_memory" as const,
+            score: 0.95,
+            publicClaimId,
+            revisionLocator: anti.revisionLocator,
+            contentDigest: anti.contentDigest,
+            claimId: anti.claimId,
+            normalizedHash: anti.normalizedHash,
+            trigger: anti.payload.trigger,
+            rejectedStrategy: anti.payload.rejectedStrategy,
+            rejectionReason: anti.payload.rejectionReason,
+            saferAlternative: anti.payload.saferAlternative,
+            matchType: "lexical" as const,
+        };
+        const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([warning]);
+        try {
+            const messages = [makeUserMsg("u-warning", "please add Redis backed session caching")];
+            expect(
+                await runAutoSearchHint({
+                    sessionId: "s-warning",
+                    db,
+                    messages,
+                    options: baseOptions,
+                }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(messages[0])).toContain("⚠ Previously rejected: Redis");
+            expect(
+                db
+                    .prepare(
+                        `SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
+                         JOIN claim_public_ids public ON public.claim_id = usage.claim_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(publicClaimId),
+            ).toEqual({ count: 1 });
+
+            await runAutoSearchHint({
+                sessionId: "s-warning",
+                db,
+                messages,
+                options: baseOptions,
+            });
+            expect(
+                db
+                    .prepare(
+                        `SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
+                         JOIN claim_public_ids public ON public.claim_id = usage.claim_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(publicClaimId),
+            ).toEqual({ count: 1 });
         } finally {
             spy.mockRestore();
         }

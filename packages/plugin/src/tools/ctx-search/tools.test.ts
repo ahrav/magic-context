@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
+import { createAntiMemory } from "../../features/magic-context/memory/storage-anti-memory";
+import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import { indexMessagesAfterOrdinal } from "../../features/magic-context/message-index";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import * as searchModule from "../../features/magic-context/search";
@@ -331,6 +333,58 @@ describe("createCtxSearchTools", () => {
         } finally {
             spy.mockRestore();
         }
+    });
+
+    it("counts an anti-memory warning only after its explicit-search block is delivered", async () => {
+        const project = "git:explicit-warning";
+        const created = createAntiMemory(
+            db,
+            { producer: "tool-test", operationKey: "anti-explicit" },
+            {
+                projectId: ensureProject(db, project),
+                payload: {
+                    trigger: "session caching",
+                    rejectedStrategy: "Redis",
+                    rejectionReason: "split ownership",
+                },
+                provenance: {
+                    sourceLocator: "test://tool/anti",
+                    sourceContent: "Redis rejected",
+                    extractor: "test",
+                    extractorVersion: "1",
+                    extractorRunId: "seed",
+                    independenceKey: "anti",
+                    sourceTrustClass: "explicit_user",
+                },
+                actor: "user:test",
+            },
+        );
+        const publicClaimId = (created.result.payload as { claim: { publicClaimId: string } }).claim
+            .publicClaimId;
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => project,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: publicClaimId, sources: ["memory"] },
+            toolContext(),
+        );
+
+        expect(result).toContain("[anti-memory warning]");
+        expect(result).toContain("⚠ Previously rejected: Redis");
+        expect(
+            db
+                .prepare(
+                    `SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
+                     JOIN claim_public_ids public ON public.claim_id = usage.claim_id
+                     WHERE public.public_id = ?`,
+                )
+                .get(publicClaimId),
+        ).toEqual({ count: 1 });
     });
 
     it("honors the requested limit for a multi-locator query", async () => {

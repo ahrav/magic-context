@@ -14,6 +14,14 @@ import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { normalizeVerificationFiles } from "../memory";
 import { formatRevisionLocator } from "../memory/claim-operation-contract";
+import { ANTI_MEMORY_CATEGORY } from "../memory/constants";
+import {
+    ANTI_MEMORY_DEFAULT_TTL_MS,
+    parseAntiMemoryContent,
+    readAntiMemory,
+    stageExtendAntiMemoryTtlInCurrentTransaction,
+    stageReviseAntiMemoryInCurrentTransaction,
+} from "../memory/storage-anti-memory";
 import {
     type AutonomousManifestIdentity,
     type AutonomousManifestItem,
@@ -290,6 +298,11 @@ async function verifyOneBatch(
                         validateVerifyManifest(
                             text,
                             new Set(batch.map((memory) => memory.publicClaimId)),
+                            new Set(
+                                batch
+                                    .filter((memory) => memory.category === ANTI_MEMORY_CATEGORY)
+                                    .map((memory) => memory.publicClaimId),
+                            ),
                         );
                     } catch (error) {
                         const providerFailure = providerOutputFailureFromInvalidManifest(
@@ -341,9 +354,15 @@ async function verifyOneBatch(
 }
 
 type VerifyWrite =
-    | { kind: "verify"; publicClaimId: string; files: string[] }
-    | { kind: "update"; publicClaimId: string; files: string[]; content: string }
-    | { kind: "archive"; publicClaimId: string; reason: string };
+    | { kind: "verify"; publicClaimId: string; category: string; files: string[] }
+    | {
+          kind: "update";
+          publicClaimId: string;
+          category: string;
+          files: string[];
+          content: string;
+      }
+    | { kind: "archive"; publicClaimId: string; category: string; reason: string };
 
 function freshTarget(db: Database, publicClaimId: string) {
     const claim = getProjectMemoryClaimByPublicId(db, publicClaimId);
@@ -355,6 +374,12 @@ function freshTarget(db: Database, publicClaimId: string) {
     };
 }
 
+function byCategory(batch: readonly VerifyPromptMemory[], publicClaimId: string): string {
+    const memory = batch.find((candidate) => candidate.publicClaimId === publicClaimId);
+    if (!memory) throw new Error(`verify returned unknown claim ${publicClaimId}`);
+    return memory.category;
+}
+
 function stageVerificationItem(
     db: Database,
     identity: AutonomousManifestIdentity,
@@ -363,6 +388,47 @@ function stageVerificationItem(
 ): ClaimOperationStageOutcome {
     const outcomes: ClaimOperationStageOutcome[] = [];
     if (item.value.kind === "verify") {
+        if (item.value.category === ANTI_MEMORY_CATEGORY) {
+            const record = readAntiMemory(db, item.binding.publicClaimId);
+            if (record === null)
+                throw new Error(`missing anti-memory ${item.binding.publicClaimId}`);
+            const expiresAt = nowMs + ANTI_MEMORY_DEFAULT_TTL_MS;
+            if (record.expiresAt !== null && record.expiresAt < expiresAt) {
+                outcomes.push(
+                    stageExtendAntiMemoryTtlInCurrentTransaction(
+                        db,
+                        {
+                            token: item.binding.token,
+                            expiresAt,
+                            provenance: dreamerInferenceProvenance({
+                                identity,
+                                binding: item.binding,
+                                sourceContent: record.content,
+                            }),
+                            actor: `dreamer:${identity.runId}`,
+                        },
+                        nowMs,
+                    ),
+                );
+            }
+            const current = freshTarget(db, item.binding.publicClaimId);
+            outcomes.push(
+                stageRecordProjectMemoryVerificationInCurrentTransaction(
+                    db,
+                    {
+                        token: current.token,
+                        revisionLocator: current.revisionLocator,
+                        outcome: "verified",
+                        verifier: identity.producer,
+                    },
+                    nowMs,
+                ),
+            );
+            return combineClaimOperationStageOutcomes(outcomes, {
+                kind: item.value.kind,
+                publicClaimId: item.binding.publicClaimId,
+            });
+        }
         outcomes.push(
             stageApplyProjectMemoryMappingInCurrentTransaction(
                 db,
@@ -401,22 +467,34 @@ function stageVerificationItem(
             ),
         );
         const oldTarget = freshTarget(db, item.binding.publicClaimId);
+        const revisionInput = {
+            token: oldTarget.token,
+            provenance: dreamerInferenceProvenance({
+                identity,
+                binding: item.binding,
+                sourceContent: item.value.content,
+            }),
+            actor: `dreamer:${identity.runId}`,
+        };
         outcomes.push(
-            stageReviseProjectMemoryClaimInCurrentTransaction(
-                db,
-                {
-                    token: oldTarget.token,
-                    content: item.value.content,
-                    provenance: dreamerInferenceProvenance({
-                        identity,
-                        binding: item.binding,
-                        sourceContent: item.value.content,
-                    }),
-                    actor: `dreamer:${identity.runId}`,
-                },
-                nowMs,
-            ),
+            item.value.category === ANTI_MEMORY_CATEGORY
+                ? stageReviseAntiMemoryInCurrentTransaction(
+                      db,
+                      { ...revisionInput, payload: parseAntiMemoryContent(item.value.content) },
+                      nowMs,
+                  )
+                : stageReviseProjectMemoryClaimInCurrentTransaction(
+                      db,
+                      { ...revisionInput, content: item.value.content },
+                      nowMs,
+                  ),
         );
+        if (item.value.category === ANTI_MEMORY_CATEGORY) {
+            return combineClaimOperationStageOutcomes(outcomes, {
+                kind: item.value.kind,
+                publicClaimId: item.binding.publicClaimId,
+            });
+        }
         const current = freshTarget(db, item.binding.publicClaimId);
         outcomes.push(
             stageApplyProjectMemoryMappingInCurrentTransaction(
@@ -430,6 +508,24 @@ function stageVerificationItem(
             ),
         );
     } else {
+        if (item.value.category === ANTI_MEMORY_CATEGORY) {
+            outcomes.push(
+                stageRecordProjectMemoryVerificationInCurrentTransaction(
+                    db,
+                    {
+                        token: item.binding.token,
+                        revisionLocator: item.binding.revisionLocator,
+                        outcome: "stale",
+                        verifier: identity.producer,
+                    },
+                    nowMs,
+                ),
+            );
+            return combineClaimOperationStageOutcomes(outcomes, {
+                kind: item.value.kind,
+                publicClaimId: item.binding.publicClaimId,
+            });
+        }
         outcomes.push(
             stageRecordProjectMemoryVerificationInCurrentTransaction(
                 db,
@@ -478,6 +574,11 @@ export async function applyVerifyManifest(
         parsed = validateVerifyManifest(
             manifestText,
             new Set(batch.map((memory) => memory.publicClaimId)),
+            new Set(
+                batch
+                    .filter((memory) => memory.category === ANTI_MEMORY_CATEGORY)
+                    .map((memory) => memory.publicClaimId),
+            ),
         );
     } catch (error) {
         recordDreamerManifestRejection({
@@ -491,11 +592,15 @@ export async function applyVerifyManifest(
 
     const writes: VerifyWrite[] = [];
     for (const entry of parsed.verified) {
-        const normalized = await normalizeVerificationFiles({
-            cwd: args.sessionDirectory,
-            files: entry.files,
-        });
-        if (normalized.files.length === 0) {
+        const category = byCategory(batch, entry.publicClaimId);
+        const normalized =
+            category === ANTI_MEMORY_CATEGORY
+                ? { files: [] }
+                : await normalizeVerificationFiles({
+                      cwd: args.sessionDirectory,
+                      files: entry.files,
+                  });
+        if (normalized.files.length === 0 && category !== ANTI_MEMORY_CATEGORY) {
             const error = new Error(`verify entry ${entry.publicClaimId} has no valid files`);
             recordDreamerManifestRejection({
                 ...args,
@@ -508,6 +613,7 @@ export async function applyVerifyManifest(
         writes.push({
             kind: "verify",
             publicClaimId: entry.publicClaimId,
+            category,
             files: normalized.files,
         });
     }
@@ -523,11 +629,15 @@ export async function applyVerifyManifest(
             });
             throw error;
         }
-        const normalized = await normalizeVerificationFiles({
-            cwd: args.sessionDirectory,
-            files: entry.files,
-        });
-        if (normalized.files.length === 0) {
+        const category = byCategory(batch, entry.publicClaimId);
+        const normalized =
+            category === ANTI_MEMORY_CATEGORY
+                ? { files: [] }
+                : await normalizeVerificationFiles({
+                      cwd: args.sessionDirectory,
+                      files: entry.files,
+                  });
+        if (normalized.files.length === 0 && category !== ANTI_MEMORY_CATEGORY) {
             const error = new Error(`verify update ${entry.publicClaimId} has no valid files`);
             recordDreamerManifestRejection({
                 ...args,
@@ -540,6 +650,7 @@ export async function applyVerifyManifest(
         writes.push({
             kind: "update",
             publicClaimId: entry.publicClaimId,
+            category,
             files: normalized.files,
             content,
         });
@@ -548,6 +659,7 @@ export async function applyVerifyManifest(
         writes.push({
             kind: "archive",
             publicClaimId: entry.publicClaimId,
+            category: byCategory(batch, entry.publicClaimId),
             reason: entry.reason,
         });
     }

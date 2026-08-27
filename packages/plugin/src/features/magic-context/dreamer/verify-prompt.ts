@@ -14,6 +14,7 @@
  */
 
 import type { ClaimMutationToken } from "../memory/claim-operation-contract";
+import { ANTI_MEMORY_CATEGORY } from "../memory/constants";
 import {
     assertManifestCoversExactly,
     assertNoDuplicateManifestIds,
@@ -34,6 +35,8 @@ Decide ONE of three outcomes per memory:
 - ARCHIVE — the code CLEARLY contradicts the memory, or the thing it describes no longer exists.
 
 BE CONSERVATIVE ABOUT ARCHIVING. Wrong archival of a TRUE memory is the worst possible outcome — far worse than leaving a slightly-stale memory. If you cannot find the code, or you are unsure, or it might still be true somewhere you didn't look: mark it VERIFIED, never archived. Archive ONLY when you have positive evidence the code contradicts it.
+
+Anti-memory records (${ANTI_MEMORY_CATEGORY}) invert that archival bias because retaining an obsolete rejection creates a false warning. Check current project evidence even when no backing files are listed. Use ARCHIVE when the rejection no longer clearly holds; the host preserves it as labeled stale history rather than deleting it. VERIFIED extends its validity window. UPDATE must return the complete field-labeled anti-memory content.
 
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <verify>
@@ -61,7 +64,7 @@ export function buildVerifyPrompt(projectPath: string, memories: VerifyPromptMem
     const list = memories
         .map(
             (m) =>
-                `[${m.publicClaimId}] ${m.category}\nRevision: ${m.revisionLocator}\nContent digest: ${m.contentDigest}\nContent: ${m.content}\nBacking files: ${m.mappedFiles.join(", ")}`,
+                `[${m.publicClaimId}] ${m.category}\nRevision: ${m.revisionLocator}\nContent digest: ${m.contentDigest}\nContent: ${m.content}\nBacking files: ${m.mappedFiles.length === 0 ? "(none; inspect current project evidence)" : m.mappedFiles.join(", ")}`,
         )
         .join("\n\n");
     return `## Verify these memories against the code
@@ -112,7 +115,10 @@ function verifyBody(text: string): string {
 /** Parse the agent's complete `<verify>` manifest. The root close tag is
  *  mandatory so truncated output cannot apply a partial set of verdicts.
  *  A well-formed root with no recognized entries is a format miss, not success. */
-export function parseVerifyManifest(text: string): ParsedVerifyManifest {
+export function parseVerifyManifest(
+    text: string,
+    allowFilelessClaimIds: ReadonlySet<string> = new Set(),
+): ParsedVerifyManifest {
     const out: ParsedVerifyManifest = { verified: [], updated: [], archived: [] };
     const body = verifyBody(text);
 
@@ -120,7 +126,7 @@ export function parseVerifyManifest(text: string): ParsedVerifyManifest {
         const publicClaimId = attrOf(m[1], "claim");
         if (!publicClaimId) throw new Error("verify manifest entry missing public claim id");
         const files = filesOf(m[1]);
-        if (files.length === 0) {
+        if (files.length === 0 && !allowFilelessClaimIds.has(publicClaimId)) {
             throw new Error(`verify manifest entry ${publicClaimId} is missing backing files`);
         }
         out.verified.push({ publicClaimId, files });
@@ -129,7 +135,7 @@ export function parseVerifyManifest(text: string): ParsedVerifyManifest {
         const publicClaimId = attrOf(m[1], "claim");
         if (!publicClaimId) throw new Error("verify manifest entry missing public claim id");
         const files = filesOf(m[1]);
-        if (files.length === 0) {
+        if (files.length === 0 && !allowFilelessClaimIds.has(publicClaimId)) {
             throw new Error(`verify manifest entry ${publicClaimId} is missing backing files`);
         }
         out.updated.push({
@@ -155,8 +161,9 @@ export function parseVerifyManifest(text: string): ParsedVerifyManifest {
 export function validateVerifyManifest(
     text: string,
     expectedIds: ReadonlySet<string>,
+    allowFilelessClaimIds: ReadonlySet<string> = new Set(),
 ): ParsedVerifyManifest {
-    const parsed = parseVerifyManifest(text);
+    const parsed = parseVerifyManifest(text, allowFilelessClaimIds);
     const ids = verifyIds(parsed);
     assertParsedManifestNonEmpty(ids.length, expectedIds.size, text, "verify", "verified");
     assertManifestCoversExactly(ids, expectedIds, "verify");

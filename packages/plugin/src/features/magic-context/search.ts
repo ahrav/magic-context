@@ -9,9 +9,16 @@ import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
 import { readProjectIdentityMap } from "./memory/claim-memory-render";
 import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-operation-contract";
+import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
-import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
+import {
+    embedBatch,
+    embedText,
+    getProjectEmbeddingSnapshot,
+    isEmbeddingEnabled,
+} from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
+import { readAntiMemory } from "./memory/storage-anti-memory";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
@@ -73,6 +80,7 @@ const MEMORY_SOURCE_BOOST = 1.3;
 const MESSAGE_SOURCE_BOOST = 1.15;
 const GIT_COMMIT_SOURCE_BOOST = 1.2;
 const PRIMER_SOURCE_BOOST = 1.25;
+const ANTI_MEMORY_SEMANTIC_THRESHOLD = 0.7;
 
 interface MessageSearchRow {
     messageOrdinal?: number | string;
@@ -140,6 +148,11 @@ export interface UnifiedSearchOptions {
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ) => Promise<CapturedQueryEmbedding | Float32Array | null>;
+    embedPassages?: (
+        texts: string[],
+        signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
+    ) => Promise<(Float32Array | null)[]>;
     isEmbeddingRuntimeEnabled?: () => boolean;
     /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
     maxMessageOrdinal?: number;
@@ -201,6 +214,22 @@ export interface MemorySearchResult {
     contentDigest?: string;
 }
 
+export interface AntiMemorySearchResult {
+    source: "anti_memory";
+    score: number;
+    publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
+    claimId: number;
+    normalizedHash: string;
+    trigger: string;
+    rejectedStrategy: string;
+    rejectionReason: string;
+    saferAlternative: string | null;
+    matchType: "exact" | "lexical" | "semantic";
+    policyLabel?: string;
+}
+
 export interface MessageSearchResult {
     source: "message";
     content: string;
@@ -258,6 +287,7 @@ export interface NoteSearchResult {
 
 export type UnifiedSearchResult =
     | MemorySearchResult
+    | AntiMemorySearchResult
     | MessageSearchResult
     | CompartmentSearchResult
     | GitCommitSearchResult
@@ -768,6 +798,127 @@ function tokenizeKeywordNeedle(text: string): string[] {
     return tokens;
 }
 
+async function searchAntiMemories(args: {
+    db: Database;
+    projectPath: string;
+    query: string;
+    limit: number;
+    surface: "auto_search" | "explicit_search";
+    queryEmbedding: Float32Array | null;
+    embedPassages: (
+        texts: string[],
+        signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
+    ) => Promise<(Float32Array | null)[]>;
+    signal?: AbortSignal;
+}): Promise<AntiMemorySearchResult[]> {
+    const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
+    const projectIds = resolveProjectIdsForIdentities(
+        args.db,
+        workspace.isWorkspaced ? workspace.expandedIdentities : [args.projectPath],
+    );
+    if (projectIds.length === 0) return [];
+    const ownProjectIds = resolveProjectIdsForIdentities(
+        args.db,
+        workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
+    );
+    const state = readProjectMemoryCurrentState(args.db, {
+        projectIds,
+        workspaceAuthorization: {
+            ownProjectIds,
+            sharedCategories: workspace.shareCategories ?? [],
+        },
+        workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+        workspaceIdentities: workspace.identities,
+        surface: "explicit_search",
+        lifecycleStates: ["active"],
+    });
+    if (state.status !== "ok") return [];
+    const normalizedQuery = args.query.trim().toLowerCase();
+    const queryTokens = tokenizeKeywordNeedle(normalizedQuery);
+    const candidates: Array<{
+        result: Omit<AntiMemorySearchResult, "score" | "matchType">;
+        text: string;
+        lexicalScore: number | null;
+    }> = [];
+    for (const item of state.items) {
+        if (item.category !== ANTI_MEMORY_CATEGORY) continue;
+        if (
+            args.surface === "auto_search" &&
+            (item.dispositions.stale || item.dispositions.disputed || item.dispositions.superseded)
+        ) {
+            continue;
+        }
+        const record = readAntiMemory(args.db, item.publicClaimId);
+        if (record === null) continue;
+        const text =
+            `${record.payload.trigger}\n${record.payload.rejectedStrategy}\n${record.content}`.toLowerCase();
+        const exact = text.includes(normalizedQuery);
+        const textTokens = new Set(tokenizeKeywordNeedle(text));
+        const matched = queryTokens.filter((token) => textTokens.has(token)).length;
+        const coverage = queryTokens.length === 0 ? 0 : matched / queryTokens.length;
+        const lexicalScore =
+            exact || (matched > 0 && (queryTokens.length <= 1 || matched >= 2))
+                ? exact
+                    ? 1
+                    : 0.5 + coverage / 2
+                : null;
+        const result: Omit<AntiMemorySearchResult, "score" | "matchType"> = {
+            source: "anti_memory",
+            publicClaimId: record.publicClaimId,
+            revisionLocator: record.revisionLocator,
+            contentDigest: record.contentDigest,
+            claimId: record.claimId,
+            normalizedHash: record.normalizedHash,
+            trigger: record.payload.trigger,
+            rejectedStrategy: record.payload.rejectedStrategy,
+            rejectionReason: record.payload.rejectionReason,
+            saferAlternative: record.payload.saferAlternative,
+            ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+        };
+        candidates.push({ result, text, lexicalScore });
+    }
+
+    const semanticQueryEmbedding = args.surface === "auto_search" ? args.queryEmbedding : null;
+    const vectors =
+        semanticQueryEmbedding && candidates.length > 0
+            ? await args
+                  .embedPassages(
+                      candidates.map((candidate) => candidate.text),
+                      args.signal,
+                      "passage",
+                  )
+                  .catch((error) => {
+                      log(
+                          `[search] anti-memory embedding failed: ${error instanceof Error ? error.message : String(error)}`,
+                      );
+                      return [];
+                  })
+            : [];
+    const ranked: AntiMemorySearchResult[] = [];
+    for (const [index, candidate] of candidates.entries()) {
+        const vector = vectors[index] ?? null;
+        const semanticScore =
+            semanticQueryEmbedding && vector
+                ? normalizeCosineScore(cosineSimilarity(semanticQueryEmbedding, vector))
+                : 0;
+        const semanticMatch = semanticScore >= ANTI_MEMORY_SEMANTIC_THRESHOLD;
+        if (candidate.lexicalScore === null && !semanticMatch) continue;
+        const semanticWins = semanticMatch && semanticScore > (candidate.lexicalScore ?? 0);
+        ranked.push({
+            ...candidate.result,
+            score: Math.max(candidate.lexicalScore ?? 0, semanticScore),
+            matchType: semanticWins ? "semantic" : "lexical",
+        });
+    }
+    return ranked
+        .sort(
+            (left, right) =>
+                right.score - left.score || left.publicClaimId.localeCompare(right.publicClaimId),
+        )
+        .slice(0, args.limit);
+}
+
 interface RankedNoteMatch {
     note: Note;
     score: number;
@@ -1237,6 +1388,7 @@ export function mergeMessageAndCompartmentResults(args: {
 function getSourceBoost(result: UnifiedSearchResult): number {
     switch (result.source) {
         case "memory":
+        case "anti_memory":
             return MEMORY_SOURCE_BOOST;
         case "message":
         case "compartment":
@@ -1258,7 +1410,10 @@ function compareUnifiedResults(left: UnifiedSearchResult, right: UnifiedSearchRe
         return rightEffective - leftEffective;
     }
 
-    if (left.source === "memory" && right.source === "memory") {
+    if (
+        (left.source === "memory" || left.source === "anti_memory") &&
+        (right.source === "memory" || right.source === "anti_memory")
+    ) {
         return left.publicClaimId < right.publicClaimId ? -1 : 1;
     }
 
@@ -1481,7 +1636,7 @@ export function resolveClaimsByLocatorsForSearch(args: {
     visibleRevisionLocators?: ReadonlySet<string> | null;
     /** Bump claim retrieval telemetry (explicit agent lookups). */
     countRetrievals?: boolean;
-}): MemorySearchResult[] | null {
+}): Array<MemorySearchResult | AntiMemorySearchResult> | null {
     if (args.locators.length === 0) return null;
     const publicClaimIds: string[] = [];
     for (const raw of args.locators) {
@@ -1540,7 +1695,7 @@ export function resolveClaimsByLocatorsForSearch(args: {
         args.db,
         visible.map((item) => item.projectId),
     );
-    const ordered: MemorySearchResult[] = [];
+    const ordered: Array<MemorySearchResult | AntiMemorySearchResult> = [];
     for (const item of visible) {
         if (args.visibleRevisionLocators?.has(item.revisionLocator)) continue;
         const identity = identityByProjectId.get(item.projectId);
@@ -1554,24 +1709,46 @@ export function resolveClaimsByLocatorsForSearch(args: {
                       workspace.canonicalIdentityByStoredPath,
                   ) ?? undefined)
                 : undefined;
-        ordered.push({
-            source: "memory",
-            content: item.content,
-            score: 1,
-            publicClaimId: item.publicClaimId,
-            revisionLocator: item.revisionLocator,
-            category: item.category,
-            matchType: "exact",
-            ...(sourceName === undefined ? {} : { sourceName }),
-            ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
-            contentDigest: item.contentDigest,
-        });
+        if (item.category === ANTI_MEMORY_CATEGORY) {
+            if (item.lifecycleState !== "active") continue;
+            const record = readAntiMemory(args.db, item.publicClaimId);
+            if (record === null) continue;
+            ordered.push({
+                source: "anti_memory",
+                score: 1,
+                publicClaimId: record.publicClaimId,
+                revisionLocator: record.revisionLocator,
+                contentDigest: record.contentDigest,
+                claimId: record.claimId,
+                normalizedHash: record.normalizedHash,
+                trigger: record.payload.trigger,
+                rejectedStrategy: record.payload.rejectedStrategy,
+                rejectionReason: record.payload.rejectionReason,
+                saferAlternative: record.payload.saferAlternative,
+                matchType: "exact",
+                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+            });
+        } else
+            ordered.push({
+                source: "memory",
+                content: item.content,
+                score: 1,
+                publicClaimId: item.publicClaimId,
+                revisionLocator: item.revisionLocator,
+                category: item.category,
+                matchType: "exact",
+                ...(sourceName === undefined ? {} : { sourceName }),
+                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+                contentDigest: item.contentDigest,
+            });
         if (ordered.length >= args.limit) break;
     }
     if (ordered.length === 0) return null;
     if (args.countRetrievals !== false) {
         recordClaimUsage(args.db, {
-            publicClaimIds: ordered.map((result) => result.publicClaimId),
+            publicClaimIds: ordered
+                .filter((result): result is MemorySearchResult => result.source === "memory")
+                .map((result) => result.publicClaimId),
             kind: "retrieved",
         });
     }
@@ -1598,8 +1775,8 @@ export function resolveClaimsByLocatorsForSearch(args: {
         return (
             item.revisionLocator === result.revisionLocator &&
             item.contentDigest === result.contentDigest &&
-            item.content === result.content &&
-            item.category === result.category &&
+            (result.source === "anti_memory" || item.content === result.content) &&
+            (result.source === "anti_memory" || item.category === result.category) &&
             (item.explicitLabel ?? undefined) === result.policyLabel
         );
     });
@@ -1688,6 +1865,7 @@ async function executeUnifiedSearch(args: {
     const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;
     const embeddingEnabled = options.embeddingEnabled ?? true;
     const embedQuery = options.embedQuery ?? embedText;
+    const embedPassages = options.embedPassages ?? embedBatch;
     const isEmbeddingRuntimeEnabled = options.isEmbeddingRuntimeEnabled ?? isEmbeddingEnabled;
     const gitCommitsEnabled = options.gitCommitsEnabled ?? false;
     const activeSources = resolveSources(options.sources);
@@ -1697,6 +1875,7 @@ async function executeUnifiedSearch(args: {
     const runGitCommits = activeSources.has("git_commit") && gitCommitsEnabled;
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
     const runNotes = activeSources.has("note");
+    const runAntiMemories = activeSources.has("memory") && memoryFeatureEnabled;
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
     filterSpan?.end("ok");
     // Downstream chain roots depend on the filter span so criticalPathMs
@@ -1721,8 +1900,10 @@ async function executeUnifiedSearch(args: {
     // (`ensureMessagesIndexed` walks raw OpenCode session history); doing
     // that BEFORE the embed call meant the embed fetch couldn't start
     // until indexing finished.
+    const antiMemorySemanticEnabled =
+        runAntiMemories && (options.memoryPolicySurface ?? "explicit_search") === "auto_search";
     const needsEmbedding =
-        (runGitCommits || runCompartmentChunks || runPrimers) &&
+        (runGitCommits || runCompartmentChunks || runPrimers || antiMemorySemanticEnabled) &&
         embeddingEnabled &&
         isEmbeddingRuntimeEnabled();
 
@@ -1810,6 +1991,18 @@ async function executeUnifiedSearch(args: {
         queryContract?.chunkModelId ??
         options.chunkModelIdOverride ??
         embeddingSnapshot?.chunkModelId;
+    const antiMemoryResults = runAntiMemories
+        ? await searchAntiMemories({
+              db,
+              projectPath,
+              query: trimmedQuery,
+              limit: tierLimit,
+              surface: options.memoryPolicySurface ?? "explicit_search",
+              queryEmbedding,
+              embedPassages,
+              signal: options.signal,
+          })
+        : [];
     let compartmentLoad: VectorLoadEvent | null = null;
     const compartmentSpan =
         trace && runCompartmentChunks
@@ -1992,6 +2185,7 @@ async function executeUnifiedSearch(args: {
     const fusionSpan =
         trace?.begin("fusion", "unified", { parent: rootId, dependsOn: laneSpanIds }) ?? null;
     const fused = [
+        ...antiMemoryResults,
         ...primerResults,
         ...messageLikeResults,
         ...gitCommitResults,
@@ -2000,6 +2194,7 @@ async function executeUnifiedSearch(args: {
     fusionSpan?.end("ok", {
         candidatesIn:
             primerResults.length +
+            antiMemoryResults.length +
             messageLikeResults.length +
             gitCommitResults.length +
             noteResults.length,

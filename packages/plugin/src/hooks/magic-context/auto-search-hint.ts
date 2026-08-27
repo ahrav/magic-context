@@ -29,6 +29,7 @@ import {
 } from "../../features/magic-context/search-bounds";
 import { formatAge } from "../../shared/format-age";
 import { estimateTokens } from "../../shared/token-estimator";
+import { renderAntiMemoryWarning } from "../../tools/ctx-search/render";
 import { cavemanCompress } from "./caveman";
 
 const MAX_FRAGMENTS = 3;
@@ -50,6 +51,8 @@ function truncate(text: string, limit: number): string {
 
 function renderFragment(result: UnifiedSearchResult, charCap: number, nowMs: number): string {
     switch (result.source) {
+        case "anti_memory":
+            return renderAntiMemoryWarning(result);
         case "memory": {
             const compressed = cavemanCompress(boundDynamicField(result.content), "ultra");
             return truncate(compressed, charCap);
@@ -120,7 +123,13 @@ export function packAutoSearchHint(
     const fragmentCharCap = Math.max(20, options.fragmentCharCap ?? FRAGMENT_CHAR_CAP);
     const nowMs = options.nowMs ?? Date.now();
 
-    const picks = results.slice(0, maxFragments);
+    const warning = results.find((result) => result.source === "anti_memory");
+    const picks = warning
+        ? [warning, ...results.filter((result) => result.source !== "anti_memory")].slice(
+              0,
+              maxFragments,
+          )
+        : results.slice(0, maxFragments);
     const kept: Array<{ result: UnifiedSearchResult; line: string }> = [];
 
     for (const result of picks) {

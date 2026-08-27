@@ -23,6 +23,7 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
+import { recordClaimUsage } from "../../features/magic-context/memory/storage-claim-operations";
 import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
 import type {
     UnifiedSearchOptions,
@@ -447,11 +448,14 @@ export async function runAutoSearchHint(args: {
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.
     const payload = `\n\n${hintText}`;
-    // Automatic search suppresses its claim-hint lane while no retrieval
-    // projection exists: unified search serves no project-memory claims on
-    // this path, so a fresh hint never carries claim fragments. The
-    // eligibility gate below still verifies previously persisted decisions.
-    const memoryFragments: Array<{ id: number; hash: string }> = [];
+    // Anti-memory fragments bind to current claim identity and hash so a
+    // persisted decision fails the ordinary auto-search eligibility gate.
+    // Warning replay requires a fresh match rather than stored warning text.
+    const warningResults = delivery.delivered.filter((result) => result.source === "anti_memory");
+    const memoryFragments = warningResults.map((result) => ({
+        id: result.claimId,
+        hash: result.normalizedHash,
+    }));
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
@@ -467,7 +471,15 @@ export async function runAutoSearchHint(args: {
     // quarantined, rejected, or rewritten between the search lane's recheck
     // and this persist, and the current prompt must never receive a fragment
     // the policy has since hidden.
-    replayHintIfEligible(outcome.decision);
+    if (outcome.kind === "appended" && warningResults.length > 0) {
+        appendReminderToUserMessageById(messages, userMsgId, payload);
+        recordClaimUsage(db, {
+            publicClaimIds: warningResults.map((result) => result.publicClaimId),
+            kind: "retrieved",
+        });
+    } else {
+        replayHintIfEligible(outcome.decision);
+    }
     sessionLog(
         sessionId,
         `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,

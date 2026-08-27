@@ -222,4 +222,21 @@ export async function embedText(
     return currentProvider.embed(text, signal, purpose);
 }
 
+export async function embedBatch(
+    texts: string[],
+    signal?: AbortSignal,
+    purpose?: EmbeddingPurpose,
+): Promise<(Float32Array | null)[]> {
+    const currentProvider = getOrCreateProvider();
+    if (!currentProvider) {
+        return texts.map(() => null);
+    }
+
+    if (!(await currentProvider.initialize())) {
+        return texts.map(() => null);
+    }
+
+    return currentProvider.embedBatch(texts, signal, purpose);
+}
+
 export { cosineSimilarity };
