@@ -5956,6 +5956,58 @@ fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
 /// Unlike the non-transactional helpers, this does not filter on state; the caller
 /// decides which states it accepts so it can distinguish "not managed" from
 /// "managed but draining".
+/// The live fence a claim intent must clear before its context mutation may run.
+///
+/// `Ok(None)` means staging may proceed; `Ok(Some(outcome))` is the rejection to
+/// return. Both the fresh insert and a `staged` replay call this, because a replay
+/// executes the same mutation and the stored binding only proves what was true
+/// when the row was written.
+fn claim_intent_stage_fence(
+    tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
+    binding: &ClaimIntentBinding,
+) -> rusqlite::Result<Option<ClaimIntentTxnOutcome>> {
+    let transition: Option<String> = tx
+        .query_row(
+            "SELECT transition_state FROM mc_claim_intent_controls WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(state) = transition.filter(|state| state != "accepting") {
+        return Ok(Some(ClaimIntentTxnOutcome::Frozen(state)));
+    }
+    // Resolve the authority from the bound route, never from the caller-supplied
+    // binding. `mc_authority` is keyed by `context_store_uuid`, which the host mints
+    // independently of the format marker's `database_incarnation_id`, so keying this
+    // lookup by the binding identity matches no row and fails open.
+    let Some((authority_project, state, generation)) =
+        authority_for_route_tx(tx, route_project_root, "memories")?
+    else {
+        return Ok(Some(ClaimIntentTxnOutcome::RouteNotManaged));
+    };
+    if state != "MODULE" {
+        return Ok(Some(ClaimIntentTxnOutcome::Frozen(state)));
+    }
+    // The route owns the project vocabulary; a binding naming another project must
+    // not be able to stage against this route's authority.
+    if authority_project != binding.authority_project {
+        return Ok(Some(ClaimIntentTxnOutcome::BindingMismatch {
+            field: "authority project",
+            expected: authority_project,
+            found: binding.authority_project.clone(),
+        }));
+    }
+    if generation != binding.authority_generation {
+        return Ok(Some(ClaimIntentTxnOutcome::BindingMismatch {
+            field: "authority generation",
+            expected: generation.to_string(),
+            found: binding.authority_generation.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
 fn authority_for_route_tx(
     tx: &rusqlite::Transaction<'_>,
     route_project_root: &str,
@@ -15053,48 +15105,28 @@ impl McStore {
                         found,
                     });
                 }
+                // A staged replay goes on to execute the context mutation, so it has to
+                // clear the same live fence as a fresh stage. The stored binding proves
+                // only what was true when the row was written: a drain committed since
+                // then has already moved the authority to DRAINING and bumped the
+                // generation, and returning here would commit under the obsolete one.
+                // Terminal and already-committed records are recovery reads and stay
+                // idempotent so a crashed attempt can still be resolved.
+                if record.state == ClaimIntentState::Staged {
+                    if let Some(rejection) =
+                        claim_intent_stage_fence(tx, route_project_root, binding)?
+                    {
+                        return Ok(rejection);
+                    }
+                }
                 return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
                     record,
                     replayed: true,
                 }));
             }
 
-            let transition: Option<String> = tx
-                .query_row(
-                    "SELECT transition_state FROM mc_claim_intent_controls WHERE id = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(state) = transition.filter(|state| state != "accepting") {
-                return Ok(ClaimIntentTxnOutcome::Frozen(state));
-            }
-            // Resolve the authority from the bound route, never from the caller-supplied
-            // binding. `mc_authority` is keyed by `context_store_uuid`, which the host mints
-            // independently of the format marker's `database_incarnation_id`, so keying this
-            // lookup by the binding identity matches no row and fails open.
-            let authority = authority_for_route_tx(tx, route_project_root, "memories")?;
-            let Some((authority_project, state, generation)) = authority else {
-                return Ok(ClaimIntentTxnOutcome::RouteNotManaged);
-            };
-            if state != "MODULE" {
-                return Ok(ClaimIntentTxnOutcome::Frozen(state));
-            }
-            // The route owns the project vocabulary; a binding naming another project must
-            // not be able to stage against this route's authority.
-            if authority_project != binding.authority_project {
-                return Ok(ClaimIntentTxnOutcome::BindingMismatch {
-                    field: "authority project",
-                    expected: authority_project,
-                    found: binding.authority_project.clone(),
-                });
-            }
-            if generation != binding.authority_generation {
-                return Ok(ClaimIntentTxnOutcome::BindingMismatch {
-                    field: "authority generation",
-                    expected: generation.to_string(),
-                    found: binding.authority_generation.to_string(),
-                });
+            if let Some(rejection) = claim_intent_stage_fence(tx, route_project_root, binding)? {
+                return Ok(rejection);
             }
             tx.execute(
                 "INSERT INTO mc_claim_intents(

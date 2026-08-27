@@ -333,3 +333,69 @@ fn store_rebuild_is_refused_until_intents_drain_then_freezes_new_stages() {
         digest
     );
 }
+
+/// Replaying a `staged` intent revalidates live authority instead of trusting the
+/// binding stored when the row was written.
+///
+/// A replay goes on to execute the same context mutation. If a drain committed
+/// after the row was staged, the authority is already DRAINING at a higher
+/// generation, so returning the stored record would commit a claim under the
+/// obsolete one. Recovery reads of terminal or already-committed rows must stay
+/// idempotent, so only `staged` is fenced.
+#[test]
+fn replaying_a_staged_intent_refuses_after_authority_begins_draining() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    store
+        .bind_authority_route(STORE_UUID, PROJECT, ROUTE_ROOT)
+        .unwrap();
+    let preparing = store
+        .authority_begin_prepare(STORE_UUID, PROJECT, "memories")
+        .unwrap();
+    let active = store
+        .authority_finish_prepare(
+            STORE_UUID,
+            PROJECT,
+            "memories",
+            preparing.generation,
+            "same",
+            "same",
+            true,
+        )
+        .unwrap();
+    let active_binding = binding(active.generation);
+    let identity = command("replay-fence");
+
+    // The first attempt stages under MODULE authority and leaves the row staged,
+    // as a crash before the context commit would.
+    let staged = store
+        .stage_claim_intent(ROUTE_ROOT, &active_binding, &identity, &request(1), 1)
+        .unwrap();
+    assert!(!staged.replayed);
+    assert_eq!(staged.record.state, ClaimIntentState::Staged);
+
+    let draining = store
+        .authority_begin_drain(STORE_UUID, PROJECT, "memories", "lease", 100, 2)
+        .unwrap();
+    assert!(draining.generation > active.generation);
+
+    // The retry presents the same identity, digest, and stored binding, so only a
+    // live authority read can refuse it.
+    assert!(matches!(
+        store.stage_claim_intent(ROUTE_ROOT, &active_binding, &identity, &request(1), 3),
+        Err(McStoreError::ClaimIntentAuthorityFrozen { ref state }) if state == "DRAINING"
+    ));
+
+    // The staged row is untouched, so the drain can still settle it.
+    let settled = store
+        .acknowledge_claim_intent(
+            &active_binding,
+            &identity,
+            &staged.record.request_digest,
+            ClaimIntentAckKind::TerminalRejected,
+            Some(&result("stale")),
+            4,
+        )
+        .unwrap();
+    assert_eq!(settled.record.state, ClaimIntentState::TerminalRejected);
+}

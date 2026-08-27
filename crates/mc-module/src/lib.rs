@@ -11344,15 +11344,11 @@ impl McHandler {
                     requested.len()
                 };
                 let category = string_arg(&args, "category");
-                let rows = match memory_tool::list_committed_claims(
-                    &store,
-                    &requested,
-                    category,
-                    limit,
-                ) {
-                    Ok(rows) => rows,
-                    Err(error) => return tool_error_result(format!("Error: {error}")),
-                };
+                let rows =
+                    match memory_tool::list_committed_claims(&store, &requested, category, limit) {
+                        Ok(rows) => rows,
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    };
                 let claims = rows
                     .into_iter()
                     .map(|row| {
