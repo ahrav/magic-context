@@ -2,10 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 import { __test, TRANSFORM_DECISIONS_RETENTION } from "./transform-decision-log";
 
 let dir: string;
@@ -15,9 +14,7 @@ let db: Database;
 beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "mc-txn-decision-"));
     dbPath = join(dir, "context.db");
-    db = new Database(dbPath);
-    initializeDatabase(db);
-    runMigrations(db);
+    db = createDirectTestDatabase({ path: dbPath }).db;
     __test.reset();
 });
 

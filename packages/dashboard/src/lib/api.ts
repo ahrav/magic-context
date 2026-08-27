@@ -2,18 +2,21 @@ import { invoke } from "./platform";
 
 import type {
   CacheEvent,
+  ClaimLifecycleState,
+  ClaimMemoryReadResult,
+  ClaimMemoryStats,
+  ClaimMutationResponse,
+  ClaimMutationTarget,
+  ClaimProjectRow,
   Compartment,
   ConfigFile,
   ContextTokenBreakdown,
   DbCacheEvent,
   DbHealth,
   DreamRun,
-  DreamRunMemoryDetail,
   DreamStateEntry,
   Harness,
   LogEntry,
-  Memory,
-  MemoryStats,
   MuralManifest,
   Note,
   OpencodeInstallState,
@@ -46,17 +49,15 @@ export async function getProjects(): Promise<import("./types").ProjectInfo[]> {
 
 export async function getMemories(params?: {
   project?: string;
-  workspaceId?: number;
-  status?: string;
+  lifecycle?: ClaimLifecycleState;
   category?: string;
   search?: string;
   limit?: number;
   offset?: number;
-}): Promise<Memory[]> {
+}): Promise<ClaimMemoryReadResult> {
   return invoke("get_memories", {
     project: params?.project ?? null,
-    workspaceId: params?.workspaceId ?? null,
-    status: params?.status ?? null,
+    lifecycle: params?.lifecycle ?? null,
     category: params?.category ?? null,
     search: params?.search ?? null,
     limit: params?.limit ?? 100,
@@ -64,13 +65,9 @@ export async function getMemories(params?: {
   });
 }
 
-export async function getMemoryStats(params?: {
-  project?: string;
-  workspaceId?: number;
-}): Promise<MemoryStats> {
+export async function getMemoryStats(params?: { project?: string }): Promise<ClaimMemoryStats> {
   return invoke("get_memory_stats", {
     project: params?.project ?? null,
-    workspaceId: params?.workspaceId ?? null,
   });
 }
 
@@ -132,28 +129,45 @@ export async function applyWorkspaceChanges(params: {
   return invoke("apply_workspace_changes", params);
 }
 
-export async function updateMemoryStatus(memoryId: number, status: string): Promise<void> {
-  return invoke("update_memory_status", { memoryId, status });
+export function claimMutationTarget(claim: {
+  revisionLocator: string;
+  mutationToken: ClaimMutationTarget["mutationToken"];
+}): ClaimMutationTarget {
+  return {
+    revisionLocator: claim.revisionLocator,
+    mutationToken: claim.mutationToken,
+  };
 }
 
-export async function updateMemoryContent(memoryId: number, content: string): Promise<void> {
-  return invoke("update_memory_content", { memoryId, content });
+export async function setMemoryLifecycle(
+  target: ClaimMutationTarget,
+  operationKey: string,
+  lifecycleState: "active" | "archived",
+): Promise<ClaimMutationResponse> {
+  return invoke("set_memory_lifecycle", { target, operationKey, lifecycleState });
 }
 
-export async function updateMemoryCategory(memoryId: number, category: string): Promise<void> {
-  return invoke("update_memory_category", { memoryId, category });
+export async function reviseMemoryContent(
+  target: ClaimMutationTarget,
+  operationKey: string,
+  content: string,
+): Promise<ClaimMutationResponse> {
+  return invoke("revise_memory_content", { target, operationKey, content });
 }
 
-export async function deleteMemory(memoryId: number): Promise<void> {
-  return invoke("delete_memory", { memoryId });
+export async function reviseMemoryCategory(
+  target: ClaimMutationTarget,
+  operationKey: string,
+  category: string,
+): Promise<ClaimMutationResponse> {
+  return invoke("revise_memory_category", { target, operationKey, category });
 }
 
-export async function bulkUpdateMemoryStatus(memoryIds: number[], status: string): Promise<number> {
-  return invoke("bulk_update_memory_status", { memoryIds, status });
-}
-
-export async function bulkDeleteMemory(memoryIds: number[]): Promise<number> {
-  return invoke("bulk_delete_memory", { memoryIds });
+export async function bulkArchiveMemories(
+  targets: ClaimMutationTarget[],
+  operationKey: string,
+): Promise<ClaimMutationResponse> {
+  return invoke("bulk_archive_memories", { targets, operationKey });
 }
 
 // ── Session API ─────────────────────────────────────────────
@@ -273,7 +287,7 @@ export async function getProjectCards(): Promise<import("./types").ProjectCard[]
   return invoke("get_project_cards");
 }
 
-export async function enumerateMemoryProjects(): Promise<ProjectRow[]> {
+export async function enumerateMemoryProjects(): Promise<ClaimProjectRow[]> {
   return invoke("enumerate_memory_projects");
 }
 
@@ -362,10 +376,6 @@ export async function getDreamRuns(projectPath?: string, limit?: number): Promis
     projectPath: projectPath ?? null,
     limit: limit ?? 20,
   });
-}
-
-export async function getDreamRunMemoryChanges(runId: number): Promise<DreamRunMemoryDetail> {
-  return invoke("get_dream_run_memory_changes", { runId });
 }
 
 // ── Log & Cache API ─────────────────────────────────────────

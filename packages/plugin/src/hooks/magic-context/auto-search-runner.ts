@@ -212,9 +212,6 @@ export interface AutoSearchRunnerOptions {
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     gitCommitsEnabled?: boolean;
-    /** Memory ids already rendered in the injected <session-history> block —
-     *  skip fragments that just duplicate visible memories. */
-    visibleMemoryIds?: Set<number>;
 }
 
 export function collectUserPromptParts(message: MessageLike): string {
@@ -396,7 +393,6 @@ export async function runAutoSearchHint(args: {
             // Hard-filter memories already rendered in <session-history>.
             // unifiedSearch applies this during memory merging so ranking
             // can't be distorted by already-visible hits.
-            visibleMemoryIds: options.visibleMemoryIds ?? null,
             // Primers v1 are cache-neutral: they surface via explicit ctx_search
             // and dashboard only, never transform-time auto-search prompt hints.
             sources: [...AUTO_SEARCH_SOURCES],
@@ -451,19 +447,11 @@ export async function runAutoSearchHint(args: {
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.
     const payload = `\n\n${hintText}`;
-    // Record which memories contributed fragments — each bound to the exact
-    // SHA-256 digest of the LOADED bytes the search lane ranked and packed
-    // (carried on the result itself, so a rewrite between the lane's recheck
-    // and this persist cannot pair the packed text with the new revision's
-    // identity). A result without a digest records an empty hash, which can
-    // never match a live row: it fails closed rather than silently untracked.
-    const seenFragmentIds = new Set<number>();
+    // Automatic search suppresses its claim-hint lane while no retrieval
+    // projection exists: unified search serves no project-memory claims on
+    // this path, so a fresh hint never carries claim fragments. The
+    // eligibility gate below still verifies previously persisted decisions.
     const memoryFragments: Array<{ id: number; hash: string }> = [];
-    for (const result of delivery.delivered) {
-        if (result.source !== "memory" || seenFragmentIds.has(result.memoryId)) continue;
-        seenFragmentIds.add(result.memoryId);
-        memoryFragments.push({ id: result.memoryId, hash: result.contentDigest ?? "" });
-    }
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",

@@ -1,7 +1,15 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { analyzePasses, buildSegments, findBusts, mainAgentRequests } from "./cache-analysis";
+import {
+    analyzePasses,
+    buildSegments,
+    findBusts,
+    isInternalAgentRequest,
+    mainAgentRequests,
+} from "./cache-analysis";
+import { MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES } from "../../plugin/src/hooks/magic-context/internal-agent-signatures";
+import { HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST } from "./incident-pool/support/tool-loop";
 
 /**
  * Unit coverage for the cache-bust oracle itself.
@@ -233,6 +241,62 @@ describe("cache-bust oracle", () => {
                 const filtered = mainAgentRequests([mc, subagent]);
                 expect(filtered).toHaveLength(1);
                 expect(filtered[0]).toBe(mc);
+            });
+        });
+    });
+
+    describe("#given internal agent request signatures", () => {
+        it("rejects title, summary, compaction, and MC-child requests from body.system only", () => {
+            const signatures = [
+                "You are a title generator. You output ONLY a thread title.",
+                "Summarize what was done in this conversation. Write like a pull request description.",
+                "You are an anchored context summarization assistant for coding sessions.",
+                "You are Historian — the hippocampus of a long-running coding agent.",
+                "You are a dreamer curate agent for the magic-context system.",
+                "You are Sidekick, a focused memory-retrieval subagent for an AI coding assistant.",
+            ];
+            for (const signature of signatures) {
+                expect(
+                    isInternalAgentRequest({
+                        body: { system: signature, messages: [MC_SYSTEM] },
+                    }),
+                ).toBe(true);
+            }
+            expect(
+                isInternalAgentRequest({
+                    body: {
+                        system: MC_SYSTEM,
+                        messages: signatures,
+                    },
+                }),
+            ).toBe(false);
+        });
+
+        it("accepts a main-agent request", () => {
+            expect(
+                isInternalAgentRequest({
+                    body: { system: MC_SYSTEM, messages: [] },
+                }),
+            ).toBe(false);
+        });
+    });
+
+    describe("#given the historian selector in the incident-pool tool loop", () => {
+        describe("#when the shared production signature changes", () => {
+            it("#then the narrower selector marker must still be contained by it", () => {
+                // Two predicates coexist on purpose: the broad hidden-agent
+                // filter here excludes every non-main-agent request, while the
+                // tool-loop selector answers only the historian, so collapsing
+                // them would make historian matchers reply to the dreamer,
+                // sidekick, and OpenCode's title/summary/compaction agents too.
+                // What must not drift is the identity text. Pin containment so
+                // editing the production opener fails here rather than silently
+                // leaving the selector matching nothing.
+                const historianSignature = MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES.find(
+                    (signature) => signature.includes("Historian"),
+                );
+                expect(historianSignature).toBeDefined();
+                expect(historianSignature).toContain(HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST);
             });
         });
     });

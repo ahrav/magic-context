@@ -534,9 +534,7 @@ describe("migrateOpenCodeSessionToPi", () => {
                     mkdirSync: (path, options) => mkdirSync(path, options),
                 },
             }),
-        ).toThrow(
-            `database schema v${LATEST_SUPPORTED_VERSION + 1} is newer than this CLI supports (max v${LATEST_SUPPORTED_VERSION})`,
-        );
+        ).toThrow("database is not the exact supported direct format");
         expect(writes).toEqual([]);
     });
 });

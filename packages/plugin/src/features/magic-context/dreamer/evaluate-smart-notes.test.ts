@@ -2,20 +2,17 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import { addNote, getNotes } from "../storage-notes";
+import { createDirectTestDatabase } from "../test-database";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import { acquireLease } from "./lease";
 
 const PROJECT = "git:evaluate-smart-notes-test";
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { unifiedSearch } from "../../src/features/magic-context/search";
-import { encodePhysicalResultLocator } from "../../src/features/magic-context/search-result-locator";
+import { encodePhysicalResultLocator } from "./physical-locator";
 import { closeQuietly } from "../../src/shared/sqlite-helpers";
 import { canonicalFingerprint } from "./canonical-json";
 import { loadReviewedRelease } from "./index";

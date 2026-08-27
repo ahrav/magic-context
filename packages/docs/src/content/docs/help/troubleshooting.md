@@ -61,6 +61,14 @@ npx @cortexkit/magic-context@latest doctor merge-identity \
 
 Without `--dry-run` or `--yes`, the command refuses to mutate `context.db`.
 
+**Limitation.** A merge completes only when the source identity owns no
+authoritative history of its own. If both identities are registered and the
+source owns episodes or claims, `--yes` refuses even though the dry-run
+succeeded, because merging would repoint claim history across projects and lose
+its derivation lineage. There is no relocation command to run instead yet, so
+treat this as unsupported rather than as a step to work around: keep using the
+two identities, and prefer the target identity for new work.
+
 ---
 
 ## Storage unavailable / schema fence error

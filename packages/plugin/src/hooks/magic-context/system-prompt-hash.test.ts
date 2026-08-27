@@ -33,7 +33,6 @@ import {
     REVIEW_USER_MEMORIES_SYSTEM_PROMPT,
 } from "../../features/magic-context/dreamer/task-prompts";
 import { VERIFY_SYSTEM_PROMPT } from "../../features/magic-context/dreamer/verify-prompt";
-import { MIGRATION_SYSTEM_PROMPT } from "../../features/magic-context/memory/memory-migration";
 import { SIDEKICK_SYSTEM_PROMPT } from "../../features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "../../features/magic-context/smart-notes/compiler-prompt";
 import {
@@ -653,6 +652,15 @@ describe("system-prompt-hash skips Magic Context internal child agents", () => {
         }
     });
 
+    it("does not forbid the project promotion its own verdict schema requests", () => {
+        // The reviewer's task text and output schema define `promote_project`.
+        // A system role that also says it must not touch project memories makes
+        // a compliant model omit the action, so promotion becomes
+        // provider-dependent or inert.
+        expect(REVIEW_USER_MEMORIES_SYSTEM_PROMPT).not.toMatch(/do NOT touch project memories/i);
+        expect(REVIEW_USER_MEMORIES_SYSTEM_PROMPT).toContain("promote_project");
+    });
+
     it("detects every dedicated Magic Context child prompt constant", () => {
         const prompts = [
             ["dreamer-base", DREAMER_SYSTEM_PROMPT],
@@ -667,7 +675,6 @@ describe("system-prompt-hash skips Magic Context internal child agents", () => {
             ["historian", COMPARTMENT_AGENT_SYSTEM_PROMPT],
             ["historian-recomp", COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT],
             ["historian-editor", HISTORIAN_EDITOR_SYSTEM_PROMPT],
-            ["memory-migration", MIGRATION_SYSTEM_PROMPT],
             ["sidekick", SIDEKICK_SYSTEM_PROMPT],
         ] as const;
 

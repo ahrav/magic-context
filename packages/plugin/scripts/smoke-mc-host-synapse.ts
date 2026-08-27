@@ -24,15 +24,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { insertMemory } from "../src/features/magic-context/memory/storage-memory";
 import { SynapseEmbeddingProvider } from "../src/features/magic-context/memory/embedding-synapse";
-import { runMigrations } from "../src/features/magic-context/migrations";
 import {
     applySynapseReceiptGroup,
     getSynapseLedgerPage,
 } from "../src/features/magic-context/storage-embedding-measurements";
-import { initializeDatabase } from "../src/features/magic-context/storage-db";
-import { Database } from "../src/shared/sqlite";
+import { createDirectTestDatabase } from "../src/features/magic-context/test-database";
 import { McHostClient } from "../src/shared/mc-host-client";
 
 const OVERALL_DEADLINE_MS = 180_000;
@@ -487,19 +484,15 @@ try {
     log("running the durable ledger application against a file-backed database");
     {
         const dbPath = join(dataDir, "smoke.sqlite");
-        const db = new Database(dbPath);
-        db.exec("PRAGMA foreign_keys=ON");
-        initializeDatabase(db);
-        runMigrations(db);
+        const { db } = createDirectTestDatabase({ path: dbPath });
+        // Scratch destination for the receipt application; the ledger contract
+        // is destination-agnostic through writeDestination().
+        db.exec(
+            "CREATE TABLE smoke_embedding_destination (item_id TEXT NOT NULL, embedding BLOB NOT NULL, model_id TEXT NOT NULL, PRIMARY KEY(item_id, model_id))",
+        );
 
         const projectPath = identity.project_root;
-        const memories = corpus.items.slice(0, 2).map((item) =>
-            insertMemory(db, {
-                projectPath,
-                category: "CONSTRAINTS",
-                content: item.text,
-            }),
-        );
+        const smokeItems = corpus.items.slice(0, 2);
         const provider = new SynapseEmbeddingProvider({
             connectionFile,
             projectRoot: projectPath,
@@ -507,10 +500,10 @@ try {
             model: lane.model,
         });
         assert.ok(await provider.initialize(), "provider must discover the certified lane");
-        const detailedItems = memories.map((memory, index) => ({
-            id: `memory:${memory.id}`,
-            text: corpus.items[index].text,
-            contentSha256: createHash("sha256").update(corpus.items[index].text).digest("hex"),
+        const detailedItems = smokeItems.map((item, index) => ({
+            id: `smoke-item:${index}`,
+            text: item.text,
+            contentSha256: createHash("sha256").update(item.text).digest("hex"),
             applicationGroup: "smoke-memory-group",
         }));
         const detailed = await provider.embedItemsDetailed(detailedItems, {
@@ -535,13 +528,12 @@ try {
                 new Map(ids.map((id) => [id, hashById.get(id) as string])),
             writeDestination: () => {
                 const insert = db.prepare(
-                    "INSERT INTO memory_embeddings (memory_id, embedding, model_id) VALUES (?, ?, ?)",
+                    "INSERT INTO smoke_embedding_destination (item_id, embedding, model_id) VALUES (?, ?, ?)",
                 );
                 for (const receipt of detailed.receipts) {
                     for (const [id, vector] of receipt.vectors) {
-                        const memoryId = Number(id.slice("memory:".length));
                         insert.run(
-                            memoryId,
+                            id,
                             Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength),
                             provider.modelId,
                         );
@@ -551,10 +543,10 @@ try {
         });
         const destinationCount = (
             db
-                .prepare("SELECT COUNT(*) AS count FROM memory_embeddings WHERE model_id = ?")
+                .prepare("SELECT COUNT(*) AS count FROM smoke_embedding_destination WHERE model_id = ?")
                 .get(provider.modelId) as { count: number }
         ).count;
-        assert.equal(destinationCount, memories.length);
+        assert.equal(destinationCount, smokeItems.length);
         for (const receipt of detailed.receipts) {
             const page = getSynapseLedgerPage(db, receipt.rowId);
             assert.equal(page?.state, "complete", "receipts complete with their destination");

@@ -11,7 +11,6 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { getMemoryCount } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
@@ -26,6 +25,7 @@ import {
 	resolveExecuteThresholdDetail,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { formatBytes } from "@magic-context/core/hooks/magic-context/format-bytes";
+import { readProjectClaimLaneSnapshot } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
@@ -456,6 +456,10 @@ export function buildPiStatusDetail(
 	const compartments = getCompartments(deps.db, sessionId);
 	const metaRow = readSessionMetaRow(deps.db, sessionId);
 	const memoryBlockCount = Number(metaRow?.memory_block_count ?? 0);
+	const claimLane = safeRead(
+		() => readProjectClaimLaneSnapshot(deps.db, deps.projectIdentity),
+		null,
+	);
 
 	// v2 m[0] per-block attribution via the SHARED core helper so the Pi dialog
 	// renders byte-identical categories to OpenCode's sidebar (Docs / User
@@ -598,10 +602,7 @@ export function buildPiStatusDetail(
 		inputTokens,
 		systemPromptTokens,
 		compartmentCount: compartments.length,
-		memoryCount: safeRead(
-			() => getMemoryCount(deps.db, deps.projectIdentity),
-			0,
-		),
+		memoryCount: claimLane?.items.length ?? 0,
 		memoryBlockCount,
 		sessionNoteCount: safeRead(
 			() =>

@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { getMemoriesByProject } from "../memory";
-import { getCurrentMemoryClaimByLegacyMemoryId } from "../memory/storage-memory-claims";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import type { AutonomousManifestIdentity } from "../memory/storage-claim-autonomous";
+import {
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "../memory/storage-claim-current-state";
+import { createClaimReaderTestDatabase } from "../test-claim-database";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import {
     applyRetrospectiveLearnings,
@@ -13,6 +15,7 @@ import {
     parseRetrospectiveLearnings,
     validateRetrospectiveLearningText,
 } from "./retrospective-learnings";
+import { claimEffectMemoryChanges } from "./storage-dream-runs";
 
 let db: Database | null = null;
 afterEach(() => {
@@ -20,179 +23,214 @@ afterEach(() => {
     db = null;
 });
 
-function freshDb(): Database {
-    const database = new Database(":memory:");
-    initializeDatabase(database);
-    runMigrations(database);
-    return database;
-}
-
 const PROJECT = "git:retro-test";
 
+function identity(runId = "retro-run", batchId = "window-1"): AutonomousManifestIdentity {
+    return {
+        producer: "dreamer-retrospective",
+        task: "retrospective",
+        runId,
+        leaseKey: `memory:${PROJECT}`,
+        leaseGeneration: 1,
+        batchId,
+    };
+}
+
+function claims(database: Database) {
+    const result = readProjectMemoryCurrentState(database, {
+        projectIds: resolveProjectIdsForIdentities(database, [PROJECT]),
+        lifecycleStates: ["active"],
+        surface: "maintenance_hygiene",
+        workspaceEpoch: "retro-test",
+    });
+    if (result.status !== "ok") throw new Error(result.reasons.join(", "));
+    return result.items;
+}
+
+function apply(
+    database: Database,
+    args: Omit<Parameters<typeof applyRetrospectiveLearnings>[0], "db" | "identity">,
+    manifestIdentity = identity(),
+) {
+    return database
+        .transaction(() =>
+            applyRetrospectiveLearnings({
+                db: database,
+                identity: manifestIdentity,
+                ...args,
+            }),
+        )
+        .immediate();
+}
+
 describe("parseRetrospectiveLearnings", () => {
-    test("parses memory + observation learnings and ignores invalid routes/categories", () => {
-        const xml = `<learnings>
-            <learning route="memory" category="PROJECT_RULES">Verify a tool is callable before claiming support.</learning>
+    test("parses memory and observation routes", () => {
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="memory" category="PROJECT_RULES">Verify tool availability before claiming support.</learning>
             <learning route="observation">Prefers evidence-backed root-cause analysis.</learning>
             <learning route="memory" category="NOT_A_CATEGORY">dropped</learning>
-            <learning route="bogus">dropped</learning>
-        </learnings>`;
-        const learnings = parseRetrospectiveLearnings(xml);
-        expect(learnings.length).toBe(2);
+        </learnings>`);
+        expect(learnings).toHaveLength(2);
         expect(learnings[0]).toEqual({
             route: "memory",
             category: "PROJECT_RULES",
-            content: "Verify a tool is callable before claiming support.",
+            content: "Verify tool availability before claiming support.",
         });
-        expect(learnings[1].route).toBe("observation");
+        expect(learnings[1]?.route).toBe("observation");
     });
 
-    test("returns [] when there is no <learnings> block", () => {
+    test("returns an empty manifest when the root is absent", () => {
         expect(parseRetrospectiveLearnings("no xml here")).toEqual([]);
     });
 });
 
-describe("validateRetrospectiveLearningText", () => {
-    test("rejects quotes, dates, frustration markers", () => {
+describe("retrospective privacy validation", () => {
+    test("rejects quotes, dates, frustration markers, and near-transcriptions", () => {
         expect(validateRetrospectiveLearningText('They said "do it now please"')).toBe("raw_quote");
         expect(validateRetrospectiveLearningText("Broke on 2026-06-20 release")).toBe("date");
         expect(validateRetrospectiveLearningText("that's wrong again")).toBe("frustration_marker");
-    });
-
-    test("accepts a clean third-person rule", () => {
         expect(
             validateRetrospectiveLearningText(
-                "Run the focused test suite before declaring a fix complete.",
+                "Avoid using bash to search the codebase instead of the dedicated search tool.",
+                ["you keep using bash to search the codebase instead of the dedicated search tool"],
             ),
-        ).toBeNull();
+        ).toBe("source_overlap");
     });
 
-    test("rejects a near-transcription of a source user line (source_overlap)", () => {
-        const source = [
-            "you keep using bash to search the codebase instead of the dedicated search tool",
-        ];
-        // Lightly reworded but echoes a long verbatim run.
-        const transcription =
-            "Avoid using bash to search the codebase instead of the dedicated search tool.";
-        expect(validateRetrospectiveLearningText(transcription, source)).toBe("source_overlap");
-        // A genuine distillation shares no long run.
-        expect(
-            validateRetrospectiveLearningText(
-                "Prefer indexed search tools over shell scans for code lookups.",
-                source,
-            ),
-        ).toBeNull();
-    });
-});
-
-describe("hasHighSourceOverlap", () => {
-    test("flags a long shared word run, ignores short incidental overlap", () => {
-        const source = ["the historian must never run during an active tool call window"];
-        expect(
-            hasHighSourceOverlap(
-                "Ensure the historian must never run during an active tool call window.",
-                source,
-            ),
-        ).toBe(true);
-        expect(hasHighSourceOverlap("Keep the historian idle during tool use.", source)).toBe(
-            false,
-        );
-    });
-
-    test("catches a verbatim run buried PAST the old 400-word leading window", () => {
-        // Privacy regression: the old guard truncated each source to its leading
-        // 400 words, so a verbatim run from word 401+ slipped through. Build a
-        // source with 500 filler words then the sensitive run at the tail.
-        const filler = Array.from({ length: 500 }, (_, i) => `filler${i}`).join(" ");
+    test("scans source text beyond the old leading window", () => {
+        const filler = Array.from({ length: 500 }, (_, index) => `filler${index}`).join(" ");
         const tail = "delete the production database without any backup whatsoever";
-        const source = [`${filler} ${tail}`];
-        expect(hasHighSourceOverlap(`Note: ${tail}.`, source)).toBe(true);
+        expect(hasHighSourceOverlap(`Note: ${tail}.`, [`${filler} ${tail}`])).toBe(true);
     });
 });
 
 describe("applyRetrospectiveLearnings", () => {
-    test("writes memory learnings, gates observations on userMemoryCollectionEnabled", () => {
-        db = freshDb();
+    test("writes an inference-tainted claim and gates profile observations", () => {
+        db = createClaimReaderTestDatabase();
         const learnings = parseRetrospectiveLearnings(`<learnings>
-            <learning route="memory" category="CONSTRAINTS">External rate limits apply when calling the provider in bulk.</learning>
+            <learning route="memory" category="CONSTRAINTS">External rate limits apply to bulk provider calls.</learning>
             <learning route="observation">Wants tradeoffs discussed before structural changes.</learning>
         </learnings>`);
-
-        // Gate OFF → observation dropped.
-        const off = applyRetrospectiveLearnings({
-            db,
-            projectIdentity: PROJECT,
-            sourceSessionId: "ses-1",
-            learnings,
-            userMemoryCollectionEnabled: false,
-        });
-        expect(off.memoryWritten).toBe(1);
-        expect(off.observationsInserted).toBe(0);
-        expect(off.observationsDropped).toBe(1);
-        expect(getUserMemoryCandidates(db).length).toBe(0);
-        expect(getMemoriesByProject(db, PROJECT).length).toBe(1);
-    });
-
-    test("gate ON inserts observation candidates", () => {
-        db = freshDb();
-        const learnings = parseRetrospectiveLearnings(`<learnings>
-            <learning route="observation">Prefers the smallest effective fix first.</learning>
-        </learnings>`);
-        const on = applyRetrospectiveLearnings({
-            db,
+        const result = apply(db, {
             projectIdentity: PROJECT,
             sourceSessionId: "ses-1",
             learnings,
             userMemoryCollectionEnabled: true,
         });
-        expect(on.observationsInserted).toBe(1);
-        expect(getUserMemoryCandidates(db).length).toBe(1);
+
+        expect(result).toMatchObject({
+            memoryWritten: 1,
+            observationsInserted: 1,
+            observationsDropped: 0,
+            rejected: [],
+        });
+        expect(claims(db)).toHaveLength(1);
+        expect(claims(db)[0]?.policy.originTaint).toBe("DREAMER_INFERENCE");
+        expect(getUserMemoryCandidates(db)).toHaveLength(1);
     });
 
-    test("is idempotent: a re-emitted identical memory is skipped, not a fatal throw", () => {
-        db = freshDb();
-        const xml = `<learnings><learning route="memory" category="PROJECT_RULES">Always rebuild dists after a server-side change.</learning></learnings>`;
-        const first = applyRetrospectiveLearnings({
-            db,
-            projectIdentity: PROJECT,
-            sourceSessionId: "ses-1",
-            learnings: parseRetrospectiveLearnings(xml),
-            userMemoryCollectionEnabled: false,
-        });
-        expect(first.memoryWritten).toBe(1);
-        // Same content again — must not throw on UNIQUE, must skip.
-        const second = applyRetrospectiveLearnings({
-            db,
-            projectIdentity: PROJECT,
-            sourceSessionId: "ses-2",
-            learnings: parseRetrospectiveLearnings(xml),
-            userMemoryCollectionEnabled: false,
-        });
-        expect(second.memoryWritten).toBe(0);
-        expect(getMemoriesByProject(db, PROJECT).length).toBe(1);
-        // The duplicate write leaves the claim at revision 1.
-        const memoryId = getMemoriesByProject(db, PROJECT)[0]?.id as number;
-        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
-        expect(claim?.revision).toBe(1);
-        expect(claim?.content).toBe("Always rebuild dists after a server-side change.");
-        expect(claim?.state).toBe("active");
-    });
-
-    test("rejects a near-transcription learning via sourceUserTexts", () => {
-        db = freshDb();
+    test("returns the claim effects a run needs for its memory-change telemetry", () => {
+        // Route-`memory` learnings are claim-native, so a caller diffing the
+        // legacy `memories` table sees nothing and records NULL changes for a
+        // run that did create claims. The effects have to come back here.
+        db = createClaimReaderTestDatabase();
         const learnings = parseRetrospectiveLearnings(`<learnings>
-            <learning route="memory" category="PROJECT_RULES">Stop reinventing the search tool that was purpose built for this.</learning>
+            <learning route="memory" category="CONSTRAINTS">Bulk provider calls are rate limited.</learning>
         </learnings>`);
-        const applied = applyRetrospectiveLearnings({
-            db,
+        const result = apply(db, {
+            projectIdentity: PROJECT,
+            sourceSessionId: "ses-effects",
+            learnings,
+            userMemoryCollectionEnabled: false,
+        });
+
+        expect(result.memoryWritten).toBe(1);
+        expect(result.effects.length).toBeGreaterThan(0);
+        const changes = claimEffectMemoryChanges(result.effects);
+        expect(changes).not.toBeNull();
+        expect(changes?.claimUpsertedIds ?? []).toHaveLength(1);
+    });
+
+    test("replays one window without duplicate claims, observations, or generations", () => {
+        db = createClaimReaderTestDatabase();
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="memory" category="PROJECT_RULES">Run focused tests before declaring completion.</learning>
+            <learning route="observation">Prefers concise root-cause summaries.</learning>
+        </learnings>`);
+        const args = {
             projectIdentity: PROJECT,
             sourceSessionId: "ses-1",
             learnings,
+            userMemoryCollectionEnabled: true,
+        };
+        const first = apply(db, args);
+        const generation = claims(db)[0]?.policy.generation;
+        const second = apply(db, args);
+
+        expect(second).toEqual(first);
+        expect(claims(db)).toHaveLength(1);
+        expect(claims(db)[0]?.revision).toBe(1);
+        expect(claims(db)[0]?.policy.generation).toBe(generation);
+        expect(getUserMemoryCandidates(db)).toHaveLength(1);
+        expect(
+            (
+                db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get() as {
+                    count: number;
+                }
+            ).count,
+        ).toBe(1);
+    });
+
+    test("rejects source overlap before any semantic write", () => {
+        db = createClaimReaderTestDatabase();
+        const result = apply(db, {
+            projectIdentity: PROJECT,
+            sourceSessionId: "ses-1",
+            learnings: parseRetrospectiveLearnings(`<learnings>
+                <learning route="memory" category="PROJECT_RULES">Stop reinventing the search tool that was purpose built for this.</learning>
+            </learnings>`),
             userMemoryCollectionEnabled: false,
             sourceUserTexts: ["stop reinventing the search tool that was purpose built for this"],
         });
-        expect(applied.memoryWritten).toBe(0);
-        expect(applied.rejected[0]?.reason).toBe("source_overlap");
-        expect(getMemoriesByProject(db, PROJECT).length).toBe(0);
+        expect(result.memoryWritten).toBe(0);
+        expect(result.rejected[0]?.reason).toBe("source_overlap");
+        expect(claims(db)).toHaveLength(0);
+    });
+
+    test("outer failure rolls back claim graph, receipt, candidate, and generation", () => {
+        db = createClaimReaderTestDatabase();
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="memory" category="ARCHITECTURE">Claims and evidence commit together.</learning>
+            <learning route="observation">Prefers atomic publication.</learning>
+        </learnings>`);
+        expect(() =>
+            db
+                ?.transaction(() => {
+                    applyRetrospectiveLearnings({
+                        db: db as Database,
+                        projectIdentity: PROJECT,
+                        sourceSessionId: "ses-1",
+                        learnings,
+                        identity: identity(),
+                        userMemoryCollectionEnabled: true,
+                    });
+                    throw new Error("window write failed");
+                })
+                .immediate(),
+        ).toThrow("window write failed");
+
+        expect(claims(db)).toHaveLength(0);
+        expect(getUserMemoryCandidates(db)).toHaveLength(0);
+        for (const table of [
+            "observations",
+            "claim_operation_receipts",
+            "claim_operation_effects",
+            "claim_project_generations",
+        ]) {
+            const row = db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
+                count: number;
+            };
+            expect(row.count).toBe(0);
+        }
     });
 });

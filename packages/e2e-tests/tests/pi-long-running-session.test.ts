@@ -3,14 +3,15 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
-import { insertMemory, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
+import { seedProjectMemoryClaim } from "../../plugin/src/features/magic-context/test-claim-database";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
-import { Database } from "../../plugin/src/shared/sqlite";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { PiTestHarness } from "../src/pi-harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
+
+type Database = ReturnType<typeof openTestDb>;
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -168,15 +169,11 @@ function writeDb(h: PiTestHarness, fn: (db: Database) => void): void {
 function seedMemory(h: PiTestHarness, content: string): void {
     const projectIdentity = resolveProjectIdentity(realpathSync(pathResolve(h.env.workdir)));
     writeDb(h, (db) => {
-        const seeded = insertMemory(db, {
-            projectPath: projectIdentity,
+        seedProjectMemoryClaim(db as unknown as Parameters<typeof seedProjectMemoryClaim>[0], {
+            projectIdentity,
             category: "PROJECT_RULES",
             content,
-            sourceType: "user",
         });
-        // Synchronous promotion: the async policy evaluator may not have
-        // marked the row eligible before the next turn renders memory.
-        updateMemoryVerification(db, seeded.id, "verified");
     });
 }
 

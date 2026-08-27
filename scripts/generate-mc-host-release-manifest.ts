@@ -481,25 +481,63 @@ export function sha256Hex(text: string): string {
 // ---------------------------------------------------------------------------
 
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+/**
+ * An inert R50 name reservation: exact semver carrying a prerelease identifier.
+ * The prerelease is what makes it inert — semver range resolution excludes
+ * prerelease versions unless the range itself carries a prerelease on the same
+ * version triple, so a dependent's `^`/`~` range can never select it. A bare
+ * label ("reserved") or an ordinary GA version is not evidence of a reservation
+ * and must not satisfy the gate.
+ */
+const RESERVATION_VERSION_RE =
+    /^\d+\.\d+\.\d+-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/;
 const DOTTED_FLOOR_RE = /^\d+\.\d+$/;
 
 function fail(message: string): never {
     throw new Error(`mc-host release contract: ${message}`);
 }
 
-function assertExactKeys(
-    obj: Record<string, unknown>,
+/**
+ * Build an exact-key asserter: the returned function requires an object to carry
+ * every key in `keys`, permits any key in `optional`, and rejects anything else,
+ * naming the first offending key.
+ *
+ * `subject` is the calling module's error prefix. The same assertion guards
+ * in-source contract literals here and operator-authored manifests in the U9
+ * qualifier, and an operator editing a source manifest must not be told the
+ * release contract is at fault, so each module binds its own reporter rather
+ * than sharing one prefix.
+ */
+export function exactKeysAsserter(
+    subject: string,
+): (
+    obj: unknown,
     keys: string[],
     where: string,
-): void {
-    const actual = Object.keys(obj).sort();
-    const expected = [...keys].sort();
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-        fail(
-            `${where} keys must be exactly ${expected.join(", ")}; got ${actual.join(", ")}`,
-        );
-    }
+    optional?: string[],
+) => void {
+    const reject = (message: string): never => {
+        throw new Error(`${subject}: ${message}`);
+    };
+    return (obj, keys, where, optional = []): void => {
+        if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+            reject(`${where} must be an object`);
+        }
+        // SAFETY: `obj` is a non-null, non-array object after the guard, and only
+        // its own enumerable keys are read.
+        const record = obj as Record<string, unknown>;
+        for (const key of Object.keys(record)) {
+            if (!keys.includes(key) && !optional.includes(key)) {
+                reject(`${where}: unknown key ${key}`);
+            }
+        }
+        for (const key of keys) {
+            if (!(key in record)) reject(`${where}: missing key ${key}`);
+        }
+    };
 }
+
+const assertExactKeys = exactKeysAsserter("mc-host release contract");
 
 function compareSemver(a: string, b: string): number {
     const pa = a.split(".").map(Number);
@@ -1151,9 +1189,15 @@ export function validateRegistryGate(
             ) {
                 gateFail(`missing inert reservation version for ${pkg.name}`);
             }
-            if (pkg.reservation_version === contract.release.version) {
+            // Presence alone is not evidence of inertness. A GA version is
+            // selectable by an ordinary dependent range, and a bare label is
+            // not a version at all; either would report R50 satisfied while
+            // leaving the name takeover-exposed. `release.version` is exact GA
+            // semver, so a prerelease can never collide with it and no separate
+            // inequality check is reachable.
+            if (!RESERVATION_VERSION_RE.test(pkg.reservation_version)) {
                 gateFail(
-                    `reservation version for ${pkg.name} must differ from the coordinated release version`,
+                    `reservation version ${pkg.reservation_version} for ${pkg.name} must be an inert prerelease (MAJOR.MINOR.PATCH-<prerelease>)`,
                 );
             }
         }
@@ -1176,19 +1220,98 @@ export interface PlatformProbe {
     glibc?: string;
     osVersion?: string;
     procfsSelfFdExec?: boolean;
+    devFdExec?: boolean;
 }
 
-function compareDotted(a: string, b: string): number {
-    const pa = a.split(".").map(Number);
-    const pb = b.split(".").map(Number);
-    const len = Math.max(pa.length, pb.length);
-    for (let i = 0; i < len; i++) {
-        const da = pa[i] ?? 0;
-        const db = pb[i] ?? 0;
-        if (da !== db) return da - db;
-        if (Number.isNaN(da) || Number.isNaN(db)) return Number.NaN;
+/**
+ * Compares a host-reported dotted version against a contract floor over the
+ * floor's precision. Host strings are messy in exactly the deployments the
+ * floors encode — `uname -r` reports `4.18.0-513.el8.x86_64` and glibc
+ * reports `2.28-236.el8` on the RHEL-8 floor — so each probe component
+ * contributes its leading integer and a component with no leading digits
+ * counts as 0 (conservative: it can only fail the floor, never satisfy it).
+ * Floors themselves are validated as clean dotted versions; a malformed
+ * floor yields NaN so `>= 0` checks fail closed.
+ *
+ * Exported so the input qualifier gates its oracle host against these same
+ * floors with this same comparator; two implementations could disagree about
+ * whether a host clears a floor.
+ */
+export function compareDotted(probe: string, floor: string): number {
+    const floorParts = floor.split(".").map(Number);
+    const probeParts = probe.split(".").map((part) => {
+        const digits = /^\d+/.exec(part);
+        return digits === null ? 0 : Number(digits[0]);
+    });
+    for (let i = 0; i < floorParts.length; i++) {
+        const df = floorParts[i] ?? 0;
+        if (Number.isNaN(df)) return Number.NaN;
+        const dp = probeParts[i] ?? 0;
+        if (dp !== df) return dp - df;
     }
     return 0;
+}
+
+/**
+ * True when `probe` is at or above the dotted `floor`.
+ *
+ * `compareDotted` alone is not that predicate. It reads each component's leading
+ * digit run and scores a missing or non-numeric component as 0, which admits two
+ * kinds of value that do not actually clear a floor:
+ *
+ *   - Values shorter than the floor, compared as if their absent components were
+ *     zeros, so one high component decides the result alone: `999garbage` clears
+ *     `4.18` without ever naming a minor version.
+ *   - Prerelease builds, whose marker is discarded: `4.18-rc1` scores exactly
+ *     equal to `4.18` even though a release candidate precedes it.
+ *
+ * So one digit-led component per floor component is required, and at equality a
+ * prerelease marker disqualifies. A numeric release suffix means the opposite of a
+ * prerelease — `2.28-236.el8` is 2.28 plus patches — so the two are separated by
+ * the marker, not by shape, and the marker only counts while the version is still
+ * exactly at the floor: components are scanned until one beyond the floor's
+ * precision carries a non-zero number, the point the version has genuinely moved
+ * past it. `4.18.0-rc2` is therefore rejected and `4.18.1-rc2` is not.
+ *
+ * Both the U8 platform gate and the U9 oracle-host check call this. That is the
+ * point: sharing only `compareDotted` let the qualifier add these guards while
+ * `evaluatePlatform` kept a bare `>= 0`, so the two disagreed about the same host
+ * — exactly what sharing the comparator was meant to prevent.
+ */
+export function meetsDottedFloor(probe: unknown, floor: string): boolean {
+    if (typeof probe !== "string" || probe.length === 0) return false;
+    const parts = probe.split(".");
+    const floorParts = floor.split(".");
+    if (parts.length < floorParts.length) return false;
+    // Shape, not just a leading digit. `compareDotted` reads the digit run and
+    // discards the rest, so `999garbage` scores 999 and a component that is digits
+    // welded to letters passes as a version. Require digits, then either nothing or
+    // a separator before whatever follows — which is every real distro spelling
+    // (`0-513`, `28-236`) and none of the malformed ones. Only the components the
+    // floor actually compares are constrained; beyond its precision live `el8` and
+    // `x86_64`, which are not version numbers at all.
+    for (let i = 0; i < floorParts.length; i++) {
+        // `.+`, not `.*`: a separator with nothing after it (`4.18-`, `2.28+`) is not
+        // a suffix, and `compareDotted` would read the digits and ignore the dangling
+        // separator entirely.
+        if (!/^\d+(?:[-+._~].+)?$/.test(parts[i] ?? "")) return false;
+    }
+    const ordering = compareDotted(probe, floor);
+    if (Number.isNaN(ordering) || ordering < 0) return false;
+    if (ordering !== 0) return true;
+    for (const [index, part] of parts.entries()) {
+        if (index >= floorParts.length) {
+            const leading = /^\d*/.exec(part)?.[0] ?? "";
+            if (Number(leading || "0") > 0) break;
+        }
+        // Every separator the shape check above admits, not just `-` and `.`:
+        // `4.18~rc1` and `13.5_rc1` are prereleases too, and accepting a separator
+        // in one regex while the other ignores it is how they slipped through.
+        if (/^\d*[-+._~]?(?:rc|pre|alpha|beta|dev|snapshot)/i.test(part)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /** Evaluate a host probe against the contract's platform capability table. */
@@ -1212,16 +1335,10 @@ export function evaluatePlatform(
             (p) => p.target === "linux-x64-gnu",
         );
         if (linux === undefined || !("kernel_min" in linux)) return unsupported;
-        if (
-            probe.kernel === undefined ||
-            !(compareDotted(probe.kernel, linux.kernel_min) >= 0)
-        ) {
+        if (!meetsDottedFloor(probe.kernel, linux.kernel_min)) {
             return unsupported;
         }
-        if (
-            probe.glibc === undefined ||
-            !(compareDotted(probe.glibc, linux.glibc_min) >= 0)
-        ) {
+        if (!meetsDottedFloor(probe.glibc, linux.glibc_min)) {
             return unsupported;
         }
         if (probe.procfsSelfFdExec !== true) return unsupported;
@@ -1243,9 +1360,20 @@ export function evaluatePlatform(
             (p) => p.target === target,
         );
         if (mac === undefined || !("os_min" in mac)) return unsupported;
+        if (!meetsDottedFloor(probe.osVersion, mac.os_min)) {
+            return unsupported;
+        }
+        // Each macOS row requires `capabilities.dev_fd_exec`, the Darwin
+        // counterpart of the Linux `procfs_self_fd_exec` gate: the retained
+        // native payload is executed through a descriptor, so a host that
+        // cannot do that must read as unsupported here rather than failing at
+        // exec time. Absent evidence is not proof of the capability, so an
+        // omitted probe field is unsupported, exactly as on Linux.
         if (
-            probe.osVersion === undefined ||
-            !(compareDotted(probe.osVersion, mac.os_min) >= 0)
+            "capabilities" in mac &&
+            "dev_fd_exec" in mac.capabilities &&
+            mac.capabilities.dev_fd_exec === true &&
+            probe.devFdExec !== true
         ) {
             return unsupported;
         }
@@ -1342,6 +1470,70 @@ export function validateStopProvenance(
         return invalid(
             "predecessor record must carry exactly its required fields",
         );
+    }
+    // `release_version` binds the record to the release that is claiming stop
+    // authority, exactly as it does for genesis; the predecessor's own identity
+    // travels in `predecessor_release_version`. Without this check a record
+    // minted under a different release grants legacy stop authority under this
+    // contract.
+    if (rec.release_version !== contract.release.version) {
+        return invalid("predecessor must bind the current release identity");
+    }
+    // Presence is not validity. This is the consumer-facing gate for the only
+    // tag that grants legacy stop authority, so every bound field is checked
+    // for type, and each field whose value the contract fixes is bound to it.
+    // The loop above only proves a key is present and not `""`, which admits
+    // `false`, `0`, and structurally wrong values.
+    const nonEmptyString = (field: string): string | null => {
+        const value = rec[field];
+        return typeof value === "string" && value.length > 0 ? value : null;
+    };
+    if (rec.legacy_proof_version !== contract.proof.legacy_stop_only.version) {
+        return invalid(
+            "predecessor must carry the contract's legacy stop-only proof version",
+        );
+    }
+    const target = nonEmptyString("target");
+    if (target === null) {
+        return invalid("predecessor target must be a nonempty string");
+    }
+    if (!contract.platforms.supported.some((row) => row.target === target)) {
+        return invalid(`predecessor target ${target} is not a supported platform`);
+    }
+    if (nonEmptyString("payload_manifest_digest") === null) {
+        return invalid(
+            "predecessor payload_manifest_digest must be a nonempty string",
+        );
+    }
+    const predecessorRelease = nonEmptyString("predecessor_release_version");
+    if (predecessorRelease === null || !SEMVER_RE.test(predecessorRelease)) {
+        return invalid("predecessor_release_version must be exact semver");
+    }
+    // `proof.legacy_stop_only.adjacent_release_only` limits legacy stop
+    // authority to the release immediately preceding this one, but the contract
+    // states no predecessor version, so exact adjacency is not derivable here.
+    // Enforce the half that is: a predecessor must be strictly older than the
+    // release claiming authority, which rejects a record naming this release or
+    // a newer one as its own predecessor.
+    if (compareSemver(predecessorRelease, contract.release.version) >= 0) {
+        return invalid(
+            "predecessor_release_version must be older than the current release",
+        );
+    }
+    const predecessorDaemon = nonEmptyString("predecessor_daemon_version");
+    if (
+        predecessorDaemon === null ||
+        !/^mc-host\/\d+\.\d+\.\d+$/.test(predecessorDaemon)
+    ) {
+        return invalid("predecessor_daemon_version must be mc-host/<semver>");
+    }
+    const manifest = rec.predecessor_manifest;
+    if (
+        manifest === null ||
+        typeof manifest !== "object" ||
+        Array.isArray(manifest)
+    ) {
+        return invalid("predecessor_manifest must be an object");
     }
     return { valid: true, legacyStopAuthority: true };
 }

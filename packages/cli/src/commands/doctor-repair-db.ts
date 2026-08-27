@@ -5,28 +5,43 @@ import {
     constants,
     copyFileSync,
     existsSync,
+    mkdtempSync,
     openSync,
     renameSync,
     rmSync,
     statSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-authority";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import {
+    composeRegisteredSchema,
+    computeExpectedDirectFormat,
+} from "@magic-context/core/features/magic-context/storage-current-schema";
 import {
     getPersistedSchemaVersion,
-    initializeDatabase,
     inspectRpcServerDiscovery,
 } from "@magic-context/core/features/magic-context/storage-db";
+import {
+    buildDirectFormatMarker,
+    classifyDatabaseFormatFamily,
+    createDirectFormatMarkerSchema,
+    databaseResetMarkerPath,
+    type FormatFamilyClassification,
+    inspectDatabaseForClassification,
+    MC_APPLICATION_ID,
+    readDirectFormatMarker,
+    stampDirectFormatMarker,
+} from "@magic-context/core/features/magic-context/storage-format-epoch";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { inspectLivePiProcesses } from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
+import { DATABASE_RESET_COMMAND } from "../lib/database-repair-guidance";
 import { type PromptIO, promptIO } from "../lib/prompts";
 
-const ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"] as const;
+const ROW_COUNT_TABLES = ["tags", "compartments", "claims", "notes", "dream_runs"] as const;
 const DATABASE_SUFFIXES = ["", "-wal", "-shm"] as const;
-const RECOGNIZABLE_TABLES = [...ROW_COUNT_TABLES, "schema_migrations"] as const;
 
 export const REPAIR_DB_EXIT = {
     salvaged: 0,
@@ -70,7 +85,7 @@ interface SalvageResult {
     schemaVersionAfter?: number;
 }
 
-function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
+export function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
     const rpc = inspectRpcServerDiscovery(storageDir);
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";
@@ -97,6 +112,36 @@ function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
 
 export function defaultSqliteExecutable(): string {
     return process.env.MAGIC_CONTEXT_SQLITE3 ?? "sqlite3";
+}
+
+function classifyOpenDatabase(db: DatabaseType, path: string): FormatFamilyClassification {
+    return classifyDatabaseFormatFamily(
+        inspectDatabaseForClassification(db, path),
+        computeExpectedDirectFormat(),
+    );
+}
+
+// A read-only SQLite open can rewrite an existing SHM file, so the probe runs
+// against a private scratch copy of the family. Unreadable contents return
+// null; migrateAndCheckRecoveredDatabase re-validates after `.recover`.
+function classifyDatabaseFamily(dbPath: string): FormatFamilyClassification | null {
+    let probeDir: string | null = null;
+    let db: DatabaseType | null = null;
+    try {
+        probeDir = mkdtempSync(join(tmpdir(), "mc-repair-format-probe-"));
+        const probePath = join(probeDir, "probe.db");
+        for (const suffix of DATABASE_SUFFIXES) {
+            const source = `${dbPath}${suffix}`;
+            if (existsSync(source)) copyFileSync(source, `${probePath}${suffix}`);
+        }
+        db = new Database(probePath, { readonly: true });
+        return classifyOpenDatabase(db, probePath);
+    } catch {
+        return null;
+    } finally {
+        db?.close();
+        if (probeDir !== null) rmSync(probeDir, { recursive: true, force: true });
+    }
 }
 
 const DEFAULT_DEPS: RepairDbDeps = {
@@ -293,21 +338,34 @@ function migrateAndCheckRecoveredDatabase(path: string): SalvageResult {
     let db: DatabaseType | null = null;
     try {
         db = new Database(path);
-        const recognized = db
-            .prepare(
-                `SELECT name FROM sqlite_master WHERE type='table' AND name IN (${RECOGNIZABLE_TABLES.map(() => "?").join(",")})`,
-            )
-            .all(...RECOGNIZABLE_TABLES) as Array<{ name?: string }>;
-        if (recognized.length === 0) {
+        db.exec("PRAGMA busy_timeout=5000");
+        db.exec("PRAGMA foreign_keys=ON");
+        const marker = readDirectFormatMarker(db);
+        if (marker.status !== "present") {
+            const why = marker.status === "malformed" ? ` (${marker.reason})` : "";
             return {
                 ok: false,
-                detail: ".recover found no recognizable Magic Context schema or user tables",
+                detail:
+                    `the recovered contents carry no valid direct-format marker${why}; ` +
+                    `this command repairs only the supported direct claims format — run \`${DATABASE_RESET_COMMAND}\` to abandon the family`,
+            };
+        }
+        // Restore application_id and user_version before classifying.
+        // pi-lens-ignore: sql-injection
+        db.exec(`PRAGMA application_id = ${MC_APPLICATION_ID}`);
+        // pi-lens-ignore: sql-injection
+        db.exec(`PRAGMA user_version = ${marker.marker.formatEpoch}`);
+        const classification = classifyOpenDatabase(db, path);
+        if (classification.family !== "current") {
+            return {
+                ok: false,
+                detail:
+                    `the recovered database is not the exact current direct format (${classification.family}): ` +
+                    `${classification.reasons.join("; ")} — run \`${DATABASE_RESET_COMMAND}\` to abandon the family`,
             };
         }
 
         const schemaVersionBefore = getPersistedSchemaVersion(db);
-        initializeDatabase(db);
-        runMigrations(db);
         ensureContextStoreUuid(db);
         const schemaVersionAfter = getPersistedSchemaVersion(db);
         const errors = integrityErrors(db);
@@ -350,9 +408,24 @@ function prepareFreshDatabase(path: string): SalvageResult {
     let db: DatabaseType | null = null;
     try {
         db = new Database(path);
+        db.exec("PRAGMA busy_timeout=5000");
+        db.exec("PRAGMA foreign_keys=ON");
         const schemaVersionBefore = getPersistedSchemaVersion(db);
-        initializeDatabase(db);
-        runMigrations(db);
+        const expected = computeExpectedDirectFormat();
+        const fresh = db;
+        fresh
+            .transaction(() => {
+                composeRegisteredSchema(fresh);
+                createDirectFormatMarkerSchema(fresh);
+                stampDirectFormatMarker(
+                    fresh,
+                    buildDirectFormatMarker({
+                        componentManifestDigest: expected.componentManifestDigest,
+                        createdAtMs: Date.now(),
+                    }),
+                );
+            })
+            .immediate();
         ensureContextStoreUuid(db);
         const schemaVersionAfter = getPersistedSchemaVersion(db);
         const errors = integrityErrors(db);
@@ -429,6 +502,9 @@ function printHelp(): void {
     console.log(
         "Salvage needs a sqlite3 shell built with SQLITE_ENABLE_DBPAGE_VTAB; without one, the command backs up and stops without modifying the database.",
     );
+    console.log(
+        "Legacy-format, unsupported, and reset-pending databases are refused; use `magic-context doctor reset-db` for those.",
+    );
 }
 
 export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<RepairDbExitCode> {
@@ -449,8 +525,34 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
         return REPAIR_DB_EXIT.failed;
     }
 
+    // Repair salvages only the supported direct claims format.
+    if (existsSync(databaseResetMarkerPath(dbPath))) {
+        prompts.log.error(`A database reset is pending for this family: ${dbPath}`);
+        prompts.log.info(
+            `Complete or roll back the reset first: run \`${DATABASE_RESET_COMMAND}\`. No salvage was attempted and no file was changed.`,
+        );
+        prompts.outro("Database repair refused; a reset is pending");
+        return REPAIR_DB_EXIT.refused;
+    }
+
     const initialInspection = deps.inspectHolders(storageDir);
     if (!initialInspection.safe) return reportSafetyRefusal(prompts, dbPath, initialInspection);
+
+    const familyClassification = classifyDatabaseFamily(dbPath);
+    if (
+        familyClassification !== null &&
+        familyClassification.family !== "current" &&
+        familyClassification.family !== "malformed-marker"
+    ) {
+        prompts.log.error(
+            `This database is not the supported direct claims format (${familyClassification.family}): ${familyClassification.reasons.join("; ")}`,
+        );
+        prompts.log.info(
+            `doctor repair-db repairs only the supported direct claims format. For a legacy or unsupported family the only supported action is an explicit reset: run \`${DATABASE_RESET_COMMAND}\`. No salvage was attempted and no file was changed.`,
+        );
+        prompts.outro("Database repair refused; use doctor reset-db");
+        return REPAIR_DB_EXIT.refused;
+    }
 
     let backup: BackupBundle;
     try {
@@ -576,7 +678,11 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
         }
     }
 
-    removeRecoveryBundle(recoveredPath);
+    // Keep the salvaged bundle. `.recover` emits a `lost_and_found` table
+    // whenever page-to-table attribution is lost, and the exact-inventory gate
+    // refuses any unregistered object, so the recoveries that salvage the most
+    // rows are precisely the ones that fail classification. Deleting them here
+    // would discard that data before the operator ever sees it.
     const unavailableAfter = Object.fromEntries(
         ROW_COUNT_TABLES.map((table) => [table, null]),
     ) as RowCounts;
@@ -587,6 +693,11 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
     );
     prompts.log.info(`Database remains unchanged: ${dbPath}`);
     prompts.log.info(`Backup base: ${backup.basePath}`);
+    if (existsSync(recoveredPath)) {
+        prompts.log.warn(
+            `Salvaged contents retained for inspection: ${recoveredPath}. This command installs only the exact registered direct format, so a recovery carrying extra objects (for example a \`lost_and_found\` table from unattributed pages) is not installed automatically. Inspect it with \`sqlite3 ${recoveredPath} '.tables'\` before deciding; delete it once you no longer need it.`,
+        );
+    }
 
     const confirmed = await prompts.confirm(
         "Salvage failed. Move the corrupt database aside and create a fresh empty database? This discards all unrecovered data from the active database.",

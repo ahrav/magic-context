@@ -25,11 +25,14 @@ import {
     saveCommitEmbedding,
     upsertCommits,
 } from "../../src/features/magic-context/git-commits";
-import { insertMemory, saveEmbedding } from "../../src/features/magic-context/memory";
+import {
+    createBenchmarkMemoryFixtureTables,
+    insertBenchmarkMemory,
+    saveMemoryVector,
+} from "./memory-vector-store";
 import { ensureMessagesIndexed } from "../../src/features/magic-context/message-index";
-import { runMigrations } from "../../src/features/magic-context/migrations";
-import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
-import { initializeDatabase } from "../../src/features/magic-context/storage-db";
+import { SOURCE_LOCATOR_KIND } from "./physical-locator";
+import { createDirectTestDatabase } from "../../src/features/magic-context/test-database";
 import { addNote } from "../../src/features/magic-context/storage-notes";
 import { createPrimer } from "../../src/features/magic-context/storage-primers";
 import type { RawMessage } from "../../src/hooks/magic-context/read-session-raw";
@@ -379,10 +382,9 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
     }
 
     const startedAt = clock();
-    const db = new Database(databasePath);
+    const db = createDirectTestDatabase({ path: databasePath }).db;
     try {
-        initializeDatabase(db);
-        runMigrations(db);
+        createBenchmarkMemoryFixtureTables(db);
 
         const entries: SeedManifestEntry[] = [];
         const sessionKeys = new Map<string, { projectScope: string; sessionScope: string | null }>();
@@ -466,10 +468,9 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
 
         for (const plan of byKind("memory").sort(numericAscending)) {
             advanceIdCursor(db, "memories", Number(plan.alias.locator) - 1);
-            // insertMemory otherwise stamps wall-clock timestamps, and the
-            // v80 telemetry freeze forbids rewriting them after insert —
-            // identical seeds must produce identical row bytes.
-            const memory = insertMemory(db, {
+            // Identical seeds must produce identical row bytes, so the
+            // fixture insert stamps the deterministic seed epoch.
+            const memory = insertBenchmarkMemory(db, {
                 projectPath: plan.alias.projectScope,
                 category: "ARCHITECTURE_DECISIONS",
                 content: documentText(plan.document.semanticPayload),
@@ -482,7 +483,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             });
             verifyEmittedId(plan, memory.id);
             const vector = documentVector(plan.document);
-            saveEmbedding(db, memory.id, vector, BENCHMARK_EMBEDDING_MODEL_ID);
+            saveMemoryVector(db, memory.id, vector, BENCHMARK_EMBEDDING_MODEL_ID);
             record(plan, null, null, vector.byteLength);
         }
 
@@ -740,7 +741,7 @@ function seedSyntheticStream(
         }
         if (kind === "memory") {
             batch.push(() => {
-                const memory = insertMemory(db, {
+                const memory = insertBenchmarkMemory(db, {
                     projectPath: args.projectScope,
                     category: "ARCHITECTURE_DECISIONS",
                     content: documentText(document),
@@ -749,7 +750,7 @@ function seedSyntheticStream(
                     // seeding loop above.
                     sourceType: "user",
                 });
-                saveEmbedding(
+                saveMemoryVector(
                     db,
                     memory.id,
                     deterministicVector(document.id, args.dims),

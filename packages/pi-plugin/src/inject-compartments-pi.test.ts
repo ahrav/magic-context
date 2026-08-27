@@ -3,24 +3,29 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { formatRevisionLocator } from "@magic-context/core/features/magic-context/memory/claim-operation-contract";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
-	archiveMemory,
-	getMemoriesByProject,
-	insertMemory as insertMemoryRaw,
-} from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
+	computeProjectMemoryMutationToken,
+	getProjectMemoryClaimByPublicId,
+	reviseProjectMemoryClaim,
+	setProjectMemoryClaimLifecycle,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
-	queueMemoryMutation,
 	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
+import {
+	type SeededProjectMemoryClaim,
+	seedProjectMemoryClaim,
+} from "@magic-context/core/features/magic-context/test-claim-database";
 import {
 	getActiveUserMemories,
 	insertUserMemory,
 } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import { COMPARTMENT_RENDER_EPOCH } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
+import { readProjectClaimLaneSnapshot } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	__test,
@@ -33,10 +38,106 @@ import {
 } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
-// Policy reclassification: automatic injection requires effective-VERIFIED
-// rows, so these fixtures use explicit-user origin memories.
-const insertMemory: typeof insertMemoryRaw = (db, input) =>
-	insertMemoryRaw(db, { sourceType: "user", ...input });
+const seededClaims = new WeakMap<
+	ReturnType<typeof createTestDb>,
+	Map<number, SeededProjectMemoryClaim>
+>();
+
+let testMemoryId = 0;
+
+function insertMemory(
+	db: ReturnType<typeof createTestDb>,
+	input: {
+		projectPath: string;
+		category: string;
+		content: string;
+		importance?: number;
+		expiresAt?: number | null;
+		sourceType?: string;
+	},
+): { id: number } {
+	testMemoryId += 1;
+	const claim = seedProjectMemoryClaim(db, {
+		projectIdentity: input.projectPath,
+		content: input.content,
+		category: input.category,
+		...(input.importance == null ? {} : { importance: input.importance }),
+		...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+	});
+	const byMemoryId =
+		seededClaims.get(db) ?? new Map<number, SeededProjectMemoryClaim>();
+	byMemoryId.set(testMemoryId, claim);
+	seededClaims.set(db, byMemoryId);
+	return { id: testMemoryId };
+}
+
+function seededClaim(
+	db: ReturnType<typeof createTestDb>,
+	memoryId: number,
+): SeededProjectMemoryClaim {
+	const claim = seededClaims.get(db)?.get(memoryId);
+	if (!claim) throw new Error(`missing seeded claim for memory ${memoryId}`);
+	return claim;
+}
+
+function refreshSeededClaim(
+	db: ReturnType<typeof createTestDb>,
+	memoryId: number,
+): void {
+	const claim = seededClaim(db, memoryId);
+	const current = getProjectMemoryClaimByPublicId(db, claim.publicClaimId);
+	if (!current) throw new Error(`missing revised claim ${claim.publicClaimId}`);
+	seededClaims.get(db)?.set(memoryId, {
+		...claim,
+		revision: current.revision,
+		contentDigest: current.contentDigest,
+		revisionLocator: formatRevisionLocator({
+			publicClaimId: current.publicClaimId,
+			revision: current.revision,
+			contentDigest: current.contentDigest,
+		}),
+		token: computeProjectMemoryMutationToken(db, claim.publicClaimId),
+	});
+}
+
+function makeSeededClaimShareable(
+	db: ReturnType<typeof createTestDb>,
+	memoryId: number,
+): void {
+	const claim = seededClaim(db, memoryId);
+	reviseProjectMemoryClaim(
+		db,
+		{ producer: "test", operationKey: `share-${claim.publicClaimId}` },
+		{
+			token: computeProjectMemoryMutationToken(db, claim.publicClaimId),
+			sharing: "shareable",
+			provenance: {
+				sourceLocator: `transcript://share/${claim.publicClaimId}`,
+				sourceContent: "share fixture",
+				extractor: "historian",
+				extractorVersion: "1",
+				extractorRunId: `share-${claim.publicClaimId}`,
+				independenceKey: `share-${claim.publicClaimId}`,
+				sourceTrustClass: "explicit_user",
+			},
+			actor: "user:test",
+		},
+	);
+	refreshSeededClaim(db, memoryId);
+}
+
+function archiveSeededClaim(
+	db: ReturnType<typeof createTestDb>,
+	memoryId: number,
+): void {
+	const claim = seededClaim(db, memoryId);
+	setProjectMemoryClaimLifecycle(
+		db,
+		{ producer: "test", operationKey: `archive-${claim.publicClaimId}` },
+		{ token: claim.token, state: "archived", actor: "user:test" },
+	);
+	refreshSeededClaim(db, memoryId);
+}
 
 function projectMemoryEpochOf(
 	db: ReturnType<typeof createTestDb>,
@@ -102,11 +203,7 @@ describe("workspace memory sharing", () => {
 				category: "CONSTRAINTS",
 				content: "foreign constraint is shared",
 			});
-			runInMemoryClaimsWriteTransaction(db, () =>
-				db
-					.prepare("UPDATE memories SET shareable = 1 WHERE id = ?")
-					.run(shared.id),
-			);
+			makeSeededClaimShareable(db, shared.id);
 			insertMemory(db, {
 				projectPath: "git:foreign",
 				category: "NAMING",
@@ -333,12 +430,14 @@ describe("trimPiMessagesToBoundary", () => {
 				frozenCompartments,
 				frozenUserProfile,
 			);
+			const claimLane = readProjectClaimLaneSnapshot(db, state.projectIdentity);
+			if (!claimLane) throw new Error("missing claim lane");
 			const m1 = renderM1Pi(state, db, {
+				claimFormatEpoch: 1,
+				claimSnapshotVector: claimLane.snapshotVector,
+				renderedRevisionLocators: [],
 				maxCompartmentSeq: 1,
-				maxMemoryId: 0,
 				maxMutationId: 0,
-				maxMemoryMutationId: 0,
-				projectMemoryEpoch: 0,
 				projectUserProfileVersion: 0,
 				projectDocsHash: "",
 				sessionFactsVersion: 0,
@@ -1108,280 +1207,136 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
-	it("replays byte-identical m[1] on defer and surfaces additive memory on next cache-busting pass", () => {
+	it("folds a new claim into m[0] when its snapshot vector changes", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-additive-stable-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-claim-additive-fold-"));
 		try {
-			const state = piState("ses-pi-m1-additive-stable", cwd);
-			appendCompartments(db, state.sessionId, [
-				{
-					sequence: 1,
-					startMessage: 1,
-					endMessage: 1,
-					startMessageId: "m0",
-					endMessageId: "m0",
-					title: "large baseline",
-					content: "baseline ".repeat(300),
-				},
-			]);
+			const state = piState("ses-pi-claim-additive-fold", cwd);
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "Large baseline memory. ".repeat(300),
-				sourceType: "user",
+				content: "Initial Pi claim.",
 			});
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
-			const initialM1 = textOf(first[1] as never);
-			const epochBeforeAdditive = projectMemoryEpochOf(
-				db,
-				state.projectIdentity,
-			);
+			const initialM0 = textOf(first[0] as never);
 
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "New additive memory appears only after a bust.",
-				sourceType: "user",
+				content: "New claim folds after vector change.",
 			});
-			// Linking an immediately auto-eligible memory bumps the project
-			// memory epoch, which would rematerialize m0 on the next bust and
-			// absorb the memory there. Pin the epoch back so this test keeps
-			// exercising the memory-id additive m[1] lane in isolation.
-			setProjectState(db, state.projectIdentity, {
-				projectMemoryEpoch: epochBeforeAdditive,
-			});
-
-			const deferOne = [userMessage("defer one", 11)];
-			injectM0M1Pi(state, db, deferOne as never, undefined, false);
-			const deferTwo = [userMessage("defer two", 12)];
-			injectM0M1Pi(state, db, deferTwo as never, undefined, false);
-
-			expect(textOf(deferOne[1] as never)).toBe(initialM1);
-			expect(textOf(deferTwo[1] as never)).toBe(initialM1);
-			expect(initialM1).not.toContain("New additive memory");
-
-			const bust = [userMessage("bust", 13)];
-			injectM0M1Pi(state, db, bust as never, undefined, true);
-			expect(textOf(bust[1] as never)).toContain("<new-memories>");
-			expect(textOf(bust[1] as never)).toContain(
-				"New additive memory appears only after a bust.",
+			const folded = [userMessage("fold", 11)];
+			const foldResult = injectM0M1Pi(
+				state,
+				db,
+				folded as never,
+				undefined,
+				false,
 			);
+			expect(foldResult.m0Materialized).toBe(true);
+			expect(textOf(folded[0] as never)).toContain(
+				"New claim folds after vector change.",
+			);
+			expect(textOf(folded[0] as never)).not.toBe(initialM0);
+
+			const replay = [userMessage("replay", 12)];
+			const replayResult = injectM0M1Pi(
+				state,
+				db,
+				replay as never,
+				undefined,
+				false,
+			);
+			expect(replayResult.m0Materialized).toBe(false);
+			expect(textOf(replay[0] as never)).toBe(textOf(folded[0] as never));
 		} finally {
 			closeQuietly(db);
 		}
 	});
 
-	it("renders archive removals for m0-resident memory only on cache-busting pass and replays them on defer", () => {
+	it("folds an archived claim out of m[0] when its snapshot vector changes", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-archive-delta-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-claim-archive-fold-"));
 		try {
-			const state = piState("ses-pi-m1-archive-delta", cwd);
-			appendCompartments(db, state.sessionId, [
-				{
-					sequence: 1,
-					startMessage: 1,
-					endMessage: 1,
-					startMessageId: "m0",
-					endMessageId: "m0",
-					title: "large baseline",
-					content: "baseline ".repeat(300),
-				},
-			]);
+			const state = piState("ses-pi-claim-archive-fold", cwd);
 			const memory = insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "Baseline memory to remove from m0. ".repeat(300),
-				sourceType: "user",
+				content: "Claim removed by lifecycle fold.",
 			});
-			injectM0M1Pi(
+			const first = [userMessage("hello", 10)];
+			injectM0M1Pi(state, db, first as never, undefined, true);
+			expect(textOf(first[0] as never)).toContain(
+				"Claim removed by lifecycle fold.",
+			);
+
+			archiveSeededClaim(db, memory.id);
+			const folded = [userMessage("fold", 11)];
+			const foldResult = injectM0M1Pi(
 				state,
 				db,
-				[userMessage("hello", 10)] as never,
+				folded as never,
 				undefined,
-				true,
+				false,
 			);
-
-			db.transaction(() => {
-				archiveMemory(db, memory.id);
-				queueMemoryMutation(db, {
-					projectPath: state.projectIdentity,
-					mutationType: "archive",
-					targetMemoryId: memory.id,
-					queuedAt: 10,
-				});
-			})();
-
-			const defer = [userMessage("defer", 11)];
-			injectM0M1Pi(state, db, defer as never, undefined, false);
-			expect(textOf(defer[1] as never)).not.toContain("<memory-updates>");
-
-			const bust = [userMessage("bust", 12)];
-			injectM0M1Pi(state, db, bust as never, undefined, true);
-			const m1 = textOf(bust[1] as never);
-			expect(m1).toContain("<memory-updates>");
-			expect(m1).toContain(
-				"These memories changed since the snapshot below — trust these:",
+			expect(foldResult.m0Materialized).toBe(true);
+			expect(textOf(folded[0] as never)).not.toContain(
+				"Claim removed by lifecycle fold.",
 			);
-			expect(m1).toContain(`<removed id="${memory.id}"/>`);
+			expect(textOf(folded[1] as never)).not.toContain("<memory-updates>");
 
-			const deferAfterBust = [userMessage("defer after bust", 13)];
-			injectM0M1Pi(state, db, deferAfterBust as never, undefined, false);
-			expect(textOf(deferAfterBust[1] as never)).toBe(m1);
+			const replay = [userMessage("replay", 12)];
+			const replayResult = injectM0M1Pi(
+				state,
+				db,
+				replay as never,
+				undefined,
+				false,
+			);
+			expect(replayResult.m0Materialized).toBe(false);
+			expect(textOf(replay[0] as never)).toBe(textOf(folded[0] as never));
 		} finally {
 			closeQuietly(db);
 		}
 	});
 
-	it("force-renders an eligible supersede replacement that predates the m0 marker", () => {
+	it("rejects m[1] publication when the claim snapshot vector changed", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-forced-supersede-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-stale-vector-"));
 		try {
-			const state = piState("ses-pi-m1-forced-supersede", cwd);
-			const replacement = insertMemory(db, {
+			const state = piState("ses-pi-m1-stale-vector", cwd);
+			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "Replacement content must render in the delta.",
+				content: "Frozen vector claim.",
 			});
-			const source = insertMemory(db, {
+			const lane = readProjectClaimLaneSnapshot(db, state.projectIdentity);
+			if (!lane) throw new Error("missing claim lane");
+			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "Baseline source memory.",
+				content: "Concurrent vector claim.",
 			});
-			const markers = {
-				maxCompartmentSeq: -1,
-				maxMemoryId: source.id,
-				maxMutationId: 0,
-				maxMemoryMutationId: 0,
-				projectMemoryEpoch: 0,
-				workspaceFingerprint: null,
-				projectUserProfileVersion: 0,
-				projectDocsHash: "",
-				sessionFactsVersion: 0,
-				materializedAt: Date.now(),
-				upgradeState: "",
-				compartmentRenderEpoch: null,
-				lastBaselineEndMessageId: null,
-				systemHash: "",
-				modelKey: "",
-				projectIdentity: state.projectIdentity,
-				muralEnabled: false,
-				renderBudgetIdentity: "",
-			};
-
-			runInMemoryClaimsWriteTransaction(db, () =>
-				db
-					.prepare(
-						"UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
-					)
-					.run(replacement.id, source.id),
-			);
-			queueMemoryMutation(db, {
-				projectPath: state.projectIdentity,
-				mutationType: "superseded",
-				targetMemoryId: source.id,
-				supersededById: replacement.id,
-				queuedAt: markers.materializedAt + 1,
-			});
-
-			const m1 = renderM1Pi(state, db, markers, [source.id]);
-			expect(m1).toContain(
-				`<superseded id="${source.id}" by="${replacement.id}"/>`,
-			);
-			expect(m1).toContain("Replacement content must render in the delta.");
-			expect(m1).not.toContain(`<removed id="${source.id}"/>`);
+			expect(() =>
+				renderM1Pi(state, db, {
+					claimFormatEpoch: 1,
+					claimSnapshotVector: lane.snapshotVector,
+					renderedRevisionLocators: lane.items.map(
+						(item) => item.revisionLocator,
+					),
+					maxCompartmentSeq: -1,
+					maxMutationId: 0,
+					projectUserProfileVersion: 0,
+					projectDocsHash: "",
+					sessionFactsVersion: 0,
+					materializedAt: Date.now(),
+					upgradeState: "",
+					lastBaselineEndMessageId: null,
+				}),
+			).toThrow("claim snapshot changed before m1 render");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
-			closeQuietly(db);
-		}
-	});
-
-	it("skips memory mutation deltas for memories trimmed out of m0", () => {
-		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-trimmed-delta-"));
-		try {
-			const state = {
-				...piState("ses-pi-m1-trimmed-delta", cwd),
-				injectionBudgetTokens: 1,
-			};
-			const memory = insertMemory(db, {
-				projectPath: state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "This memory is too large for a one-token m0 budget.",
-				sourceType: "user",
-			});
-			injectM0M1Pi(
-				state,
-				db,
-				[userMessage("hello", 10)] as never,
-				undefined,
-				true,
-			);
-			queueMemoryMutation(db, {
-				projectPath: state.projectIdentity,
-				mutationType: "update",
-				targetMemoryId: memory.id,
-				newContent: "Updated but not resident.",
-				queuedAt: 10,
-			});
-
-			const bust = [userMessage("bust", 11)];
-			injectM0M1Pi(state, db, bust as never, undefined, true);
-
-			expect(textOf(bust[1] as never)).not.toContain("<memory-updates>");
-			expect(textOf(bust[1] as never)).not.toContain(
-				"Updated but not resident.",
-			);
-		} finally {
-			closeQuietly(db);
-		}
-	});
-
-	it("reconcile rematerialization advances the memory mutation cursor and omits memory-updates", () => {
-		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-reconcile-delta-"));
-		try {
-			const state = piState("ses-pi-m1-reconcile-delta", cwd);
-			const memory = insertMemory(db, {
-				projectPath: state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "Old baseline content.",
-				sourceType: "user",
-			});
-			injectM0M1Pi(
-				state,
-				db,
-				[userMessage("hello", 10)] as never,
-				undefined,
-				true,
-			);
-			runInMemoryClaimsWriteTransaction(db, () =>
-				db
-					.prepare(
-						"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-					)
-					.run("Reconciled content.", "reconciled-hash", Date.now(), memory.id),
-			);
-			queueMemoryMutation(db, {
-				projectPath: state.projectIdentity,
-				mutationType: "update",
-				targetMemoryId: memory.id,
-				newContent: "Reconciled content.",
-				queuedAt: 10,
-			});
-			// The insert-time eligibility bump already moved the epoch past its
-			// cached value; reconcile needs a value the cache has not seen.
-			setProjectState(db, state.projectIdentity, {
-				projectMemoryEpoch: projectMemoryEpochOf(db, state.projectIdentity) + 1,
-			});
-
-			const bust = [userMessage("bust", 11)];
-			const result = injectM0M1Pi(state, db, bust as never, undefined, true);
-
-			expect(result.m0Materialized).toBe(true);
-			expect(textOf(bust[0] as never)).toContain("Reconciled content.");
-			expect(textOf(bust[1] as never)).not.toContain("<memory-updates>");
-		} finally {
 			closeQuietly(db);
 		}
 	});
@@ -1404,7 +1359,7 @@ describe("injectM0M1Pi", () => {
 				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
 					injectedSibling = true;
 					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
+						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_claim_format_epoch = ?, cached_m1_bytes = ? WHERE session_id = ?",
 					).run(
 						Buffer.from(
 							`<session-history>${"baseline ".repeat(300)}</session-history>`,
@@ -1477,7 +1432,7 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
-	it("soft m1 refresh CAS treats docs-hash-only marker drift as a match", () => {
+	it("claim snapshot changes force a hard fold despite concurrent docs-marker drift", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-docs-"));
 		const originalExec = db.exec.bind(db);
@@ -1513,11 +1468,12 @@ describe("injectM0M1Pi", () => {
 			const result = injectM0M1Pi(state, db, bust as never, undefined, true);
 
 			expect(changedDocsMarker).toBe(true);
-			expect(result.m0Materialized).toBe(false);
-			expect(textOf(bust[0] as never)).toBe(baselineM0);
-			expect(textOf(bust[1] as never)).toContain(
+			expect(result.m0Materialized).toBe(true);
+			expect(textOf(bust[0] as never)).not.toBe(baselineM0);
+			expect(textOf(bust[0] as never)).toContain(
 				"Pi docs-hash-only CAS delta memory",
 			);
+			expect(textOf(bust[1] as never)).not.toContain("<new-memories>");
 		} finally {
 			db.exec = originalExec as typeof db.exec;
 			closeQuietly(db);
@@ -1561,7 +1517,7 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 			expect(historyClose).toBeGreaterThan(-1);
 			expect(memoryOpen).toBeGreaterThan(-1);
 			expect(memoryOpen).toBeGreaterThan(historyClose);
-			expect(m0).toContain("<ARCHITECTURE>\n#");
+			expect(m0).toContain("<ARCHITECTURE>\nmcm_");
 			expect(m0).not.toContain("<memory id=");
 			// Compartment body lives INSIDE <session-history>; memory does NOT.
 			const historyBlock = m0.slice(
@@ -1575,36 +1531,38 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 		}
 	});
 
-	it("materializeM0Pi binds maxMemoryId watermark to the rendered memory set", () => {
-		// Regression for the round-7 HIGH: the persisted maxMemoryId watermark must
-		// equal the max id of the memories actually rendered into m[0]. If it were
-		// read separately (lower), a memory present in m[0] could also satisfy
-		// "id > watermark" and render again in m[1] — duplicated across the split.
+	it("materializeM0Pi binds canonical revision locators and the snapshot vector", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-watermark-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-locators-"));
 		try {
-			const state = piState("ses-pi-watermark", cwd);
-			for (const content of [
+			const state = piState("ses-pi-locators", cwd);
+			const locators = [
 				"The widget service owns rendering.",
 				"Orders flow through an async queue.",
 				"Sessions use stateless JWT.",
-			]) {
-				insertMemory(db, {
+			].map((content) => {
+				const memory = insertMemory(db, {
 					projectPath: state.projectIdentity,
 					category: "ARCHITECTURE",
 					content,
-					sourceType: "user",
 				});
-			}
-			const maxId = getMemoriesByProject(db, state.projectIdentity, [
-				"active",
-				"permanent",
-			]).reduce((m, x) => (x.id > m ? x.id : m), 0);
+				return seededClaim(db, memory.id).revisionLocator;
+			});
 
-			const { snapshotMarkers } = materializeM0Pi(state, db);
+			const { snapshotMarkers, renderedRevisionLocators } = materializeM0Pi(
+				state,
+				db,
+			);
 
-			expect(maxId).toBeGreaterThan(0);
-			expect(snapshotMarkers.maxMemoryId).toBe(maxId);
+			expect(new Set(renderedRevisionLocators)).toEqual(new Set(locators));
+			expect(snapshotMarkers.renderedRevisionLocators).toEqual(
+				renderedRevisionLocators,
+			);
+			expect(
+				Object.keys(
+					snapshotMarkers.claimSnapshotVector?.projectGenerations ?? {},
+				),
+			).toHaveLength(1);
 		} finally {
 			closeQuietly(db);
 		}
@@ -2422,7 +2380,7 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
 					injectedSibling = true;
 					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
+						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_claim_format_epoch = ?, cached_m1_bytes = ? WHERE session_id = ?",
 					).run(
 						Buffer.from(
 							`<session-history>${"baseline ".repeat(300)}</session-history>`,

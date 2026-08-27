@@ -24,28 +24,14 @@ fn make_db_with_workspace_schema(version: i64, include_share_categories: bool) -
     let sql = format!(
         "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
          INSERT INTO schema_migrations (version) VALUES ({version});
-         CREATE TABLE memories (
+         CREATE TABLE projects (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
-             project_path TEXT NOT NULL,
-             category TEXT NOT NULL DEFAULT 'CONSTRAINTS',
-             content TEXT NOT NULL,
-             normalized_hash TEXT NOT NULL DEFAULT '',
-             status TEXT DEFAULT 'active',
-             created_at INTEGER DEFAULT 0,
-             updated_at INTEGER DEFAULT 0,
-             first_seen_at INTEGER DEFAULT 0,
-             last_seen_at INTEGER DEFAULT 0,
-             source_session_id TEXT,
-             source_type TEXT DEFAULT 'test',
-             seen_count INTEGER DEFAULT 1,
-             retrieval_count INTEGER DEFAULT 0,
-             last_retrieved_at INTEGER,
-             expires_at INTEGER,
-             verification_status TEXT DEFAULT 'unverified',
-             verified_at INTEGER,
-             superseded_by_memory_id INTEGER,
-             merged_from TEXT,
-             metadata_json TEXT
+             canonical_identity TEXT NOT NULL UNIQUE
+         );
+         CREATE TABLE claim_memory_current_heads (
+             claim_id INTEGER PRIMARY KEY,
+             project_id INTEGER NOT NULL,
+             lifecycle_state TEXT NOT NULL
          );
          CREATE TABLE project_state (
              project_path TEXT PRIMARY KEY,
@@ -68,12 +54,7 @@ fn make_db_with_workspace_schema(version: i64, include_share_categories: bool) -
              PRIMARY KEY (workspace_id, project_path)
          );
          CREATE UNIQUE INDEX idx_workspace_member_unique ON workspace_members(project_path);
-         CREATE UNIQUE INDEX idx_workspace_member_name ON workspace_members(workspace_id, display_name);
-         CREATE TABLE memory_embeddings (
-             memory_id INTEGER PRIMARY KEY,
-             embedding BLOB NOT NULL,
-             model_id TEXT
-         );"
+         CREATE UNIQUE INDEX idx_workspace_member_name ON workspace_members(workspace_id, display_name);"
     );
     conn.execute_batch(&sql).expect("schema");
     workspaces::clear_workspace_schema_ready_cache_for_tests();
@@ -101,29 +82,6 @@ fn make_db_pre_v34() -> Connection {
     conn.execute_batch(
         "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
          INSERT INTO schema_migrations (version) VALUES (33);
-         CREATE TABLE memories (
-             id INTEGER PRIMARY KEY AUTOINCREMENT,
-             project_path TEXT NOT NULL,
-             category TEXT NOT NULL,
-             content TEXT NOT NULL,
-             normalized_hash TEXT NOT NULL,
-             status TEXT DEFAULT 'active',
-             created_at INTEGER DEFAULT 0,
-             updated_at INTEGER DEFAULT 0,
-             first_seen_at INTEGER DEFAULT 0,
-             last_seen_at INTEGER DEFAULT 0,
-             source_session_id TEXT,
-             source_type TEXT DEFAULT 'test',
-             seen_count INTEGER DEFAULT 1,
-             retrieval_count INTEGER DEFAULT 0,
-             last_retrieved_at INTEGER,
-             expires_at INTEGER,
-             verification_status TEXT DEFAULT 'unverified',
-             verified_at INTEGER,
-             superseded_by_memory_id INTEGER,
-             merged_from TEXT,
-             metadata_json TEXT
-         );
          CREATE TABLE project_state (
              project_path TEXT PRIMARY KEY,
              project_memory_epoch INTEGER NOT NULL DEFAULT 0,
@@ -507,95 +465,6 @@ fn display_name_unique_within_workspace() {
 }
 
 #[test]
-fn memory_status_restore_widens_epoch_fan_out() {
-    let _g = env_lock();
-    let mut conn = make_db_v35();
-    seed_epoch(&conn, "git:a", 5);
-    seed_epoch(&conn, "git:b", 7);
-    let ws = workspaces::create_workspace(&mut conn, "w").unwrap();
-    apply_add_member(&mut conn, ws, "git:a", "a", "/a");
-    apply_add_member(&mut conn, ws, "git:b", "b", "/b");
-
-    conn.execute(
-        "INSERT INTO memories (project_path, category, content, normalized_hash, status, created_at, updated_at, first_seen_at, last_seen_at)
-         VALUES ('git:a', 'CONSTRAINTS', 'x', 'h1', 'archived', 1, 1, 1, 1)",
-        [],
-    )
-    .unwrap();
-    let mid = conn.last_insert_rowid();
-
-    db::update_memory_status(&mut conn, mid, "active").expect("restore");
-    assert_eq!(epoch(&conn, "git:a"), 8);
-    assert_eq!(epoch(&conn, "git:b"), 9);
-}
-
-#[test]
-fn enumerate_memory_projects_includes_workspace_only_member() {
-    let _g = env_lock();
-    let mut conn = make_db_v35();
-    let ws = workspaces::create_workspace(&mut conn, "w").unwrap();
-    apply_add_member(&mut conn, ws, "git:zero-mem", "zero", "/zero");
-
-    let rows = db::enumerate_memory_projects(&conn).expect("enum");
-    assert!(rows.iter().any(|r| r.identity == "git:zero-mem"));
-}
-
-#[test]
-fn workspace_filter_paths_union_members() {
-    let _g = env_lock();
-    let mut conn = make_db_v35();
-    let ws = workspaces::create_workspace(&mut conn, "w").unwrap();
-    apply_add_member(&mut conn, ws, "git:x", "x", "/x");
-    apply_add_member(&mut conn, ws, "git:y", "y", "/y");
-    conn.execute(
-        "INSERT INTO memories (project_path, category, content, normalized_hash, status, created_at, updated_at, first_seen_at, last_seen_at)
-         VALUES ('git:x', 'C', 'one', 'h1', 'active', 1, 1, 1, 1),
-                ('git:y', 'C', 'two', 'h2', 'active', 1, 1, 1, 1)",
-        [],
-    )
-    .unwrap();
-
-    let paths = workspaces::resolve_workspace_filter_paths(&conn, ws).unwrap();
-    assert!(paths.contains(&"git:x".to_string()));
-    assert!(paths.contains(&"git:y".to_string()));
-
-    let mems = db::get_memories(&conn, None, Some(ws), None, None, None, 50, 0).unwrap();
-    assert_eq!(mems.len(), 2);
-}
-
-#[test]
-fn empty_workspace_filter_returns_no_memories_or_stats() {
-    let _g = env_lock();
-    let mut conn = make_db_v35();
-    // A workspace with ZERO members. There ARE global memories in the DB.
-    let ws = workspaces::create_workspace(&mut conn, "empty").unwrap();
-    conn.execute(
-        "INSERT INTO memories (project_path, category, content, normalized_hash, status, created_at, updated_at, first_seen_at, last_seen_at)
-         VALUES ('git:somewhere', 'C', 'global', 'h1', 'active', 1, 1, 1, 1),
-                ('git:elsewhere', 'C', 'other', 'h2', 'active', 1, 1, 1, 1)",
-        [],
-    )
-    .unwrap();
-
-    // Filtering by the empty workspace must NOT leak global memories/stats.
-    let mems = db::get_memories(&conn, None, Some(ws), None, None, None, 50, 0).unwrap();
-    assert_eq!(
-        mems.len(),
-        0,
-        "empty workspace must not surface global memories"
-    );
-
-    let stats = db::get_memory_stats(&conn, None, Some(ws)).unwrap();
-    assert_eq!(stats.active, 0, "empty workspace stats must be zero");
-    assert_eq!(stats.archived, 0);
-    assert_eq!(stats.permanent, 0);
-
-    // Sanity: no filter still sees the globals (the gate is filter-specific).
-    let all = db::get_memories(&conn, None, None, None, None, None, 50, 0).unwrap();
-    assert_eq!(all.len(), 2);
-}
-
-#[test]
 fn rename_workspace_does_not_bump_member_epochs() {
     let _g = env_lock();
     let mut conn = make_db_v35();
@@ -618,24 +487,4 @@ fn workspace_member_identities_union_helper() {
     let new: HashSet<String> = ["git:b".into(), "git:c".into()].into_iter().collect();
     let u = workspaces::workspace_member_identities_union(&old, &new);
     assert_eq!(u.len(), 3);
-}
-
-#[test]
-fn enumerate_memory_projects_includes_non_git_dir_project() {
-    let _g = env_lock();
-    let conn = make_db_v35();
-    conn.execute(
-        "INSERT INTO memories (project_path, category, content, normalized_hash, status, created_at, updated_at, first_seen_at, last_seen_at)
-         VALUES ('dir:1234567890ab', 'CONSTRAINTS', 'some memory', 'h1', 'active', 1, 1, 1, 1)",
-        [],
-    )
-    .unwrap();
-
-    let rows = db::enumerate_memory_projects(&conn).expect("enum");
-    let matched = rows.iter().find(|r| r.identity == "dir:1234567890ab");
-    assert!(matched.is_some(), "should find the dir: project");
-    let row = matched.unwrap();
-    assert_eq!(row.display_name, "dir:1234567890…");
-    assert_eq!(row.primary_path, "");
-    assert_eq!(row.session_count, 0);
 }

@@ -1,6 +1,6 @@
 /** Test-only builders for a minimal valid release; not exported by the facade. */
 
-import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
+import { SOURCE_LOCATOR_KIND } from "./physical-locator";
 import { canonicalFingerprint } from "./canonical-json";
 import {
     type CorpusArtifact,

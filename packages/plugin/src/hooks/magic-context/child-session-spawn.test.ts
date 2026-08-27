@@ -1,15 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import { runMigrations } from "../../features/magic-context/migrations";
 import {
     __resetChildSpawnFenceProbeForTests,
     type ChildSpawnFenceFailure,
 } from "../../features/magic-context/schema-fence-probe";
-import {
-    initializeDatabase,
-    LATEST_SUPPORTED_VERSION,
-} from "../../features/magic-context/storage-db";
+import { LATEST_SUPPORTED_VERSION } from "../../features/magic-context/storage-db";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import {
     __resetNotificationStateForTests,
     drainNotifications,
@@ -24,9 +21,7 @@ import {
 const dbs: Database[] = [];
 
 function staleDatabase(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     db.prepare(
         "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
     ).run(LATEST_SUPPORTED_VERSION + 1, "future schema", Date.now());
@@ -70,7 +65,6 @@ describe("createChildSessionWithFence", () => {
 
     it("refuses an unreadable probe and surfaces the doctor recovery message", async () => {
         const db = new Database(":memory:");
-        initializeDatabase(db);
         db.close();
         const create = mock(async () => ({ id: "child" }));
         const prompt = mock(async () => undefined);

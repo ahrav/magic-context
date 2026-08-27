@@ -13,8 +13,10 @@ import { join } from "node:path";
 import { openDatabase } from "../src/features/magic-context/storage";
 import { getMuralCoverage, resolveMural } from "../src/features/magic-context/mural/resolve-mural";
 import { muralCoverageGate } from "../src/features/magic-context/mural/render-trigger";
-import { getMemoriesByProject } from "../src/features/magic-context/memory";
-import { filterMemoriesByPolicy } from "../src/features/magic-context/memory/storage-claim-visibility";
+import {
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "../src/features/magic-context/memory/storage-claim-current-state";
 import {
     muralImageTokenEstimateForDimensions,
     renderMural,
@@ -35,8 +37,11 @@ const identities =
         : (
               db
                   .prepare(
-                      `SELECT DISTINCT project_path FROM memories
-                       WHERE status='active' AND mural_cue IS NOT NULL AND mural_cue != ''
+                      `SELECT DISTINCT projects.canonical_identity AS project_path
+                       FROM claim_mural_cues
+                       JOIN claims ON claims.id = claim_mural_cues.claim_id
+                       JOIN projects ON projects.id = claims.project_id
+                       WHERE claim_mural_cues.cue IS NOT NULL
                        UNION SELECT project_path FROM mural_manifest`,
                   )
                   .all() as { project_path: string }[]
@@ -46,11 +51,12 @@ for (const identity of identities) {
     // Same policy gate production uses: the mural is an automatic injection
     // channel, so even this offline render tool must not draw policy-hidden
     // content into a PNG.
-    const pool = filterMemoriesByPolicy(
-        db,
-        getMemoriesByProject(db, identity, ["active", "permanent"]),
-        "auto_inject",
-    ).memories;
+    const projectIds = resolveProjectIdsForIdentities(db, [identity]);
+    const state =
+        projectIds.length > 0
+            ? readProjectMemoryCurrentState(db, { projectIds, surface: "auto_inject" })
+            : null;
+    const pool = state?.status === "ok" ? state.items : [];
     const coverage = getMuralCoverage(db, identity, pool);
     const gatePassed = muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount);
     const header = `${identity} · active=${coverage.activeMemoryCount} cued=${coverage.cuedMemoryCount}`;
@@ -65,7 +71,14 @@ for (const identity of identities) {
         console.log(`${header} → NO MURAL (overflow pool empty; all memories fit the m0 budget)`);
         continue;
     }
-    const result = renderMural(entries);
+    const result = renderMural(
+        entries.map((entry) => ({
+            id: entry.publicClaimId,
+            category: entry.category,
+            importance: entry.importance,
+            cue: entry.cue,
+        })),
+    );
     const tokens = muralImageTokenEstimateForDimensions(result.width, result.height);
     const file = join(outDir, `${identity.replace(/[^a-z0-9]/gi, "_").slice(0, 60)}.png`);
     writeFileSync(file, result.png);

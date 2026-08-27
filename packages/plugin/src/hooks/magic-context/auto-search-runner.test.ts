@@ -1,16 +1,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { insertMemory } from "../../features/magic-context/memory";
-import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
-import {
-    runInMemoryClaimsWriteTransaction,
-    updateMemoryContentWithClaimsInCurrentTransaction,
-    updateMemoryVerificationWithClaimsInCurrentTransaction,
-} from "../../features/magic-context/memory/storage-memory-claims";
-import { runMigrations } from "../../features/magic-context/migrations";
 import * as searchModule from "../../features/magic-context/search";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
 import {
@@ -51,9 +43,7 @@ describe("auto-search-runner", () => {
     };
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        db = createDirectTestDatabase().db;
         _resetAutoSearchCache();
     });
 
@@ -621,41 +611,21 @@ describe("auto-search-runner", () => {
         }
     });
 
-    test("persisted hints record contributing memory ids and stop replaying when one is hidden", async () => {
-        // A real claim-backed memory: fresh hints go through the same
-        // eligibility gate as replays, so the mocked result must carry a
-        // policy-eligible id and the digest of the bytes the lane loaded.
+    test("fresh hints record no claim fragments", async () => {
+        // R12: while no retrieval projection exists, a fresh hint decision
+        // must not bind claim fragments even if a memory-shaped result leaks
+        // into the delivered set.
         const content = "the historian runs on overflow";
-        const seeded = insertMemory(db, {
-            projectPath: "git:test",
-            category: "ARCHITECTURE",
-            content,
-        });
-        // A fresh insert is a CANDIDATE (auto-ineligible); the auto-search
-        // lane only surfaces verified rows, so promote the seed the same way.
-        runInMemoryClaimsWriteTransaction(db, () =>
-            updateMemoryVerificationWithClaimsInCurrentTransaction(
-                db,
-                {
-                    producer: "auto-search-runner-test",
-                    operationKey: `verify:${seeded.id}`,
-                    requestDigest: sha256Utf8Hex(`verify:${seeded.id}`),
-                },
-                { memoryId: seeded.id, verificationStatus: "verified", nowMs: 2_000 },
-            ),
-        );
-        const digest = sha256Utf8Hex(content);
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
             async () =>
                 [
                     {
-                        source: "memory",
+                        source: "message",
                         content,
                         score: 0.9,
-                        memoryId: seeded.id,
-                        category: "ARCHITECTURE",
-                        matchType: "fts",
-                        contentDigest: digest,
+                        messageOrdinal: 3,
+                        messageId: "m3",
+                        role: "assistant",
                     },
                 ] as unknown as Awaited<ReturnType<typeof searchModule.unifiedSearch>>,
         );
@@ -676,47 +646,8 @@ describe("auto-search-runner", () => {
             expect(decisions).toHaveLength(1);
             const decision = decisions[0];
             if (decision.decision !== "hint") throw new Error("expected a hint decision");
-            // The decision binds the contributing fragments — id plus the
-            // exact digest of the loaded bytes — for the replay gates.
-            expect(decision.memoryFragments).toEqual([{ id: seeded.id, hash: digest }]);
+            expect(decision.memoryFragments).toEqual([]);
             expect(findUserPromptText(messages[0])).toContain("historian runs on overflow");
-
-            // An in-place rewrite changes the exact content digest, so the
-            // replay pass must suppress the persisted hint instead of
-            // re-serving a fragment bound to bytes that no longer exist.
-            runInMemoryClaimsWriteTransaction(db, () =>
-                updateMemoryContentWithClaimsInCurrentTransaction(
-                    db,
-                    {
-                        producer: "auto-search-runner-test",
-                        operationKey: `rewrite:${seeded.id}`,
-                        requestDigest: sha256Utf8Hex(`rewrite:${seeded.id}`),
-                    },
-                    {
-                        memoryId: seeded.id,
-                        content: "rewritten after the hint was persisted",
-                        normalizedHash: "hash:rewritten",
-                    },
-                ),
-            );
-            const replayMessages: MessageLike[] = [
-                makeUserMsg(
-                    "u-hint-policy",
-                    "please explain how the historian decides when to run",
-                ),
-            ];
-            await runAutoSearchHint({
-                sessionId: "s-hint-policy",
-                db,
-                messages: replayMessages,
-                options: baseOptions,
-            });
-            expect(findUserPromptText(replayMessages[0])).not.toContain(
-                "historian runs on overflow",
-            );
-            expect(findUserPromptText(replayMessages[0])).not.toContain("<ctx-search-hint>");
-            // No second search: the persisted decision still owns the message.
-            expect(spy).toHaveBeenCalledTimes(1);
         } finally {
             spy.mockRestore();
         }
@@ -738,9 +669,7 @@ describe("executeAutoSearchDelivery", () => {
     });
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        db = createDirectTestDatabase().db;
     });
 
     afterEach(() => {

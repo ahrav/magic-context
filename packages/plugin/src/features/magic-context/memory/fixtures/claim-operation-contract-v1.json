@@ -1,0 +1,242 @@
+{
+    "protocol": "mc-claim-operation-contract-v1",
+    "requestEncodingVersion": 1,
+    "resultEncodingVersion": 1,
+    "digestProtocols": {
+        "request": "mc-claim-request-v1",
+        "mutationToken": "mc-claim-mutation-token-v1",
+        "snapshotVector": "mc-claim-snapshot-vector-v1",
+        "applicabilityHeads": "mc-claim-applicability-heads-v1",
+        "policyHeads": "mc-claim-policy-heads-v1"
+    },
+    "canonicalization": [
+        {
+            "name": "scalars-and-key-order",
+            "value": {
+                "b": 1,
+                "a": null,
+                "c": true,
+                "d": false
+            },
+            "canonical": "{\"a\":null,\"b\":1,\"c\":true,\"d\":false}",
+            "requestDigest": "11d36f83a06868740566791c7b0b025785baaca7f574fa5215b5dd41700d887b"
+        },
+        {
+            "name": "unicode-and-escapes",
+            "value": {
+                "é": "café",
+                "emoji": "🎉 party",
+                "control": "line\nbreak\ttab\u0000nul \"quote\" back\\slash"
+            },
+            "canonical": "{\"control\":\"line\\u000abreak\\u0009tab\\u0000nul \\\"quote\\\" back\\\\slash\",\"emoji\":\"🎉 party\",\"é\":\"café\"}",
+            "requestDigest": "194146243a4d8b0dc07b42dbd909a654cab867c0348790a71a8b5b228f4652d4"
+        },
+        {
+            "name": "astral-key-order",
+            "value": {
+                "�": 1,
+                "😀": 2,
+                "A": 3
+            },
+            "canonical": "{\"A\":3,\"�\":1,\"😀\":2}",
+            "requestDigest": "352e3e48cb7e3331f6df928ecdd1dfbd7f33e6847007ae1d1fca9a4c877f8b1b"
+        },
+        {
+            "name": "numbers",
+            "value": {
+                "zero": 0,
+                "negative": -42,
+                "maxSafe": 9007199254740991,
+                "minSafe": -9007199254740991
+            },
+            "canonical": "{\"maxSafe\":9007199254740991,\"minSafe\":-9007199254740991,\"negative\":-42,\"zero\":0}",
+            "requestDigest": "fe947df2d2efcf5c4519718e646b3c0059259a1067984641ef26a3df9624b237"
+        },
+        {
+            "name": "nesting",
+            "value": {
+                "list": [
+                    1,
+                    [
+                        2,
+                        {
+                            "deep": null
+                        }
+                    ],
+                    "x"
+                ],
+                "empty": {},
+                "emptyList": [],
+                "": "empty key"
+            },
+            "canonical": "{\"\":\"empty key\",\"empty\":{},\"emptyList\":[],\"list\":[1,[2,{\"deep\":null}],\"x\"]}",
+            "requestDigest": "6ad364f18ea895374a0861bfd2f34e2c2e0b65b668d7f14ce9fe9b931890a052"
+        }
+    ],
+    "invalidCanonical": [
+        {
+            "name": "float",
+            "valueJson": "1.5"
+        },
+        {
+            "name": "beyond-safe-integer",
+            "valueJson": "9007199254740993"
+        }
+    ],
+    "publicClaimIds": {
+        "valid": [
+            "mcm_00112233445566778899aabbccddeeff",
+            "mcm_ffeeddccbbaa99887766554433221100"
+        ],
+        "invalid": [
+            "",
+            "mcm_",
+            "mcm_0011",
+            "MCM_00112233445566778899aabbccddeeff",
+            "mcm_00112233445566778899AABBCCDDEEFF",
+            "mcl_00112233445566778899aabbccddeeff",
+            "mcm_00112233445566778899aabbccddeeff0"
+        ]
+    },
+    "revisionLocators": {
+        "valid": [
+            {
+                "locator": "mcm_00112233445566778899aabbccddeeff/r2/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "publicClaimId": "mcm_00112233445566778899aabbccddeeff",
+                "revision": 2,
+                "contentDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            },
+            {
+                "locator": "mcm_ffeeddccbbaa99887766554433221100/r1/0000000000000000000000000000000000000000000000000000000000000000",
+                "publicClaimId": "mcm_ffeeddccbbaa99887766554433221100",
+                "revision": 1,
+                "contentDigest": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+        ],
+        "invalid": [
+            "",
+            "mcm_00112233445566778899aabbccddeeff",
+            "mcm_00112233445566778899aabbccddeeff/r0/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "mcm_00112233445566778899aabbccddeeff/r01/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "mcm_00112233445566778899aabbccddeeff/2/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "mcm_00112233445566778899aabbccddeeff/r2/ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "mcm_00112233445566778899aabbccddeeff/r2/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/extra",
+            "mcl_00112233445566778899aabbccddeeff/r2/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        ]
+    },
+    "mutationTokens": [
+        {
+            "token": {
+                "tokenVersion": 1,
+                "publicClaimId": "mcm_00112233445566778899aabbccddeeff",
+                "revision": 3,
+                "contentDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "lifecycleSeq": 2,
+                "applicabilityHeadsDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "policyHeadsDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "canonical": "{\"applicabilityHeadsDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contentDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lifecycleSeq\":2,\"policyHeadsDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"publicClaimId\":\"mcm_00112233445566778899aabbccddeeff\",\"revision\":3,\"tokenVersion\":1}",
+            "digest": "d08eaeb10257f02785db8a863a42be912ec213c9c2597d3ba7dfe87659c8227a"
+        }
+    ],
+    "applicabilityHeads": [
+        {
+            "heads": [],
+            "digest": "375aa357e35eec20a8b67953e58e6a9ea05fb829b8a6c5044353ec7b169a1fd3"
+        },
+        {
+            "heads": [
+                {
+                    "streamKey": "baseline:v1",
+                    "seq": 4
+                },
+                {
+                    "streamKey": "agent:v1",
+                    "seq": 1
+                }
+            ],
+            "digest": "dd5e89e1fc45ba3785369f7356b081775e1f668e3a02a0688ed8cad9806c748a"
+        }
+    ],
+    "policyHeads": [
+        {
+            "counts": {
+                "maturitySeq": 0,
+                "approvalCount": 0,
+                "dispositionCount": 0,
+                "artifactCount": 0,
+                "artifactEventCount": 0,
+                "verificationCount": 0
+            },
+            "digest": "1f0a4b3d312e02309d73c557ba8a9dbe26915fe615c346bbd9f3f88bdcb77f25"
+        },
+        {
+            "counts": {
+                "maturitySeq": 3,
+                "approvalCount": 1,
+                "dispositionCount": 2,
+                "artifactCount": 1,
+                "artifactEventCount": 1,
+                "verificationCount": 4
+            },
+            "digest": "df62e59cb726f13f357db6e048e354c5840d4cd24ee21c774ac4fb6a49206c93"
+        }
+    ],
+    "snapshotVectors": [
+        {
+            "vector": {
+                "vectorVersion": 1,
+                "databaseIncarnationId": "00112233445566778899aabbccddeeff",
+                "workspaceEpoch": "ws-epoch-7",
+                "projectGenerations": {
+                    "1": 12,
+                    "2": 3
+                },
+                "policyGenerations": {
+                    "1": 12,
+                    "2": 4
+                }
+            },
+            "canonical": "{\"databaseIncarnationId\":\"00112233445566778899aabbccddeeff\",\"policyGenerations\":{\"1\":12,\"2\":4},\"projectGenerations\":{\"1\":12,\"2\":3},\"vectorVersion\":1,\"workspaceEpoch\":\"ws-epoch-7\"}",
+            "digest": "14a294a2b8b00ff367ea8ee5bcdeac9dc2853c8512044bff01b34f16f3331f23"
+        }
+    ],
+    "results": {
+        "valid": [
+            {
+                "name": "applied",
+                "resultJson": "{\"effects\":[{\"changeKind\":\"upsert\",\"effectKey\":\"upsert:mcm_00112233445566778899aabbccddeeff:r2\",\"generation\":13,\"projectId\":1,\"revisionLocator\":\"mcm_00112233445566778899aabbccddeeff/r2/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"generations\":{\"1\":13},\"outcome\":\"applied\",\"payload\":{\"claim\":{\"publicClaimId\":\"mcm_00112233445566778899aabbccddeeff\",\"revision\":2},\"kind\":\"revised\"},\"resultEncodingVersion\":1,\"staleReason\":null}",
+                "outcome": "applied",
+                "effectCount": 1
+            },
+            {
+                "name": "stale",
+                "resultJson": "{\"effects\":[],\"generations\":{},\"outcome\":\"stale\",\"payload\":null,\"resultEncodingVersion\":1,\"staleReason\":\"revision: revision head moved from r1 to r2\"}",
+                "outcome": "stale",
+                "effectCount": 0
+            }
+        ],
+        "invalid": [
+            {
+                "name": "wrong-version",
+                "resultJson": "{\"effects\":[{\"changeKind\":\"upsert\",\"effectKey\":\"upsert:mcm_00112233445566778899aabbccddeeff:r2\",\"generation\":13,\"projectId\":1,\"revisionLocator\":\"mcm_00112233445566778899aabbccddeeff/r2/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"generations\":{\"1\":13},\"outcome\":\"applied\",\"payload\":{\"claim\":{\"publicClaimId\":\"mcm_00112233445566778899aabbccddeeff\",\"revision\":2},\"kind\":\"revised\"},\"resultEncodingVersion\":2,\"staleReason\":null}"
+            },
+            {
+                "name": "unknown-outcome",
+                "resultJson": "{\"effects\":[],\"generations\":{},\"outcome\":\"weird\",\"payload\":null,\"resultEncodingVersion\":1,\"staleReason\":\"revision: revision head moved from r1 to r2\"}"
+            },
+            {
+                "name": "not-json",
+                "resultJson": "{"
+            },
+            {
+                "name": "bad-effect-locator",
+                "resultJson": "{\"effects\":[{\"changeKind\":\"upsert\",\"effectKey\":\"upsert:mcm_00112233445566778899aabbccddeeff:r2\",\"generation\":13,\"projectId\":1,\"revisionLocator\":\"not-a-locator\"}],\"generations\":{\"1\":13},\"outcome\":\"applied\",\"payload\":{\"claim\":{\"publicClaimId\":\"mcm_00112233445566778899aabbccddeeff\",\"revision\":2},\"kind\":\"revised\"},\"resultEncodingVersion\":1,\"staleReason\":null}"
+            },
+            {
+                "name": "float-generation",
+                "resultJson": "{\"effects\":[{\"changeKind\":\"upsert\",\"effectKey\":\"upsert:mcm_00112233445566778899aabbccddeeff:r2\",\"generation\":13,\"projectId\":1,\"revisionLocator\":\"mcm_00112233445566778899aabbccddeeff/r2/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"generations\":{\"1\":13.5},\"outcome\":\"applied\",\"payload\":{\"claim\":{\"publicClaimId\":\"mcm_00112233445566778899aabbccddeeff\",\"revision\":2},\"kind\":\"revised\"},\"resultEncodingVersion\":1,\"staleReason\":null}"
+            }
+        ]
+    }
+}

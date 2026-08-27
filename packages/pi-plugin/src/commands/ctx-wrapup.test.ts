@@ -10,9 +10,7 @@ import {
 	getCompartments,
 	getLastCompartmentEndMessage,
 } from "@magic-context/core/features/magic-context/compartment-storage";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	getOverflowState,
 	getPendingPiCompactionMarkerState,
@@ -20,7 +18,8 @@ import {
 	recordOverflowDetected,
 	setPendingPiCompactionMarkerState,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
+import type { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	consumeDeferredHistoryRefresh,
@@ -33,9 +32,7 @@ import {
 } from "./ctx-wrapup";
 
 function createDb(): Database {
-	const db = new Database(":memory:");
-	initializeDatabase(db);
-	runMigrations(db);
+	const db = createDirectTestDatabase().db;
 	return db;
 }
 

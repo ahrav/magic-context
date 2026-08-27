@@ -3,7 +3,7 @@ import {
   applyWorkspaceChanges,
   createWorkspace,
   deleteWorkspace,
-  enumerateMemoryProjects,
+  enumerateProjects,
   listWorkspaces,
   workspaceSchemaReady,
 } from "../../lib/api";
@@ -25,7 +25,7 @@ import {
 export default function WorkspacesPanel() {
   const [ready] = createResource(workspaceSchemaReady);
   const [workspaces, { refetch }] = createResource(listWorkspaces);
-  const [projects] = createResource(enumerateMemoryProjects);
+  const [projects] = createResource(enumerateProjects);
   const [error, setError] = createSignal<string | null>(null);
   const [newName, setNewName] = createSignal("");
   const [stages, setStages] = createSignal<Record<number, WorkspaceStage>>({});

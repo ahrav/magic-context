@@ -10,6 +10,7 @@ name = "mc_store"
 path = "src/lib.rs"
 
 [dependencies]
+mc-core = { workspace = true }
 cortexkit-cache-core = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }

@@ -71,7 +71,6 @@ import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
     clearInjectionCache,
-    getVisibleMemoryIds,
     injectM0M1,
     type M0HardSignals,
     type M0M1State,
@@ -1964,13 +1963,7 @@ export async function runPostTransformPhase(
     }
 
     if (args.fullFeatureMode && args.autoSearch?.enabled && args.projectPath) {
-        // Resolve memory ids currently rendered in the <session-history>
-        // block. The auto-search runner drops hint fragments for memories the
-        // agent already sees in message[0] so the hint stays "vague recall"
-        // for content not already in context.
         const tAutoSearch = performance.now();
-        const visibleMemoryIds = getVisibleMemoryIds(args.db, args.sessionId) ?? undefined;
-
         try {
             const autoSearchOutcome = await runAutoSearchHint({
                 sessionId: args.sessionId,
@@ -1983,7 +1976,6 @@ export async function runPostTransformPhase(
                     directory: args.autoSearch.directory ?? args.sessionDirectory,
                     projectPath: args.projectPath,
                     ensureProjectRegistered: args.autoSearch.ensureProjectRegistered,
-                    visibleMemoryIds,
                 },
             });
             if (!autoSearchOutcome.ok) {

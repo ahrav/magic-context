@@ -1,17 +1,13 @@
 import type { ContextEvent } from "@earendil-works/pi-coding-agent";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { setHarness } from "@magic-context/core/shared/harness";
-import { Database } from "@magic-context/core/shared/sqlite";
+import type { Database } from "@magic-context/core/shared/sqlite";
 
 export type PiMessage = ContextEvent["messages"][number];
 
 export function createTestDb(path = ":memory:"): Database {
 	setHarness("pi");
-	const db = new Database(path);
-	initializeDatabase(db);
-	runMigrations(db);
-	return db;
+	return createDirectTestDatabase({ path }).db;
 }
 
 export function userMessage(

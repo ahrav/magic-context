@@ -1,12 +1,5 @@
 /**
- * Reusable scripted tool_use driving for incident cases (U4, KTD7, R10).
- *
- * A case drives the REAL `ctx_memory` / `ctx_search` / `ctx_note` loops by
- * scripting one tool_use response through the mock provider and capturing:
- *   - the published tool name (from the provider-visible tools array),
- *   - the validated arguments the loop executed,
- *   - the provider-visible tool result (the tool_result block the harness
- *     sends back on the wire — the agent-visible outcome R10 requires).
+ * Incident-case harness and context-database support.
  *
  * `createCaseHarness` boots the shared TestHarness INSIDE the case-owned
  * workspace (relocated TMPDIR) and enforces the KTD7 canonical-path check so
@@ -17,17 +10,13 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "../../../../plugin/src/shared/sqlite";
 import { TestHarness, type TestHarnessOptions } from "../../harness";
-import { openTestDb } from "../../test-db";
 import type { MockUsage } from "../../mock-provider/server";
+import { openTestDb } from "../../test-db";
+import { DEFAULT_SCRIPTED_TOOL_USAGE } from "../../scripted-tool-call";
 import type { CaseDriverContext } from "../registry";
 
-/** Low-pressure pure-defer usage (below a 20% execute threshold at 100k). */
-export const DEFER_USAGE: MockUsage = {
-    input_tokens: 2_000,
-    output_tokens: 20,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 2_000,
-};
+/** Shared low-pressure usage stays below a 20% execute threshold at 100k. */
+export const DEFER_USAGE = DEFAULT_SCRIPTED_TOOL_USAGE;
 
 /** High usage that marks the NEXT transform pass as an execute pass. */
 export const EXECUTE_USAGE: MockUsage = {
@@ -105,157 +94,21 @@ export function caseNamespaceIsUnique(context: CaseDriverContext): boolean {
     );
 }
 
-function publishedToolName(
-    body: Record<string, unknown>,
-    tool: string,
-): string | null {
-    const tools = body.tools;
-    if (!Array.isArray(tools)) return null;
-    for (const entry of tools) {
-        if (!entry || typeof entry !== "object") continue;
-        const name = (entry as { name?: unknown }).name;
-        if (name === tool) return name;
-    }
-    return null;
-}
-
-let scriptedCallCounter = 0;
-
-export interface ScriptedToolCallOptions {
-    /** Exact published tool name, e.g. "ctx_memory". */
-    tool: string;
-    input: Record<string, unknown>;
-    prompt: string;
-    /** Usage for the tool_use response and the follow-up default. */
-    usage?: MockUsage;
-    followUpText?: string;
-}
-
-export interface ScriptedToolCall {
-    /** Tool name as published on the provider wire. */
-    publishedToolName: string;
-    /** The validated arguments the loop executed. */
-    input: Record<string, unknown>;
-    callId: string;
-    /** Provider-visible tool result (the wire tool_result text). */
-    resultText: string;
-}
-
-interface WireContentBlock {
-    type?: string;
-    text?: string;
-    tool_use_id?: string;
-    content?: unknown;
-}
-
-function toolResultTextOf(block: WireContentBlock): string {
-    const content = block.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-        return content
-            .map((inner) =>
-                inner && typeof inner === "object"
-                    ? ((inner as WireContentBlock).text ?? "")
-                    : "",
-            )
-            .join("\n");
-    }
-    return "";
-}
-
-/** Find the provider-visible tool_result for one scripted call id. */
-export function findToolResultText(
-    h: TestHarness,
-    callId: string,
-): string | null {
-    for (const request of h.mock.requests()) {
-        const messages = request.body.messages;
-        if (!Array.isArray(messages)) continue;
-        for (const message of messages) {
-            const content = (message as { content?: unknown }).content;
-            if (!Array.isArray(content)) continue;
-            for (const block of content as WireContentBlock[]) {
-                if (
-                    block?.type === "tool_result" &&
-                    block.tool_use_id === callId
-                ) {
-                    return toolResultTextOf(block);
-                }
-            }
-        }
-    }
-    return null;
-}
-
 /**
- * Drive ONE real tool loop: script a tool_use response for `tool`, send the
- * prompt, and capture the provider-visible tool result. Throws an
- * infrastructure error when the tool never published or no result reached
- * the wire — a missing loop must never look like a behavioral verdict.
+ * Historian identity substring, deliberately shorter than the production
+ * signature line so this stays a *selector* rather than the broad hidden-agent
+ * *filter* in `cache-analysis.ts`. This one answers "should my matcher reply to
+ * this request", so it must match the historian and not the dreamer, sidekick,
+ * or OpenCode's own title/summary/compaction agents.
+ *
+ * Its relationship to the shared signature is pinned by a test in
+ * `cache-analysis.test.ts`: editing the production historian opener without
+ * updating this marker fails loudly instead of silently desyncing.
  */
-export async function runScriptedToolCall(
-    h: TestHarness,
-    sessionId: string,
-    options: ScriptedToolCallOptions,
-): Promise<ScriptedToolCall> {
-    const usage = options.usage ?? DEFER_USAGE;
-    const callId = `toolu_incident_${++scriptedCallCounter}`;
-    let published: string | null = null;
-    h.mock.reset();
-    h.mock.addMatcher((body) => {
-        if (published !== null) return null;
-        const name = publishedToolName(body, options.tool);
-        if (!name) return null;
-        published = name;
-        return {
-            content: [
-                { type: "tool_use", id: callId, name, input: options.input },
-            ],
-            stop_reason: "tool_use" as const,
-            usage,
-        };
-    });
-    h.mock.setDefault({
-        text: options.followUpText ?? "scripted tool follow-up",
-        usage,
-    });
-    await h.sendPrompt(sessionId, options.prompt);
-    if (published === null) {
-        const visible = [
-            ...new Set(
-                h.mock
-                    .requests()
-                    .flatMap((request) => request.body.tools ?? [])
-                    .map((tool) =>
-                        tool &&
-                        typeof tool === "object" &&
-                        typeof (tool as { name?: unknown }).name === "string"
-                            ? (tool as { name: string }).name
-                            : null,
-                    )
-                    .filter((name): name is string => name !== null),
-            ),
-        ];
-        throw new Error(
-            `tool ${options.tool} was never published on the provider wire (visible: ${visible.join(", ") || "none"})`,
-        );
-    }
-    const resultText = findToolResultText(h, callId);
-    if (resultText === null) {
-        throw new Error(
-            `no provider-visible tool_result for scripted ${options.tool} call`,
-        );
-    }
-    return {
-        publishedToolName: published,
-        input: options.input,
-        callId,
-        resultText,
-    };
-}
-
 const HISTORIAN_SYSTEM_MARKER =
     "the hippocampus of a long-running coding agent";
+
+export const HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST = HISTORIAN_SYSTEM_MARKER;
 
 function isHistorianRequest(body: Record<string, unknown>): boolean {
     if (JSON.stringify(body.messages ?? "").includes("<new_messages>"))

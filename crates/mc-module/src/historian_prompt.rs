@@ -3,10 +3,10 @@
 //! The builders in this module take already-loaded rows and strings. They do not read the
 //! store, call the clock, or inspect provider state; callers own those integration choices.
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use mc_store::{StoredCompartment, StoredMemory};
+use crate::memory_render::{render_claim_memory_block, MirroredClaimMemory};
+use mc_store::StoredCompartment;
 use serde::Deserialize;
 
 /// Permanent seed floor — every historian run receives this many calibration examples.
@@ -15,24 +15,6 @@ pub const SEED_FLOOR: usize = 4;
 pub const SESSION_REF_WINDOW: usize = 6;
 
 const SEED_BANDS: [(i32, i32); 5] = [(85, 100), (60, 84), (30, 59), (10, 29), (1, 9)];
-
-/// Keep this order byte-identical to the prompt-side memory renderer. The v2 taxonomy is
-/// first; legacy categories remain readable so old memories do not disappear from the
-/// historian's deduplication context.
-pub const HISTORIAN_MEMORY_CATEGORY_PRIORITY: [&str; 12] = [
-    "PROJECT_RULES",
-    "ARCHITECTURE",
-    "CONSTRAINTS",
-    "CONFIG_VALUES",
-    "NAMING",
-    "USER_DIRECTIVES",
-    "USER_PREFERENCES",
-    "CONFIG_DEFAULTS",
-    "ARCHITECTURE_DECISIONS",
-    "ENVIRONMENT",
-    "WORKFLOW_RULES",
-    "KNOWN_ISSUES",
-];
 
 const EXTRACTION_FREE_TOGGLE: &str = "<extraction>disabled</extraction>\nStructural recomp mode: emit compartments and <meta> only. Do NOT emit <facts>, <events>, <user_observations>, or <primer_candidates>.";
 const FACT_EXTRACTION_DISABLED_TOGGLE: &str = "<fact_extraction>disabled</fact_extraction>\nMemory is disabled for this project: do NOT emit a <facts> block. Produce compartments only.";
@@ -319,42 +301,9 @@ pub fn build_reference_blocks_from_stored(
     build_reference_blocks(session_id, chunk_start, &refs)
 }
 
-/// Render the historian's category-grouped project-memory block from already-loaded rows.
-///
-/// This differs from the m0/m1 memory render: the historian needs compact category groups
-/// for fact deduplication, not per-memory ids or update metadata.
-pub fn render_historian_memory_block(memories: &[StoredMemory]) -> String {
-    let mut by_category: HashMap<&str, Vec<&StoredMemory>> = HashMap::new();
-    for memory in memories {
-        by_category
-            .entry(memory.category.as_str())
-            .or_default()
-            .push(memory);
-    }
-
-    let mut sections = Vec::new();
-    for category in HISTORIAN_MEMORY_CATEGORY_PRIORITY {
-        let Some(category_memories) = by_category.get(category) else {
-            continue;
-        };
-        if category_memories.is_empty() {
-            continue;
-        }
-        sections.push(format!("<{category}>"));
-        for memory in category_memories {
-            sections.push(format!("- {}", escape_xml_content(&memory.content)));
-        }
-        sections.push(format!("</{category}>"));
-    }
-
-    if sections.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<project-memory>\n{}\n</project-memory>",
-            sections.join("\n")
-        )
-    }
+/// Render the same claim-native project-memory block used by the host.
+pub fn render_historian_claim_block(claims: &[MirroredClaimMemory]) -> String {
+    render_claim_memory_block(claims, "project-memory")
 }
 
 pub fn build_compartment_agent_prompt(inputs: &CompartmentPromptInputs<'_>) -> String {
@@ -463,13 +412,16 @@ mod tests {
         prompt_cases: Vec<PromptCase>,
     }
 
-    fn memory(row: &GoldenMemory) -> StoredMemory {
-        StoredMemory {
-            id: row.id,
+    fn claim(row: &GoldenMemory) -> MirroredClaimMemory {
+        let public_claim_id = format!("mcm_{:032x}", row.id);
+        MirroredClaimMemory {
+            revision_locator: format!("{public_claim_id}/r1/{}", "a".repeat(64)),
+            public_claim_id,
+            project_id: 1,
             category: row.category.clone(),
             content: row.content.clone(),
-            status: "active".to_string(),
-            ..StoredMemory::default()
+            importance: 50,
+            provenance_label: None,
         }
     }
 
@@ -477,6 +429,21 @@ mod tests {
     fn xml_escaping_matches_prompt_reference_order() {
         assert_eq!(escape_xml_attr("&\"'<>"), "&amp;&quot;&apos;&lt;&gt;");
         assert_eq!(escape_xml_content("&<>\"'"), "&amp;&lt;&gt;\"'");
+    }
+
+    #[test]
+    fn claim_historian_context_uses_public_identity() {
+        let block = render_historian_claim_block(&[MirroredClaimMemory {
+            public_claim_id: format!("mcm_{}", "a".repeat(32)),
+            revision_locator: format!("mcm_{}/r1/{}", "a".repeat(32), "b".repeat(64)),
+            project_id: 1,
+            category: "CONSTRAINTS".to_string(),
+            content: "Use the public contract.".to_string(),
+            importance: 80,
+            provenance_label: None,
+        }]);
+        assert!(block.contains("mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!block.contains("#1"));
     }
 
     #[test]
@@ -541,8 +508,8 @@ mod tests {
                 case.label
             );
 
-            let memories: Vec<StoredMemory> = case.memories.iter().map(memory).collect();
-            let project_memory = render_historian_memory_block(&memories);
+            let claims: Vec<MirroredClaimMemory> = case.memories.iter().map(claim).collect();
+            let project_memory = render_historian_claim_block(&claims);
             assert_eq!(
                 project_memory, case.project_memory,
                 "project memory mismatch in '{}'",
