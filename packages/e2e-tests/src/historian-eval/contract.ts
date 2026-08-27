@@ -527,7 +527,18 @@ function scenarioDuplicateKey(scenario: HistorianEvalScenario): Record<string, u
     return {
         schema: scenario.schema,
         families: canonicalOrder(scenario.families),
-        transcript: scenario.transcript,
+        // Turn ORDER is preserved — it is meaning, not presentation — but each
+        // message is canonicalized through the same production path the renderer
+        // uses. Two transcripts that differ only in internal whitespace, or in a
+        // `<system-reminder>` block, reach the historian as identical blocks, so
+        // they are the same evaluation and keeping both double-weights it.
+        transcript: {
+            epilogueStartIndex: scenario.transcript.epilogueStartIndex,
+            turns: scenario.transcript.turns.map((turn) => ({
+                user: messageAsHistorianSeesIt("user", turn.user),
+                assistant: messageAsHistorianSeesIt("assistant", turn.assistant),
+            })),
+        },
         expectedHistorianRuns: scenario.trigger.expectedHistorianRuns,
         compartments: scenario.gold.compartments,
         expectedClaims: canonicalOrder(scenario.gold.expectedClaims.map(claimSemantics)),
@@ -877,8 +888,15 @@ export interface ReleaseManifest {
     releaseTuple: ReleaseTuple;
     approvals: { privacy: Approval; goldIntent: Approval };
     /**
-     * Errata (R12): scenario ids from prior releases found wrong. Tombstoned
-     * ids persist in every later release; existing releases are never edited.
+     * Errata (R12): scenario ids from prior releases found wrong. Existing
+     * releases are never edited.
+     *
+     * Tombstones must persist into every later release, which is a relation
+     * BETWEEN two manifests and therefore not something `parseManifest` can
+     * check from one document — see `assertReleaseSuccession`. Approval binding
+     * only stops a prior release's approvals being replayed on a manifest that
+     * drops a tombstone; it cannot stop a freshly approved release from dropping
+     * one.
      */
     tombstones: string[];
 }
@@ -1007,4 +1025,40 @@ export function parseManifest(raw: unknown, label = "manifest"): ReleaseManifest
         approvals: { privacy, goldIntent },
         tombstones,
     };
+}
+
+/**
+ * Enforce the errata invariant across a release boundary: a later release
+ * carries forward every tombstone its predecessor declared.
+ *
+ * Separate from `parseManifest` because this is a relation between two
+ * manifests, not a property of one document. `parseManifest` can prove a
+ * release's approvals are bound to exactly the corpus and tombstone set they
+ * signed, which stops a prior release's approvals being REPLAYED on a manifest
+ * that drops a tombstone — but a release that drops one and collects fresh
+ * approvals is internally consistent, and would resurrect a scenario already
+ * known to be wrong. Only the predecessor can rule that out.
+ *
+ * Version order is checked too, so the arguments cannot be supplied backwards
+ * and quietly pass: "later" is what makes the inheritance direction meaningful.
+ * Both versions match `RELEASE_VERSION_RE`, so the numeric suffix is total.
+ *
+ * The stronger alternative is an append-only tombstone registry the promote step
+ * reads instead of the previous manifest; this check is what the contract can
+ * enforce with no store, and the two are compatible — a registry would supply
+ * the `previous` set.
+ */
+export function assertReleaseSuccession(previous: ReleaseManifest, next: ReleaseManifest): void {
+    const versionOf = (release: ReleaseManifest): number => Number(release.releaseVersion.slice(1));
+    if (versionOf(next) <= versionOf(previous)) {
+        fail("releaseSuccession.releaseVersion: not-later-than-previous");
+    }
+    const carried = new Set(next.tombstones);
+    const dropped = previous.tombstones.filter((id) => !carried.has(id)).sort();
+    if (dropped.length > 0) {
+        // Ids are authored `hse-*` values, not artifact content, so naming them
+        // is a diagnostic the operator can act on rather than an echo of the
+        // material under review.
+        fail(`releaseSuccession.tombstones: dropped-${dropped.join(",")}`);
+    }
 }

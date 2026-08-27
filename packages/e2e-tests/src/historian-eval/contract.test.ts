@@ -3,6 +3,7 @@ import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
+    assertReleaseSuccession,
     MAX_EXPECTATION_ENTRIES,
     MAX_PROBE_CHOICES,
     MAX_TRANSCRIPT_TURNS,
@@ -807,8 +808,39 @@ describe("release tuple and manifest", () => {
         }
     });
 
-    test("privacy and sanitizer versions must be the ones the lane implements", () => {
+    test("a later release cannot drop a predecessor's tombstone", () => {
         const tuple = buildReleaseTuple([validScenario()]);
+        const manifest = (releaseVersion: string, tombstones: string[]) => {
+            const releaseFingerprint = releaseApprovalFingerprint({ releaseVersion, releaseTuple: tuple, tombstones });
+            return parseManifest({
+                schema: MANIFEST_SCHEMA,
+                releaseVersion,
+                releaseTuple: tuple,
+                approvals: {
+                    privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint },
+                    goldIntent: { kind: "gold-intent", approver: "operator-b", releaseFingerprint },
+                },
+                tombstones,
+            });
+        };
+        const v1 = manifest("v1", ["hse-known-wrong", "hse-also-wrong"]);
+        // Freshly approved and internally consistent, so approval binding cannot
+        // catch it: only the predecessor shows the resurrection.
+        const resurrects = manifest("v2", ["hse-also-wrong"]);
+        expect(() => assertReleaseSuccession(v1, resurrects)).toThrow(
+            /releaseSuccession\.tombstones: dropped-hse-known-wrong/,
+        );
+
+        const carriesForward = manifest("v2", ["hse-known-wrong", "hse-also-wrong", "hse-newly-wrong"]);
+        expect(() => assertReleaseSuccession(v1, carriesForward)).not.toThrow();
+
+        // Supplied backwards, the inheritance direction is meaningless, so the
+        // version order is checked rather than silently passing.
+        expect(() => assertReleaseSuccession(carriesForward, v1)).toThrow(/not-later-than-previous/);
+        expect(() => assertReleaseSuccession(v1, v1)).toThrow(/not-later-than-previous/);
+    });
+
+    test("privacy and sanitizer versions must be the ones the lane implements", () => {        const tuple = buildReleaseTuple([validScenario()]);
         for (const key of ["privacyPolicyVersion", "sanitizerVersion"] as const) {
             // A manifest that invents a version and recomputes the fingerprint
             // over it would present the corpus as reviewed under a policy no code
