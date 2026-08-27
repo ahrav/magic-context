@@ -955,6 +955,15 @@ describe("immutable input fail-closed rules", () => {
                     `${cargo}\n[features]\nbypass = ["ort/c\\u0075da"]\n`,
                 /\[features\] table .* holds a string this qualifier cannot read/,
             ],
+            [
+                // A bracket inside a quoted value is not structure. Counting it
+                // leaves the depth permanently positive, so every later line is
+                // read as nested content and a target-specific dependency after it
+                // is never seen.
+                (cargo) =>
+                    `${cargo}\npoison = "["\n\n[target.'cfg(target_os = "linux")'.dependencies]\nort = { version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
+            ],
         ];
         for (const [mutate, error] of cases) {
             const root = freshRoot();

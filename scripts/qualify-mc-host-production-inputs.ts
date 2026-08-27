@@ -1738,6 +1738,39 @@ function stripTomlComments(line: string): string {
 }
 
 /**
+ * The net brace and bracket nesting a line opens or closes, ignoring quoted text.
+ *
+ * Counting every character treats a bracket inside a string as structure, so a
+ * valid `poison = "["` leaves the depth permanently positive and every line after
+ * it — including a later target-specific dependency — is read as nested content and
+ * skipped. Structure is only structure outside strings.
+ *
+ * Basic and literal strings on one line, which is what Cargo dependency and feature
+ * values are; a multi-line `"""` string would need the parser this scan is not.
+ */
+function structuralDelta(line: string): number {
+    let delta = 0;
+    let quote: string | null = null;
+    let escaped = false;
+    for (const char of line) {
+        if (quote !== null) {
+            if (quote === '"') {
+                if (escaped) escaped = false;
+                else if (char === "\\") escaped = true;
+                else if (char === '"') quote = null;
+            } else if (char === "'") {
+                quote = null;
+            }
+            continue;
+        }
+        if (char === '"' || char === "'") quote = char;
+        else if (char === "{" || char === "[") delta++;
+        else if (char === "}" || char === "]") delta--;
+    }
+    return delta;
+}
+
+/**
  * Resolve a TOML key or string value as written to the name Cargo will see, or
  * `null` when this scan cannot say. Used for dependency keys, a renamed
  * dependency's `package` value, and forwarded feature values in `[features]` —
@@ -1865,10 +1898,7 @@ function dependencyDeclarations(
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
         const atTopLevel = depth === 0;
-        for (const char of line) {
-            if (char === "{" || char === "[") depth++;
-            else if (char === "}" || char === "]") depth--;
-        }
+        depth += structuralDelta(line);
         // A `[...]` line is only a section header at top level; inside a multiline
         // array it is array syntax.
         const header = atTopLevel ? /^\[([^\]]+)\]$/.exec(trimmed) : null;
@@ -1931,10 +1961,7 @@ function joinInlineEntry(lines: string[], index: number): string | null {
     for (let i = index; i < lines.length; i++) {
         const line = lines[i] ?? "";
         collected.push(line.trim());
-        for (const char of line) {
-            if (char === "{" || char === "[") depth++;
-            else if (char === "}" || char === "]") depth--;
-        }
+        depth += structuralDelta(line);
         if (depth <= 0) return collected.join(" ");
     }
     return null;
@@ -2176,10 +2203,7 @@ function assertNoForbiddenFeatureForwarding(
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
         const atTopLevel = depth === 0;
-        for (const char of line) {
-            if (char === "{" || char === "[") depth++;
-            else if (char === "}" || char === "]") depth--;
-        }
+        depth += structuralDelta(line);
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
