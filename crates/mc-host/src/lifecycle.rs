@@ -1827,25 +1827,36 @@ mod tests {
                 "the symlink target must be untouched"
             );
 
-            // A FIFO at the lock name must classify, not hang.
-            let root = temp_root();
-            let coordination = coordination_dir_path(Some(root.path())).expect("path");
-            std::fs::create_dir_all(&coordination).expect("coordination root");
-            rustix::fs::mkfifoat(
-                rustix::fs::CWD,
-                coordination.join(name).as_path(),
-                Mode::from_raw_mode(0o600),
-            )
-            .expect("plant fifo");
-            let mutator_err = if name == TRANSACTION_LOCK_NAME {
-                LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
-            } else {
-                InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).err()
-            };
-            assert!(
-                matches!(mutator_err, Some(InstanceError::Insecure { .. })),
-                "a fifo at {name} must fail closed: {mutator_err:?}"
-            );
+            // A FIFO at the lock name must classify, not hang. Linux-gated
+            // like the other two fifo cases in this module: rustix gates
+            // `mkfifoat` away from Apple targets and this crate is
+            // `deny(unsafe_code)`, so the plant has no portable in-process
+            // form. Shelling out to `mkfifo(1)` is not the answer either —
+            // forking from this test binary hands the child duplicates of the
+            // `flock`ed descriptors sibling tests hold in parallel threads,
+            // and the lock outlives its guard until the child execs and exits,
+            // which makes those siblings fail with EWOULDBLOCK.
+            #[cfg(target_os = "linux")]
+            {
+                let root = temp_root();
+                let coordination = coordination_dir_path(Some(root.path())).expect("path");
+                std::fs::create_dir_all(&coordination).expect("coordination root");
+                rustix::fs::mkfifoat(
+                    rustix::fs::CWD,
+                    coordination.join(name).as_path(),
+                    Mode::from_raw_mode(0o600),
+                )
+                .expect("plant fifo");
+                let mutator_err = if name == TRANSACTION_LOCK_NAME {
+                    LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
+                } else {
+                    InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).err()
+                };
+                assert!(
+                    matches!(mutator_err, Some(InstanceError::Insecure { .. })),
+                    "a fifo at {name} must fail closed: {mutator_err:?}"
+                );
+            }
 
             // A hard-linked lock file has an owner besides us.
             let root = temp_root();

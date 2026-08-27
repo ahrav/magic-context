@@ -330,6 +330,20 @@ fn owner_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// Permission bits as rustix's platform-width `RawMode`.
+///
+/// `RawMode` is `u32` on Linux and `u16` on the Darwin targets, while the
+/// manifest commits `mode` as `u32`, so the two cannot meet without an explicit
+/// conversion — leaving it implicit compiles on Linux and fails on Darwin. Only
+/// the permission and set-id bits are meaningful to any caller here, and every
+/// value passed is already within them (0o600 or 0o700 for staged output, and a
+/// manifest mode that validation requires to equal `mode & 0o777`), so the mask
+/// documents that range rather than narrowing a value that could exceed it.
+#[allow(clippy::unnecessary_cast)]
+fn raw_mode(mode: u32) -> rustix::fs::RawMode {
+    (mode & 0o7777) as rustix::fs::RawMode
+}
+
 fn verify_file_against_entry(fd: &OwnedFd, entry: &ManifestFile) -> Result<(), GenerationError> {
     let stat = rustix::fs::fstat(fd).map_err(|_| invalid("file stat failed"))?;
     let mode = mode_bits(&stat);
@@ -990,18 +1004,18 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
             .map_err(|_| invalid("staging directory chmod failed"))?;
         }
     }
-    let mode = if spec.executable { 0o700 } else { 0o600 };
+    let mode: u32 = if spec.executable { 0o700 } else { 0o600 };
     let dest_fd = openat(
         temp_fd,
         spec.rel_path.as_str(),
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(mode),
+        Mode::from_raw_mode(raw_mode(mode)),
     )
     .map_err(|e| match e {
         rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT => GenerationError::InsufficientStorage,
         _ => invalid("staging output creation failed"),
     })?;
-    rustix::fs::fchmod(&dest_fd, Mode::from_raw_mode(mode))
+    rustix::fs::fchmod(&dest_fd, Mode::from_raw_mode(raw_mode(mode)))
         .map_err(|_| invalid("staging output chmod failed"))?;
 
     let mut hasher = sha2::Sha256::new();
@@ -1067,13 +1081,14 @@ fn write_new_file(
         dir,
         name,
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(mode),
+        Mode::from_raw_mode(raw_mode(mode)),
     )
     .map_err(|e| match e {
         rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT => GenerationError::InsufficientStorage,
         _ => invalid("file creation failed"),
     })?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode)).map_err(|_| invalid("file chmod failed"))?;
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(raw_mode(mode)))
+        .map_err(|_| invalid("file chmod failed"))?;
     write_all_fd(&fd, bytes).map_err(|e| {
         if is_storage_exhausted(&e) {
             GenerationError::InsufficientStorage
