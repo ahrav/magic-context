@@ -93,6 +93,7 @@ export function tsOpenCodeStandaloneFiles(root: string = E2E_ROOT): string[] {
         [
             "src/oracle-arms/presets.test.ts",
             "src/oracle-arms/scripted-ctx-search.test.ts",
+            ...HISTORIAN_EVAL_HARNESS_TESTS,
         ],
         root,
     );
