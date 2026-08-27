@@ -335,9 +335,10 @@ const INJECTED_BLOCK_TAGS = [
 /**
  * Drop injected Magic Context blocks so what remains is raw history.
  *
- * A block whose closing tag was lost to budget trimming does not match and its
- * contents stay in the searched text; that keeps the leak gate conservative
- * (it can still over-report, never under-report).
+ * Sound only when the transcript does not author these tags itself — see
+ * `carriesInjectedBlockTag`, which callers must consult first. A block whose
+ * closing tag was lost to budget trimming does not match and its contents stay
+ * in the searched text, which is the safe direction for a leak gate.
  */
 export function stripInjectedBlocks(text: string): string {
     let remaining = text;
@@ -345,6 +346,20 @@ export function stripInjectedBlocks(text: string): string {
         remaining = remaining.replace(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, "g"), "\n");
     }
     return remaining;
+}
+
+/**
+ * Whether text opens or closes an injected-block tag itself.
+ *
+ * `stripInjectedBlocks` treats every matching tag span as injected, which an
+ * authored transcript can forge: a user message opening `<session-history>` and
+ * a later assistant reply closing it makes the raw gold text between them look
+ * like an injected span, so stripping would remove the very bytes the leak gate
+ * is searching for and hide a real leak. A scenario whose authored text carries
+ * these tags therefore keeps the unstripped payload.
+ */
+export function carriesInjectedBlockTag(text: string): boolean {
+    return INJECTED_BLOCK_TAGS.some((tag) => text.includes(`<${tag}>`) || text.includes(`</${tag}>`));
 }
 
 /** Ids of the messages in a session-messages response. */
@@ -915,6 +930,21 @@ class ScenarioRunner {
                 `${this.historianMarkerMockHits} historian-marker request(s) reached the MockProvider during a live run`,
             );
         }
+        // `status: "failed"` is not by itself model behavior. Production records
+        // it for infrastructure conditions too — `stale_snapshot`,
+        // `chunk-coverage: ...`, a missing protected-tail boundary snapshot,
+        // drain-quota exhaustion, `exception: ...` — and only `validation: ...`
+        // means the historian emitted unusable output. Letting the others reach
+        // the scorer's all-attempts-invalid path would charge a runner or
+        // database regression to historian quality as FAIL:invalid-output,
+        // which is exactly the attribution R6 forbids. An unexplained failure
+        // is not evidence of model behavior either, so it takes this path too.
+        if (row.status === "failed" && !(row.failure_reason ?? "").startsWith("validation: ")) {
+            throw new RunAbort(
+                "harness-failure",
+                `historian run ${runIndex} failed for a non-validation reason: ${row.failure_reason ?? "<none recorded>"}`,
+            );
+        }
 
         const rawOutput = await this.captureChildOutput(harness, sessionId);
         if (rawOutput === null && row.status === "success") {
@@ -1293,12 +1323,19 @@ class ScenarioRunner {
      * historian-authored summaries and claim text, and a summary may legitimately
      * restate an authored sentence verbatim — most likely for a short factual
      * assistant reply. Searching them too would convert a correct splice into a
-     * `gold-range-leak` ERROR on summarization wording alone. What remains after
-     * stripping is the raw message text the splice is responsible for removing.
+     * `gold-range-leak` ERROR on summarization wording alone.
+     *
+     * The exclusion is skipped for a scenario whose own transcript authors those
+     * tags, because there a tag span is not evidence of injection and stripping
+     * could hide a real leak. Such a scenario keeps the unstripped search, which
+     * can over-report but never conceals surviving raw text.
      */
     private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null): void {
         if (payloadText === null) return;
-        const rawHistory = stripInjectedBlocks(payloadText);
+        const authoredCarriesTag = this.scenario.transcript.turns.some(
+            (turn) => carriesInjectedBlockTag(turn.user) || carriesInjectedBlockTag(turn.assistant),
+        );
+        const rawHistory = authoredCarriesTag ? payloadText : stripInjectedBlocks(payloadText);
         for (const claim of this.probeGoldClaims(probe)) {
             for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
                 const authored = this.scenario.transcript.turns[turn];

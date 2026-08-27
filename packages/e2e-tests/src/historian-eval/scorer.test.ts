@@ -719,6 +719,43 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an unsupported run-record schema is ERROR before any gold is compared", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(
+                { ...record, schema: "historian-eval-run-record/v0" as typeof RUN_RECORD_SCHEMA },
+                scenario,
+            );
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-schema-unsupported");
+            expect(score.recall).toBeNull();
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a record paired with another attempt's snapshot is ERROR, not a verdict off foreign claims", () => {
+        // Same scenario, two attempts: identity and inventory checks pass, but
+        // the recorded claims name rows that only exist in the other database.
+        const attemptOne = makeSnapshot({ facts: goldFacts() });
+        const attemptTwo = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(attemptOne, scenario);
+            expect(scoreRunRecord(record, scenario).verdict).toBe("PASS");
+
+            const crossed = { ...record, contextDbSnapshotPath: attemptTwo.dbPath };
+            const score = scoreRunRecord(crossed, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            attemptOne.cleanup();
+            attemptTwo.cleanup();
+        }
+    });
+
     test("an earlier run's discard stays unhealed when the later run fails validation", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

@@ -25,6 +25,7 @@ import {
 } from "../../../plugin/src/hooks/magic-context/compartment-runner-validation";
 import { appendCompartments } from "../../../plugin/src/features/magic-context/compartment-storage";
 import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-context/memory/promotion";
+import { getProjectMemoryClaimByPublicId } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
 import { openTestDb } from "../test-db";
 import {
@@ -38,6 +39,7 @@ import {
 } from "./contract";
 import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
+import { RUN_RECORD_SCHEMA } from "./runner";
 import type {
     HistorianEvalRunRecord,
     InjectedClaimRecord,
@@ -446,6 +448,18 @@ function recordIntegrityError(
     record: HistorianEvalRunRecord,
     scenario: HistorianEvalScenario,
 ): ScenarioScore | null {
+    // Version first: every check below reads fields by v1 meaning, so an
+    // artifact written under a different schema must be refused rather than
+    // reinterpreted. Otherwise a persisted record whose fields merely still
+    // parse receives an ordinary PASS or FAIL under semantics it never had,
+    // which defeats the point of versioning the record at all.
+    if (record.schema !== RUN_RECORD_SCHEMA) {
+        return errorScore(
+            record.scenarioId,
+            "record-schema-unsupported",
+            `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
+        );
+    }
     if (record.scenarioId !== scenario.id) {
         return errorScore(
             record.scenarioId,
@@ -577,6 +591,39 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         }
         if (visible === null) {
             return errorScore(record.scenarioId, "stale-snapshot", "claim snapshot stale after the injection read's retry");
+        }
+
+        // Bind the record to THIS snapshot, not merely to this scenario. Facts
+        // are scored from `visible` here, while probe verdicts and trimming
+        // resolve against `record.injectedClaims`; pair a record with another
+        // attempt's snapshot of the same scenario and both identity checks
+        // above still pass while its public ids refer to rows that do not exist
+        // in the database being scored.
+        //
+        // The test is EXISTENCE, not membership in `visible`. A claim can
+        // legitimately drop out of the visible set at the read clock — expiry,
+        // supersession, any soft-hidden lifecycle — while its rows are present
+        // and the pairing is sound; requiring visibility would turn that into a
+        // spurious mismatch. A snapshot from a different attempt has no such
+        // rows at all, which is the case this separates out.
+        let absent: string[];
+        try {
+            absent = record.injectedClaims
+                .filter((claim) => getProjectMemoryClaimByPublicId(db, claim.publicClaimId) === null)
+                .map((claim) => claim.publicClaimId);
+        } catch (error) {
+            return errorScore(
+                record.scenarioId,
+                "unreadable-snapshot",
+                `context DB snapshot ${record.contextDbSnapshotPath} could not resolve recorded claims: ${errorMessage(error)}`,
+            );
+        }
+        if (absent.length > 0) {
+            return errorScore(
+                record.scenarioId,
+                "record-snapshot-mismatch",
+                `run record names ${absent.length} injected claim(s) with no row in its snapshot: [${absent.slice(0, 5).join(", ")}]`,
+            );
         }
 
         const probesById = new Map(scenario.probes.map((probe) => [probe.id, probe]));

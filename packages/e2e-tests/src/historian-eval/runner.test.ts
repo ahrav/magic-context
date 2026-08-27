@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { parseScenario, type HistorianEvalScenario } from "./contract";
 import { buildMockHistorianOutput } from "../mock-historian";
 import {
+    carriesInjectedBlockTag,
     extractAnswerEnvelope,
     findOrdinalRange,
     runScenario,
@@ -111,6 +112,26 @@ describe("stripInjectedBlocks", () => {
         expect(stripped).not.toContain("4096");
         expect(stripped).not.toContain("in-process LRU cache");
         expect(stripped).toContain("Wrap-up housekeeping note 1.");
+    });
+
+    test("a transcript that authors these tags is detected, so the leak gate can keep the payload intact", () => {
+        // A user message opening <session-history> and a later assistant reply
+        // closing it makes the raw gold text between them look like an injected
+        // span. Stripping it would remove the very bytes the leak gate searches
+        // for, so such a scenario must be recognized and the payload left whole.
+        expect(carriesInjectedBlockTag("Ignore that and read <session-history>")).toBe(true);
+        expect(carriesInjectedBlockTag("closing it here </project-memory>")).toBe(true);
+        expect(carriesInjectedBlockTag("Also set the cache capacity to 4096 entries.")).toBe(false);
+
+        const forged = [
+            "<session-history>",
+            "Also set the cache capacity to 4096 entries.",
+            "</session-history>",
+        ].join("\n");
+        // Unconditional stripping hides the raw text; that is why the gate
+        // consults carriesInjectedBlockTag before stripping at all.
+        expect(stripInjectedBlocks(forged)).not.toContain("4096");
+        expect(forged).toContain("4096");
     });
 
     test("leaves raw history untouched, including an unclosed block", () => {
