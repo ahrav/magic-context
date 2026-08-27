@@ -42,7 +42,7 @@ import {
     computeProjectMemoryMutationToken,
 } from "./storage-claim-operations.ts";
 import { readActiveDispositions } from "./storage-claim-policy.ts";
-import { uniformlyAbsentClaimSql } from "./storage-claim-visibility.ts";
+import { antiMemoryClaimSql, uniformlyAbsentClaimSql } from "./storage-claim-visibility.ts";
 import { ClaimGraphCorruptionError, resolveProjectId } from "./storage-claims.ts";
 import type { MemoryScope } from "./types.ts";
 
@@ -172,13 +172,7 @@ function resolveCandidates(
     // hydration for rows `surfaceDecision` (the authoritative check, kept as
     // defence in depth) would discard anyway.
     if ((request.surface ?? "explicit_search") !== "explicit_search") {
-        clauses.push(
-            `NOT EXISTS (
-                SELECT 1 FROM claim_memory_revision_attributes attrs
-                 WHERE attrs.revision_id = claims.current_revision_id
-                   AND attrs.category = ?)`,
-        );
-        bindings.push(ANTI_MEMORY_CATEGORY);
+        clauses.push(`NOT ${antiMemoryClaimSql("claims.current_revision_id")}`);
     }
     return db
         .prepare(
@@ -681,6 +675,7 @@ export function countProjectMemoryClaims(
                JOIN claim_memory_lifecycle_heads heads ON heads.claim_id = claims.id
               WHERE claims.project_id IN (${request.projectIds.map(() => "?").join(", ")})
                 AND heads.state IN (${lifecycleStates.map(() => "?").join(", ")})
+                AND NOT ${antiMemoryClaimSql("claims.current_revision_id")}
                 AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`,
         )
         .get(...request.projectIds, ...lifecycleStates) as { cnt: number } | undefined;

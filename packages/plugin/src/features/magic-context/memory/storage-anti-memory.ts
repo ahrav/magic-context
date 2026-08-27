@@ -16,6 +16,7 @@ import {
     stageCreateProjectMemoryClaimInCurrentTransaction,
     stageReviseProjectMemoryClaimInCurrentTransaction,
     tokenRequestShape,
+    validateProjectMemoryMutationToken,
 } from "./storage-claim-operations";
 import { ClaimGraphCorruptionError } from "./storage-claims";
 
@@ -368,10 +369,19 @@ export function extendAntiMemoryTtl(
         resolvePayload: () => {
             const current = readAntiMemory(db, input.token.publicClaimId);
             if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
-            if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
-                throw new ClaimOperationInputError(
-                    "anti-memory TTL extension must move expiry forward",
-                );
+            // Judge forward progress only for a caller whose token is still
+            // current. A superseded token means a concurrent extension already
+            // won, and its expiry can legitimately sit beyond this request's —
+            // forward progress from the caller's own snapshot. That race is the
+            // contract's zero-effect `stale` outcome, which the stage below
+            // produces; throwing here would relabel it a caller defect and
+            // record no receipt at all.
+            if (validateProjectMemoryMutationToken(db, input.token).ok) {
+                if (current.expiresAt === null || input.expiresAt <= current.expiresAt) {
+                    throw new ClaimOperationInputError(
+                        "anti-memory TTL extension must move expiry forward",
+                    );
+                }
             }
             return current.payload;
         },

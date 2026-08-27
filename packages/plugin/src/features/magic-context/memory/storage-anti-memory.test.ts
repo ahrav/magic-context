@@ -592,4 +592,58 @@ describe("anti-memory typed operations", () => {
             closeQuietly(db);
         }
     });
+    test("reports a losing concurrent extension as stale, not a caller defect", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-extend-race");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            // Both clients start from the same snapshot.
+            const sharedToken = computeProjectMemoryMutationToken(db, publicClaimId);
+
+            const winner = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend-winner" },
+                {
+                    token: sharedToken,
+                    expiresAt: 300 * DAY_MS,
+                    provenance: provenance("winner"),
+                    actor: "verifier",
+                    nowMs: 20,
+                },
+            );
+            expect(winner.outcome).toBe("applied");
+
+            // Forward progress from the loser's snapshot, behind the winner's
+            // expiry. Its token is now superseded, so this is a lost race and
+            // the contract's stale outcome — not bad input.
+            const loser = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend-loser" },
+                {
+                    token: sharedToken,
+                    expiresAt: 200 * DAY_MS,
+                    provenance: provenance("loser"),
+                    actor: "verifier",
+                    nowMs: 21,
+                },
+            );
+
+            expect(loser.outcome).toBe("stale");
+            expect(loser.result.effects).toEqual([]);
+            expect(readAntiMemory(db, publicClaimId)?.expiresAt).toBe(300 * DAY_MS);
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });
