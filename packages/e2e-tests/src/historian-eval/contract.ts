@@ -362,6 +362,17 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         expectedClaims.map((claim) => claim.id),
         `${label}.gold.expectedClaims`,
     );
+    // Ids being distinct is not enough: two entries with different ids but the
+    // same category and normalized predicate are one expectation written twice.
+    // A scorer that checks each expectation independently would count a single
+    // injected fact for both and inflate recall; a one-to-one scorer would leave
+    // the second permanently unsatisfiable. Either way the number is wrong, so
+    // the duplicate must never reach a freeze. The identity is JSON-encoded
+    // rather than concatenated so no category string can forge a collision.
+    unique(
+        expectedClaims.map((claim) => JSON.stringify([claim.category, normalizeContent(claim.predicate.value)])),
+        `${label}.gold.expectedClaims.identity`,
+    );
     const expectedAbsent = array(goldValue.expectedAbsent, `${label}.gold.expectedAbsent`).map((entry, index) =>
         parseExpectedAbsent(entry, `${label}.gold.expectedAbsent[${index}]`),
     );
@@ -404,22 +415,41 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
 }
 
 /**
- * Scenario identity: canonical fingerprint over the semantic payload.
- * Trigger pressure is harness-owned (R5/KTD3) and excluded, except the
+ * Scenario identity: canonical fingerprint over the semantic payload plus the
+ * scenario's name (id and title), which is what approvals and tombstones bind
+ * to. Trigger pressure is harness-owned (R5/KTD3) and excluded, except the
  * declared run count, which is scenario semantics (a run that never fires
  * is ERROR).
  */
 export function scenarioFingerprint(scenario: HistorianEvalScenario): string {
     return canonicalFingerprint({
-        schema: scenario.schema,
+        ...scenarioSemanticPayload(scenario),
         id: scenario.id,
         title: scenario.title,
+    });
+}
+
+/**
+ * What the scenario actually evaluates, with its NAME removed: no id, no title.
+ * Copying a scenario and relabelling it changes `scenarioFingerprint` — that is
+ * the point of an identity — so the release's uniqueness guard cannot be built
+ * on it. Two entries agreeing here drive the same transcript against the same
+ * golds and probes, so keeping both double-weights one evaluation in every
+ * aggregate the release reports.
+ */
+function scenarioSemanticPayload(scenario: HistorianEvalScenario): Record<string, unknown> {
+    return {
+        schema: scenario.schema,
         families: scenario.families,
         transcript: scenario.transcript,
         expectedHistorianRuns: scenario.trigger.expectedHistorianRuns,
         gold: scenario.gold,
         probes: scenario.probes,
-    });
+    };
+}
+
+function scenarioSemanticFingerprint(scenario: HistorianEvalScenario): string {
+    return canonicalFingerprint(scenarioSemanticPayload(scenario));
 }
 
 /** Normalization applied to both predicate values and candidate content. */
@@ -432,17 +462,42 @@ export function predicateMatches(predicate: ContentPredicate, content: string): 
 }
 
 /**
+ * Authored evidence text for a half-open turn range: both messages of every
+ * turn, ballast excluded. Ballast is harness-owned filler that never carries
+ * authored evidence, so including it could only let a predicate match by
+ * accident against generated prose.
+ */
+function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTurnExclusive: number): string {
+    return scenario.transcript.turns
+        .slice(startTurn, endTurnExclusive)
+        .map((turn) => `${turn.user} ${turn.assistant}`)
+        .join(" ");
+}
+
+/**
  * The raw text mass the chunk builder will see for the transcript. Rendered
  * with the PRODUCTION `formatBlock` over the block shape the chunk builder
  * constructs (one block per message, compact roles), and with the SHARED
  * ballast generator the harnesses send — so the freeze lint's headroom check
  * measures the same bytes that actually reach the historian, and stays
  * current when either production renderer or ballast generator changes.
+ *
+ * Ballast is rendered with `ballastProse`'s default seed because that is the
+ * only seed the harnesses can send: `TestHarness.ballast(tokens)` and its pi
+ * and rust twins take no seed. Rotating the word bank per turn here would
+ * measure a transcript no runner produces, and the word bank's words differ in
+ * length, so a rotated seed changes the rendered byte count — near the
+ * chunk-budget boundary that is the difference between a scenario freezing
+ * lint-clean and its live chunk splitting. A runner that ever varies ballast
+ * per turn has to thread the same seed through both sides.
+ *
+ * Exported for the seed-fidelity test: this rendering is the lint's whole
+ * measurement surface, so its agreement with the harness is a contract.
  */
-function renderedTranscriptText(scenario: HistorianEvalScenario): string {
+export function renderedTranscriptText(scenario: HistorianEvalScenario): string {
     const blocks: ChunkBlock[] = [];
+    const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
     scenario.transcript.turns.forEach((turn, index) => {
-        const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn, index);
         blocks.push({
             role: compactRole("user"),
             startOrdinal: index * 2 + 1,
@@ -473,6 +528,7 @@ function renderedTranscriptText(scenario: HistorianEvalScenario): string {
 export function lintScenario(scenario: HistorianEvalScenario): string[] {
     const diagnostics: string[] = [];
     const label = scenario.id;
+    const preEpilogueText = evidenceText(scenario, 0, scenario.transcript.epilogueStartIndex);
 
     for (const claim of scenario.gold.expectedClaims) {
         if (!MEMORY_CATEGORIES.includes(claim.category)) {
@@ -486,6 +542,16 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
             // heals the boundary, so recall could never be attributed to the
             // historian.
             diagnostics.push(`${label}.gold.expectedClaims.${claim.id}.sourceTurnRange: inside-epilogue`);
+        }
+        // The range is what the probe tier's leakage gate trusts when it decides
+        // whether the fact-bearing raw text survived injection, and what the
+        // scorer treats as the fact's origin. A predicate absent from every
+        // message in its declared range names no authored fact at all: the
+        // scenario would score the historian against something the transcript
+        // never said, and the leakage gate would guard the wrong turns.
+        const authoredIn = evidenceText(scenario, claim.sourceTurnRange[0], claim.sourceTurnRange[1] + 1);
+        if (!predicateMatches(claim.predicate, authoredIn)) {
+            diagnostics.push(`${label}.gold.expectedClaims.${claim.id}.sourceTurnRange: predicate-not-authored`);
         }
     }
     if (scenario.gold.expectedClaims.length === 0) {
@@ -501,6 +567,15 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     for (const absent of scenario.gold.expectedAbsent) {
         if (normalizeContent(absent.predicate.value).length === 0) {
             diagnostics.push(`${label}.gold.expectedAbsent.${absent.id}.predicate: empty-after-normalization`);
+        }
+        // A hard negative only measures non-promotion if the historian was
+        // actually exposed to the forbidden formation. A predicate absent from
+        // the pre-epilogue transcript — never authored, or authored only in the
+        // epilogue that discard-last can drop — passes its absence check
+        // vacuously, so the release would claim coverage for a family it never
+        // exercised.
+        if (!predicateMatches(absent.predicate, preEpilogueText)) {
+            diagnostics.push(`${label}.gold.expectedAbsent.${absent.id}.predicate: not-authored-before-epilogue`);
         }
         // A forbidden formation that is a normalized substring of a gold
         // claim's content is a contradiction: any claim satisfying the gold
@@ -589,16 +664,28 @@ export interface ReleaseManifest {
 }
 
 export function buildReleaseTuple(scenarios: readonly HistorianEvalScenario[]): ReleaseTuple {
+    // An empty corpus still hashes to a well-formed fingerprint that approvals
+    // can bind to, so the lane would promote a release that measures nothing and
+    // report a vacuous pass. Discovery or filtering yielding zero files is a
+    // pipeline fault, not a valid release.
+    if (scenarios.length === 0) fail("releaseTuple.scenarios: empty");
     // Tombstones are keyed by scenario id, so an id shared by two distinct
-    // scenarios would retire both at once; and a duplicated scenario would
-    // shift corpusFingerprint without changing the scored corpus. Both are
-    // authoring mistakes that must fail closed before hashing.
+    // scenarios would retire both at once. Unique ids alone leave the worse
+    // authoring mistake open: `scenarioFingerprint` covers the id and title, so
+    // a scenario copied under a new name has a new identity by construction and
+    // no identity-based check can see it — while it silently double-weights one
+    // evaluation in every aggregate the release reports. Hence the second,
+    // name-independent check. A third check over full fingerprints would be
+    // dead: distinct ids already imply distinct identities.
     unique(
         scenarios.map((scenario) => scenario.id),
         "releaseTuple.scenarios.id",
     );
+    unique(
+        scenarios.map((scenario) => scenarioSemanticFingerprint(scenario)),
+        "releaseTuple.scenarios.semantic",
+    );
     const fingerprints = scenarios.map((scenario) => scenarioFingerprint(scenario));
-    unique(fingerprints, "releaseTuple.scenarios.fingerprint");
     return {
         corpusFingerprint: canonicalFingerprint([...fingerprints].sort()),
         scenarioSchemaVersion: SCENARIO_SCHEMA,
@@ -639,6 +726,14 @@ function parseReleaseTuple(raw: unknown, label: string): ReleaseTuple {
     const value = record(raw, label);
     exact(value, ["corpusFingerprint", "scenarioSchemaVersion", "privacyPolicyVersion", "sanitizerVersion"], label);
     if (value.scenarioSchemaVersion !== SCENARIO_SCHEMA) fail(`${label}.scenarioSchemaVersion: version-invalid`);
+    // Pinned to the imported constants for the same reason the schema version is:
+    // these name the policies the lane actually implements. Accepting arbitrary
+    // strings would let a manifest declare `"made-up"` versions, recompute the
+    // release fingerprint over them, and present the corpus as reviewed under a
+    // privacy or sanitizer policy no code here enforces. Rotating either policy
+    // is a deliberate constant bump, which correctly invalidates prior approvals.
+    if (value.privacyPolicyVersion !== PRIVACY_POLICY_VERSION) fail(`${label}.privacyPolicyVersion: version-invalid`);
+    if (value.sanitizerVersion !== SANITIZER_VERSION) fail(`${label}.sanitizerVersion: version-invalid`);
     return {
         corpusFingerprint: hex64(value.corpusFingerprint, `${label}.corpusFingerprint`),
         scenarioSchemaVersion: SCENARIO_SCHEMA,
@@ -664,6 +759,12 @@ export function parseManifest(raw: unknown, label = "manifest"): ReleaseManifest
     const goldIntent = parseApproval(approvalsValue.goldIntent, `${label}.approvals.goldIntent`);
     if (privacy.kind !== "privacy") fail(`${label}.approvals.privacy.kind: wrong-kind`);
     if (goldIntent.kind !== "gold-intent") fail(`${label}.approvals.goldIntent.kind: wrong-kind`);
+    // Two approval kinds exist because they are two different reviews: one asks
+    // whether the corpus is safe to publish, the other whether the golds encode
+    // the intended behavior. One actor holding both seats collapses them into a
+    // single judgement while the manifest still presents two, so the manifest
+    // would overstate the review the release actually received.
+    if (privacy.approver === goldIntent.approver) fail(`${label}.approvals: approver-not-independent`);
     const expectedFingerprint = releaseApprovalFingerprint({ releaseVersion, releaseTuple, tombstones });
     for (const approval of [privacy, goldIntent]) {
         if (approval.releaseFingerprint !== expectedFingerprint) {

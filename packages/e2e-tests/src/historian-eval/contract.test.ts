@@ -12,8 +12,10 @@ import {
     parseScenario,
     predicateMatches,
     releaseApprovalFingerprint,
+    renderedTranscriptText,
     scenarioFingerprint,
 } from "./contract";
+import { ballastProse } from "../ballast";
 import { validScenario, validScenarioRaw } from "./test-support";
 
 /** Deep key-order permutation: same semantics, different byte order. */
@@ -146,6 +148,46 @@ describe("parseScenario", () => {
         expect(() => parseScenario(raw)).toThrow(/string-invalid/);
     });
 
+    test("whitespace-only contract strings reject like empty ones", () => {
+        // Production transcript formatting trims and can discard a blank
+        // message, and a blank probe answer is not scoreable, so a
+        // whitespace-only value would freeze a scenario whose runtime input the
+        // gold contract cannot match.
+        const edits: Array<(raw: Record<string, unknown>) => void> = [
+            (raw) => {
+                raw.title = "   ";
+            },
+            (raw) => {
+                (raw.transcript as { turns: Array<{ user: string }> }).turns[0].user = "  \t ";
+            },
+            (raw) => {
+                (raw.probes as Record<string, unknown>[])[0].goldAnswer = " ";
+            },
+            (raw) => {
+                (raw.probes as Record<string, unknown>[])[0].question = "\n";
+            },
+        ];
+        for (const edit of edits) {
+            const raw = validScenarioRaw();
+            edit(raw);
+            expect(() => parseScenario(raw)).toThrow(/string-invalid/);
+        }
+    });
+
+    test("two expected claims sharing a category and normalized predicate reject", () => {
+        const raw = validScenarioRaw();
+        const claims = (raw.gold as { expectedClaims: Record<string, unknown>[] }).expectedClaims;
+        // Distinct id, same expectation: whitespace and case are normalized away,
+        // so this is one gold written twice and would double-count on recall.
+        claims.push({
+            id: "exp-lru-cache-again",
+            category: "ARCHITECTURE",
+            predicate: { kind: "normalized-substring", value: "In-Process   LRU Cache" },
+            sourceTurnRange: [1, 1],
+        });
+        expect(() => parseScenario(raw)).toThrow(/gold\.expectedClaims\.identity: duplicate/);
+    });
+
     test("run budget above two rejects (KTD3)", () => {
         const raw = validScenarioRaw();
         (raw.trigger as Record<string, unknown>).expectedHistorianRuns = 3;
@@ -167,10 +209,22 @@ describe("lintScenario", () => {
     test("accepts a well-formed scenario carrying each of the seven hard-negative families", () => {
         const raw = validScenarioRaw();
         raw.families = [...HARD_NEGATIVE_FAMILIES];
+        // Each predicate is a formation the pre-epilogue transcript actually
+        // contains: a hard negative the historian was never exposed to would
+        // pass its absence check vacuously, so the lint requires the evidence.
+        const authoredFormations = [
+            "use Redis for the session cache",
+            "TTL eviction",
+            "operational dependency",
+            "Redis would give us",
+            "Redis rejected",
+            "cache capacity",
+            "out of the box",
+        ];
         (raw.gold as Record<string, unknown>).expectedAbsent = HARD_NEGATIVE_FAMILIES.map((family, index) => ({
             id: `abs-family-${index}`,
             family,
-            predicate: { kind: "normalized-substring", value: `forbidden formation ${index}` },
+            predicate: { kind: "normalized-substring", value: authoredFormations[index] },
         }));
         expect(lintScenario(parseScenario(raw))).toEqual([]);
     });
@@ -234,6 +288,63 @@ describe("lintScenario", () => {
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics.some((d) => d.includes("minCount: exceeds-message-capacity"))).toBe(true);
     });
+
+    test("rejects a gold claim whose predicate is absent from its declared source range", () => {
+        const raw = validScenarioRaw();
+        // Range [1,1] is the LRU-cache decision turn; "4096" is authored in turn
+        // 2. The range is what the leakage gate guards and what the scorer treats
+        // as the fact's origin, so a predicate that is not in it names no
+        // authored fact.
+        (raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> }).expectedClaims[1].sourceTurnRange =
+            [1, 1];
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.gold.expectedClaims.exp-cache-capacity.sourceTurnRange: predicate-not-authored",
+        );
+    });
+
+    test("accepts a gold claim whose predicate spans its multi-turn source range", () => {
+        const raw = validScenarioRaw();
+        (raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> }).expectedClaims[1].sourceTurnRange =
+            [0, 2];
+        expect(lintScenario(parseScenario(raw))).toEqual([]);
+    });
+
+    test("rejects a hard-negative predicate the transcript never authors", () => {
+        const raw = validScenarioRaw();
+        (raw.gold as { expectedAbsent: Array<{ predicate: { value: string } }> }).expectedAbsent[0].predicate.value =
+            "use Cassandra for the session cache";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.gold.expectedAbsent.abs-redis-active.predicate: not-authored-before-epilogue",
+        );
+    });
+
+    test("rejects a hard-negative predicate authored only in the discardable epilogue", () => {
+        const raw = validScenarioRaw();
+        (raw.transcript as { turns: Array<{ user: string }> }).turns[3].user =
+            "One last thought: we could still use Kafka for the session cache.";
+        (raw.gold as { expectedAbsent: Array<{ predicate: { value: string } }> }).expectedAbsent[0].predicate.value =
+            "use Kafka for the session cache";
+        const diagnostics = lintScenario(parseScenario(raw));
+        // Discard-last can drop the epilogue, so the historian may never see the
+        // formation and the absence check would pass without measuring anything.
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.gold.expectedAbsent.abs-redis-active.predicate: not-authored-before-epilogue",
+        );
+    });
+
+    test("headroom lint measures the ballast the harnesses actually send", () => {
+        const scenario = validScenario();
+        const rendered = renderedTranscriptText(scenario);
+        // `TestHarness.ballast(tokens)` and its pi/rust twins take no seed, so
+        // every turn must carry the default-seed bytes. A per-turn seed rotation
+        // here would measure a transcript no runner produces — and because the
+        // word bank's words differ in length, it would measure a different size.
+        const harnessBallast = ballastProse(scenario.trigger.ballastTokensPerTurn);
+        expect(harnessBallast.length).toBeGreaterThan(0);
+        expect(rendered.split(harnessBallast).length - 1).toBe(scenario.transcript.turns.length);
+    });
 });
 
 describe("predicate matching", () => {
@@ -251,8 +362,31 @@ describe("release tuple and manifest", () => {
         const a = validScenario();
         const rawB = validScenarioRaw();
         rawB.id = "hse-second-scenario";
+        // A distinct id is no longer enough to make a second corpus entry: the
+        // tuple rejects semantic duplicates regardless of name, so `b` has to
+        // differ in substance. Editing an epilogue turn keeps every gold range
+        // and predicate valid.
+        (rawB.transcript as { turns: Array<{ user: string }> }).turns[3].user = "That is all for today.";
         const b = parseScenario(rawB);
         expect(buildReleaseTuple([a, b])).toEqual(buildReleaseTuple([b, a]));
+    });
+
+    test("release tuple rejects an empty corpus", () => {
+        // A vacuous release still produces a bindable fingerprint, so approvals
+        // could promote a corpus that measures nothing.
+        expect(() => buildReleaseTuple([])).toThrow(/releaseTuple\.scenarios: empty/);
+    });
+
+    test("release tuple rejects a scenario copied under a new id", () => {
+        const a = validScenario();
+        const rawCopy = validScenarioRaw();
+        rawCopy.id = "hse-auth-rejected-redis-copy";
+        rawCopy.title = "A relabelled copy of the same evaluation";
+        const copy = parseScenario(rawCopy);
+        // Identity fingerprints cover id and title, so they differ here by
+        // construction; only the id-independent check can see the duplicate.
+        expect(scenarioFingerprint(copy)).not.toBe(scenarioFingerprint(a));
+        expect(() => buildReleaseTuple([a, copy])).toThrow(/releaseTuple\.scenarios\.semantic: duplicate/);
     });
 
     test("release tuple rejects duplicate scenario ids and duplicated scenarios", () => {
@@ -335,5 +469,53 @@ describe("release tuple and manifest", () => {
             tombstones: [],
         };
         expect(() => parseManifest(bumped)).toThrow(/stale-or-foreign-release/);
+    });
+
+    test("one actor cannot hold both governance seats", () => {
+        const tuple = buildReleaseTuple([validScenario()]);
+        const releaseFingerprint = releaseApprovalFingerprint({
+            releaseVersion: "v1",
+            releaseTuple: tuple,
+            tombstones: [],
+        });
+        // Privacy and gold-intent are two different reviews; one approver
+        // collapses them while the manifest still presents two.
+        const sameActor = {
+            schema: MANIFEST_SCHEMA,
+            releaseVersion: "v1",
+            releaseTuple: tuple,
+            approvals: {
+                privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint },
+                goldIntent: { kind: "gold-intent", approver: "operator-a", releaseFingerprint },
+            },
+            tombstones: [],
+        };
+        expect(() => parseManifest(sameActor)).toThrow(/approver-not-independent/);
+    });
+
+    test("privacy and sanitizer versions must be the ones the lane implements", () => {
+        const tuple = buildReleaseTuple([validScenario()]);
+        for (const key of ["privacyPolicyVersion", "sanitizerVersion"] as const) {
+            // A manifest that invents a version and recomputes the fingerprint
+            // over it would present the corpus as reviewed under a policy no code
+            // here enforces, so the check cannot rely on the binding alone.
+            const forgedTuple = { ...tuple, [key]: "made-up" };
+            const releaseFingerprint = releaseApprovalFingerprint({
+                releaseVersion: "v1",
+                releaseTuple: forgedTuple,
+                tombstones: [],
+            });
+            const forged = {
+                schema: MANIFEST_SCHEMA,
+                releaseVersion: "v1",
+                releaseTuple: forgedTuple,
+                approvals: {
+                    privacy: { kind: "privacy", approver: "operator-a", releaseFingerprint },
+                    goldIntent: { kind: "gold-intent", approver: "operator-b", releaseFingerprint },
+                },
+                tombstones: [],
+            };
+            expect(() => parseManifest(forged)).toThrow(new RegExp(`${key}: version-invalid`));
+        }
     });
 });

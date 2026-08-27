@@ -73,8 +73,15 @@ export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
  * Historian-eval tests that boot the TestHarness (`opencode serve` + mock
  * provider). TS-mode only: `mc-module`'s Rust historian producer does not
  * promote claims, so these must never join a rust or pi selection.
+ *
+ * Forward declaration: entries are excluded from `historianEvalUnitFiles()` and
+ * claimed by `tsOpenCodeStandaloneFiles()` the moment they land, so adding one
+ * never trips `assertSrcTestsClassified` — which every CLI path runs, and which
+ * would otherwise break `--mode ts` and `--incident-unit` alike. Listing a name
+ * before the file exists is therefore deliberate, and the presence filter in
+ * `tsOpenCodeStandaloneFiles` is what makes it harmless.
  */
-const HISTORIAN_EVAL_HARNESS_TESTS = ["src/historian-eval/runner.test.ts"];
+export const HISTORIAN_EVAL_HARNESS_TESTS = ["src/historian-eval/runner.test.ts"];
 
 export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
@@ -89,13 +96,20 @@ export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
 
 /** OpenCode-only oracle tests that require the TypeScript TestHarness. */
 export function tsOpenCodeStandaloneFiles(root: string = E2E_ROOT): string[] {
-    return assertPresent(
-        [
-            "src/oracle-arms/presets.test.ts",
-            "src/oracle-arms/scripted-ctx-search.test.ts",
-        ],
-        root,
-    );
+    return [
+        ...assertPresent(
+            [
+                "src/oracle-arms/presets.test.ts",
+                "src/oracle-arms/scripted-ctx-search.test.ts",
+            ],
+            root,
+        ),
+        // Presence-filtered, not asserted: the harness list is a forward
+        // declaration (see HISTORIAN_EVAL_HARNESS_TESTS), so a name may legally
+        // precede its file. Claiming the ones that do exist is what keeps the
+        // historian-eval exclusion wired to a destination.
+        ...HISTORIAN_EVAL_HARNESS_TESTS.filter((file) => existsSync(resolve(root, file))),
+    ];
 }
 
 /**

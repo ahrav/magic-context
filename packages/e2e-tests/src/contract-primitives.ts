@@ -53,7 +53,13 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
     }
 
     function stringValue(value: unknown, label: string): string {
-        if (typeof value !== "string" || value.length === 0) fail(`${label}: string-invalid`);
+        // Whitespace-only rejects for the same reason empty does. Production
+        // transcript formatting trims a message and can discard it as empty, and
+        // a blank probe question, answer, or choice is not scoreable — so a
+        // formally valid frozen artifact would carry runtime input its gold
+        // contract can never match. The authored value is returned unaltered:
+        // trimming here would change the bytes a fingerprint covers.
+        if (typeof value !== "string" || value.trim().length === 0) fail(`${label}: string-invalid`);
         return value;
     }
 

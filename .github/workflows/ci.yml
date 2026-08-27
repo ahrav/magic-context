@@ -322,6 +322,15 @@ jobs:
       - name: Prospective holdout unit contracts
         run: bun run test:prospective-unit
 
+      # Shares this job rather than adding its own: both are pure-data artifact
+      # contract lanes that need nothing beyond Bun — no opencode, no Cargo — so
+      # a second checkout and install would buy nothing. Without a CI caller the
+      # historian-eval contract and freeze lint can regress while every other
+      # lane stays green (test:e2e selects --mode ts and test:opencode-e2e runs
+      # the green manifest; neither includes historianEvalUnitFiles()).
+      - name: Historian eval unit contracts
+        run: bun run test:historian-eval-unit
+
       - name: Authenticate lifecycle-appropriate epoch artifacts
         run: bun run validate:prospective-holdout
 

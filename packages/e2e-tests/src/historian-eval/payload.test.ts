@@ -64,8 +64,32 @@ describe("buildMockHistorianOutput", () => {
         }
     });
 
-    test("wrong-but-well-formed category is allowed for the mutation battery and not promoted", () => {
-        const raw = buildMockHistorianOutput({
+    test("multi-line fact content throws instead of silently changing the fact set", () => {
+        // The production parser reads one bullet line at a time, so an
+        // unprefixed continuation is dropped and a `* `-prefixed one becomes an
+        // extra fact — either way the parsed set differs from the authored one.
+        for (const content of ["first line\nsecond line", "first line\n* smuggled second fact", "a\r\nb"]) {
+            expect(() =>
+                buildMockHistorianOutput({
+                    compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
+                    facts: [{ category: "ARCHITECTURE", content }],
+                }),
+            ).toThrow(/must be single-line/);
+        }
+    });
+
+    test("single-line fact content round-trips byte-for-byte through the parser", () => {
+        const content = "Sessions use the in-process LRU cache; capacity 4096.";
+        const parsed = parseCompartmentOutput(
+            buildMockHistorianOutput({
+                compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
+                facts: [{ category: "ARCHITECTURE", content }],
+            }),
+        );
+        expect(parsed.facts).toEqual([{ category: "ARCHITECTURE", content }]);
+    });
+
+    test("wrong-but-well-formed category is allowed for the mutation battery and not promoted", () => {        const raw = buildMockHistorianOutput({
             compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
             facts: [{ category: "WORKFLOW_RULES", content: "outside taxonomy" }],
         });
