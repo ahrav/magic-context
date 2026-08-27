@@ -857,6 +857,19 @@ impl GenerationStore {
         let Some(manifest_fd) = open_rel_nofollow(&dir, GENERATION_MANIFEST_NAME) else {
             return false;
         };
+        // A manifest above the read cap cannot be decoded, so its schema cannot
+        // be decided either — and "we could not read it" is not evidence that it
+        // is schema 1. This implementation refuses to write one, so an oversized
+        // manifest is either corruption or a future release's format, and only
+        // one of those is safe to delete. Quarantine it: preserving a generation
+        // costs one skipped directory, while deleting a newer release's
+        // generation is the forward-compatibility break quarantine exists to
+        // prevent. Every other read failure stays removable.
+        match rustix::fs::fstat(&manifest_fd) {
+            Ok(stat) if stat.st_size as u64 > MAX_MANIFEST_BYTES as u64 => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
         let Ok(bytes) = read_all_fd(&manifest_fd, MAX_MANIFEST_BYTES) else {
             return false;
         };
@@ -1879,6 +1892,52 @@ mod tests {
             std::fs::read(&manifest).expect("occupant still there"),
             quarantined,
             "quarantined bytes must be preserved exactly"
+        );
+    }
+
+    /// A manifest above the read cap cannot have its schema decided, so pruning
+    /// must not treat it as removable corruption: it may be a newer release's
+    /// generation, and deleting that is the forward-compatibility break
+    /// quarantine exists to prevent.
+    #[test]
+    fn an_oversized_manifest_is_quarantined_rather_than_pruned() {
+        let root = tempfile::tempdir().expect("root");
+        let src = tempfile::tempdir().expect("src");
+        let store = store_at(root.path());
+        let digest = stage_default(&store, src.path());
+        let manifest_path = store
+            .root()
+            .join(GENERATIONS_DIR_NAME)
+            .join(&digest)
+            .join(GENERATION_MANIFEST_NAME);
+
+        // Unknown schema plus padding past MAX_MANIFEST_BYTES, so the capped
+        // read fails before the schema can be decoded.
+        let mut oversized = br#"{"schema":2,"unknown_future_field":true,"pad":""#.to_vec();
+        oversized.resize(oversized.len() + MAX_MANIFEST_BYTES, b'x');
+        oversized.extend_from_slice(br#""}"#);
+        assert!(oversized.len() > MAX_MANIFEST_BYTES);
+        std::fs::write(&manifest_path, &oversized).expect("write oversized manifest");
+
+        // Promote a successor so the oversized generation is no longer the
+        // current profile target, leaving the quarantine rule as the only thing
+        // that can preserve it.
+        let successor = vec![SourceSpec {
+            rel_path: "bin/ck-mc-host".to_owned(),
+            source: write_source(src.path(), "launcher-successor", b"#successor-binary"),
+            executable: true,
+        }];
+        store
+            .stage_and_promote(&successor, &meta(), &BTreeSet::new())
+            .expect("stage successor");
+
+        let report = store.prune(&BTreeSet::new()).expect("prune");
+        assert_eq!(report.removed_generations, 0);
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(
+            std::fs::read(&manifest_path).expect("manifest still there"),
+            oversized,
+            "an undecidable manifest must be preserved byte-for-byte"
         );
     }
 }

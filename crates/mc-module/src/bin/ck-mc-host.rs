@@ -423,18 +423,35 @@ impl Runtime {
     /// may already have committed and begun tearing down. Collapsing it into a
     /// not-committed result would let a caller report a serving daemon as
     /// untouched while it goes down.
-    fn shutdown(&self, publication: &Path) -> Result<(), &'static str> {
+    fn shutdown(&self, publication: &Path, deadline: Instant) -> Result<(), &'static str> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("shutdown_failed");
+        }
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
-            let client = Client::connect(&path)
-                .await
-                .map_err(|_| "authentication_failed")?;
-            let result = client.host_shutdown().await;
-            let _ = client.close().await;
-            result.map_err(|error| match error.outcome() {
-                SendOutcome::OutcomeUnknown => "shutdown_outcome_unknown",
-                _ => "shutdown_failed",
+            // Bounded by the caller's deadline as well as by the client's own
+            // timeouts: an unreachable or stalled peer must not let one attempt
+            // outlive the budget the caller reserved for the whole operation.
+            // A timeout here is an unknown outcome, not a proven failure — the
+            // request may already have been written — so it is reported as such
+            // and settled by observation.
+            match tokio::time::timeout(remaining, async {
+                let client = Client::connect(&path)
+                    .await
+                    .map_err(|_| "authentication_failed")?;
+                let result = client.host_shutdown().await;
+                let _ = client.close().await;
+                result.map_err(|error| match error.outcome() {
+                    SendOutcome::OutcomeUnknown => "shutdown_outcome_unknown",
+                    _ => "shutdown_failed",
+                })
             })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("shutdown_outcome_unknown"),
+            }
         })
     }
 }
@@ -987,7 +1004,7 @@ fn stop_phase(
         Err(_) => return (false, Err(("running", "internal_error"))),
     };
     let mut commit_uncertain = false;
-    match runtime.shutdown(&publication) {
+    match runtime.shutdown(&publication, outer) {
         Ok(()) => {}
         Err("authentication_failed") => return (false, Err(("running", "authentication_failed"))),
         // The frame was in flight when the client deadline expired: the host
@@ -1155,20 +1172,33 @@ fn cmd_restart(payload_dir: Option<&Path>) -> DaemonResult {
         }
     };
     let stop_committed = match observed.state {
-        LifecycleState::Running => match stop_phase(&runtime, outer) {
-            (_, Ok(())) => true,
-            // Pre-acknowledgement failure: no start attempt, both bits false.
-            (false, Err((state, reason))) => {
-                return DaemonResult::new(command, false, state, reason)
+        LifecycleState::Running => {
+            // The stop is irreversible and the successor start needs a budget of
+            // its own. Preflight validation can consume most of the aggregate on
+            // slow storage, and committing a stop that `start_phase` will then
+            // refuse to follow produces `stop_committed:true` with no successor —
+            // an outage manufactured by a deadline rather than by any on-disk
+            // state. Refusing here leaves the daemon serving with both bits
+            // false, and retrying is the correct remediation.
+            if outer.saturating_duration_since(Instant::now()) < phase_cap(SPAWN_PUBLICATION_AUTH) {
+                return DaemonResult::new(command, false, "running", "lifecycle_busy")
                     .with_effects(effects(false, false));
             }
-            // Acknowledged but teardown missed its deadline: committed stop,
-            // no start attempt.
-            (true, Err((state, reason))) => {
-                return DaemonResult::new(command, false, state, reason)
-                    .with_effects(effects(true, false));
+            match stop_phase(&runtime, outer) {
+                (_, Ok(())) => true,
+                // Pre-acknowledgement failure: no start attempt, both bits false.
+                (false, Err((state, reason))) => {
+                    return DaemonResult::new(command, false, state, reason)
+                        .with_effects(effects(false, false));
+                }
+                // Acknowledged but teardown missed its deadline: committed stop,
+                // no start attempt.
+                (true, Err((state, reason))) => {
+                    return DaemonResult::new(command, false, state, reason)
+                        .with_effects(effects(true, false));
+                }
             }
-        },
+        }
         // Nothing was running, so there is no stop to commit.
         _ => false,
     };
