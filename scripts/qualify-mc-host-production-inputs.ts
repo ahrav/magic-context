@@ -1737,6 +1737,25 @@ function stripTomlComments(line: string): string {
     return line;
 }
 
+/** Regex-escape a literal so a version's dots cannot match arbitrary characters. */
+function escapeRegex(literal: string): string {
+    return literal.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+}
+
+/**
+ * Match `key = <value>` in a joined inline entry, anchored to a key boundary.
+ *
+ * Every key in a dependency entry is a suffix of some other name a manifest may
+ * legally carry: `features` sits inside `default-features`, and `default-features`,
+ * `version`, and `package` all sit inside a `fake…` decoy Cargo tolerates as an
+ * unused key. An unanchored match reads the decoy and reports on it, so key lookups
+ * go through one anchored constructor rather than each site remembering the
+ * boundary — three of them did, one did not, and that is the bug this removes.
+ */
+function tomlKeyPattern(key: string, value: string): RegExp {
+    return new RegExp(`(?:^|[\\s,{])${escapeRegex(key)}\\s*=\\s*${value}`);
+}
+
 /**
  * The net brace and bracket nesting a line opens or closes, ignoring quoted text.
  *
@@ -1948,8 +1967,8 @@ function dependencyDeclarations(
 /** The crate a declaration resolves to: `package = "..."` when renamed, else the
  *  key. `null` when a `package` value is present but unreadable. */
 function resolveRenamedCrate(key: string, entry: string): string | null {
-    if (!/(?:^|[\s,{])package\s*=/.test(entry)) return key;
-    const renamed = /(?:^|[\s,{])package\s*=\s*("[^"\\]*"|'[^']*')/.exec(entry);
+    if (!tomlKeyPattern("package", "").test(entry)) return key;
+    const renamed = tomlKeyPattern("package", `("[^"\\\\]*"|'[^']*')`).exec(entry);
     return resolveTomlName(renamed?.[1] ?? "");
 }
 
@@ -2014,12 +2033,14 @@ function assertPinnedCrateFeatures(
             `${crate} must be declared exactly once, as an inline dependency table under [dependencies], in ${MC_HOST_CARGO_TOML_PATH}; the qualified feature closure cannot be checked otherwise`,
         );
     }
-    if (!entry.includes(`version = "=${version}"`)) {
+    // Anchored: `fakeversion = "=<pin>"` contains the literal a substring test looks
+    // for, so a decoy key could satisfy the pin while the real one differs.
+    if (!tomlKeyPattern("version", `"=${escapeRegex(version)}"`).test(entry)) {
         fail(
             `pinned ${crate} identity does not match ${MC_HOST_CARGO_TOML_PATH}`,
         );
     }
-    if (!/default-features\s*=\s*false/.test(entry)) {
+    if (!tomlKeyPattern("default-features", "false").test(entry)) {
         fail(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} must set default-features = false`,
         );
@@ -2029,8 +2050,8 @@ function assertPinnedCrateFeatures(
     // `default-features` legitimately, `fakefeatures` as a decoy whose array an
     // unanchored extraction would read instead of the real one. Using two patterns
     // is what let presence be anchored while extraction was not.
-    const FEATURES_KEY = /(?:^|[\s,{])features\s*=/;
-    const declared = /(?:^|[\s,{])features\s*=\s*\[([^\]]*)\]/.exec(entry);
+    const FEATURES_KEY = tomlKeyPattern("features", "");
+    const declared = tomlKeyPattern("features", "\\[([^\\]]*)\\]").exec(entry);
     if (FEATURES_KEY.test(entry) && declared === null) {
         fail(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} declares a features list this qualifier cannot read`,

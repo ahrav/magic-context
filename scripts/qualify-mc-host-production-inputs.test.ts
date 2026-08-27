@@ -956,6 +956,27 @@ describe("immutable input fail-closed rules", () => {
                 /\[features\] table .* holds a string this qualifier cannot read/,
             ],
             [
+                // Every key in a dependency entry is a suffix of some decoy Cargo
+                // tolerates as an unused key. The opt-out must come from the real
+                // key, or default features — accelerators included — enter the build.
+                (cargo) =>
+                    cargo.replace(
+                        'ort = { version = "=2.0.0-rc.13", default-features = false,',
+                        'ort = { version = "=2.0.0-rc.13", fakedefault-features = false,',
+                    ),
+                /ort .* must set default-features = false/,
+            ],
+            [
+                // Same shape on the version pin, which a substring test also read
+                // out of a decoy.
+                (cargo) =>
+                    cargo.replace(
+                        'ort = { version = "=2.0.0-rc.13",',
+                        'ort = { fakeversion = "=2.0.0-rc.13", version = "=2.0.0-rc.12",',
+                    ),
+                /pinned ort identity does not match/,
+            ],
+            [
                 // A bracket inside a quoted value is not structure. Counting it
                 // leaves the depth permanently positive, so every later line is
                 // read as nested content and a target-specific dependency after it
