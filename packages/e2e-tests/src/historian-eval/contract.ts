@@ -14,7 +14,7 @@
  * the pressure recipe never changes a frozen scenario's identity.
  */
 
-import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { canonicalFingerprint, canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import {
     PRIVACY_POLICY_VERSION,
     SANITIZER_VERSION,
@@ -132,7 +132,7 @@ export type Probe =
           answerType: "exact";
           goldAnswer: string;
           /** Gold expected-claim backing this probe; enables the trimmed-by-injection-budget ERROR (KTD6). */
-          sourceClaimRef?: string;
+          sourceClaimRef: string;
       }
     | {
           id: string;
@@ -140,7 +140,7 @@ export type Probe =
           answerType: "multiple-choice";
           choices: string[];
           goldAnswer: string;
-          sourceClaimRef?: string;
+          sourceClaimRef: string;
       }
     | { id: string; question: string; answerType: "claim-id"; expectedClaimRef: string };
 
@@ -197,6 +197,16 @@ function parsePredicate(raw: unknown, label: string): ContentPredicate {
  */
 export const MAX_TRANSCRIPT_TURNS = 100;
 export const MAX_TURN_TEXT_CHARS = 20_000;
+/**
+ * Operational maximum for the authored expectation and probe arrays. Same
+ * reason as the transcript maxima, plus one specific to the lint's shape: it
+ * compares every expected-absent predicate against every expected claim, so the
+ * work is quadratic in these counts. Uncapped, a compact artifact with
+ * thousands of entries forces hundreds of millions of normalize-and-substring
+ * operations and hangs freeze lint before any semantic check can reject it. The
+ * cap is enforced before the arrays are mapped, so the parse itself stays cheap.
+ */
+export const MAX_EXPECTATION_ENTRIES = 100;
 
 function turnText(value: unknown, label: string): string {
     const result = string(value, label);
@@ -244,34 +254,24 @@ function parseProbe(raw: unknown, label: string): Probe {
     const answerType = enumeration(value.answerType, PROBE_ANSWER_TYPES, `${label}.answerType`);
     const id = staticId(value.id, `${label}.id`, PROBE_ID_RE);
     const question = string(value.question, `${label}.question`);
-    const sourceClaimRef =
-        "sourceClaimRef" in value
-            ? staticId(value.sourceClaimRef, `${label}.sourceClaimRef`, EXPECTED_CLAIM_ID_RE)
-            : undefined;
     if (answerType === "exact") {
-        exact(
-            value,
-            sourceClaimRef === undefined
-                ? ["id", "question", "answerType", "goldAnswer"]
-                : ["id", "question", "answerType", "goldAnswer", "sourceClaimRef"],
-            label,
-        );
+        // `sourceClaimRef` is required, not optional: it is the only thing that
+        // gives a probe's gold answer a declared source range. Without it the
+        // runtime cannot tell "the supporting turns were trimmed by the injection
+        // budget" (the KTD6 ERROR) from "the model got it wrong", so an
+        // unanswerable probe would be scored as a model failure and contaminate
+        // probe accuracy.
+        exact(value, ["id", "question", "answerType", "goldAnswer", "sourceClaimRef"], label);
         return {
             id,
             question,
             answerType,
             goldAnswer: string(value.goldAnswer, `${label}.goldAnswer`),
-            ...(sourceClaimRef === undefined ? {} : { sourceClaimRef }),
+            sourceClaimRef: staticId(value.sourceClaimRef, `${label}.sourceClaimRef`, EXPECTED_CLAIM_ID_RE),
         };
     }
     if (answerType === "multiple-choice") {
-        exact(
-            value,
-            sourceClaimRef === undefined
-                ? ["id", "question", "answerType", "choices", "goldAnswer"]
-                : ["id", "question", "answerType", "choices", "goldAnswer", "sourceClaimRef"],
-            label,
-        );
+        exact(value, ["id", "question", "answerType", "choices", "goldAnswer", "sourceClaimRef"], label);
         const choices = array(value.choices, `${label}.choices`).map((entry, index) =>
             string(entry, `${label}.choices[${index}]`),
         );
@@ -285,11 +285,13 @@ function parseProbe(raw: unknown, label: string): Probe {
             answerType,
             choices,
             goldAnswer,
-            ...(sourceClaimRef === undefined ? {} : { sourceClaimRef }),
+            sourceClaimRef: staticId(value.sourceClaimRef, `${label}.sourceClaimRef`, EXPECTED_CLAIM_ID_RE),
         };
     }
     // claim-id: gold names a gold expected-claim reference, never a literal
     // runtime id — the scorer resolves it against the recorded injected set.
+    // `expectedClaimRef` already carries the provenance the other two types get
+    // from `sourceClaimRef`, so carrying both would be two names for one edge.
     exact(value, ["id", "question", "answerType", "expectedClaimRef"], label);
     return {
         id,
@@ -355,7 +357,12 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
 
     const goldValue = record(root.gold, `${label}.gold`);
     exact(goldValue, ["expectedClaims", "expectedAbsent", "compartments"], `${label}.gold`);
-    const expectedClaims = array(goldValue.expectedClaims, `${label}.gold.expectedClaims`).map((entry, index) =>
+    const bounded = (value: unknown, arrayLabel: string): unknown[] => {
+        const entries = array(value, arrayLabel);
+        if (entries.length > MAX_EXPECTATION_ENTRIES) fail(`${arrayLabel}: above-operational-maximum`);
+        return entries;
+    };
+    const expectedClaims = bounded(goldValue.expectedClaims, `${label}.gold.expectedClaims`).map((entry, index) =>
         parseExpectedClaim(entry, `${label}.gold.expectedClaims[${index}]`, turns.length),
     );
     unique(
@@ -373,12 +380,21 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         expectedClaims.map((claim) => JSON.stringify([claim.category, normalizeContent(claim.predicate.value)])),
         `${label}.gold.expectedClaims.identity`,
     );
-    const expectedAbsent = array(goldValue.expectedAbsent, `${label}.gold.expectedAbsent`).map((entry, index) =>
+    const expectedAbsent = bounded(goldValue.expectedAbsent, `${label}.gold.expectedAbsent`).map((entry, index) =>
         parseExpectedAbsent(entry, `${label}.gold.expectedAbsent[${index}]`),
     );
     unique(
         expectedAbsent.map((absent) => absent.id),
         `${label}.gold.expectedAbsent`,
+    );
+    // Same argument as the expected-claim identity check above, applied to the
+    // other side of the gold: one forbidden formation written twice under two ids
+    // becomes two gold checks, so a per-expectation scorer double-counts a single
+    // false promotion. Family is part of the identity because the same formation
+    // legitimately exercises two families.
+    unique(
+        expectedAbsent.map((absent) => JSON.stringify([absent.family, normalizeContent(absent.predicate.value)])),
+        `${label}.gold.expectedAbsent.identity`,
     );
     const compartmentsValue = record(goldValue.compartments, `${label}.gold.compartments`);
     exact(compartmentsValue, ["minCount"], `${label}.gold.compartments`);
@@ -386,7 +402,7 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         minCount: integer(compartmentsValue.minCount, `${label}.gold.compartments.minCount`, 1),
     };
 
-    const probes = array(root.probes, `${label}.probes`).map((entry, index) =>
+    const probes = bounded(root.probes, `${label}.probes`).map((entry, index) =>
         parseProbe(entry, `${label}.probes[${index}]`),
     );
     unique(
@@ -395,9 +411,10 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
     );
     const expectedClaimIds = new Set(expectedClaims.map((claim) => claim.id));
     for (const probe of probes) {
-        const reference =
-            probe.answerType === "claim-id" ? probe.expectedClaimRef : (probe.sourceClaimRef ?? null);
-        if (reference !== null && !expectedClaimIds.has(reference)) {
+        // Every probe type now carries exactly one gold reference, so there is no
+        // absent case to tolerate here.
+        const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
+        if (!expectedClaimIds.has(reference)) {
             fail(`${label}.probes.${probe.id}: dangling-reference`);
         }
     }
@@ -449,7 +466,35 @@ function scenarioSemanticPayload(scenario: HistorianEvalScenario): Record<string
 }
 
 function scenarioSemanticFingerprint(scenario: HistorianEvalScenario): string {
-    return canonicalFingerprint(scenarioSemanticPayload(scenario));
+    // Set-like arrays are reordered before hashing. `canonicalJson` preserves
+    // array order by contract, so without this a copied scenario evades the
+    // duplicate guard by permuting `families`, either gold array, or `probes` —
+    // it runs the same transcript and checks, and the release would double-weight
+    // it. `transcript.turns` is deliberately left alone: turn order is meaning,
+    // not presentation.
+    return canonicalFingerprint({
+        ...scenarioSemanticPayload(scenario),
+        families: canonicalOrder(scenario.families),
+        gold: {
+            ...scenario.gold,
+            expectedClaims: canonicalOrder(scenario.gold.expectedClaims),
+            expectedAbsent: canonicalOrder(scenario.gold.expectedAbsent),
+        },
+        probes: canonicalOrder(scenario.probes),
+    });
+}
+
+/**
+ * Order-independent view of a set-like array: entries sorted by their own
+ * canonical serialization, so the result depends on the entries and not on the
+ * order they were authored in. Sorting by serialization rather than by `id`
+ * keeps the normalization honest if a copy also renumbers its ids.
+ */
+function canonicalOrder<T>(entries: readonly T[]): T[] {
+    return [...entries]
+        .map((entry) => [canonicalJson(entry), entry] as const)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([, entry]) => entry);
 }
 
 /** Normalization applied to both predicate values and candidate content. */

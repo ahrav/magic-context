@@ -74,13 +74,15 @@ export interface MockHistorianFact {
      */
     category: string;
     /**
-     * Fact body. Must be single-line: the production parser reads facts one
-     * bullet line at a time (`FACT_ITEM_REGEX` in compartment-parser.ts), so an
-     * embedded line break either drops the continuation (an unprefixed line
-     * matches nothing) or, if the continuation itself starts with `* `, promotes
-     * it to a separate fact. Either way the parsed fact set differs from the
-     * authored one, and a mutation or scoring test silently exercises the wrong
-     * input.
+     * Fact body. Must be single-line, where "line" is ECMAScript's definition:
+     * the production parser reads facts one bullet line at a time
+     * (`FACT_ITEM_REGEX` in compartment-parser.ts), and its `m` flag treats all
+     * four line terminators — LF, CR, U+2028, U+2029 — as line breaks while `.`
+     * refuses to cross them. So any of the four either drops the continuation (an
+     * unprefixed line matches nothing) or, if the continuation starts with `* `,
+     * promotes it to a separate fact. Either way the parsed fact set differs from
+     * the authored one, and a mutation or scoring test silently exercises the
+     * wrong input.
      */
     content: string;
 }
@@ -127,7 +129,7 @@ export function buildMockHistorianOutput(options: MockHistorianOutputOptions): s
         if (!CATEGORY_TAG_RE.test(fact.category)) {
             throw new Error(`buildMockHistorianOutput: category is not tag-shaped: ${JSON.stringify(fact.category)}`);
         }
-        if (/[\r\n]/.test(fact.content)) {
+        if (/[\r\n\u2028\u2029]/.test(fact.content)) {
             throw new Error(
                 `buildMockHistorianOutput: fact content must be single-line: ${JSON.stringify(fact.content)}`,
             );

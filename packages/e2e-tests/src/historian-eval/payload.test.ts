@@ -65,16 +65,20 @@ describe("buildMockHistorianOutput", () => {
     });
 
     test("multi-line fact content throws instead of silently changing the fact set", () => {
-        // The production parser reads one bullet line at a time, so an
-        // unprefixed continuation is dropped and a `* `-prefixed one becomes an
-        // extra fact — either way the parsed set differs from the authored one.
-        for (const content of ["first line\nsecond line", "first line\n* smuggled second fact", "a\r\nb"]) {
-            expect(() =>
-                buildMockHistorianOutput({
-                    compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
-                    facts: [{ category: "ARCHITECTURE", content }],
-                }),
-            ).toThrow(/must be single-line/);
+        // The production parser reads one bullet line at a time and its `m` flag
+        // honors all four ECMAScript line terminators, so an unprefixed
+        // continuation is dropped and a `* `-prefixed one becomes an extra fact —
+        // either way the parsed set differs from the authored one.
+        const separators = ["\n", "\r", "\u2028", "\u2029"];
+        for (const separator of separators) {
+            for (const content of [`first${separator}second`, `first${separator}* smuggled second fact`]) {
+                expect(() =>
+                    buildMockHistorianOutput({
+                        compartments: [{ start: 1, end: 2, title: "t", body: "b" }],
+                        facts: [{ category: "ARCHITECTURE", content }],
+                    }),
+                ).toThrow(/must be single-line/);
+            }
         }
     });
 

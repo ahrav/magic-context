@@ -3,6 +3,7 @@ import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
+    MAX_EXPECTATION_ENTRIES,
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
     buildReleaseTuple,
@@ -186,6 +187,99 @@ describe("parseScenario", () => {
             sourceTurnRange: [1, 1],
         });
         expect(() => parseScenario(raw)).toThrow(/gold\.expectedClaims\.identity: duplicate/);
+    });
+
+    test("two expected-absent entries sharing a family and normalized predicate reject", () => {
+        const raw = validScenarioRaw();
+        const absent = (raw.gold as { expectedAbsent: Record<string, unknown>[] }).expectedAbsent;
+        absent.push({
+            id: "abs-redis-active-again",
+            family: "proposed-but-rejected",
+            predicate: { kind: "normalized-substring", value: "Use   REDIS for the Session Cache" },
+        });
+        expect(() => parseScenario(raw)).toThrow(/gold\.expectedAbsent\.identity: duplicate/);
+    });
+
+    test("the same forbidden formation may serve two declared families", () => {
+        const raw = validScenarioRaw();
+        raw.families = ["proposed-but-rejected", "explored-never-accepted"];
+        (raw.gold as { expectedAbsent: Record<string, unknown>[] }).expectedAbsent.push({
+            id: "abs-redis-explored",
+            family: "explored-never-accepted",
+            predicate: { kind: "normalized-substring", value: "use Redis for the session cache" },
+        });
+        // Family is part of the identity precisely so this stays legal.
+        expect(lintScenario(parseScenario(raw))).toEqual([]);
+    });
+
+    test("expectation and probe arrays reject above the operational maximum", () => {
+        const cases: Array<[string, (raw: Record<string, unknown>) => void]> = [
+            [
+                "gold.expectedClaims",
+                (raw) => {
+                    (raw.gold as { expectedClaims: unknown[] }).expectedClaims = Array.from(
+                        { length: MAX_EXPECTATION_ENTRIES + 1 },
+                        (_unused, index) => ({
+                            id: `exp-bulk-${index}`,
+                            category: "ARCHITECTURE",
+                            predicate: { kind: "normalized-substring", value: `formation ${index}` },
+                            sourceTurnRange: [1, 1],
+                        }),
+                    );
+                },
+            ],
+            [
+                "gold.expectedAbsent",
+                (raw) => {
+                    (raw.gold as { expectedAbsent: unknown[] }).expectedAbsent = Array.from(
+                        { length: MAX_EXPECTATION_ENTRIES + 1 },
+                        (_unused, index) => ({
+                            id: `abs-bulk-${index}`,
+                            family: "proposed-but-rejected",
+                            predicate: { kind: "normalized-substring", value: `forbidden ${index}` },
+                        }),
+                    );
+                },
+            ],
+            [
+                "probes",
+                (raw) => {
+                    raw.probes = Array.from({ length: MAX_EXPECTATION_ENTRIES + 1 }, (_unused, index) => ({
+                        id: `probe-bulk-${index}`,
+                        question: `question ${index}?`,
+                        answerType: "exact",
+                        goldAnswer: `${index}`,
+                        sourceClaimRef: "exp-lru-cache",
+                    }));
+                },
+            ],
+        ];
+        // Bounded before mapping: the lint compares every absent predicate with
+        // every claim, so uncapped arrays hang freeze lint rather than failing it.
+        for (const [label, edit] of cases) {
+            const raw = validScenarioRaw();
+            edit(raw);
+            expect(() => parseScenario(raw)).toThrow(
+                new RegExp(`${label.replace(/\./g, "\\.")}: above-operational-maximum`),
+            );
+        }
+    });
+
+    test("exact and multiple-choice probes require a gold source claim", () => {
+        for (const index of [0, 1]) {
+            const raw = validScenarioRaw();
+            delete (raw.probes as Record<string, unknown>[])[index].sourceClaimRef;
+            // Without it the probe's gold answer has no declared source range, so
+            // the runtime cannot separate an injection-budget trim (the KTD6
+            // ERROR) from a model failure.
+            expect(() => parseScenario(raw)).toThrow(/probes\[\d\]: fields-invalid/);
+        }
+    });
+
+    test("a claim-id probe carries only its expected-claim reference", () => {
+        const raw = validScenarioRaw();
+        (raw.probes as Record<string, unknown>[])[2].sourceClaimRef = "exp-lru-cache";
+        expect(() => parseScenario(raw)).toThrow(/probes\[2\]: fields-invalid/);
     });
 
     test("run budget above two rejects (KTD3)", () => {
@@ -387,6 +481,32 @@ describe("release tuple and manifest", () => {
         // construction; only the id-independent check can see the duplicate.
         expect(scenarioFingerprint(copy)).not.toBe(scenarioFingerprint(a));
         expect(() => buildReleaseTuple([a, copy])).toThrow(/releaseTuple\.scenarios\.semantic: duplicate/);
+    });
+
+    test("reordering set-like arrays does not hide a copied scenario", () => {
+        const a = validScenario();
+        const rawCopy = validScenarioRaw();
+        rawCopy.id = "hse-auth-rejected-redis-permuted";
+        rawCopy.title = "The same evaluation with its arrays permuted";
+        // canonicalJson preserves array order, so a permuted copy would otherwise
+        // hash differently while running the identical transcript and checks.
+        (rawCopy.gold as { expectedClaims: unknown[] }).expectedClaims.reverse();
+        (rawCopy.probes as unknown[]).reverse();
+        const copy = parseScenario(rawCopy);
+        expect(() => buildReleaseTuple([a, copy])).toThrow(/releaseTuple\.scenarios\.semantic: duplicate/);
+    });
+
+    test("reordering the transcript is a real difference, not a permutation", () => {
+        const a = validScenario();
+        const rawReordered = validScenarioRaw();
+        rawReordered.id = "hse-turns-reordered";
+        const turns = (rawReordered.transcript as { turns: unknown[] }).turns;
+        // Turn order is meaning: the decision turn now precedes the proposal.
+        [turns[0], turns[1]] = [turns[1], turns[0]];
+        (rawReordered.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> }).expectedClaims[0].sourceTurnRange =
+            [0, 0];
+        const reordered = parseScenario(rawReordered);
+        expect(() => buildReleaseTuple([a, reordered])).not.toThrow();
     });
 
     test("release tuple rejects duplicate scenario ids and duplicated scenarios", () => {
