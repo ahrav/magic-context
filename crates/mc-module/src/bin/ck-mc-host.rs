@@ -573,12 +573,27 @@ fn start_phase(
     outer: Instant,
     stop_committed: bool,
 ) -> StartOutcome {
-    let fail = |state: &'static str, reason: &'static str| StartOutcome {
+    // Resolution failures are the only ones that say anything about the retained
+    // artifact, so they are the only ones that may report the generation check as
+    // failing.
+    let unresolved = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
         state,
         reason,
         daemon_ver: None,
         generation_check: Some(("fail", reason)),
+    };
+    // Every failure after resolution — namespace drift, log or envelope faults,
+    // spawn faults, a spent budget — leaves a generation that was completely
+    // validated moments earlier. Reporting `artifact.current_generation` as
+    // failing there would tell a diagnostic consumer the retained artifact is
+    // corrupt on the strength of an unrelated lifecycle or spawn error.
+    let resolved_but_failed = |state: &'static str, reason: &'static str| StartOutcome {
+        ok: false,
+        state,
+        reason,
+        daemon_ver: None,
+        generation_check: Some(("pass", "healthy")),
     };
 
     // Validate or stage the requested generation (KTD9).
@@ -586,13 +601,13 @@ fn start_phase(
         Some(digest) => digest,
         None => match resolve_generation(payload_dir) {
             Ok(digest) => digest,
-            Err((state, reason)) => return fail(state, reason),
+            Err((state, reason)) => return unresolved(state, reason),
         },
     };
 
     // Namespace identity must still hold before the spawn commit (KTD2).
     if anchor.verify().is_err() {
-        return fail("wedged", "wedged");
+        return resolved_but_failed("wedged", "wedged");
     }
 
     // Generation resolution stages and hashes every payload file synchronously
@@ -609,13 +624,7 @@ fn start_phase(
     // pre-stop reservation in `cmd_restart` is what keeps that overrun rare;
     // post-stop staging is unbounded work that no reservation can size.
     if !stop_committed && Instant::now() >= outer {
-        return StartOutcome {
-            ok: false,
-            state: "stopped",
-            reason: "startup_timeout",
-            daemon_ver: None,
-            generation_check: Some(("pass", "healthy")),
-        };
+        return resolved_but_failed("stopped", "startup_timeout");
     }
 
     let envelope = serve::StartupEnvelope {
@@ -625,7 +634,7 @@ fn start_phase(
         // layout ever gained or lost a level.
         data_dir: match mc_host::data_dir_path(None) {
             Ok(data_dir) => data_dir,
-            Err(_) => return fail("stopped", "internal_error"),
+            Err(_) => return resolved_but_failed("stopped", "internal_error"),
         },
         payload_manifest_digest: digest,
         opencode: None,
@@ -637,14 +646,14 @@ fn start_phase(
         // JSON envelope cannot represent. That is an operational failure of this
         // command, not a reason to abandon the single required result object
         // after generation staging has already run.
-        Err(_) => return fail("stopped", "internal_error"),
+        Err(_) => return resolved_but_failed("stopped", "internal_error"),
     };
     let log_path = match daemon_log_path() {
         Ok(path) => path,
-        Err(_) => return fail("stopped", "internal_error"),
+        Err(_) => return resolved_but_failed("stopped", "internal_error"),
     };
     if spawn::spawn_detached(&log_path, &envelope_bytes).is_err() {
-        return fail("stopped", "internal_error");
+        return resolved_but_failed("stopped", "internal_error");
     }
 
     // Bounded wait for publication evidence plus authentication — never for
@@ -652,7 +661,7 @@ fn start_phase(
     let deadline = phase_deadline(outer, phase_cap(SPAWN_PUBLICATION_AUTH));
     let publication = match publication_path() {
         Ok(path) => path,
-        Err(_) => return fail("stopped", "internal_error"),
+        Err(_) => return resolved_but_failed("stopped", "internal_error"),
     };
     loop {
         if publication.exists() && runtime.authenticate(&publication, deadline) {

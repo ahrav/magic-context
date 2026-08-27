@@ -47,7 +47,13 @@ fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
         .append(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // `O_NONBLOCK` keeps a planted FIFO at this name from hanging the open
+        // while it waits for a reader — this open is outside every lifecycle
+        // timeout, so `start` would hang without emitting a result and `restart`
+        // would hang after already stopping the incumbent. The metadata predicate
+        // below still rejects anything that is not a regular file, and the flag
+        // has no effect on regular-file append semantics.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(log_path)
         .map_err(|_| SpawnError("daemon log open failed"))?;
     let meta = file
