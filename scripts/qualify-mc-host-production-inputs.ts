@@ -23,18 +23,31 @@
  *     can ever qualify.
  *
  * Usage:
- *   bun scripts/qualify-mc-host-production-inputs.ts          # write outputs
- *   bun scripts/qualify-mc-host-production-inputs.ts --check  # fail on any drift
+ *   bun scripts/qualify-mc-host-production-inputs.ts                # write outputs
+ *   bun scripts/qualify-mc-host-production-inputs.ts --check        # fail on any drift
+ *   bun scripts/qualify-mc-host-production-inputs.ts --check --verify-bytes
+ *       # additionally re-hash the local artifact bytes (qualifying host only)
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import {
+    closeSync,
+    existsSync,
+    mkdirSync,
+    openSync,
+    readFileSync,
+    readSync,
+    realpathSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
     buildContract,
     canonicalJson,
+    compareDotted,
     type ReleaseContract,
     sha256Hex,
     validateContractSchema,
@@ -278,6 +291,7 @@ const CREDENTIALS_DOC = {
                     "--cwd",
                     "--env",
                     "--extension",
+                    "--format",
                     "--hostname",
                     "--log-level",
                     "--mode",
@@ -337,17 +351,21 @@ const CREDENTIALS_DOC = {
                     "--mode",
                     "--model",
                     "--models",
+                    "--no-approve",
                     "--no-context-files",
                     "--no-extensions",
                     "--no-prompt-templates",
                     "--no-session",
                     "--no-skills",
+                    "--no-tools",
                     "--output",
                     "--print",
                     "--provider",
                     "--require",
                     "--resume",
                     "--session",
+                    "--system-prompt",
+                    "--thinking",
                     "--tools",
                 ],
                 variants: {
@@ -503,8 +521,6 @@ const CREDENTIALS_DOC = {
         },
     },
 } as const;
-
-export type CredentialsDoc = typeof CREDENTIALS_DOC;
 
 /** Validators and evaluators accept values wider than CREDENTIALS_DOC's literal type. */
 export interface CredentialsMatrix {
@@ -749,17 +765,19 @@ export function evaluateBrocaRun(
         return { ok: false, reason: "auth_mechanism_unsupported" };
     }
     let rowBytes = 0;
-    // First pass: presence, then individual caps for every value, then row size —
-    // individual-size precedence over aggregate row size (KTD21).
+    // Presence first, then individual caps for every value, then row size —
+    // individual-size precedence over aggregate row size (KTD21). The first
+    // pass collects the validated pairs so the cap pass cannot silently skip a
+    // variable and under-count the row.
+    const present: Array<[string, string]> = [];
     for (const name of row.credential_variables) {
         const value = request.credentials[name];
         if (value === undefined || value === "") {
             return { ok: false, reason: "credential_missing" };
         }
+        present.push([name, value]);
     }
-    for (const name of row.credential_variables) {
-        const value = request.credentials[name];
-        if (value === undefined) continue;
+    for (const [name, value] of present) {
         if (utf8Bytes(value) > doc.caps.value_cap_bytes) {
             return { ok: false, reason: "credential_value_too_large" };
         }
@@ -897,6 +915,64 @@ const FIXTURE_OR_CACHE_PATH_PATTERNS = [
     "/target/",
 ];
 
+/**
+ * Resolve a `verify_local_path` to the exact absolute path whose bytes will be
+ * hashed, enforcing the U9 path rules (`relative`, `no_parent_segments`,
+ * `no_symlink_escape`) declared in the closure manifest schema.
+ *
+ * The fixture/developer-cache deny-list is applied to the fully symlink-resolved
+ * path, not just the spelling in the manifest: a symlink at an allowed path that
+ * points into a developer cache must not be able to qualify.
+ */
+function resolveVerifyPath(
+    rootDir: string,
+    key: string,
+    verifyPath: string,
+    mode: SourceManifest["mode"],
+): string {
+    if (verifyPath.startsWith("~")) {
+        fail(`inputs.${key}: home-relative verify path is rejected`);
+    }
+    // `no_parent_segments` applies to the path as written: normalizing first
+    // would silently collapse an interior `..` and accept it.
+    if (
+        verifyPath
+            .split(/[\\/]+/)
+            .some((segment) => segment === "..")
+    ) {
+        fail(`inputs.${key}: parent segments in the verify path are rejected`);
+    }
+    if (mode === "production" && !isAbsolute(verifyPath)) {
+        fail(
+            `inputs.${key}: production qualification requires an absolute verify path`,
+        );
+    }
+    const lexical = isAbsolute(verifyPath)
+        ? normalize(verifyPath)
+        : resolve(rootDir, verifyPath);
+    // Resolve symlinks when the bytes exist so the deny-list sees the real
+    // location; when absent, keep the lexical path so the caller reports the
+    // missing-bytes failure against the path the manifest actually names.
+    let resolved = lexical;
+    if (existsSync(lexical)) {
+        try {
+            resolved = realpathSync(lexical);
+        } catch {
+            fail(`inputs.${key}: verify path could not be resolved`);
+        }
+    }
+    for (const candidate of new Set([verifyPath, lexical, resolved])) {
+        for (const pattern of FIXTURE_OR_CACHE_PATH_PATTERNS) {
+            if (candidate.includes(pattern)) {
+                fail(
+                    `inputs.${key}: fixture/developer-cache verify path (${pattern}) is rejected`,
+                );
+            }
+        }
+    }
+    return resolved;
+}
+
 interface QualifiedArtifact {
     qualified: true;
     source: string;
@@ -980,7 +1056,12 @@ function isPlaceholderSha256(hash: string): boolean {
 function tinyFixtureHashBlacklist(rootDir: string): Set<string> {
     const blacklist = new Set<string>();
     const path = join(rootDir, TINY_FIXTURE_MANIFEST_PATH);
-    if (!existsSync(path)) return blacklist;
+    // Required input, not best-effort: a missing manifest would silently empty
+    // the blacklist and let committed tiny-fixture bytes qualify as production
+    // inputs, so treat absence exactly like the unreadable case below.
+    if (!existsSync(path)) {
+        fail(`missing tiny-fixture manifest at ${TINY_FIXTURE_MANIFEST_PATH}`);
+    }
     const collect = (value: unknown): void => {
         if (typeof value === "string") {
             if (SHA256_RE.test(value)) blacklist.add(value);
@@ -1003,6 +1084,7 @@ function tinyFixtureHashBlacklist(rootDir: string): Set<string> {
 }
 
 function validateQualifiedArtifact(
+    rootDir: string,
     key: string,
     artifact: QualifiedArtifact,
     mode: SourceManifest["mode"],
@@ -1082,21 +1164,7 @@ function validateQualifiedArtifact(
     if (typeof verifyPath !== "string" || verifyPath.length === 0) {
         fail(`inputs.${key}: qualified entries must verify real local bytes`);
     }
-    if (verifyPath.startsWith("~")) {
-        fail(`inputs.${key}: home-relative verify path is rejected`);
-    }
-    for (const pattern of FIXTURE_OR_CACHE_PATH_PATTERNS) {
-        if (verifyPath.includes(pattern)) {
-            fail(
-                `inputs.${key}: fixture/developer-cache verify path (${pattern}) is rejected`,
-            );
-        }
-    }
-    if (mode === "production" && !isAbsolute(verifyPath)) {
-        fail(
-            `inputs.${key}: production qualification requires an absolute verify path`,
-        );
-    }
+    resolveVerifyPath(rootDir, key, verifyPath, mode);
 }
 
 export function checkOracleEvidence(
@@ -1139,12 +1207,16 @@ export function checkOracleEvidence(
     if (oracle.host?.target !== "linux-x64-gnu") {
         fail("oracle: the offline oracle must run on the linux-x64-gnu lane");
     }
+    // Same comparator the U8 platform gate uses against these same floors, so
+    // the qualifier and `evaluatePlatform` cannot disagree on a host version.
+    // Real hosts report three-component versions (kernel `5.15.0`), which a
+    // strict `major.minor` match would reject outright.
     const versionAtLeast = (value: unknown, floor: string): boolean => {
-        if (typeof value !== "string" || !/^\d+\.\d+$/.test(value))
+        if (typeof value !== "string" || !/^\d+(\.\d+)*$/.test(value)) {
             return false;
-        const [a, b] = value.split(".").map(Number);
-        const [fa, fb] = floor.split(".").map(Number);
-        return a > fa || (a === fa && b >= fb);
+        }
+        const ordering = compareDotted(value, floor);
+        return !Number.isNaN(ordering) && ordering >= 0;
     };
     if (
         !versionAtLeast(oracle.host.kernel, linux.kernel_min) ||
@@ -1205,7 +1277,7 @@ export function validateSourceManifest(
             fail(`inputs.${key} must be an object`);
         }
         if (artifact.qualified === true) {
-            validateQualifiedArtifact(key, artifact, m.mode, blacklist);
+            validateQualifiedArtifact(rootDir, key, artifact, m.mode, blacklist);
         } else if (artifact.qualified === false) {
             if (
                 typeof artifact.reason !== "string" ||
@@ -1259,20 +1331,39 @@ function verifyArtifactBytes(
     rootDir: string,
     key: string,
     artifact: QualifiedArtifact,
+    mode: SourceManifest["mode"],
 ): void {
-    const path = isAbsolute(artifact.verify_local_path)
-        ? artifact.verify_local_path
-        : join(rootDir, artifact.verify_local_path);
+    const path = resolveVerifyPath(
+        rootDir,
+        key,
+        artifact.verify_local_path,
+        mode,
+    );
     if (!existsSync(path)) {
         fail(`inputs.${key}: verify bytes missing at ${artifact.verify_local_path}`);
     }
-    const bytes = readFileSync(path);
-    if (bytes.length !== artifact.size_bytes) {
+    // Production artifacts are hundreds of MB (ONNX model, ORT shared library):
+    // compare the cheap size first, then hash in fixed-size chunks so peak
+    // memory stays constant instead of scaling with the artifact.
+    const size = statSync(path).size;
+    if (size !== artifact.size_bytes) {
         fail(
-            `inputs.${key}: byte size ${bytes.length} does not match locked size ${artifact.size_bytes}`,
+            `inputs.${key}: byte size ${size} does not match locked size ${artifact.size_bytes}`,
         );
     }
-    const digest = createHash("sha256").update(bytes).digest("hex");
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    const fd = openSync(path, "r");
+    try {
+        let read = readSync(fd, buffer, 0, buffer.length, null);
+        while (read > 0) {
+            hash.update(buffer.subarray(0, read));
+            read = readSync(fd, buffer, 0, buffer.length, null);
+        }
+    } finally {
+        closeSync(fd);
+    }
+    const digest = hash.digest("hex");
     if (digest !== artifact.sha256) {
         fail(
             `inputs.${key}: byte digest does not match the locked sha256 (input bytes changed)`,
@@ -1328,7 +1419,11 @@ function buildLock(
     manifest: SourceManifest,
     contract: ReleaseContract,
     u8Digest: string,
-): { lock: Record<string, unknown>; unqualified: string[] } {
+): {
+    lock: Record<string, unknown>;
+    unqualified: string[];
+    productionQualified: boolean;
+} {
     const unqualified: string[] = [];
     const inputs: Record<string, unknown> = {};
     for (const key of INPUT_KEYS) {
@@ -1375,6 +1470,11 @@ function buildLock(
         }
     }
     unqualified.sort();
+    // Single source of truth for the release verdict: the lock records it and
+    // the evidence artifact reuses this exact value, so the artifact a build
+    // gate reads can never disagree with the lock it cites.
+    const productionQualified =
+        manifest.mode === "production" && unqualified.length === 0;
     const lock = {
         schema: "magic-context.mc-host-production-inputs-lock/v1",
         release: { id: contract.release.id, version: contract.release.version },
@@ -1391,11 +1491,10 @@ function buildLock(
         cold_start_budgets_ms: QUALIFICATION_PINS.cold_start_budgets_ms,
         package_size_limits_bytes: QUALIFICATION_PINS.package_size_limits_bytes,
         durability_scope: QUALIFICATION_PINS.durability_scope,
-        production_qualified:
-            manifest.mode === "production" && unqualified.length === 0,
+        production_qualified: productionQualified,
         unqualified,
     };
-    return { lock, unqualified };
+    return { lock, unqualified, productionQualified };
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,7 +1512,7 @@ export interface QualifyResult {
 
 export function generate(
     rootDir: string,
-    options: { check: boolean },
+    options: { check: boolean; verifyBytes?: boolean },
 ): QualifyResult {
     const contract = buildContract();
     validateContractSchema(contract);
@@ -1450,13 +1549,27 @@ export function generate(
     }
     validateSourceManifest(manifestRaw, contract, rootDir);
     const manifest = manifestRaw;
-    for (const key of INPUT_KEYS) {
-        const artifact = manifest.inputs[key];
-        if (artifact.qualified) verifyArtifactBytes(rootDir, key, artifact);
+    // Byte verification needs the real artifacts on disk at the manifest's
+    // (absolute, in production) verify paths, which only the qualifying host
+    // has. Drift checking must stay portable so CI can guard the committed
+    // lock, so verify bytes in write mode and only on explicit request in
+    // --check mode.
+    const verifyBytes = options.verifyBytes ?? !options.check;
+    if (verifyBytes) {
+        for (const key of INPUT_KEYS) {
+            const artifact = manifest.inputs[key];
+            if (artifact.qualified) {
+                verifyArtifactBytes(rootDir, key, artifact, manifest.mode);
+            }
+        }
     }
     crossCheckRepoPins(rootDir, manifest);
 
-    const { lock, unqualified } = buildLock(manifest, contract, u8Digest);
+    const {
+        lock,
+        unqualified,
+        productionQualified,
+    } = buildLock(manifest, contract, u8Digest);
     const lockText = `${canonicalJson(lock)}\n`;
     const lockSha256 = sha256Hex(lockText);
 
@@ -1468,8 +1581,6 @@ export function generate(
     const credentialsText = `${canonicalJson(credentials)}\n`;
     const credentialsSha256 = sha256Hex(credentialsText);
 
-    const productionQualified =
-        manifest.mode === "production" && unqualified.length === 0;
     const evidence = {
         schema: "magic-context.mc-host-release-qualification/v1",
         release: { id: contract.release.id, version: contract.release.version },
@@ -1532,7 +1643,9 @@ export function generate(
 /**
  * Load and verify the qualification evidence a production build is allowed to
  * consume. Fails closed on absent, malformed, stale (artifact or U8 digest
- * mismatch), test-only, or non-production evidence. Returns the verified
+ * mismatch), test-only, or non-production evidence. The production verdict is
+ * re-derived from the digest-verified lock bytes rather than trusted from the
+ * evidence file's own `production_qualified` field. Returns the verified
  * evidence and artifact digests for embedding into build inputs.
  */
 export function requireQualificationEvidence(rootDir: string): {
@@ -1602,6 +1715,38 @@ export function requireQualificationEvidence(rootDir: string): {
         }
         digests[key] = actual;
     }
+    // The evidence's own `production_qualified`/`test_only` bits are
+    // self-describing and therefore not authority: re-derive the verdict from
+    // the lock bytes just digest-verified above. Evidence that claims
+    // qualification over a lock that records unqualified inputs fails closed.
+    const lock = ((): Record<string, unknown> => {
+        try {
+            return JSON.parse(
+                readFileSync(join(rootDir, OUTPUT_PATHS.lock), "utf8"),
+            );
+        } catch {
+            return reject(`malformed JSON in ${OUTPUT_PATHS.lock}`);
+        }
+    })();
+    if (lock.release_contract_sha256 !== u8Digest) {
+        reject(`stale U8 release-contract digest in ${OUTPUT_PATHS.lock}`);
+    }
+    if (lock.mode !== "production") {
+        reject(
+            `inputs are not production-qualified (lock mode ${String(lock.mode)})`,
+        );
+    }
+    if (!Array.isArray(lock.unqualified) || lock.unqualified.length > 0) {
+        const count = Array.isArray(lock.unqualified)
+            ? lock.unqualified.length
+            : "malformed";
+        reject(
+            `inputs are not production-qualified (lock records ${count} unqualified inputs)`,
+        );
+    }
+    if (lock.production_qualified !== true) {
+        reject("inputs are not production-qualified (lock verdict is not true)");
+    }
     return {
         evidence,
         u8Digest,
@@ -1617,7 +1762,10 @@ export function requireQualificationEvidence(rootDir: string): {
 function main(): void {
     const args = process.argv.slice(2);
     const check = args.includes("--check");
-    const unknown = args.filter((arg) => arg !== "--check");
+    const verifyBytes = args.includes("--verify-bytes");
+    const unknown = args.filter(
+        (arg) => arg !== "--check" && arg !== "--verify-bytes",
+    );
     if (unknown.length > 0) {
         console.error(`unknown arguments: ${unknown.join(" ")}`);
         process.exit(2);
@@ -1625,7 +1773,10 @@ function main(): void {
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
     let result: QualifyResult;
     try {
-        result = generate(rootDir, { check });
+        result = generate(rootDir, {
+            check,
+            verifyBytes: verifyBytes ? true : undefined,
+        });
     } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
         process.exit(1);

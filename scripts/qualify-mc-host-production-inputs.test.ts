@@ -5,6 +5,7 @@ import {
     mkdtempSync,
     readFileSync,
     rmSync,
+    symlinkSync,
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -55,6 +56,9 @@ function freshRoot(): string {
         RELEASE_CONTRACT,
         "bun.lock",
         "crates/mc-host/Cargo.toml",
+        // Required input: the qualifier fails closed without it so a missing
+        // manifest cannot silently empty the tiny-fixture hash blacklist.
+        TINY_MANIFEST,
     ]) {
         mkdirSync(join(root, dirname(relative)), { recursive: true });
         cpSync(join(repoRoot, relative), join(root, relative));
@@ -223,8 +227,6 @@ describe("immutable input fail-closed rules", () => {
         );
 
         const rootB = freshRoot();
-        mkdirSync(join(rootB, dirname(TINY_MANIFEST)), { recursive: true });
-        cpSync(join(repoRoot, TINY_MANIFEST), join(rootB, TINY_MANIFEST));
         const tiny = JSON.parse(
             readFileSync(join(repoRoot, TINY_MANIFEST), "utf8"),
         );
@@ -719,6 +721,36 @@ describe("typed argument variants", () => {
             expect(Object.values(doc.rejection_bindings)).toContain(id);
         }
     });
+
+    // The matrix is a second declaration of an argv contract the Rust broca
+    // backends already implement. Without this cross-check the two drift and
+    // the collision oracle stops covering flags the daemon actually emits, so
+    // a prompt equal to a host-owned flag would render as a real control.
+    test("control_tokens cover every flag the Rust broca backends emit", () => {
+        for (const [harness, source] of [
+            ["opencode", "crates/mc-host/src/broca/opencode.rs"],
+            ["pi", "crates/mc-host/src/broca/pi.rs"],
+        ] as const) {
+            const rust = readFileSync(join(repoRoot, source), "utf8");
+            const emitted = new Set(
+                [...rust.matchAll(/"(--[a-z][a-z0-9-]*)"/g)].map((m) => m[1]),
+            );
+            expect(emitted.size).toBeGreaterThan(0);
+            const declared = doc.harnesses[harness].argument_variants
+                .control_tokens as readonly string[];
+            for (const flag of [...emitted].sort()) {
+                expect(declared).toContain(flag);
+            }
+        }
+    });
+
+    test("control_tokens are sorted and duplicate-free", () => {
+        for (const harness of ["opencode", "pi"] as const) {
+            const tokens = doc.harnesses[harness].argument_variants
+                .control_tokens as readonly string[];
+            expect([...tokens]).toEqual([...new Set(tokens)].sort());
+        }
+    });
 });
 
 describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
@@ -784,5 +816,97 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
         expect(accepted.lockSha256).toBe(generated.lockSha256);
         expect(accepted.credentialsSha256).toBe(generated.credentialsSha256);
         expect(accepted.u8Digest).toBe(generated.u8Digest);
+    });
+
+    test("evidence claiming qualification over an unqualified lock is rejected", () => {
+        const root = freshRoot();
+        // Test-mode manifest => the lock records unqualified inputs.
+        installManifest(root, fixtureManifest());
+        generate(root, { check: false });
+
+        // Forge evidence that asserts a production verdict while citing the
+        // real, unmodified lock and credentials digests. The gate must derive
+        // the verdict from the lock bytes, not from these self-reported bits.
+        const evidencePath = join(root, OUTPUT_PATHS.evidence);
+        const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+        evidence.production_qualified = true;
+        evidence.test_only = false;
+        evidence.unqualified = [];
+        writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+
+        expect(() => requireQualificationEvidence(root)).toThrow(
+            /inputs are not production-qualified/,
+        );
+    });
+});
+
+describe("verify-path resolution", () => {
+    test("a symlink into a developer cache cannot qualify", () => {
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        manifest.mode = "production";
+
+        // Real bytes live in a developer cache; the manifest names an
+        // innocuous absolute path that is a symlink to them.
+        const cache = join(root, "home/.cache/huggingface");
+        mkdirSync(cache, { recursive: true });
+        const realModel = join(cache, "model.onnx");
+        cpSync(
+            join(repoRoot, FIXTURE_DIR, "artifacts/model.onnx"),
+            realModel,
+        );
+        const link = join(root, "qualified-model.onnx");
+        symlinkSync(realModel, link);
+
+        for (const artifact of Object.values(manifest.inputs) as {
+            verify_local_path: string;
+        }[]) {
+            artifact.verify_local_path = join(root, artifact.verify_local_path);
+        }
+        manifest.inputs.model_onnx.verify_local_path = link;
+        installManifest(root, manifest);
+
+        expect(() => generate(root, { check: false })).toThrow(
+            /fixture\/developer-cache verify path/,
+        );
+    });
+
+    test("parent segments in a verify path are rejected", () => {
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        manifest.inputs.model_onnx.verify_local_path =
+            "scripts/__fixtures__/mc-host-qualification/artifacts/../artifacts/model.onnx";
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).toThrow(
+            /parent segments in the verify path are rejected/,
+        );
+    });
+
+    test("a missing tiny-fixture manifest fails closed", () => {
+        const root = freshRoot();
+        installManifest(root, fixtureManifest());
+        rmSync(join(root, TINY_MANIFEST), { force: true });
+        expect(() => generate(root, { check: false })).toThrow(
+            /missing tiny-fixture manifest/,
+        );
+    });
+
+    test("--check does not require local artifact bytes", () => {
+        const root = freshRoot();
+        installProductionManifest(root);
+        generate(root, { check: false });
+
+        // Drop the artifacts a foreign host (CI) would never hold. Drift
+        // checking of the committed lock must still work.
+        rmSync(join(root, FIXTURE_DIR, "artifacts"), {
+            recursive: true,
+            force: true,
+        });
+        expect(generate(root, { check: true }).drift).toEqual([]);
+
+        // Byte verification remains available on the qualifying host.
+        expect(() =>
+            generate(root, { check: true, verifyBytes: true }),
+        ).toThrow(/verify bytes missing/);
     });
 });

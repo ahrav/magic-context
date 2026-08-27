@@ -1178,7 +1178,12 @@ export interface PlatformProbe {
     procfsSelfFdExec?: boolean;
 }
 
-function compareDotted(a: string, b: string): number {
+/**
+ * Compare dotted numeric version strings component-wise, zero-filling missing
+ * components. Returns a negative number, zero, or a positive number, or NaN
+ * when either side has a non-numeric component.
+ */
+export function compareDotted(a: string, b: string): number {
     const pa = a.split(".").map(Number);
     const pb = b.split(".").map(Number);
     const len = Math.max(pa.length, pb.length);

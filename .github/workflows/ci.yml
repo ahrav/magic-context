@@ -303,6 +303,36 @@ jobs:
       - name: E2E harness typecheck
         run: bun run --cwd packages/e2e-tests typecheck
 
+  release-qualification-gate:
+    name: Release contract + production-input qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Production-input qualification unit tests
+        run: bun test scripts/qualify-mc-host-production-inputs.test.ts
+
+      - name: U8 release contract drift
+        run: bun run release:contract:check
+
+      # Drift-only: byte verification needs the real production artifacts,
+      # which live on the qualifying host, so --check stays portable here and
+      # guards the committed lock/credentials/evidence digests.
+      - name: U9 production-input qualification drift
+        run: bun run release:qualify:check
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest
