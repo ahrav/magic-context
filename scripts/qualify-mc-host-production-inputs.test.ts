@@ -321,14 +321,13 @@ describe("immutable input fail-closed rules", () => {
         );
     });
 
-    test("a mutable ref in the query string or fragment is rejected", () => {
+    test("a mutable ref in the query string is rejected", () => {
         // An endpoint can name its revision outside the path, and such a URL
         // keeps resolving a moving target however immutable its path looks.
         for (const source of [
             "https://artifacts.example.invalid/download?ref=main",
             "https://artifacts.example.invalid/download?rev=v1&branch=LATEST",
             "https://artifacts.example.invalid/d?path=repo/main/model.onnx",
-            "https://artifacts.example.invalid/download#HEAD",
         ]) {
             const root = freshRoot();
             const manifest = fixtureManifest();
@@ -336,6 +335,39 @@ describe("immutable input fail-closed rules", () => {
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).toThrow(
                 /mutable source identity/,
+            );
+        }
+    });
+
+    test("a mutable ref behind encoded separators is rejected", () => {
+        // One raw path segment, but a server that decodes escaped separators
+        // resolves it through the moving ref. Comparing the decoded value
+        // wholesale against the ref set misses it.
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        manifest.inputs.model_onnx.source =
+            "https://artifacts.example.invalid/repo/resolve%2Fmain%2Fmodel.onnx";
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).toThrow(
+            /mutable source identity \(main ref\)/,
+        );
+    });
+
+    test("a source URL fragment is rejected outright", () => {
+        // A fragment never reaches the server, so it cannot select artifact
+        // bytes; what it can do is carry an OAuth-style token that `buildLock`
+        // would copy into the committed lock.
+        for (const source of [
+            "https://artifacts.example.invalid/rev/abc123/model.onnx#access_token=secret",
+            "https://artifacts.example.invalid/rev/abc123/model.onnx#HEAD",
+            "https://artifacts.example.invalid/rev/abc123/model.onnx#anything",
+        ]) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.inputs.model_onnx.source = source;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                /source must not carry a URL fragment/,
             );
         }
     });
@@ -522,6 +554,52 @@ describe("immutable input fail-closed rules", () => {
         );
     });
 
+    test("the Pi version is the one the workspace resolves, not any in the lock", () => {
+        const pkg = "@earendil-works/pi-coding-agent";
+
+        // A transitive copy at an unrelated version satisfies a substring search
+        // for `"<pkg>@<version>"` while the workspace resolves to something else.
+        const decoy = freshRoot();
+        const lockPath = join(decoy, "bun.lock");
+        const lock = readFileSync(lockPath, "utf8");
+        writeFileSync(
+            lockPath,
+            lock.replace(
+                `    "${pkg}": [`,
+                `    "some-other-package/${pkg}": ["${pkg}@0.79.0", "", {}, "sha512-decoy"],\n\n    "${pkg}": [`,
+            ),
+        );
+        const citesDecoy = fixtureManifest();
+        citesDecoy.harnesses.pi.version = "0.79.0";
+        installManifest(decoy, citesDecoy);
+        expect(() => generate(decoy, { check: false })).toThrow(
+            /does not match the resolved bun\.lock pin \(0\.80\.2\)/,
+        );
+
+        // A workspace-specific resolution outranks the hoisted one.
+        const nested = freshRoot();
+        const nestedLockPath = join(nested, "bun.lock");
+        writeFileSync(
+            nestedLockPath,
+            readFileSync(nestedLockPath, "utf8").replace(
+                `    "${pkg}": [`,
+                `    "packages/pi-plugin/${pkg}": ["${pkg}@0.81.0", "", {}, "sha512-nested"],\n\n    "${pkg}": [`,
+            ),
+        );
+        const citesNested = fixtureManifest();
+        citesNested.harnesses.pi.version = "0.81.0";
+        installManifest(nested, citesNested);
+        expect(() => generate(nested, { check: false })).not.toThrow();
+
+        // An unreadable or unresolved lockfile fails closed rather than passing.
+        const unreadable = freshRoot();
+        writeFileSync(join(unreadable, "bun.lock"), "{not json\n");
+        installManifest(unreadable, fixtureManifest());
+        expect(() => generate(unreadable, { check: false })).toThrow(
+            /bun\.lock does not resolve/,
+        );
+    });
+
     test("a forbidden ORT capability in Cargo.toml fails production closed", () => {
         // The declared array is not the effective feature closure, but adding a
         // download, TLS, or accelerator feature while leaving the version pin
@@ -581,7 +659,23 @@ describe("immutable input fail-closed rules", () => {
                         /^ort = .*$/m,
                         '[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = ["load-dynamic"]',
                     ),
-                /not declared as an inline dependency table/,
+                /ort must be declared exactly once/,
+            ],
+            [
+                // A decoy assignment under an unrelated table. A scan that
+                // ignores section headers validates the decoy and never reaches
+                // the real dependency's forbidden feature.
+                (cargo) =>
+                    cargo
+                        .replace(
+                            '"load-dynamic", "ndarray", "std"',
+                            '"load-dynamic", "ndarray", "std", "download-binaries"',
+                        )
+                        .replace(
+                            "[dependencies]",
+                            '[package.metadata.qualification]\nort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }\n\n[dependencies]',
+                        ),
+                /ort must be declared exactly once/,
             ],
         ];
         for (const [mutate, error] of cases) {
@@ -657,6 +751,41 @@ describe("oracle evidence hook", () => {
             expect(() => generate(root, { check: false })).toThrow(
                 /host must meet the exact minimum Linux floor/,
             );
+        }
+    });
+
+    test("a prerelease host version does not satisfy the stable floor", () => {
+        // `compareDotted` reads leading digits only, so a release candidate
+        // scores exactly equal to the floor it actually precedes.
+        for (const [field, value] of [
+            ["kernel", "4.18-rc1"],
+            ["kernel", "4.18.0-rc2"],
+            ["glibc", "2.28-pre"],
+            ["glibc", "2.28-beta3"],
+        ] as const) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.oracle.host[field] = value;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                /host must meet the exact minimum Linux floor/,
+            );
+        }
+
+        // A numeric release suffix means the opposite — the floor plus patches —
+        // and a prerelease is only disqualifying while the version sits exactly
+        // at the floor.
+        for (const [field, value] of [
+            ["kernel", "4.18.0-513.el8.x86_64"],
+            ["glibc", "2.28-236.el8"],
+            ["kernel", "4.19-rc1"],
+            ["kernel", "4.18.1-rc2"],
+        ] as const) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            manifest.oracle.host[field] = value;
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).not.toThrow();
         }
     });
 

@@ -74,6 +74,8 @@ const TINY_FIXTURE_MANIFEST_PATH =
 const QUALIFICATION_FIXTURE_MANIFEST_PATH =
     "scripts/__fixtures__/mc-host-qualification/source-manifest.test-fixture.json";
 const BUN_LOCK_PATH = "bun.lock";
+/** The workspace whose resolution of the Pi harness package is the released one. */
+const PI_HARNESS_WORKSPACE = "packages/pi-plugin";
 const MC_HOST_CARGO_TOML_PATH = "crates/mc-host/Cargo.toml";
 
 function fail(message: string): never {
@@ -1236,6 +1238,16 @@ function validateQualifiedArtifact(
             );
         }
     }
+    // A fragment is never sent to the server, so it cannot select artifact bytes:
+    // on an immutable artifact URL it is noise at best, and at worst it is where
+    // an OAuth-style flow puts an access token — which `buildLock` would copy
+    // into the committed lock. Rejecting the whole component closes that class
+    // rather than chasing individual credential and ref spellings inside it.
+    if (sourceUrl.hash !== "") {
+        fail(
+            `inputs.${key}: source must not carry a URL fragment (it cannot select bytes and can carry credentials)`,
+        );
+    }
     const rejectMutableRef = (value: string): void => {
         // Case-folded: a ref differing only in case is still a moving target,
         // and no immutable artifact URL needs a token spelled like one.
@@ -1258,30 +1270,22 @@ function validateQualifiedArtifact(
                 `inputs.${key}: source path segment ${JSON.stringify(rawSegment)} has a malformed percent-escape`,
             );
         }
-        rejectMutableRef(segment);
+        // Decoding can reveal separators the split above could not see:
+        // `resolve%2Fmain%2Fmodel.onnx` is one raw segment that a server which
+        // decodes escaped separators resolves through the moving `main` ref. Split
+        // again after decoding so each revealed component is compared on its own.
+        for (const token of segment.split(/[\\/]+/)) rejectMutableRef(token);
     }
-    // An endpoint can name its revision in the query string
-    // (`/download?ref=main`) or the fragment instead of the path, and such a URL
-    // keeps resolving a moving target however immutable its path looks. Split
-    // composite values so a ref buried in `?path=repo/main/model.onnx` is caught.
+    // An endpoint can also name its revision in the query string
+    // (`/download?ref=main`), and such a URL keeps resolving a moving target
+    // however immutable its path looks. Split composite values so a ref buried in
+    // `?path=repo/main/model.onnx` is caught.
     //
     // `URLSearchParams` already decoded these values, so they are compared as
     // they are: decoding a second time would turn a literal `%` in a legitimate
     // value into a malformed-escape rejection.
     for (const [, value] of sourceUrl.searchParams) {
         for (const token of value.split(/[\\/,;:@]+/)) rejectMutableRef(token);
-    }
-    // The fragment is raw, so decode it the same way path segments are.
-    for (const raw of sourceUrl.hash.replace(/^#/, "").split(/[\\/,;:@]+/)) {
-        let token: string;
-        try {
-            token = decodeURIComponent(raw);
-        } catch {
-            fail(
-                `inputs.${key}: source fragment ${JSON.stringify(raw)} has a malformed percent-escape`,
-            );
-        }
-        rejectMutableRef(token);
     }
     if (
         !Number.isSafeInteger(artifact.size_bytes) ||
@@ -1395,6 +1399,20 @@ export function checkOracleEvidence(
     // Demand one digit-led component per floor component before comparing: that
     // rejects the truncated garbage while still admitting every distro suffix,
     // which only ever appears after those components.
+    //
+    // Suffixes also need a direction. `compareDotted` reads only each component's
+    // leading digits, so `4.18-rc1` scores exactly equal to a `4.18` floor even
+    // though a release candidate precedes 4.18 final. A numeric release suffix
+    // (`2.28-236.el8`) means the opposite — 2.28 plus patches — so the two cannot
+    // be told apart by shape, only by the marker.
+    //
+    // A prerelease marker therefore disqualifies only while the version is still
+    // exactly at the floor: scan components until one beyond the floor's precision
+    // carries a non-zero number, which is the point the version has genuinely gone
+    // past it. `4.18.0-rc2` is caught (the `.0` has not moved past `4.18`), while
+    // `4.18.0-513.el8` and `4.18.1-rc2` are not, and anything strictly above the
+    // floor is never examined — 4.19-rc1 really does follow 4.18.
+    const PRERELEASE_MARKER = /^\d*[-.]?(?:rc|pre|alpha|beta|dev|snapshot)/i;
     const versionAtLeast = (value: unknown, floor: string): boolean => {
         if (typeof value !== "string" || value.length === 0) {
             return false;
@@ -1406,7 +1424,17 @@ export function checkOracleEvidence(
             if (!/^\d/.test(parts[i] ?? "")) return false;
         }
         const ordering = compareDotted(value, floor);
-        return !Number.isNaN(ordering) && ordering >= 0;
+        if (Number.isNaN(ordering) || ordering < 0) return false;
+        if (ordering === 0) {
+            for (const [index, part] of parts.entries()) {
+                if (index >= floorParts.length) {
+                    const leading = /^\d*/.exec(part)?.[0] ?? "";
+                    if (Number(leading || "0") > 0) break;
+                }
+                if (PRERELEASE_MARKER.test(part)) return false;
+            }
+        }
+        return true;
     };
     if (
         !versionAtLeast(oracle.host.kernel, linux.kernel_min) ||
@@ -1595,23 +1623,40 @@ const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
 ];
 
 /**
- * Extract one crate's complete inline dependency entry from `Cargo.toml`, across
- * however many lines its inline table spans.
+ * Extract one crate's complete inline dependency entry from the `[dependencies]`
+ * table of `Cargo.toml`, across however many lines its inline table spans.
  *
- * Returns `null` when the declaration is absent, unbalanced, or written in the
- * `[dependencies.<crate>]` section form, whose keys this text scan cannot
- * attribute to the crate. Callers must fail closed on `null` rather than read it
- * as "declares nothing".
+ * Returns `null` unless the crate is declared exactly once in the whole file and
+ * that declaration is in `[dependencies]`. Section tracking is the load-bearing
+ * part: a bare textual search for `ort = ` would validate a decoy assignment
+ * under an unrelated table such as `[package.metadata.qualification]` and never
+ * reach the real dependency. Requiring uniqueness covers the other direction, so
+ * a second declaration under `[target.'cfg(...)'.dependencies]` cannot contribute
+ * features this check never sees. `null` also covers the absent, unbalanced, and
+ * `[dependencies.<crate>]` section forms; callers must fail closed on it rather
+ * than read it as "declares nothing".
  *
  * Brace and bracket counting is enough here because Cargo dependency values are
  * versions, paths, and URLs, none of which contain them.
  */
 function inlineDependencyEntry(cargo: string, crate: string): string | null {
     const lines = cargo.split("\n");
-    const start = lines.findIndex((line) =>
-        line.trimStart().startsWith(`${crate} = `),
-    );
-    if (start === -1) return null;
+    const starts: number[] = [];
+    let section = "";
+    for (const [index, line] of lines.entries()) {
+        const trimmed = line.trim();
+        const header = /^\[([^\]]+)\]$/.exec(trimmed);
+        if (header !== null) {
+            section = header[1] ?? "";
+            continue;
+        }
+        if (!trimmed.startsWith(`${crate} = `)) continue;
+        // Any declaration outside `[dependencies]` still counts, so a decoy or a
+        // target-specific duplicate is reported as ambiguity rather than ignored.
+        starts.push(section === "dependencies" ? index : -1);
+    }
+    if (starts.length !== 1 || starts[0] === -1) return null;
+    const start = starts[0] as number;
     const collected: string[] = [];
     let depth = 0;
     for (let i = start; i < lines.length; i++) {
@@ -1649,7 +1694,7 @@ function assertPinnedCrateFeatures(
     const entry = inlineDependencyEntry(cargo, crate);
     if (entry === null) {
         fail(
-            `${crate} is not declared as an inline dependency table in ${MC_HOST_CARGO_TOML_PATH}; the qualified feature closure cannot be checked`,
+            `${crate} must be declared exactly once, as an inline dependency table under [dependencies], in ${MC_HOST_CARGO_TOML_PATH}; the qualified feature closure cannot be checked otherwise`,
         );
     }
     if (!entry.includes(`version = "=${version}"`)) {
@@ -1683,6 +1728,80 @@ function assertPinnedCrateFeatures(
     }
 }
 
+/**
+ * Strip trailing commas from `bun.lock`'s JSONC so it can be parsed as JSON.
+ *
+ * String-aware, because a lockfile carries package names, version ranges, and
+ * integrity hashes: a blind regex would corrupt any value that legitimately ends
+ * in a comma before a closing brace.
+ */
+function stripJsoncTrailingCommas(text: string): string {
+    let out = "";
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < text.length; i++) {
+        const char = text[i] as string;
+        if (inString) {
+            out += char;
+            if (escaped) escaped = false;
+            else if (char === "\\") escaped = true;
+            else if (char === '"') inString = false;
+            continue;
+        }
+        if (char === '"') {
+            inString = true;
+            out += char;
+            continue;
+        }
+        if (char === ",") {
+            // Look past whitespace for a closer; drop the comma only then.
+            let j = i + 1;
+            while (j < text.length && /\s/.test(text[j] as string)) j++;
+            const next = text[j];
+            if (next === "}" || next === "]") continue;
+        }
+        out += char;
+    }
+    return out;
+}
+
+/**
+ * Resolve the version `workspace` actually gets for `pkg`, from `bun.lock`'s
+ * `packages` table.
+ *
+ * A nested resolution is keyed by its consumer path, so the workspace-specific
+ * entry wins over the hoisted one when both exist. This replaces a substring
+ * search for `"<pkg>@<version>"`, which proved only that the version appeared
+ * somewhere in the file — a transitive copy at an unrelated version would satisfy
+ * it while the workspace resolved to something else entirely.
+ *
+ * Returns `null` when the lockfile cannot be read or the package is not resolved,
+ * so callers fail closed instead of accepting an unverified version.
+ */
+function resolveLockedVersion(
+    lockText: string,
+    workspace: string,
+    pkg: string,
+): string | null {
+    let lock: { packages?: Record<string, unknown> };
+    try {
+        lock = JSON.parse(stripJsoncTrailingCommas(lockText));
+    } catch {
+        return null;
+    }
+    const packages = lock.packages;
+    if (packages === null || typeof packages !== "object") return null;
+    const entry = packages[`${workspace}/${pkg}`] ?? packages[pkg];
+    // Each value is `[ "<name>@<version>", ... ]`.
+    const descriptor = Array.isArray(entry) ? entry[0] : undefined;
+    if (typeof descriptor !== "string") return null;
+    // Scoped names begin with `@`, so split at the last separator.
+    const at = descriptor.lastIndexOf("@");
+    if (at <= 0) return null;
+    if (descriptor.slice(0, at) !== pkg) return null;
+    return descriptor.slice(at + 1);
+}
+
 /** Repo-pinned identity cross-checks (bun.lock harness versions, Cargo crate pins). */
 function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
     const bunLockPath = join(rootDir, BUN_LOCK_PATH);
@@ -1691,14 +1810,20 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
         if (!existsSync(bunLockPath)) {
             fail("bun.lock is required to qualify the exact Pi version");
         }
-        const bunLock = readFileSync(bunLockPath, "utf8");
-        if (
-            !bunLock.includes(
-                `"${manifest.harnesses.pi.package}@${piVersion}"`,
-            )
-        ) {
+        const pkg = manifest.harnesses.pi.package;
+        const locked = resolveLockedVersion(
+            readFileSync(bunLockPath, "utf8"),
+            PI_HARNESS_WORKSPACE,
+            pkg,
+        );
+        if (locked === null) {
             fail(
-                `harnesses.pi: version ${piVersion} does not match the resolved bun.lock pin`,
+                `harnesses.pi: bun.lock does not resolve ${pkg} for ${PI_HARNESS_WORKSPACE}`,
+            );
+        }
+        if (locked !== piVersion) {
+            fail(
+                `harnesses.pi: version ${piVersion} does not match the resolved bun.lock pin (${locked})`,
             );
         }
     }
