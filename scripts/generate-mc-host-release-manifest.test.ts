@@ -454,6 +454,63 @@ describe("platform floors", () => {
         }
     });
 
+    test("garbage and prerelease host versions fail the platform gate too", () => {
+        // The U9 oracle-host check rejects these. Sharing only `compareDotted`
+        // once let this gate keep a bare `>= 0` and accept them, so the two
+        // disagreed about the same host; they now share the whole predicate.
+        for (const kernel of [
+            "999garbage",
+            "5",
+            "4.18-rc1",
+            "4.18.0-rc2",
+            "4.18-pre",
+        ]) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "linux",
+                    arch: "x64",
+                    libc: "gnu",
+                    kernel,
+                    glibc: "2.28",
+                    procfsSelfFdExec: true,
+                }),
+                `kernel=${kernel} must not clear the floor`,
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+        }
+        for (const glibc of ["999garbage", "2.28-pre", "2.28-beta3"]) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "linux",
+                    arch: "x64",
+                    libc: "gnu",
+                    kernel: "4.18",
+                    glibc,
+                    procfsSelfFdExec: true,
+                }),
+                `glibc=${glibc} must not clear the floor`,
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+        }
+        expect(
+            evaluatePlatform(contract, {
+                os: "darwin",
+                arch: "arm64",
+                osVersion: "13.5-beta",
+                devFdExec: true,
+            }),
+        ).toEqual({ supported: false, reason: "unsupported_platform" });
+        // A prerelease genuinely above the floor still clears it.
+        expect(
+            evaluatePlatform(contract, {
+                os: "linux",
+                arch: "x64",
+                libc: "gnu",
+                kernel: "4.19-rc1",
+                glibc: "2.28-236.el8",
+                procfsSelfFdExec: true,
+            }).supported,
+        ).toBe(true);
+    });
+
     test("real-world version strings at the floor are supported", () => {
         // RHEL/Rocky 8 report exactly these shapes at the contract floors.
         const rhel8 = evaluatePlatform(contract, {

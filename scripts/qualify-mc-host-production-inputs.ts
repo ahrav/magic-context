@@ -47,9 +47,9 @@ import { fileURLToPath } from "node:url";
 import {
     buildContract,
     canonicalJson,
-    compareDotted,
     exactKeysAsserter,
     generate as generateReleaseOutputs,
+    meetsDottedFloor,
     type ReleaseContract,
     sha256Hex,
     validateContractSchema,
@@ -1076,10 +1076,17 @@ function resolveVerifyPath(
     // Resolve symlinks when the bytes exist so the deny-list sees the real
     // location; when absent, keep the lexical path so the caller reports the
     // missing-bytes failure against the path the manifest actually names.
+    //
+    // `realpathSync.native` deliberately, matching `safeRealpath` in the plugin's
+    // enforcement-artifact canonicalizer: the OS `realpath(3)` is the authority on
+    // symlink resolution, and two security checks in one repository should not
+    // disagree about what a path resolves to. Not imported from there — release
+    // tooling depending on a plugin feature's internals would point the coupling
+    // the wrong way — so the shared decision is the primitive, not the call.
     let resolved = lexical;
     if (existsSync(lexical)) {
         try {
-            resolved = realpathSync(lexical);
+            resolved = realpathSync.native(lexical);
         } catch {
             fail(`inputs.${key}: verify path could not be resolved`);
         }
@@ -1388,60 +1395,14 @@ export function checkOracleEvidence(
     if (oracle.host?.target !== "linux-x64-gnu") {
         fail("oracle: the offline oracle must run on the linux-x64-gnu lane");
     }
-    // Same comparator the U8 platform gate uses against these same floors, so
-    // the qualifier and `evaluatePlatform` cannot disagree on a host version.
-    // No format pre-filter on the *spelling*: `compareDotted` exists precisely
-    // to read the messy strings real hosts report (`uname -r` gives
-    // `4.18.0-513.el8.x86_64`, glibc gives `2.28-236.el8`), taking each segment's
-    // leading digit run and counting a segment with no leading digits as 0.
-    //
-    // Precision is required, though. Because a missing component scores 0, a
-    // value shorter than the floor is compared as if its absent components were
-    // zeros, so a single high segment decides the result on its own and
-    // `999garbage` clears a `4.18` floor without ever naming a minor version.
-    // Demand one digit-led component per floor component before comparing: that
-    // rejects the truncated garbage while still admitting every distro suffix,
-    // which only ever appears after those components.
-    //
-    // Suffixes also need a direction. `compareDotted` reads only each component's
-    // leading digits, so `4.18-rc1` scores exactly equal to a `4.18` floor even
-    // though a release candidate precedes 4.18 final. A numeric release suffix
-    // (`2.28-236.el8`) means the opposite — 2.28 plus patches — so the two cannot
-    // be told apart by shape, only by the marker.
-    //
-    // A prerelease marker therefore disqualifies only while the version is still
-    // exactly at the floor: scan components until one beyond the floor's precision
-    // carries a non-zero number, which is the point the version has genuinely gone
-    // past it. `4.18.0-rc2` is caught (the `.0` has not moved past `4.18`), while
-    // `4.18.0-513.el8` and `4.18.1-rc2` are not, and anything strictly above the
-    // floor is never examined — 4.19-rc1 really does follow 4.18.
-    const PRERELEASE_MARKER = /^\d*[-.]?(?:rc|pre|alpha|beta|dev|snapshot)/i;
-    const versionAtLeast = (value: unknown, floor: string): boolean => {
-        if (typeof value !== "string" || value.length === 0) {
-            return false;
-        }
-        const parts = value.split(".");
-        const floorParts = floor.split(".");
-        if (parts.length < floorParts.length) return false;
-        for (let i = 0; i < floorParts.length; i++) {
-            if (!/^\d/.test(parts[i] ?? "")) return false;
-        }
-        const ordering = compareDotted(value, floor);
-        if (Number.isNaN(ordering) || ordering < 0) return false;
-        if (ordering === 0) {
-            for (const [index, part] of parts.entries()) {
-                if (index >= floorParts.length) {
-                    const leading = /^\d*/.exec(part)?.[0] ?? "";
-                    if (Number(leading || "0") > 0) break;
-                }
-                if (PRERELEASE_MARKER.test(part)) return false;
-            }
-        }
-        return true;
-    };
+    // One predicate for both gates: `meetsDottedFloor` carries the precision and
+    // prerelease rules on top of `compareDotted`, so the U8 platform gate and this
+    // oracle-host check cannot disagree about whether a host clears a floor. That
+    // divergence is the failure this sharing exists to prevent, and it happened
+    // once already when only the comparator was shared.
     if (
-        !versionAtLeast(oracle.host.kernel, linux.kernel_min) ||
-        !versionAtLeast(oracle.host.glibc, linux.glibc_min)
+        !meetsDottedFloor(oracle.host.kernel, linux.kernel_min) ||
+        !meetsDottedFloor(oracle.host.glibc, linux.glibc_min)
     ) {
         fail("oracle: host must meet the exact minimum Linux floor");
     }
