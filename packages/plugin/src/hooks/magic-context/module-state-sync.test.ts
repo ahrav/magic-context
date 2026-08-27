@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { computeClaimOperationRequestDigest } from "../../features/magic-context/memory/claim-operation-contract";
+import { createAntiMemory } from "../../features/magic-context/memory/storage-anti-memory";
 import {
     advanceOutboxConsumerCheckpointInCurrentTransaction,
     computeProjectMemoryMutationToken,
@@ -1763,5 +1764,37 @@ describe("U10 committed claim mirror state sync", () => {
         expect(serialized).not.toContain('"memoryId"');
         expect(serialized).not.toContain('"legacy"');
         expect(facade.snapshots[0]?.snapshot.claims[0]).not.toHaveProperty("id");
+    });
+
+    it("never mirrors a verified rejected approach", () => {
+        const db = createContextDb();
+        const projectPath = "git:u10-anti-memory";
+        const projectId = ensureProject(db, projectPath);
+        createAntiMemory(
+            db,
+            { producer: "test", operationKey: "anti-memory" },
+            {
+                projectId,
+                payload: {
+                    trigger: "cache work",
+                    rejectedStrategy: "use Redis",
+                    rejectionReason: "operational burden",
+                },
+                provenance: {
+                    sourceLocator: "transcript://u10-anti-memory",
+                    sourceContent: "user rejected Redis",
+                    extractor: "test",
+                    extractorVersion: "1",
+                    extractorRunId: "u10-anti-memory",
+                    independenceKey: "u10-anti-memory",
+                    sourceTrustClass: "explicit_user",
+                },
+                actor: "host:user-corroborated",
+                nowMs: 1,
+            },
+        );
+
+        const snapshot = buildAuthorizedClaimMirrorSnapshot({ db, projectPath, nowMs: 2 });
+        expect(snapshot?.claims ?? []).toEqual([]);
     });
 });

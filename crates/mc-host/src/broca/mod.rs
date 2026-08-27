@@ -70,17 +70,11 @@ impl BrocaComponent {
 }
 
 fn request_error(error: RequestError) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: error.code.to_owned(),
-        message: error.message,
-    }
+    RequestOutcome::error(error.code, error.message)
 }
 
 fn app_error(code: &str, message: &str) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: code.to_owned(),
-        message: message.to_owned(),
-    }
+    RequestOutcome::error(code, message)
 }
 
 async fn respond(ctx: &RequestCtx, body: Vec<u8>) -> RequestOutcome {
@@ -117,6 +111,7 @@ impl CompositeComponent for BrocaComponent {
             reserved_handler_tasks: config::RESERVED_HANDLER_TASKS,
             reserved_pending_requests: config::RESERVED_PENDING_REQUESTS,
             retained_resident_bytes: config::DECLARED_RETAINED_RESIDENT_BYTES,
+            general_task_hold_bound: 0,
             route_class: RouteClass::Reserved,
         }
     }

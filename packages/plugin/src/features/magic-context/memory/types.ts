@@ -19,6 +19,8 @@ export type MemoryCategory =
     | "WORKFLOW_RULES"
     | "KNOWN_ISSUES";
 
+export type AntiMemoryCategory = "REJECTED_APPROACH";
+
 export type MemoryStatus = "active" | "permanent" | "archived";
 export type MemoryScope = "project" | "ecosystem" | "universe";
 export type VerificationStatus = "unverified" | "verified" | "stale" | "flagged";

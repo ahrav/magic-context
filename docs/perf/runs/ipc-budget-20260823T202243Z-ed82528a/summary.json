@@ -1,0 +1,2130 @@
+{
+  "arms": {
+    "atomic-floor@same-l3-0,1": {
+      "attempts": 10,
+      "blocks": [
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 3964442.0549606895,
+            "max_batch_rtt_ns": 259.7212,
+            "median_batch_rtt_ns": 251.47825,
+            "min_batch_rtt_ns": 250.9606
+          },
+          "run_block": 1
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 4557467.719627047,
+            "max_batch_rtt_ns": 227.5699,
+            "median_batch_rtt_ns": 218.8115,
+            "min_batch_rtt_ns": 217.8616
+          },
+          "run_block": 2
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 33,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 5446975.322519153,
+            "max_batch_rtt_ns": 192.3135,
+            "median_batch_rtt_ns": 182.9349,
+            "min_batch_rtt_ns": 182.3122
+          },
+          "run_block": 3
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 3712682.889149159,
+            "max_batch_rtt_ns": 277.4102,
+            "median_batch_rtt_ns": 268.54235,
+            "min_batch_rtt_ns": 268.0363
+          },
+          "run_block": 4
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 6020414.684357334,
+            "max_batch_rtt_ns": 174.437,
+            "median_batch_rtt_ns": 165.54545000000002,
+            "min_batch_rtt_ns": 165.0571
+          },
+          "run_block": 5
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 3713667.728674749,
+            "max_batch_rtt_ns": 277.3716,
+            "median_batch_rtt_ns": 268.5331,
+            "min_batch_rtt_ns": 268.0135
+          },
+          "run_block": 6
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 4980767.513362278,
+            "max_batch_rtt_ns": 208.6052,
+            "median_batch_rtt_ns": 200.12365,
+            "min_batch_rtt_ns": 199.1779
+          },
+          "run_block": 7
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 4556640.383030826,
+            "max_batch_rtt_ns": 227.1375,
+            "median_batch_rtt_ns": 218.8438,
+            "min_batch_rtt_ns": 217.991
+          },
+          "run_block": 8
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 3963367.8748638257,
+            "max_batch_rtt_ns": 259.9505,
+            "median_batch_rtt_ns": 251.5578,
+            "min_batch_rtt_ns": 250.9733
+          },
+          "run_block": 9
+        },
+        {
+          "outcomes": null,
+          "results": {
+            "batches": 200,
+            "clock_bracket_ns": 31,
+            "exchanges_per_batch": 10000,
+            "exchanges_per_sec": 6827988.198109175,
+            "max_batch_rtt_ns": 156.9817,
+            "median_batch_rtt_ns": 145.92185,
+            "min_batch_rtt_ns": 145.0515
+          },
+          "run_block": 10
+        }
+      ],
+      "class": "same-l3",
+      "merged": {
+        "max_ns": 319,
+        "p50_ns": 255,
+        "p999_ns": null,
+        "p99_ns": 319,
+        "samples": 2000
+      },
+      "pair": [
+        0,
+        1
+      ]
+    },
+    "tcp-open@same-l3-0,1": {
+      "attempts": 30,
+      "blocks": [
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000350969,
+            "issue_p50_ns": 139519,
+            "issue_p99_ns": 327423,
+            "lag_p99_ns": 1662975,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 627711,
+            "sched_p99_ns": 1841151,
+            "scheduled_slots": 200000
+          },
+          "run_block": 1
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000013944,
+            "issue_p50_ns": 26111,
+            "issue_p99_ns": 48191,
+            "lag_p99_ns": 21183,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35967,
+            "sched_p99_ns": 68031,
+            "scheduled_slots": 500000
+          },
+          "run_block": 1
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000030933,
+            "issue_p50_ns": 42623,
+            "issue_p99_ns": 86975,
+            "lag_p99_ns": 25791,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 58879,
+            "sched_p99_ns": 97983,
+            "scheduled_slots": 800000
+          },
+          "run_block": 1
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000403367,
+            "issue_p50_ns": 128831,
+            "issue_p99_ns": 236543,
+            "lag_p99_ns": 1054719,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 612863,
+            "sched_p99_ns": 1141759,
+            "scheduled_slots": 200000
+          },
+          "run_block": 2
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000018222,
+            "issue_p50_ns": 26175,
+            "issue_p99_ns": 49535,
+            "lag_p99_ns": 21695,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 36031,
+            "sched_p99_ns": 68927,
+            "scheduled_slots": 500000
+          },
+          "run_block": 2
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.00002834,
+            "issue_p50_ns": 40959,
+            "issue_p99_ns": 84159,
+            "lag_p99_ns": 24575,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 56831,
+            "sched_p99_ns": 95999,
+            "scheduled_slots": 800000
+          },
+          "run_block": 2
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000634232,
+            "issue_p50_ns": 129215,
+            "issue_p99_ns": 224255,
+            "lag_p99_ns": 1052671,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 610303,
+            "sched_p99_ns": 1137663,
+            "scheduled_slots": 200000
+          },
+          "run_block": 3
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.0000235,
+            "issue_p50_ns": 26111,
+            "issue_p99_ns": 48063,
+            "lag_p99_ns": 21183,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35903,
+            "sched_p99_ns": 67903,
+            "scheduled_slots": 500000
+          },
+          "run_block": 3
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.00003089,
+            "issue_p50_ns": 46143,
+            "issue_p99_ns": 92415,
+            "lag_p99_ns": 27071,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 59071,
+            "sched_p99_ns": 100735,
+            "scheduled_slots": 800000
+          },
+          "run_block": 3
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000496994,
+            "issue_p50_ns": 128959,
+            "issue_p99_ns": 227199,
+            "lag_p99_ns": 1051647,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 609279,
+            "sched_p99_ns": 1136639,
+            "scheduled_slots": 200000
+          },
+          "run_block": 4
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000015295,
+            "issue_p50_ns": 26303,
+            "issue_p99_ns": 48127,
+            "lag_p99_ns": 20799,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35967,
+            "sched_p99_ns": 67711,
+            "scheduled_slots": 500000
+          },
+          "run_block": 4
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.0000325,
+            "issue_p50_ns": 42623,
+            "issue_p99_ns": 86207,
+            "lag_p99_ns": 25535,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 57279,
+            "sched_p99_ns": 97407,
+            "scheduled_slots": 800000
+          },
+          "run_block": 4
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000990678,
+            "issue_p50_ns": 137471,
+            "issue_p99_ns": 334335,
+            "lag_p99_ns": 1615871,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 623615,
+            "sched_p99_ns": 1816575,
+            "scheduled_slots": 200000
+          },
+          "run_block": 5
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000013081,
+            "issue_p50_ns": 25855,
+            "issue_p99_ns": 47807,
+            "lag_p99_ns": 20799,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35775,
+            "sched_p99_ns": 67711,
+            "scheduled_slots": 500000
+          },
+          "run_block": 5
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000035044,
+            "issue_p50_ns": 43583,
+            "issue_p99_ns": 89791,
+            "lag_p99_ns": 26175,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 58495,
+            "sched_p99_ns": 99903,
+            "scheduled_slots": 800000
+          },
+          "run_block": 5
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.001030931,
+            "issue_p50_ns": 127999,
+            "issue_p99_ns": 221311,
+            "lag_p99_ns": 1051647,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 609791,
+            "sched_p99_ns": 1134591,
+            "scheduled_slots": 200000
+          },
+          "run_block": 6
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000016089,
+            "issue_p50_ns": 26047,
+            "issue_p99_ns": 48831,
+            "lag_p99_ns": 21119,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35839,
+            "sched_p99_ns": 68351,
+            "scheduled_slots": 500000
+          },
+          "run_block": 6
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000033092,
+            "issue_p50_ns": 47615,
+            "issue_p99_ns": 91583,
+            "lag_p99_ns": 26815,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 59839,
+            "sched_p99_ns": 100351,
+            "scheduled_slots": 800000
+          },
+          "run_block": 6
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000842285,
+            "issue_p50_ns": 127423,
+            "issue_p99_ns": 222207,
+            "lag_p99_ns": 1051647,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 608767,
+            "sched_p99_ns": 1134591,
+            "scheduled_slots": 200000
+          },
+          "run_block": 7
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000015136,
+            "issue_p50_ns": 26111,
+            "issue_p99_ns": 47871,
+            "lag_p99_ns": 20991,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35967,
+            "sched_p99_ns": 67711,
+            "scheduled_slots": 500000
+          },
+          "run_block": 7
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000032354,
+            "issue_p50_ns": 43199,
+            "issue_p99_ns": 86655,
+            "lag_p99_ns": 25151,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 57023,
+            "sched_p99_ns": 97535,
+            "scheduled_slots": 800000
+          },
+          "run_block": 7
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000793924,
+            "issue_p50_ns": 131839,
+            "issue_p99_ns": 226431,
+            "lag_p99_ns": 1050623,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 609791,
+            "sched_p99_ns": 1131519,
+            "scheduled_slots": 200000
+          },
+          "run_block": 8
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000028101,
+            "issue_p50_ns": 26111,
+            "issue_p99_ns": 48255,
+            "lag_p99_ns": 20991,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 36031,
+            "sched_p99_ns": 67903,
+            "scheduled_slots": 500000
+          },
+          "run_block": 8
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000035248,
+            "issue_p50_ns": 45311,
+            "issue_p99_ns": 92607,
+            "lag_p99_ns": 26751,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 58943,
+            "sched_p99_ns": 101631,
+            "scheduled_slots": 800000
+          },
+          "run_block": 8
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000805518,
+            "issue_p50_ns": 135807,
+            "issue_p99_ns": 347647,
+            "lag_p99_ns": 1130495,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 619519,
+            "sched_p99_ns": 1490943,
+            "scheduled_slots": 200000
+          },
+          "run_block": 9
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000018641,
+            "issue_p50_ns": 25919,
+            "issue_p99_ns": 48063,
+            "lag_p99_ns": 20863,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35775,
+            "sched_p99_ns": 67647,
+            "scheduled_slots": 500000
+          },
+          "run_block": 9
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 800000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000031261,
+            "issue_p50_ns": 48319,
+            "issue_p99_ns": 94911,
+            "lag_p99_ns": 27391,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 60543,
+            "sched_p99_ns": 107647,
+            "scheduled_slots": 800000
+          },
+          "run_block": 9
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 200000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.00018377,
+            "issue_p50_ns": 138623,
+            "issue_p99_ns": 327423,
+            "lag_p99_ns": 1661951,
+            "offered_rate_per_sec": 20000,
+            "sched_p50_ns": 625663,
+            "sched_p99_ns": 1826815,
+            "scheduled_slots": 200000
+          },
+          "run_block": 10
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 500000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 12.000019855,
+            "issue_p50_ns": 25983,
+            "issue_p99_ns": 47999,
+            "lag_p99_ns": 20863,
+            "offered_rate_per_sec": 50000,
+            "sched_p50_ns": 35711,
+            "sched_p99_ns": 67647,
+            "scheduled_slots": 500000
+          },
+          "run_block": 10
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 393,
+            "protocol_error": 0,
+            "success": 14514,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 2.18654178,
+            "issue_p50_ns": 46591,
+            "issue_p99_ns": 1742847,
+            "lag_p99_ns": 2965503,
+            "offered_rate_per_sec": 80000,
+            "sched_p50_ns": 59583,
+            "sched_p99_ns": 4993023,
+            "scheduled_slots": 14907
+          },
+          "run_block": 10
+        }
+      ],
+      "class": "same-l3",
+      "pair": [
+        0,
+        1
+      ]
+    },
+    "tcp-serial@same-l3-0,1": {
+      "attempts": 10,
+      "blocks": [
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.194518697,
+            "max_ns": 3508223,
+            "p50_ns": 24191,
+            "p999_ns": 62783,
+            "p99_ns": 28991,
+            "scheduled": 150000
+          },
+          "run_block": 1
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.28882468,
+            "max_ns": 3624959,
+            "p50_ns": 24447,
+            "p999_ns": 65791,
+            "p99_ns": 30527,
+            "scheduled": 150000
+          },
+          "run_block": 2
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.299094546,
+            "max_ns": 1135615,
+            "p50_ns": 24639,
+            "p999_ns": 64767,
+            "p99_ns": 30719,
+            "scheduled": 150000
+          },
+          "run_block": 3
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.214801417,
+            "max_ns": 8388607,
+            "p50_ns": 24255,
+            "p999_ns": 61375,
+            "p99_ns": 29055,
+            "scheduled": 150000
+          },
+          "run_block": 4
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.210167557,
+            "max_ns": 3557375,
+            "p50_ns": 24191,
+            "p999_ns": 62079,
+            "p99_ns": 28863,
+            "scheduled": 150000
+          },
+          "run_block": 5
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.160509592,
+            "max_ns": 254463,
+            "p50_ns": 23999,
+            "p999_ns": 62015,
+            "p99_ns": 28479,
+            "scheduled": 150000
+          },
+          "run_block": 6
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.188501532,
+            "max_ns": 111295,
+            "p50_ns": 24191,
+            "p999_ns": 61759,
+            "p99_ns": 28607,
+            "scheduled": 150000
+          },
+          "run_block": 7
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.145609607,
+            "max_ns": 83775,
+            "p50_ns": 23871,
+            "p999_ns": 60991,
+            "p99_ns": 28607,
+            "scheduled": 150000
+          },
+          "run_block": 8
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.186309144,
+            "max_ns": 79615,
+            "p50_ns": 24191,
+            "p999_ns": 62207,
+            "p99_ns": 28863,
+            "scheduled": 150000
+          },
+          "run_block": 9
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 150000,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "elapsed_secs": 4.151036742,
+            "max_ns": 92671,
+            "p50_ns": 23935,
+            "p999_ns": 61119,
+            "p99_ns": 28607,
+            "scheduled": 150000
+          },
+          "run_block": 10
+        }
+      ],
+      "class": "same-l3",
+      "merged": {
+        "max_ns": 8388607,
+        "p50_ns": 24191,
+        "p999_ns": 62527,
+        "p99_ns": 29119,
+        "samples": 1500000
+      },
+      "pair": [
+        0,
+        1
+      ]
+    },
+    "tcp-throughput@same-l3-0,1": {
+      "attempts": 10,
+      "blocks": [
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1008117,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6955990.253650283,
+            "measured_secs": 10.000024506,
+            "offered": 1008117,
+            "successful": 1008117,
+            "successful_per_sec": 100811.4529514534,
+            "terminal": 1008117
+          },
+          "run_block": 1
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1020806,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 7043559.8525299,
+            "measured_secs": 10.000002197,
+            "offered": 1020806,
+            "successful": 1020806,
+            "successful_per_sec": 102080.5775728971,
+            "terminal": 1020806
+          },
+          "run_block": 2
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1003005,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6920680.500698325,
+            "measured_secs": 10.000078026,
+            "offered": 1003005,
+            "successful": 1003005,
+            "successful_per_sec": 100299.717401425,
+            "terminal": 1003005
+          },
+          "run_block": 3
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1011237,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6977531.473521739,
+            "measured_secs": 10.000005484,
+            "offered": 1011237,
+            "successful": 1011237,
+            "successful_per_sec": 101123.64454379331,
+            "terminal": 1011237
+          },
+          "run_block": 4
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1009730,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6967083.171618708,
+            "measured_secs": 10.000077261,
+            "offered": 1009730,
+            "successful": 1009730,
+            "successful_per_sec": 100972.219878532,
+            "terminal": 1009730
+          },
+          "run_block": 5
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 998390,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6888842.554903617,
+            "measured_secs": 10.000070324,
+            "offered": 998390,
+            "successful": 998390,
+            "successful_per_sec": 99838.29789715388,
+            "terminal": 998390
+          },
+          "run_block": 6
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1003453,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6923824.869141016,
+            "measured_secs": 10.0000012,
+            "offered": 1003453,
+            "successful": 1003453,
+            "successful_per_sec": 100345.28795856544,
+            "terminal": 1003453
+          },
+          "run_block": 7
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1001140,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6907820.498186379,
+            "measured_secs": 10.00006587,
+            "offered": 1001140,
+            "successful": 1001140,
+            "successful_per_sec": 100113.34055342578,
+            "terminal": 1001140
+          },
+          "run_block": 8
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1006655,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6945915.945080219,
+            "measured_secs": 10.000005118,
+            "offered": 1006655,
+            "successful": 1006655,
+            "successful_per_sec": 100665.44847942346,
+            "terminal": 1006655
+          },
+          "run_block": 9
+        },
+        {
+          "outcomes": {
+            "body_mismatch": 0,
+            "histogram_overflow": 0,
+            "missed_slot": 0,
+            "peer_closed": 0,
+            "protocol_error": 0,
+            "success": 1008003,
+            "unexpected_frame": 0,
+            "unresolved_at_drain": 0,
+            "write_failure": 0
+          },
+          "results": {
+            "depth": 32,
+            "goodput_bytes_per_sec": 6955212.931722676,
+            "measured_secs": 10.000011169,
+            "offered": 1008003,
+            "successful": 1008003,
+            "successful_per_sec": 100800.18741627068,
+            "terminal": 1008003
+          },
+          "run_block": 10
+        }
+      ],
+      "class": "same-l3",
+      "pair": [
+        0,
+        1
+      ]
+    }
+  },
+  "attempts": [
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b01",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b02",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b03",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b04",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b05",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b06",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b07",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b08",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b09",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-cross-numa-b10",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b01",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b02",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b03",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b04",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b05",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b06",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b07",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b08",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b09",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "atomic-floor",
+      "attempt": "atomic-floor-same-l3-b10",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b01-r20000",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b01-r50000",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b01-r80000",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b02-r20000",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b02-r50000",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b02-r80000",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b03-r20000",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b03-r50000",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b03-r80000",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b04-r20000",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b04-r50000",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b04-r80000",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b05-r20000",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b05-r50000",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b05-r80000",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b06-r20000",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b06-r50000",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b06-r80000",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b07-r20000",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b07-r50000",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b07-r80000",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b08-r20000",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b08-r50000",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b08-r80000",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b09-r20000",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b09-r50000",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b09-r80000",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b10-r20000",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b10-r50000",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-open",
+      "attempt": "tcp-open-same-l3-b10-r80000",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b01",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b02",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b03",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b04",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b05",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b06",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b07",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b08",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b09",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-cross-numa-b10",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": "the allowed CPU set does not span two CPU-bearing NUMA nodes with distinct physical cores",
+      "state": "skipped"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b01",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b02",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b03",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b04",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b05",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b06",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b07",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b08",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b09",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-serial",
+      "attempt": "tcp-serial-same-l3-b10",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b01",
+      "fail_reason": null,
+      "run_block": 1,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b02",
+      "fail_reason": null,
+      "run_block": 2,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b03",
+      "fail_reason": null,
+      "run_block": 3,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b04",
+      "fail_reason": null,
+      "run_block": 4,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b05",
+      "fail_reason": null,
+      "run_block": 5,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b06",
+      "fail_reason": null,
+      "run_block": 6,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b07",
+      "fail_reason": null,
+      "run_block": 7,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b08",
+      "fail_reason": null,
+      "run_block": 8,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b09",
+      "fail_reason": null,
+      "run_block": 9,
+      "skip_reason": null,
+      "state": "complete"
+    },
+    {
+      "arm": "tcp-throughput",
+      "attempt": "tcp-throughput-same-l3-b10",
+      "fail_reason": null,
+      "run_block": 10,
+      "skip_reason": null,
+      "state": "complete"
+    }
+  ],
+  "gap_stats": {
+    "blocks": 10,
+    "gap_ns_bootstrap_95": [
+      23789.07815,
+      24109.532424999998
+    ],
+    "max_gap_ns": 24456.0651,
+    "max_ratio": 164.02615509603257,
+    "median_gap_ns": 23962.9897,
+    "median_ratio": 110.40205105101091,
+    "min_gap_ns": 23652.1562,
+    "min_ratio": 89.37073306791602,
+    "ratio_bootstrap_95": [
+      93.25807358634698,
+      134.68725759819478
+    ]
+  },
+  "gaps": [
+    {
+      "atomic_rtt_ns": 251.47825,
+      "gap_ns": 23939.52175,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 96.19519779543559,
+      "run_block": 1,
+      "tcp_p50_ns": 24191.0
+    },
+    {
+      "atomic_rtt_ns": 218.8115,
+      "gap_ns": 24228.1885,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 111.72630323360518,
+      "run_block": 2,
+      "tcp_p50_ns": 24447.0
+    },
+    {
+      "atomic_rtt_ns": 182.9349,
+      "gap_ns": 24456.0651,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 134.68725759819478,
+      "run_block": 3,
+      "tcp_p50_ns": 24639.0
+    },
+    {
+      "atomic_rtt_ns": 268.54235,
+      "gap_ns": 23986.45765,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 90.32094937725837,
+      "run_block": 4,
+      "tcp_p50_ns": 24255.0
+    },
+    {
+      "atomic_rtt_ns": 165.54545000000002,
+      "gap_ns": 24025.45455,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 146.12905398487243,
+      "run_block": 5,
+      "tcp_p50_ns": 24191.0
+    },
+    {
+      "atomic_rtt_ns": 268.5331,
+      "gap_ns": 23730.4669,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 89.37073306791602,
+      "run_block": 6,
+      "tcp_p50_ns": 23999.0
+    },
+    {
+      "atomic_rtt_ns": 200.12365,
+      "gap_ns": 23990.87635,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 120.88026577568418,
+      "run_block": 7,
+      "tcp_p50_ns": 24191.0
+    },
+    {
+      "atomic_rtt_ns": 218.8438,
+      "gap_ns": 23652.1562,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 109.07779886841666,
+      "run_block": 8,
+      "tcp_p50_ns": 23871.0
+    },
+    {
+      "atomic_rtt_ns": 251.5578,
+      "gap_ns": 23939.4422,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 96.16477803510764,
+      "run_block": 9,
+      "tcp_p50_ns": 24191.0
+    },
+    {
+      "atomic_rtt_ns": 145.92185,
+      "gap_ns": 23789.07815,
+      "pair": [
+        0,
+        1
+      ],
+      "ratio": 164.02615509603257,
+      "run_block": 10,
+      "tcp_p50_ns": 23935.0
+    }
+  ],
+  "schema": 1
+}

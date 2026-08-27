@@ -12150,7 +12150,7 @@ async fn settle_prepared(ctx: &RequestCtx, outcome: PreparedOutcome) -> RequestO
             body,
             binary: false,
         },
-        PreparedSettlement::Error { code, message } => RequestOutcome::Error { code, message },
+        PreparedSettlement::Error { code, message } => RequestOutcome::error(code, message),
         PreparedSettlement::Streamed => RequestOutcome::Streamed,
     }
 }

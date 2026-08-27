@@ -190,13 +190,14 @@ function sendErrorBody(
     code: string,
     channel = 0,
     epoch = 0,
+    extra: Record<string, unknown> = {},
 ): Promise<void> {
     return conn.send({
         ty: PeerFrameType.Error,
         channel,
         epoch,
         corr,
-        body: jsonBody({ code, message: `error ${code}` }),
+        body: jsonBody({ code, message: `error ${code}`, ...extra }),
     });
 }
 
@@ -374,6 +375,34 @@ describe("McHostClient facade", () => {
         const requestFrame = await cursor.next(isRoutedRequest(7));
         await sendErrorBody(conn, requestFrame.corr, "store_unavailable", 7, 77);
         expectCallError(await rejection(requestPromise), "terminal", "store_unavailable");
+    });
+
+    test("error response metadata is additive and retry_after_ms is surfaced when present", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+
+        const oldBodyPromise = client.routeOpen(TOOL_TARGET, IDENTITY);
+        const oldBodyFrame = await cursor.next(isRouteOpen);
+        await sendErrorBody(conn, oldBodyFrame.corr, "unknown_module");
+        const oldBodyError = expectCallError(
+            await rejection(oldBodyPromise),
+            "terminal",
+            "unknown_module",
+        );
+        expect(oldBodyError.retry_after_ms).toBeUndefined();
+
+        const extendedBodyPromise = client.routeOpen(TOOL_TARGET, IDENTITY);
+        const extendedBodyFrame = await cursor.next(isRouteOpen);
+        await sendErrorBody(conn, extendedBodyFrame.corr, "server_busy", 0, 0, {
+            retry_after_ms: 73,
+            future_metadata: true,
+        });
+        const extendedBodyError = expectCallError(
+            await rejection(extendedBodyPromise),
+            "terminal",
+            "server_busy",
+        );
+        expect(extendedBodyError.retry_after_ms).toBe(73);
     });
 
     test("artifact_invalid bind rejection is permanent: one route.open, no retry", async () => {
