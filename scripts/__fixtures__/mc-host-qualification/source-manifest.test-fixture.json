@@ -103,14 +103,24 @@
     "host": {
       "target": "linux-x64-gnu",
       "kernel": "4.18",
-      "glibc": "2.28"
+      "glibc": "2.28",
+      "procfs_self_fd_exec": true
     },
     "expected_vectors": 8,
     "tolerance": 0.01,
     "network_access": "none",
     "result": "pass",
     "vectors_compared": 8,
-    "observed_max_error": 0.004
+    "observed_max_error": 0.004,
+    "bound_inputs": {
+      "config": "4fd2d898799ffd2fb86d6876bbc61fee51f15f9084371b6855a7c33baa3f7afe",
+      "corpus": "9e0acccc7df8aa48992d86aa72b07014b86e74e2dd563ca8873788e92fc9d4cc",
+      "model_onnx": "7b76162eb214679b69ada2511b7bcbc4a3a10e5a4f6975b63151d9e70228fbb9",
+      "ort_runtime": "7163d84f017b03efe91688c775f817bc86598f094361cab70066a5f601f3f262",
+      "special_tokens_map": "edb50ff6967f699266556dd0ad34fcc8223862dbfc2c1fc89605886694b47be8",
+      "tokenizer": "ce626902caf146eae1f94b18c3ac4e6afdb3de53543c964a70ec47931567f485",
+      "tokenizer_config": "ab5bb3f9cf48aaa106425b71ae7669ac7e11fbdf7171a603d8ff6a002c7b15c9"
+    }
   },
   "harnesses": {
     "opencode": {

@@ -8,6 +8,7 @@ import {
     symlinkSync,
     writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -103,6 +104,24 @@ function installManifest(root: string, manifest: any): void {
 const STAGED_PRODUCTION_INPUT_DIR = "opt/mc-host-inputs";
 
 /**
+ * Rebind the oracle transcript to whatever digests the inputs now carry.
+ *
+ * Any helper that restages bytes has to do this, which is the binding working as
+ * intended: a transcript naming digests the lock no longer holds is exactly the
+ * stale-oracle case the check exists to reject.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
+function rebindOracle(manifest: any): void {
+    if (manifest.oracle === null || manifest.oracle === undefined) return;
+    manifest.oracle.bound_inputs = Object.fromEntries(
+        Object.entries(manifest.inputs).map(([key, artifact]) => [
+            key,
+            (artifact as { sha256?: string }).sha256,
+        ]),
+    );
+}
+
+/**
  * Point every source at a resolvable host. The committed fixtures name RFC 2606
  * `.invalid` hosts, which production mode rejects because they can never serve an
  * artifact, so a production-mode test aimed at any other rule has to clear that one
@@ -137,6 +156,7 @@ function unblacklistDigests(manifest: any): void {
             .update(`path-rule probe ${n++}`)
             .digest("hex");
     }
+    rebindOracle(manifest);
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
@@ -175,6 +195,7 @@ function installProductionManifest(
         );
     }
     mutate?.(manifest);
+    rebindOracle(manifest);
     installManifest(root, manifest);
 }
 
@@ -988,7 +1009,7 @@ describe("oracle evidence hook", () => {
         lowManifest.oracle.host.kernel = "2.6.32-696.el6.x86_64";
         installManifest(low, lowManifest);
         expect(() => generate(low, { check: false })).toThrow(
-            /host must meet the exact minimum Linux floor/,
+            /does not satisfy the certified linux-x64-gnu lane/,
         );
     });
 
@@ -1006,7 +1027,7 @@ describe("oracle evidence hook", () => {
             manifest.oracle.host[field] = value;
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).toThrow(
-                /host must meet the exact minimum Linux floor/,
+                /does not satisfy the certified linux-x64-gnu lane/,
             );
         }
     });
@@ -1025,7 +1046,7 @@ describe("oracle evidence hook", () => {
             manifest.oracle.host[field] = value;
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).toThrow(
-                /host must meet the exact minimum Linux floor/,
+                /does not satisfy the certified linux-x64-gnu lane/,
             );
         }
 
@@ -1043,6 +1064,50 @@ describe("oracle evidence hook", () => {
             manifest.oracle.host[field] = value;
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).not.toThrow();
+        }
+    });
+
+    test("an oracle transcript cannot outlive the bytes it names", () => {
+        // The scenario the binding exists for: artifacts are requalified with new
+        // digests and the oracle object is retained. A recorded pass then covers
+        // bytes that are no longer in the lock.
+        const root = freshRoot();
+        installProductionManifest(root, (manifest) => {
+            manifest.inputs.model_onnx.sha256 = createHash("sha256")
+                .update("requalified model bytes")
+                .digest("hex");
+        });
+        // `installProductionManifest` rebinds, so undo that to model the stale case.
+        const manifestPath = join(root, SOURCE_MANIFEST_PATH);
+        const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+        manifest.oracle.bound_inputs.model_onnx = createHash("sha256")
+            .update("bytes from a previous qualification")
+            .digest("hex");
+        writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+        expect(() => generate(root, { check: false })).toThrow(
+            /bound_inputs\.model_onnx names bytes that are not the qualified ones/,
+        );
+    });
+
+    test("an oracle host without procfs fd exec cannot qualify", () => {
+        // The certified Linux lane executes the sealed ORT object through
+        // /proc/self/fd. An oracle that loaded it some other way did not exercise
+        // the production path, so its evidence cannot stand in for one that did.
+        for (const value of [false, undefined]) {
+            const root = freshRoot();
+            const manifest = fixtureManifest();
+            if (value === undefined) {
+                delete manifest.oracle.host.procfs_self_fd_exec;
+            } else {
+                manifest.oracle.host.procfs_self_fd_exec = value;
+            }
+            installManifest(root, manifest);
+            expect(() => generate(root, { check: false })).toThrow(
+                value === undefined
+                    ? /oracle\.host: missing key procfs_self_fd_exec/
+                    : /does not satisfy the certified linux-x64-gnu lane/,
+            );
         }
     });
 
@@ -1093,6 +1158,9 @@ describe("oracle evidence hook", () => {
 
     test("mismatched oracle evidence is rejected", () => {
         const contract = buildContract();
+        // The oracle binds itself to the artifact digests, so the check needs the
+        // input table it is being validated against.
+        const inputs = fixtureManifest().inputs;
         const base = fixtureManifest().oracle;
         const cases: [(o: typeof base) => void, RegExp][] = [
             [
@@ -1135,7 +1203,7 @@ describe("oracle evidence hook", () => {
                 (o) => {
                     o.host.kernel = "4.17";
                 },
-                /minimum Linux floor/,
+                /does not satisfy the certified linux-x64-gnu lane/,
             ],
             [
                 (o) => {
@@ -1147,9 +1215,11 @@ describe("oracle evidence hook", () => {
         for (const [mutate, error] of cases) {
             const oracle = JSON.parse(JSON.stringify(base));
             mutate(oracle);
-            expect(() => checkOracleEvidence(oracle, contract)).toThrow(error);
+            expect(() => checkOracleEvidence(oracle, contract, inputs)).toThrow(
+                error,
+            );
         }
-        expect(() => checkOracleEvidence(base, contract)).not.toThrow();
+        expect(() => checkOracleEvidence(base, contract, inputs)).not.toThrow();
     });
 });
 
@@ -1844,5 +1914,33 @@ describe("verify-path resolution", () => {
         expect(() =>
             generate(root, { check: true, verifyBytes: true }),
         ).toThrow(/verify bytes missing/);
+    });
+});
+
+describe("release prerequisite (CLI)", () => {
+    test("the consumption gate is reachable outside the tests", () => {
+        // `--check` reports drift and exits 0 over unqualified inputs on purpose, so
+        // without a separate entry point nothing in the repo would reject an
+        // unqualified release. `--require-qualified` is that entry point: it runs the
+        // same gate a production build runs, ready for a release job to invoke.
+        const script = join(
+            repoRoot,
+            "scripts/qualify-mc-host-production-inputs.ts",
+        );
+        const required = spawnSync("bun", [script, "--require-qualified"], {
+            cwd: repoRoot,
+            encoding: "utf8",
+        });
+        expect(required.status).toBe(1);
+        expect(required.stderr).toContain("not production-qualified");
+
+        // The drift check over the same tree stays green, which is what keeps CI
+        // usable while the real production bytes are still unqualified.
+        const drift = spawnSync("bun", [script, "--check"], {
+            cwd: repoRoot,
+            encoding: "utf8",
+        });
+        expect(drift.status).toBe(0);
+        expect(drift.stdout).toContain("production_qualified false");
     });
 });

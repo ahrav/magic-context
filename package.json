@@ -32,6 +32,7 @@
     "release:contract:check": "bun scripts/generate-mc-host-release-manifest.ts --check",
     "release:qualify": "bun scripts/qualify-mc-host-production-inputs.ts",
     "release:qualify:check": "bun scripts/qualify-mc-host-production-inputs.ts --check",
+    "release:qualify:require": "bun scripts/qualify-mc-host-production-inputs.ts --require-qualified",
     "test:release": "bun test scripts/generate-mc-host-release-manifest.test.ts scripts/qualify-mc-host-production-inputs.test.ts",
     "check:all": "bun run test && bun run test:release && bun run test:rust && bun run release:contract:check && bun run release:qualify:check && cargo clippy --workspace --all-targets -- -D warnings",
     "build:dists": "bun run --cwd packages/plugin build && bun run --cwd packages/pi-plugin build"

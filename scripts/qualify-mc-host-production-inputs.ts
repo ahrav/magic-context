@@ -47,9 +47,9 @@ import { fileURLToPath } from "node:url";
 import {
     buildContract,
     canonicalJson,
+    evaluatePlatform,
     exactKeysAsserter,
     generate as generateReleaseOutputs,
-    meetsDottedFloor,
     type ReleaseContract,
     sha256Hex,
     validateContractSchema,
@@ -1148,7 +1148,14 @@ export interface OracleEvidence {
     model_fingerprint: string;
     table_epoch: number;
     execution_provider: string;
-    host: { target: string; kernel: string; glibc: string };
+    host: {
+        target: string;
+        kernel: string;
+        glibc: string;
+        /** The certified Linux lane executes the sealed ORT object through
+         *  `/proc/self/fd`; an oracle on a host that cannot must not qualify it. */
+        procfs_self_fd_exec: boolean;
+    };
     expected_vectors: number;
     tolerance: number;
     network_access: string;
@@ -1158,6 +1165,18 @@ export interface OracleEvidence {
     vectors_compared: number;
     /** Worst per-vector deviation observed; must be within `tolerance`. */
     observed_max_error: number;
+    /**
+     * The artifact digests the oracle ran against, one per qualified input.
+     *
+     * This is the oracle declaring its own inputs, cross-checked against the
+     * qualified set — not a recomputation of the Synapse fingerprint, which is a
+     * composite over model, tokenizer, config, corpus, table epoch, and embedding
+     * parameters and would have to be derived the way the Rust side derives it.
+     * What it does establish is that a transcript cannot outlive the bytes it
+     * describes: requalifying an artifact changes its digest, and a retained
+     * oracle then names bytes that are no longer in the lock.
+     */
+    bound_inputs: Record<string, string>;
 }
 
 export interface SourceManifest {
@@ -1393,6 +1412,7 @@ function validateQualifiedArtifact(
 export function checkOracleEvidence(
     oracle: OracleEvidence,
     contract: ReleaseContract,
+    inputs: Record<(typeof INPUT_KEYS)[number], ArtifactSource>,
 ): void {
     assertExactKeys(
         oracle,
@@ -1407,6 +1427,7 @@ export function checkOracleEvidence(
             "result",
             "vectors_compared",
             "observed_max_error",
+            "bound_inputs",
         ],
         "oracle",
     );
@@ -1425,32 +1446,36 @@ export function checkOracleEvidence(
             `oracle: execution provider must be ${contract.model_lane.execution_provider}`,
         );
     }
-    const linux = contract.platforms.supported.find(
-        (p) => p.target === "linux-x64-gnu",
-    );
-    if (linux === undefined || !("kernel_min" in linux))
-        fail("oracle: U8 contract lacks the linux floor");
     // Nested exactness matters here: an unknown or mis-cased key (`Kernel`)
-    // would otherwise read as absent and be reported as a version failure
+    // would otherwise read as absent and be reported as a capability failure
     // rather than as the typo it is.
     assertExactKeys(
         oracle.host,
-        ["target", "kernel", "glibc"],
+        ["target", "kernel", "glibc", "procfs_self_fd_exec"],
         "oracle.host",
     );
     if (oracle.host?.target !== "linux-x64-gnu") {
         fail("oracle: the offline oracle must run on the linux-x64-gnu lane");
     }
-    // One predicate for both gates: `meetsDottedFloor` carries the precision and
-    // prerelease rules on top of `compareDotted`, so the U8 platform gate and this
-    // oracle-host check cannot disagree about whether a host clears a floor. That
-    // divergence is the failure this sharing exists to prevent, and it happened
-    // once already when only the comparator was shared.
-    if (
-        !meetsDottedFloor(oracle.host.kernel, linux.kernel_min) ||
-        !meetsDottedFloor(oracle.host.glibc, linux.glibc_min)
-    ) {
-        fail("oracle: host must meet the exact minimum Linux floor");
+    // Run the recorded host through the U8 platform gate itself rather than
+    // re-deriving its floors here. Sharing a predicate made the two agree; running
+    // the same function makes them identical by construction, which is what the
+    // last divergence between them argued for. It also brings the capability
+    // requirements along: the certified Linux lane demands `procfs_self_fd_exec`,
+    // so an oracle that loaded the sealed ORT object by some other path cannot
+    // qualify evidence for a host that never exercised the production path.
+    const platform = evaluatePlatform(contract, {
+        os: "linux",
+        arch: "x64",
+        libc: "gnu",
+        kernel: oracle.host.kernel,
+        glibc: oracle.host.glibc,
+        procfsSelfFdExec: oracle.host.procfs_self_fd_exec,
+    });
+    if (!platform.supported || platform.target !== "linux-x64-gnu") {
+        fail(
+            "oracle: recorded host does not satisfy the certified linux-x64-gnu lane",
+        );
     }
     if (
         !Number.isSafeInteger(oracle.expected_vectors) ||
@@ -1496,6 +1521,34 @@ export function checkOracleEvidence(
         fail(
             `oracle: observed_max_error must be a finite value in [0, ${oracle.tolerance}]`,
         );
+    }
+    // A recorded pass says the comparison succeeded; it does not say over which
+    // bytes. Without that binding, evidence from another embedding space — or an
+    // oracle retained across a requalification that changed the artifacts — still
+    // reads as a pass for the current bundle.
+    assertExactKeys(oracle.bound_inputs, [...INPUT_KEYS], "oracle.bound_inputs");
+    for (const key of INPUT_KEYS) {
+        const bound = oracle.bound_inputs[key];
+        if (typeof bound !== "string" || !SHA256_RE.test(bound)) {
+            fail(
+                `oracle.bound_inputs.${key} must be 64 lowercase hex naming the bytes the oracle ran against`,
+            );
+        }
+        const artifact = inputs[key];
+        if (!artifact.qualified) {
+            // An unqualified input already lands in `unqualified[]` and forces
+            // `production_qualified: false`, so no release can consume this state.
+            // Failing here instead would make it unrepresentable, and release
+            // engineering has to be able to record inputs and the oracle
+            // incrementally — the tool's contract is that gaps propagate to the
+            // verdict rather than aborting the run.
+            continue;
+        }
+        if (artifact.sha256 !== bound) {
+            fail(
+                `oracle: bound_inputs.${key} names bytes that are not the qualified ones (oracle ${bound}, lock ${artifact.sha256})`,
+            );
+        }
     }
 }
 
@@ -1543,7 +1596,7 @@ export function validateSourceManifest(
             fail(`inputs.${key}: qualified must be true or false`);
         }
     }
-    if (m.oracle !== null) checkOracleEvidence(m.oracle, contract);
+    if (m.oracle !== null) checkOracleEvidence(m.oracle, contract, m.inputs);
     assertExactKeys(m.harnesses, ["opencode", "pi"], "harnesses");
     const expectPackage = {
         opencode: CREDENTIALS_DOC.harnesses.opencode.package,
@@ -1944,9 +1997,14 @@ function assertPinnedCrateFeatures(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} must set default-features = false`,
         );
     }
-    const declared = /features\s*=\s*\[([^\]]*)\]/.exec(entry);
-    // `default-features` ends in the same word, so require a boundary before it.
-    if (/(?:^|[\s,{])features\s*=/.test(entry) && declared === null) {
+    // One anchored pattern for both the presence test and the extraction. A
+    // boundary is required because `features` is a suffix of other keys —
+    // `default-features` legitimately, `fakefeatures` as a decoy whose array an
+    // unanchored extraction would read instead of the real one. Using two patterns
+    // is what let presence be anchored while extraction was not.
+    const FEATURES_KEY = /(?:^|[\s,{])features\s*=/;
+    const declared = /(?:^|[\s,{])features\s*=\s*\[([^\]]*)\]/.exec(entry);
+    if (FEATURES_KEY.test(entry) && declared === null) {
         fail(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} declares a features list this qualifier cannot read`,
         );
@@ -2651,14 +2709,40 @@ function main(): void {
     const args = process.argv.slice(2);
     const check = args.includes("--check");
     const verifyBytes = args.includes("--verify-bytes");
+    const requireQualified = args.includes("--require-qualified");
     const unknown = args.filter(
-        (arg) => arg !== "--check" && arg !== "--verify-bytes",
+        (arg) =>
+            arg !== "--check" &&
+            arg !== "--verify-bytes" &&
+            arg !== "--require-qualified",
     );
     if (unknown.length > 0) {
         console.error(`unknown arguments: ${unknown.join(" ")}`);
         process.exit(2);
     }
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+    // `--check` reports drift and prints the verdict; it exits 0 over unqualified
+    // inputs on purpose, because the committed manifest is deliberately unqualified
+    // until release engineering records the real bytes, and CI has to stay green in
+    // that state. `--require-qualified` is the release prerequisite: it runs the
+    // same consumption gate a production build runs, so the gate is reachable
+    // outside the tests and a release cannot proceed on an unqualified verdict.
+    if (requireQualified) {
+        try {
+            const accepted = requireQualificationEvidence(rootDir, {
+                verifyBytes: verifyBytes ? true : undefined,
+            });
+            console.log(
+                "mc-host production inputs are qualified " +
+                    `(U8 sha256 ${accepted.u8Digest}, lock sha256 ${accepted.lockSha256}, ` +
+                    `credentials sha256 ${accepted.credentialsSha256})`,
+            );
+        } catch (error) {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exit(1);
+        }
+        return;
+    }
     let result: QualifyResult;
     try {
         result = generate(rootDir, {
