@@ -145,6 +145,7 @@ export class MockProvider {
     private capturedEmbeddings: CapturedEmbeddingRequest[] = [];
     private defaultResponse: MockResponse | null = null;
     private matchers: RequestMatcher[] = [];
+    private defaultHitCount = 0;
 
     async start(
         options: MockServerOptions = {},
@@ -223,6 +224,16 @@ export class MockProvider {
         this.captured = [];
         this.defaultResponse = null;
         this.matchers = [];
+        this.defaultHitCount = 0;
+    }
+
+    /**
+     * How many `/messages` requests fell through matchers and the queue to the
+     * default response. Runners set a poison default and treat any hit as
+     * script drift.
+     */
+    defaultHits(): number {
+        return this.defaultHitCount;
     }
 
     private async handle(req: Request): Promise<Response> {
@@ -353,10 +364,11 @@ export class MockProvider {
                     break;
                 }
             }
-            const scripted =
-                matcherResponse ??
-                this.responses.shift() ??
-                this.defaultResponse;
+            const fromQueue = matcherResponse === null ? this.responses.shift() : undefined;
+            const scripted = matcherResponse ?? fromQueue ?? this.defaultResponse;
+            if (matcherResponse === null && fromQueue === undefined && this.defaultResponse !== null) {
+                this.defaultHitCount += 1;
+            }
             if (!scripted) {
                 return new Response(
                     JSON.stringify({
