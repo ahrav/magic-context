@@ -658,6 +658,22 @@ describe("immutable input fail-closed rules", () => {
             /does not match the resolved bun\.lock pin \(0\.80\.2\)/,
         );
 
+        // A hoisted entry is only the workspace's resolution if the workspace
+        // still depends on the package. Otherwise the lock would record a version
+        // nothing in the released workspace binds to.
+        const undeclared = freshRoot();
+        const undeclaredLock = join(undeclared, "bun.lock");
+        writeFileSync(
+            undeclaredLock,
+            readFileSync(undeclaredLock, "utf8")
+                .replace(`        "${pkg}": "^0.80.2",\n`, "")
+                .replace(`        "${pkg}": "^0.80.2",\n`, ""),
+        );
+        installManifest(undeclared, fixtureManifest());
+        expect(() => generate(undeclared, { check: false })).toThrow(
+            /bun\.lock does not resolve/,
+        );
+
         // An unreadable or unresolved lockfile fails closed rather than passing.
         const unreadable = freshRoot();
         writeFileSync(join(unreadable, "bun.lock"), "{not json\n");
@@ -782,6 +798,17 @@ describe("immutable input fail-closed rules", () => {
                 (cargo) =>
                     `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\nort={ version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
+            ],
+            [
+                // A quoted key can carry escapes: Cargo reads `"o\u0072t"` as
+                // `ort` and unifies its features. A scan that cannot decode the
+                // spelling must refuse the file, not treat it as a different key
+                // and validate only the safe base entry.
+                (cargo) =>
+                    `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\n"o\\u0072t" = { version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
+                // Crate-agnostic: an unreadable dependency table means no crate's
+                // closure can be checked, so whichever is validated first reports.
+                /must be declared exactly once/,
             ],
         ];
         for (const [mutate, error] of cases) {

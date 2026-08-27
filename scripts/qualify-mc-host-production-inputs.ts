@@ -1669,26 +1669,87 @@ function stripTomlComments(line: string): string {
  * false qualification. Brace and bracket counting suffices because Cargo
  * dependency values are versions, paths, and URLs, none of which contain them.
  */
+/**
+ * Resolve a TOML key as written to the name Cargo will see, or `null` when this
+ * scan cannot say.
+ *
+ * `null` is a refusal, not an absence. A quoted key is a basic string and may
+ * carry escapes — `"o\u0072t"` is `ort` to Cargo — so a scan that treats any
+ * spelling it does not understand as "some other key" would skip the declaration
+ * entirely, which is how a target-specific entry with an accelerator feature could
+ * go unexamined while the base entry validated cleanly. Callers must treat `null`
+ * as an unreadable dependency table.
+ */
+function tomlKeyName(raw: string): string | null {
+    const key = raw.trim();
+    // Bare keys: letters, digits, underscore, dash.
+    if (/^[A-Za-z0-9_-]+$/.test(key)) return key;
+    // Literal strings take no escapes, so the contents are the name verbatim.
+    const literal = /^'([^']*)'$/.exec(key);
+    if (literal !== null) return literal[1] ?? null;
+    // Basic strings without a backslash need no decoding.
+    const basic = /^"([^"\\]*)"$/.exec(key);
+    if (basic !== null) return basic[1] ?? null;
+    // Anything else — an escaped basic string, a dotted key, a spelling not
+    // covered above — is refused rather than guessed at.
+    return null;
+}
+
+/**
+ * Extract one crate's complete inline dependency entry from the `[dependencies]`
+ * table of `Cargo.toml`, across however many lines its inline table spans, with
+ * comments removed.
+ *
+ * Returns `null` unless the crate is declared exactly once in the whole file and
+ * that declaration is in `[dependencies]`. Section tracking is the load-bearing
+ * part: a bare textual search for `ort = ` would validate a decoy assignment
+ * under an unrelated table such as `[package.metadata.qualification]` and never
+ * reach the real dependency. Requiring uniqueness covers the other direction, so
+ * a second declaration under `[target.'cfg(...)'.dependencies]` cannot contribute
+ * features this check never sees, and an undecodable key in any dependency table
+ * is refused rather than skipped — a declaration this scan cannot read is exactly
+ * the one that must not pass unexamined. `null` also covers the absent, unbalanced,
+ * and `[dependencies.<crate>]` section forms; callers must fail closed on it rather
+ * than read it as "declares nothing".
+ *
+ * This is a scan, not a TOML parser. Every shape it cannot account for fails, so
+ * being wrong costs a false rejection with an actionable message rather than a
+ * false qualification. Brace and bracket counting suffices because Cargo
+ * dependency values are versions, paths, and URLs, none of which contain them.
+ */
 function inlineDependencyEntry(cargo: string, crate: string): string | null {
     const lines = cargo.split("\n").map(stripTomlComments);
-    // TOML allows any whitespace around `=` and permits a quoted key, so anchor on
-    // the key itself rather than one exact spelling. Detection is what makes the
-    // uniqueness rule below mean anything: a target-specific `ort={ ... }` that
-    // this pattern missed would not be counted, and its features would go
-    // unchecked while the base entry validated cleanly.
-    const keyPattern = new RegExp(
-        `^"?${crate.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")}"?\\s*=`,
-    );
     const starts: number[] = [];
     let section = "";
+    let depth = 0;
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
+        const atTopLevel = depth === 0;
+        for (const char of line) {
+            if (char === "{" || char === "[") depth++;
+            else if (char === "}" || char === "]") depth--;
+        }
+        if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
             section = header[1] ?? "";
             continue;
         }
-        if (!keyPattern.test(trimmed)) continue;
+        const assignment = /^(.*?)=/.exec(trimmed);
+        if (assignment === null) continue;
+        // Every table Cargo unifies features from, not just the base one.
+        const isDependencyTable = /(?:^|\.)(?:dev-|build-)?dependencies$/.test(
+            section,
+        );
+        const name = tomlKeyName(assignment[1] ?? "");
+        if (name === null) {
+            // An unreadable key in a dependency table could be this crate. Refusing
+            // the whole file is the only answer that cannot be wrong in the unsafe
+            // direction.
+            if (isDependencyTable) return null;
+            continue;
+        }
+        if (name !== crate) continue;
         // Any declaration outside `[dependencies]` still counts, so a decoy or a
         // target-specific duplicate is reported as ambiguity rather than ignored.
         starts.push(section === "dependencies" ? index : -1);
@@ -1696,7 +1757,7 @@ function inlineDependencyEntry(cargo: string, crate: string): string | null {
     if (starts.length !== 1 || starts[0] === -1) return null;
     const start = starts[0] as number;
     const collected: string[] = [];
-    let depth = 0;
+    depth = 0;
     for (let i = start; i < lines.length; i++) {
         const line = lines[i] ?? "";
         collected.push(line.trim());
@@ -1818,8 +1879,11 @@ function stripJsoncTrailingCommas(text: string): string {
  * version would satisfy it while the workspace resolved to something else.
  *
  * Returns `null` when the lockfile cannot be read, the workspace is not declared,
- * or the package is not resolved, so callers fail closed instead of accepting an
- * unverified version.
+ * the workspace does not itself depend on the package, or the package is not
+ * resolved, so callers fail closed instead of accepting an unverified version.
+ * The declaration check is what makes the hoisted fallback safe: without it, a
+ * workspace that stopped depending on the package at all would still qualify
+ * whatever version some unrelated workspace or transitive dependency left hoisted.
  */
 function resolveLockedVersion(
     lockText: string,
@@ -1828,7 +1892,7 @@ function resolveLockedVersion(
 ): string | null {
     let lock: {
         packages?: Record<string, unknown>;
-        workspaces?: Record<string, { name?: unknown }>;
+        workspaces?: Record<string, Record<string, unknown>>;
     };
     try {
         lock = JSON.parse(stripJsoncTrailingCommas(lockText));
@@ -1837,8 +1901,24 @@ function resolveLockedVersion(
     }
     const packages = lock.packages;
     if (packages === null || typeof packages !== "object") return null;
-    const consumer = lock.workspaces?.[workspace]?.name;
+    const importer = lock.workspaces?.[workspace];
+    if (importer === null || typeof importer !== "object") return null;
+    const consumer = importer.name;
     if (typeof consumer !== "string" || consumer.length === 0) return null;
+    const declared = [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ].some((table) => {
+        const entries = importer[table];
+        return (
+            entries !== null &&
+            typeof entries === "object" &&
+            pkg in (entries as Record<string, unknown>)
+        );
+    });
+    if (!declared) return null;
     const entry = packages[`${consumer}/${pkg}`] ?? packages[pkg];
     // Each value is `[ "<name>@<version>", ... ]`.
     const descriptor = Array.isArray(entry) ? entry[0] : undefined;
