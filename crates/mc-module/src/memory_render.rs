@@ -393,21 +393,73 @@ mod tests {
         ));
     }
 
+    /// Extract the string entries of one `export const <name>` array from the
+    /// TypeScript source. The declaration match requires a non-identifier
+    /// character after the name so a sibling const that shares `name` as a
+    /// prefix (e.g. `CATEGORY_PRIORITY_LEGACY`) cannot silently redirect the
+    /// parse, and exactly one declaration must exist.
+    fn typescript_string_array<'a>(source: &'a str, name: &str) -> Vec<&'a str> {
+        let declaration = format!("export const {name}");
+        let tails = source
+            .match_indices(&declaration)
+            .map(|(index, matched)| &source[index + matched.len()..])
+            .filter(|tail| {
+                !tail
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tails.len(),
+            1,
+            "expected exactly one `export const {name}` declaration"
+        );
+        let body = tails[0]
+            .split("];")
+            .next()
+            .unwrap_or_else(|| panic!("unterminated TypeScript {name} array"));
+        body.lines()
+            .filter_map(|line| line.trim().strip_prefix('"'))
+            .filter_map(|line| line.split('"').next())
+            .collect()
+    }
+
     #[test]
     fn positive_category_vocabulary_matches_typescript() {
         let source =
             include_str!("../../../packages/plugin/src/features/magic-context/memory/constants.ts");
-        let priority = source
-            .split("export const CATEGORY_PRIORITY")
-            .nth(1)
-            .and_then(|tail| tail.split("];").next())
-            .expect("TypeScript CATEGORY_PRIORITY array");
-        let typescript_categories = priority
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix('"'))
-            .filter_map(|line| line.split('"').next())
-            .collect::<Vec<_>>();
 
-        assert_eq!(typescript_categories, POSITIVE_MEMORY_CATEGORIES);
+        assert_eq!(
+            typescript_string_array(source, "CATEGORY_PRIORITY"),
+            POSITIVE_MEMORY_CATEGORIES
+        );
+
+        // CATEGORY_PRIORITY only orders rows; the writable taxonomies decide
+        // which categories can actually reach mirror rows. Anchoring the gate
+        // to them ensures a newly writable positive category fails this test
+        // instead of being silently dropped by the native surfaces.
+        for name in ["V2_MEMORY_CATEGORIES", "PROMOTABLE_CATEGORIES"] {
+            let categories = typescript_string_array(source, name);
+            assert!(!categories.is_empty(), "TypeScript {name} parsed as empty");
+            for category in categories {
+                assert!(
+                    is_positive_memory_category(category),
+                    "TypeScript {name} entry {category} is missing from POSITIVE_MEMORY_CATEGORIES"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_order_is_a_prefix_of_the_positive_vocabulary() {
+        // `claim_render_order` ranks with MEMORY_CATEGORY_ORDER while the
+        // inclusion gate uses POSITIVE_MEMORY_CATEGORIES. Pinning the order
+        // array to the vocabulary's prefix keeps a single-list edit from
+        // desyncing sort order from the inclusion gate.
+        assert_eq!(
+            MEMORY_CATEGORY_ORDER[..],
+            POSITIVE_MEMORY_CATEGORIES[..MEMORY_CATEGORY_ORDER.len()]
+        );
     }
 }
