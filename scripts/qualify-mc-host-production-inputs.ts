@@ -1623,8 +1623,39 @@ const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
 ];
 
 /**
+ * Strip TOML comments from one line, leaving `#` inside a quoted value alone.
+ *
+ * Comments are the one place a `Cargo.toml` can contain text that reads exactly
+ * like a declaration but means nothing: a commented `version = "=2.0.0-rc.13"`
+ * inside a multiline features array would otherwise satisfy a textual check while
+ * Cargo resolves whatever the real key says. Removing them before any comparison
+ * closes that for every check at once, rather than per pattern.
+ *
+ * Basic strings only. TOML literal strings (`'...'`) and multi-line strings do
+ * not appear in Cargo dependency declarations, and treating one as unquoted would
+ * only truncate the entry into a rejection.
+ */
+function stripTomlComments(line: string): string {
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (char === "\\") escaped = true;
+            else if (char === '"') inString = false;
+            continue;
+        }
+        if (char === '"') inString = true;
+        else if (char === "#") return line.slice(0, i);
+    }
+    return line;
+}
+
+/**
  * Extract one crate's complete inline dependency entry from the `[dependencies]`
- * table of `Cargo.toml`, across however many lines its inline table spans.
+ * table of `Cargo.toml`, across however many lines its inline table spans, with
+ * comments removed.
  *
  * Returns `null` unless the crate is declared exactly once in the whole file and
  * that declaration is in `[dependencies]`. Section tracking is the load-bearing
@@ -1636,11 +1667,13 @@ const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
  * `[dependencies.<crate>]` section forms; callers must fail closed on it rather
  * than read it as "declares nothing".
  *
- * Brace and bracket counting is enough here because Cargo dependency values are
- * versions, paths, and URLs, none of which contain them.
+ * This is a scan, not a TOML parser. Every shape it cannot account for fails, so
+ * being wrong costs a false rejection with an actionable message rather than a
+ * false qualification. Brace and bracket counting suffices because Cargo
+ * dependency values are versions, paths, and URLs, none of which contain them.
  */
 function inlineDependencyEntry(cargo: string, crate: string): string | null {
-    const lines = cargo.split("\n");
+    const lines = cargo.split("\n").map(stripTomlComments);
     const starts: number[] = [];
     let section = "";
     for (const [index, line] of lines.entries()) {
@@ -1769,21 +1802,29 @@ function stripJsoncTrailingCommas(text: string): string {
  * Resolve the version `workspace` actually gets for `pkg`, from `bun.lock`'s
  * `packages` table.
  *
- * A nested resolution is keyed by its consumer path, so the workspace-specific
- * entry wins over the hoisted one when both exist. This replaces a substring
- * search for `"<pkg>@<version>"`, which proved only that the version appeared
- * somewhere in the file — a transitive copy at an unrelated version would satisfy
- * it while the workspace resolved to something else entirely.
+ * A nested resolution is keyed by the *consumer's package name*, not its
+ * directory (`@cortexkit/pi-magic-context/<pkg>`, never `packages/pi-plugin/<pkg>`
+ * — no key in the table is a filesystem path), so the workspace's name is read
+ * from `workspaces[workspace].name` and the nested entry is preferred over the
+ * hoisted one when both exist.
  *
- * Returns `null` when the lockfile cannot be read or the package is not resolved,
- * so callers fail closed instead of accepting an unverified version.
+ * This replaces a substring search for `"<pkg>@<version>"`, which proved only that
+ * the version appeared somewhere in the file — a transitive copy at an unrelated
+ * version would satisfy it while the workspace resolved to something else.
+ *
+ * Returns `null` when the lockfile cannot be read, the workspace is not declared,
+ * or the package is not resolved, so callers fail closed instead of accepting an
+ * unverified version.
  */
 function resolveLockedVersion(
     lockText: string,
     workspace: string,
     pkg: string,
 ): string | null {
-    let lock: { packages?: Record<string, unknown> };
+    let lock: {
+        packages?: Record<string, unknown>;
+        workspaces?: Record<string, { name?: unknown }>;
+    };
     try {
         lock = JSON.parse(stripJsoncTrailingCommas(lockText));
     } catch {
@@ -1791,7 +1832,9 @@ function resolveLockedVersion(
     }
     const packages = lock.packages;
     if (packages === null || typeof packages !== "object") return null;
-    const entry = packages[`${workspace}/${pkg}`] ?? packages[pkg];
+    const consumer = lock.workspaces?.[workspace]?.name;
+    if (typeof consumer !== "string" || consumer.length === 0) return null;
+    const entry = packages[`${consumer}/${pkg}`] ?? packages[pkg];
     // Each value is `[ "<name>@<version>", ... ]`.
     const descriptor = Array.isArray(entry) ? entry[0] : undefined;
     if (typeof descriptor !== "string") return null;

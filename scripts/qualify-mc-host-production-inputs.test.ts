@@ -576,20 +576,39 @@ describe("immutable input fail-closed rules", () => {
             /does not match the resolved bun\.lock pin \(0\.80\.2\)/,
         );
 
-        // A workspace-specific resolution outranks the hoisted one.
+        // A nested resolution outranks the hoisted one. Bun keys it by the
+        // consumer's package name, never by its directory.
         const nested = freshRoot();
         const nestedLockPath = join(nested, "bun.lock");
         writeFileSync(
             nestedLockPath,
             readFileSync(nestedLockPath, "utf8").replace(
                 `    "${pkg}": [`,
-                `    "packages/pi-plugin/${pkg}": ["${pkg}@0.81.0", "", {}, "sha512-nested"],\n\n    "${pkg}": [`,
+                `    "@cortexkit/pi-magic-context/${pkg}": ["${pkg}@0.81.0", "", {}, "sha512-nested"],\n\n    "${pkg}": [`,
             ),
         );
         const citesNested = fixtureManifest();
         citesNested.harnesses.pi.version = "0.81.0";
         installManifest(nested, citesNested);
         expect(() => generate(nested, { check: false })).not.toThrow();
+
+        // A directory-keyed entry is not a Bun resolution and must not be read
+        // as one, or the check silently falls back to the hoisted version.
+        const pathKeyed = freshRoot();
+        const pathKeyedLock = join(pathKeyed, "bun.lock");
+        writeFileSync(
+            pathKeyedLock,
+            readFileSync(pathKeyedLock, "utf8").replace(
+                `    "${pkg}": [`,
+                `    "packages/pi-plugin/${pkg}": ["${pkg}@0.81.0", "", {}, "sha512-pathkeyed"],\n\n    "${pkg}": [`,
+            ),
+        );
+        const citesPathKeyed = fixtureManifest();
+        citesPathKeyed.harnesses.pi.version = "0.81.0";
+        installManifest(pathKeyed, citesPathKeyed);
+        expect(() => generate(pathKeyed, { check: false })).toThrow(
+            /does not match the resolved bun\.lock pin \(0\.80\.2\)/,
+        );
 
         // An unreadable or unresolved lockfile fails closed rather than passing.
         const unreadable = freshRoot();
@@ -676,6 +695,36 @@ describe("immutable input fail-closed rules", () => {
                             '[package.metadata.qualification]\nort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }\n\n[dependencies]',
                         ),
                 /ort must be declared exactly once/,
+            ],
+            [
+                // A comment is the one place Cargo.toml can hold text that reads
+                // exactly like a declaration and means nothing. The real pin here
+                // is rc.12; the commented rc.13 must not satisfy the check.
+                (cargo) =>
+                    cargo.replace(
+                        'ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }',
+                        'ort = { version = "=2.0.0-rc.12", default-features = false, features = [\n    # version = "=2.0.0-rc.13"\n    "load-dynamic",\n] }',
+                    ),
+                /pinned ort identity does not match/,
+            ],
+            [
+                // Same shape, faking the default-features opt-out instead.
+                (cargo) =>
+                    cargo.replace(
+                        'ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }',
+                        'ort = { version = "=2.0.0-rc.13", features = [\n    # default-features = false\n    "load-dynamic",\n] }',
+                    ),
+                /ort .* must set default-features = false/,
+            ],
+            [
+                // A `#` inside a quoted value is not a comment, so the entry must
+                // survive intact rather than be truncated into a rejection.
+                (cargo) =>
+                    cargo.replace(
+                        '"load-dynamic", "ndarray", "std"',
+                        '"load-dynamic", "ndarray", "std", "cuda#notacomment"',
+                    ),
+                /ort feature cuda#notacomment .* outside the qualified closure/,
             ],
         ];
         for (const [mutate, error] of cases) {
