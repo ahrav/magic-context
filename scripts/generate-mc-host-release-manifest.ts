@@ -1283,8 +1283,15 @@ export function meetsDottedFloor(probe: unknown, floor: string): boolean {
     const parts = probe.split(".");
     const floorParts = floor.split(".");
     if (parts.length < floorParts.length) return false;
+    // Shape, not just a leading digit. `compareDotted` reads the digit run and
+    // discards the rest, so `999garbage` scores 999 and a component that is digits
+    // welded to letters passes as a version. Require digits, then either nothing or
+    // a separator before whatever follows — which is every real distro spelling
+    // (`0-513`, `28-236`) and none of the malformed ones. Only the components the
+    // floor actually compares are constrained; beyond its precision live `el8` and
+    // `x86_64`, which are not version numbers at all.
     for (let i = 0; i < floorParts.length; i++) {
-        if (!/^\d/.test(parts[i] ?? "")) return false;
+        if (!/^\d+(?:[-+._~].*)?$/.test(parts[i] ?? "")) return false;
     }
     const ordering = compareDotted(probe, floor);
     if (Number.isNaN(ordering) || ordering < 0) return false;

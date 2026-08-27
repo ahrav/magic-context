@@ -1796,6 +1796,48 @@ function stripTomlComments(line: string): string {
     return line;
 }
 
+/**
+ * Normalize a TOML table header to its dotted form, collapsing the whitespace TOML
+ * permits around dots.
+ *
+ * `[target . 'cfg(...)' . dependencies]` is the same table as
+ * `[target.'cfg(...)'.dependencies]`, so a suffix test on the raw text classifies it
+ * as something other than a dependency table and every declaration inside goes
+ * unexamined. Whitespace is collapsed only outside quotes, since a quoted key may
+ * legitimately contain dots and spaces of its own.
+ */
+function normalizeTableHeader(header: string): string {
+    let out = "";
+    let quote: string | null = null;
+    let escaped = false;
+    for (const char of header) {
+        if (quote !== null) {
+            out += char;
+            if (quote === '"') {
+                if (escaped) escaped = false;
+                else if (char === "\\") escaped = true;
+                else if (char === '"') quote = null;
+            } else if (char === "'") {
+                quote = null;
+            }
+            continue;
+        }
+        if (char === '"' || char === "'") {
+            quote = char;
+            out += char;
+            continue;
+        }
+        out += char;
+    }
+    // Collapse only in the unquoted spans, which is what splitting on quotes gives.
+    return out
+        .split(/(\'[^']*\'|"(?:[^"\\]|\\.)*")/)
+        .map((part, index) =>
+            index % 2 === 1 ? part : part.replace(/\s*\.\s*/g, ".").trim(),
+        )
+        .join("");
+}
+
 /** Regex-escape a literal so a version's dots cannot match arbitrary characters. */
 function escapeRegex(literal: string): string {
     return literal.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
@@ -1982,7 +2024,7 @@ function dependencyDeclarations(
         const header = atTopLevel ? /^\[([^\]]+)\]$/.exec(trimmed) : null;
         if (header !== null) {
             if (!closeSubtable()) return null;
-            section = header[1] ?? "";
+            section = normalizeTableHeader(header[1] ?? "");
             const subtable = /^(.*)\.([^.]+)$/.exec(section);
             const parent = subtable?.[1] ?? "";
             if (subtable !== null && dependencyTable.test(parent)) {
@@ -2287,7 +2329,7 @@ function assertNoForbiddenFeatureForwarding(
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
-            section = header[1] ?? "";
+            section = normalizeTableHeader(header[1] ?? "");
             continue;
         }
         if (section !== "features") continue;
@@ -2527,6 +2569,23 @@ export function generate(
     // lock, so verify bytes in write mode and only on explicit request in
     // --check mode.
     const verifyBytes = options.verifyBytes ?? !options.check;
+    if (verifyBytes && manifest.mode === "production") {
+        // Byte verification is the qualifying host's operation, so it is the one
+        // place the pinned harness runtime can be bound to a real interpreter rather
+        // than copied into the lock as an assertion. Deliberately not in `--check`:
+        // that has to stay portable, which is what lets CI guard the committed lock
+        // from any runner.
+        //
+        // Bun only. Node and npm would have to be spawned to be identified, and the
+        // lock pins them as ranges (`24.x`, `11.x`) rather than exact versions, so
+        // there is nothing here to compare them against.
+        const running = process.versions?.bun;
+        if (running !== QUALIFICATION_PINS.harness_runtimes.bun) {
+            fail(
+                `production byte verification must run under the pinned Bun ${QUALIFICATION_PINS.harness_runtimes.bun} (running ${String(running)})`,
+            );
+        }
+    }
     if (verifyBytes) {
         for (const key of INPUT_KEYS) {
             const artifact = manifest.inputs[key];
@@ -2831,6 +2890,11 @@ function main(): void {
     // that state. `--require-qualified` is the release prerequisite: it runs the
     // same consumption gate a production build runs, so the gate is reachable
     // outside the tests and a release cannot proceed on an unqualified verdict.
+    //
+    // The prerequisite pairs with `--verify-bytes` (see `release:qualify:require`),
+    // because it runs where the artifacts are: without it the gate proves the
+    // committed description is canonical while the bytes about to be packaged could
+    // have been replaced, truncated, or removed since qualification.
     if (requireQualified) {
         try {
             const accepted = requireQualificationEvidence(rootDir, {

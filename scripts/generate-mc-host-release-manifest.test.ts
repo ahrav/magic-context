@@ -460,6 +460,9 @@ describe("platform floors", () => {
         // disagreed about the same host; they now share the whole predicate.
         for (const kernel of [
             "999garbage",
+            // Above the floor on its first component, so the ordering check returns
+            // early: the component's shape has to be validated regardless.
+            "999garbage.0",
             "5",
             "4.18-rc1",
             "4.18.0-rc2",

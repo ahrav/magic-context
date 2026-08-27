@@ -23,6 +23,7 @@ import {
     evaluateBrocaRun,
     generate,
     OUTPUT_PATHS,
+    QUALIFICATION_PINS,
     renderArgumentVariant,
     requireQualificationEvidence,
     ROW_CAP_BYTES,
@@ -1047,6 +1048,14 @@ describe("immutable input fail-closed rules", () => {
                 /pinned ort identity does not match/,
             ],
             [
+                // TOML permits whitespace around the dots in a table header, and it
+                // is the same table either way. A raw suffix test classifies it as
+                // something else and everything inside goes unexamined.
+                (cargo) =>
+                    `${cargo}\n[target . 'cfg(target_os = "linux")' . dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
+                /ort must be declared exactly once/,
+            ],
+            [
                 // A bracket inside a quoted value is not structure. Counting it
                 // leaves the depth permanently positive, so every later line is
                 // read as nested content and a target-specific dependency after it
@@ -1986,6 +1995,24 @@ describe("verify-path resolution", () => {
         expect(() => generate(denied, { check: false })).toThrow(
             /fixture\/developer-cache verify path \(tests\/fixtures\)/,
         );
+    });
+
+    test("production byte verification binds the pinned Bun runtime", () => {
+        // The pins are copied into the lock as assertions. Byte verification is the
+        // qualifying host's operation, so it is where one of them can be bound to a
+        // real interpreter — and where `--check` must not, since that has to stay
+        // portable for CI.
+        const root = freshRoot();
+        installProductionManifest(root);
+        generate(root, { check: false });
+        // The suite runs under the pinned Bun, so the bound check passes here; the
+        // point of the test is that the binding exists on this path and not on the
+        // portable one.
+        expect(Bun.version).toBe(QUALIFICATION_PINS.harness_runtimes.bun);
+        expect(() =>
+            generate(root, { check: true, verifyBytes: true }),
+        ).not.toThrow();
+        expect(generate(root, { check: true }).drift).toEqual([]);
     });
 
     test("a missing tiny-fixture manifest fails closed", () => {
