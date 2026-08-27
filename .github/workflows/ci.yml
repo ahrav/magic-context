@@ -343,8 +343,15 @@ jobs:
         with:
           bun-version: latest
 
+      # The release-script suite asserts the mc-host -> mc-module dependency
+      # boundary through `cargo tree`, which needs a resolvable workspace.
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
 
       # Same script `check:all` runs, so a contributor's local pass covers
       # exactly what this gate covers.
