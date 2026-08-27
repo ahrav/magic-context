@@ -1,0 +1,97 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-line-length-conflict",
+  "title": "User's decided line length beats the assistant's guessed value",
+  "families": [
+    "conflicting-evidence"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "What is our formatter line length?",
+        "assistant": "I think it is 100 characters — most of our other repos use 100, so I would guess this one does too."
+      },
+      {
+        "user": "Your guess is wrong here. The decided value is 120 characters; it is already in the formatter config.",
+        "assistant": "Confirmed against your decision: line length is 120 characters, overriding my 100 guess."
+      },
+      {
+        "user": "Also indentation is 4 spaces, never tabs.",
+        "assistant": "Recorded: indentation is 4 spaces, never tabs."
+      },
+      {
+        "user": "Formatting rules are settled then.",
+        "assistant": "Closing the formatting thread."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-line-120",
+        "category": "CONFIG_VALUES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "120 characters"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-indent-4",
+        "category": "CONFIG_VALUES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "4 spaces"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-line-100",
+        "family": "conflicting-evidence",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "line length is 100"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-line-length",
+      "question": "What is the formatter line length?",
+      "answerType": "exact",
+      "goldAnswer": "120",
+      "sourceClaimRef": "exp-line-120"
+    },
+    {
+      "id": "probe-line-mc",
+      "question": "Which line length is the decided value?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "100 characters",
+        "120 characters"
+      ],
+      "goldAnswer": "120 characters"
+    }
+  ]
+}

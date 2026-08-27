@@ -1,0 +1,115 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-build-rejected-bazel",
+  "title": "Rejected Bazel migration must not surface as an active build decision",
+  "families": [
+    "proposed-but-rejected"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "Our monorepo builds take 14 minutes. Should we migrate the monorepo to Bazel?",
+        "assistant": "Bazel would give us hermetic caching, but migrating 40 packages means rewriting every build file. That is a large up-front cost."
+      },
+      {
+        "user": "Let's not. Bazel is rejected because the migration cost outweighs the caching win. We adopt Turborepo for build task caching instead.",
+        "assistant": "Recorded: Turborepo adopted for build task caching. Bazel rejected because the migration cost outweighs the benefit."
+      },
+      {
+        "user": "Set the Turborepo remote cache retention to 14 days.",
+        "assistant": "Done: remote cache retention is 14 days."
+      },
+      {
+        "user": "Good, closing out this build-tooling thread.",
+        "assistant": "Summary recorded; ready for the next task."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-turborepo",
+        "category": "ARCHITECTURE",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "turborepo"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-bazel-rejected",
+        "category": "CONSTRAINTS",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "migration cost"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-cache-retention",
+        "category": "CONFIG_VALUES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "14 days"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-bazel-active",
+        "family": "proposed-but-rejected",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "migrate the monorepo to bazel"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-retention",
+      "question": "What is the remote cache retention period?",
+      "answerType": "exact",
+      "goldAnswer": "14 days",
+      "sourceClaimRef": "exp-cache-retention"
+    },
+    {
+      "id": "probe-build-tool",
+      "question": "Which tool handles build task caching?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "bazel",
+        "turborepo"
+      ],
+      "goldAnswer": "turborepo"
+    },
+    {
+      "id": "probe-rejection",
+      "question": "Which claim records the Bazel rejection?",
+      "answerType": "claim-id",
+      "expectedClaimRef": "exp-bazel-rejected"
+    }
+  ]
+}
