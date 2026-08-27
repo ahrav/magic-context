@@ -273,6 +273,105 @@ describe("storage-db direct format", () => {
             expect(fileDigest(journalPath)).toBe(beforeJournal);
         });
 
+        it("#when a journal sits beside an empty main #then bootstraps instead of refusing (AE1)", () => {
+            // SQLite writes a transaction's pages to the main file only at
+            // commit, so `main:0 bytes` + `-journal` is a bootstrap in flight or
+            // one interrupted mid-transaction, never foreign committed state.
+            const dir = makeTempDir("storage-db-bootstrap-journal-");
+            const dbPath = join(dir, "context.db");
+            writeFileSync(dbPath, "");
+            writeFileSync(`${dbPath}-journal`, "interrupted bootstrap journal");
+
+            const db = openDatabase(dbPath);
+
+            expect(getFormatRefusal()).toBeNull();
+            expect(db).not.toBeNull();
+            expect(readDirectFormatMarker(db as Database).status).toBe("present");
+        });
+
+        it("#when a bootstrap is killed mid-transaction #then the next open recovers the family", async () => {
+            const dir = makeTempDir("storage-db-bootstrap-crash-");
+            const dbPath = join(dir, "context.db");
+            const workerPath = join(dir, "wedge-worker.ts");
+            // Hold BEGIN IMMEDIATE open with the exact bootstrap shape, then die
+            // without committing so a hot journal survives.
+            writeFileSync(
+                workerPath,
+                [
+                    `const { Database } = await import(${JSON.stringify(join(import.meta.dir, "../../shared/sqlite.ts"))});`,
+                    `const db = new Database(${JSON.stringify(dbPath)});`,
+                    `db.exec("PRAGMA journal_mode=DELETE");`,
+                    `db.exec("BEGIN IMMEDIATE");`,
+                    `db.exec("CREATE TABLE partial_bootstrap (id INTEGER PRIMARY KEY)");`,
+                    `console.log("HELD");`,
+                    `setInterval(() => {}, 1000);`,
+                ].join("\n"),
+            );
+            const worker = Bun.spawn(["bun", workerPath], { stdout: "pipe", stderr: "pipe" });
+            const reader = worker.stdout.getReader();
+            await reader.read();
+            reader.releaseLock();
+            worker.kill("SIGKILL");
+            await worker.exited;
+            expect(statSync(dbPath).size).toBe(0);
+
+            const db = openDatabase(dbPath);
+
+            expect(getFormatRefusal()).toBeNull();
+            expect(db).not.toBeNull();
+            expect(readDirectFormatMarker(db as Database).status).toBe("present");
+        });
+
+        it("#when only the marker epoch is newer #then reports a fence rejection, not a reset-worthy refusal", () => {
+            // Appending schema components does not move the fence row, so the
+            // marker epoch is the only signal that types the direction. Treating
+            // this as a plain refusal would tell the operator to reset a family a
+            // newer binary legitimately owns.
+            const dir = makeTempDir("storage-db-newer-epoch-only-");
+            const dbPath = join(dir, "context.db");
+            const future = new Database(dbPath);
+            const futureMarker = buildDirectFormatMarker({
+                componentManifestDigest: "b".repeat(64),
+                createdAtMs: 1,
+                formatEpoch: 2,
+            });
+            future.exec(`
+                CREATE TABLE mc_format_marker (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    format_epoch INTEGER NOT NULL,
+                    database_incarnation_id TEXT NOT NULL,
+                    component_manifest_digest TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    marker_digest TEXT NOT NULL
+                );
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL);
+            `);
+            future
+                .prepare(
+                    "INSERT INTO mc_format_marker (id, format_epoch, database_incarnation_id, component_manifest_digest, created_at_ms, marker_digest) VALUES (1, ?, ?, ?, ?, ?)",
+                )
+                .run(
+                    futureMarker.formatEpoch,
+                    futureMarker.databaseIncarnationId,
+                    futureMarker.componentManifestDigest,
+                    futureMarker.createdAtMs,
+                    computeMarkerDigest(futureMarker),
+                );
+            // Fence row stays exactly at this build's supported version.
+            future
+                .prepare(
+                    "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, 'same fence', 0)",
+                )
+                .run(LATEST_SUPPORTED_VERSION);
+            future.close();
+            const before = fileDigest(dbPath);
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getSchemaFenceRejection()).not.toBeNull();
+            expect(getFormatRefusal()).toBeNull();
+            expect(fileDigest(dbPath)).toBe(before);
+        });
+
         it("#when the database is a legacy migration-lane family #then refuses it unchanged", () => {
             const dir = makeTempDir("storage-db-legacy-refusal-");
             const dbPath = join(dir, "context.db");

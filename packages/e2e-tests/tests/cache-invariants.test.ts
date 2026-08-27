@@ -36,6 +36,13 @@ import {
     mainAgentRequests,
 } from "../src/cache-analysis";
 import { TestHarness } from "../src/harness";
+import {
+    driveAgedCtxReduceSurvival,
+    driveFirstRenderPureDeferStability,
+    failedCheckIds,
+    verifyAgedCtxReduceSurvival,
+    verifyFirstRenderPureDeferStability,
+} from "../src/incident-pool/scenarios/source-linked-regressions";
 import type { MockUsage } from "../src/mock-provider/server";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";

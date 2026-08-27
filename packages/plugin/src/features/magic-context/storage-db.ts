@@ -14,7 +14,6 @@ import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
     classifyProcessKind,
-    discoverLivePiProcessIds,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
@@ -37,13 +36,16 @@ import { composeRegisteredSchema, computeExpectedDirectFormat } from "./storage-
 import {
     buildDirectFormatMarker,
     classifyDatabaseFormatFamily,
+    classifyPreOpenFamily,
     createDirectFormatMarkerSchema,
+    DIRECT_FORMAT_EPOCH,
     type FormatFamilyClassification,
     inspectDatabaseForClassification,
     listDatabaseFamilyArtifacts,
+    readDirectFormatMarker,
     stampDirectFormatMarker,
 } from "./storage-format-epoch";
-import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import { ensureColumn } from "./storage-schema-helpers";
 import {
     loadToolDefinitionMeasurements,
     setDatabase as setToolDefinitionDatabase,
@@ -52,7 +54,7 @@ import {
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
 // storage-db <-> migrations import cycle.
-export { ensureColumn, FORK_MIGRATION_VERSION_FLOOR, healAllNullColumns };
+export { ensureColumn, FORK_MIGRATION_VERSION_FLOOR };
 
 const databases = new Map<string, Database>();
 const pendingAsyncOpens = new Map<string, Promise<Database | null>>();
@@ -267,16 +269,7 @@ const defaultRpcDiscoveryFs: RpcDiscoveryFs = {
     statSync: (path) => ({ mtimeMs: statSync(path).mtimeMs }),
     unlinkSync: (path) => unlinkSync(path),
 };
-let rpcDiscoveryFs = defaultRpcDiscoveryFs;
-
-/** Allows tests to simulate discovery filesystem errors and verify they reject the result rather than treating it as a valid server record. */
-export function __setRpcDiscoveryFsForTests(overrides: Partial<RpcDiscoveryFs>): void {
-    rpcDiscoveryFs = { ...defaultRpcDiscoveryFs, ...overrides };
-}
-
-export function __resetRpcDiscoveryFsForTests(): void {
-    rpcDiscoveryFs = defaultRpcDiscoveryFs;
-}
+const rpcDiscoveryFs = defaultRpcDiscoveryFs;
 
 type RpcDiscoveryJunkReason = "parse-invalid" | "invalid-pid";
 
@@ -479,14 +472,6 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-/** Return the live processes that would block an on-open migration. */
-export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
-    const discovery = inspectRpcServerDiscovery(storageDir);
-    const openCode = discovery.state === "live" ? (discovery.serverProcesses ?? []) : [];
-    const pi = discoverLivePiProcessIds().map((pid) => ({ kind: "Pi" as const, pid }));
-    return [...openCode, ...pi];
-}
-
 // Per-connection SQLite tuning, settable once at plugin init (before the first
 // openDatabase) so the 27 openDatabase call sites don't each need config
 // threading. Defaults match the config schema (64 MiB cache, mmap disabled) so
@@ -617,11 +602,6 @@ function expectedDirectFormat(): ReturnType<typeof computeExpectedDirectFormat> 
     return cachedExpectedFormat;
 }
 
-/** Test seam: schema-component changes within one process invalidate the cache. */
-export function __resetExpectedDirectFormatCacheForTests(): void {
-    cachedExpectedFormat = null;
-}
-
 /**
  * Serialize with any concurrent bootstrapper under BEGIN IMMEDIATE, recheck
  * the family, and create the registered direct format only if the family is
@@ -672,16 +652,36 @@ function recordFormatRefusal(
     } catch {
         // An unreadable version lane stays a plain format refusal.
     }
-    if (persistedVersion > latestSupportedVersion) {
+    // The fence row is a constant pinned to the retired migration lane, so it
+    // only moves on a breaking format change. The marker's format epoch is the
+    // signal that actually distinguishes a database this build is too old to
+    // read from one it must refuse: reset guidance for the former would destroy
+    // a family a newer binary legitimately owns.
+    const marker = readDirectFormatMarker(db);
+    const persistedEpoch = marker.status === "present" ? marker.marker.formatEpoch : 0;
+    if (persistedVersion > latestSupportedVersion || persistedEpoch > DIRECT_FORMAT_EPOCH) {
         lastSchemaFenceRejection = { persistedVersion, supportedVersion: latestSupportedVersion };
+        const lane =
+            persistedEpoch > DIRECT_FORMAT_EPOCH
+                ? `format epoch ${persistedEpoch} (this binary reads epoch ${DIRECT_FORMAT_EPOCH})`
+                : `format lane v${persistedVersion} (max v${latestSupportedVersion})`;
         log(
-            `[magic-context] storage fatal: refusing to open ${dbPath}; its format lane v${persistedVersion} is newer than this binary supports (max v${latestSupportedVersion}). A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart.`,
+            `[magic-context] storage fatal: refusing to open ${dbPath}; its ${lane} is newer than this binary supports. A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart. Do not reset this database: a newer binary owns it.`,
         );
         return;
     }
     lastFormatRefusal = { family: classification.family, reasons: classification.reasons };
+    // A digest-only mismatch at the same epoch cannot be direction-typed from a
+    // hash, so this must not assert the family is garbage.
+    const manifestOnly =
+        marker.status === "present" &&
+        persistedEpoch === DIRECT_FORMAT_EPOCH &&
+        classification.reasons.some((reason) => reason.includes("component manifest digest"));
+    const guidance = manifestOnly
+        ? "Align every Magic Context binary sharing this database on one revision first; run 'npx @cortexkit/magic-context@latest doctor reset-db' only to abandon the family deliberately."
+        : "To abandon this database family and start fresh, run 'npx @cortexkit/magic-context@latest doctor reset-db'.";
     log(
-        `[magic-context] storage fatal: refusing to open ${dbPath}; the database is not the supported direct claims format (${classification.family}): ${classification.reasons.join("; ")}. No data was changed. To abandon this database family and start fresh, run 'npx @cortexkit/magic-context@latest doctor reset-db'.`,
+        `[magic-context] storage fatal: refusing to open ${dbPath}; the database is not the supported direct claims format (${classification.family}): ${classification.reasons.join("; ")}. No data was changed. ${guidance}`,
     );
 }
 
@@ -694,32 +694,17 @@ function recordFormatRefusal(
  * migrated.
  */
 // Inspect family artifacts before opening SQLite: open-time recovery can
-// consume an orphan WAL for an empty main file.
+// consume an orphan WAL for an empty main file. The rules themselves live in
+// the format-epoch leaf module so the pre-open and post-open verdicts cannot
+// drift.
 function refusePreOpenFamily(dbPath: string): DatabaseFormatRefusal | null {
-    const artifacts = listDatabaseFamilyArtifacts(dbPath);
-    if (artifacts.includes("reset-marker")) {
-        return {
-            family: "reset-pending",
-            reasons: [`a reset marker ${dbPath}.mc-reset is pending for this database family`],
-        };
-    }
-    if (artifacts.includes("journal")) {
-        return {
-            family: existsSync(dbPath) ? "unsupported" : "orphan-artifacts",
-            reasons: [
-                `a pre-existing rollback journal ${dbPath}-journal must be refused before SQLite open-time recovery`,
-            ],
-        };
-    }
-    if (existsSync(dbPath) && statSync(dbPath).size > 0) return null;
-    const orphans = artifacts;
-    if (orphans.length === 0) return null;
-    return {
-        family: "orphan-artifacts",
-        reasons: orphans.map(
-            (artifact) => `orphan ${artifact} artifact without a current main database`,
-        ),
-    };
+    const verdict = classifyPreOpenFamily(dbPath, {
+        artifacts: listDatabaseFamilyArtifacts(dbPath),
+        mainFileExists: existsSync(dbPath),
+        mainFileSize: existsSync(dbPath) ? statSync(dbPath).size : 0,
+    });
+    if (verdict.decision === "open") return null;
+    return { family: verdict.family, reasons: verdict.reasons };
 }
 
 function openDirectDatabase(

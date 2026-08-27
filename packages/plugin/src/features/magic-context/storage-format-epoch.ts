@@ -357,6 +357,78 @@ export function listDatabaseFamilyArtifacts(
     return artifacts;
 }
 
+/** What the pre-open artifact gate decided; artifacts only, no SQLite open. */
+export type PreOpenFamilyVerdict =
+    | { readonly decision: "open" }
+    | {
+          readonly decision: "refuse";
+          readonly family: "reset-pending" | "unsupported" | "orphan-artifacts";
+          readonly reasons: readonly string[];
+      };
+
+/** Disk-only facts the pre-open gate classifies; gathered impurely. */
+export interface PreOpenFamilyInput {
+    readonly artifacts: readonly string[];
+    readonly mainFileExists: boolean;
+    readonly mainFileSize: number;
+}
+
+/**
+ * Pure pre-open gate (R15, R17): decide from disk artifacts alone whether
+ * SQLite may be opened at all, so open-time recovery can never consume an
+ * orphan WAL or roll back a family this build has not classified.
+ *
+ * A rollback journal is only terminal beside a NONEMPTY main file. Beside a
+ * missing or zero-length main file it is not foreign committed state: SQLite
+ * writes a transaction's pages to the main file only at commit, so a pristine
+ * bootstrap holding `BEGIN IMMEDIATE` leaves exactly `main:0 bytes` plus
+ * `-journal` for the whole composition. Refusing that shape would reject a
+ * concurrent bootstrapper's own in-flight journal (never reaching the
+ * `busy_timeout` wait that serializes cold opens) and would permanently wedge
+ * a bootstrap interrupted mid-transaction, even though rollback restores the
+ * family to pristine. Such a family is handed to the write-lock-serialized
+ * classification instead, which is what actually decides.
+ */
+export function classifyPreOpenFamily(
+    dbPath: string,
+    input: PreOpenFamilyInput,
+): PreOpenFamilyVerdict {
+    if (input.artifacts.includes("reset-marker")) {
+        return {
+            decision: "refuse",
+            family: "reset-pending",
+            reasons: [
+                `a reset marker ${databaseResetMarkerPath(dbPath)} is pending for this database family`,
+            ],
+        };
+    }
+    const mainHasContent = input.mainFileExists && input.mainFileSize > 0;
+    if (input.artifacts.includes("journal")) {
+        if (mainHasContent) {
+            return {
+                decision: "refuse",
+                family: "unsupported",
+                reasons: [
+                    `a pre-existing rollback journal ${databaseFamilyFilePath(dbPath, "rollback-journal")} must be refused before SQLite open-time recovery`,
+                ],
+            };
+        }
+        // A WAL alongside an empty main file is an orphan, not a bootstrapper's
+        // journal: DELETE-mode bootstrap never produces one. Fall through to the
+        // orphan rules below rather than admitting an ambiguous family.
+        if (!input.artifacts.includes("wal")) return { decision: "open" };
+    }
+    if (mainHasContent) return { decision: "open" };
+    if (input.artifacts.length === 0) return { decision: "open" };
+    return {
+        decision: "refuse",
+        family: "orphan-artifacts",
+        reasons: input.artifacts.map(
+            (artifact) => `orphan ${artifact} artifact without a current main database`,
+        ),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // U11 reset-marker and quarantine primitives (KTD11, R15-R16).
 //

@@ -3278,12 +3278,12 @@ pub fn invalidate_all_memory_block_caches(conn: &Connection) -> Result<usize, ru
              memory_block_ids = '',
              cached_m0_bytes = NULL,
              cached_m1_bytes = NULL,
-             cached_m0_max_memory_mutation_id = NULL
+             cached_m0_max_mutation_id = NULL
          WHERE memory_block_cache != ''
             OR memory_block_ids != ''
             OR cached_m0_bytes IS NOT NULL
             OR cached_m1_bytes IS NOT NULL
-            OR cached_m0_max_memory_mutation_id IS NOT NULL",
+            OR cached_m0_max_mutation_id IS NOT NULL",
         [],
     )
 }

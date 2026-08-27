@@ -260,21 +260,6 @@ export function seedProjectRegistry(db: Database, seed: ProjectIdentitySeed, now
     }
 }
 
-/** Fail closed when the published registry diverges from the computed seed. */
-export function assertProjectRegistrySeed(db: Database, seed: ProjectIdentitySeed): void {
-    const projects = db.prepare("SELECT COUNT(*) AS count FROM projects").get() as {
-        count: number;
-    };
-    const aliases = db.prepare("SELECT COUNT(*) AS count FROM project_aliases").get() as {
-        count: number;
-    };
-    if (projects.count !== seed.terminals.length || aliases.count !== seed.aliasTargets.size) {
-        throw new Error(
-            `project registry seed cardinality mismatch: projects ${projects.count}/${seed.terminals.length}, aliases ${aliases.count}/${seed.aliasTargets.size}`,
-        );
-    }
-}
-
 /**
  * Resolve every historical alias of the given canonical identities, walking
  * multi-hop rekey chains and the numeric registry. Corrupt cycles skip their

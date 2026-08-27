@@ -4554,17 +4554,12 @@ pub struct McStore {
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
-    facade_mutation_abandon_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
     before_max_compartment_end_read_hook: BeforeMaxCompartmentEndReadHook,
-    #[cfg(any(test, feature = "test-support"))]
-    authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     tag_number_query_count: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     authority_seed_transaction_count: std::sync::atomic::AtomicUsize,
-    #[cfg(any(test, feature = "test-support"))]
-    authority_seed_resolution_pass_count: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     historian_side_channel_fail_once: Mutex<BTreeSet<String>>,
 }
@@ -4823,17 +4818,14 @@ impl McStore {
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
-            facade_mutation_abandon_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             before_max_compartment_end_read_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
-            authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             tag_number_query_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             authority_seed_transaction_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
-            authority_seed_resolution_pass_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
         };
@@ -4992,51 +4984,10 @@ impl McStore {
                             )",
                         params![identity_scope],
                     )?;
-                    #[cfg(any(test, feature = "test-support"))]
-                    if let Some(hook) = self
-                        .facade_mutation_abandon_hook
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .as_mut()
-                    {
-                        // This callback runs after both writes and before commit, allowing tests
-                        // to simulate a process abandoning the transaction at the crash window.
-                        hook();
-                    }
                 }
                 Ok(FacadeMutationOutcome::Applied(response))
             })
             .map_err(Into::into)
-    }
-
-    /// Run one facade mutation while SQLite triggers can verify the route's authority state in
-    /// the mutation transaction. The scope is cleared on every normal return before another
-    /// facade mutation can enter.
-    pub fn with_facade_mutation<T, E>(
-        &self,
-        route_project_root: &str,
-        domain: &str,
-        mutation: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
-        let _mutation_guard = self
-            .facade_mutation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        {
-            let mut scope = self
-                .facade_authority_scope
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *scope = Some(FacadeAuthorityScope {
-                owner: std::thread::current().id(),
-                route_project_root: route_project_root.to_string(),
-                domain: domain.to_string(),
-            });
-        }
-        let _scope_guard = FacadeMutationScopeGuard {
-            scope: &self.facade_authority_scope,
-        };
-        mutation()
     }
 
     /// Complete route normalization after schema upgrades using the same caller-identity
@@ -5177,15 +5128,6 @@ impl McStore {
         domain: &str,
     ) -> Result<Option<(String, String)>, McStoreError> {
         validate_authority_domain(domain)?;
-        #[cfg(any(test, feature = "test-support"))]
-        if self
-            .authority_project_resolution_fail_once
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(McStoreError::Serde(
-                "injected authority project resolution failure".to_string(),
-            ));
-        }
         self.inner
             .with_conn(|conn| {
                 conn.query_row(
@@ -5214,15 +5156,6 @@ impl McStore {
         domain: &str,
     ) -> Result<Option<String>, McStoreError> {
         validate_authority_domain(domain)?;
-        #[cfg(any(test, feature = "test-support"))]
-        if self
-            .authority_project_resolution_fail_once
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(McStoreError::Serde(
-                "injected authority project resolution failure".to_string(),
-            ));
-        }
         self.inner
             .with_conn(|conn| {
                 conn.query_row(
@@ -5240,12 +5173,6 @@ impl McStore {
                 .optional()
             })
             .map_err(Into::into)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn fail_next_authority_project_resolution_for_test(&self) {
-        self.authority_project_resolution_fail_once
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -5299,38 +5226,6 @@ impl McStore {
             .abandon_historian_hook
             .lock()
             .expect("abandon historian hook mutex") = Some(hook);
-    }
-
-    /// Install a test callback that runs after a facade mutation and its ledger row have both
-    /// been written, but before the enclosing fenced transaction commits. Panicking from the
-    /// callback exercises the crash window without allowing either half to persist.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_facade_mutation_abandon_hook(&self, hook: Box<dyn FnMut() + Send>) {
-        *self
-            .facade_mutation_abandon_hook
-            .lock()
-            .expect("facade mutation abandon hook mutex") = Some(hook);
-    }
-
-    /// Count retained command outcomes for one identity scope. This is intentionally a read-only
-    /// inspection API so retention tests do not need to reach through the store's connection.
-    pub fn facade_mutation_ledger_count(
-        &self,
-        identity_scope: &str,
-    ) -> Result<usize, McStoreError> {
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM mc_facade_mutation_ledger WHERE identity_scope = ?1",
-                    params![identity_scope],
-                    |row| row.get::<_, i64>(0),
-                )
-            })
-            .map_err(Into::into)
-            .and_then(|count| {
-                usize::try_from(count)
-                    .map_err(|_| McStoreError::Serde("ledger count exceeds usize".to_string()))
-            })
     }
 
     pub fn facade_mutation_ledger_response(
@@ -8887,20 +8782,6 @@ impl McStore {
         }
     }
 
-    /// Return the newest note status version for the project. Note readiness is an
-    /// in-session m1 input, so it may defer, but it must not be invisible to the next
-    /// genuine rendering opportunity.
-    pub fn max_note_status_version(&self, project_path: &str) -> Result<i64, McStoreError> {
-        let max = self.inner.with_conn(|conn| {
-            conn.query_row(
-                "SELECT COALESCE(MAX(status_version), 0) FROM mc_notes WHERE project_path = ?1",
-                params![project_path],
-                |row| row.get(0),
-            )
-        })?;
-        Ok(max)
-    }
-
     pub fn load_m1_revision_snapshot(
         &self,
         note_project_path: &str,
@@ -11034,11 +10915,9 @@ impl McStore {
         Ok(rows)
     }
 
-    /// The highest memory-mutation-log id across the given project identities (the union,
-    /// or a single-element slice). The cursor a baseline re-render (HARD) folds the
-    /// corrections up to, and the watermark a delta pass (SOFT) reads new corrections
-    /// past. 0 when the log is empty. Union-scoped to match
-    /// [`Self::memory_mutations_for_render`].
+    /// Register `project_path` as a member of `workspace`, creating the workspace when it is
+    /// absent. Both writes are conflict-tolerant, so re-seeding an existing member is a no-op
+    /// rather than an error.
     pub fn seed_workspace_member(
         &self,
         workspace: &str,
@@ -12042,12 +11921,6 @@ impl McStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn authority_seed_transaction_count_for_test(&self) -> usize {
         self.authority_seed_transaction_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn authority_seed_resolution_pass_count_for_test(&self) -> usize {
-        self.authority_seed_resolution_pass_count
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -13961,16 +13834,6 @@ fn canonical_authority_value(value: &Value) -> String {
             )
         }
     }
-}
-
-pub fn compute_normalized_memory_hash(content: &str) -> String {
-    let normalized = content
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let digest = md5::compute(normalized.as_bytes());
-    format!("{digest:032x}")
 }
 
 fn idle_historian_after_success(firing_seq: u64) -> HistorianDurableState {

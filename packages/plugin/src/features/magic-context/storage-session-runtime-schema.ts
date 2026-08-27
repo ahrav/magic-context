@@ -311,6 +311,11 @@ CREATE TABLE embedding_registrations (
       updated_at INTEGER NOT NULL DEFAULT 0
     );
 
+-- One ledger row is one provider page under its full destination context;
+-- the stable row id is the durable receipt identity. Live-row uniqueness is
+-- the partial index below, excluding terminal 'obsolete' rows, so quarantined
+-- and retired receipts stay durable and queryable while a fresh attempt for
+-- the same page identity can occupy a new row.
 CREATE TABLE synapse_batch_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_path TEXT NOT NULL DEFAULT '',

@@ -173,12 +173,6 @@ struct DreamRunsArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RunIdArgs {
-    run_id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MaxLinesArgs {
     max_lines: Option<usize>,
 }

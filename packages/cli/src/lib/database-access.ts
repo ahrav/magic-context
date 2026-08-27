@@ -6,6 +6,7 @@ import {
     openSync,
     readSync,
     rmSync,
+    statSync,
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage-db";
 import {
     classifyDatabaseFormatFamily,
+    classifyPreOpenFamily,
     type DatabaseFormatFamily,
     type DatabaseResetMarker,
     type ExpectedDirectFormat,
@@ -50,22 +52,6 @@ export class UnsupportedSchemaVersionError extends Error {
         this.path = path;
         this.persistedVersion = persistedVersion;
         this.supportedVersion = supportedVersion;
-    }
-}
-
-export class OutdatedSchemaVersionError extends Error {
-    readonly path: string;
-    readonly persistedVersion: number;
-    readonly minimumSupportedVersion: number;
-
-    constructor(path: string, persistedVersion: number, minimumSupportedVersion: number) {
-        super(
-            `Refusing to mutate ${path}: database schema v${persistedVersion} is behind this CLI's schema floor v${minimumSupportedVersion}. Run a session or doctor migrate first so the plugin can upgrade it, then retry.`,
-        );
-        this.name = "OutdatedSchemaVersionError";
-        this.path = path;
-        this.persistedVersion = persistedVersion;
-        this.minimumSupportedVersion = minimumSupportedVersion;
     }
 }
 
@@ -130,14 +116,23 @@ export function openExistingDatabase(
  */
 export function openExistingContextDatabase(
     path: string,
-    options: { readonly: boolean; minimumSupportedVersion?: number },
+    options: { readonly: boolean },
 ): DatabaseType | null {
     if (!existsSync(path)) return null;
     if (!options.readonly) {
-        const family = inspectDirectDatabaseFamilyState(path);
-        if (family.state !== "current") {
+        // Artifact-only pre-open gate: a pending reset or an orphan/hot-journal
+        // family must be refused before SQLite can recover it. Content
+        // classification happens on the live connection below instead of a
+        // whole-family temp copy, which on a large store means reading and
+        // rewriting every byte of context.db before any work begins.
+        const preOpen = classifyPreOpenFamily(path, {
+            artifacts: listDatabaseFamilyArtifacts(path),
+            mainFileExists: true,
+            mainFileSize: statSync(path).size,
+        });
+        if (preOpen.decision === "refuse") {
             throw new Error(
-                `Refusing to mutate ${path}: database is not the exact supported direct format (${family.state}). Run 'npx @cortexkit/magic-context@latest doctor reset-db' only if you intend to abandon it.`,
+                `Refusing to mutate ${path}: database is not the exact supported direct format (${preOpen.family}): ${preOpen.reasons.join("; ")}. Run 'npx @cortexkit/magic-context@latest doctor reset-db' only if you intend to abandon it.`,
             );
         }
     }
@@ -145,6 +140,17 @@ export function openExistingContextDatabase(
     if (db === null) return null;
 
     try {
+        if (!options.readonly) {
+            const classification = classifyDatabaseFormatFamily(
+                inspectDatabaseForClassification(db, path),
+                getExpectedDirectFormat(),
+            );
+            if (classification.family !== "current") {
+                throw new Error(
+                    `Refusing to mutate ${path}: database is not the exact supported direct format (${classification.family}): ${classification.reasons.join("; ")}. Run 'npx @cortexkit/magic-context@latest doctor reset-db' only if you intend to abandon it.`,
+                );
+            }
+        }
         const persistedVersion = getPersistedSchemaVersion(db);
         if (persistedVersion > LATEST_SUPPORTED_VERSION) {
             throw new UnsupportedSchemaVersionError(
@@ -152,12 +158,6 @@ export function openExistingContextDatabase(
                 persistedVersion,
                 LATEST_SUPPORTED_VERSION,
             );
-        }
-        const minimumSupportedVersion =
-            options.minimumSupportedVersion ??
-            (options.readonly ? undefined : CLI_SCHEMA_FLOOR_VERSION);
-        if (minimumSupportedVersion !== undefined && persistedVersion < minimumSupportedVersion) {
-            throw new OutdatedSchemaVersionError(path, persistedVersion, minimumSupportedVersion);
         }
         if (!options.readonly) {
             // The CLI has no module route during database open. It can mint the
@@ -185,10 +185,7 @@ export function openExistingContextDatabase(
  * running, it may enforce an older maximum schema version.
  */
 export function openExistingContextDatabaseForMutation(path: string): DatabaseType | null {
-    return openExistingContextDatabase(path, {
-        readonly: false,
-        minimumSupportedVersion: CLI_SCHEMA_FLOOR_VERSION,
-    });
+    return openExistingContextDatabase(path, { readonly: false });
 }
 
 /** Create a consistent SQLite snapshot, including committed WAL contents. */

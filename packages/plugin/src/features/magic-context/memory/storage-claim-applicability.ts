@@ -533,18 +533,6 @@ export function readApplicabilityIntervals(
 // Legacy-memory lineage helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Known path state from a raw file list. Single owner of the `""` no-file
- * sentinel exclusion rule: a sentinel-only (or empty) list reads as
- * known-empty (file-independent). Every producer of a known-paths state goes
- * through here so the two sides of a `pathsStateEquals` comparison can never
- * drift.
- */
-export function knownPathsStateFromFiles(files: readonly string[]): ApplicabilityPathsInput {
-    const exact = [...new Set(files.filter((file) => file.length > 0))].sort();
-    return { state: "known", exact };
-}
-
 function sameSortedValues(left: readonly string[], right: readonly string[]): boolean {
     return left.length === right.length && left.every((value, index) => value === right[index]);
 }

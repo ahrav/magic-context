@@ -678,7 +678,11 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
         }
     }
 
-    removeRecoveryBundle(recoveredPath);
+    // Keep the salvaged bundle. `.recover` emits a `lost_and_found` table
+    // whenever page-to-table attribution is lost, and the exact-inventory gate
+    // refuses any unregistered object, so the recoveries that salvage the most
+    // rows are precisely the ones that fail classification. Deleting them here
+    // would discard that data before the operator ever sees it.
     const unavailableAfter = Object.fromEntries(
         ROW_COUNT_TABLES.map((table) => [table, null]),
     ) as RowCounts;
@@ -689,6 +693,11 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
     );
     prompts.log.info(`Database remains unchanged: ${dbPath}`);
     prompts.log.info(`Backup base: ${backup.basePath}`);
+    if (existsSync(recoveredPath)) {
+        prompts.log.warn(
+            `Salvaged contents retained for inspection: ${recoveredPath}. This command installs only the exact registered direct format, so a recovery carrying extra objects (for example a \`lost_and_found\` table from unattributed pages) is not installed automatically. Inspect it with \`sqlite3 ${recoveredPath} '.tables'\` before deciding; delete it once you no longer need it.`,
+        );
+    }
 
     const confirmed = await prompts.confirm(
         "Salvage failed. Move the corrupt database aside and create a fresh empty database? This discards all unrecovered data from the active database.",
