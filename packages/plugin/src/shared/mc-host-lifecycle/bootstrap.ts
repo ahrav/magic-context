@@ -771,8 +771,17 @@ export function revalidateRetainedBootstrap(
             // are unaffected.
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
-    } catch {
-        throw new BootstrapError("native_payload_missing", "retained bootstrap is not openable");
+    } catch (error) {
+        // Same line the launcher source and the trust index draw: only true
+        // absence is "missing". A retained object that is present but rejected
+        // by O_NOFOLLOW or by its mode is a tampered or damaged artifact, and
+        // reporting it as absent would both name a remedy that does not apply
+        // and discard the evidence that something replaced it.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+            throw new BootstrapError("native_payload_missing", "retained bootstrap is absent");
+        }
+        throw invalid("retained bootstrap is not openable");
     }
     try {
         const stat = fstatSync(fd);

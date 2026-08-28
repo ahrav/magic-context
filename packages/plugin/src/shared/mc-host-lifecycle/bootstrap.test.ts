@@ -851,6 +851,42 @@ describe("bootstrap staging (U3 scenarios 3 and 6)", () => {
         }
     });
 
+    test("a present but unopenable retained bootstrap is invalid, not missing", () => {
+        // Same line the launcher source and the trust index draw. A retained
+        // object rejected by O_NOFOLLOW is a tampered artifact, and calling it
+        // absent both names a remedy that does not apply and discards the
+        // evidence that something replaced it.
+        const dir = tempDir("mc-retained-present-invalid-");
+        try {
+            const bytes = Buffer.from("retained-launcher\n");
+            const digest = sha256(bytes);
+            const store = path.join(dir, "store");
+            mkdirSync(store, { recursive: true });
+            const real = path.join(dir, "elsewhere");
+            writeFileSync(real, bytes, { mode: 0o500 });
+            // The digest-addressed name is a symlink: present, untrustworthy.
+            symlinkSync(real, path.join(store, digest));
+            let reason: string | null = null;
+            try {
+                revalidateRetainedBootstrap(path.join(store, digest), digest);
+            } catch (error) {
+                reason = (error as BootstrapError).reason;
+            }
+            expect(reason).toBe("native_payload_invalid");
+
+            // A genuinely absent retained object is still missing.
+            let absentReason: string | null = null;
+            try {
+                revalidateRetainedBootstrap(path.join(store, "f".repeat(64)), "f".repeat(64));
+            } catch (error) {
+                absentReason = (error as BootstrapError).reason;
+            }
+            expect(absentReason).toBe("native_payload_missing");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("an owner-writable retained bootstrap is rejected before its digest is trusted", () => {
         // Staging writes 0o500. A writable retained object did not come from
         // that path, and accepting one leaves the digest describing bytes that

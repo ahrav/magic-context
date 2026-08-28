@@ -73,7 +73,8 @@ const STDIO_FLUSH_GRACE_MS = 250;
 interface CollectedExit {
     exitCode: number | null;
     signal: NodeJS.Signals | null;
-    stdout: string;
+    /** Raw bytes: decoding is a validation step, not a convenience. */
+    stdout: Buffer;
     timedOut: boolean;
     outputCapExceeded: boolean;
 }
@@ -147,7 +148,7 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
             resolve({
                 exitCode,
                 signal,
-                stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+                stdout: Buffer.concat(stdoutChunks),
                 timedOut,
                 outputCapExceeded,
             });
@@ -264,9 +265,20 @@ export async function runNativeLifecycle(
             "native lifecycle command rejected its invocation",
         );
     }
+    // Decoded strictly. `Buffer.toString("utf8")` substitutes U+FFFD for an
+    // invalid byte, so a corrupt byte inside an otherwise well-formed JSON
+    // string would parse, validate, and be accepted as a conforming result
+    // carrying a silently mangled value — a truncated or corrupted stream must
+    // fail closed instead.
+    let stdoutText: string;
+    try {
+        stdoutText = new TextDecoder("utf-8", { fatal: true }).decode(collected.stdout);
+    } catch {
+        throw new NativeLaunchError("malformed_output", "native output is not valid UTF-8");
+    }
     let result: DaemonResultV1;
     try {
-        result = parseDaemonResult(collected.stdout);
+        result = parseDaemonResult(stdoutText);
     } catch (error) {
         if (error instanceof ContractViolation) {
             throw new NativeLaunchError("malformed_output", error.message);

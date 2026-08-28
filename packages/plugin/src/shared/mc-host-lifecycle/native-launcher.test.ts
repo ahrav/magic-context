@@ -174,6 +174,43 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         expect(existsSync(sentinel)).toBe(false);
     }, 10_000);
 
+    test("byte-invalid stdout fails closed instead of decoding to U+FFFD", async () => {
+        // Buffer.toString("utf8") substitutes U+FFFD for an invalid byte, so a
+        // corrupt byte inside an otherwise well-formed JSON string would parse,
+        // validate, and be accepted as a conforming result carrying a silently
+        // mangled value. The payload here is contract-valid except that one byte
+        // of `versions.release` is 0xFF, which is not legal UTF-8.
+        const valid = probeResultJson(false);
+        const marker = '"release":"0.38.0"';
+        expect(valid).toContain(marker);
+        const [head, tail] = valid.split(marker) as [string, string];
+        const payload = Buffer.concat([
+            Buffer.from(head, "utf8"),
+            Buffer.from('"release":"0.3', "utf8"),
+            Buffer.from([0xff]),
+            Buffer.from('8.0"', "utf8"),
+            Buffer.from(tail, "utf8"),
+        ]);
+        // Sanity: lossy decoding really would accept this, which is the bug.
+        expect(() => JSON.parse(payload.toString("utf8"))).not.toThrow();
+
+        const payloadFile = path.join(dir, "corrupt-stdout.bin");
+        writeFileSync(payloadFile, payload);
+        const binary = scriptBinary(dir, `cat ${payloadFile}\nexit 1`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.code).toBe("malformed_output");
+        expect(error?.message).toContain("not valid UTF-8");
+    }, 10_000);
+
     test("usage exits (2) are a typed contract failure with no lifecycle result", async () => {
         const binary = scriptBinary(dir, `exit 2`);
         let error: NativeLaunchError | null = null;
