@@ -47,8 +47,8 @@ pub mod wire;
 
 pub use auth::{
     authenticate_client, authenticate_server, compute_proof, AuthError, AuthStage, Authenticated,
-    ClientAuth, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE,
-    MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
+    ClientAuth, ClientAuthenticated, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN,
+    DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
 };
 pub use client::{
     CallError, Client, ClientError, RequestOptions, Response, ResponseStream, SendOutcome,

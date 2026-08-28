@@ -182,7 +182,7 @@ sequenceDiagram
   participant H as mc-host
   C->>H: ClientHello {client_nonce, role}
   H-->>C: ServerProof {daemon_id, server_nonce, daemon_ver, server_proof}
-  Note over C: verify server proof, then daemon ID
+  Note over C: verify server proof, then daemon ID, then daemon version
   C->>H: ClientAuth {client_auth}
   Note over H: constant-time verify
   H-->>C: v2 envelope traffic enabled
@@ -208,9 +208,11 @@ Those proofs use key bytes `00..1f`, client nonce `20..3f`, server nonce `40..5f
 HMAC-SHA256(key, ASCII(D) || client_nonce || server_nonce || daemon_id)
 ```
 
-The client MUST compare server proof in constant time, then require `ServerProof.daemon_id` to equal the connection-file daemon ID. It MUST emit no `ClientAuth` until both checks succeed. The server MUST compare client proof in constant time. `role` is unverified reporting metadata and MUST NOT affect privilege, admission, or capacity.
+The client MUST compare server proof in constant time, then require `ServerProof.daemon_id` to equal the connection-file daemon ID, then require `ServerProof.daemon_ver` to equal the connection-file `daemon_ver`. It MUST emit no `ClientAuth` until all three checks succeed. The server MUST compare client proof in constant time. `role` is unverified reporting metadata and MUST NOT affect privilege, admission, or capacity.
 
-Any malformed JSON, wrong array length, oversized message, nonce-generation failure, proof mismatch, daemon-ID mismatch, EOF, or deadline expiry MUST close the socket. No envelope may be read or written on a failed handshake. Mixed-generation key and daemon-ID values therefore fail closed.
+`daemon_ver` is not an input to either proof, so the HMAC binds the key and the daemon ID but not the reported version. The connection-file comparison is what binds it: a successful handshake proves the peer holds the key and daemon ID from one connection-file snapshot, and requiring the version to match that same snapshot makes the reported version usable for compatibility and fencing. This is snapshot binding, not cryptographic authentication — an attacker who can rewrite both the owner-only connection file and this message consistently is not excluded, but that requires the write access that would let them replace the key outright.
+
+Any malformed JSON, wrong array length, oversized message, nonce-generation failure, proof mismatch, daemon-ID mismatch, daemon-version mismatch, EOF, or deadline expiry MUST close the socket. No envelope may be read or written on a failed handshake. Mixed-generation key, daemon-ID, and daemon-version values therefore fail closed.
 
 ## 6. Envelope framing
 

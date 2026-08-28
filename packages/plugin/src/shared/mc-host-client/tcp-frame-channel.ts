@@ -12,7 +12,13 @@
  */
 
 import { Socket } from "node:net";
-import { type AuthByteIo, AuthError, type AuthResult, authenticateClient } from "./auth";
+import {
+    type AuthByteIo,
+    type AuthCredentials,
+    AuthError,
+    type AuthResult,
+    authenticateClient,
+} from "./auth";
 import type { Deadline } from "./deadline";
 import { McHostCallError, SocketClosedError, SocketTimeoutError } from "./errors";
 import {
@@ -61,7 +67,12 @@ const EMPTY_BODY = new Uint8Array(0);
 export interface TcpFrameChannelOptions {
     host: string;
     port: number;
-    credentials: { key: Uint8Array; daemonId: Uint8Array };
+    /**
+     * Validated connection-file credentials. `daemonVer` is the file's
+     * `daemon_ver`, which the handshake requires the peer to report back
+     * (wire doc Section 5.2).
+     */
+    credentials: AuthCredentials;
     /**
      * Shared aggregate byte budget (KTD7). The channel registers itself as
      * the budget's release observer so paused inbound admission and flush
@@ -117,7 +128,7 @@ export class TcpFrameChannel implements FrameChannel {
     private readonly socket: Socket;
     private readonly host: string;
     private readonly port: number;
-    private readonly credentials: { key: Uint8Array; daemonId: Uint8Array };
+    private readonly credentials: AuthCredentials;
     private readonly budget: ByteBudget;
     private readonly frameDeadlineMs: number;
     private readonly maxBodyLen: number;
@@ -131,6 +142,7 @@ export class TcpFrameChannel implements FrameChannel {
     private closed = false;
     private startState: "idle" | "started" = "idle";
     private phase: "setup" | "frames" = "setup";
+    private authResult: AuthResult | null = null;
     private readonly timers = new Set<ReturnType<typeof setTimeout>>();
     private connectWaiter: { resolve: () => void; reject: (error: unknown) => void } | null = null;
 
@@ -231,11 +243,13 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * Single-flight dial plus authentication under `deadline`. Leftover
-     * post-auth bytes stay buffered until `beginFrames()`, so the owner can
-     * finish its own setup checks before any frame dispatches.
+     * Single-flight dial plus authentication under `deadline`. The proven
+     * identity lands in {@link authenticated} rather than the resolution
+     * value, so identity is readable only from the channel that proved it.
+     * Leftover post-auth bytes stay buffered until `beginFrames()`, so the
+     * owner can finish its own setup checks before any frame dispatches.
      */
-    async start(deadline: Deadline): Promise<AuthResult> {
+    async start(deadline: Deadline): Promise<void> {
         if (this.startState !== "idle") {
             throw new Error("TcpFrameChannel.start() is single-flight per channel");
         }
@@ -248,7 +262,16 @@ export class TcpFrameChannel implements FrameChannel {
         if (this.closed) {
             throw new SocketClosedError("frame channel closed during authentication");
         }
-        return result;
+        this.authResult = result;
+    }
+
+    /**
+     * Peer identity the handshake proved, or null until `start()` resolves.
+     * The daemon version here equals the connection-file `daemon_ver` the
+     * credentials carried; the handshake admits no other value.
+     */
+    get authenticated(): AuthResult | null {
+        return this.authResult;
     }
 
     /** Transfer auth-leftover bytes into the frame reader and begin delivery. */

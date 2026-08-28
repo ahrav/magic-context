@@ -643,11 +643,15 @@ describe("stream handling (KTD11)", () => {
         const generation = new ConnectionGeneration({
             host: "127.0.0.1",
             port: 1,
-            credentials: { key: new Uint8Array(32), daemonId: new Uint8Array(16) },
+            credentials: {
+                key: new Uint8Array(32),
+                daemonId: new Uint8Array(16),
+                daemonVer: "test",
+            },
             channelFactory: (args) => {
                 handlers = args.handlers;
                 return {
-                    start: async () => ({ daemonVer: "test" }),
+                    start: async () => {},
                     beginFrames: () => {},
                     produce: () => ({ cancel: () => true }),
                     reserve: () => {
@@ -1013,7 +1017,11 @@ describe("setup failures", () => {
         const generation = new ConnectionGeneration({
             host: "127.0.0.1",
             port,
-            credentials: { key: Buffer.alloc(32), daemonId: Buffer.alloc(16) },
+            credentials: {
+                key: Buffer.alloc(32),
+                daemonId: Buffer.alloc(16),
+                daemonVer: peer.daemonVer,
+            },
             onRetired: (info) => retirements.push(info),
         });
         await rejection(generation.start(Deadline.start(2_000)));

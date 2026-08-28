@@ -369,12 +369,13 @@ impl Client {
                 "client handshake timed out",
             ));
         }
-        timeout_at(deadline, authenticate_client(&mut stream, &info, remaining))
-            .await
-            .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
-            .map_err(|_| {
-                ClientError::new("authentication_failed", "daemon authentication failed")
-            })?;
+        let authenticated =
+            timeout_at(deadline, authenticate_client(&mut stream, &info, remaining))
+                .await
+                .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
+                .map_err(|_| {
+                    ClientError::new("authentication_failed", "daemon authentication failed")
+                })?;
         negotiate_tcp(&mut stream, deadline).await?;
 
         let (read, write) = stream.into_split();
@@ -382,6 +383,7 @@ impl Client {
         let (control_tx, control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_FRAMES);
         let inner = Arc::new(Inner {
             daemon_id: info.daemon_id,
+            daemon_ver: authenticated.daemon_ver,
             closed: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             cancel: CancellationToken::new(),
@@ -433,6 +435,11 @@ impl Client {
     /// Authenticated daemon ID from the secure discovery and proof transcript.
     pub fn daemon_id(&self) -> [u8; DAEMON_ID_LEN] {
         self.inner.daemon_id
+    }
+
+    /// Returns the daemon version obtained during authentication.
+    pub fn daemon_ver(&self) -> &str {
+        &self.inner.daemon_ver
     }
 
     /// Opens a full `(channel, epoch)` route under one absolute 30-second deadline.
@@ -874,6 +881,7 @@ enum PendingKind {
 
 struct Inner {
     daemon_id: [u8; DAEMON_ID_LEN],
+    daemon_ver: String,
     closed: AtomicBool,
     retired: AtomicBool,
     cancel: CancellationToken,
@@ -2348,6 +2356,7 @@ mod tests {
         (
             Arc::new(Inner {
                 daemon_id: [0; DAEMON_ID_LEN],
+                daemon_ver: "mc-host/0.0.0-test".to_owned(),
                 closed: AtomicBool::new(false),
                 retired: AtomicBool::new(false),
                 cancel: CancellationToken::new(),

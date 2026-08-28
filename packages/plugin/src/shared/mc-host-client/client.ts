@@ -66,12 +66,15 @@ import {
     sanitizedCandidateFactory,
 } from "./transport-provider";
 import type {
+    AuthenticatedPeer,
     BindIdentity,
     CatalogEntry,
+    CatalogSnapshot,
     ConnectOptions,
     ConsumerIdentity,
     ManagedCallOptions,
     ManagedRouteKind,
+    PublicationDiagnostics,
     RequestOptions,
     RouteTarget,
 } from "./types";
@@ -493,6 +496,37 @@ export class McHostClient {
     }
 
     /**
+     * Handshake-retained peer identity for the current connection, or null
+     * when no authenticated generation is live. Lifecycle policy must use
+     * this, never {@link publication}, for compatibility and fencing.
+     */
+    get authenticated(): AuthenticatedPeer | null {
+        const active = this.active;
+        if (!active || active.generation.isRetired()) return null;
+        const daemonVer = active.generation.daemonVer;
+        if (daemonVer === null) return null;
+        return {
+            daemonVer,
+            // Copied, like every other crossing of this value (`auth.ts`,
+            // `transport-provider.ts`): callers must not be able to mutate the
+            // retained identity that authorizes compatibility and fencing.
+            daemonId: active.generation.authenticatedDaemonId?.slice() ?? null,
+            proof: "current",
+        };
+    }
+
+    /**
+     * Connection-file `daemon_ver`/`pid` for the current connection, or null.
+     * Untrusted display metadata only: it must never authorize
+     * compatibility, shutdown, or cleanup.
+     */
+    get publication(): PublicationDiagnostics | null {
+        const active = this.active;
+        if (!active) return null;
+        return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
+    }
+
+    /**
      * Open a route and return its connection-bound immutable handle. One
      * attempt under one bounded deadline; retry policy belongs to owners
      * above (managed `call()` owns its own allowlisted retry loop).
@@ -608,19 +642,39 @@ export class McHostClient {
 
     /** List catalog entries through a validated tagged `catalog.list`. */
     async catalogList(): Promise<CatalogEntry[]> {
+        return (await this.catalogSnapshot()).modules;
+    }
+
+    /**
+     * One strictly validated `catalog.list`: tagged generation, closed-shape
+     * host `subc_ops`, and per-module id/version/roles/control_ops. Any
+     * duplicate, missing field, or out-of-bounds value is a terminal
+     * `malformed_control_response` — never a cast.
+     *
+     * Unknown fields are *ignored*, not rejected: wire doc §7.1 makes forward
+     * compatibility the rule for this family, so a newer daemon adding a field
+     * must not strand an older client. The negotiation family (§7.7.1) is the
+     * one closed-shape exception and is validated elsewhere.
+     */
+    async catalogSnapshot(): Promise<CatalogSnapshot> {
         const deadline = Deadline.start(this.requestTimeoutMs, this.clock);
         const active = await this.ensureConnection(deadline);
         const bodyText = JSON.stringify({ op: "catalog.list" });
         const parsed = await this.controlRequest(active, bodyText, "catalog.list", deadline);
-        const modules = parsed.modules ?? [];
-        if (!Array.isArray(modules)) {
-            throw new McHostCallError(
-                "terminal",
-                "catalog.list response carried a non-array modules field",
-                "malformed_control_response",
-            );
-        }
-        return modules as CatalogEntry[];
+        return parseCatalogResponse(parsed);
+    }
+
+    /**
+     * Bounded authenticated `host.shutdown`. Resolves only after the host's
+     * correlated success response is fully received — the caller-observable
+     * stop-commit point. Never called by `close()`/`closeAsync()`; ordinary
+     * client close remains connection teardown only.
+     */
+    async hostShutdown(options: { timeoutMs?: number } = {}): Promise<void> {
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const active = await this.ensureConnection(deadline);
+        const bodyText = JSON.stringify({ op: "host.shutdown" });
+        await this.controlRequest(active, bodyText, "host.shutdown", deadline);
     }
 
     /**
@@ -741,7 +795,11 @@ export class McHostClient {
         const generation = new ConnectionGeneration({
             host: snapshot.endpoint.host,
             port: snapshot.endpoint.port,
-            credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
+            credentials: {
+                key: snapshot.key,
+                daemonId: snapshot.daemonId,
+                daemonVer: snapshot.daemonVer,
+            },
             onRetired: (info) => {
                 retiredReason = info.reason;
                 if (conn) this.onGenerationRetired(conn, info);
@@ -943,6 +1001,25 @@ export class McHostClient {
             throw failure;
         }
         const snapshot = bootstrap.snapshot;
+        // A candidate channel performs no handshake: its authority is the
+        // bootstrap's, carried across the activate-then-commit barrier. The
+        // identity is read here, before the candidate exists, so the candidate
+        // inherits it instead of adopting whatever its channel reports.
+        const inheritedDaemonVer = bootstrap.generation.daemonVer;
+        const inheritedDaemonId = bootstrap.generation.authenticatedDaemonId;
+        if (inheritedDaemonVer === null || inheritedDaemonId === null) {
+            // The bootstrap authenticates before it can negotiate, so this is
+            // unreachable; kept as a fail-closed guard because promotion off an
+            // unauthenticated generation would publish an identity that nothing
+            // proved.
+            const failure = new McHostCallError(
+                "terminal",
+                "transport promotion requires an authenticated bootstrap identity",
+                "negotiation_failed",
+            );
+            bootstrap.generation.retire("negotiation_failed", failure);
+            throw failure;
+        }
         let conn: ActiveConnection | null = null;
         let candidate: ConnectionGeneration;
         try {
@@ -953,13 +1030,24 @@ export class McHostClient {
             candidate = new ConnectionGeneration({
                 host: snapshot.endpoint.host,
                 port: snapshot.endpoint.port,
-                credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
+                credentials: {
+                    key: snapshot.key,
+                    daemonId: snapshot.daemonId,
+                    daemonVer: snapshot.daemonVer,
+                },
                 channelFactory: sanitizedCandidateFactory(
                     grant.selected.transport,
                     provider,
                     grant.descriptor,
-                    snapshot.daemonId,
+                    // The provider gets its own copy: a provider that retains
+                    // and mutates the array must not reach the identity this
+                    // candidate inherits.
+                    inheritedDaemonId.slice(),
                 ),
+                inheritedIdentity: {
+                    daemonVer: inheritedDaemonVer,
+                    daemonId: inheritedDaemonId,
+                },
                 firstCorrelation: ACTIVATION_CORRELATION,
                 onRetired: (info) => {
                     if (conn) this.onGenerationRetired(conn, info);
@@ -1249,7 +1337,11 @@ export class McHostClient {
         const generation = new ConnectionGeneration({
             host: snapshot.endpoint.host,
             port: snapshot.endpoint.port,
-            credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
+            credentials: {
+                key: snapshot.key,
+                daemonId: snapshot.daemonId,
+                daemonVer: snapshot.daemonVer,
+            },
             ...this.generationOptions,
         });
         episode.shadowGenerations.add(generation);
@@ -1936,6 +2028,100 @@ function parseResponseJson<Response = JsonValue>(terminal: RequestTerminal): Res
         "response body was not valid JSON",
         "invalid_response_body",
     );
+}
+
+const MAX_CATALOG_MODULES = 64;
+const MAX_CATALOG_OPS = 32;
+const MAX_CATALOG_ROLES = 32;
+const MAX_CATALOG_STRING_LEN = 128;
+const OP_NAME_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
+
+function malformedCatalog(detail: string): McHostCallError {
+    return new McHostCallError(
+        "terminal",
+        `catalog.list response rejected: ${detail}`,
+        "malformed_control_response",
+    );
+}
+
+function requireOpArray(value: unknown, field: string, allowEmpty: boolean): string[] {
+    if (!Array.isArray(value)) throw malformedCatalog(`${field} is not an array`);
+    if (!allowEmpty && value.length === 0) throw malformedCatalog(`${field} is empty`);
+    if (value.length > MAX_CATALOG_OPS) throw malformedCatalog(`${field} exceeds the entry cap`);
+    const seen = new Set<string>();
+    for (const entry of value) {
+        if (typeof entry !== "string" || !OP_NAME_PATTERN.test(entry)) {
+            throw malformedCatalog(`${field} carries a non-operation entry`);
+        }
+        if (seen.has(entry)) throw malformedCatalog(`${field} carries a duplicate entry`);
+        seen.add(entry);
+    }
+    return value as string[];
+}
+
+/**
+ * A `catalog.list` response is an ordinary control response, so it follows the
+ * wire doc Section 7.1 rule: unknown fields are ignored, both at the top level
+ * and inside each module entry, which lets a host add backward-compatible
+ * fields without breaking this client. The negotiation family (Section 7.7.1)
+ * is the only closed-shape exception and is decoded elsewhere. Ignoring
+ * unknown fields never relaxes the required ones: every field this snapshot
+ * exposes is still rejected when absent, wrong-typed, or out of bounds.
+ */
+function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot {
+    const generation = parsed.generation;
+    if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+        throw malformedCatalog("generation is not a nonnegative integer");
+    }
+    const subcOps = requireOpArray(parsed.subc_ops, "subc_ops", false);
+    const rawModules = parsed.modules;
+    if (!Array.isArray(rawModules)) throw malformedCatalog("modules is not an array");
+    if (rawModules.length > MAX_CATALOG_MODULES) {
+        throw malformedCatalog("modules exceeds the entry cap");
+    }
+    const seenIds = new Set<string>();
+    const modules: CatalogEntry[] = rawModules.map((raw) => {
+        if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+            throw malformedCatalog("module entry is not an object");
+        }
+        const record = raw as Record<string, unknown>;
+        const moduleId = record.module_id;
+        if (
+            typeof moduleId !== "string" ||
+            moduleId.length === 0 ||
+            moduleId.length > MAX_CATALOG_STRING_LEN
+        ) {
+            throw malformedCatalog("module_id is not a bounded nonempty string");
+        }
+        if (seenIds.has(moduleId)) throw malformedCatalog("duplicate module_id");
+        seenIds.add(moduleId);
+        const moduleVersion = record.module_version;
+        if (
+            typeof moduleVersion !== "string" ||
+            moduleVersion.length === 0 ||
+            moduleVersion.length > MAX_CATALOG_STRING_LEN
+        ) {
+            throw malformedCatalog("module_version is not a bounded nonempty string");
+        }
+        // Count-bounded but deliberately not element-validated: `roles` is an
+        // opaque pass-through the protocol requires to survive intact, so it is
+        // typed `unknown[]` rather than cast to a shape this client would be
+        // guessing at. The whole body is already capped by
+        // MAX_CONTROL_BODY_LEN, so an unvalidated element is not a resource
+        // risk; any consumer that interprets a role must narrow it itself.
+        const roles = record.roles;
+        if (!Array.isArray(roles) || roles.length > MAX_CATALOG_ROLES) {
+            throw malformedCatalog("roles is not a bounded array");
+        }
+        const controlOps = requireOpArray(record.control_ops, "control_ops", true);
+        return {
+            module_id: moduleId,
+            module_version: moduleVersion,
+            roles,
+            control_ops: controlOps,
+        };
+    });
+    return { generation, subcOps, modules };
 }
 
 function wrapNegotiationError(error: unknown): Error {
