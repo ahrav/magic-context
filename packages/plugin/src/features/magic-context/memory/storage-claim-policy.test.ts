@@ -4,6 +4,8 @@ import { describe, expect, test } from "bun:test";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createDirectTestDatabase } from "../test-database";
+import { createAntiMemory } from "./storage-anti-memory";
+import { recordClaimUsage } from "./storage-claim-operations";
 import {
     advanceProjectorWatermarkInCurrentTransaction,
     appendMaturityAssertionInCurrentTransaction,
@@ -24,6 +26,7 @@ import {
     refreshEffectivePolicyInCurrentTransaction,
     revokeEnforcementArtifactInCurrentTransaction,
 } from "./storage-claim-policy";
+import { ensureProject } from "./storage-claims";
 
 interface Fixture {
     db: Database;
@@ -153,6 +156,76 @@ function approve(fx: Fixture, revisionId: number, identity: string) {
 }
 
 describe("claim policy storage kernel", () => {
+    test("anti-memory rejected disposition remains joinable to usage", () => {
+        const db = createDirectTestDatabase().db;
+        try {
+            const result = createAntiMemory(
+                db,
+                { producer: "policy-test", operationKey: "seed-retirement" },
+                {
+                    projectId: ensureProject(db, "git:retirement"),
+                    payload: {
+                        trigger: "session caching",
+                        rejectedStrategy: "Redis",
+                        rejectionReason: "split ownership",
+                    },
+                    provenance: {
+                        sourceLocator: "test://retirement",
+                        sourceContent: "Redis rejected",
+                        extractor: "test",
+                        extractorVersion: "1",
+                        extractorRunId: "seed",
+                        independenceKey: "retirement",
+                        sourceTrustClass: "explicit_user",
+                    },
+                    actor: "user:test",
+                },
+            );
+            const publicClaimId = (result.result.payload as { claim: { publicClaimId: string } })
+                .claim.publicClaimId;
+            const target = db
+                .prepare(
+                    `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                       FROM claim_public_ids public
+                       JOIN claims ON claims.id = public.claim_id
+                      WHERE public.public_id = ?`,
+                )
+                .get(publicClaimId) as { revisionId: number; projectId: number };
+
+            recordClaimUsage(db, { publicClaimIds: [publicClaimId], kind: "retrieved" });
+            const eventId = db
+                .transaction(() => {
+                    const id = recordDispositionEventInCurrentTransaction(db, {
+                        revisionId: target.revisionId,
+                        projectId: target.projectId,
+                        disposition: "rejected",
+                        action: "assert",
+                        actor: "user:test",
+                        reason: "false warning",
+                    });
+                    refreshEffectivePolicyInCurrentTransaction(db, target.revisionId);
+                    return id;
+                })
+                .immediate();
+            expect(eventId).toBeGreaterThan(0);
+            expect(
+                db
+                    .prepare(
+                        `SELECT usage.retrieval_count AS deliveries, dispositions.reason
+                           FROM claim_usage_stats usage
+                           JOIN claims ON claims.id = usage.claim_id
+                           JOIN claim_disposition_events dispositions
+                             ON dispositions.revision_id = claims.current_revision_id
+                          WHERE claims.id = (SELECT claim_id FROM claim_public_ids WHERE public_id = ?)
+                            AND dispositions.disposition = 'rejected'`,
+                    )
+                    .get(publicClaimId),
+            ).toEqual({ deliveries: 1, reason: "false warning" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("policy subjects freeze once and replay idempotently", () => {
         const fx = fixture();
         try {

@@ -147,7 +147,7 @@ describe("current-state provider: hydration", () => {
 });
 
 describe("current-state provider: anti-memory surface exclusion", () => {
-    test("denies every non-explicit surface while preserving explicit search", () => {
+    test("denies auto-inject and hygiene while preserving explicit search and verification", () => {
         const ctx = setup();
         try {
             const positive = createClaimOp(ctx, "positive", "Positive fact.");
@@ -168,15 +168,11 @@ describe("current-state provider: anti-memory surface exclusion", () => {
             );
             const antiId = publicIdOf(anti);
 
-            // The maintenance lanes feed the dreamer curate/verify pipeline,
-            // which re-creates content it consumes; a rejected approach that
-            // reaches them can be laundered back into positive memory, so the
-            // exclusion must cover every surface except explicit search.
-            for (const surface of [
-                "auto_inject",
-                "maintenance_hygiene",
-                "maintenance_verification",
-            ] as const) {
+            // Laundering happens when a lane re-creates content it consumed
+            // into a NEW row: the rewrite can drop the negation and resurrect
+            // the rejected approach under a positive category. Curate and
+            // hygiene do that, so they must never see a warning.
+            for (const surface of ["auto_inject", "maintenance_hygiene"] as const) {
                 const automatic = readProjectMemoryCurrentState(ctx.db, {
                     projectIds: [ctx.projectId],
                     surface,
@@ -189,14 +185,20 @@ describe("current-state provider: anti-memory surface exclusion", () => {
                 ]);
             }
 
-            const explicit = readProjectMemoryCurrentState(ctx.db, {
-                projectIds: [ctx.projectId],
-                surface: "explicit_search",
-                nowMs: 2,
-            });
-            expect(explicit.status).toBe("ok");
-            if (explicit.status !== "ok") throw new Error("unreachable");
-            expect(explicit.items.map((item) => item.publicClaimId)).toContain(antiId);
+            // Verification re-judges a warning in place — renew, demote, or
+            // revise under the same category through the typed writer — so it
+            // cannot mint a positive-category copy and must see the row. Denying
+            // it would leave a warning un-re-judged until its TTL lapsed.
+            for (const surface of ["explicit_search", "maintenance_verification"] as const) {
+                const visible = readProjectMemoryCurrentState(ctx.db, {
+                    projectIds: [ctx.projectId],
+                    surface,
+                    nowMs: 2,
+                });
+                expect(visible.status).toBe("ok");
+                if (visible.status !== "ok") throw new Error("unreachable");
+                expect(visible.items.map((item) => item.publicClaimId)).toContain(antiId);
+            }
         } finally {
             closeQuietly(ctx.db);
         }

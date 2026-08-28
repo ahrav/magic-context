@@ -31,6 +31,23 @@ function commit(message: string, daysAgo = 3): UnifiedSearchResult {
     };
 }
 
+function antiMemory(id: string, strategy: string): UnifiedSearchResult {
+    return {
+        source: "anti_memory",
+        score: 0.95,
+        publicClaimId: id,
+        revisionLocator: `${id}/r1/${"a".repeat(64)}`,
+        contentDigest: "a".repeat(64),
+        claimId: 1,
+        normalizedHash: "b".repeat(64),
+        trigger: "session caching",
+        rejectedStrategy: strategy,
+        rejectionReason: "it creates split ownership",
+        saferAlternative: "use SQLite",
+        matchType: "lexical",
+    };
+}
+
 describe("buildAutoSearchHint", () => {
     it("returns null for empty results", () => {
         expect(buildAutoSearchHint([])).toBeNull();
@@ -128,6 +145,38 @@ describe("buildAutoSearchHint", () => {
         expect(hint).not.toBeNull();
         const bullet = (hint ?? "").split("\n").find((line) => line.startsWith("- "));
         expect(Buffer.byteLength(bullet ?? "", "utf8")).toBeLessThanOrEqual(MAX_RENDER_FIELD_BYTES);
+    });
+
+    it("puts one bounded warning first and stays inside the hint budget", () => {
+        const first = antiMemory(`mcm_${"a".repeat(32)}`, "Redis");
+        const second = antiMemory(`mcm_${"b".repeat(32)}`, "Memcached");
+        const packed = packAutoSearchHint([memory("ordinary fragment"), second, first]);
+
+        expect(packed.text).toContain("⚠ Previously rejected: Memcached");
+        expect(packed.text).toContain("Reason: it creates split ownership");
+        expect(packed.text).not.toContain("Previously rejected: Redis");
+        expect(packed.delivered.filter((result) => result.source === "anti_memory")).toHaveLength(
+            1,
+        );
+        expect(packed.delivered[0]).toBe(second);
+        expect(packed.tokenCount).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
+    });
+
+    it("keeps a full-structure warning when every dynamic field is oversized", () => {
+        const warning = antiMemory(`mcm_${"c".repeat(32)}`, "x".repeat(20_000));
+        if (warning.source !== "anti_memory") throw new Error("expected anti-memory fixture");
+        warning.rejectionReason = "y".repeat(20_000);
+        warning.saferAlternative = "z".repeat(20_000);
+
+        const packed = packAutoSearchHint([warning], { fragmentCharCap: 220 });
+        expect(packed.text).not.toBeNull();
+        expect(packed.delivered).toEqual([warning]);
+        expect(packed.tokenCount).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
+        expect(packed.text).toContain("⚠ Previously rejected:");
+        expect(packed.text).toContain("Reason:");
+        expect(packed.text).toContain("Safer alternative:");
+        expect(packed.text).toContain("Verify before proceeding:");
+        expect(packed.text?.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(1);
     });
 });
 

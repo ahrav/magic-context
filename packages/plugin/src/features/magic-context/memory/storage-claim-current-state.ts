@@ -52,6 +52,45 @@ export type ProjectMemorySurface =
     | "maintenance_hygiene"
     | "maintenance_verification";
 
+/**
+ * The only surfaces a rejected approach may reach.
+ *
+ * Anti-memory rows are stored warnings: approaches the user rejected. Two
+ * invariants keep a warning from being laundered back into positive guidance,
+ * and this set is the whole of the first one.
+ *
+ * VISIBILITY — this set is the sole authority for which surfaces may see an
+ * anti-memory row, enforced twice below: once in the candidate query so hot
+ * surfaces do not hydrate rows they cannot use, and once in `surfaceDecision`,
+ * which is authoritative. A reader must not source anti-memory rows for a
+ * surface absent from this set by going around the provider.
+ *   - `explicit_search`: the user asked for warnings; showing them is the point.
+ *   - `maintenance_verification`: re-judges a row IN PLACE — renews its TTL,
+ *     demotes it to stale, or revises its content under the SAME category
+ *     through the typed writer, which never passes a category. It cannot mint a
+ *     positive-category copy, so it cannot launder. It is already the one lane
+ *     trusted to see `stale` and `disputed` rows below, for the same reason.
+ *     Denying it would leave a warning un-re-judged until its TTL lapsed, which
+ *     is worse: a user-corroborated warning reaches VERIFIED maturity from its
+ *     evidence alone (`automaticMaturityTarget`), so it would keep auto-injecting
+ *     long after the rejection stopped being true.
+ *   - `auto_inject` and `maintenance_hygiene` are denied. Curate and hygiene
+ *     passes re-create content into NEW rows, and a rewrite can drop the
+ *     negation and resurrect the rejected approach under a positive category.
+ *
+ * MUTATION — the second invariant, enforced elsewhere: every write to an
+ * anti-memory row goes through the typed API in `storage-anti-memory.ts`, which
+ * preserves the category and the TTL and outcome vocabulary. Generic revision
+ * paths refuse the category (`refuseGenericAntiMemoryRevisionAccess`).
+ *
+ * Adding a surface here grants it sight of rejected approaches. Never add one
+ * whose lane can re-create content under a different category.
+ */
+const ANTI_MEMORY_VISIBLE_SURFACES: ReadonlySet<ProjectMemorySurface> = new Set([
+    "explicit_search",
+    "maintenance_verification",
+]);
+
 export interface ProjectMemoryWorkspaceAuthorization {
     /** Projects owned by the active workspace member. */
     ownProjectIds: readonly number[];
@@ -167,11 +206,11 @@ function resolveCandidates(
             "current-state reads require public locators or an authorized project set",
         );
     }
-    // Anti-memory is only reachable through explicit search; filtering it in
-    // the candidate query keeps the hot automatic surfaces from paying full
-    // hydration for rows `surfaceDecision` (the authoritative check, kept as
-    // defence in depth) would discard anyway.
-    if ((request.surface ?? "explicit_search") !== "explicit_search") {
+    // Anti-memory is reachable through explicit search and the verification
+    // lane only; filtering it in the candidate query keeps the hot automatic
+    // surfaces from paying full hydration for rows `surfaceDecision` (the
+    // authoritative check, kept as defence in depth) would discard anyway.
+    if (!ANTI_MEMORY_VISIBLE_SURFACES.has(request.surface ?? "explicit_search")) {
         clauses.push(`NOT ${antiMemoryClaimSql("claims.current_revision_id")}`);
     }
     return db
@@ -374,12 +413,11 @@ function surfaceDecision(
     if (item.expiresAt !== null && item.expiresAt <= nowMs) {
         return { eligible: false, label: null };
     }
-    // Rejected approaches are reachable only through explicit search. Every
-    // other surface — automatic injection AND the dreamer maintenance lanes —
-    // must never see them: a maintenance curate pass that consumes one can
-    // re-create its content under a positive category, laundering a rejected
-    // approach back into auto-injected memory.
-    if (item.category === ANTI_MEMORY_CATEGORY && surface !== "explicit_search") {
+    // Rejected approaches reach only the surfaces in
+    // ANTI_MEMORY_VISIBLE_SURFACES; that set carries the reasoning. This is the
+    // authoritative check, and the candidate query filters the same set early so
+    // hot surfaces do not pay hydration for rows discarded here.
+    if (item.category === ANTI_MEMORY_CATEGORY && !ANTI_MEMORY_VISIBLE_SURFACES.has(surface)) {
         return { eligible: false, label: null };
     }
     const facts = item.dispositions;

@@ -247,6 +247,9 @@ describe("trace neutrality", () => {
         const spans = collect.spans;
         expect(spans.filter((span) => span.stage === "root")).toHaveLength(1);
         expect(spanOf(spans, "query_inference", "query").status).toBe("ok");
+        const antiMemory = spanOf(spans, "fusion", "memory");
+        expect(antiMemory.status).toBe("ok");
+        expect(spanOf(spans, "fusion", "unified").dependsOn).toContain(antiMemory.id);
         expect(spanOf(spans, "reranking", "unified").status).toBe("not_applicable");
         expect(spanOf(spans, "packing", "unified").status).toBe("not_applicable");
         const analysis = analyzeSearchTrace(spans);

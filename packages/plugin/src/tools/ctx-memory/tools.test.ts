@@ -142,10 +142,20 @@ describe("ctx_memory anti-memory write union", () => {
                 rejectedStrategy: "Use Redis",
                 rejectionReason: "The project must work offline",
                 saferAlternative: "Use SQLite",
+                preconditions: "offline operation",
+                attemptedApproach: "external cache",
+                observedFailure: "startup failed",
+                rootCause: "network dependency",
+                recovery: "remove Redis",
+                nonApplicableWhen: null,
             };
             const created = parseResult(
                 await tool.execute(
-                    { action: "create", category: "REJECTED_APPROACH", antiMemory: payload },
+                    reduced({
+                        action: "create",
+                        category: "REJECTED_APPROACH",
+                        antiMemory: payload,
+                    }),
                     "call-anti-create",
                 ),
             );

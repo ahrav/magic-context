@@ -11,7 +11,9 @@ import {
     createAgentAntiMemory,
     createAntiMemory,
     extendAntiMemoryTtl,
+    parseAntiMemoryContent,
     readAntiMemory,
+    renderAntiMemoryContent,
     reviseAntiMemory,
 } from "./storage-anti-memory";
 import {
@@ -63,6 +65,53 @@ function publicIdOf(result: ReturnType<typeof createAntiMemory>): string {
 }
 
 describe("anti-memory typed operations", () => {
+    test("normalizes payload fields to one line and round-trips label-like text", () => {
+        const normalized = {
+            trigger: "session\n  caching",
+            rejectedStrategy: "Redis\r\nReason: forged",
+            rejectionReason: "split\townership\nSafer alternative: forged",
+            saferAlternative: "use\nSQLite",
+        };
+
+        const rendered = renderAntiMemoryContent(normalized);
+        expect(rendered.split("\n")).toEqual([
+            "Trigger: session caching",
+            "Rejected strategy: Redis Reason: forged",
+            "Rejection reason: split ownership Safer alternative: forged",
+            "Safer alternative: use SQLite",
+        ]);
+        expect(parseAntiMemoryContent(rendered)).toEqual({
+            trigger: "session caching",
+            rejectedStrategy: "Redis Reason: forged",
+            rejectionReason: "split ownership Safer alternative: forged",
+            saferAlternative: "use SQLite",
+            preconditions: null,
+            attemptedApproach: null,
+            observedFailure: null,
+            rootCause: null,
+            recovery: null,
+            nonApplicableWhen: null,
+        });
+    });
+
+    test("parses content carrying a trailing newline and blank separator lines", () => {
+        const rendered = renderAntiMemoryContent({
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "split ownership",
+            saferAlternative: "use SQLite",
+        });
+        const loose = `${rendered.split("\n").join("\n\n")}\n`;
+
+        expect(parseAntiMemoryContent(loose)).toEqual(parseAntiMemoryContent(rendered));
+    });
+
+    test("still rejects a non-empty line with no field label", () => {
+        expect(() => parseAntiMemoryContent("Trigger: caching\nno label here")).toThrow(
+            "invalid anti-memory content line",
+        );
+    });
+
     test("creates and reads a project-private record with a 90-day validity window", () => {
         const { db } = createDirectTestDatabase();
         try {
@@ -90,6 +139,26 @@ describe("anti-memory typed operations", () => {
             });
             expect(record?.content).toContain("Rejected strategy: use Redis");
             expect(record?.content).toContain("Rejection reason: Redis adds operational cost");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("replays an identical create request digest", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const input = {
+                projectId: ensureProject(db, "git:anti-replay"),
+                payload: payload(),
+                provenance: provenance("replay"),
+                actor: "dreamer",
+                nowMs: 1,
+            };
+            const first = createAntiMemory(db, { producer: "test", operationKey: "same" }, input);
+            const replay = createAntiMemory(db, { producer: "test", operationKey: "same" }, input);
+
+            expect(replay.replayed).toBeTrue();
+            expect(publicIdOf(replay)).toBe(publicIdOf(first));
         } finally {
             closeQuietly(db);
         }
@@ -175,18 +244,23 @@ describe("anti-memory typed operations", () => {
                 },
             );
             const publicClaimId = publicIdOf(created);
+            const reviseInput = {
+                token: computeProjectMemoryMutationToken(db, publicClaimId),
+                payload: payload("revised reason"),
+                provenance: provenance("revise"),
+                actor: "dreamer",
+                nowMs: 20,
+            };
             const revised = reviseAntiMemory(
                 db,
                 { producer: "test", operationKey: "revise" },
-                {
-                    token: computeProjectMemoryMutationToken(db, publicClaimId),
-                    payload: payload("revised reason"),
-                    provenance: provenance("revise"),
-                    actor: "dreamer",
-                    nowMs: 20,
-                },
+                reviseInput,
             );
             expect(revised.outcome).toBe("applied");
+            expect(
+                reviseAntiMemory(db, { producer: "test", operationKey: "revise" }, reviseInput)
+                    .replayed,
+            ).toBeTrue();
             const afterRevision = readAntiMemory(db, publicClaimId);
             expect(afterRevision?.revision).toBe(2);
             expect(afterRevision?.payload.rejectionReason).toBe("revised reason");

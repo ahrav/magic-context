@@ -2023,10 +2023,11 @@ export interface RecordProjectMemoryVerificationInput {
 }
 
 /** Transaction-local domain stage for composition inside one outer claim operation. */
-export function stageRecordProjectMemoryVerificationInCurrentTransaction(
+function stageVerificationEventInCurrentTransaction(
     db: Database,
     input: RecordProjectMemoryVerificationInput,
     nowMs: number,
+    antiMemory: "refuse" | "require",
 ): ClaimOperationStageOutcome {
     const validation = validateProjectMemoryMutationToken(db, input.token);
     if (!validation.ok) {
@@ -2040,7 +2041,18 @@ export function stageRecordProjectMemoryVerificationInCurrentTransaction(
             reason: `revision: verification targets ${input.revisionLocator} but current is ${expectedLocator}`,
         };
     }
-    refuseGenericAntiMemoryRevisionAccess(db, claim.currentRevisionId, "verification");
+    // Each entry point admits exactly one category class, so neither is a side
+    // door into the other: the generic recorder refuses anti-memory, and the
+    // typed recorder accepts nothing else.
+    if (antiMemory === "refuse") {
+        refuseGenericAntiMemoryRevisionAccess(db, claim.currentRevisionId, "verification");
+    } else if (
+        readRevisionAttributes(db, claim.currentRevisionId)?.category !== ANTI_MEMORY_CATEGORY
+    ) {
+        throw new ClaimOperationInputError(
+            "typed anti-memory verification requires an anti-memory claim",
+        );
+    }
     db.prepare(
         `INSERT INTO verification_events (revision_id, observation_id, outcome, verifier, created_at)
          VALUES (?, NULL, ?, ?, ?)`,
@@ -2063,6 +2075,33 @@ export function stageRecordProjectMemoryVerificationInCurrentTransaction(
         ],
         policyRevisionIds: [claim.currentRevisionId],
     };
+}
+
+export function stageRecordProjectMemoryVerificationInCurrentTransaction(
+    db: Database,
+    input: RecordProjectMemoryVerificationInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    return stageVerificationEventInCurrentTransaction(db, input, nowMs, "refuse");
+}
+
+/**
+ * Record a verification outcome against an anti-memory claim.
+ *
+ * The generic recorder refuses this category because a generic revision path
+ * drops the TTL, outcome, and scope invariants the typed writer maintains. A
+ * verification event carries none of that state — it appends an outcome against
+ * the current revision and touches neither content nor category — so the
+ * verification lane needs an entry point that is allowed to record one. This is
+ * the API that refusal message names; re-exported from `storage-anti-memory.ts`
+ * so the typed surface is where a caller looks for it.
+ */
+export function stageAntiMemoryVerificationInCurrentTransaction(
+    db: Database,
+    input: RecordProjectMemoryVerificationInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    return stageVerificationEventInCurrentTransaction(db, input, nowMs, "require");
 }
 
 /** Append one verification event against the exact current revision and
@@ -2103,6 +2142,7 @@ export function recordClaimUsage(
         nowMs?: number;
     },
 ): void {
+    if (args.publicClaimIds.length === 0) return;
     const nowMs = args.nowMs ?? Date.now();
     const column = args.kind === "seen" ? "seen_count" : "retrieval_count";
     const stamp = args.kind === "seen" ? "last_seen_at" : "last_retrieved_at";
@@ -2118,6 +2158,33 @@ export function recordClaimUsage(
             update.run(nowMs, nowMs, publicClaimId);
         }
     }).immediate();
+}
+
+/**
+ * Count each DELIVERED anti-memory warning exactly once as `retrieved`.
+ *
+ * The shared search resolver deliberately counts only `memory`-source usage,
+ * so warning retrieval telemetry is a delivery-surface obligation. Every
+ * surface that renders packed results (explicit tools, auto-search runners)
+ * must call this one entry point instead of restating the filter, or a new
+ * consumer silently loses warning counters.
+ */
+export function recordDeliveredAntiMemoryUsage(
+    db: Database,
+    delivered: readonly { source: string; publicClaimId?: string }[],
+    nowMs?: number,
+): void {
+    const publicClaimIds = delivered.flatMap((result) =>
+        result.source === "anti_memory" && result.publicClaimId !== undefined
+            ? [result.publicClaimId]
+            : [],
+    );
+    if (publicClaimIds.length === 0) return;
+    recordClaimUsage(db, {
+        publicClaimIds,
+        kind: "retrieved",
+        ...(nowMs === undefined ? {} : { nowMs }),
+    });
 }
 
 // ---------------------------------------------------------------------------

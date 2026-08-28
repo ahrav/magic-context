@@ -568,26 +568,27 @@ Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands.
 }
 ```
 
-### ctx_search — description ~336 tokens, params ~238 tokens (total ~574)
+### ctx_search — description ~335 tokens, params ~226 tokens (total ~561)
 
 **Description:**
 
 ```
 Your long-term recall for this project — search everything that ever happened here, not just what's currently visible.
 
-Reach for it when something feels familiar but isn't in view: "did we solve this before?", "what did we decide about X?", "when did this break?", "where does Y live?". Results only contain things you CANNOT currently see — claims already shown in <project-memory> and the live conversation tail are filtered out. Only a query that is entirely opaque public claim ids (`mcm_<32hex>`) or full revision locators bypasses text search and resolves those claims directly; a numeric id is ordinary search text.
+Reach for it when something feels familiar but isn't in view: "did we solve this before?", "what did we reject?", "when did this break?", "where does Y live?". Results only contain things you CANNOT currently see — claims already shown in <project-memory> and the live conversation tail are filtered out. Rejected-approach claims are searchable warnings. A query that is entirely opaque public claim ids (`mcm_<32hex>`) or full revision locators resolves claims directly; a numeric id is ordinary search text.
 
 Sources (omit for a broad search across all):
 - message: the raw conversation behind your compacted history. Hits include message ordinals — expand the surrounding exchange with ctx_expand(start=N-10, end=N+5).
 - git_commit: this repository's commit history.
 - note: parked decisions, follow-ups, and dismissed notes with their recorded text.
-- memory: accepted but empty — broad project-memory retrieval is disabled until the claim retrieval projection is active. Claims are reachable only by exact locator.
+- memory: rejected-approach warnings plus exact positive-memory locators. Broad positive-memory text retrieval remains disabled.
 
 Picking sources:
 - "when did this change / was this working before" → ["git_commit", "message"]
 - "did we discuss this earlier" → ["message"]
 - "did we decide something about this / leave a follow-up" → ["note"]
-- "what's our convention / rule for X" → no source serves claims by text; use the claim's locator
+- "did we reject this approach" → ["memory"]
+- "what's our convention / rule for X" → use its locator
 ```
 
 **Parameters (JSON Schema per parameter, as serialized to the provider):**
@@ -595,7 +596,7 @@ Picking sources:
 ```json
 {
   "query": {
-    "description": "Search query. Matches against Primers, git commit messages, notes, and raw user/assistant message text. Project-memory claims are NOT text-searchable; a query that is only opaque public claim ids (mcm_<32hex>) or full revision locators resolves those claims directly.",
+    "description": "Search query. Matches rejected-approach warnings, Primers, git commit messages, notes, and raw user/assistant message text. Positive project-memory claims require an opaque public claim id (mcm_<32hex>) or full revision locator.",
     "type": "string"
   },
   "limit": {
@@ -603,7 +604,7 @@ Picking sources:
     "type": "number"
   },
   "sources": {
-    "description": "Optional. Restrict to specific sources. Examples: [\"primer\"] for standing project explanations, [\"git_commit\"] for \"when did we change X\", [\"message\"] for \"did we discuss this earlier\", [\"note\"] for parked decisions or follow-ups, [\"git_commit\",\"message\"] for regression hunts. [\"memory\"] is accepted but returns nothing: broad project-memory retrieval is disabled until the claim retrieval projection is active. Omit for a broad search across all enabled sources; pass [] to search no sources.",
+    "description": "Optional. Restrict to specific sources. Examples: [\"primer\"] for standing project explanations, [\"git_commit\"] for \"when did we change X\", [\"message\"] for \"did we discuss this earlier\", [\"note\"] for parked decisions or follow-ups, [\"git_commit\",\"message\"] for regression hunts. [\"memory\"] searches rejected-approach warnings and resolves exact positive-memory locators; broad positive-memory text retrieval remains disabled. Omit for all enabled sources; pass [] to search no sources.",
     "type": "array",
     "items": {
       "type": "string",

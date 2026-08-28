@@ -9,11 +9,15 @@
  * hints, and omission notice.
  */
 
-import type { UnifiedSearchResult } from "../../features/magic-context/search";
+import type {
+    AntiMemorySearchResult,
+    UnifiedSearchResult,
+} from "../../features/magic-context/search";
 import {
     binarySearchLargestFit,
     boundDynamicField,
     MAX_RENDERED_RESULT_TOKENS,
+    renderAntiMemoryWarningLine,
 } from "../../features/magic-context/search-bounds";
 import { formatAge } from "../../shared/format-age";
 import { estimateTokens } from "../../shared/token-estimator";
@@ -23,12 +27,32 @@ const NOTE_EXPAND_HINT =
 const MESSAGE_EXPAND_HINT =
     "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.";
 
+export function renderAntiMemoryWarning(result: AntiMemorySearchResult): string {
+    return renderAntiMemoryWarningLine({
+        trigger: result.trigger,
+        rejectedStrategy: result.rejectedStrategy,
+        rejectionReason: result.rejectionReason,
+        saferAlternative: result.saferAlternative,
+        boundField: boundDynamicField,
+        citation: result.publicClaimId,
+    });
+}
+
 function formatResult(
     result: UnifiedSearchResult,
     index: number,
     currentSessionId: string,
     nowMs: number,
 ): string {
+    if (result.source === "anti_memory") {
+        const policy = result.policyLabel
+            ? ` status=${boundDynamicField(result.policyLabel)}`
+            : " status=active";
+        return [
+            `[${index}] [anti-memory warning] score=${result.score.toFixed(2)} id=${result.publicClaimId} match=${result.matchType}${policy}`,
+            renderAntiMemoryWarning(result),
+        ].join("\n");
+    }
     if (result.source === "memory") {
         const source = result.sourceName ? ` source=${boundDynamicField(result.sourceName)}` : "";
         const policy = result.policyLabel
@@ -199,13 +223,4 @@ export function packSearchResults(
         omittedCount: results.length,
         reason: "packer-empty",
     };
-}
-
-export function formatSearchResults(
-    query: string,
-    results: UnifiedSearchResult[],
-    currentSessionId: string,
-    nowMs: number = Date.now(),
-): string {
-    return packSearchResults(query, results, currentSessionId, nowMs).text;
 }

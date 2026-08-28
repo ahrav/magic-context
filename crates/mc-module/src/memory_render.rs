@@ -84,6 +84,31 @@ pub enum MirroredClaimMemoryError {
     },
 }
 
+impl std::fmt::Display for MirroredClaimMemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inactive { public_claim_id } => {
+                write!(f, "mirrored claim {public_claim_id} is inactive")
+            }
+            Self::MissingCategory { public_claim_id } => {
+                write!(f, "mirrored claim {public_claim_id} has no category")
+            }
+            Self::NonPositiveCategory {
+                public_claim_id,
+                category,
+            } => write!(
+                f,
+                "mirrored claim {public_claim_id} has non-positive category {category}"
+            ),
+            Self::MissingImportance { public_claim_id } => {
+                write!(f, "mirrored claim {public_claim_id} has no importance")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MirroredClaimMemoryError {}
+
 impl TryFrom<&CommittedClaimMirrorRow> for MirroredClaimMemory {
     type Error = MirroredClaimMemoryError;
 

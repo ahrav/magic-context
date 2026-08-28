@@ -126,10 +126,21 @@ describe("Pi ctx_memory anti-memory write union", () => {
 				trigger: "Choosing a cache backend",
 				rejectedStrategy: "Use Redis",
 				rejectionReason: "The project must work offline",
+				saferAlternative: "Use SQLite",
+				preconditions: "offline operation",
+				attemptedApproach: "external cache",
+				observedFailure: "startup failed",
+				rootCause: "network dependency",
+				recovery: "remove Redis",
+				nonApplicableWhen: null,
 			};
 			const created = parseResult(
 				await tool.execute(
-					{ action: "create", category: "REJECTED_APPROACH", antiMemory },
+					reduced({
+						action: "create",
+						category: "REJECTED_APPROACH",
+						antiMemory,
+					}),
 					"call-anti-create",
 				),
 			);

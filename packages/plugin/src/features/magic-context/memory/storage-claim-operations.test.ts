@@ -1638,6 +1638,23 @@ describe("claim operations: mapping and verification (scenario 14)", () => {
 });
 
 describe("claim usage telemetry (R3)", () => {
+    test("empty usage batches do not open a transaction", () => {
+        const ctx = setup();
+        try {
+            const originalTransaction = ctx.db.transaction.bind(ctx.db);
+            let transactions = 0;
+            ctx.db.transaction = ((callback: () => unknown) => {
+                transactions += 1;
+                return originalTransaction(callback);
+            }) as typeof ctx.db.transaction;
+
+            recordClaimUsage(ctx.db, { publicClaimIds: [], kind: "retrieved" });
+            expect(transactions).toBe(0);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("counters mutate without receipts or generation movement", () => {
         const ctx = setup();
         try {

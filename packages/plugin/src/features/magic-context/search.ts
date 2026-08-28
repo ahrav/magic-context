@@ -9,9 +9,21 @@ import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
 import { readProjectIdentityMap } from "./memory/claim-memory-render";
 import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-operation-contract";
+import { CLAIM_POLICY_VERSION } from "./memory/claim-visibility-policy";
+import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
-import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
+import {
+    embedBatchForProject,
+    embedText,
+    getProjectEmbeddingSnapshot,
+    isEmbeddingEnabled,
+} from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
+import {
+    listActiveAntiMemoryPublicIds,
+    readAntiMemories,
+    readAntiMemory,
+} from "./memory/storage-anti-memory";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
@@ -26,6 +38,7 @@ import {
     normalizeSearchResultLimit,
     prepareExplicitQuery,
     QueryBoundsError,
+    truncateUtf8Bytes,
 } from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
 import {
@@ -73,6 +86,19 @@ const MEMORY_SOURCE_BOOST = 1.3;
 const MESSAGE_SOURCE_BOOST = 1.15;
 const GIT_COMMIT_SOURCE_BOOST = 1.2;
 const PRIMER_SOURCE_BOOST = 1.25;
+const ANTI_MEMORY_SEMANTIC_THRESHOLD = 0.7;
+/** Ceiling on candidate texts sent to the embedding provider per search.
+ *  Anti-memory passage vectors are computed live (nothing persists them),
+ *  and this lane runs on the per-user-prompt auto-search path, so the batch
+ *  must not scale with the record population. Lexically matched candidates
+ *  keep priority; the remainder of the budget goes to the newest records. */
+const ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES = 32;
+/** Ceiling on the bytes of one anti-memory passage handed to the embedding
+ *  provider and scanned for lexical overlap. Payload fields are normalized but
+ *  not length-limited at write time, so without this a single oversized record
+ *  could exceed the provider's input budget or spend the whole per-prompt
+ *  deadline. Paired with the candidate ceiling above, it bounds a batch. */
+const ANTI_MEMORY_MAX_PASSAGE_BYTES = 2048;
 
 interface MessageSearchRow {
     messageOrdinal?: number | string;
@@ -140,6 +166,11 @@ export interface UnifiedSearchOptions {
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ) => Promise<CapturedQueryEmbedding | Float32Array | null>;
+    embedPassages?: (
+        texts: string[],
+        signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
+    ) => Promise<(Float32Array | null)[]>;
     isEmbeddingRuntimeEnabled?: () => boolean;
     /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
     maxMessageOrdinal?: number;
@@ -201,6 +232,22 @@ export interface MemorySearchResult {
     contentDigest?: string;
 }
 
+export interface AntiMemorySearchResult {
+    source: "anti_memory";
+    score: number;
+    publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
+    claimId: number;
+    normalizedHash: string;
+    trigger: string;
+    rejectedStrategy: string;
+    rejectionReason: string;
+    saferAlternative: string | null;
+    matchType: "exact" | "lexical" | "semantic";
+    policyLabel?: string;
+}
+
 export interface MessageSearchResult {
     source: "message";
     content: string;
@@ -258,6 +305,7 @@ export interface NoteSearchResult {
 
 export type UnifiedSearchResult =
     | MemorySearchResult
+    | AntiMemorySearchResult
     | MessageSearchResult
     | CompartmentSearchResult
     | GitCommitSearchResult
@@ -768,6 +816,267 @@ function tokenizeKeywordNeedle(text: string): string[] {
     return tokens;
 }
 
+async function searchAntiMemories(args: {
+    db: Database;
+    projectPath: string;
+    query: string;
+    limit: number;
+    surface: "auto_search" | "explicit_search";
+    queryEmbedding: Float32Array | null;
+    embedPassages: (
+        texts: string[],
+        signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
+    ) => Promise<(Float32Array | null)[]>;
+    signal?: AbortSignal;
+}): Promise<AntiMemorySearchResult[]> {
+    const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
+    const projectIds = resolveProjectIdsForIdentities(
+        args.db,
+        workspace.isWorkspaced ? workspace.expandedIdentities : [args.projectPath],
+    );
+    if (projectIds.length === 0) return [];
+    const ownProjectIds = resolveProjectIdsForIdentities(
+        args.db,
+        workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
+    );
+    // Bounded candidate listing first: hydrating current state for the whole
+    // project claim set just to keep the anti-memory category would make this
+    // per-prompt lane O(all active claims). The id list is capped like every
+    // sibling lane and scopes the provider read below to anti-memory claims.
+    //
+    // Listed from the caller's own projects, not the expanded workspace set.
+    // Anti-memory records are written `sharing: "private"`, so a co-member's
+    // warning can never clear the authorization step below — including it here
+    // would let newer foreign rows consume the ceiling and then be dropped,
+    // hiding the caller's own warnings behind claims they can never see.
+    const candidateIds = listActiveAntiMemoryPublicIds(
+        args.db,
+        ownProjectIds,
+        MAX_LANE_CANDIDATES,
+        Date.now(),
+    );
+    if (candidateIds.length === 0) return [];
+    // One closure = one authorization/surface/lifecycle setting, shared by the
+    // hydration read and the post-embedding recheck below, so the two reads
+    // cannot drift: the provider stays the single authority on visibility.
+    //
+    // `stale` is a routine outcome, not a failure: the provider reports it when
+    // a project, policy, or workspace generation moves during hydration, which
+    // any concurrent claim write can cause. Giving up on the first one would
+    // drop the whole warning lane for an unrelated write, so it is retried once
+    // against the new snapshot — the same two-attempt shape the locator lane
+    // uses. Persisting past that returns null and the caller fails closed.
+    const readAntiMemoryState = (publicClaimIds: readonly string[]) => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const result = readProjectMemoryCurrentState(args.db, {
+                publicClaimIds: [...publicClaimIds],
+                projectIds,
+                workspaceAuthorization: {
+                    ownProjectIds,
+                    sharedCategories: workspace.shareCategories ?? [],
+                },
+                workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+                workspaceIdentities: workspace.identities,
+                surface: "explicit_search",
+                lifecycleStates: ["active"],
+            });
+            if (result.status === "ok") {
+                return result.items.filter((item) => item.category === ANTI_MEMORY_CATEGORY);
+            }
+        }
+        return null;
+    };
+    // The state read uses the explicit-search surface (the only surface whose
+    // candidate query includes anti-memory), so the automatic-surface policy
+    // gates are applied here. A projection written under a newer policy version
+    // fails closed — its stored bits are not trustworthy — and anything below
+    // the automatic eligibility bar (effective VERIFIED+ with a present,
+    // supported policy subject) must not be auto-injected into user prompts.
+    // Dispositions are re-checked from the authoritative facts because the
+    // projection can lag a policy-unaware writer.
+    const eligibleForSurface = (item: ProjectMemoryClaimSnapshot): boolean => {
+        if (args.surface !== "auto_search") return true;
+        if (item.policy.policyVersion > CLAIM_POLICY_VERSION) return false;
+        if (!item.policy.autoEligible) return false;
+        return !(
+            item.dispositions.stale ||
+            item.dispositions.disputed ||
+            item.dispositions.superseded
+        );
+    };
+    const antiMemoryItems = readAntiMemoryState(candidateIds);
+    if (antiMemoryItems === null) return [];
+    const records = readAntiMemories(
+        args.db,
+        antiMemoryItems.map((item) => item.publicClaimId),
+    );
+    const normalizedQuery = args.query.trim().toLowerCase();
+    const queryTokens = tokenizeKeywordNeedle(normalizedQuery);
+    const candidates: Array<{
+        result: Omit<AntiMemorySearchResult, "score" | "matchType">;
+        text: string;
+        lexicalScore: number | null;
+    }> = [];
+    for (const item of antiMemoryItems) {
+        if (!eligibleForSurface(item)) continue;
+        const record = records.get(item.publicClaimId);
+        if (record === undefined) continue;
+        // Match against payload values only. The rendered `record.content`
+        // carries constant field labels ("Rejected strategy", "Root cause",
+        // …) whose tokens would let unrelated prompts match every record.
+        //
+        // `nonApplicableWhen` is deliberately absent: it records the exception
+        // where the rejection does NOT hold, and it is not rendered in the
+        // warning. Matching on it would retrieve the warning for exactly the
+        // prompt it disclaims and then show text asserting the opposite. It
+        // belongs in an exclusion test, which does not exist yet.
+        //
+        // Payload fields carry no write-side length limit, so the assembled
+        // text is capped: it feeds both the token scan below and a live
+        // provider batch, and one oversized record must not be able to blow the
+        // embedding request or the per-prompt time budget. Field order puts the
+        // load-bearing values first, so truncation drops context, not identity.
+        const text = truncateUtf8Bytes(
+            [
+                record.payload.trigger,
+                record.payload.rejectedStrategy,
+                record.payload.rejectionReason,
+                record.payload.saferAlternative,
+                record.payload.preconditions,
+                record.payload.attemptedApproach,
+                record.payload.observedFailure,
+                record.payload.rootCause,
+                record.payload.recovery,
+            ]
+                .filter((value): value is string => value !== null)
+                .join("\n")
+                .toLowerCase(),
+            ANTI_MEMORY_MAX_PASSAGE_BYTES,
+        );
+        const exact = text.includes(normalizedQuery);
+        const textTokens = new Set(tokenizeKeywordNeedle(text));
+        const matched = queryTokens.filter((token) => textTokens.has(token)).length;
+        const coverage = queryTokens.length === 0 ? 0 : matched / queryTokens.length;
+        const lexicalScore =
+            exact || (matched > 0 && (queryTokens.length <= 1 || matched >= 2))
+                ? exact
+                    ? 1
+                    : 0.5 + coverage / 2
+                : null;
+        const result: Omit<AntiMemorySearchResult, "score" | "matchType"> = {
+            source: "anti_memory",
+            publicClaimId: record.publicClaimId,
+            revisionLocator: record.revisionLocator,
+            contentDigest: record.contentDigest,
+            claimId: record.claimId,
+            normalizedHash: record.normalizedHash,
+            trigger: record.payload.trigger,
+            rejectedStrategy: record.payload.rejectedStrategy,
+            rejectionReason: record.payload.rejectionReason,
+            saferAlternative: record.payload.saferAlternative,
+            ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+        };
+        candidates.push({ result, text, lexicalScore });
+    }
+
+    // The embedding batch is a live provider call on the per-prompt path, so
+    // it is capped independently of the candidate ceiling: lexically matched
+    // candidates first (strongest score first), then the newest remaining
+    // records. State items arrive ordered by ascending claim id, so a higher
+    // candidate index means a newer record.
+    const semanticQueryEmbedding = args.surface === "auto_search" ? args.queryEmbedding : null;
+    const embedIndices =
+        semanticQueryEmbedding && candidates.length > 0
+            ? candidates
+                  .map((_, index) => index)
+                  .sort((left, right) => {
+                      const leftScore = candidates[left].lexicalScore;
+                      const rightScore = candidates[right].lexicalScore;
+                      if ((leftScore !== null) !== (rightScore !== null)) {
+                          return leftScore !== null ? -1 : 1;
+                      }
+                      if (leftScore !== null && rightScore !== null && leftScore !== rightScore) {
+                          return rightScore - leftScore;
+                      }
+                      return right - left;
+                  })
+                  .slice(0, ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES)
+            : [];
+    const vectorByCandidate = new Map<number, Float32Array | null>();
+    if (semanticQueryEmbedding && embedIndices.length > 0) {
+        const vectors = await args
+            .embedPassages(
+                embedIndices.map((index) => candidates[index].text),
+                args.signal,
+                "passage",
+            )
+            .catch((error) => {
+                log(
+                    `[search] anti-memory embedding failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                return [];
+            });
+        embedIndices.forEach((candidateIndex, vectorIndex) => {
+            vectorByCandidate.set(candidateIndex, vectors[vectorIndex] ?? null);
+        });
+    }
+    const ranked: AntiMemorySearchResult[] = [];
+    for (const [index, candidate] of candidates.entries()) {
+        const vector = vectorByCandidate.get(index) ?? null;
+        const semanticScore =
+            semanticQueryEmbedding && vector
+                ? normalizeCosineScore(cosineSimilarity(semanticQueryEmbedding, vector))
+                : 0;
+        const semanticMatch = semanticScore >= ANTI_MEMORY_SEMANTIC_THRESHOLD;
+        if (candidate.lexicalScore === null && !semanticMatch) continue;
+        const semanticWins = semanticMatch && semanticScore > (candidate.lexicalScore ?? 0);
+        ranked.push({
+            ...candidate.result,
+            // A cosine score below the threshold is noise, not evidence. Folding
+            // it into the score through `Math.max` would let an unrelated
+            // passage outrank a genuine lexical hit while still reporting
+            // `matchType: "lexical"`, so only a threshold-clearing score ranks.
+            score: semanticMatch
+                ? Math.max(candidate.lexicalScore ?? 0, semanticScore)
+                : (candidate.lexicalScore ?? 0),
+            matchType: semanticWins ? "semantic" : "lexical",
+        });
+    }
+    const published = ranked
+        .sort(
+            (left, right) =>
+                right.score - left.score || left.publicClaimId.localeCompare(right.publicClaimId),
+        )
+        .slice(0, args.limit);
+    // Revalidate before publishing, on every path. The awaited passage
+    // embedding opens the widest window — a live provider call that can take
+    // seconds, during which another process can retire, revise, expire, or
+    // quarantine a warning — but it is not the only one: the state read and the
+    // record read are separate autocommit statements, so even the lexical path
+    // publishes bytes assembled across two snapshots. The provider proves
+    // visibility at publication time, the same rule the locator lane applies.
+    if (published.length === 0) return published;
+    const current = readAntiMemoryState(published.map((result) => result.publicClaimId));
+    if (current === null) return [];
+    const currentById = new Map(current.map((item) => [item.publicClaimId, item]));
+    return published.filter((result) => {
+        const item = currentById.get(result.publicClaimId);
+        // Absent means archived, expired, or no longer visible; a moved locator
+        // or digest means the payload copied above is pre-transition content.
+        if (item === undefined) return false;
+        if (item.revisionLocator !== result.revisionLocator) return false;
+        if (item.contentDigest !== result.contentDigest) return false;
+        // A disposition landing between the two reads changes the label without
+        // touching the revision, so the label is the only signal that a warning
+        // went stale, disputed, or superseded under an explicit search — where
+        // the surface policy below deliberately does not gate on dispositions.
+        // Publishing the pre-transition copy would render it as unqualified.
+        if ((item.explicitLabel ?? undefined) !== result.policyLabel) return false;
+        return eligibleForSurface(item);
+    });
+}
+
 interface RankedNoteMatch {
     note: Note;
     score: number;
@@ -1237,6 +1546,7 @@ export function mergeMessageAndCompartmentResults(args: {
 function getSourceBoost(result: UnifiedSearchResult): number {
     switch (result.source) {
         case "memory":
+        case "anti_memory":
             return MEMORY_SOURCE_BOOST;
         case "message":
         case "compartment":
@@ -1258,8 +1568,11 @@ function compareUnifiedResults(left: UnifiedSearchResult, right: UnifiedSearchRe
         return rightEffective - leftEffective;
     }
 
-    if (left.source === "memory" && right.source === "memory") {
-        return left.publicClaimId < right.publicClaimId ? -1 : 1;
+    if (
+        (left.source === "memory" || left.source === "anti_memory") &&
+        (right.source === "memory" || right.source === "anti_memory")
+    ) {
+        return left.publicClaimId.localeCompare(right.publicClaimId);
     }
 
     if (left.source === "message" && right.source === "message") {
@@ -1481,7 +1794,7 @@ export function resolveClaimsByLocatorsForSearch(args: {
     visibleRevisionLocators?: ReadonlySet<string> | null;
     /** Bump claim retrieval telemetry (explicit agent lookups). */
     countRetrievals?: boolean;
-}): MemorySearchResult[] | null {
+}): Array<MemorySearchResult | AntiMemorySearchResult> | null {
     if (args.locators.length === 0) return null;
     const publicClaimIds: string[] = [];
     for (const raw of args.locators) {
@@ -1540,7 +1853,7 @@ export function resolveClaimsByLocatorsForSearch(args: {
         args.db,
         visible.map((item) => item.projectId),
     );
-    const ordered: MemorySearchResult[] = [];
+    const ordered: Array<MemorySearchResult | AntiMemorySearchResult> = [];
     for (const item of visible) {
         if (args.visibleRevisionLocators?.has(item.revisionLocator)) continue;
         const identity = identityByProjectId.get(item.projectId);
@@ -1554,24 +1867,46 @@ export function resolveClaimsByLocatorsForSearch(args: {
                       workspace.canonicalIdentityByStoredPath,
                   ) ?? undefined)
                 : undefined;
-        ordered.push({
-            source: "memory",
-            content: item.content,
-            score: 1,
-            publicClaimId: item.publicClaimId,
-            revisionLocator: item.revisionLocator,
-            category: item.category,
-            matchType: "exact",
-            ...(sourceName === undefined ? {} : { sourceName }),
-            ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
-            contentDigest: item.contentDigest,
-        });
+        if (item.category === ANTI_MEMORY_CATEGORY) {
+            if (item.lifecycleState !== "active") continue;
+            const record = readAntiMemory(args.db, item.publicClaimId);
+            if (record === null) continue;
+            ordered.push({
+                source: "anti_memory",
+                score: 1,
+                publicClaimId: record.publicClaimId,
+                revisionLocator: record.revisionLocator,
+                contentDigest: record.contentDigest,
+                claimId: record.claimId,
+                normalizedHash: record.normalizedHash,
+                trigger: record.payload.trigger,
+                rejectedStrategy: record.payload.rejectedStrategy,
+                rejectionReason: record.payload.rejectionReason,
+                saferAlternative: record.payload.saferAlternative,
+                matchType: "exact",
+                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+            });
+        } else
+            ordered.push({
+                source: "memory",
+                content: item.content,
+                score: 1,
+                publicClaimId: item.publicClaimId,
+                revisionLocator: item.revisionLocator,
+                category: item.category,
+                matchType: "exact",
+                ...(sourceName === undefined ? {} : { sourceName }),
+                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+                contentDigest: item.contentDigest,
+            });
         if (ordered.length >= args.limit) break;
     }
     if (ordered.length === 0) return null;
     if (args.countRetrievals !== false) {
         recordClaimUsage(args.db, {
-            publicClaimIds: ordered.map((result) => result.publicClaimId),
+            publicClaimIds: ordered
+                .filter((result): result is MemorySearchResult => result.source === "memory")
+                .map((result) => result.publicClaimId),
             kind: "retrieved",
         });
     }
@@ -1595,13 +1930,23 @@ export function resolveClaimsByLocatorsForSearch(args: {
     const confirmed = ordered.filter((result) => {
         const item = currentByClaimId.get(result.publicClaimId);
         if (item === undefined) return false;
-        return (
-            item.revisionLocator === result.revisionLocator &&
-            item.contentDigest === result.contentDigest &&
-            item.content === result.content &&
-            item.category === result.category &&
-            (item.explicitLabel ?? undefined) === result.policyLabel
-        );
+        if (
+            item.revisionLocator !== result.revisionLocator ||
+            item.contentDigest !== result.contentDigest ||
+            (item.explicitLabel ?? undefined) !== result.policyLabel
+        ) {
+            return false;
+        }
+        // An anti-memory result carries payload fields, not `content`/`category`,
+        // so the equality checks above cannot cover it. The read spans
+        // `["active", "archived"]` and archiving moves neither the locator nor
+        // the digest, so the lifecycle and category gates hydration applied are
+        // re-applied here instead; otherwise a warning archived under us is
+        // still published.
+        if (result.source === "anti_memory") {
+            return item.category === ANTI_MEMORY_CATEGORY && item.lifecycleState === "active";
+        }
+        return item.content === result.content && item.category === result.category;
     });
     // Dropping is the same observable outcome as never resolving: `null` is
     // exactly what a missing or foreign-hidden locator returns, so a caller
@@ -1697,6 +2042,7 @@ async function executeUnifiedSearch(args: {
     const runGitCommits = activeSources.has("git_commit") && gitCommitsEnabled;
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
     const runNotes = activeSources.has("note");
+    const runAntiMemories = activeSources.has("memory") && memoryFeatureEnabled;
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
     filterSpan?.end("ok");
     // Downstream chain roots depend on the filter span so criticalPathMs
@@ -1721,8 +2067,10 @@ async function executeUnifiedSearch(args: {
     // (`ensureMessagesIndexed` walks raw OpenCode session history); doing
     // that BEFORE the embed call meant the embed fetch couldn't start
     // until indexing finished.
+    const antiMemorySemanticEnabled =
+        runAntiMemories && (options.memoryPolicySurface ?? "explicit_search") === "auto_search";
     const needsEmbedding =
-        (runGitCommits || runCompartmentChunks || runPrimers) &&
+        (runGitCommits || runCompartmentChunks || runPrimers || antiMemorySemanticEnabled) &&
         embeddingEnabled &&
         isEmbeddingRuntimeEnabled();
 
@@ -1792,6 +2140,18 @@ async function executeUnifiedSearch(args: {
     const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
     const queryContract =
         capturedQuery instanceof Float32Array || capturedQuery === null ? null : capturedQuery;
+    const embedPassages =
+        options.embedPassages ??
+        (async (texts, signal, purpose) => {
+            const batch = await embedBatchForProject(projectPath, texts, signal, purpose);
+            const expectedGeneration = queryContract?.generation ?? embeddingSnapshot?.generation;
+            const expectedModelId = queryContract?.modelId ?? embeddingSnapshot?.modelId;
+            return batch &&
+                batch.generation === expectedGeneration &&
+                batch.modelId === expectedModelId
+                ? batch.vectors
+                : texts.map(() => null);
+        });
     const generationIsCurrent =
         queryContract === null ||
         (embeddingSnapshot !== null && embeddingSnapshot.generation === queryContract.generation);
@@ -1810,6 +2170,42 @@ async function executeUnifiedSearch(args: {
         queryContract?.chunkModelId ??
         options.chunkModelIdOverride ??
         embeddingSnapshot?.chunkModelId;
+    const laneSpanIds: number[] = [];
+    const antiMemorySpan =
+        trace && runAntiMemories
+            ? trace.begin("fusion", "memory", {
+                  parent: rootId,
+                  dependsOn: [...filterDeps, ...semanticDeps],
+              })
+            : null;
+    if (trace && !runAntiMemories) trace.notApplicable("fusion", "memory", rootId);
+    const antiMemoryPromise: Promise<AntiMemorySearchResult[]> = runAntiMemories
+        ? searchAntiMemories({
+              db,
+              projectPath,
+              query: trimmedQuery,
+              limit: tierLimit,
+              surface: options.memoryPolicySurface ?? "explicit_search",
+              queryEmbedding,
+              embedPassages,
+              signal: options.signal,
+          }).then(
+              (results) => {
+                  if (antiMemorySpan) {
+                      laneSpanIds.push(antiMemorySpan.id);
+                      antiMemorySpan.end("ok", {
+                          candidatesOut: results.length,
+                          ...laneDepth,
+                      });
+                  }
+                  return results;
+              },
+              (error) => {
+                  antiMemorySpan?.end(options.signal?.aborted ? "cancelled" : "failed");
+                  throw error;
+              },
+          )
+        : Promise.resolve([]);
     let compartmentLoad: VectorLoadEvent | null = null;
     const compartmentSpan =
         trace && runCompartmentChunks
@@ -1864,7 +2260,7 @@ async function executeUnifiedSearch(args: {
         candidatesOut: messageLikeResults.length,
     });
 
-    const laneSpanIds: number[] = messageFusionSpan ? [messageFusionSpan.id] : [];
+    if (messageFusionSpan) laneSpanIds.push(messageFusionSpan.id);
 
     // Hybrid lanes (git-commit, primer) decompose into lexical_scan,
     // vector_scan, and fusion spans through stage marks the lane functions
@@ -1981,7 +2377,8 @@ async function executeUnifiedSearch(args: {
         return lane;
     };
 
-    const [gitCommitResults, primerResults, noteResults] = await Promise.all([
+    const [antiMemoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
+        antiMemoryPromise,
         runGitCommits
             ? Promise.resolve(runGitCommitLane())
             : Promise.resolve([] as GitCommitSearchResult[]),
@@ -1992,6 +2389,7 @@ async function executeUnifiedSearch(args: {
     const fusionSpan =
         trace?.begin("fusion", "unified", { parent: rootId, dependsOn: laneSpanIds }) ?? null;
     const fused = [
+        ...antiMemoryResults,
         ...primerResults,
         ...messageLikeResults,
         ...gitCommitResults,
@@ -2000,6 +2398,7 @@ async function executeUnifiedSearch(args: {
     fusionSpan?.end("ok", {
         candidatesIn:
             primerResults.length +
+            antiMemoryResults.length +
             messageLikeResults.length +
             gitCommitResults.length +
             noteResults.length,
@@ -2010,7 +2409,16 @@ async function executeUnifiedSearch(args: {
             parent: rootId,
             dependsOn: fusionSpan ? [fusionSpan.id] : [],
         }) ?? null;
-    const results = fused.slice(0, limit);
+    const reservedAntiMemory =
+        (options.memoryPolicySurface ?? "explicit_search") === "auto_search"
+            ? antiMemoryResults[0]
+            : undefined;
+    const results = reservedAntiMemory
+        ? [
+              ...fused.filter((result) => result !== reservedAntiMemory).slice(0, limit - 1),
+              reservedAntiMemory,
+          ].sort(compareUnifiedResults)
+        : fused.slice(0, limit);
     topKSpan?.end("ok", { candidatesIn: fused.length, candidatesOut: results.length });
     if (trace) {
         trace.notApplicable("reranking", "unified", rootId);

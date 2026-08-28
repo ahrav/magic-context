@@ -15,6 +15,7 @@ import {
     prepareAutomaticQuery,
     prepareExplicitQuery,
     QueryBoundsError,
+    renderAntiMemoryWarningLine,
     truncateUtf8Bytes,
 } from "./search-bounds";
 
@@ -260,5 +261,33 @@ describe("QueryBoundsError", () => {
         expect(error.limit).toBe(64);
         expect(error.actual).toBe(65);
         expect(error.message).toBe(describeQueryBoundsViolation(detail));
+    });
+});
+
+describe("renderAntiMemoryWarningLine", () => {
+    const fields = {
+        trigger: "session caching",
+        rejectedStrategy: "Redis",
+        rejectionReason: "it creates split ownership",
+    };
+
+    it("renders the safer-alternative clause when bounding keeps content", () => {
+        expect(
+            renderAntiMemoryWarningLine({
+                ...fields,
+                saferAlternative: "use SQLite",
+                boundField: (text) => text,
+            }),
+        ).toContain(" Safer alternative: use SQLite.");
+    });
+
+    it("drops the clause when the caller's bounding empties the field", () => {
+        const line = renderAntiMemoryWarningLine({
+            ...fields,
+            saferAlternative: "   ",
+            boundField: (text) => text.trim(),
+        });
+        expect(line).not.toContain("Safer alternative");
+        expect(line).not.toContain(": .");
     });
 });

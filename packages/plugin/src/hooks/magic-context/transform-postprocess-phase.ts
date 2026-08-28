@@ -392,11 +392,8 @@ export function runRustModePostprocess(args: {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
     for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        // Same replay gate as runAutoSearchHint: a persisted hint replays
-        // only while every contributing memory is still auto_search-eligible
-        // and byte-identical — a quarantine, contradiction, rejection, or
-        // rewrite after the hint was computed must not keep re-injecting the
-        // stored fragment through this sticky loop.
+        // Anti-memory warnings never replay from stored hint text; they require
+        // a fresh search. Decisions without warning fragments can replay.
         if (
             decision.decision === "hint" &&
             autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
@@ -1725,9 +1722,8 @@ export async function runPostTransformPhase(
             appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
         }
         for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-            // Same replay gate as runAutoSearchHint (see the Rust-mode loop
-            // above): the stored fragment must never outlive its
-            // contributing memories' eligibility.
+            // Anti-memory warnings require a fresh search; stored decisions
+            // replay only when they contain no warning fragments.
             if (
                 decision.decision === "hint" &&
                 autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)

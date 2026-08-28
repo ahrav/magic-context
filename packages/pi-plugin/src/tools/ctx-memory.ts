@@ -175,12 +175,12 @@ export function createCtxMemoryTool(
 					);
 				}
 				const action = rawAction as (typeof ALL_ACTIONS)[number];
-				assertCtxMemoryWriteShape({ ...params, action } as CtxMemoryArgs);
 				if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(action)) {
 					return err(
 						`Error: Action '${action}' is not allowed in this context.`,
 					);
 				}
+				assertCtxMemoryWriteShape({ ...params, action } as CtxMemoryArgs);
 				const projectIdentity = resolveProject(ctx.cwd);
 				if (!projectIdentity) {
 					return err(

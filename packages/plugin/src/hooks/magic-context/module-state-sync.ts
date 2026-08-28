@@ -956,10 +956,8 @@ function buildAutoSearchHintSeeds(args: {
         if (mapping && value.nativeBlockId !== blockId) {
             recordAutoSearchHintNativeBlockId(args.db, args.sessionId, value.messageId, blockId);
         }
-        // The same replay gate as the TypeScript and Pi paths: a hint whose
-        // contributing memory was hidden or rewritten seeds the empty
-        // no-result shape, so the native overlay revokes the fragment
-        // instead of replaying it verbatim.
+        // Anti-memory warnings seed the empty no-result shape because stored
+        // warning text never replays; fresh search is required.
         const hintText =
             value.decision === "hint" &&
             autoSearchHintFragmentsStillEligible(args.db, value.memoryFragments)
