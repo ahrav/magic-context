@@ -504,6 +504,80 @@ describe("promoteRelease", () => {
         });
     });
 
+    test("the artifact anchor is order-independent, so promotion and read-back agree", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            // Ids where one is a prefix of the other, so lexicographic FILENAME
+            // order and id order genuinely disagree: `-` sorts before the `.` of
+            // `.json`, putting `hse-alpha-beta.json` first while `hse-alpha` sorts
+            // first as an id. Handed to the promoter reversed, so the operator's
+            // array order matches neither.
+            scenarios[0].id = "hse-alpha-beta";
+            scenarios[1].id = "hse-alpha";
+            const shuffled = [...scenarios].reverse();
+            const promoted = promoteRelease({
+                scenarios: shuffled,
+                approvals: approvalsFor(shuffled),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // The value promotion hands back for out-of-band recording must be the
+            // one a consumer recomputes, or an authenticated load rejects a release
+            // that is perfectly valid.
+            const reread = loadRelease(promoted.releaseDir);
+            expect(releaseArtifactFingerprint(reread.manifest, reread.mutationEvidence, reread.scenarios)).toBe(
+                promoted.artifactFingerprint,
+            );
+            expect(
+                loadRelease(promoted.releaseDir, { expectedArtifactFingerprint: promoted.artifactFingerprint }).manifest
+                    .releaseVersion,
+            ).toBe("v1");
+        });
+    });
+
+    test("prior release lineage rejects a symlinked release directory or manifest", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promote = (version: string): unknown =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios, version, ["hse-retired"]),
+                    releasesRoot: root,
+                    releaseVersion: version,
+                    tombstones: ["hse-retired"],
+                });
+            promote("v1");
+            const next = corpusRaw();
+            const promoteV2 = (): unknown =>
+                promoteRelease({
+                    scenarios: next,
+                    approvals: approvalsFor(next, "v2", ["hse-retired"]),
+                    releasesRoot: root,
+                    releaseVersion: "v2",
+                });
+
+            // This read does not go through `loadRelease`, so it had none of its
+            // symlink checks. A linked release resolves outside the releases root,
+            // where its tombstone list stays mutable: dropping an id there would
+            // shrink the inherited set and re-admit a retired scenario.
+            // `v1-elsewhere` is not `RELEASE_VERSION_RE`-shaped, so it is not
+            // itself read as a release.
+            const outsideDir = join(root, "v1-elsewhere");
+            renameSync(join(root, "v1"), outsideDir);
+            symlinkSync(outsideDir, join(root, "v1"));
+            expect(promoteV2).toThrow(/release\.v1: not-a-real-directory/);
+
+            // And the manifest alone replaced by a link.
+            rmSync(join(root, "v1"));
+            renameSync(outsideDir, join(root, "v1"));
+            const manifestPath = join(root, "v1", RELEASE_FILES.manifest);
+            const outsideManifest = join(root, "manifest-elsewhere.json");
+            renameSync(manifestPath, outsideManifest);
+            symlinkSync(outsideManifest, manifestPath);
+            expect(promoteV2).toThrow(/release\.v1\.manifest: not-a-regular-file/);
+        });
+    });
+
     test("interrupted promotions never accumulate: stale staging trees are swept before publishing", () => {
         withRoot((root) => {
             const stale = join(root, ".staging-interrupted");

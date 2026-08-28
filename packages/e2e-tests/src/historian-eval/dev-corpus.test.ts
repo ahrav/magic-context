@@ -29,6 +29,37 @@ function parseCorpus(): HistorianEvalScenario[] {
 }
 
 describe("dev corpus", () => {
+    test("scenarios declaring several hard negatives in one family have every one mutated", () => {
+        const multi = parseCorpus().filter((scenario) => {
+            const perFamily = new Map<string, number>();
+            for (const absent of scenario.gold.expectedAbsent) {
+                perFamily.set(absent.family, (perFamily.get(absent.family) ?? 0) + 1);
+            }
+            return [...perFamily.values()].some((count) => count > 1);
+        });
+        // Same family implies the same battery class, so these are exactly the
+        // scenarios where mutating only the first predicate left a
+        // false-authoritative check in the release that nothing demonstrated.
+        expect(multi.length).toBeGreaterThan(0);
+        const artifact = runMutationBattery(multi);
+        expect(artifact.green).toBe(true);
+        for (const entry of artifact.scenarios) {
+            const applied = entry.results.filter(
+                (result) =>
+                    (result.mutationClass === "speculation-promoted" ||
+                        result.mutationClass === "rejected-proposal-active") &&
+                    result.applicable,
+            );
+            expect(applied.length).toBeGreaterThan(0);
+            // The detail carries the number actually mutated, so a regression to
+            // first-predicate-only surfaces here instead of passing silently.
+            expect(
+                applied.some((result) => /^all ([2-9]|\d{2,}) expected-absent target/.test(result.detail)),
+            ).toBe(true);
+        }
+    });
+
+
     test("every scenario parses under the current contract", () => {
         // Reported per file: a bare throw names only the first offender, and a
         // contract change usually breaks several at once.

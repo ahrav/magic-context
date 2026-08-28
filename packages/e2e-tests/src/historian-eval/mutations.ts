@@ -227,9 +227,35 @@ function runFalseAuthoritativeClass(
     if (forbidden.length === 0) {
         return { mutationClass, applicable: false, green: true, detail: "no expected-absent predicate in class families" };
     }
-    const output = baselineOutput(scenario, [...goldSatisfyingFacts(scenario), forbidden[0]]);
-    const check = checkMutationOutcome(mutationClass as Exclude<MutationClass, "probe-wrong-answer">, output, scenario);
-    return { mutationClass, applicable: true, ...check };
+    // Every declared hard negative in the class, not just the first. A scenario
+    // may declare several in one family, and mutating only one leaves the rest
+    // unexercised: a detector that catches the first while accepting a later one
+    // would still emit green admission evidence, so the release would ship a
+    // false-authoritative check nothing ever demonstrated.
+    const gold = goldSatisfyingFacts(scenario);
+    const checks = forbidden.map((fact, index) => ({
+        index,
+        ...checkMutationOutcome(
+            mutationClass as Exclude<MutationClass, "probe-wrong-answer">,
+            baselineOutput(scenario, [...gold, fact]),
+            scenario,
+        ),
+    }));
+    const failure = checks.find((check) => !check.green);
+    if (failure !== undefined) {
+        return {
+            mutationClass,
+            applicable: true,
+            green: false,
+            detail: `expected-absent target ${failure.index + 1} of ${checks.length}: ${failure.detail}`,
+        };
+    }
+    return {
+        mutationClass,
+        applicable: true,
+        green: true,
+        detail: `all ${checks.length} expected-absent target(s) caught: ${checks[0].detail}`,
+    };
 }
 
 function runWrongCategory(scenario: HistorianEvalScenario): MutationResult {

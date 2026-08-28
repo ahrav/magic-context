@@ -176,18 +176,33 @@ function checkMutationEvidence(
  * frozen release would measure different schedules while every in-directory check
  * and the anchor still matched. Approvals stay trigger-independent:
  * `releaseApprovalFingerprint` covers the version, tuple, and tombstones.
+ *
+ * Scenarios are ordered by id HERE rather than by any caller, because the two
+ * call sites obtain them differently and neither order is canonical: promotion
+ * has the operator's array order, while `loadRelease` has lexicographic FILENAME
+ * order, and those disagree whenever one id is a prefix of another (`-` sorts
+ * before the `.` of `.json`, so `hse-a-b.json` precedes `hse-a.json` while
+ * `hse-a` precedes `hse-a-b`). Canonicalizing inside the anchor keeps promotion's
+ * returned value and any later recomputation identical. Ids are unique — both
+ * `promoteRelease` and `buildReleaseTuple` enforce it — so the order is total.
  */
 export function releaseArtifactFingerprint(
     manifest: ReleaseManifest,
     evidence: MutationEvidenceArtifact,
     scenarios: readonly HistorianEvalScenario[],
 ): string {
-    return canonicalFingerprint({ manifest, mutationEvidence: evidence, scenarios });
+    const ordered = [...scenarios].sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+    return canonicalFingerprint({ manifest, mutationEvidence: evidence, scenarios: ordered });
 }
 
 /** Real regular file — not a symlink whose target lives outside the frozen tree. */
 function assertRegularFile(path: string, label: string): void {
     if (!lstatSync(path).isFile()) fail([`${label}: not-a-regular-file`]);
+}
+
+/** Real directory — not a symlink whose target lives outside the releases root. */
+function assertRealDirectory(path: string, label: string): void {
+    if (!lstatSync(path).isDirectory()) fail([`${label}: not-a-real-directory`]);
 }
 
 export interface LoadReleaseOptions {
@@ -233,7 +248,7 @@ export function loadRelease(
     // ordinary tree, so a `vN` entry linked outside the releases root would pass
     // the whole strict path while its bytes stay mutable outside the supposedly
     // immutable release.
-    if (!lstatSync(releaseDir).isDirectory()) fail(["release: not-a-real-directory"]);
+    assertRealDirectory(releaseDir, "release");
     const entries = readdirSync(releaseDir).sort();
     const expected: string[] = [RELEASE_FILES.evidence, RELEASE_FILES.manifest, RELEASE_FILES.scenariosDir];
     const unexpected = entries.filter((entry) => !expected.includes(entry));
@@ -253,7 +268,7 @@ export function loadRelease(
     assertRegularFile(join(releaseDir, RELEASE_FILES.manifest), "release.manifest");
     assertRegularFile(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence");
     const scenariosDir = join(releaseDir, RELEASE_FILES.scenariosDir);
-    if (!lstatSync(scenariosDir).isDirectory()) fail(["release.scenarios: not-a-real-directory"]);
+    assertRealDirectory(scenariosDir, "release.scenarios");
 
     const scenarioFiles = readdirSync(scenariosDir).sort();
     // Position-based labels, for the same reason the entry check above reports
@@ -377,6 +392,15 @@ function installedReleases(releasesRoot: string): ReleaseLineage[] {
             if (!existsSync(manifestPath)) {
                 fail([`release: prior release ${entry} has no readable manifest; refusing to inherit tombstones`]);
             }
+            // Same symlink rule the consumer path applies, because this read does
+            // not go through `loadRelease`: a linked release directory or manifest
+            // resolves outside the releases root, where its tombstone list stays
+            // mutable. Dropping a tombstone there before the next promotion would
+            // shrink the inherited set and let a retired scenario be published
+            // again. Entry names are `RELEASE_VERSION_RE`-bounded, so labelling
+            // them echoes no artifact content.
+            assertRealDirectory(join(releasesRoot, entry), `release.${entry}`);
+            assertRegularFile(manifestPath, `release.${entry}.manifest`);
             const lineage = parseReleaseLineage(
                 readReleaseJson(manifestPath, `release.${entry}.manifest`),
                 `release.${entry}.manifest`,
