@@ -13,6 +13,7 @@
 
 import {
     existsSync,
+    lstatSync,
     mkdirSync,
     mkdtempSync,
     readdirSync,
@@ -49,6 +50,9 @@ export const RELEASE_FILES = {
     evidence: "mutation-evidence.json",
     scenariosDir: "scenarios",
 } as const;
+
+/** Corpus-size budget (R1), enforced identically by promotion and by loading. */
+export const CORPUS_SIZE_BUDGET = { min: 10, max: 30 } as const;
 
 export interface PromotionInput {
     /** Raw scenario documents (unparsed: the privacy gate runs first). */
@@ -116,12 +120,42 @@ function checkMutationEvidence(
 }
 
 /**
+ * Fingerprint of the whole manifest, including the approver strings. This is
+ * the value an operator records out of band at promotion time and passes back
+ * to `loadRelease` as `expectedManifestFingerprint`: nothing inside the
+ * release directory can authenticate its own approvals, so without an external
+ * anchor an editor can rewrite `approver` (or fabricate both approvals) and
+ * still satisfy every in-directory consistency check.
+ */
+export function manifestFingerprint(manifest: ReleaseManifest): string {
+    return canonicalFingerprint(manifest);
+}
+
+/** Real regular file — not a symlink whose target lives outside the frozen tree. */
+function assertRegularFile(path: string, label: string): void {
+    if (!lstatSync(path).isFile()) fail([`${label}: not-a-regular-file`]);
+}
+
+export interface LoadReleaseOptions {
+    /**
+     * Expected `manifestFingerprint`, from a trust anchor outside the release
+     * directory. Omit only when the caller already trusts the tree (the
+     * promoter's own read-back of bytes it just wrote).
+     */
+    expectedManifestFingerprint?: string;
+}
+
+/**
  * Strict consumer path: load a release directory back through the full
  * parse + lint + fingerprint pipeline. Fails closed on unexpected entries,
- * fingerprint drift, tombstoned scenarios present in the corpus, or
- * missing/ungreen mutation evidence.
+ * symlinked artifacts, a corpus outside the size budget, fingerprint drift,
+ * tombstoned scenarios present in the corpus, or missing/ungreen mutation
+ * evidence.
  */
-export function loadRelease(releaseDir: string): {
+export function loadRelease(
+    releaseDir: string,
+    options: LoadReleaseOptions = {},
+): {
     manifest: ReleaseManifest;
     scenarios: HistorianEvalScenario[];
     mutationEvidence: MutationEvidenceArtifact;
@@ -130,12 +164,44 @@ export function loadRelease(releaseDir: string): {
     const expected: string[] = [RELEASE_FILES.evidence, RELEASE_FILES.manifest, RELEASE_FILES.scenariosDir];
     const unexpected = entries.filter((entry) => !expected.includes(entry));
     if (unexpected.length > 0 || entries.length !== expected.length) {
-        fail([`release: unexpected entries (${unexpected.length > 0 ? unexpected.join(", ") : "missing files"})`]);
+        // Counts only: entry names from an externally assembled tree have not
+        // been through the privacy scan (which covers scenario values, not
+        // filesystem names), so echoing them would push unreviewed text —
+        // a forbidden token, customer identifier, or local path — into logs.
+        fail([
+            `release: unexpected entries (${unexpected.length} unexpected of ${entries.length}, expected ${expected.length})`,
+        ]);
     }
+    // Name checks alone are satisfied by symlinks, and every read below
+    // follows them: a self-consistent link farm would pass `loadRelease`
+    // while later runs load bytes that can change outside the supposedly
+    // immutable release directory.
+    assertRegularFile(join(releaseDir, RELEASE_FILES.manifest), "release.manifest");
+    assertRegularFile(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence");
+    const scenariosDir = join(releaseDir, RELEASE_FILES.scenariosDir);
+    if (!lstatSync(scenariosDir).isDirectory()) fail(["release.scenarios: not-a-real-directory"]);
+
     const manifest = parseManifest(readReleaseJson(join(releaseDir, RELEASE_FILES.manifest), "release.manifest"));
-    const scenarioFiles = readdirSync(join(releaseDir, RELEASE_FILES.scenariosDir)).sort();
+    if (
+        options.expectedManifestFingerprint !== undefined &&
+        manifestFingerprint(manifest) !== options.expectedManifestFingerprint
+    ) {
+        fail(["release.manifest: fingerprint does not match the expected trust anchor"]);
+    }
+    const scenarioFiles = readdirSync(scenariosDir).sort();
+    for (const file of scenarioFiles) {
+        assertRegularFile(join(scenariosDir, file), `release.scenarios.${file}`);
+    }
+    // The same budget promotion enforces (R1): a separately assembled or
+    // truncated release must not pass the strict path with a corpus that
+    // promotion would reject.
+    if (scenarioFiles.length < CORPUS_SIZE_BUDGET.min || scenarioFiles.length > CORPUS_SIZE_BUDGET.max) {
+        fail([
+            `release: corpus size ${scenarioFiles.length} outside the ${CORPUS_SIZE_BUDGET.min}-${CORPUS_SIZE_BUDGET.max} budget (R1)`,
+        ]);
+    }
     const scenarios = scenarioFiles.map((file) =>
-        parseScenario(readReleaseJson(join(releaseDir, RELEASE_FILES.scenariosDir, file), `release.scenarios.${file}`), file),
+        parseScenario(readReleaseJson(join(scenariosDir, file), `release.scenarios.${file}`), file),
     );
     const diagnostics: string[] = [];
     for (const [index, scenario] of scenarios.entries()) {
@@ -172,6 +238,25 @@ function writeReleaseTree(dir: string, manifest: ReleaseManifest, scenarios: rea
     }
 }
 
+/** Ordinal of a `vN` directory name. Canonical form only — see `promoteRelease`. */
+function versionOrdinal(version: string): number {
+    return Number(version.slice(1));
+}
+
+/**
+ * Installed release ordinals. Publication must move strictly forward: the
+ * tombstone rule is "errata go into vN+1", which only retires a scenario if
+ * every later release also carries the tombstone. Rejecting just the exact
+ * destination version would allow promoting v2 and then v1-with-X-tombstoned,
+ * leaving the numerically later — and immutable — v2 still serving X.
+ */
+function installedVersionOrdinals(releasesRoot: string): number[] {
+    if (!existsSync(releasesRoot)) return [];
+    return readdirSync(releasesRoot)
+        .filter((entry) => RELEASE_VERSION_RE.test(entry))
+        .map(versionOrdinal);
+}
+
 /** Prior releases' tombstones persist in every later release (R12). */
 function inheritedTombstones(releasesRoot: string): string[] {
     if (!existsSync(releasesRoot)) return [];
@@ -191,9 +276,15 @@ function inheritedTombstones(releasesRoot: string): string[] {
     return [...tombstones].sort();
 }
 
-export function promoteRelease(input: PromotionInput): { releaseDir: string } {
+export function promoteRelease(input: PromotionInput): { releaseDir: string; manifestFingerprint: string } {
     if (!RELEASE_VERSION_RE.test(input.releaseVersion)) {
         fail(["release: version-invalid"]);
+    }
+    // Canonical form only: `v01` and `v1` share an ordinal, so accepting both
+    // would let two distinct directory names claim the same release position
+    // and defeat the monotonicity check below.
+    if (input.releaseVersion !== `v${versionOrdinal(input.releaseVersion)}`) {
+        fail(["release: version-not-canonical"]);
     }
 
     // Privacy gate FIRST — before any parser, because schema diagnostics
@@ -213,8 +304,10 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     if (lintDiagnostics.length > 0) fail(lintDiagnostics);
     const ids = new Set(scenarios.map((scenario) => scenario.id));
     if (ids.size !== scenarios.length) fail(["release: duplicate scenario ids"]);
-    if (scenarios.length < 10 || scenarios.length > 30) {
-        fail([`release: corpus size ${scenarios.length} outside the 10-30 budget (R1)`]);
+    if (scenarios.length < CORPUS_SIZE_BUDGET.min || scenarios.length > CORPUS_SIZE_BUDGET.max) {
+        fail([
+            `release: corpus size ${scenarios.length} outside the ${CORPUS_SIZE_BUDGET.min}-${CORPUS_SIZE_BUDGET.max} budget (R1)`,
+        ]);
     }
 
     // Cheap rejection gates run before the battery: tombstone conflicts,
@@ -235,6 +328,11 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         // Immutability: an existing release is never modified; errata go
         // into vN+1 (R12).
         fail(["release: version already installed"]);
+    }
+    const installed = installedVersionOrdinals(input.releasesRoot);
+    const newest = installed.length === 0 ? 0 : Math.max(...installed);
+    if (versionOrdinal(input.releaseVersion) <= newest) {
+        fail([`release: version ${input.releaseVersion} is not later than the installed v${newest}`]);
     }
 
     // Admission gate (R13): the battery is recomputed here rather than
@@ -286,5 +384,7 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         rmSync(staging, { recursive: true, force: true });
         throw error;
     }
-    return { releaseDir: destination };
+    // The caller records this out of band; it is the only anchor that lets a
+    // later `loadRelease` detect an edited approver string.
+    return { releaseDir: destination, manifestFingerprint: manifestFingerprint(manifest) };
 }

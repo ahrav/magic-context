@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -97,7 +97,11 @@ describe("promoteRelease", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
             const approvals = approvalsFor(scenarios);
-            (scenarios[0].transcript as { turns: Array<{ user: string }> }).turns[0].user = "edited after approval";
+            // Append rather than replace: the original wording grounds the
+            // scenario's hard-negative predicate, and dropping it would trip
+            // the freeze lint before the approval binding is ever checked.
+            const turns = (scenarios[0].transcript as { turns: Array<{ user: string }> }).turns;
+            turns[0].user = `${turns[0].user} Edited after approval.`;
             expect(() =>
                 promoteRelease({ scenarios, approvals, releasesRoot: root, releaseVersion: "v1" }),
             ).toThrow(/stale-or-foreign-tuple/);
@@ -347,6 +351,160 @@ describe("promoteRelease", () => {
             // values also reject: an installed release is byte-immutable.
             writeFileSync(manifestPath, `${original}\n`);
             expect(() => loadRelease(releaseDir)).toThrow(/non-canonical-bytes/);
+        });
+    });
+
+    test("promotion only moves forward: an earlier version is rejected even when unoccupied", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promote = (version: string): unknown =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios),
+                    releasesRoot: root,
+                    releaseVersion: version,
+                });
+            promote("v2");
+            // Installing v1 after v2 would let a later tombstone-carrying
+            // release sit BELOW an immutable release that still serves the
+            // retired scenario, so the vN+1 errata rule could never retire it.
+            expect(() => promote("v1")).toThrow(/not later than the installed v2/);
+            expect(readdirSync(root)).toEqual(["v2"]);
+            // Forward is still allowed.
+            promote("v3");
+            expect(readdirSync(root).sort()).toEqual(["v2", "v3"]);
+        });
+    });
+
+    test("non-canonical version strings reject (v01 and v1 would share an ordinal)", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            expect(() =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios),
+                    releasesRoot: root,
+                    releaseVersion: "v01",
+                }),
+            ).toThrow(/version-not-canonical/);
+            expect(readdirSync(root)).toEqual([]);
+        });
+    });
+
+    test("load enforces the corpus-size budget promotion enforces (R1)", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // A separately assembled or truncated release must not pass the
+            // strict path with a corpus promotion would have rejected.
+            rmSync(join(releaseDir, RELEASE_FILES.scenariosDir, "hse-scenario-0.json"));
+            expect(() => loadRelease(releaseDir)).toThrow(/outside the 10-30 budget/);
+        });
+    });
+
+    test("load reports only the COUNT of unexpected entries, never their unscanned names", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // Entry names from an externally assembled tree never went through
+            // the privacy scan, so they must not reach diagnostics or logs.
+            const secret = "ghp-deadbeefsecrettoken.txt";
+            writeFileSync(join(releaseDir, secret), "tamper\n");
+            let message = "";
+            try {
+                loadRelease(releaseDir);
+            } catch (error) {
+                message = (error as Error).message;
+            }
+            expect(message).toMatch(/unexpected entries/);
+            expect(message).not.toContain(secret);
+            expect(message).not.toContain("deadbeef");
+        });
+    });
+
+    test("load rejects symlinked release artifacts (a frozen tree must be real files)", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // Bytes moved outside the installed vN directory: name-only checks
+            // pass and every read follows the link, so what later runs load
+            // could change without touching the "immutable" tree.
+            const manifestPath = join(releaseDir, RELEASE_FILES.manifest);
+            const outside = join(root, "manifest-elsewhere.json");
+            renameSync(manifestPath, outside);
+            symlinkSync(outside, manifestPath);
+            expect(() => loadRelease(releaseDir)).toThrow(/release\.manifest: not-a-regular-file/);
+        });
+    });
+
+    test("load rejects a symlinked scenario file and a symlinked scenarios directory", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            const scenarioPath = join(releaseDir, RELEASE_FILES.scenariosDir, "hse-scenario-0.json");
+            const outside = join(root, "scenario-elsewhere.json");
+            renameSync(scenarioPath, outside);
+            symlinkSync(outside, scenarioPath);
+            expect(() => loadRelease(releaseDir)).toThrow(/not-a-regular-file/);
+
+            // And the whole directory replaced by a link.
+            const dirPath = join(releaseDir, RELEASE_FILES.scenariosDir);
+            const outsideDir = join(root, "scenarios-elsewhere");
+            renameSync(dirPath, outsideDir);
+            symlinkSync(outsideDir, dirPath);
+            expect(() => loadRelease(releaseDir)).toThrow(/not-a-real-directory/);
+        });
+    });
+
+    test("an out-of-band manifest fingerprint detects an edited approver the tree cannot self-detect", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promoted = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            const anchor = promoted.manifestFingerprint;
+            expect(anchor).toMatch(/^[0-9a-f]{64}$/);
+            // The untampered release matches its recorded anchor.
+            expect(
+                loadRelease(promoted.releaseDir, { expectedManifestFingerprint: anchor }).manifest.releaseVersion,
+            ).toBe("v1");
+
+            // Rewrite only the approver: the tuple fingerprint the approvals
+            // carry is unchanged, so every in-directory consistency check
+            // still passes and the release loads as approved.
+            const manifestPath = join(promoted.releaseDir, RELEASE_FILES.manifest);
+            const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+            manifest.approvals.privacy.approver = "attacker";
+            writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+            expect(loadRelease(promoted.releaseDir).manifest.approvals.privacy.approver).toBe("attacker");
+
+            // Only the external anchor catches it.
+            expect(() =>
+                loadRelease(promoted.releaseDir, { expectedManifestFingerprint: anchor }),
+            ).toThrow(/does not match the expected trust anchor/);
         });
     });
 });

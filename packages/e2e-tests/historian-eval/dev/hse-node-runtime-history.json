@@ -67,7 +67,7 @@
         "family": "current-vs-historical",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "runs on node 16"
+          "value": "node 16"
         }
       }
     ],

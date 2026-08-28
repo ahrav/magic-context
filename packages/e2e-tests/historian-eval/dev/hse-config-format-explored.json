@@ -67,7 +67,7 @@
         "family": "explored-never-accepted",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "use toml for the config"
+          "value": "toml"
         }
       },
       {
@@ -75,7 +75,7 @@
         "family": "explored-never-accepted",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "use yaml for the config"
+          "value": "yaml"
         }
       }
     ],

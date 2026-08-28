@@ -19,7 +19,7 @@ import {
     type ExpectedClaim,
     type HistorianEvalScenario,
 } from "./contract";
-import { buildHistorianPayload, type PayloadFact } from "./payload";
+import { buildHistorianPayload, type PayloadCompartment, type PayloadFact } from "./payload";
 import type { ProbeExchange } from "./runner";
 import { compareProbeAnswer, scoreRawOutput, type FailReason } from "./scorer";
 
@@ -81,19 +81,37 @@ function goldSatisfyingFacts(scenario: HistorianEvalScenario): PayloadFact[] {
     }));
 }
 
-function baselineOutput(scenario: HistorianEvalScenario, facts: PayloadFact[]): string {
+/**
+ * Baseline compartments: `gold.compartments.minCount` contiguous,
+ * non-overlapping segments covering the whole synthetic chunk. A fixed single
+ * compartment would trip the scorer's `compartment-count` structural finding
+ * for every scenario declaring a minimum above one, so `assertBaselineValidates`
+ * would report a baseline FAIL — and promotion would reject the scenario —
+ * before any mutation ran. The count is clamped to the message count because a
+ * segment must cover at least one message.
+ */
+function baselineCompartments(scenario: HistorianEvalScenario): PayloadCompartment[] {
     const messageCount = scenario.transcript.turns.length * 2;
-    return buildHistorianPayload({
-        compartments: [
-            {
-                start: 1,
-                end: messageCount,
-                title: `Baseline for ${scenario.id}`,
-                body: "Synthetic baseline compartment for the mutation battery.",
-            },
-        ],
-        facts,
-    });
+    const count = Math.max(1, Math.min(scenario.gold.compartments.minCount, messageCount));
+    const span = Math.floor(messageCount / count);
+    const remainder = messageCount % count;
+    const compartments: PayloadCompartment[] = [];
+    let start = 1;
+    for (let index = 0; index < count; index += 1) {
+        const end = start + span + (index < remainder ? 1 : 0) - 1;
+        compartments.push({
+            start,
+            end,
+            title: `Baseline ${index + 1} of ${count} for ${scenario.id}`,
+            body: "Synthetic baseline compartment for the mutation battery.",
+        });
+        start = end + 1;
+    }
+    return compartments;
+}
+
+function baselineOutput(scenario: HistorianEvalScenario, facts: PayloadFact[]): string {
+    return buildHistorianPayload({ compartments: baselineCompartments(scenario), facts });
 }
 
 /**
@@ -236,20 +254,12 @@ function runStructuralOverlap(scenario: HistorianEvalScenario): MutationResult {
 }
 
 function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
-    const probe = scenario.probes[0];
-    if (!probe) {
+    if (scenario.probes.length === 0) {
         // A probe-less scenario would freeze with this class never
         // exercised; the freeze lint forbids it and the battery fails red
         // as defense in depth.
         return { mutationClass: "probe-wrong-answer", applicable: false, green: false, detail: "scenario has no probes; probe class cannot be exercised" };
     }
-    const exchange: ProbeExchange = {
-        probeId: probe.id,
-        answerRaw: "historian-eval-mutation-wrong-answer",
-        reAsked: false,
-        injectedRevisionLocators: [],
-        payloadText: null,
-    };
     // No injected claims: the gold claim was never promoted, so a miss is a
     // probe FAIL, not a trimmed ERROR (KTD6). The expected outcome comes
     // from the policy table so this class stays table-driven like the rest
@@ -258,16 +268,34 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
     if (expected.stage !== "probe-comparison") {
         throw new Error(`probe-wrong-answer policy entry must stay at probe-comparison, got ${expected.stage}`);
     }
-    const verdict = compareProbeAnswer({ probe, exchange, scenario, injectedClaims: [] });
-    if (verdict.outcome !== expected.outcome) {
-        return {
-            mutationClass: "probe-wrong-answer",
-            applicable: true,
-            green: false,
-            detail: `expected probe ${expected.outcome} but got ${verdict.outcome}`,
+    // EVERY probe, not just the first: `compareProbeAnswer` branches on
+    // `answerType`, and the corpus places `claim-id` probes after an `exact`
+    // or `multiple-choice` one. Mutating only `probes[0]` would leave the
+    // claim-id comparison path unexercised, so a regression accepting a wrong
+    // claim identifier would still pass the admission gate.
+    const failures = scenario.probes.flatMap((probe) => {
+        const exchange: ProbeExchange = {
+            probeId: probe.id,
+            answerRaw: "historian-eval-mutation-wrong-answer",
+            reAsked: false,
+            injectedRevisionLocators: [],
+            payloadText: null,
         };
+        const verdict = compareProbeAnswer({ probe, exchange, scenario, injectedClaims: [] });
+        return verdict.outcome === expected.outcome
+            ? []
+            : [`${probe.id} (${probe.answerType}): expected probe ${expected.outcome} but got ${verdict.outcome}`];
+    });
+    if (failures.length > 0) {
+        return { mutationClass: "probe-wrong-answer", applicable: true, green: false, detail: failures.join("; ") };
     }
-    return { mutationClass: "probe-wrong-answer", applicable: true, green: true, detail: "probe fail as expected" };
+    const answerTypes = [...new Set(scenario.probes.map((probe) => probe.answerType))].sort();
+    return {
+        mutationClass: "probe-wrong-answer",
+        applicable: true,
+        green: true,
+        detail: `probe fail as expected for all ${scenario.probes.length} probe(s), covering answer types ${answerTypes.join(", ")}`,
+    };
 }
 
 /** Construction invariant: semantic-class fixtures must be validator-clean. */
@@ -349,6 +377,17 @@ export function runMutationBattery(scenarios: readonly HistorianEvalScenario[]):
 
 const RESULT_LABELS: readonly string[] = [...MUTATION_CLASSES, "baseline-fixture", "battery-coverage"];
 
+/**
+ * The two false-authoritative classes are the only ones a green run may skip
+ * (a scenario need not declare an expected-absent predicate in both class
+ * family sets). Every other class is unconditionally applied, so a green
+ * artifact marking one `applicable: false` was not produced by the battery.
+ */
+const ALWAYS_APPLICABLE_CLASSES: readonly MutationClass[] = MUTATION_CLASSES.filter(
+    (mutationClass) =>
+        mutationClass !== "speculation-promoted" && mutationClass !== "rejected-proposal-active",
+);
+
 function evidenceFail(code: string): never {
     throw new Error(`mutation evidence: ${code}`);
 }
@@ -421,6 +460,16 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
             );
             if (!falseAuthoritativeApplied) {
                 evidenceFail(`scenarios[${index}]: green-without-applicable-false-authoritative-class`);
+            }
+            // Coverage alone still admits an artifact that lists every class
+            // but marks the unconditional ones skipped, which would claim
+            // green while demonstrating only the false-authoritative pair.
+            const skipped = ALWAYS_APPLICABLE_CLASSES.filter(
+                (mutationClass) =>
+                    !results.some((result) => result.mutationClass === mutationClass && result.applicable),
+            );
+            if (skipped.length > 0) {
+                evidenceFail(`scenarios[${index}]: green-with-skipped-required-class-${skipped.join(",")}`);
             }
         }
         return entry as unknown as ScenarioMutationEvidence;
