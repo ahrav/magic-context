@@ -153,9 +153,9 @@ function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunA
         factsEmitted: 2,
         chunkStartOrdinal: 1,
         chunkEndOrdinal: 20,
-        // A promoting run changed the claim state; the runner records the delta
-        // per run so a later run's lost promotion is not masked by an earlier one.
-        claimsAdded: 2,
+        // A promoting run left promotion evidence; the runner records the delta per
+        // run so a later run's lost promotion is not masked by an earlier one.
+        promotionEvidenceAdded: 2,
         ...overrides,
     };
     // A discarding run emitted one more compartment than it persisted, which is
@@ -639,12 +639,20 @@ describe("scoreRunRecord", () => {
             const second = scoreRunRecord(record, scenario);
             expect(first.verdict).toBe("PASS");
             expect(JSON.stringify(second)).toBe(JSON.stringify(first));
-            // Boundary twin: the pinned clock is the CAUSE. Advancing the
-            // record's own clock past the expiry flips the verdict, so a
-            // scorer substituting any other clock cannot satisfy both.
+            // Boundary twin: the pinned clock is the CAUSE. Advancing the record's
+            // own clock past the expiry changes the outcome, so a scorer
+            // substituting any other clock cannot satisfy both halves.
+            //
+            // The advanced clock now lands on `record-snapshot-mismatch` rather
+            // than FAIL:recall, and that is the correct reading: at that clock the
+            // recorded injected claims are no longer on the snapshot's injection
+            // surface, which for any record the runner produced means the record
+            // and its snapshot disagree. Either way the verdict is clock-derived,
+            // which is what this asserts.
             const advanced = scoreRunRecord({ ...record, nowMs: pinnedNowMs + 120_000 }, scenario);
-            expect(advanced.verdict).toBe("FAIL");
-            expect(advanced.failReasons).toEqual(["recall"]);
+            expect(advanced.verdict).not.toBe("PASS");
+            expect(advanced.errorReason).toBe("record-snapshot-mismatch");
+            expect(JSON.stringify(advanced)).not.toBe(JSON.stringify(first));
         } finally {
             fixture.cleanup();
         }

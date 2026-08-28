@@ -333,7 +333,15 @@ describe("parseScenario", () => {
     test("two probes asking the same question of different claims stay distinct", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        probes.push({ ...probes[0], id: "probe-capacity-of-lru", sourceClaimRef: "exp-lru-cache" });
+        // Same question, different backing claim — and a different gold value,
+        // because probes sharing an answer value are refused separately: they run
+        // in one session, so the earlier exchange would answer the later probe.
+        probes.push({
+            ...probes[0],
+            id: "probe-capacity-of-lru",
+            sourceClaimRef: "exp-lru-cache",
+            goldAnswer: "in-process lru cache",
+        });
         // The backing claim is part of the identity, so this is a different probe.
         expect(parseScenario(raw).probes).toHaveLength(4);
     });
@@ -356,6 +364,37 @@ describe("parseScenario", () => {
 });
 
 describe("gold and probe freeze guards", () => {
+    test("rejects two probes sharing an answer value even on different claims", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Different backing claim, same gold value: the earlier exchange still puts
+        // the later probe's answer in recent history, which is what makes the copy
+        // work — the claim behind each probe is irrelevant to that.
+        probes.push({
+            id: "probe-other-4096",
+            question: "How many entries does the cache hold?",
+            answerType: "exact",
+            goldAnswer: "4096",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).toThrow(/shared-answer-surface/);
+    });
+
+    test("rejects a multiple-choice option that exposes another claim's exact answer", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // The option list would reveal probe-capacity's gold value.
+        probes.push({
+            id: "probe-capacity-choice",
+            question: "Which capacity was configured?",
+            answerType: "multiple-choice",
+            choices: ["4096", "8192"],
+            goldAnswer: "8192",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).toThrow(/shared-answer-surface/);
+    });
+
     test("rejects two claim-id probes on one claim, whose runtime answer is identical", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];

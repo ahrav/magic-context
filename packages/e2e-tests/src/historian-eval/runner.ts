@@ -141,14 +141,17 @@ export interface HistorianRunArtifact {
     chunkStartOrdinal: number | null;
     chunkEndOrdinal: number | null;
     /**
-     * Claims under the scenario's project that this run added.
+     * Promotion evidence this run added under the scenario's project — claims
+     * created plus evidence rows attached to existing ones.
      *
      * Recorded per run because a scenario-wide count cannot separate them: run 1
      * promoting successfully leaves the total non-zero, so run 2's silently
      * skipped promotion passes the plumbing guard and its missing fact is then
-     * charged to historian recall instead.
+     * charged to historian recall instead. Evidence attachments count because a
+     * fact an earlier run already promoted is deduplicated onto that claim rather
+     * than creating another.
      */
-    claimsAdded: number;
+    promotionEvidenceAdded: number;
 }
 
 export interface ProbeExchange {
@@ -1058,7 +1061,7 @@ class ScenarioRunner {
         const trigger = this.scenario.trigger;
         const invocationsBefore = this.countHistorianInvocations(harness, sessionId);
         const markerHitsBefore = this.historianMarkerMockHits;
-        const claimsBefore = this.scopedClaimCount(harness);
+        const promotionEvidenceBefore = this.scopedPromotionEvidenceCount(harness);
 
         await this.scriptedTurn(
             harness,
@@ -1172,33 +1175,59 @@ class ScenarioRunner {
             factsEmitted: row.facts_emitted ?? 0,
             chunkStartOrdinal: row.chunk_start_ordinal,
             chunkEndOrdinal: row.chunk_end_ordinal,
-            claimsAdded: Math.max(0, this.scopedClaimCount(harness) - claimsBefore),
+            promotionEvidenceAdded: Math.max(0, this.scopedPromotionEvidenceCount(harness) - promotionEvidenceBefore),
         };
     }
 
     /**
-     * Claims under the scenario's project identity.
+     * Promotion evidence under the scenario's project: claims plus the evidence
+     * rows attached to their revisions.
      *
-     * Scoped, not global: the verification bridge and the authoritative claim read
-     * are both scoped this way, so claims promoted under a different identity would
-     * satisfy a global count while leaving those reads empty.
+     * Scoped, not global, because the verification bridge and the authoritative
+     * claim read are both scoped this way — claims promoted under a different
+     * identity would satisfy a global count while leaving those reads empty.
+     *
+     * Evidence rows are counted alongside claims because a promotion does not
+     * always create one. `stageCreateProjectMemoryClaimInCurrentTransaction`
+     * matches on a normalized content hash and, for a fact an earlier run already
+     * promoted, attaches evidence to the existing claim instead — so counting
+     * claims alone reads a successful re-promotion as a lost one, which is a
+     * false plumbing failure on exactly the repeated-fact transcript a two-run
+     * scenario produces.
      */
-    private scopedClaimCount(harness: TestHarness): number {
+    private scopedPromotionEvidenceCount(harness: TestHarness): number {
         const db = openTestDb(harness.contextDbPath(), { readonly: true });
         try {
             const projectIds = resolveProjectIdsForIdentities(db, [
                 resolveProjectIdentity(harness.opencode.env.workdir),
             ]);
             if (projectIds.length === 0) return 0;
-            return (
+            const placeholders = projectIds.map(() => "?").join(", ");
+            const claims =
                 (
                     db
-                        .prepare(
-                            `SELECT COUNT(*) AS n FROM claims WHERE project_id IN (${projectIds.map(() => "?").join(", ")})`,
-                        )
+                        .prepare(`SELECT COUNT(*) AS n FROM claims WHERE project_id IN (${placeholders})`)
                         .get(...projectIds) as { n: number } | null
-                )?.n ?? 0
-            );
+                )?.n ?? 0;
+            let evidence = 0;
+            try {
+                evidence =
+                    (
+                        db
+                            .prepare(
+                                `SELECT COUNT(*) AS n FROM claim_evidence
+                                   JOIN claim_revisions ON claim_revisions.id = claim_evidence.revision_id
+                                   JOIN claims ON claims.id = claim_revisions.claim_id
+                                  WHERE claims.project_id IN (${placeholders})`,
+                            )
+                            .get(...projectIds) as { n: number } | null
+                    )?.n ?? 0;
+            } catch {
+                // Older fragment without the evidence tables: the claim count alone
+                // still detects a first promotion, which is the common case.
+                evidence = 0;
+            }
+            return claims + evidence;
         } finally {
             db.close();
         }
@@ -1349,13 +1378,16 @@ class ScenarioRunner {
         // whether the scenario ended with any claims lets an earlier success mask a
         // later run's lost promotion.
         const lostPromotion = runs.filter(
-            (run) => !run.discardedLast && run.factsEmitted > 0 && run.claimsAdded === 0,
+            (run) => !run.discardedLast && run.factsEmitted > 0 && run.promotionEvidenceAdded === 0,
         );
         if (lostPromotion.length > 0) {
             throw new RunAbort(
                 "no-op-promotion",
                 lostPromotion
-                    .map((run) => `run ${run.runIndex} emitted ${run.factsEmitted} fact(s) but added no claim`)
+                    .map(
+                        (run) =>
+                            `run ${run.runIndex} emitted ${run.factsEmitted} fact(s) but added no claim or evidence`,
+                    )
                     .join("; "),
             );
         }
@@ -1370,7 +1402,7 @@ class ScenarioRunner {
             // session-directory or identity-normalization drift — satisfy a global
             // count while leaving those reads empty. The scorer would then report
             // FAIL:recall, charging a project-routing fault to the historian.
-            if (this.scopedClaimCount(harness) === 0) {
+            if (this.scopedPromotionEvidenceCount(harness) === 0) {
                 throw new RunAbort(
                     "no-op-promotion",
                     `${totalFacts} fact(s) emitted across runs but zero claims reached the store`,

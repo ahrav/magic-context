@@ -933,18 +933,23 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // rows at all, which is the case this separates out.
         let absent: string[];
         try {
-            // Existence AND ownership. A globally-present row is not evidence the
-            // claim was ever on this scenario's injection surface: a real claim
-            // from another project can be appended with its true public id,
-            // locator, content, and category, and it is never compared because the
-            // reverse and divergence checks iterate `visible`. Its locator in a
-            // probe set would then let `compareProbeAnswer` accept a claim that was
-            // never injected. Ownership is the discriminator that still admits a
-            // claim of THIS project hidden at the read clock by expiry or
-            // supersession.
+            // Membership in the VISIBLE surface, which is the only thing that makes
+            // a recorded claim evidence of injection. Existence proved a row
+            // somewhere; ownership narrowed that to this project; neither excluded
+            // a real but soft-hidden claim of the same project, which an edited
+            // record could append with forged content and a locator that then
+            // carries a probe answer.
+            //
+            // The runner reads `injectedClaims` from the same surface, at the same
+            // pinned clock, from the database this snapshot is a copy of — so for a
+            // genuine record the two sets are identical, and anything extra is an
+            // addition. Ownership is still checked, so a foreign claim is named as
+            // such rather than reported as merely unexpected.
             const ownProjectIds = new Set(resolveProjectIdsForIdentities(db, [record.projectIdentity]));
+            const visibleLocators = new Set(visible.map((item) => item.revisionLocator));
             absent = record.injectedClaims
                 .filter((claim) => {
+                    if (!visibleLocators.has(claim.revisionLocator)) return true;
                     const ref = getProjectMemoryClaimByPublicId(db, claim.publicClaimId);
                     return ref === null || !ownProjectIds.has(ref.projectId);
                 })
@@ -961,7 +966,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             return errorScore(
                 record.scenarioId,
                 "record-snapshot-mismatch",
-                `run record names ${absent.length} injected claim(s) absent from its snapshot or owned by another project: [${absent.slice(0, 5).join(", ")}]`,
+                `run record names ${absent.length} injected claim(s) not on its snapshot's injection surface, or owned by another project: [${absent.slice(0, 5).join(", ")}]`,
                 record.system,
             );
         }

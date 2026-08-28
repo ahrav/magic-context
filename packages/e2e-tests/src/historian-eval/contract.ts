@@ -541,21 +541,26 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         for (const right of probes.slice(leftIndex + 1)) {
             const leftRef = left.answerType === "claim-id" ? left.expectedClaimRef : left.sourceClaimRef;
             const rightRef = right.answerType === "claim-id" ? right.expectedClaimRef : right.sourceClaimRef;
-            if (leftRef !== rightRef) continue;
-            // Two claim-id probes on one claim have EMPTY answer surfaces and the
-            // identical runtime answer — the same public id — so the surface
-            // comparison alone would exempt the most direct copy of all.
-            if (left.answerType === "claim-id" && right.answerType === "claim-id") {
+            // Two claim-id probes on ONE claim resolve to the same public id, so
+            // their empty answer surfaces hide the most direct copy of all.
+            if (left.answerType === "claim-id" && right.answerType === "claim-id" && leftRef === rightRef) {
                 fail(
                     `${label}.probes: shared-answer-surface (${left.id} and ${right.id} both resolve ${leftRef} to the same runtime claim id)`,
                 );
             }
+            // Answer values are compared across ALL pairs, not only probes sharing
+            // a gold claim. What makes the copy work is that the earlier exchange
+            // put the later probe's answer in recent history; which claim each
+            // probe rests on does not change that. Two exact probes on different
+            // claims that happen to share a gold value are just as copyable, and a
+            // multiple-choice prompt can expose another claim's exact answer as one
+            // of its options.
             const leftSurface = answerSurface(left);
             const rightSurface = answerSurface(right);
             const shared = leftSurface.filter((value) => rightSurface.includes(value));
             if (shared.length > 0) {
                 fail(
-                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} rest on ${leftRef} and share an answer value, so the earlier exchange answers the later probe)`,
+                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} share the answer value ${JSON.stringify(shared[0])}, so the earlier exchange answers the later probe)`,
                 );
             }
         }
