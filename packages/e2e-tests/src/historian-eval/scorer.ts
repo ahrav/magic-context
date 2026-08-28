@@ -113,6 +113,17 @@ export interface ScenarioScore {
 
 export type RawOutputStageResult =
     | { stage: "validation-rejected"; error: string }
+    /**
+     * The output validated but left authored evidence outside what it processed, so it
+     * cannot be scored against this scenario's gold.
+     *
+     * A distinct stage rather than a FAIL, because it is not a claim about historian
+     * quality: an artifact that stopped short simply was not shown the transcript the
+     * gold is written against, and scoring it would report a vacuous absence pass. Also
+     * not `validation-rejected` — the output IS valid, which is what makes the omission
+     * easy to miss.
+     */
+    | { stage: "authored-evidence-unprocessed"; error: string }
     | { stage: "scored"; score: ScenarioScore };
 
 interface FactsScore {
@@ -340,10 +351,36 @@ function goldAnswerStatedInCompartments(probe: Probe, exchange: ProbeExchange): 
     // The ANSWER as a complete value, not the gold predicate. A summary matching a
     // predicate broader than the answer states the topic without stating the value, so
     // searching for the predicate reported an answer the probe could not have read.
+    //
+    // Decoded first, because the payload carries the WIRE form. The renderers escape
+    // block contents, so an authored answer of `A&B` reaches the request as `A&amp;B`:
+    // comparing against the raw value reported it absent and converted an answerable
+    // probe into an infrastructure ERROR. Decoding also removes the reverse hazard, where
+    // an answer of `amp` matched the entity text rather than any stated value.
     return containsCompleteValue(
-        injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS),
+        decodeXmlEntities(injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS)),
         probe.goldAnswer,
     );
+}
+
+/**
+ * The XML entity forms the block renderers emit, turned back into the characters an
+ * authored value is written with.
+ *
+ * Numeric forms are decoded too: an escaper is free to emit them, and a value the
+ * comparison cannot see is a false "unavailable" — which charges an answerable probe as
+ * infrastructure. `&amp;` is decoded LAST so a doubly-escaped `&amp;lt;` becomes
+ * `&lt;` rather than `<`, matching how a decoder consumes one layer.
+ */
+function decodeXmlEntities(text: string): string {
+    return text
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
+        .replace(/&#x([0-9a-fA-F]+);/g, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)))
+        .replace(/&amp;/g, "&");
 }
 
 /** Resolve a gold expected-claim reference to concrete injected claims. */
@@ -615,6 +652,29 @@ export function scoreRawOutput(
     const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, chunk, [], 1);
     if (!validated.ok) {
         return { stage: "validation-rejected", error: validated.error };
+    }
+
+    // Stopping early is LEGAL in a valid output — `<unprocessed_from>` is how the
+    // historian says it did — but a prefix that ends before the authored span cannot be
+    // scored against gold written over that span. Enough early compartments and facts to
+    // satisfy `minCount` and recall, with a hard negative in the unprocessed suffix,
+    // produced a PASS for an artifact that was never shown the forbidden formation: the
+    // absence check passed vacuously.
+    //
+    // Measured from how far the EMITTED compartments reach rather than from
+    // `unprocessed_from`, because the two agree on what was processed and the reach is on
+    // the validated result. Pre-discard, since the question is what the output covered,
+    // not what production would persist. Bounded by the authored span, since filler and
+    // padding carry no gold.
+    const emittedReach = validated.compartments.reduce(
+        (furthest, compartment) => Math.max(furthest, compartment.endMessage),
+        0,
+    );
+    if (emittedReach < authoredSpan.endMessage) {
+        return {
+            stage: "authored-evidence-unprocessed",
+            error: `output covers up to ordinal ${emittedReach}, short of the authored span ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the unprocessed suffix would pass vacuously`,
+        };
     }
 
     // Mirror production's publish gating (compartment-runner-incremental):

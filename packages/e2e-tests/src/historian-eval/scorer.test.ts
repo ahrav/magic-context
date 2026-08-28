@@ -474,6 +474,28 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         ).toBe(true);
     });
 
+    test("an output that stops inside the authored span is not scored", () => {
+        const base = validScenario();
+        // Gold's minimum is 1 and the early compartment satisfies it; both gold facts are
+        // emitted, so recall would be 1. But the output stops before the epilogue turn
+        // where the hard negative is authored, so the absence check would pass vacuously —
+        // which is a PASS for an artifact never shown the forbidden formation.
+        const short = buildMockHistorianOutput({
+            compartments: [{ start: 1, end: 4, title: "Prefix", body: "Chose the in-process LRU cache over Redis; capacity 4096." }],
+            facts: goldFacts(),
+            unprocessedFrom: 5,
+        });
+        const result = scoreRawOutput(short, base);
+        expect(result.stage).toBe("authored-evidence-unprocessed");
+    });
+
+    test("an output covering the authored span still scores", () => {
+        // The guard must not reject the ordinary case: the golden output covers every
+        // authored message, so it is scoreable.
+        const result = scoreRawOutput(goldenRawOutput(), validScenario());
+        expect(result.stage).toBe("scored");
+    });
+
     test("a chunk range supplied half-way is a caller error, not a silent authored-space fallback", () => {
         expect(() => scoreRawOutput(goldenRawOutput(), validScenario(), { chunkStartOrdinal: 21 })).toThrow(
             /chunkStartOrdinal and chunkEndOrdinal must be supplied together/,

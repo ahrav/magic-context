@@ -1346,6 +1346,7 @@ class ScenarioRunner {
         const trigger = this.scenario.trigger;
         const invocationsBefore = this.countHistorianInvocations(harness, sessionId);
         const completedInvocationsBefore = this.countHistorianInvocations(harness, sessionId, "completed");
+        const failedInvocationsBefore = this.countHistorianInvocations(harness, sessionId, "failed");
         const markerHitsBefore = this.historianMarkerMockHits;
         const promotionEvidenceBefore = this.scopedPromotionEvidenceCount(harness);
 
@@ -1424,10 +1425,20 @@ class ScenarioRunner {
         // failure to model quality, which is precisely the attribution R6 forbids.
         const completedDuringRun =
             this.countHistorianInvocations(harness, sessionId, "completed") - completedInvocationsBefore;
+        // No FAILED attempt either, not merely one completed. Attributing validation
+        // exhaustion to the model means every attempt it needed produced text to
+        // validate — and a mixed window breaks that: the primary attempt returns
+        // malformed output (completed) while the repair never executes (failed) and the
+        // session-model fallback lands on the mock. One completed attempt then suppressed
+        // the fallback abort and recorded FAIL:invalid-output for a run whose repair the
+        // provider refused.
+        const failedDuringRun =
+            this.countHistorianInvocations(harness, sessionId, "failed") - failedInvocationsBefore;
         const failedValidation =
             row.status === "failed" &&
             (row.failure_reason ?? "").startsWith("validation: ") &&
-            completedDuringRun > 0;
+            completedDuringRun > 0 &&
+            failedDuringRun === 0;
         if (this.options.mode.kind === "live" && markerHitsDuringRun > 0 && !failedValidation) {
             throw new RunAbort(
                 "fallback-engaged",
@@ -1890,7 +1901,17 @@ class ScenarioRunner {
             }
             await this.scriptedTurn(harness, sessionId, prompt, {
                 text: next,
-                usage: { input_tokens: 200, output_tokens: 40 },
+                // The build turn's declared usage, which `lintScenario` already proves is
+                // below the execution threshold. A fixed 200 crossed it whenever
+                // `modelContextLimit` was 500 or less — 200/500 is the pinned 40% — so a
+                // lint-clean recipe started an undeclared historian pass on a PROBE turn
+                // and `driveProbes` aborted it. Inheriting the proven value ties the probe
+                // phase to the same guarantee instead of adding a second number nothing
+                // checks.
+                usage: {
+                    input_tokens: this.scenario.trigger.usageTokensPerTurn,
+                    output_tokens: 40,
+                },
             });
         } else {
             await harness.sendPrompt(sessionId, prompt, {
