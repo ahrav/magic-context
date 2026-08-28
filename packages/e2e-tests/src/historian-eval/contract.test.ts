@@ -357,6 +357,29 @@ describe("parseScenario", () => {
 });
 
 describe("gold and probe freeze guards", () => {
+    test("rejects two probes on one claim whose answer surfaces overlap", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // An exact probe on exp-lru-cache whose gold answer is already a choice of
+        // the multiple-choice probe on the same claim: probes share one session, so
+        // the earlier exchange answers the later one.
+        probes.push({
+            id: "probe-store-exact",
+            question: "Name the cache that backs sessions.",
+            answerType: "exact",
+            goldAnswer: "in-process lru",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).toThrow(/shared-answer-surface/);
+    });
+
+    test("accepts an exact and a claim-id probe on one claim, whose answers cannot substitute", () => {
+        // The canonical scenario already pairs a multiple-choice and a claim-id
+        // probe on exp-lru-cache: one answers with a value, the other with a
+        // runtime claim id, so neither exchange supplies the other's answer.
+        expect(() => parseScenario(validScenarioRaw())).not.toThrow();
+    });
+
     test("rejects same-category predicate subsumption, which credits one fact to two golds", () => {
         const raw = validScenarioRaw();
         // "LRU cache" is contained in the existing "in-process LRU cache", so any

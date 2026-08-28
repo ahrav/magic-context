@@ -44,6 +44,7 @@ import {
     RUN_RECORD_SCHEMA,
     authoredTurnOrdinalsFor,
     buildProbePrompt,
+    extractAnswerEnvelope,
     goldRangeLeak,
     rangeCoveredByCompartments,
 } from "./runner";
@@ -537,6 +538,44 @@ function errorMessage(error: unknown): string {
  * reach them, and a record missing a declared run would otherwise be scored
  * from whatever its retained snapshot happens to contain.
  */
+/**
+ * Shape of a deserialized run record, checked before anything traverses it.
+ *
+ * The interface is a compile-time claim about values this module constructs; a
+ * record loaded from disk has had no such guarantee. A truncated artifact with
+ * `historianRuns: null` satisfies the schema string and then throws inside the
+ * first `.map`, aborting scoring for every remaining scenario rather than being
+ * counted as one damaged artifact. Checked explicitly rather than behind a
+ * blanket catch, so a genuine scorer bug still surfaces as a bug.
+ */
+function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null {
+    const isPair = (value: unknown): boolean =>
+        Array.isArray(value) && value.length === 2 && value.every((entry) => typeof entry === "number");
+    const problems: string[] = [];
+    if (typeof record.scenarioId !== "string" || record.scenarioId.length === 0) problems.push("scenarioId");
+    if (typeof record.scenarioFingerprint !== "string") problems.push("scenarioFingerprint");
+    if (typeof record.sessionId !== "string") problems.push("sessionId");
+    if (typeof record.projectIdentity !== "string") problems.push("projectIdentity");
+    if (typeof record.nowMs !== "number" || !Number.isFinite(record.nowMs)) problems.push("nowMs");
+    if (record.system === null || typeof record.system !== "object") problems.push("system");
+    if (typeof record.expectedHistorianRuns !== "number") problems.push("expectedHistorianRuns");
+    if (!Array.isArray(record.historianRuns)) problems.push("historianRuns");
+    if (!Array.isArray(record.probes)) problems.push("probes");
+    if (!Array.isArray(record.injectedClaims)) problems.push("injectedClaims");
+    if (!Array.isArray(record.authoredTurnOrdinals) || !record.authoredTurnOrdinals.every(isPair)) {
+        problems.push("authoredTurnOrdinals");
+    }
+    if (typeof record.contextDbSnapshotPath !== "string") problems.push("contextDbSnapshotPath");
+    if (record.error !== null && typeof record.error?.reason !== "string") problems.push("error");
+    if (problems.length === 0) return null;
+    return errorScore(
+        typeof record.scenarioId === "string" ? record.scenarioId : "<unknown>",
+        "record-malformed",
+        `run record field(s) have the wrong shape: [${problems.join(", ")}]`,
+        null,
+    );
+}
+
 function recordIdentityError(
     record: HistorianEvalRunRecord,
     scenario: HistorianEvalScenario,
@@ -751,6 +790,10 @@ function telemetryMismatch(
  * infrastructure: FAIL:invalid-output (KTD4/KTD8).
  */
 export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: HistorianEvalScenario): ScenarioScore {
+    // Shape precedes everything: every check below reads nested fields.
+    const shapeError = recordShapeError(record);
+    if (shapeError !== null) return shapeError;
+
     // Identity precedes the stored-error passthrough. An ERROR artifact under an
     // unsupported schema, or paired with a different scenario, would otherwise
     // enter the lane report under its own stale identity and reason — reported
@@ -1070,6 +1113,30 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             }
         }
 
+        // The recorded answer must be reproducible from the recorded response.
+        // Without this, `answerRaw` is an unfalsifiable derivation and editing it
+        // to the gold value turns a probe FAIL into a PASS.
+        for (const exchange of record.probes) {
+            if (exchange.responseText === null) {
+                if (!scriptedProbes) continue;
+                return errorScore(
+                    record.scenarioId,
+                    "harness-failure",
+                    `probe ${exchange.probeId}: scripted record carries no response text, so its answer cannot be checked`,
+                    record.system,
+                );
+            }
+            const extracted = extractAnswerEnvelope(exchange.responseText);
+            if (extracted !== exchange.answerRaw) {
+                return errorScore(
+                    record.scenarioId,
+                    "record-snapshot-mismatch",
+                    `probe ${exchange.probeId}: recorded answer ${JSON.stringify(exchange.answerRaw)} is not what its recorded response yields (${JSON.stringify(extracted)})`,
+                    record.system,
+                );
+            }
+        }
+
         const probesById = new Map(scenario.probes.map((probe) => [probe.id, probe]));
         const probeVerdicts = record.probes.map((exchange) => {
             const probe = probesById.get(exchange.probeId);
@@ -1145,7 +1212,16 @@ function resolveReportSystem(
     const canonical = (system: SystemVersionTuple): string => canonicalJson(system);
     let agreed: SystemVersionTuple | null = null;
     for (const score of scores) {
-        if (score.system === null) continue;
+        if (score.system === null) {
+            // Raw-output seam results carry no system because no run produced
+            // them — and no probe tier ran either, so their empty `probeVerdicts`
+            // would let a scenario declaring hidden probes PASS. A lane report is
+            // a statement about executed runs, so the mutation battery's scores
+            // are refused rather than silently averaged in.
+            throw new Error(
+                `historian-eval report: score for ${score.scenarioId} carries no system identity; raw-output seam results are not lane results`,
+            );
+        }
         if (agreed === null) {
             agreed = score.system;
             continue;

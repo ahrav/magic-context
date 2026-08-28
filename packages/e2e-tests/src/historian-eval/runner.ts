@@ -151,6 +151,16 @@ export interface ProbeExchange {
     injectedRevisionLocators: string[];
     /** Captured probe-turn request payload (mock-captured; null on live routes). */
     payloadText: string | null;
+    /**
+     * Assistant text the answer was extracted from.
+     *
+     * `answerRaw` is a derivation, and on its own an unfalsifiable one: rescoring
+     * a stored record trusted it as the model's response with nothing to check it
+     * against, so editing a wrong answer to the gold value turned a probe FAIL
+     * into a PASS while every integrity check still passed. Keeping the response
+     * makes the extraction reproducible, so the two must agree.
+     */
+    responseText: string | null;
 }
 
 export interface SystemVersionTuple {
@@ -1388,6 +1398,7 @@ class ScenarioRunner {
 
         const first = await this.askProbe(harness, sessionId, buildProbePrompt(probe));
         let answerRaw = first.answerRaw;
+        let responseText = first.responseText;
         const toolNames = new Set(first.toolNames);
         let reAsked = false;
         if (answerRaw === null) {
@@ -1398,6 +1409,7 @@ class ScenarioRunner {
                 `Your previous reply had no valid <answer></answer> envelope. ${buildProbePrompt(probe)}`,
             );
             answerRaw = retry.answerRaw;
+            responseText = retry.responseText;
             for (const name of retry.toolNames) toolNames.add(name);
             if (answerRaw === null) {
                 throw new RunAbort("probe-envelope-malformed", `probe ${probe.id} answered without a valid envelope twice`);
@@ -1425,6 +1437,7 @@ class ScenarioRunner {
             reAsked,
             injectedRevisionLocators: this.visibleRevisionLocators(harness, sessionId),
             payloadText,
+            responseText,
         };
     }
 
@@ -1432,7 +1445,7 @@ class ScenarioRunner {
         harness: TestHarness,
         sessionId: string,
         prompt: string,
-    ): Promise<{ answerRaw: string | null; toolNames: string[] }> {
+    ): Promise<{ answerRaw: string | null; responseText: string | null; toolNames: string[] }> {
         const mode = this.options.mode;
         if (mode.kind === "scripted") {
             const next = this.probeResponseQueue.shift();
@@ -1452,8 +1465,10 @@ class ScenarioRunner {
         const messagesRes = await harness.client.session.messages({ path: { id: sessionId } });
         const toolNames = toolInvocationsInNewMessages(messagesRes.data, this.seenProbeMessageIds);
         for (const id of messageIds(messagesRes.data)) this.seenProbeMessageIds.add(id);
+        const responseText = extractLatestAssistantText(messagesRes.data);
         return {
-            answerRaw: extractAnswerEnvelope(extractLatestAssistantText(messagesRes.data)),
+            answerRaw: extractAnswerEnvelope(responseText),
+            responseText,
             toolNames,
         };
     }

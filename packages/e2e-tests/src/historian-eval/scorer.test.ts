@@ -127,6 +127,17 @@ function makeSnapshot(args: {
     };
 }
 
+/**
+ * Rewrite a probe's answer together with the response it was extracted from.
+ *
+ * The scorer reproduces the extraction and requires the two to agree, so editing
+ * `answerRaw` alone produces a deliberately-forged record — which is a different
+ * test than "the model answered wrongly".
+ */
+function withAnswer(exchange: ProbeExchange, answerRaw: string): ProbeExchange {
+    return { ...exchange, answerRaw, responseText: `<answer>${answerRaw}</answer>` };
+}
+
 function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunArtifact {
     const run: HistorianRunArtifact = {
         runIndex: 1,
@@ -188,6 +199,9 @@ function makeRecord(
                 ...fixture.injectedClaims.map((claim) => `${claim.publicClaimId}: ${claim.content}`),
                 "</project-memory>",
             ].join("\n"),
+            // The response the answer was extracted from; the scorer reproduces
+            // the extraction and requires the two to agree.
+            responseText: `<answer>${answerRaw}</answer>`,
         };
     });
     const record = buildRecord();
@@ -669,8 +683,7 @@ describe("scoreRunRecord", () => {
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
-                          ...exchange,
-                          answerRaw: "wrong",
+                          ...withAnswer(exchange, "wrong"),
                           injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
                               (locator) => locator !== trimmedLocator,
                           ),
@@ -719,8 +732,7 @@ describe("scoreRunRecord", () => {
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
                     ? {
-                          ...exchange,
-                          answerRaw: "wrong",
+                          ...withAnswer(exchange, "wrong"),
                           injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
                               (locator) => locator !== trimmedLocator,
                           ),
@@ -833,14 +845,13 @@ describe("scoreRunRecord", () => {
             record.probes = record.probes.map((exchange) => {
                 if (exchange.probeId === "probe-capacity") {
                     return {
-                        ...exchange,
-                        answerRaw: "wrong",
+                        ...withAnswer(exchange, "wrong"),
                         injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
                             (locator) => locator !== trimmedLocator,
                         ),
                     };
                 }
-                if (exchange.probeId === "probe-store") return { ...exchange, answerRaw: "redis" };
+                if (exchange.probeId === "probe-store") return withAnswer(exchange, "redis");
                 return exchange;
             });
             const score = scoreRunRecord(record, scenario);
@@ -959,6 +970,44 @@ describe("scoreRunRecord", () => {
             );
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("unreadable-snapshot");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a malformed persisted record is one ERROR, not a thrown lane abort", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // TypeScript's interface says nothing about JSON loaded from disk.
+            const truncated = { ...record, historianRuns: null } as unknown as HistorianEvalRunRecord;
+            const score = scoreRunRecord(truncated, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an edited probe answer no longer matching its recorded response is ERROR", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // Only the answer is edited, as a forged record would: the response it
+            // was supposedly extracted from still yields the original.
+            const forged = {
+                ...record,
+                probes: record.probes.map((exchange, index) =>
+                    index === 0 ? { ...exchange, answerRaw: "4096" } : exchange,
+                ),
+            };
+            const honest = { ...record, probes: record.probes.map((e, i) => (i === 0 ? withAnswer(e, "4096") : e)) };
+            expect(scoreRunRecord(honest, scenario).errorReason).toBeNull();
+            const score = scoreRunRecord({ ...forged, probes: forged.probes.map((e, i) => (i === 0 ? { ...e, answerRaw: "wrong" } : e)) }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
         } finally {
             fixture.cleanup();
         }
@@ -1337,6 +1386,7 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
         reAsked: false,
         injectedRevisionLocators: locators,
         payloadText: null,
+        responseText: answerRaw === null ? null : `<answer>${answerRaw}</answer>`,
     });
 
     test("exact-value probe compares by normalized string equality", () => {
@@ -1394,8 +1444,7 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
             record.probes = record.probes.map((probeExchange) =>
                 probeExchange.probeId === "probe-capacity"
                     ? {
-                          ...probeExchange,
-                          answerRaw: "wrong",
+                          ...withAnswer(probeExchange, "wrong"),
                           injectedRevisionLocators: probeExchange.injectedRevisionLocators.filter(
                               (locator) =>
                                   locator !==
@@ -1416,6 +1465,14 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 });
 
 describe("buildLaneReport", () => {
+    const LANE_SYSTEM = {
+        repoCommitSha: "c".repeat(40),
+        historianModelId: "scripted-mock",
+        probeModelId: "scripted-mock",
+        parserImpl: "ts" as const,
+        chunkTokenBudget: null,
+    };
+
     function passScore(id: string): ScenarioScore {
         return {
             scenarioId: id,
@@ -1432,7 +1489,9 @@ describe("buildLaneReport", () => {
             falseAuthoritativeMatches: [],
             structuralFindings: [],
             probeVerdicts: [],
-            system: null,
+            // Lane scores come from runs, so they carry a system; a systemless
+            // score is a raw-output seam result and the report refuses it.
+            system: LANE_SYSTEM,
         };
     }
 
@@ -1491,6 +1550,11 @@ describe("buildLaneReport", () => {
         // Derived from the scores, not from the caller's label.
         expect(buildLaneReport([{ ...passScore("hse-a"), system }]).system).toEqual(system);
 
+        // A systemless score is a raw-output seam result, not a lane result.
+        expect(() => buildLaneReport([{ ...passScore("hse-a"), system: null }])).toThrow(
+            /carries no system identity/,
+        );
+
         expect(() =>
             buildLaneReport([
                 { ...passScore("hse-a"), system },
@@ -1501,9 +1565,6 @@ describe("buildLaneReport", () => {
         expect(() => buildLaneReport([{ ...passScore("hse-a"), system }], { system: other })).toThrow(
             /does not match the scored records/,
         );
-
-        // A score with no run record behind it constrains nothing.
-        expect(buildLaneReport([passScore("hse-a")], { system }).system).toEqual(system);
 
         // Field order must not matter: a deserialized run-record tuple and a
         // caller literal never share a construction site.

@@ -517,6 +517,42 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         }),
         `${label}.probes.identity`,
     );
+    // Probes run sequentially in ONE resumed session, so a later probe sees every
+    // earlier probe's prompt and answer as recent raw history. That is only
+    // exploitable when an earlier answer IS a correct answer to the later probe,
+    // which needs both to rest on the same gold claim — so a pair whose answer
+    // surfaces overlap is refused at freeze time.
+    //
+    // Probe uniqueness does not cover this: it includes the question text and
+    // answer type, so "which cache backs sessions" as multiple-choice and a
+    // differently worded exact probe on the same claim are distinct probes whose
+    // answers are the same string.
+    //
+    // This does not make the probes independent — a model can still infer from a
+    // related exchange without copying a value. True isolation needs each probe
+    // to run from an identical pre-probe session state.
+    const answerSurface = (probe: Probe): string[] =>
+        probe.answerType === "claim-id"
+            ? []
+            : [probe.goldAnswer, ...(probe.answerType === "multiple-choice" ? probe.choices : [])].map(
+                  normalizeContent,
+              );
+    for (const [leftIndex, left] of probes.entries()) {
+        for (const right of probes.slice(leftIndex + 1)) {
+            const leftRef = left.answerType === "claim-id" ? left.expectedClaimRef : left.sourceClaimRef;
+            const rightRef = right.answerType === "claim-id" ? right.expectedClaimRef : right.sourceClaimRef;
+            if (leftRef !== rightRef) continue;
+            const leftSurface = answerSurface(left);
+            const rightSurface = answerSurface(right);
+            const shared = leftSurface.filter((value) => rightSurface.includes(value));
+            if (shared.length > 0) {
+                fail(
+                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} rest on ${leftRef} and share an answer value, so the earlier exchange answers the later probe)`,
+                );
+            }
+        }
+    }
+
     const expectedClaimIds = new Set(expectedClaims.map((claim) => claim.id));
     for (const probe of probes) {
         // Every probe type now carries exactly one gold reference, so there is no
