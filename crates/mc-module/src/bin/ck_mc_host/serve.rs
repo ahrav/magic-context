@@ -279,7 +279,10 @@ fn merge_selection(
     if require_previous_credentials && changed {
         return Err("restart cannot change the active harness selection");
     }
-    if (changed || require_previous_credentials)
+    // Only reachable with `changed`, so no `require_previous_credentials`
+    // disjunct: a restart that reaches here matched the previous selection
+    // exactly, which already implies identical credential identities.
+    if changed
         && previous
             .credential_identities
             .iter()

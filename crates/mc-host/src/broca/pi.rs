@@ -305,7 +305,10 @@ async fn run_pi(
             return subprocess::harness_unavailable_failure(HarnessName::Pi, "closure_incomplete")
         }
     };
-    args.insert(0, entrypoint.path().to_string_lossy().into_owned());
+    // Node reads the entrypoint as data and resolves its sibling modules
+    // relative to it, so this must be a path the loader can walk back to the
+    // closure tree — not every platform's descriptor path can.
+    args.insert(0, entrypoint.module_path().to_string_lossy().into_owned());
     let mut resolved_extensions = Vec::with_capacity(descriptor.provider_extension_nodes.len());
     for extension_node in &descriptor.provider_extension_nodes {
         let extension = match descriptor.closure.resolve_node_descriptor(extension_node) {
@@ -318,7 +321,7 @@ async fn run_pi(
             }
         };
         args.push("--extension".to_owned());
-        args.push(extension.path().to_string_lossy().into_owned());
+        args.push(extension.module_path().to_string_lossy().into_owned());
         resolved_extensions.push(extension);
     }
     args.push("--extension".to_owned());
@@ -356,13 +359,18 @@ async fn run_pi(
         // Moved, not cloned: the prompt is the request's dominant byte cost
         // and nothing after spec construction reads it.
         stdin: request.prompt.into_bytes(),
-        inherit_fds: std::iter::once(descriptor.closure.inherited_fd())
-            .chain(std::iter::once(interpreter.inherited_fd()))
-            .chain(std::iter::once(entrypoint.inherited_fd()))
+        // Exactly the descriptors the child's own arguments name: the
+        // exec'd interpreter, plus the module descriptors only where
+        // `module_path` is descriptor-rooted. The closure directory
+        // descriptor is deliberately absent — no argument references it, and
+        // inheriting it would hand the harness a rename-immune handle it can
+        // write back through into the validated closure tree.
+        inherit_fds: std::iter::once(interpreter.inherited_fd())
+            .chain(entrypoint.module_inherited_fd())
             .chain(
                 resolved_extensions
                     .iter()
-                    .map(|extension| extension.inherited_fd()),
+                    .filter_map(|extension| extension.module_inherited_fd()),
             )
             .collect(),
     };

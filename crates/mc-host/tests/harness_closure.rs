@@ -151,6 +151,30 @@ fn setup() -> (tempfile::TempDir, PathBuf, ClosureCandidate) {
 }
 
 #[test]
+fn resolved_descriptor_is_rewound_after_verification() {
+    let (temp, _source, candidate) = setup();
+    let store = HarnessClosureStore::open(&temp.path().join("closures")).expect("store");
+    let closure = store.materialize(&candidate).expect("materialize");
+
+    let node = closure
+        .resolve_node_descriptor("node_modules/pi/dist/helper.js")
+        .expect("resolve node");
+
+    // Verification hashes the node to EOF through an offset-sharing dup. A
+    // macOS child opening `/dev/fd/N` receives a dup of this descriptor,
+    // offset included, so a descriptor left at EOF reads as an empty file.
+    let offset = rustix::fs::seek(
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(node.inherited_fd()) },
+        rustix::fs::SeekFrom::Current(0),
+    )
+    .expect("query descriptor offset");
+    assert_eq!(
+        offset, 0,
+        "a handed-out node descriptor must be positioned at the start of the file"
+    );
+}
+
+#[test]
 fn materialization_preserves_layout_and_security() {
     let (temp, _source, candidate) = setup();
     let store_root = temp.path().join("closures");
@@ -158,10 +182,10 @@ fn materialization_preserves_layout_and_security() {
     let closure = store.materialize(&candidate).expect("materialize");
 
     let entrypoint = closure
-        .resolve_node("node_modules/pi/dist/cli.js")
+        .resolve_node_descriptor("node_modules/pi/dist/cli.js")
         .expect("entrypoint");
     assert_eq!(
-        std::fs::read(&entrypoint).expect("read copied entrypoint"),
+        std::fs::read(entrypoint.closure_path()).expect("read copied entrypoint"),
         b"import './helper.js'; import './addon.node'"
     );
     assert_eq!(closure.manifest().extensions, candidate.manifest.extensions);
@@ -189,8 +213,9 @@ fn retained_closure_survives_source_deletion_and_deduplicates_by_digest() {
     assert_eq!(
         std::fs::read(
             second
-                .resolve_node("node_modules/pi/dist/helper.js")
+                .resolve_node_descriptor("node_modules/pi/dist/helper.js")
                 .expect("resolve retained node")
+                .closure_path()
         )
         .expect("read retained node"),
         b"export const answer = 42"
@@ -278,8 +303,9 @@ fn retained_executable_loads_dependency_and_extension_after_source_deletion() {
 
     let output = std::process::Command::new(
         closure
-            .resolve_node("bin/run")
-            .expect("retained executable"),
+            .resolve_node_descriptor("bin/run")
+            .expect("retained executable")
+            .closure_path(),
     )
     .env_clear()
     .output()
@@ -437,8 +463,9 @@ fn production_closures_from_environment_materialize() {
         })
         .expect("materialize OpenCode closure");
     assert!(opencode
-        .resolve_node("bin/opencode")
+        .resolve_node_descriptor("bin/opencode")
         .expect("OpenCode executable")
+        .closure_path()
         .is_file());
 
     let pi = store
@@ -451,8 +478,9 @@ fn production_closures_from_environment_materialize() {
         })
         .expect("materialize Pi closure");
     assert!(pi
-        .resolve_node("node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
+        .resolve_node_descriptor("node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
         .expect("Pi entrypoint")
+        .closure_path()
         .is_file());
     assert_eq!(pi.manifest().nodes.len(), 3_081);
 }
