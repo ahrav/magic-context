@@ -477,12 +477,31 @@ fn publication_daemon_ver(observed: &LifecycleProbe) -> Option<String> {
 
 /// Parses `mc-host/X.Y.Z` against the embedded half-open supported daemon
 /// range from the release contract.
+///
+/// The accepted shape must stay byte-for-byte identical to
+/// `evaluateDaemonCompatibility` in
+/// `packages/plugin/src/shared/mc-host-lifecycle/compatibility.ts`, whose
+/// `^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$` regex gates the same
+/// authenticated `daemon_ver` against the same contract range. The two must
+/// agree on every input or one side reports a daemon compatible while the other
+/// rejects it, so `triple` rejects anything but three components that are pure
+/// ASCII digits with no redundant leading zero — `u64::from_str` alone would
+/// accept a leading `+` and `007`, neither of which the regex does.
 fn daemon_version_compatible(daemon_ver: &str) -> bool {
     fn triple(version: &str) -> Option<[u64; 3]> {
+        fn component(part: &str) -> Option<u64> {
+            if part.is_empty()
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+            {
+                return None;
+            }
+            part.parse().ok()
+        }
         let mut parts = version.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
+        let major = component(parts.next()?)?;
+        let minor = component(parts.next()?)?;
+        let patch = component(parts.next()?)?;
         if parts.next().is_some() {
             return None;
         }
@@ -1433,5 +1452,36 @@ mod tests {
         assert!(!daemon_version_compatible("mc-host/0.0.9"));
         assert!(!daemon_version_compatible("other/0.1.0"));
         assert!(!daemon_version_compatible("mc-host/1"));
+    }
+
+    /// The accepted shape must match `evaluateDaemonCompatibility`'s
+    /// `^(\d+)\.(\d+)\.(\d+)$` in
+    /// `packages/plugin/src/shared/mc-host-lifecycle/compatibility.ts`. A
+    /// component that side accepts and this one rejects (or the reverse) makes
+    /// a native result and the TypeScript policy verdict contradict each other
+    /// for the same daemon.
+    #[test]
+    fn daemon_version_shape_matches_the_typescript_gate() {
+        // `u64::from_str` alone accepts these; the regex does not.
+        assert!(!daemon_version_compatible("mc-host/+0.1.0"));
+        assert!(!daemon_version_compatible("mc-host/0.+1.0"));
+        assert!(!daemon_version_compatible("mc-host/0.1.+0"));
+        // Neither side accepts empty components, signs, or whitespace.
+        assert!(!daemon_version_compatible("mc-host/0..0"));
+        assert!(!daemon_version_compatible("mc-host/0.1."));
+        assert!(!daemon_version_compatible("mc-host/-0.1.0"));
+        assert!(!daemon_version_compatible("mc-host/ 0.1.0"));
+        assert!(!daemon_version_compatible("mc-host/0.1.0 "));
+        assert!(!daemon_version_compatible("mc-host/0.1.0-rc1"));
+        assert!(!daemon_version_compatible("mc-host/0.1.0.0"));
+        // A redundant leading zero is not the canonical spelling, and the
+        // mismatch detail both sides emit calls the grammar canonical, so
+        // neither side may accept it.
+        assert!(!daemon_version_compatible("mc-host/0.01.0"));
+        assert!(!daemon_version_compatible("mc-host/00.1.0"));
+        assert!(!daemon_version_compatible("mc-host/0.1.00"));
+        assert!(!daemon_version_compatible("mc-host/01.2.3"));
+        // A single zero component is canonical and stays accepted.
+        assert!(daemon_version_compatible("mc-host/0.1.0"));
     }
 }

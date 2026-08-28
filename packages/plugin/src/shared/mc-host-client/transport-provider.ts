@@ -47,9 +47,10 @@ export interface CandidateChannelArgs {
     maxBodyLen: number;
     handlers: FrameChannelHandlers;
     /**
-     * Authenticated per-incarnation daemon identity from the connection
-     * snapshot that negotiated this grant. Providers scoping replay state
-     * (candidate watermarks) key on it, never on the reusable PID.
+     * Authenticated per-incarnation daemon identity, copied from the
+     * generation whose handshake proved it and which negotiated this grant.
+     * Providers scoping replay state (candidate watermarks) key on it, never
+     * on the reusable PID.
      */
     daemonId: Uint8Array;
 }
@@ -522,11 +523,7 @@ export function sanitizedCandidateFactory(
         return {
             start: async (deadline) => {
                 try {
-                    const result = await channel.start(deadline);
-                    // Plain snapshot: the provider result's getters must not
-                    // carry deferred provider code past this boundary, where
-                    // a later read would escape unsanitized.
-                    return { daemonVer: String(result.daemonVer) };
+                    await channel.start(deadline);
                 } catch {
                     throw sanitizedProviderError(transport, "start");
                 }

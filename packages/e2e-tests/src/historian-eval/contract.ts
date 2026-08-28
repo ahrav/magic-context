@@ -19,6 +19,7 @@ import {
     PRIVACY_POLICY_VERSION,
     SANITIZER_VERSION,
 } from "../../../plugin/scripts/retrieval-benchmark/privacy";
+import { deriveProtectedTailTokenTarget } from "../../../plugin/src/hooks/magic-context/protected-tail-boundary";
 import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
@@ -36,6 +37,32 @@ import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
 import { ballastProse } from "../ballast";
 import { HEX64_RE, makeContractPrimitives } from "../contract-primitives";
+
+/**
+ * The fixed sentences `buildProbePrompt` wraps a probe's question in.
+ *
+ * Held here, not in the runner, because two consumers must agree on them: the
+ * runner renders them into the prompt it sends, and the freeze lint searches them
+ * for probe-answer collisions. A probe whose gold answer is a word this
+ * boilerplate uses — "project", "memory", "session", "value" — can be answered by
+ * echoing the very turn being scored, and a lint measuring only the transcript's
+ * harness text would not see it. Same reason `ballastProse` has a single
+ * implementation: the text a lint measures has to be the text a runner sends.
+ *
+ * Only the boilerplate. The rendered question and choices are per-probe and are
+ * checked by the self-answering and shared-surface guards instead; folding them in
+ * here would make every multiple-choice gold collide with its own prompt.
+ */
+export const PROBE_PROMPT_SHARED =
+    "Answer strictly from the project memory and session history already available to you in this conversation. " +
+    "Reply with the answer inside an <answer></answer> envelope. Put nothing else inside the envelope.";
+export const PROBE_PROMPT_EXACT_SUFFIX = "Answer with the exact value only.";
+export const PROBE_PROMPT_CHOICE_PREFIX = "Choose exactly one of:";
+export const PROBE_PROMPT_CLAIM_ID_SUFFIX =
+    "Answer with the id of the single project-memory claim (the identifier before the colon in the project-memory block) that records it.";
+export const PROBE_PROMPT_REASK_PREFIX = "Your previous reply had no valid <answer></answer> envelope.";
+/** The label `buildProbePrompt` puts in front of the authored question. */
+export const PROBE_PROMPT_QUESTION_LABEL = "Question:";
 
 export const SCENARIO_SCHEMA = "historian-eval-scenario/v1";
 export const MANIFEST_SCHEMA = "historian-eval-manifest/v1";
@@ -186,9 +213,16 @@ export interface HistorianEvalScenario {
 function parsePredicate(raw: unknown, label: string): ContentPredicate {
     const value = record(raw, label);
     exact(value, ["kind", "value"], label);
+    const text = string(value.value, `${label}.value`);
+    // Bounded for the same reason the transcript maxima exist: a predicate value
+    // is normalized and substring-scanned repeatedly — per visible claim during
+    // scoring, and all-pairs during the freeze lint's subsumption check — so an
+    // unbounded value multiplies through those scans and can stall lint ahead of
+    // every semantic check. Well beyond any authored formation.
+    if (text.length > MAX_PREDICATE_VALUE_CHARS) fail(`${label}.value: above-operational-maximum`);
     return {
         kind: enumeration(value.kind, ["normalized-substring"], `${label}.kind`),
-        value: string(value.value, `${label}.value`),
+        value: text,
     };
 }
 
@@ -211,6 +245,31 @@ export const MAX_TURN_TEXT_CHARS = 20_000;
  * cap is enforced before the arrays are mapped, so the parse itself stays cheap.
  */
 export const MAX_EXPECTATION_ENTRIES = 100;
+
+/** Operational maximum for one predicate value; see `parsePredicate`. */
+export const MAX_PREDICATE_VALUE_CHARS = 2_000;
+/**
+ * Reject a gold answer the answer envelope cannot carry.
+ *
+ * Probe answers travel inside `<answer>...</answer>` and the runner extracts
+ * them non-greedily, so a value containing the closing delimiter is read back
+ * truncated at that point. The truncated prefix is non-empty, so the runner does
+ * not re-ask either — it records a probe FAILURE against an answer no correct
+ * reply could ever have produced. Freezing such a value would bake a
+ * permanently-wrong probe into the corpus.
+ */
+function boundedAnswer(value: string, label: string): string {
+    if (value.length > MAX_PROBE_ANSWER_CHARS) fail(`${label}: above-operational-maximum`);
+    return value;
+}
+
+function envelopeSafeAnswer(value: string, label: string): string {
+    if (value.includes("</answer>") || value.includes("<answer>")) {
+        fail(`${label}: answer-envelope-delimiter`);
+    }
+    return value;
+}
+
 /**
  * Operational maximum for one probe's option list. Bounded before the array is
  * mapped for the same reason as the expectation arrays, and separately from them
@@ -220,6 +279,48 @@ export const MAX_EXPECTATION_ENTRIES = 100;
  * than this is also not one a model can usefully answer.
  */
 export const MAX_PROBE_CHOICES = 10;
+/**
+ * Character ceilings for authored probe text.
+ *
+ * Transcript turns and gold predicates are bounded already; probe questions, exact
+ * answers, and choice strings were not, and they now feed regex construction.
+ * `containsCompleteValue` escapes an answer into a `RegExp` and the freeze guards run
+ * that all-pairs across up to `MAX_EXPECTATION_ENTRIES` probes, so an unbounded value
+ * turns a malformed corpus entry into a memory blow-up or a native regex error instead
+ * of this contract's named diagnostic. Bounded here, before any scan reads them.
+ *
+ * The question shares the turn ceiling (it is authored prose of the same kind); an
+ * answer shares the predicate ceiling, since both are values matched against content.
+ */
+export const MAX_PROBE_QUESTION_CHARS = MAX_TURN_TEXT_CHARS;
+export const MAX_PROBE_ANSWER_CHARS = MAX_PREDICATE_VALUE_CHARS;
+
+/** Separator the probe prompt renders multiple-choice options with. */
+export const PROBE_CHOICE_SEPARATOR = " | ";
+
+/**
+ * Ceiling on the harness-owned padding turns the runner appends after the
+ * epilogue. Owned here so the freeze lint can tell whether a recipe's real
+ * padding mass can clear its protected tail within the cap.
+ */
+export const MAX_PADDING_TURNS = 32;
+
+/** Build turns the runner prepends to reach its minimum; see `MIN_BUILD_TURNS`. */
+export const MIN_BUILD_TURNS = 10;
+
+/**
+ * The harness-owned filler exchange the runner prepends, without ballast.
+ *
+ * Owned here for the same reason as `renderedTranscriptBlocks`: the freeze lint's
+ * chunk-headroom check has to measure the bytes a runner actually sends, and
+ * filler turns consume the historian's chunk budget just as authored ones do. A
+ * copy of these strings in the runner is how the lint would come to measure a
+ * transcript no run produces.
+ */
+export const FILLER_TURN = {
+    user: "Routine progress update.",
+    assistant: "Noted; continuing with routine work.",
+} as const;
 
 function turnText(value: unknown, label: string): string {
     const result = string(value, label);
@@ -267,6 +368,7 @@ function parseProbe(raw: unknown, label: string): Probe {
     const answerType = enumeration(value.answerType, PROBE_ANSWER_TYPES, `${label}.answerType`);
     const id = staticId(value.id, `${label}.id`, PROBE_ID_RE);
     const question = string(value.question, `${label}.question`);
+    if (question.length > MAX_PROBE_QUESTION_CHARS) fail(`${label}.question: above-operational-maximum`);
     if (answerType === "exact") {
         // `sourceClaimRef` is required, not optional: it is the only thing that
         // gives a probe's gold answer a declared source range. Without it the
@@ -275,11 +377,26 @@ function parseProbe(raw: unknown, label: string): Probe {
         // unanswerable probe would be scored as a model failure and contaminate
         // probe accuracy.
         exact(value, ["id", "question", "answerType", "goldAnswer", "sourceClaimRef"], label);
+        const goldAnswer = boundedAnswer(
+            envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`),
+            `${label}.goldAnswer`,
+        );
+        // A question that states its own answer measures nothing: the value the
+        // probe rewards is in the prompt the model is answering, so it needs
+        // neither injected memory nor session history to reply correctly.
+        //
+        // Only for `exact`. A multiple-choice prompt renders every option anyway,
+        // so a question that restates them exposes nothing the model was not
+        // going to be shown; and a claim-id answer is a runtime id no authored
+        // question can contain.
+        if (containsCompleteValue(question, goldAnswer)) {
+            fail(`${label}.question: self-answering (the question states this probe's own gold answer)`);
+        }
         return {
             id,
             question,
             answerType,
-            goldAnswer: string(value.goldAnswer, `${label}.goldAnswer`),
+            goldAnswer,
             sourceClaimRef: staticId(value.sourceClaimRef, `${label}.sourceClaimRef`, EXPECTED_CLAIM_ID_RE),
         };
     }
@@ -293,9 +410,50 @@ function parseProbe(raw: unknown, label: string): Probe {
         // whitespace as the same answer, so `"Redis"` beside `" redis "` would be
         // two indistinguishable options in one question, and a model picking the
         // non-gold spelling of the same option would be scored wrong.
-        unique(choices.map(normalizeContent), `${label}.choices`);
+        // Canonicalized the way `compareProbeAnswer` compares: it decodes entities before
+        // equality, so `A&B` and `A&amp;B` are ONE option as far as scoring is concerned.
+        // Normalizing alone accepted both, and a model picking the nominally-wrong encoding
+        // of the same option was then scored correct. Gold membership stays raw-exact on
+        // purpose — an author must write the gold as one of the literal choices, and
+        // loosening that would hide a genuine mismatch.
+        unique(choices.map((choice) => normalizeContent(decodeXmlEntities(choice))), `${label}.choices`);
+        // Every choice, not only the gold one: the model may legitimately reply
+        // with any of them, and a delimiter-bearing choice would be read back
+        // truncated and scored wrong.
+        for (const [index, choice] of choices.entries()) {
+            boundedAnswer(envelopeSafeAnswer(choice, `${label}.choices[${index}]`), `${label}.choices[${index}]`);
+            // The prompt renders the options joined by this separator, so a
+            // choice containing it makes the option count ambiguous — `["A | B",
+            // "C"]` reads as three options — and a valid selection can be scored
+            // wrong.
+            if (choice.includes(PROBE_CHOICE_SEPARATOR)) {
+                fail(`${label}.choices[${index}]: choice-separator`);
+            }
+        }
         const goldAnswer = string(value.goldAnswer, `${label}.goldAnswer`);
         if (!choices.includes(goldAnswer)) fail(`${label}.goldAnswer: not-a-choice`);
+        // Same rule as `exact`: the question must not state its own gold answer.
+        //
+        // Two narrower rules were tried and both were bypassed. Exempting
+        // multiple-choice outright, on the grounds that the prompt renders every
+        // option anyway, accepted "Redis is correct; which cache was selected?".
+        // Refusing only a question that names the gold while leaving another choice
+        // unstated accepted "Redis, not Hazelcast, is correct; which cache was
+        // selected?" — every option named, the correct one still identified. No
+        // containment rule separates restating a list from pointing into it, because
+        // the distinction is in the surrounding words, not in which values appear.
+        //
+        // So the exemption goes. It was never worth anything: the prompt renders
+        // `Choose exactly one of: ...` itself, so a question that also lists the
+        // options is redundant, and an author who hits this rewrites the question
+        // without the values. That trade — a redundant phrasing refused, in exchange
+        // for the whole class closed — is the right way round for a freeze gate.
+        //
+        // Steering that never names the option ("the obvious one") is still invisible
+        // here, as it is for `exact`. No substring rule reaches it.
+        if (containsCompleteValue(question, goldAnswer)) {
+            fail(`${label}.question: self-answering (the question states this probe's own gold answer)`);
+        }
         return {
             id,
             question,
@@ -397,6 +555,32 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         expectedClaims.map((claim) => JSON.stringify([claim.category, normalizeContent(claim.predicate.value)])),
         `${label}.gold.expectedClaims.identity`,
     );
+    // Identical pairs are the special case; SUBSUMPTION has the same consequence
+    // for the same reason. Predicates are normalized substrings, so if two
+    // same-category predicates stand in a containment relation, any claim
+    // matching the longer necessarily matches the shorter — one injected fact
+    // credits both expectations, giving full recall for half the formation. The
+    // check above cannot see it because the strings differ.
+    //
+    // Normalized once per claim, not once per pair: the comparison is all-pairs,
+    // so normalizing inside the inner loop would rescan the same values O(n^2)
+    // times. `parseExpectedClaim` bounds each value's length, which is what keeps
+    // the remaining containment scans bounded too.
+    const normalizedPredicates = expectedClaims.map((claim) => ({
+        id: claim.id,
+        category: claim.category,
+        value: normalizeContent(claim.predicate.value),
+    }));
+    for (const [leftIndex, left] of normalizedPredicates.entries()) {
+        for (const right of normalizedPredicates.slice(leftIndex + 1)) {
+            if (left.category !== right.category) continue;
+            if (left.value.includes(right.value) || right.value.includes(left.value)) {
+                fail(
+                    `${label}.gold.expectedClaims: subsumed-predicate (${left.id} and ${right.id} share category ${left.category} and one predicate contains the other)`,
+                );
+            }
+        }
+    }
     const expectedAbsent = bounded(goldValue.expectedAbsent, `${label}.gold.expectedAbsent`).map((entry, index) =>
         parseExpectedAbsent(entry, `${label}.gold.expectedAbsent[${index}]`),
     );
@@ -437,6 +621,122 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         }),
         `${label}.probes.identity`,
     );
+    // Probes run sequentially in ONE resumed session, so a later probe sees every
+    // earlier probe's prompt and answer as recent raw history. That is exploitable
+    // whenever the later probe's answer appears anywhere in that history, which is
+    // two distinct surfaces: the earlier probe's ANSWER (its gold value and, for
+    // multiple-choice, its options) and the earlier probe's QUESTION text. Both are
+    // refused per ordered pair below, and by CONTAINMENT as well as equality — an
+    // earlier value that merely holds the later answer inside it hands it over just
+    // as completely.
+    //
+    // Probe uniqueness does not cover either: it includes the question text and
+    // answer type, so "which cache backs sessions" as multiple-choice and a
+    // differently worded exact probe on the same claim are distinct probes whose
+    // answers are the same string.
+    //
+    // This does not make the probes independent — a model can still infer from a
+    // related exchange without copying a value. True isolation needs each probe
+    // to run from an identical pre-probe session state.
+    const answerSurface = (probe: Probe): string[] =>
+        probe.answerType === "claim-id"
+            ? []
+            : [probe.goldAnswer, ...(probe.answerType === "multiple-choice" ? probe.choices : [])].map(
+                  normalizeContent,
+              );
+    for (const [leftIndex, left] of probes.entries()) {
+        for (const right of probes.slice(leftIndex + 1)) {
+            const leftRef = left.answerType === "claim-id" ? left.expectedClaimRef : left.sourceClaimRef;
+            const rightRef = right.answerType === "claim-id" ? right.expectedClaimRef : right.sourceClaimRef;
+            // Two claim-id probes on ONE claim resolve to the same public id, so
+            // their empty answer surfaces hide the most direct copy of all.
+            if (left.answerType === "claim-id" && right.answerType === "claim-id" && leftRef === rightRef) {
+                fail(
+                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} both resolve ${leftRef} to the same runtime claim id)`,
+                );
+            }
+            // Distinct references are not enough. `matchesGold` accepts a claim on
+            // category plus a substring predicate, so ONE promoted claim whose content
+            // happens to state both predicates satisfies both expectations and resolves
+            // to one public id for both probes — handing the later probe the earlier
+            // one's answer verbatim. The subsumption check does not reach it: it refuses
+            // predicates in a containment relation, not two unrelated predicates that
+            // can co-occur in a single sentence.
+            //
+            // Same CATEGORY is the precondition, and the only part decidable at freeze
+            // time: what a historian will write is not. Refusing the pair is the right
+            // place for it too — co-resolution is a scenario-design flaw, and detecting
+            // it at runtime would report a designed-in ambiguity as an infrastructure
+            // ERROR. Two claim-id probes on different categories stay legal.
+            if (left.answerType === "claim-id" && right.answerType === "claim-id") {
+                const leftCategory = expectedClaims.find((claim) => claim.id === leftRef)?.category;
+                const rightCategory = expectedClaims.find((claim) => claim.id === rightRef)?.category;
+                if (leftCategory !== undefined && leftCategory === rightCategory) {
+                    fail(
+                        `${label}.probes: claim-id-co-resolvable (${left.id} and ${right.id} reference same-category claims, so one promoted claim can satisfy both and resolve to one runtime id)`,
+                    );
+                }
+            }
+            // Answer values are compared across ALL pairs, not only probes sharing
+            // a gold claim. What makes the copy work is that the earlier exchange
+            // put the later probe's answer in recent history; which claim each
+            // probe rests on does not change that. Two exact probes on different
+            // claims that happen to share a gold value are just as copyable, and a
+            // multiple-choice prompt can expose another claim's exact answer as one
+            // of its options.
+            const leftSurface = answerSurface(left);
+            const rightSurface = answerSurface(right);
+            const shared = leftSurface.filter((value) => rightSurface.includes(value));
+            if (shared.length > 0) {
+                fail(
+                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} share an answer value, so the earlier exchange answers the later probe)`,
+                );
+            }
+            // Equality is not the only way an earlier surface hands over a later
+            // answer: it can CONTAIN it. An earlier gold of "limit 4096 bytes" ahead
+            // of a probe whose gold is "4096" states that answer in the accepted
+            // envelope, and the check above compares normalized strings for equality
+            // only, so the pair passes.
+            //
+            // The accepted envelope is exactly what `probeResponseLeak` exempts at
+            // runtime — deliberately, since a probe's own answer is the point of its
+            // exchange — so nothing downstream covers this. It has to be refused here.
+            //
+            // Directional and complete-value, for the same reasons as the question
+            // check below: only the earlier reply reaches the later model, and an
+            // earlier answer of "4096" must not count as stating a later answer of "4".
+            if (right.answerType !== "claim-id") {
+                if (leftSurface.some((value) => containsCompleteValue(value, right.goldAnswer))) {
+                    fail(
+                        `${label}.probes: shared-answer-surface (${left.id} runs first and one of its answer surface values states ${right.id}'s gold answer)`,
+                    );
+                }
+            }
+            // Answer surfaces are not the only part of an earlier exchange the
+            // later model reads. The QUESTION text is in the same raw history, and
+            // a question can state another probe's answer while asking about
+            // something else: "Was the limit 4096?" with gold `yes`, followed by a
+            // probe whose gold is `4096`. The surface comparison above cannot see
+            // that pair because `yes` and `4096` do not overlap.
+            //
+            // Directional, because the leak is: probes run in `probes` order, so
+            // only the EARLIER question reaches the later model. Comparing both
+            // ways would refuse pairs whose exposing text the answering model never
+            // saw.
+            //
+            // Matched as a complete value for the same reason `containsCompleteValue`
+            // exists at all: a question that only ever says "4096" must not count as
+            // exposing the answer "4". Choices are not compared — a later
+            // multiple-choice prompt renders its own options regardless, so an
+            // earlier question naming one exposes nothing new.
+            if (right.answerType !== "claim-id" && containsCompleteValue(left.question, right.goldAnswer)) {
+                fail(
+                    `${label}.probes: question-exposed-answer (${left.id} runs first and its question states ${right.id}'s gold answer)`,
+                );
+            }
+        }
+    }
+
     const expectedClaimIds = new Set(expectedClaims.map((claim) => claim.id));
     for (const probe of probes) {
         // Every probe type now carries exactly one gold reference, so there is no
@@ -477,6 +777,30 @@ export function scenarioFingerprint(scenario: HistorianEvalScenario): string {
         gold: scenario.gold,
         probes: scenario.probes,
     });
+}
+
+/**
+ * The complete trigger recipe as a fingerprint, for binding a stored run record
+ * to the pressure settings it actually executed under.
+ *
+ * Deliberately separate from `scenarioFingerprint`, which excludes everything
+ * here but `expectedHistorianRuns` because trigger pressure is harness-owned and
+ * must not move a release-facing semantic identity or invalidate an approval.
+ * That exclusion leaves the values unbound to any artifact, and they are not
+ * inert: `modelContextLimit` with the per-turn and spike usage decides WHEN the
+ * historian fires, `headroomMarginTokens` decides where the protected-tail
+ * boundary falls, and `ballastTokensPerTurn` decides how much filler the
+ * evaluated chunk carries. Change any of them without touching the run count and
+ * an artifact captured under the previous recipe still matches the scenario, so a
+ * report can claim the revised recipe was executed while scoring a snapshot the
+ * old one produced.
+ *
+ * Covers the whole recipe including `expectedHistorianRuns`, so the record binds
+ * to one object rather than to a hand-maintained subset that a later field
+ * addition silently leaves out.
+ */
+export function triggerFingerprint(scenario: HistorianEvalScenario): string {
+    return canonicalFingerprint(scenario.trigger);
 }
 
 /**
@@ -610,12 +934,62 @@ function canonicalOrder<T>(entries: readonly T[]): T[] {
 }
 
 /** Normalization applied to both predicate values and candidate content. */
+/**
+ * The XML entity forms the block renderers emit, turned back into the characters an
+ * authored value is written with.
+ *
+ * Numeric forms are decoded too: an escaper is free to emit them, and a value the
+ * comparison cannot see is a false "unavailable" — which charges an answerable probe as
+ * infrastructure. `&amp;` is decoded LAST so a doubly-escaped `&amp;lt;` becomes
+ * `&lt;` rather than `<`, matching how a decoder consumes one layer.
+ */
+/**
+ * One decoded code point, or the entity text unchanged when it names none.
+ *
+ * `String.fromCodePoint` THROWS a `RangeError` outside the Unicode range, and this
+ * decoder runs over model-authored text — so `<answer>&#999999999;</answer>` turned an
+ * ordinary wrong answer into a harness ERROR during the live scan, and could throw out
+ * of stored-record scoring entirely. An entity naming no character is not a decoding
+ * result; leaving it as written is both non-throwing and the honest reading.
+ */
+function codePointOrRaw(code: number, raw: string): string {
+    if (!Number.isSafeInteger(code) || code < 0 || code > 0x10ffff) return raw;
+    // Lone surrogates are in range for `fromCodePoint` but name no character.
+    if (code >= 0xd800 && code <= 0xdfff) return raw;
+    return String.fromCodePoint(code);
+}
+
+export function decodeXmlEntities(text: string): string {
+    return text
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#(\d+);/g, (match, code: string) => codePointOrRaw(Number(code), match))
+        .replace(/&#x([0-9a-fA-F]+);/g, (match, code: string) => codePointOrRaw(Number.parseInt(code, 16), match))
+        .replace(/&amp;/g, "&");
+}
+
 export function normalizeContent(text: string): string {
     return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 export function predicateMatches(predicate: ContentPredicate, content: string): boolean {
     return normalizeContent(content).includes(normalizeContent(predicate.value));
+}
+
+/**
+ * Whether an injection-visible claim satisfies a gold expected-claim: same
+ * category AND content predicate match. The one gold↔claim match rule shared
+ * by the runner's per-gold evidence counts and the scorer's facts
+ * precision/recall, so run-record evidence and scored verdicts agree on which
+ * claims count as gold.
+ */
+export function matchesGold(
+    claim: Pick<ExpectedClaim, "category" | "predicate">,
+    item: { category: string; content: string },
+): boolean {
+    return item.category === claim.category && predicateMatches(claim.predicate, item.content);
 }
 
 /**
@@ -628,7 +1002,14 @@ export function predicateMatches(predicate: ContentPredicate, content: string): 
  * The boundary is letter-or-digit adjacency, so `"in-process lru"` still matches
  * inside a sentence while `"4"` no longer matches inside `"4096"`.
  */
-function containsCompleteValue(content: string, value: string): boolean {
+export function containsCompleteValue(content: string, value: string): boolean {
+    // Both sides decoded first, so every collision guard uses the SAME equality
+    // `compareProbeAnswer` accepts on. Without it a gold of `A&B` was accepted when a
+    // model answered `A&amp;B`, while a question or an earlier reply containing
+    // `A&amp;B` passed these guards — so the escaped form could be copied out of the
+    // prompt or the shared history and still score.
+    content = decodeXmlEntities(content);
+    value = decodeXmlEntities(value);
     const needle = normalizeContent(value);
     if (needle.length === 0) return false;
     const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -703,6 +1084,59 @@ function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTur
  * Exported for the fidelity tests: this rendering is the lint's whole
  * measurement surface, so its agreement with the harness is a contract.
  */
+/**
+ * Token usage the lane reports for one transcript turn carrying `tokens`.
+ *
+ * The count is reported as BOTH input and cache-write. Owned here, and built from
+ * here by the runner, so the shape has one definition rather than a literal
+ * repeated at each usage site.
+ *
+ * It does NOT follow that the threshold sees twice the declared number: the
+ * percentage the protected-tail boundary consumes matches the declared count, as
+ * the harness suite demonstrates, so the lint's threshold math uses the declared
+ * value.
+ */
+export function triggerTurnUsage(tokens: number): {
+    input_tokens: number;
+    cache_creation_input_tokens: number;
+} {
+    return { input_tokens: tokens, cache_creation_input_tokens: tokens };
+}
+
+/**
+ * Execution threshold the lane pins into every harness config, owned here
+ * rather than by the runner because the freeze lint has to reason about it: a
+ * trigger recipe is only valid relative to the threshold its runs will use.
+ * The runner imports this, so recipe and product cannot drift apart.
+ */
+export const EXECUTE_THRESHOLD_PERCENTAGE = 40;
+
+/**
+ * Rendered blocks for the harness-owned filler turns that PRECEDE the authored
+ * transcript, in the same production text path `renderedTranscriptBlocks` uses.
+ *
+ * Separate from the authored renderer because that one is the lint's measurement
+ * surface for authored content and the fidelity tests bind to it; these turns are
+ * excluded from gold and the fingerprint but still occupy the chunk.
+ */
+export function renderedFillerBlocks(scenario: HistorianEvalScenario): string[] {
+    const fillerCount = Math.max(0, MIN_BUILD_TURNS - scenario.transcript.turns.length);
+    if (fillerCount === 0) return [];
+    const filler: HistorianEvalScenario = {
+        ...scenario,
+        transcript: {
+            ...scenario.transcript,
+            turns: Array.from({ length: fillerCount }, () => ({
+                user: FILLER_TURN.user,
+                assistant: FILLER_TURN.assistant,
+            })),
+        },
+    };
+    // Ballast comes from the scenario's own trigger inside the renderer, so the
+    // filler turns carry exactly what the runner attaches to them.
+    return renderedTranscriptBlocks(filler);
+}
+
 export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): string[] {
     const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
     // Built through the production text path, not from the raw authored strings:
@@ -855,7 +1289,13 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     // tokenizing one joined string: a joined estimate is a different number, and
     // near the budget with a small margin the difference decides whether the live
     // chunk splits.
-    const transcriptTokens = renderedTranscriptBlocks(scenario).reduce(
+    // Filler blocks included: the runner prepends them whenever the scenario is
+    // shorter than the build minimum, and they consume the same chunk budget. An
+    // authored-only measurement lets a short, ballast-heavy scenario pass while
+    // its filler pushes the gold into another chunk — surfacing at runtime as
+    // `run-never-fired` or `probe-gold-uncovered` rather than anything naming the
+    // recipe.
+    const transcriptTokens = [...renderedFillerBlocks(scenario), ...renderedTranscriptBlocks(scenario)].reduce(
         (total, blockText) => total + estimateTokens(blockText),
         0,
     );
@@ -863,6 +1303,138 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         diagnostics.push(
             `${label}.transcript: exceeds-single-chunk-headroom (${transcriptTokens} + margin ${scenario.trigger.headroomMarginTokens} > ${chunkBudget})`,
         );
+    }
+
+    // Trigger ordering (KTD3): the recipe only produces the run schedule it
+    // declares if ordinary turns stay BELOW the execution threshold and the
+    // spike crosses it. The numeric bounds on these fields do not imply that
+    // ordering, and either violation misaligns run rows against scripted
+    // outputs: a build turn at or above the threshold launches the historian
+    // during filler or authored turns, before `driveHistorianRun` starts
+    // counting, while a spike below it never launches and the scenario ends as
+    // `run-never-fired`.
+    // Declared tokens over the declared limit. An earlier revision doubled these
+    // on the theory that production sums input and cache-write, which the tail
+    // target above refutes: the boundary that consumes this same
+    // `usagePercentage` matches the declared value, so doubling here would reject
+    // recipes whose build turns are genuinely below the threshold.
+    const thresholdPercentage = (tokens: number): number =>
+        (tokens / scenario.trigger.modelContextLimit) * 100;
+    const buildPercentage = thresholdPercentage(scenario.trigger.usageTokensPerTurn);
+    const spikePercentage = thresholdPercentage(scenario.trigger.spikeUsageTokens);
+    if (buildPercentage >= EXECUTE_THRESHOLD_PERCENTAGE) {
+        diagnostics.push(
+            `${label}.trigger.usageTokensPerTurn: build-turn-crosses-threshold (${buildPercentage.toFixed(2)}% >= ${EXECUTE_THRESHOLD_PERCENTAGE}%)`,
+        );
+    }
+    if (spikePercentage < EXECUTE_THRESHOLD_PERCENTAGE) {
+        diagnostics.push(
+            `${label}.trigger.spikeUsageTokens: spike-below-threshold (${spikePercentage.toFixed(2)}% < ${EXECUTE_THRESHOLD_PERCENTAGE}%)`,
+        );
+    }
+
+    // Padding mass (KTD3): the runner appends padding turns after the epilogue to
+    // push the protected tail past the authored content, each carrying
+    // `ballastTokensPerTurn`. The turn count is capped, so a recipe with light
+    // ballast against a large tail target cannot build the tail it needs — and the
+    // symptom is an unrelated-looking `run-never-fired` or `probe-gold-uncovered`
+    // rather than anything naming the recipe.
+    // The DECLARED spike percentage, not a doubled "effective" one. The runner
+    // passes the same value and the harness suite is the evidence: doubling it
+    // moves this target from 13,200 to 6,400 tokens for the canonical recipe,
+    // which drops the padding from ten turns to six, and the historian's chunk
+    // then stops short of the authored gold — `probe-gold-uncovered` on scenarios
+    // that pass with the declared value. Whatever production sums elsewhere, the
+    // percentage that predicts THIS boundary is the declared one.
+    const tailTarget = deriveProtectedTailTokenTarget({
+        contextLimit: scenario.trigger.modelContextLimit,
+        executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
+        usagePercentage: (scenario.trigger.spikeUsageTokens / scenario.trigger.modelContextLimit) * 100,
+    });
+    const paddingTokensPerTurn = Math.max(1, scenario.trigger.ballastTokensPerTurn);
+    const paddingTurnsNeeded = Math.ceil(tailTarget.N / paddingTokensPerTurn) + 1;
+    if (paddingTurnsNeeded > MAX_PADDING_TURNS) {
+        diagnostics.push(
+            `${label}.trigger.ballastTokensPerTurn: padding-cannot-clear-protected-tail (${paddingTurnsNeeded} turns at ${paddingTokensPerTurn} token(s) needed for a ${tailTarget.N}-token tail, cap ${MAX_PADDING_TURNS})`,
+        );
+    }
+
+    // The answer must also not be sitting in HARNESS-owned text. The runner wraps
+    // the authored transcript in filler, per-turn ballast, post-epilogue padding,
+    // and spike/kick turns, and `ballastProse` draws from a fixed word bank —
+    // "boundary", "session", "threshold", "snapshot", "budget" among them. A gold
+    // answer that collides with any of that, or with the harness's own turn text,
+    // is stated repeatedly in raw history, and the post-epilogue padding sits in
+    // the PROTECTED TAIL, which is never compartment-covered and therefore never
+    // spliced out. So the probe model can read the answer off recent raw history
+    // and PASS with the injected payload contributing nothing.
+    //
+    // Neither runtime gate covers this. `assertProbeGoldCovered` and
+    // `goldRangeLeak` are both scoped to the AUTHORED gold range — deliberately,
+    // since an uncovered non-gold tail is allowed to remain raw — so harness
+    // padding is outside what either inspects.
+    //
+    // Every GENERATED index is rendered, not just the first. The runner numbers each
+    // padding turn (`Wrap-up housekeeping note 3.`) and each historian run
+    // (`step 2 of the plan`), so those digits are part of the tail's text: a probe
+    // whose gold answer is a bare `2` or `3` is copyable from it, and a
+    // one-index sample would miss exactly that. The padding count mirrors
+    // `paddingTurnCount()` — the same ceiling arithmetic, capped the same way — so
+    // the surface is what the runner sends and not an estimate of it.
+    //
+    // Checked at freeze time because it is fully determined by the recipe:
+    // `ballastProse` output depends only on its token count, and the turn texts are
+    // otherwise constants. Complete values, so an answer of "4" is not reported
+    // merely because the bank emits "4096". Choices are not checked — a distractor
+    // appearing in filler reveals no answer.
+    const paddingTurns = Math.min(MAX_PADDING_TURNS, paddingTurnsNeeded);
+    // Split into the text EVERY probe's turn carries and the per-type suffix, because
+    // one combined surface rejected on text the scored turn never renders: an exact
+    // probe whose gold is "choose" collided with the multiple-choice prefix its prompt
+    // never emits, and the reverse held for values unique to the exact suffix. A false
+    // refusal keeps a valid scenario out of the corpus, which is the one direction this
+    // lint must not err in.
+    const sharedHarnessText = [
+        FILLER_TURN.user,
+        FILLER_TURN.assistant,
+        ballastProse(scenario.trigger.ballastTokensPerTurn),
+        // The probe prompt's own boilerplate, which is harness-owned text on the very
+        // turn being scored — the most direct copy of all. "project", "memory",
+        // "session", and "value" are all words it uses, so a probe whose gold answer
+        // is one of them can be answered by echoing the question's own wrapper.
+        PROBE_PROMPT_SHARED,
+        PROBE_PROMPT_REASK_PREFIX,
+        PROBE_PROMPT_QUESTION_LABEL,
+        ...Array.from({ length: paddingTurns }, (_, index) => `Wrap-up housekeeping note ${index + 1}.`),
+        "Housekeeping acknowledged.",
+        "Continuing.",
+        "Acknowledged.",
+        ...Array.from(
+            { length: scenario.trigger.expectedHistorianRuns },
+            (_, index) => `Please continue with step ${index + 1} of the plan.`,
+        ),
+        "Standing by.",
+    ].join(" ");
+    // Ordered, not per-probe-in-isolation. Narrowing to the probe's OWN suffix fixed a
+    // false refusal but opened the mirror hole: probes share one resumed session, so
+    // every EARLIER prompt's suffix is in the raw history the later probe reads. A
+    // multiple-choice probe ahead of an exact probe whose gold is "choose" renders
+    // `Choose exactly one of:` first, and an earlier claim-id prompt exposes words like
+    // "identifier". So the surface for probe i is the shared wrapper plus the suffixes
+    // rendered by probes 0..i — its own and every one before it, and none after, since
+    // text that appears only later was never in that probe's history.
+    const suffixFor = (probe: Probe): string =>
+        probe.answerType === "exact"
+            ? PROBE_PROMPT_EXACT_SUFFIX
+            : probe.answerType === "multiple-choice"
+              ? PROBE_PROMPT_CHOICE_PREFIX
+              : PROBE_PROMPT_CLAIM_ID_SUFFIX;
+    for (const [index, probe] of scenario.probes.entries()) {
+        if (probe.answerType === "claim-id") continue;
+        const rendered = scenario.probes.slice(0, index + 1).map(suffixFor);
+        if (containsCompleteValue([sharedHarnessText, ...rendered].join(" "), probe.goldAnswer)) {
+            diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: occurs-in-harness-owned-text`);
+        }
     }
 
     return diagnostics.sort();
