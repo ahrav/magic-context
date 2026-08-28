@@ -92,6 +92,38 @@ describe("parseDaemonResult", () => {
         expect(parsed.readiness).toBeNull();
     });
 
+    test("readiness may not be ready with a failing reason", () => {
+        const withReadiness = (readiness: unknown) =>
+            JSON.stringify(
+                validResult({
+                    command: "start",
+                    ok: true,
+                    state: "running",
+                    reason: "started",
+                    remediation: null,
+                    readiness,
+                    checks: [],
+                }),
+            );
+        expect(() =>
+            parseDaemonResult(
+                withReadiness({ transport: { state: "ready", reason: "internal_error" } }),
+            ),
+        ).toThrow(/readiness\.transport is ready with a failing reason/);
+        // The converse stays legal, and must: `unsupported` with
+        // `synapse_unsupported` is a non-failing pairing for a non-ready state,
+        // and every `starting` reason is a failing one.
+        const legal = parseDaemonResult(
+            withReadiness({
+                transport: { state: "ready", reason: "healthy" },
+                storage: { state: "starting", reason: "storage_starting" },
+                synapse: { state: "unsupported", reason: "synapse_unsupported" },
+            }),
+        );
+        expect(legal.readiness?.transport?.state).toBe("ready");
+        expect(legal.readiness?.synapse?.reason).toBe("synapse_unsupported");
+    });
+
     test("binds pass and fail checks to their reason classes, leaving warn and skip free", () => {
         const withCheck = (status: string, reason: string, remediation: string | null) =>
             JSON.stringify(

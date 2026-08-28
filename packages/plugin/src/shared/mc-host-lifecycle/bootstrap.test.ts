@@ -22,6 +22,7 @@ import {
     BootstrapError,
     checkCapacity,
     checkPlatform,
+    containedWithin,
     copyExactBytes,
     loadTrustIndex,
     MAX_TRUST_INDEX_BYTES,
@@ -663,6 +664,39 @@ describe("bootstrap staging (U3 scenarios 3 and 6)", () => {
         }
     });
 
+    test("containment holds at the filesystem root and at name boundaries", () => {
+        // Tested directly, against paths that really exist, because the boundary
+        // cases are not all reachable through resolvePayloadPackageDir — this
+        // host has no `/node_modules`, so a walk-based test would pass merely
+        // because the candidate is absent.
+        const dir = tempDir("mc-contained-");
+        try {
+            const fsRoot = path.parse(dir).root;
+            // The root case a string-prefix test gets wrong: `realpath("/")` is
+            // already `/`, so appending a separator yields `//` and every real
+            // descendant fails containment.
+            expect(containedWithin(fsRoot, "/tmp")).toBe(true);
+            expect(containedWithin(fsRoot, fsRoot)).toBe(true);
+
+            // A sibling whose name merely starts with the root's must not be
+            // contained — the reason a bare prefix test needs the separator at
+            // all.
+            const app = path.join(dir, "app");
+            const application = path.join(dir, "application");
+            mkdirSync(path.join(app, "inside"), { recursive: true });
+            mkdirSync(path.join(application, "inside"), { recursive: true });
+            expect(containedWithin(app, path.join(app, "inside"))).toBe(true);
+            expect(containedWithin(app, app)).toBe(true);
+            expect(containedWithin(app, path.join(application, "inside"))).toBe(false);
+            // A parent is not contained in its own child.
+            expect(containedWithin(path.join(app, "inside"), app)).toBe(false);
+            // An unresolvable side is not containment.
+            expect(containedWithin(app, path.join(app, "no-such-entry"))).toBe(false);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("a payload reached through a symlinked ancestor is not certified", () => {
         // classifyEntry lstats only the final component, so the kernel has
         // already followed every ancestor by the time it answers "dir". A
@@ -812,6 +846,46 @@ describe("bootstrap staging (U3 scenarios 3 and 6)", () => {
             }
             expect(error).toBeInstanceOf(BootstrapError);
             expect((error as BootstrapError).reason).toBe("native_payload_invalid");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("an owner-writable retained bootstrap is rejected before its digest is trusted", () => {
+        // Staging writes 0o500. A writable retained object did not come from
+        // that path, and accepting one leaves the digest describing bytes that
+        // can still change: nothing snapshots the inode between the hash and the
+        // exec, and an in-place overwrite preserves dev/ino so the identity
+        // re-check cannot see it.
+        const dir = tempDir("mc-retained-writable-");
+        try {
+            const bytes = Buffer.from("retained-launcher\n");
+            const source = path.join(dir, "launcher");
+            writeFileSync(source, bytes, { mode: 0o755 });
+            const staged = stageBootstrap({
+                sourcePath: source,
+                destDir: path.join(dir, "store"),
+                expectedSha256: sha256(bytes),
+                availableBytesOverride: 1n << 40n,
+            });
+            closeSync(staged.fd);
+            // As staged: owner read+execute only, and it revalidates.
+            expect(lstatSync(staged.path).mode & 0o777).toBe(0o500);
+            closeSync(revalidateRetainedBootstrap(staged.path, staged.sha256).fd);
+
+            // Owner-writable, digest still correct: rejected anyway, because the
+            // digest is no longer a statement about what will execute.
+            execFileSync("chmod", ["0700", staged.path]);
+            let reason: string | null = null;
+            let message = "";
+            try {
+                revalidateRetainedBootstrap(staged.path, staged.sha256);
+            } catch (error) {
+                reason = (error as BootstrapError).reason;
+                message = (error as Error).message;
+            }
+            expect(reason).toBe("native_payload_invalid");
+            expect(message).toContain("owner-writable");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

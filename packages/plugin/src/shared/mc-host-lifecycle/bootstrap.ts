@@ -575,7 +575,7 @@ export function resolvePayloadPackageDir(options: {
  * ancestor swapped afterwards is still not excluded — that needs the `*at`
  * syscalls Node does not expose, and belongs to the native layer.
  */
-function containedWithin(root: string, candidate: string): boolean {
+export function containedWithin(root: string, candidate: string): boolean {
     let realRoot: string;
     let realCandidate: string;
     try {
@@ -584,7 +584,16 @@ function containedWithin(root: string, candidate: string): boolean {
     } catch {
         return false;
     }
-    return realCandidate === realRoot || realCandidate.startsWith(`${realRoot}${path.sep}`);
+    // Compared through `path.relative` rather than a string prefix. A prefix test
+    // has to append a separator to avoid matching a sibling whose name merely
+    // starts with the root's, and that breaks when the root already ends in one:
+    // for `/` the prefix becomes `//` and every real descendant fails, rejecting
+    // a valid root-level `node_modules` layout. `relative` handles the root,
+    // trailing separators, and `..` uniformly, and is the same boundary
+    // discipline `redactLifecyclePath` uses.
+    const relative = path.relative(realRoot, realCandidate);
+    if (relative === "") return true;
+    return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function resolveBunLink(
@@ -773,6 +782,18 @@ export function revalidateRetainedBootstrap(
         if ((stat.mode & 0o077) !== 0)
             throw invalid("retained bootstrap is group/world accessible");
         if ((stat.mode & 0o100) === 0) throw invalid("retained bootstrap is not owner-executable");
+        // Staging writes 0o500, so a writable retained object did not come from
+        // this code path. Accepting one leaves the digest below describing bytes
+        // that can still change: nothing snapshots the inode between
+        // `sha256OfFd` and the exec of `/proc/self/fd/3`, and the post-read
+        // identity check compares dev/ino, which an in-place overwrite
+        // preserves.
+        //
+        // This enforces the invariant staging already establishes rather than
+        // achieving immutability: the owner can always chmod the file back and
+        // rewrite it, so the digest-to-exec window is only truly closed by a
+        // sealed object, which needs the native layer.
+        if ((stat.mode & 0o200) !== 0) throw invalid("retained bootstrap is owner-writable");
         const digest = sha256OfFd(fd);
         if (digest !== expectedSha256) throw invalid("retained bootstrap digest mismatch");
         // Same reasoning as the trust index: this is the one path-addressed stat

@@ -186,6 +186,17 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
     if (typeof reason !== "string" || !isDaemonReason(reason)) {
         fail(`readiness.${component}.reason is outside the closed reason union`);
     }
+    // `ready` asserts the component is usable, so an explicitly failing reason
+    // beside it is self-contradictory and would tell a readiness consumer the
+    // transport is serving while naming the failure that stopped it.
+    //
+    // Only `ready` is constrained. The converse does not hold: `unsupported`
+    // with `synapse_unsupported` is a legitimate non-failing pairing for a
+    // non-ready state, and every `starting` reason is a failing one, so a
+    // blanket "non-ready implies failing" rule would reject conforming output.
+    if (state === "ready" && !NON_FAILING_REASONS.has(reason)) {
+        fail(`readiness.${component} is ready with a failing reason`);
+    }
     return { state, reason };
 }
 
