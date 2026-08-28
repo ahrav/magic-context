@@ -126,6 +126,54 @@ interface FactsScore {
 }
 
 /**
+ * How many gold expectations can be satisfied by DISTINCT visible claims.
+ *
+ * Kuhn's augmenting-path search for a maximum bipartite matching, expectations on one
+ * side and visible claims on the other, edges from `matchesGold`. Distinctness is the
+ * whole point: without it one claim satisfying several expectations inflates recall
+ * past the number of claims the historian actually formed.
+ */
+function maximumGoldMatching(
+    expected: readonly ExpectedClaim[],
+    visible: ReadonlyArray<{ category: string; content: string }>,
+): number {
+    const claimForExpectation = new Array<number>(expected.length).fill(-1);
+    const expectationForClaim = new Array<number>(visible.length).fill(-1);
+    let matched = 0;
+    for (let index = 0; index < expected.length; index += 1) {
+        const seen = new Array<boolean>(visible.length).fill(false);
+        if (augmentGoldMatch(index, expected, visible, seen, claimForExpectation, expectationForClaim)) {
+            matched += 1;
+        }
+    }
+    return matched;
+}
+
+function augmentGoldMatch(
+    expectationIndex: number,
+    expected: readonly ExpectedClaim[],
+    visible: ReadonlyArray<{ category: string; content: string }>,
+    seen: boolean[],
+    claimForExpectation: number[],
+    expectationForClaim: number[],
+): boolean {
+    for (const [claimIndex, item] of visible.entries()) {
+        if (seen[claimIndex] || !matchesGold(expected[expectationIndex], item)) continue;
+        seen[claimIndex] = true;
+        const incumbent = expectationForClaim[claimIndex];
+        if (
+            incumbent === -1 ||
+            augmentGoldMatch(incumbent, expected, visible, seen, claimForExpectation, expectationForClaim)
+        ) {
+            claimForExpectation[expectationIndex] = claimIndex;
+            expectationForClaim[claimIndex] = expectationIndex;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Facts precision/recall against gold, keyed by the shared `matchesGold`
  * rule (category + content predicate, R7), plus the separately-reported
  * false-authoritative check (R8; `ExpectedAbsent` carries no category, so
@@ -139,7 +187,24 @@ function scoreFacts(
     visible: ReadonlyArray<{ category: string; content: string }>,
 ): FactsScore {
     const expected = scenario.gold.expectedClaims;
-    const matchedExpected = expected.filter((claim) => visible.some((item) => matchesGold(claim, item)));
+    // Recall is a ONE-TO-ONE pairing, not an independent test per expectation. A gold
+    // predicate is a substring matcher, so one formed claim whose content states two
+    // same-category predicates satisfies both expectations independently — reporting
+    // 2/2 for one claim the historian formed. `parseScenario` refuses identical and
+    // subsumed predicates, but two unrelated predicates that can co-occur in one
+    // sentence are neither, so the corpus can legally contain the pair. Pairing bounds
+    // recall by how many claims were actually formed, which is what the tier claims to
+    // measure.
+    //
+    // Maximum matching rather than greedy, because a greedy pass over expectations can
+    // consume a claim that was the only match for a later one and understate recall.
+    // Both sides are bounded by `MAX_EXPECTATION_ENTRIES`, so the augmenting-path search
+    // is cheap.
+    const matchedExpectedCount = maximumGoldMatching(expected, visible);
+    // Precision stays per-claim and independent: it asks whether each formed claim is
+    // one the gold wanted, and a claim satisfying two expectations is still one correct
+    // claim. Pairing it would penalise a historian for stating two wanted facts in one
+    // well-formed claim, which is not an error.
     const matchedVisible = visible.filter((item) => expected.some((claim) => matchesGold(claim, item)));
     const falseAuthoritativeMatches = scenario.gold.expectedAbsent
         .filter((absent) => visible.some((item) => predicateMatches(absent.predicate, item.content)))
@@ -147,8 +212,8 @@ function scoreFacts(
         .sort();
     return {
         precision: visible.length === 0 ? null : matchedVisible.length / visible.length,
-        recall: expected.length === 0 ? null : matchedExpected.length / expected.length,
-        expectedClaimsMatched: matchedExpected.length,
+        recall: expected.length === 0 ? null : matchedExpectedCount / expected.length,
+        expectedClaimsMatched: matchedExpectedCount,
         expectedClaimsTotal: expected.length,
         visibleClaimsMatched: matchedVisible.length,
         visibleClaimsTotal: visible.length,

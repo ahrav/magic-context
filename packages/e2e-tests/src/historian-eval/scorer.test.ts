@@ -1166,6 +1166,67 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("one claim satisfying two same-category expectations does not give full recall", () => {
+        // Two expectations, unrelated predicates, same category — legal under the
+        // contract, since neither predicate contains the other. One formed claim states
+        // both, so an independent test per expectation reports 2/2 for a single claim.
+        // Recall must be bounded by the claims actually formed.
+        const base = validScenario();
+        const scenario: HistorianEvalScenario = {
+            ...base,
+            probes: [],
+            gold: {
+                ...base.gold,
+                expectedClaims: [
+                    {
+                        id: "exp-lru-cache",
+                        category: "ARCHITECTURE",
+                        predicate: { kind: "normalized-substring", value: "in-process LRU cache" },
+                        sourceTurnRange: [1, 1],
+                    },
+                    {
+                        id: "exp-ttl",
+                        category: "ARCHITECTURE",
+                        predicate: { kind: "normalized-substring", value: "TTL eviction" },
+                        sourceTurnRange: [1, 1],
+                    },
+                ],
+            },
+        };
+        const fixture = makeSnapshot({
+            facts: [
+                {
+                    category: "ARCHITECTURE",
+                    content: "Sessions use the in-process LRU cache with TTL eviction.",
+                },
+            ],
+        });
+        try {
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(record, scenario);
+            expect(score.expectedClaimsMatched).toBe(1);
+            expect(score.recall).toBe(0.5);
+            expect(score.failReasons).toContain("recall");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("two claims satisfying two expectations still give full recall", () => {
+        // The pairing must not understate: distinct claims for distinct expectations is
+        // exactly the case recall is meant to reward.
+        const base = validScenario();
+        const scenario: HistorianEvalScenario = { ...base, probes: [] };
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(record, scenario);
+            expect(score.recall).toBe(1);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a record captured under a different trigger recipe is refused", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

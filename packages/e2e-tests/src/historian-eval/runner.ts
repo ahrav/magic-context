@@ -40,6 +40,7 @@ import {
     PROBE_PROMPT_CHOICE_PREFIX,
     PROBE_PROMPT_CLAIM_ID_SUFFIX,
     PROBE_PROMPT_EXACT_SUFFIX,
+    PROBE_PROMPT_QUESTION_LABEL,
     PROBE_PROMPT_REASK_PREFIX,
     PROBE_PROMPT_SHARED,
     containsCompleteValue,
@@ -538,12 +539,12 @@ export function buildProbePrompt(probe: Probe): string {
     // lint searches those same strings for probe-answer collisions, and a copy would
     // let the two drift so lint measures a prompt no runner sends.
     if (probe.answerType === "exact") {
-        return `${PROBE_PROMPT_SHARED}\nQuestion: ${probe.question}\n${PROBE_PROMPT_EXACT_SUFFIX}`;
+        return `${PROBE_PROMPT_SHARED}\n${PROBE_PROMPT_QUESTION_LABEL} ${probe.question}\n${PROBE_PROMPT_EXACT_SUFFIX}`;
     }
     if (probe.answerType === "multiple-choice") {
-        return `${PROBE_PROMPT_SHARED}\nQuestion: ${probe.question}\n${PROBE_PROMPT_CHOICE_PREFIX} ${probe.choices.join(PROBE_CHOICE_SEPARATOR)}.`;
+        return `${PROBE_PROMPT_SHARED}\n${PROBE_PROMPT_QUESTION_LABEL} ${probe.question}\n${PROBE_PROMPT_CHOICE_PREFIX} ${probe.choices.join(PROBE_CHOICE_SEPARATOR)}.`;
     }
-    return `${PROBE_PROMPT_SHARED}\nQuestion: ${probe.question}\n${PROBE_PROMPT_CLAIM_ID_SUFFIX}`;
+    return `${PROBE_PROMPT_SHARED}\n${PROBE_PROMPT_QUESTION_LABEL} ${probe.question}\n${PROBE_PROMPT_CLAIM_ID_SUFFIX}`;
 }
 
 /**

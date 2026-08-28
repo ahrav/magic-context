@@ -61,6 +61,8 @@ export const PROBE_PROMPT_CHOICE_PREFIX = "Choose exactly one of:";
 export const PROBE_PROMPT_CLAIM_ID_SUFFIX =
     "Answer with the id of the single project-memory claim (the identifier before the colon in the project-memory block) that records it.";
 export const PROBE_PROMPT_REASK_PREFIX = "Your previous reply had no valid <answer></answer> envelope.";
+/** The label `buildProbePrompt` puts in front of the authored question. */
+export const PROBE_PROMPT_QUESTION_LABEL = "Question:";
 
 export const SCENARIO_SCHEMA = "historian-eval-scenario/v1";
 export const MANIFEST_SCHEMA = "historian-eval-manifest/v1";
@@ -1326,6 +1328,7 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         PROBE_PROMPT_CHOICE_PREFIX,
         PROBE_PROMPT_CLAIM_ID_SUFFIX,
         PROBE_PROMPT_REASK_PREFIX,
+        PROBE_PROMPT_QUESTION_LABEL,
         ...Array.from({ length: paddingTurns }, (_, index) => `Wrap-up housekeeping note ${index + 1}.`),
         "Housekeeping acknowledged.",
         "Continuing.",

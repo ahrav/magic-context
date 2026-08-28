@@ -930,6 +930,18 @@ describe("lintScenario", () => {
         );
     });
 
+    test("rejects a probe gold answer the prompt's question label states", () => {
+        const raw = validScenarioRaw();
+        // `buildProbePrompt` writes "Question: <authored question>", so a gold answer of
+        // "question" is supplied by the very prompt being answered. The label was the one
+        // piece of the wrapper still written as a literal rather than a linted constant.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "question";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
     test("a gold answer merely contained in a harness word is not a collision", () => {
         const raw = validScenarioRaw();
         // The bank emits "session", never "sessio". Bare containment would refuse a
