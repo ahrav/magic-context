@@ -1,0 +1,41 @@
+{
+  "aa": {
+    "complete_slots": 64,
+    "invalid_slots": 0,
+    "missed_slots": 0,
+    "blocks": 2,
+    "query_p99_ns_ranges": {
+      "budget-4/1:1": [6383591, 7038310],
+      "budget-4/4:1": [6083591, 7208659],
+      "budget-4-co-tenancy/1:1": [11178962, 12482001],
+      "budget-4-co-tenancy/4:1": [7527638, 12331403],
+      "budget-8/1:1": [6303534, 7261858],
+      "budget-8/4:1": [6040403, 7196865],
+      "budget-16/1:1": [6411805, 7167358],
+      "budget-16/4:1": [6032580, 7111650]
+    },
+    "batch_deadline_goodput_items_per_sec": {
+      "1:1": 160,
+      "4:1": 640
+    },
+    "classification": "mechanically complete; null calibration descriptive and inconclusive"
+  },
+  "initial_invalid_epoch": {
+    "path": "aa/",
+    "cause": "base rates of one query and one batch per second placed every scheduled request in the discarded warmup window, leaving measured_offered=0",
+    "handling": "retained; driver gained explicit recorded rates and a new epoch started under aa-v2/"
+  },
+  "smoke": {
+    "budget": 4,
+    "engine_delay_ms": 5,
+    "rate_ratio": "1:1",
+    "runs": {
+      "b0": "valid",
+      "t1-2": "valid",
+      "t2": "valid",
+      "t3": "valid",
+      "t4-2": "valid"
+    }
+  },
+  "status": "gate1 partial; gate2 blocked; no production decision"
+}

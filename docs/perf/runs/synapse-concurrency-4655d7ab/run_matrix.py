@@ -54,14 +54,15 @@ def fingerprint_values(value):
             yield from fingerprint_values(child)
 
 
-def verify_provenance(provenance):
-    checks = [
-        ("artifact", provenance["artifact"]["path"], provenance["artifact"]["sha256"]),
-        ("bundle manifest", provenance["bundle"]["manifest_path"], provenance["bundle"]["manifest_sha256"]),
-        ("model", provenance["bundle"]["model_path"], provenance["bundle"]["model_sha256"]),
-        ("ORT", provenance["ort"]["path"], provenance["ort"]["sha256"]),
-        ("corpus", provenance["corpus"]["path"], provenance["corpus"]["sha256"]),
-    ]
+def verify_provenance(provenance, engine):
+    checks = [("artifact", provenance["artifact"]["path"], provenance["artifact"]["sha256"])]
+    if engine == "real":
+        checks.extend([
+            ("bundle manifest", provenance["bundle"]["manifest_path"], provenance["bundle"]["manifest_sha256"]),
+            ("model", provenance["bundle"]["model_path"], provenance["bundle"]["model_sha256"]),
+            ("ORT", provenance["ort"]["path"], provenance["ort"]["sha256"]),
+            ("corpus", provenance["corpus"]["path"], provenance["corpus"]["sha256"]),
+        ])
     observed = {}
     for name, raw_path, expected in checks:
         path = Path(raw_path)
@@ -71,6 +72,8 @@ def verify_provenance(provenance):
         observed[name] = actual
         if actual != expected:
             raise DriftError(f"{name} SHA-256 drift: expected {expected}, got {actual}")
+    if engine == "delay":
+        return observed
     manifest = json.loads(Path(provenance["bundle"]["manifest_path"]).read_text())
     expected_fingerprint = provenance["bundle"]["fingerprint"]
     if expected_fingerprint not in set(fingerprint_values(manifest)):
@@ -98,19 +101,24 @@ def bundle_identity(provenance):
     }
 
 
-def provenance_record(provenance):
-    return {
+def provenance_record(provenance, engine):
+    record = {
+        "evidence_scope": "delay-mechanism" if engine == "delay" else "production-model",
         "artifact_sha256": provenance["artifact"]["sha256"],
-        "bundle_directory": "<redacted:bundle>",
-        "bundle_manifest_sha256": provenance["bundle"]["manifest_sha256"],
-        "bundle_identity": bundle_identity(provenance),
-        "ort_library": Path(provenance["ort"]["path"]).name,
-        "ort_version": provenance["ort"]["version"],
-        "ort_sha256": provenance["ort"]["sha256"],
-        "corpus": Path(provenance["corpus"]["path"]).name,
-        "corpus_sha256": provenance["corpus"]["sha256"],
         "commit": provenance["commit"],
     }
+    if engine == "real":
+        record.update({
+            "bundle_directory": "<redacted:bundle>",
+            "bundle_manifest_sha256": provenance["bundle"]["manifest_sha256"],
+            "bundle_identity": bundle_identity(provenance),
+            "ort_library": Path(provenance["ort"]["path"]).name,
+            "ort_version": provenance["ort"]["version"],
+            "ort_sha256": provenance["ort"]["sha256"],
+            "corpus": Path(provenance["corpus"]["path"]).name,
+            "corpus_sha256": provenance["corpus"]["sha256"],
+        })
+    return record
 
 
 def parse_csv(value):
@@ -236,7 +244,7 @@ def repository_dirty():
         return "unknown"
 
 
-def redacted_environment(run_dir, provenance, wrapper):
+def redacted_environment(run_dir, provenance, wrapper, engine):
     host_hash = hashlib.sha256(platform.node().encode()).hexdigest()[:12]
     lines = [
         f"captured_utc={utc_now()}",
@@ -248,11 +256,15 @@ def redacted_environment(run_dir, provenance, wrapper):
         "commit={}".format(provenance["commit"]),
         f"repository_dirty={repository_dirty()}",
         "artifact={} sha256={}".format(Path(provenance["artifact"]["path"]).name, provenance["artifact"]["sha256"]),
-        "bundle=<redacted:bundle> fingerprint={}".format(provenance["bundle"]["fingerprint"]),
-        "ort={} version={} sha256={}".format(Path(provenance["ort"]["path"]).name, provenance["ort"]["version"], provenance["ort"]["sha256"]),
-        "corpus={} sha256={}".format(Path(provenance["corpus"]["path"]).name, provenance["corpus"]["sha256"]),
+        f"evidence_scope={'delay-mechanism' if engine == 'delay' else 'production-model'}",
         f"cpu_wrapper={wrapper}",
     ]
+    if engine == "real":
+        lines[9:9] = [
+            "bundle=<redacted:bundle> fingerprint={}".format(provenance["bundle"]["fingerprint"]),
+            "ort={} version={} sha256={}".format(Path(provenance["ort"]["path"]).name, provenance["ort"]["version"], provenance["ort"]["sha256"]),
+            "corpus={} sha256={}".format(Path(provenance["corpus"]["path"]).name, provenance["corpus"]["sha256"]),
+        ]
     (run_dir / "environment.txt").write_text("\n".join(lines) + "\n")
 
 
@@ -280,9 +292,10 @@ def wrap_command(argv, letter, wrapper, single_cpu=False):
     raise ValueError(f"unknown CPU wrapper {wrapper}")
 
 
-def harness_argv(letter, provenance, engine):
+def harness_argv(letter, provenance, engine, base_query_rate, engine_delay_ms):
     artifact = provenance["artifact"]["path"]
-    query_rate, batch_rate = ((1, 1) if letter["rate_ratio"] == "1:1" else (1, 4))
+    query_rate = base_query_rate
+    batch_rate = query_rate if letter["rate_ratio"] == "1:1" else query_rate * 4
     argv = [
         artifact,
         "--variant", "current-plugin",
@@ -296,6 +309,7 @@ def harness_argv(letter, provenance, engine):
         "--seed", str(letter["seed"]),
         "--topology", letter["topology"],
         "--engine", engine,
+        "--engine-delay-ms", str(engine_delay_ms),
     ]
     if engine == "real":
         budget = letter["cpu_budget"] or len(letter["cpus"])
@@ -356,7 +370,7 @@ def update_evidence(run_dir, manifest):
     })
 
 
-def new_manifest(schedule, provenance, gates, constructs, wrapper, engine, idle_gap_seconds):
+def new_manifest(schedule, provenance, gates, constructs, wrapper, engine, idle_gap_seconds, base_query_rate, engine_delay_ms):
     return {
         "schema": "synapse-concurrency-run/v1",
         "created_utc": utc_now(),
@@ -369,8 +383,10 @@ def new_manifest(schedule, provenance, gates, constructs, wrapper, engine, idle_
         "cell_hold_seconds": 1,
         "warmup_fraction": 0.1,
         "idle_gap_seconds": idle_gap_seconds,
+        "base_query_rate": base_query_rate,
+        "engine_delay_ms": engine_delay_ms,
         "gate_states": gates,
-        "provenance": provenance_record(provenance),
+        "provenance": provenance_record(provenance, engine),
         "cpu_constructs": constructs,
         "cpu_wrapper": wrapper,
         "blocks": [
@@ -424,11 +440,21 @@ def execute_schedule(args, run_dir, schedule, manifest, provenance, wrapper):
                 slot = {"id": slot_id, "logical_block": logical_block, "generation": record["generation"], "state": "allocated"}
                 manifest["slots"].append(slot)
                 write_json(run_dir / "manifest.json", manifest)
-                observed = verify_provenance(provenance)
+                observed = verify_provenance(provenance, args.engine)
                 stdout_path = raw / (slot_id + ".ndjson")
                 stderr_path = raw / (slot_id + ".stderr")
                 status_path = raw / (slot_id + ".status.json")
-                argv = wrap_command(harness_argv(letter, provenance, args.engine), letter, wrapper)
+                argv = wrap_command(
+                    harness_argv(
+                        letter,
+                        provenance,
+                        args.engine,
+                        args.base_query_rate,
+                        args.engine_delay_ms,
+                    ),
+                    letter,
+                    wrapper,
+                )
                 before = loadavg()
                 co_tenant, co_tenant_argv = start_co_tenant(letter, wrapper)
                 started = utc_now()
@@ -510,6 +536,8 @@ def parse_args(argv=None):
     parser.add_argument("--idle-gap-seconds", type=float, default=1.0)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument("--engine", choices=("delay", "real"), default="delay")
+    parser.add_argument("--base-query-rate", type=int, default=10)
+    parser.add_argument("--engine-delay-ms", type=int, default=5)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-letters", type=int)
     parser.add_argument("--co-tenancy", action=argparse.BooleanOptionalAction, default=True)
@@ -521,6 +549,8 @@ def parse_args(argv=None):
         parser.error("--blocks must be positive")
     if args.idle_gap_seconds < 0 or args.timeout_seconds <= 0:
         parser.error("time values must be positive")
+    if args.base_query_rate <= 0 or args.engine_delay_ms < 0:
+        parser.error("rates must be positive and engine delay must be non-negative")
     return args
 
 
@@ -547,23 +577,33 @@ def main(argv=None):
         manifest = json.loads(manifest_path.read_text())
         if manifest["status"] == "aborted-provenance-drift":
             raise SystemExit("provenance drift aborted this epoch; start a new run directory")
-        if manifest["provenance"] != provenance_record(provenance):
+        if manifest["provenance"] != provenance_record(provenance, args.engine):
             raise SystemExit("resume provenance differs from retained manifest")
         if (
             manifest["gate_states"] != gates
             or manifest["cpu_wrapper"] != wrapper
             or manifest["engine"] != args.engine
             or manifest["idle_gap_seconds"] != args.idle_gap_seconds
+            or manifest["base_query_rate"] != args.base_query_rate
+            or manifest["engine_delay_ms"] != args.engine_delay_ms
         ):
             raise SystemExit("resume mechanism, idle gap, or gate state differs from retained manifest")
     else:
-        verify_provenance(provenance)
+        verify_provenance(provenance, args.engine)
         write_json(schedule_path, schedule)
         manifest = new_manifest(
-            schedule, provenance, gates, constructs, wrapper, args.engine, args.idle_gap_seconds
+            schedule,
+            provenance,
+            gates,
+            constructs,
+            wrapper,
+            args.engine,
+            args.idle_gap_seconds,
+            args.base_query_rate,
+            args.engine_delay_ms,
         )
         write_json(manifest_path, manifest)
-        redacted_environment(run_dir, provenance, wrapper)
+        redacted_environment(run_dir, provenance, wrapper, args.engine)
         update_evidence(run_dir, manifest)
     if args.mode == "dry-run":
         return 0

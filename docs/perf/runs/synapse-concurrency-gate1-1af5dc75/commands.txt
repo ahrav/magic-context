@@ -1,0 +1,25 @@
+Build:
+  cargo build --release -p mc-host --example synapse_perf --features bench-topology
+
+Driver tests:
+  python -m unittest docs/perf/runs/synapse-concurrency-4655d7ab/test_run_matrix.py
+
+Initial invalid A/A epoch (retained under aa/):
+  python docs/perf/runs/synapse-concurrency-4655d7ab/run_matrix.py execute --run-dir docs/perf/runs/synapse-concurrency-gate1-1af5dc75/aa --provenance /tmp/opencode/synapse-delay-provenance.json --blocks 2 --budgets 4,8,16 --topologies b0 --cpu-wrapper taskset --idle-gap-seconds 1 --engine delay --co-tenancy --gate-c50-8 pending --gate-chj pending --gate-18r pending
+
+Complete A/A epoch:
+  python docs/perf/runs/synapse-concurrency-4655d7ab/run_matrix.py execute --run-dir docs/perf/runs/synapse-concurrency-gate1-1af5dc75/aa-v2 --provenance /tmp/opencode/synapse-delay-provenance.json --blocks 2 --budgets 4,8,16 --topologies b0 --cpu-wrapper taskset --idle-gap-seconds 1 --engine delay --base-query-rate 10 --engine-delay-ms 5 --co-tenancy --gate-c50-8 pending --gate-chj pending --gate-18r pending
+
+Topology smokes:
+  python docs/perf/runs/synapse-concurrency-gate1-1af5dc75/run_smoke.py
+
+Guard tests:
+  cargo test -p mc-host --test synapse_protocol --test synapse_jobs
+  cargo test -p mc-host --features bench-topology --test synapse_protocol --test synapse_jobs --test synapse_topology
+  cargo test -p mc-host --features bench-topology --example synapse_perf
+
+Lint and format:
+  cargo clippy -p mc-host --all-targets --features bench-topology -- -D warnings
+  cargo fmt --check
+
+No real-engine or tiny-ORT command ran because MC_SYNAPSE_TEST_ORT_LIBRARY was absent.

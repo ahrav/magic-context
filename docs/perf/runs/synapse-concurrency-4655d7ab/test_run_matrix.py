@@ -100,6 +100,14 @@ class DriverTests(unittest.TestCase):
             check=False,
         )
 
+    def delay_provenance(self) -> Path:
+        path = self.root / "delay-provenance.json"
+        path.write_text(json.dumps({
+            "artifact": {"path": str(self.artifact), "sha256": digest(self.artifact)},
+            "commit": "deadbeef",
+        }))
+        return path
+
     def test_dry_run_emits_seeded_complete_abba_schedule(self) -> None:
         first = self.root / "dry-first"
         second = self.root / "dry-second"
@@ -158,6 +166,66 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(self.marker.read_text(), "x")
         manifest = json.loads((out / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "aborted-provenance-drift")
+
+    def test_delay_engine_accepts_artifact_only_provenance(self) -> None:
+        self.provenance = self.delay_provenance()
+        out = self.root / "delay"
+        result = self.run_driver("execute", out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((out / "manifest.json").read_text())
+        self.assertEqual(manifest["provenance"], {
+            "artifact_sha256": digest(self.artifact),
+            "commit": "deadbeef",
+            "evidence_scope": "delay-mechanism",
+        })
+        environment = (out / "environment.txt").read_text()
+        self.assertIn("evidence_scope=delay-mechanism", environment)
+        self.assertNotIn("bundle=", environment)
+        self.assertNotIn("ort=", environment)
+        self.assertNotIn("corpus=", environment)
+
+    def test_real_engine_still_requires_complete_provenance_and_gates(self) -> None:
+        complete_provenance = self.provenance
+        self.provenance = self.delay_provenance()
+        out = self.root / "real-incomplete"
+        result = self.run_driver(
+            "dry-run",
+            out,
+            "--engine", "real",
+            "--gate-c50-8", "byte-verified",
+            "--gate-chj", "merged",
+            "--gate-18r", "out-of-window",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bundle", result.stderr)
+
+        blocked = self.run_driver("dry-run", self.root / "real-blocked", "--engine", "real")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("c50.8 byte-verified", blocked.stderr)
+
+        self.provenance = complete_provenance
+        complete = self.run_driver(
+            "execute",
+            self.root / "real-complete",
+            "--engine", "real",
+            "--gate-c50-8", "byte-verified",
+            "--gate-chj", "merged",
+            "--gate-18r", "out-of-window",
+        )
+        self.assertEqual(complete.returncode, 0, complete.stderr)
+
+        provenance = json.loads(self.provenance.read_text())
+        Path(provenance["ort"]["path"]).write_bytes(b"drift")
+        drifted = self.run_driver(
+            "execute",
+            self.root / "real-drifted",
+            "--engine", "real",
+            "--gate-c50-8", "byte-verified",
+            "--gate-chj", "merged",
+            "--gate-18r", "out-of-window",
+        )
+        self.assertNotEqual(drifted.returncode, 0)
+        self.assertIn("ORT SHA-256 drift", drifted.stderr)
 
     def test_clean_execute_creates_raw_and_integrity_outputs(self) -> None:
         out = self.root / "clean"

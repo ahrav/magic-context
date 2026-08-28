@@ -1,0 +1,38 @@
+{
+  "artifact": {
+    "path": "target/release/examples/synapse_perf",
+    "sha256": "6ad6d1ad4839f43e59f7574c8c8e00bf336396601e1c464d696ce6aafc0bca9c"
+  },
+  "collection_scope": "delay-engine mechanism only",
+  "commit": "1af5dc7549f57f3ab7c8d43d65e2695ecb34da3d",
+  "contract": {
+    "path": "docs/perf/synapse-concurrency-contract.md",
+    "sha256": "295b35eb2f215b05414a714018a6fa1590510931627ae46f29224d4978f1d2b6",
+    "version": 1
+  },
+  "cpu": {
+    "allowed_logical_cpus": 32,
+    "budgets": [4, 8, 16],
+    "co_tenancy_budget": 4,
+    "mechanism": "taskset"
+  },
+  "driver": {
+    "path": "docs/perf/runs/synapse-concurrency-4655d7ab/run_matrix.py",
+    "sha256": "7ec52250bbd65abd6e91233ce64558f761f638ba91ab9965d129698219372f26",
+    "tests_sha256": "d56bdcefd321bef4ebb8a1f95e4a97c5af13b13716fc649783be601fd214d344"
+  },
+  "environment": {
+    "hostname": "redacted in per-run environment records",
+    "kernel": "Linux 6.12.100-125.179.amzn2023.aarch64",
+    "machine": "aarch64",
+    "rustc": "1.94.1 (e408947bf 2026-03-25)",
+    "workspace": "redacted in per-run environment records"
+  },
+  "production_inputs": {
+    "bundle": "not supplied or used",
+    "corpus": "not supplied or used",
+    "mc_synapse_test_ort_library": "absent",
+    "ort": "not supplied or used"
+  },
+  "repository_dirty_at_collection": true
+}
