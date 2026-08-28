@@ -413,7 +413,7 @@ describe("promoteRelease", () => {
             // function of the published manifest and evidence, so it can be
             // recomputed from the installed tree.
             const reread = loadRelease(promoted.releaseDir);
-            const recomputed = releaseArtifactFingerprint(reread.manifest, reread.mutationEvidence);
+            const recomputed = releaseArtifactFingerprint(reread.manifest, reread.mutationEvidence, reread.scenarios);
             expect(recomputed).toBe(promoted.artifactFingerprint);
             expect(
                 loadRelease(promoted.releaseDir, { expectedArtifactFingerprint: recomputed }).manifest.releaseVersion,
@@ -426,6 +426,81 @@ describe("promoteRelease", () => {
                     releaseVersion: "v1",
                 }),
             ).toThrow(/version already installed/);
+        });
+    });
+
+    test("load rejects a symlinked release directory", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // The whole vN entry replaced by a link. Every read follows it and the
+            // child checks then see an ordinary tree, so without a check on the
+            // directory itself the release passes while its bytes stay mutable
+            // outside the releases root.
+            const outside = join(root, "release-elsewhere");
+            renameSync(releaseDir, outside);
+            symlinkSync(outside, releaseDir);
+            expect(() => loadRelease(releaseDir)).toThrow(/release: not-a-real-directory/);
+        });
+    });
+
+    test("the artifact anchor binds harness-owned trigger pressure the release tuple excludes", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promoted = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            const scenarioPath = join(promoted.releaseDir, RELEASE_FILES.scenariosDir, "hse-scenario-0.json");
+            const scenario = JSON.parse(readFileSync(scenarioPath, "utf8")) as {
+                trigger: { ballastTokensPerTurn: number };
+            };
+            // Swap one lint-clean pressure recipe for another. `scenarioFingerprint`
+            // excludes trigger pressure by design, so the manifest tuple and the
+            // mutation evidence are both unchanged.
+            scenario.trigger.ballastTokensPerTurn += 100;
+            writeFileSync(scenarioPath, `${JSON.stringify(scenario, null, 2)}\n`);
+
+            // Every in-directory check still accepts the edited release: nothing
+            // inside it can see the change.
+            expect(loadRelease(promoted.releaseDir).manifest.releaseVersion).toBe("v1");
+            // Only the external anchor catches it. Otherwise two runs labelled with
+            // the same frozen release would execute different historian schedules.
+            expect(() =>
+                loadRelease(promoted.releaseDir, {
+                    expectedArtifactFingerprint: promoted.artifactFingerprint,
+                }),
+            ).toThrow(/artifact fingerprint does not match/);
+        });
+    });
+
+    test("load applies operator deny lists to the release before any parser runs", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // Promotion scanned this corpus against the lists in force then, which
+            // cannot cover a list that has grown since — and an externally
+            // assembled release never passed that gate at all. The strict consumer
+            // path had no way to apply either list.
+            expect(() => loadRelease(releaseDir)).not.toThrow();
+            expect(() => loadRelease(releaseDir, { forbiddenTokens: ["Filed under ticket"] })).toThrow(/^privacy\./);
+            expect(() => loadRelease(releaseDir, { forbiddenIdentifiers: ["operator-a"] })).toThrow(/^privacy\./);
+            // A list that matches nothing in the release leaves it loadable.
+            expect(() =>
+                loadRelease(releaseDir, { forbiddenTokens: ["absent-codename"], forbiddenIdentifiers: ["nobody"] }),
+            ).not.toThrow();
         });
     });
 

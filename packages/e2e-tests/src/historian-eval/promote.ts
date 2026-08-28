@@ -153,23 +153,36 @@ function checkMutationEvidence(
 }
 
 /**
- * Fingerprint over BOTH published artifacts — the manifest (including approver
- * strings) and the recomputed mutation evidence. This is the value an operator
- * records out of band at promotion time and passes back to `loadRelease`:
- * nothing inside the release directory can authenticate itself, so without an
- * external anchor an editor can rewrite `approver`, or fabricate green evidence
- * for a battery that never ran, and still satisfy every in-directory check.
+ * Fingerprint over ALL THREE published artifact groups — the manifest (including
+ * approver strings), the recomputed mutation evidence, and the scenario corpus.
+ * This is the value an operator records out of band at promotion time and passes
+ * back to `loadRelease`: nothing inside the release directory can authenticate
+ * itself, so without an external anchor an editor can rewrite `approver`, or
+ * fabricate green evidence for a battery that never ran, and still satisfy every
+ * in-directory check.
  *
- * Both files are covered because they are separately mutable. Anchoring only
- * the manifest would leave the evidence file forgeable: the parser proves an
- * artifact is internally consistent and covers every mutation class, not that
- * any mutation was ever executed.
+ * All three are covered because they are separately mutable. Anchoring only the
+ * manifest would leave the evidence file forgeable: the parser proves an artifact
+ * is internally consistent and covers every mutation class, not that any mutation
+ * was ever executed.
+ *
+ * The scenarios are covered DIRECTLY, not via `manifest.releaseTuple`. That tuple
+ * is built from `scenarioFingerprint`, which deliberately excludes harness-owned
+ * trigger pressure so pressure cannot move a semantic identity or invalidate an
+ * approval — leaving those values bound to no artifact at all. They are not
+ * inert: `modelContextLimit` with the per-turn and spike usage decides WHEN the
+ * historian fires. Left out, an edit to an installed release could swap one
+ * lint-clean pressure recipe for another, so two runs labelled with the same
+ * frozen release would measure different schedules while every in-directory check
+ * and the anchor still matched. Approvals stay trigger-independent:
+ * `releaseApprovalFingerprint` covers the version, tuple, and tombstones.
  */
 export function releaseArtifactFingerprint(
     manifest: ReleaseManifest,
     evidence: MutationEvidenceArtifact,
+    scenarios: readonly HistorianEvalScenario[],
 ): string {
-    return canonicalFingerprint({ manifest, mutationEvidence: evidence });
+    return canonicalFingerprint({ manifest, mutationEvidence: evidence, scenarios });
 }
 
 /** Real regular file — not a symlink whose target lives outside the frozen tree. */
@@ -184,14 +197,28 @@ export interface LoadReleaseOptions {
      * promoter's own read-back of bytes it just wrote).
      */
     expectedArtifactFingerprint?: string;
+    /**
+     * Deny lists for the privacy gate, in the form promotion takes them. Supplied
+     * here because a release assembled outside this promoter never passed that
+     * gate at all, and one this promoter published passed it only against the
+     * lists in force then — which cannot cover a list that has grown since.
+     * Omitting both means no scan, matching a caller that already trusts the tree.
+     */
+    forbiddenTokens?: readonly string[];
+    forbiddenIdentifiers?: readonly string[];
 }
 
 /**
  * Strict consumer path: load a release directory back through the full
- * parse + lint + fingerprint pipeline. Fails closed on unexpected entries,
- * symlinked artifacts, a corpus outside the size budget, fingerprint drift,
+ * parse + lint + fingerprint pipeline. Fails closed on a symlinked release
+ * directory, unexpected entries, symlinked artifacts, a corpus outside the size
+ * budget, sensitive content when deny lists are supplied, fingerprint drift,
  * tombstoned scenarios present in the corpus, or missing/ungreen mutation
  * evidence.
+ *
+ * Gate order mirrors promotion: structural shape, then the privacy scan over
+ * UNPARSED values (parser diagnostics interpolate scenario ids and field paths),
+ * then the parsers, then authenticity, then the cross-artifact semantics.
  */
 export function loadRelease(
     releaseDir: string,
@@ -201,6 +228,12 @@ export function loadRelease(
     scenarios: HistorianEvalScenario[];
     mutationEvidence: MutationEvidenceArtifact;
 } {
+    // The release directory itself, before anything reads through it. Every read
+    // below follows a symlink here and the child checks would then see an
+    // ordinary tree, so a `vN` entry linked outside the releases root would pass
+    // the whole strict path while its bytes stay mutable outside the supposedly
+    // immutable release.
+    if (!lstatSync(releaseDir).isDirectory()) fail(["release: not-a-real-directory"]);
     const entries = readdirSync(releaseDir).sort();
     const expected: string[] = [RELEASE_FILES.evidence, RELEASE_FILES.manifest, RELEASE_FILES.scenariosDir];
     const unexpected = entries.filter((entry) => !expected.includes(entry));
@@ -222,19 +255,6 @@ export function loadRelease(
     const scenariosDir = join(releaseDir, RELEASE_FILES.scenariosDir);
     if (!lstatSync(scenariosDir).isDirectory()) fail(["release.scenarios: not-a-real-directory"]);
 
-    const manifest = parseManifest(readReleaseJson(join(releaseDir, RELEASE_FILES.manifest), "release.manifest"));
-    const mutationEvidence = parseMutationEvidence(
-        readReleaseJson(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence"),
-    );
-    // Anchor check before any content is trusted, and over BOTH artifacts: the
-    // evidence file is separately mutable, and its parser proves internal
-    // consistency and full class coverage — not that the battery ever ran.
-    if (
-        options.expectedArtifactFingerprint !== undefined &&
-        releaseArtifactFingerprint(manifest, mutationEvidence) !== options.expectedArtifactFingerprint
-    ) {
-        fail(["release: artifact fingerprint does not match the expected trust anchor"]);
-    }
     const scenarioFiles = readdirSync(scenariosDir).sort();
     // Position-based labels, for the same reason the entry check above reports
     // counts: a scenario filename from an externally assembled tree has not been
@@ -254,12 +274,46 @@ export function loadRelease(
             `release: corpus size ${scenarioFiles.length} outside the ${CORPUS_SIZE_BUDGET.min}-${CORPUS_SIZE_BUDGET.max} budget (R1)`,
         ]);
     }
-    const scenarios = scenarioFiles.map((file, index) =>
-        parseScenario(
-            readReleaseJson(join(scenariosDir, file), `release.scenarios[${index}]`),
-            `release.scenarios[${index}]`,
-        ),
+
+    const rawManifest = readReleaseJson(join(releaseDir, RELEASE_FILES.manifest), "release.manifest");
+    const rawEvidence = readReleaseJson(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence");
+    const rawScenarios = scenarioFiles.map((file, index) =>
+        readReleaseJson(join(scenariosDir, file), `release.scenarios[${index}]`),
     );
+    // Privacy gate BEFORE any parser, exactly as promotion orders it: schema
+    // diagnostics interpolate scenario ids and field paths, so a parser run first
+    // could echo the very content the scan exists to keep out of logs. Covers all
+    // three artifact groups — approver strings and tombstone ids are published
+    // verbatim in the manifest, and evidence entries carry ids no charset rule
+    // constrains.
+    if (options.forbiddenTokens !== undefined || options.forbiddenIdentifiers !== undefined) {
+        const privacyDiagnostics = scanForSensitiveContent(
+            { manifest: rawManifest, mutationEvidence: rawEvidence, scenarios: rawScenarios },
+            {
+                ...(options.forbiddenTokens === undefined ? {} : { forbiddenTokens: options.forbiddenTokens }),
+                ...(options.forbiddenIdentifiers === undefined
+                    ? {}
+                    : { forbiddenIdentifiers: options.forbiddenIdentifiers }),
+            },
+        ).map((violation) => `privacy.${violation.category}: ${violation.path}`);
+        if (privacyDiagnostics.length > 0) fail(privacyDiagnostics.sort());
+    }
+
+    const manifest = parseManifest(rawManifest);
+    const mutationEvidence = parseMutationEvidence(rawEvidence);
+    const scenarios = rawScenarios.map((raw, index) => parseScenario(raw, `release.scenarios[${index}]`));
+    // Authenticity before any content is trusted, over all three artifact groups:
+    // each file is separately mutable, and the evidence parser proves internal
+    // consistency and full class coverage — not that the battery ever ran.
+    // Parsing first is validation, not trust: the parsers reject malformed input,
+    // and the anchor needs parsed values because it fingerprints values, not bytes
+    // (`readReleaseJson` already pins the bytes to their canonical form).
+    if (
+        options.expectedArtifactFingerprint !== undefined &&
+        releaseArtifactFingerprint(manifest, mutationEvidence, scenarios) !== options.expectedArtifactFingerprint
+    ) {
+        fail(["release: artifact fingerprint does not match the expected trust anchor"]);
+    }
     const diagnostics: string[] = [];
     for (const [index, scenario] of scenarios.entries()) {
         if (scenarioFiles[index] !== `${scenario.id}.json`) {
@@ -494,5 +548,8 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; art
     // anchor on file for a release that was never published. Recompute promptly:
     // recomputation trusts the bytes on disk, so it can only certify a tree
     // nobody has edited since the crash.
-    return { releaseDir: destination, artifactFingerprint: releaseArtifactFingerprint(manifest, evidence) };
+    return {
+        releaseDir: destination,
+        artifactFingerprint: releaseArtifactFingerprint(manifest, evidence, scenarios),
+    };
 }
