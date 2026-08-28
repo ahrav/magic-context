@@ -190,6 +190,8 @@ function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunA
         // A promoting run left promotion evidence; the runner records the delta per
         // run so a later run's lost promotion is not masked by an earlier one.
         promotionEvidenceAdded: 2,
+        // The output consumed its whole chunk, which is what a healthy run does.
+        unprocessedFrom: null,
         ...overrides,
     };
     // A discarding run emitted one more compartment than it persisted, which is
@@ -257,13 +259,29 @@ function makeRecord(
     // is normalized so each run's `lookaheadMargin` is the margin the snapshot's
     // compartments actually imply, whatever ranges a test supplies.
     fixture.db.prepare("DELETE FROM historian_runs WHERE session_id = ?").run(SESSION_ID);
+    // A real snapshot links each run to the subagent invocation that produced it, and the
+    // scorer reads `subagent_invocations.status` to tell an attempt that RETURNED malformed
+    // text from one that never executed — the distinction production's `validation: ` prefix
+    // erases. A fixture with no invocation rows carries no such evidence, so writing them is
+    // what makes these records representative rather than merely well-shaped.
+    fixture.db.prepare("DELETE FROM subagent_invocations WHERE session_id = ?").run(SESSION_ID);
+    const insertInvocation = fixture.db.prepare(
+        `INSERT INTO subagent_invocations (session_id, harness, subagent, started_at, status)
+         VALUES (?, 'opencode', 'historian', ?, 'completed')`,
+    );
     const insertRun = fixture.db.prepare(
         `INSERT INTO historian_runs
              (session_id, run_kind, status, failure_reason, chunk_start_ordinal, chunk_end_ordinal,
-              compartments_produced, facts_emitted, discarded_last, created_at)
-         VALUES (?, 'incremental', ?, ?, ?, ?, ?, ?, ?, ?)`,
+              compartments_produced, facts_emitted, discarded_last, unprocessed_from,
+              subagent_invocation_id, created_at)
+         VALUES (?, 'incremental', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const run of record.historianRuns) {
+        // `completed`: the attempt returned text. A validation-failed run in these fixtures
+        // models a model that emitted unusable compartments, which is the case the lane scores
+        // as FAIL:invalid-output; a provider failure would be `failed` and is not model
+        // behaviour.
+        const invocationId = Number(insertInvocation.run(SESSION_ID, fixture.nowMs).lastInsertRowid);
         insertRun.run(
             SESSION_ID,
             run.status,
@@ -273,6 +291,8 @@ function makeRecord(
             run.persistedCompartments,
             run.factsEmitted,
             run.discardedLast ? 1 : 0,
+            run.unprocessedFrom,
+            invocationId,
             fixture.nowMs,
         );
     }
@@ -1331,6 +1351,62 @@ describe("scoreRunRecord", () => {
             const score = scoreRunRecord({ ...record, historianRuns: stripped }, scenario);
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("record-malformed");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a probe claiming a locator its own payload never rendered is refused", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const extra = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
+            if (extra === undefined) throw new Error("fixture lacks the capacity claim");
+            // The complete final block names the claims the request carried, so a locator
+            // beyond it is an over-claim — and not inert: `compareProbeAnswer` would read that
+            // claim's gold as injected and suppress `error-trimmed` for a guess, or accept its
+            // public id for a claim-id probe. Only the RENDERED line is removed, leaving the
+            // locator behind, which is the shape a hand-edited record has.
+            record.probes = record.probes.map((exchange) =>
+                exchange.probeId === "probe-capacity"
+                    ? {
+                          ...exchange,
+                          finalRequestPayloadText:
+                              exchange.finalRequestPayloadText === null
+                                  ? null
+                                  : exchange.finalRequestPayloadText
+                                        .split("\n")
+                                        .filter((line) => !line.startsWith(`${extra.publicClaimId}:`))
+                                        .join("\n"),
+                      }
+                    : exchange,
+            );
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a validation-failed run whose invocation never completed is not invalid-output", () => {
+        const fixture = makeSnapshot({ facts: [] });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ status: "failed", failureReason: "validation: provider refused", rawOutput: null }),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation: provider refused", rawOutput: null }),
+                ],
+            });
+            // Production stamps `validation: ` even when the provider never returned output, so
+            // the reason alone cannot say the model was shown the chunk. Marking the linked
+            // invocations `failed` is what an outage looks like in the snapshot.
+            fixture.db.prepare("UPDATE subagent_invocations SET status = 'failed' WHERE session_id = ?").run(SESSION_ID);
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("harness-failure");
         } finally {
             fixture.cleanup();
         }

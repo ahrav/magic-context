@@ -161,6 +161,16 @@ export interface HistorianRunArtifact {
      * than creating another.
      */
     promotionEvidenceAdded: number;
+    /**
+     * The ordinal the output stopped processing at, or null when it consumed its chunk.
+     *
+     * The chunk is what the historian was HANDED; this is how much of it the output
+     * actually processed. A successful output may emit early compartments and then set
+     * `<unprocessed_from>` before a later turn, so chunk coverage alone does not prove the
+     * authored transcript was seen — and a hard negative in the unprocessed suffix would
+     * pass its absence check vacuously.
+     */
+    unprocessedFrom: number | null;
 }
 
 /**
@@ -329,6 +339,32 @@ export function probeResponseClaimIdLeak(args: {
         }
     }
     return null;
+}
+
+/**
+ * The transcript each run EXPOSED the model to: its chunk, for every run that made a
+ * historian request.
+ *
+ * What makes an absence check vacuous is text the model was never SHOWN — not text it saw
+ * and declined to compartmentalize. So a validation-exhausted run counts in full (it was
+ * shown its chunk and produced nothing, which the score reports as model behaviour), and a
+ * `noop` run counts for nothing (it made no request at all).
+ *
+ * KNOWN GAP: this is what each run was HANDED, not what its output consumed. A successful
+ * output may declare `<unprocessed_from>` inside its chunk, and its ordinal is now recorded
+ * on the artifact and cross-checked against the snapshot — but it is deliberately NOT
+ * subtracted here yet. Truncating at `unprocessedFrom - 1` aborted six harness tests whose
+ * runs are otherwise healthy, which says the persisted value does not mean "the first
+ * ordinal this output did not read" in the way the subtraction assumes. Establishing what
+ * it does mean against a real run is a prerequisite for closing the gap, and guessing would
+ * convert healthy runs into coverage aborts.
+ */
+export function exposedRanges(
+    runs: readonly HistorianRunArtifact[],
+): Array<{ start: number; end: number }> {
+    return runs
+        .filter((run) => run.status !== "noop" && run.chunkStartOrdinal !== null && run.chunkEndOrdinal !== null)
+        .map((run) => ({ start: run.chunkStartOrdinal as number, end: run.chunkEndOrdinal as number }));
 }
 
 export interface ProbeExchange {
@@ -709,12 +745,21 @@ export function goldRangeLeak(args: {
     );
     const withoutPrompt = probePrompt.length === 0 ? payloadText : payloadText.split(probePrompt).join("\n");
     const rawHistory = authoredCarriesTag ? withoutPrompt : stripInjectedBlocks(withoutPrompt);
+    // The prompt is stripped because we SENT it, so its text is not surviving raw history.
+    // But the strip is a global replacement, and an authored message that CONTAINS the prompt
+    // has the substring cut out of its leaked copy too — after which the exact-match below can
+    // never fire and the gold value travels unguarded. Such a message is searched in the
+    // unstripped payload instead: a match there cannot be our own prompt, since the prompt
+    // alone is shorter than the message that contains it.
+    const unstripped = authoredCarriesTag ? payloadText : stripInjectedBlocks(payloadText);
     for (const claim of goldClaims) {
         for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
             const authored = scenario.transcript.turns[turn];
             for (const raw of [authored.user, authored.assistant]) {
                 if (raw.trim().length === 0) continue;
-                if (rawHistory.includes(raw)) {
+                const searched =
+                    probePrompt.length > 0 && raw.includes(probePrompt) ? unstripped : rawHistory;
+                if (searched.includes(raw)) {
                     return `raw transcript text of gold turn ${turn} survived in the probe payload`;
                 }
             }
@@ -1530,6 +1575,7 @@ class ScenarioRunner {
             factsEmitted: row.facts_emitted ?? 0,
             chunkStartOrdinal: row.chunk_start_ordinal,
             chunkEndOrdinal: row.chunk_end_ordinal,
+            unprocessedFrom: row.unprocessed_from ?? null,
             promotionEvidenceAdded: Math.max(0, this.scopedPromotionEvidenceCount(harness) - promotionEvidenceBefore),
         };
     }
@@ -1559,6 +1605,7 @@ class ScenarioRunner {
         compartments_produced: number | null;
         facts_emitted: number | null;
         discarded_last: number;
+        unprocessed_from: number | null;
     }> {
         if (!harness.hasContextDb()) return [];
         try {
@@ -1566,7 +1613,7 @@ class ScenarioRunner {
                 .contextDb()
                 .prepare(
                     `SELECT status, failure_reason, chunk_start_ordinal, chunk_end_ordinal,
-                            compartments_produced, facts_emitted, discarded_last
+                            compartments_produced, facts_emitted, discarded_last, unprocessed_from
                      FROM historian_runs WHERE session_id = ? ORDER BY id ASC`,
                 )
                 .all(sessionId) as ReturnType<ScenarioRunner["historianRunRows"]>;
@@ -1717,15 +1764,13 @@ class ScenarioRunner {
             preEpilogue[0][0],
             Math.max(...preEpilogue.map(([, assistant]) => assistant)),
         ];
-        const chunks = runs
-            .filter((run) => run.chunkStartOrdinal !== null && run.chunkEndOrdinal !== null)
-            .map((run) => ({ start: run.chunkStartOrdinal as number, end: run.chunkEndOrdinal as number }));
-        if (!rangeCoveredByCompartments(required, chunks)) {
+        const exposed = exposedRanges(runs);
+        if (!rangeCoveredByCompartments(required, exposed)) {
             throw new RunAbort(
                 "harness-failure",
-                `the declared runs' chunks do not cover authored ordinals ${required[0]}-${required[1]}: [${chunks
-                    .map((chunk) => `${chunk.start}-${chunk.end}`)
-                    .join(", ")}]. A token-capped chunk left part of the transcript unseen, so absence checks would pass vacuously`,
+                `the declared runs exposed [${exposed
+                    .map((range) => `${range.start}-${range.end}`)
+                    .join(", ")}], which does not cover authored ordinals ${required[0]}-${required[1]}. Part of the transcript was never shown to the model, so absence checks would pass vacuously`,
             );
         }
     }

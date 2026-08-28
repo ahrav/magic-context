@@ -52,6 +52,7 @@ import {
     extractAnswerEnvelope,
     goldRangeLeak,
     injectedBlockContents,
+    exposedRanges,
     probeResponseClaimIdLeak,
     probeResponseLeak,
     rangeCoveredByCompartments,
@@ -856,6 +857,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
                 // field makes that comparison `undefined === 0` — false — so a
                 // record that simply drops the field would pass the guard vacuously.
                 typeof run.promotionEvidenceAdded === "number" &&
+                (run.unprocessedFrom === null || typeof run.unprocessedFrom === "number") &&
                 (run.failureReason === null || typeof run.failureReason === "string") &&
                 (run.lookaheadMargin === null || typeof run.lookaheadMargin === "number") &&
                 (run.chunkStartOrdinal === null || typeof run.chunkStartOrdinal === "number") &&
@@ -1096,6 +1098,7 @@ function telemetryMismatch(
         compartmentsProduced: number | null;
         factsEmitted: number | null;
         discardedLast: number;
+        unprocessedFrom: number | null;
     }>,
     compartmentEndsInSequence: readonly number[],
 ): string | null {
@@ -1128,6 +1131,7 @@ function telemetryMismatch(
             chunkEndOrdinal: row.chunkEndOrdinal,
             persistedCompartments: persisted,
             factsEmitted: row.factsEmitted ?? 0,
+            unprocessedFrom: row.unprocessedFrom ?? null,
             discardedLast,
             emittedCompartments: persisted + (discardedLast ? 1 : 0),
             lookaheadMargin:
@@ -1142,6 +1146,7 @@ function telemetryMismatch(
             chunkEndOrdinal: run.chunkEndOrdinal,
             persistedCompartments: run.persistedCompartments,
             factsEmitted: run.factsEmitted,
+            unprocessedFrom: run.unprocessedFrom,
             discardedLast: run.discardedLast,
             emittedCompartments: run.emittedCompartments,
             lookaheadMargin: run.lookaheadMargin,
@@ -1389,6 +1394,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             compartmentsProduced: number | null;
             factsEmitted: number | null;
             discardedLast: number;
+            unprocessedFrom: number | null;
         }>;
         let compartmentEndsInSequence: number[];
         try {
@@ -1396,7 +1402,8 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 .prepare(
                     `SELECT status, failure_reason AS failureReason, chunk_start_ordinal AS chunkStartOrdinal,
                             chunk_end_ordinal AS chunkEndOrdinal, compartments_produced AS compartmentsProduced,
-                            facts_emitted AS factsEmitted, discarded_last AS discardedLast
+                            facts_emitted AS factsEmitted, discarded_last AS discardedLast,
+                            unprocessed_from AS unprocessedFrom
                        FROM historian_runs WHERE session_id = ? ORDER BY id ASC`,
                 )
                 .all(record.sessionId) as typeof runRows;
@@ -1418,6 +1425,54 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         const mismatch = telemetryMismatch(record, runRows, compartmentEndsInSequence);
         if (mismatch !== null) {
             return errorScore(record.scenarioId, "record-snapshot-mismatch", mismatch, record.system);
+        }
+
+        // The runner's invocation proof, reapplied — at SESSION level, which is as far as the
+        // snapshot supports.
+        //
+        // Production stamps `validation: ` on every unsuccessful pass, including one whose
+        // provider never returned output, so the reason alone cannot say whether the model was
+        // shown the chunk; replay was accepting any such row as model behaviour and reporting
+        // an outage-only artifact as FAIL:invalid-output.
+        //
+        // Per-run attribution is NOT available here, and that is a property of the artifact
+        // rather than a shortcut: `historian_runs.subagent_invocation_id` is left NULL on the
+        // validation-failure path, so the rows that need the evidence are exactly the rows that
+        // carry no link to it. A per-run join therefore refused every genuine exhaustion — the
+        // harness suite's own all-attempts-invalid run included. What the snapshot does support
+        // is the session-level question: did any historian attempt fail to execute at all?
+        //
+        // Applied only when the record claims exhaustion, so a healthy record is unaffected,
+        // and it errs toward `harness-failure`: with a failed attempt present, the artifact
+        // cannot separate "the model emitted garbage" from "an attempt never ran", and charging
+        // that to the model is the attribution R6 forbids.
+        if (record.historianRuns.some((run) => run.status === "failed")) {
+            let attemptStatuses: Array<{ status: string; n: number }>;
+            try {
+                attemptStatuses = db
+                    .prepare(
+                        `SELECT status, COUNT(*) AS n FROM subagent_invocations
+                          WHERE session_id = ? AND subagent = 'historian' GROUP BY status`,
+                    )
+                    .all(record.sessionId) as typeof attemptStatuses;
+            } catch (error) {
+                return errorScore(
+                    record.scenarioId,
+                    "unreadable-snapshot",
+                    `context DB snapshot ${record.contextDbSnapshotPath} could not be queried for invocation status: ${errorMessage(error)}`,
+                    record.system,
+                );
+            }
+            const completed = attemptStatuses.find((row) => row.status === "completed")?.n ?? 0;
+            const failed = attemptStatuses.filter((row) => row.status !== "completed").reduce((sum, row) => sum + row.n, 0);
+            if (completed === 0 || failed > 0) {
+                return errorScore(
+                    record.scenarioId,
+                    "harness-failure",
+                    `the record reports a validation failure, but the snapshot shows ${completed} completed and ${failed} non-completed historian attempt(s); without every attempt returning output the exhaustion cannot be attributed to the model`,
+                    record.system,
+                );
+            }
         }
 
         // FAIL:invalid-output is a claim about model behavior, so it is made only
@@ -1465,16 +1520,17 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 preEpilogue[0][0],
                 Math.max(...preEpilogue.map(([, assistant]) => assistant)),
             ];
-            const chunkRanges = record.historianRuns
-                .filter((run) => run.chunkStartOrdinal !== null && run.chunkEndOrdinal !== null)
-                .map((run) => ({ start: run.chunkStartOrdinal as number, end: run.chunkEndOrdinal as number }));
-            if (!rangeCoveredByCompartments(required, chunkRanges)) {
+            // What the runs EXPOSED, not their chunk bounds: a successful output that stopped
+            // early read less than it was handed. A validation-exhausted run still saw its
+            // whole chunk, so it counts in full — see `exposedRanges`.
+            const exposed = exposedRanges(record.historianRuns);
+            if (!rangeCoveredByCompartments(required, exposed)) {
                 return errorScore(
                     record.scenarioId,
                     "harness-failure",
-                    `the recorded chunks do not cover authored ordinals ${required[0]}-${required[1]}: [${chunkRanges
-                        .map((chunk) => `${chunk.start}-${chunk.end}`)
-                        .join(", ")}]. Part of the transcript was never shown to the model, so absence checks would pass vacuously`,
+                    `the recorded runs exposed [${exposed
+                        .map((range) => `${range.start}-${range.end}`)
+                        .join(", ")}], which does not cover authored ordinals ${required[0]}-${required[1]}. Part of the transcript was never shown to the model, so absence checks would pass vacuously`,
                     record.system,
                 );
             }
@@ -1606,6 +1662,25 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                     record.scenarioId,
                     "record-snapshot-mismatch",
                     `probe ${exchange.probeId} omits ${unclaimed.length} claim(s) its own captured payload rendered as injected: [${unclaimed.slice(0, 5).join(", ")}]`,
+                    record.system,
+                );
+            }
+            // And the converse, which a COMPLETE block makes assertable. The reasons this
+            // check was one-directional — the plugin skipping the `memory_block_ids` update
+            // with no block rendered, and a block whose closing tag budget trimming removed —
+            // are both "no complete block", and neither survives here: a well-formed block was
+            // captured for the request that produced the answer, and it names every claim that
+            // request carried. A locator beyond it is an over-claim, and not inert —
+            // `compareProbeAnswer` would accept that claim's public id for a claim-id probe,
+            // or read its gold as injected and suppress `error-trimmed` for a guess.
+            const overclaimed = record.injectedClaims
+                .filter((claim) => injectedForTurn.has(claim.revisionLocator) && !rendered.has(claim.publicClaimId))
+                .map((claim) => claim.publicClaimId);
+            if (overclaimed.length > 0) {
+                return errorScore(
+                    record.scenarioId,
+                    "record-snapshot-mismatch",
+                    `probe ${exchange.probeId} claims ${overclaimed.length} injected claim(s) its own captured payload never rendered: [${overclaimed.slice(0, 5).join(", ")}]`,
                     record.system,
                 );
             }
