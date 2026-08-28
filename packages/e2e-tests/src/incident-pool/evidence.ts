@@ -43,8 +43,8 @@ import { rowDigest } from "./history";
 export const E2E_ROOT = resolve(import.meta.dir, "..", "..");
 export const REPO_ROOT = resolve(E2E_ROOT, "..", "..");
 
-export const EXPECTED_MUTATION_ARTIFACTS = 13;
-export const EXPECTED_MUTATION_RECORDS = 21;
+export const EXPECTED_MUTATION_ARTIFACTS = 20;
+export const EXPECTED_MUTATION_RECORDS = 27;
 
 export const AUDIT_SOURCE_PATH = "docs/AUDIT-KNOWN-ISSUES.md";
 export const AUDITOR_SOURCE_PATH = "AUDITOR.md";
@@ -121,19 +121,65 @@ function requireString(value: unknown, label: string): string {
 }
 
 const E2E_TEST_PATH_RE = /(?:^|[\s'"])((?:tests|scripts)\/[\w./-]+\.ts)/;
+/** `--test <target>` names an integration target, which cargo resolves to
+ *  `<crate>/tests/<target>.rs`. */
+const CARGO_INTEGRATION_RE = /cargo test -p ([\w-]+) --test ([\w-]+)/;
+/** `--lib <module>::…::<test>` names a test inside an inline `#[cfg(test)]`
+ *  module, so the verifier is the module's own source file. */
+const CARGO_UNIT_RE = /cargo test -p ([\w-]+) --lib ([\w:]+)/;
+/** A `src/`-rooted TS test path, recorded relative to its own package root. */
+const PACKAGE_SRC_TEST_PATH_RE = /(?:^|[\s'"])(src\/[\w./-]+\.test\.ts)/;
 
 /** Resolve the verifier a `mutations[]`-shaped record challenged from the
- *  artifact's committed run command. */
-function verifierFromCommand(command: string, label: string): string {
+ *  artifact's committed run command. Rust verifiers resolve through cargo's
+ *  target layout; every resolved path is then required to exist by
+ *  `buildEvidenceView`, so an unhandled layout (a `mod.rs` directory module,
+ *  say) fails loudly on the missing verifier rather than resolving to a
+ *  plausible-looking wrong file. */
+function verifierFromCommand(
+    repoRoot: string,
+    command: string,
+    label: string,
+): string {
     if (command.startsWith("cargo test -p mc-module")) {
         return "crates/mc-module/src/differential_goldens.rs";
     }
+    const integration = command.match(CARGO_INTEGRATION_RE);
+    if (integration) {
+        return `crates/${integration[1]}/tests/${integration[2]}.rs`;
+    }
+    const unit = command.match(CARGO_UNIT_RE);
+    if (unit) {
+        // Drop the test function, then the conventional `tests` module that
+        // wraps it, leaving the module path the source file is named after.
+        const segments = unit[2].split("::");
+        segments.pop();
+        if (segments.at(-1) === "tests") segments.pop();
+        if (segments.length > 0) {
+            return `crates/${unit[1]}/src/${segments.join("/")}.rs`;
+        }
+    }
     const match = command.match(E2E_TEST_PATH_RE);
-    if (!match)
-        throw new Error(
-            `${label}: cannot resolve a verifier from command ${JSON.stringify(command)}`,
-        );
-    return `packages/e2e-tests/${match[1]}`;
+    if (match) return `packages/e2e-tests/${match[1]}`;
+    // A `src/`-relative path was recorded from the owning package's directory,
+    // which the command itself does not name. Resolve it against every package
+    // and require exactly one hit, so an ambiguous path fails closed instead of
+    // silently attributing the mutation to whichever package sorts first.
+    const packageRelative = command.match(PACKAGE_SRC_TEST_PATH_RE);
+    if (packageRelative) {
+        const hits = readdirSync(resolve(repoRoot, "packages"))
+            .map((pkg) => `packages/${pkg}/${packageRelative[1]}`)
+            .filter((candidate) => existsSync(resolve(repoRoot, candidate)));
+        if (hits.length === 1) return hits[0];
+        if (hits.length > 1) {
+            throw new Error(
+                `${label}: ${JSON.stringify(packageRelative[1])} exists in more than one package (${hits.join(", ")})`,
+            );
+        }
+    }
+    throw new Error(
+        `${label}: cannot resolve a verifier from command ${JSON.stringify(command)}`,
+    );
 }
 
 /** Resolve the verifier a `mutation_records[]`-shaped record challenged: the
@@ -188,15 +234,31 @@ export function loadMutationEvidence(
             throw new Error(`${artifactPath} must be a JSON object`);
 
         const records: MutationEvidenceRecord[] = [];
+        let declaredRecords = 0;
         if (Array.isArray(raw.mutations)) {
-            const command = requireString(
-                raw.command,
-                `${artifactPath}.command`,
+            declaredRecords = raw.mutations.length;
+            // A deferred record states that no mutation was applied and names
+            // the reason, so it binds no verifier and carries no replay. It is
+            // not evidence and must not become an evidence record; the
+            // hardening-matrix gate is what keeps the unproven claim blocked.
+            // An artifact whose every record is deferred therefore has no run
+            // command to require.
+            const proven = raw.mutations.filter(
+                (rawRecord) =>
+                    !isRecord(rawRecord) || rawRecord.status !== "deferred",
             );
+            const command =
+                proven.length > 0
+                    ? requireString(raw.command, `${artifactPath}.command`)
+                    : "";
             for (const [index, rawRecord] of raw.mutations.entries()) {
                 const label = `${artifactPath}.mutations[${index}]`;
                 if (!isRecord(rawRecord))
                     throw new Error(`${label} must be an object`);
+                if (rawRecord.status === "deferred") {
+                    requireString(rawRecord.reason, `${label}.reason`);
+                    continue;
+                }
                 const name = requireString(rawRecord.name, `${label}.name`);
                 records.push({
                     evidenceId: `ev-${slugify(name)}`,
@@ -204,12 +266,17 @@ export function loadMutationEvidence(
                     artifactPath,
                     rawName: name,
                     shape: "mutations",
-                    verifierPath: verifierFromCommand(command, label),
+                    verifierPath: verifierFromCommand(
+                        repoRoot,
+                        command,
+                        label,
+                    ),
                     replayCommand: command,
                     recordDigest: rowDigest(rawRecord),
                 });
             }
         } else if (Array.isArray(raw.mutation_records)) {
+            declaredRecords = raw.mutation_records.length;
             for (const [index, rawRecord] of raw.mutation_records.entries()) {
                 const label = `${artifactPath}.mutation_records[${index}]`;
                 if (!isRecord(rawRecord))
@@ -245,7 +312,11 @@ export function loadMutationEvidence(
             );
         }
 
-        if (records.length === 0)
+        // Counted on what the artifact DECLARED, not on what survived: an
+        // all-deferred artifact contributes no evidence yet is still a
+        // well-formed record of why, while an artifact declaring nothing at all
+        // is malformed.
+        if (declaredRecords === 0)
             throw new Error(
                 `${artifactPath}: artifact contains no mutation records`,
             );
@@ -281,7 +352,9 @@ export function loadMutationEvidence(
     return { artifacts, records, verifierDigests };
 }
 
-/** Assert the accepted mutation snapshot (R11): 13 JSON artifacts, 21 records. */
+/** Assert the accepted mutation snapshot (R11): 20 JSON artifacts, 27 records.
+ *  The seven `shm-hardening-*` drills raised both counts; the all-deferred
+ *  drill contributes an artifact but no record. */
 export function assertEvidenceSnapshot(view: EvidenceView): void {
     if (view.artifacts.length !== EXPECTED_MUTATION_ARTIFACTS) {
         throw new Error(
