@@ -166,13 +166,22 @@ pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     format!("{}{source}: {content}", claim.public_claim_id)
 }
 
+/// Render the grouped claim block. Non-positive categories are dropped here, not
+/// only in `TryFrom`: the struct, its fields, and this function are all public, so
+/// a caller that assembles `MirroredClaimMemory` values by hand reaches the bytes
+/// without passing the conversion gate. Repeating the allow-list at the last
+/// boundary before bytes keeps a warning record silent on a surface that has no
+/// warning renderer instead of emitting it as an ordinary project fact.
 pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) -> String {
-    if claims.is_empty() {
+    let mut ordered = claims
+        .iter()
+        .filter(|claim| is_positive_memory_category(&claim.category))
+        .collect::<Vec<_>>();
+    if ordered.is_empty() {
         return String::new();
     }
-    let mut ordered = claims.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| claim_render_order(left, right));
-    let mut lines = Vec::with_capacity(claims.len() * 2 + 2);
+    let mut lines = Vec::with_capacity(ordered.len() * 2 + 2);
     lines.push(format!("<{wrapper}>"));
     let mut open_category: Option<&str> = None;
     for claim in ordered {
@@ -393,21 +402,112 @@ mod tests {
         ));
     }
 
+    /// The conversion gate is not the only way into the renderer: the struct, its
+    /// fields, and `render_claim_memory_block` are public, so a hand-assembled slice
+    /// reaches the bytes directly. The allow-list has to hold on that path too.
+    #[test]
+    fn render_boundary_drops_non_positive_categories_built_without_the_conversion() {
+        let hand_built = |category: &str, content: &str| MirroredClaimMemory {
+            public_claim_id: format!("mcm_{}", "a".repeat(32)),
+            revision_locator: format!("mcm_{}/r1/{}", "a".repeat(32), "b".repeat(64)),
+            project_id: 41,
+            category: category.to_string(),
+            content: content.to_string(),
+            importance: 80,
+            provenance_label: None,
+        };
+
+        let mixed = [
+            hand_built("PROJECT_RULES", "Keep this project fact."),
+            hand_built("REJECTED_APPROACH", "Do not resurrect the shelved design."),
+            hand_built(
+                "FUTURE_NEGATIVE_CATEGORY",
+                "Unknown categories stay silent.",
+            ),
+        ];
+        let block = render_claim_memory_block(&mixed, "project-memory");
+        assert!(block.contains("Keep this project fact."));
+        assert!(!block.contains("REJECTED_APPROACH"));
+        assert!(!block.contains("Do not resurrect the shelved design."));
+        assert!(!block.contains("FUTURE_NEGATIVE_CATEGORY"));
+        assert!(!block.contains("Unknown categories stay silent."));
+
+        // An all-warning slice renders no wrapper at all, so the surface cannot emit an
+        // empty `<project-memory>` block that implies the claims were considered.
+        let only_negative = [hand_built("REJECTED_APPROACH", "Shelved design.")];
+        assert_eq!(
+            render_claim_memory_block(&only_negative, "project-memory"),
+            ""
+        );
+    }
+
+    /// Extract the string entries of one `export const <name>` array from the
+    /// TypeScript source. The declaration match requires a non-identifier
+    /// character after the name so a sibling const that shares `name` as a
+    /// prefix (e.g. `CATEGORY_PRIORITY_LEGACY`) cannot silently redirect the
+    /// parse, and exactly one declaration must exist.
+    fn typescript_string_array<'a>(source: &'a str, name: &str) -> Vec<&'a str> {
+        let declaration = format!("export const {name}");
+        let tails = source
+            .match_indices(&declaration)
+            .map(|(index, matched)| &source[index + matched.len()..])
+            .filter(|tail| {
+                !tail
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tails.len(),
+            1,
+            "expected exactly one `export const {name}` declaration"
+        );
+        let body = tails[0]
+            .split("];")
+            .next()
+            .unwrap_or_else(|| panic!("unterminated TypeScript {name} array"));
+        body.lines()
+            .filter_map(|line| line.trim().strip_prefix('"'))
+            .filter_map(|line| line.split('"').next())
+            .collect()
+    }
+
     #[test]
     fn positive_category_vocabulary_matches_typescript() {
         let source =
             include_str!("../../../packages/plugin/src/features/magic-context/memory/constants.ts");
-        let priority = source
-            .split("export const CATEGORY_PRIORITY")
-            .nth(1)
-            .and_then(|tail| tail.split("];").next())
-            .expect("TypeScript CATEGORY_PRIORITY array");
-        let typescript_categories = priority
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix('"'))
-            .filter_map(|line| line.split('"').next())
-            .collect::<Vec<_>>();
 
-        assert_eq!(typescript_categories, POSITIVE_MEMORY_CATEGORIES);
+        assert_eq!(
+            typescript_string_array(source, "CATEGORY_PRIORITY"),
+            POSITIVE_MEMORY_CATEGORIES
+        );
+
+        // CATEGORY_PRIORITY only orders rows; the writable taxonomies decide
+        // which categories can actually reach mirror rows. Anchoring the gate
+        // to them ensures a newly writable positive category fails this test
+        // instead of being silently dropped by the native surfaces.
+        for name in ["V2_MEMORY_CATEGORIES", "PROMOTABLE_CATEGORIES"] {
+            let categories = typescript_string_array(source, name);
+            assert!(!categories.is_empty(), "TypeScript {name} parsed as empty");
+            for category in categories {
+                assert!(
+                    is_positive_memory_category(category),
+                    "TypeScript {name} entry {category} is missing from POSITIVE_MEMORY_CATEGORIES"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_order_is_a_prefix_of_the_positive_vocabulary() {
+        // `claim_render_order` ranks with MEMORY_CATEGORY_ORDER while the
+        // inclusion gate uses POSITIVE_MEMORY_CATEGORIES. Pinning the order
+        // array to the vocabulary's prefix keeps a single-list edit from
+        // desyncing sort order from the inclusion gate.
+        assert_eq!(
+            MEMORY_CATEGORY_ORDER[..],
+            POSITIVE_MEMORY_CATEGORIES[..MEMORY_CATEGORY_ORDER.len()]
+        );
     }
 }

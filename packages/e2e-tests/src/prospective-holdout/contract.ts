@@ -1,11 +1,12 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { HEX64_RE, makeContractPrimitives } from "../contract-primitives";
 
 export const FREEZE_SCHEMA = "prospective-release-freeze/v1";
 export const CLOSE_SCHEMA = "prospective-cohort-close/v1";
 export const POLICY_OWNER_SCHEMA = "prospective-policy-owner/v1";
 export const TRUST_ENTRY_SCHEMA = "prospective-trust-entry/v1";
 
-export const HEX64_RE = /^[0-9a-f]{64}$/;
+export { HEX64_RE };
 export const EPOCH_ID_RE = /^epoch-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export const CASE_ID_RE = /^case-[0-9a-f]{32}$/;
 export const INTAKE_ID_RE = /^intake-[0-9a-f]{32}$/;
@@ -34,36 +35,19 @@ export function fail(code: string): never {
     throw new HoldoutContractError([code]);
 }
 
-export function record(value: unknown, label: string): Record<string, unknown> {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        fail(`${label}: object-required`);
-    }
-    return value as Record<string, unknown>;
-}
+const primitives = makeContractPrimitives(HoldoutContractError);
 
-export function exact(recordValue: Record<string, unknown>, keys: readonly string[], label: string): void {
-    const actual = Object.keys(recordValue).sort();
-    const expected = [...keys].sort();
-    if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-        fail(`${label}: fields-invalid`);
-    }
-}
-
-export function string(value: unknown, label: string): string {
-    if (typeof value !== "string" || value.length === 0) fail(`${label}: string-invalid`);
-    return value;
-}
+export const record = primitives.record;
+export const exact = primitives.exact;
+export const string = primitives.string;
+export const hex64 = primitives.hex64;
+export const enumeration = primitives.enumeration;
+export const array = primitives.array;
+export const integer = primitives.integer;
+const unique = primitives.unique;
 
 export function staticId(value: unknown, label: string, pattern: RegExp = STATIC_ID_RE): string {
-    const result = string(value, label);
-    if (!pattern.test(result)) fail(`${label}: id-invalid`);
-    return result;
-}
-
-export function hex64(value: unknown, label: string): string {
-    const result = string(value, label);
-    if (!HEX64_RE.test(result)) fail(`${label}: fingerprint-invalid`);
-    return result;
+    return primitives.staticId(value, label, pattern);
 }
 
 export function instant(value: unknown, label: string): string {
@@ -87,25 +71,6 @@ export function instant(value: unknown, label: string): string {
         fail(`${label}: instant-invalid`);
     }
     return result;
-}
-
-export function enumeration<T extends string>(value: unknown, allowed: readonly T[], label: string): T {
-    if (typeof value !== "string" || !allowed.includes(value as T)) fail(`${label}: enum-invalid`);
-    return value as T;
-}
-
-export function array(value: unknown, label: string): unknown[] {
-    if (!Array.isArray(value)) fail(`${label}: array-required`);
-    return value;
-}
-
-export function integer(value: unknown, label: string, minimum = 0): number {
-    if (!Number.isSafeInteger(value) || (value as number) < minimum) fail(`${label}: integer-invalid`);
-    return value as number;
-}
-
-function unique(values: readonly string[], label: string): void {
-    if (new Set(values).size !== values.length) fail(`${label}: duplicate`);
 }
 
 export const BUILD_ROLES = ["release-n", "release-n-minus-1"] as const;

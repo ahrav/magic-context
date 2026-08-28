@@ -1,0 +1,170 @@
+{
+  "schema": "synapse-tail-u7-evidence-v3",
+  "status": "PROVISIONAL SELECTION: a+c with K=1",
+  "commit": "881be45b552625935a6b725a7ef830165a4c2f00",
+  "branch": "feat/synapse-tail-amplification",
+  "prior_epochs": {
+    "pilot": "docs/perf/runs/synapse-tail-6e5ffc03/ (untouched)",
+    "inconclusive": "docs/perf/runs/synapse-tail-af8ef126/ (untouched)"
+  },
+  "artifact": "target/release/examples/synapse_perf",
+  "artifact_sha256": "304571f903697540689d755497f098b1db25cd6f7511868c5801abb76665aa66",
+  "engine": "inline delayed deterministic engine",
+  "process_arrangement": "generator and SUT in one process; fresh process per cell; cells executed sequentially",
+  "ktd9_owner_acceptance": "recorded in frozen contract",
+  "harness_fixes_since_af8ef126": [
+    "exact non-divisor open-loop scheduling: floor(slot*1e9/rate) offsets, any rate <= 1e9 valid",
+    "module_restarted mirrors the plugin one-resubmission budget and terminates as logical Rejected, not fatal",
+    "race-free correlation allocation removed the EOF storm at high-rate batch cells",
+    "connection_loss_errors is a structured summary count (subset of the fatal gate)",
+    "terminal rejection is not censoring; censoring counts timeouts plus in-flight only",
+    "raw service samples and service_time_mean_ns emitted per repetition"
+  ],
+  "collection": {
+    "start_utc": "2026-08-26T22:15:21.554493Z",
+    "end_utc": "2026-08-26T23:21:42.008161Z",
+    "wall_span_seconds": 3980.45,
+    "sum_cell_duration_seconds": 3934.60,
+    "fixed_descriptive_blocks": 2,
+    "hold_seconds": 1,
+    "candidate_a_k_levels": [1, 2],
+    "aa_randomization_seeds": [2852126721, 2852126722],
+    "treatment_randomization_seeds": [2125262849, 2125262850],
+    "block_load_capture": "sampled /proc/loadavg before every phase block; block_loadavg.ndjson and environment.txt"
+  },
+  "capacity_derivation": {
+    "zero_delay_rates_per_second": [1000, 2000, 3000, 4000, 6000, 8000],
+    "zero_delay_reference_capacity_per_second": 4000,
+    "five_ms_mean_service_ns": 5056721.31701031,
+    "five_ms_capacity_per_second": 197.75659707330502,
+    "five_ms_rates_per_second": [49, 99, 148, 198, 297, 396],
+    "twenty_five_ms_mean_service_ns": 25059503.7125,
+    "twenty_five_ms_capacity_per_second": 39.90502012620415,
+    "twenty_five_ms_rates_per_second": [10, 20, 30, 40, 60, 80],
+    "rounding": "round half up of capacity times factor",
+    "all_frozen_rates_executable": true,
+    "evidence": "calibration.json and calibration/raw/"
+  },
+  "policy_parity": {
+    "result": "PASS by source identity check",
+    "plugin_policy_sha256": "42e02b603592d4f0bd5f42a01b53ee249bf93f4bdc954c70ace245a0342032a6",
+    "plugin_attempt_limit": 4,
+    "harness_attempt_limit": 4,
+    "retry_jitter_window": "[base, 3*base)",
+    "poll_initial_delay_ms": "[1, 2)",
+    "poll_multiplier": 1.6,
+    "poll_min_delay_ms": 10,
+    "poll_default_delay_ms": 50
+  },
+  "aa": {
+    "required_positions": 576,
+    "attempted_positions": 576,
+    "valid_positions": 570,
+    "invalid_positions": 6,
+    "invalid_reasons": {"missed_slot": 6},
+    "external_labels": ["hygiene-aa-left", "hygiene-aa-right"],
+    "both_labels_treatment_argv": "--variant hygiene-only",
+    "paired_valid_cells": 284,
+    "mechanical_binary_identity": "PASS",
+    "schedule_validity": "PARTIAL: 570/576 valid; all six invalid positions are single missed scheduled slots at zero-delay 4000-8000/s",
+    "stability_verdict": "STABLE",
+    "p95_left_over_right_median": 1.0002,
+    "p95_left_over_right_range": [0.5467, 4.9842],
+    "p95_pairs_within_10_percent": 269,
+    "p95_pairs_within_2x": 283,
+    "goodput_left_over_right_median": 1.0,
+    "amplification_left_over_right_range": [0.9634, 1.0286],
+    "stability_notes": "Medians at unity for all six primary outcomes; no label-dependent offset or accounting mismatch. 9 of 15 pairs outside +-10% have both p95 below 2 ms; the single 4.98 outlier is a closed-loop 25 ms query cell whose p95 straddles the baseline-shaped 100 ms retry step under the one-second hold."
+  },
+  "treatment": {
+    "required_positions": 2304,
+    "attempted_positions": 2304,
+    "valid_positions": 2288,
+    "invalid_positions": 16,
+    "invalid_reasons": {"missed_slot": 16},
+    "missing_summary_positions": 0,
+    "fatal_error_positions": 0,
+    "connection_loss_positions": 0,
+    "complete_valid_two_block_cells": 1137,
+    "single_valid_block_cells": 14,
+    "zero_valid_block_cells": 1,
+    "zero_valid_block_cell": "b k=0 batch 4x16-paged open 8000/s delay 0 (both blocks missed one scheduled slot)",
+    "invalid_cells_concentration": "all 16 invalid positions are open-loop zero-delay 3000-8000/s or the 5 ms 2.0x 396/s point, each with 1-2 missed slots out of 3000-8000"
+  },
+  "validation": {
+    "calibration_summaries": 4,
+    "aa_summaries": 576,
+    "treatment_summaries": 2304,
+    "all_emitted_summaries_ledger_valid": true,
+    "all_emitted_summaries_raw_logical_and_attempt_counts_match": true,
+    "all_emitted_summaries_raw_service_counts_match": true,
+    "terminal_rejection_is_not_censoring": true,
+    "invalid_attempts_retained": true,
+    "invalid_index": "invalid/index.json",
+    "checksum_manifest": "SHA256SUMS"
+  },
+  "queue_objective": {
+    "derivation_point": "1.0x per-delay reference capacity, query arm, open loop",
+    "smallest_feasible_positive_k": 1,
+    "model_guidance": "M/M/1/K with K waiting slots (system capacity K+1) at rho=1 blocks 1/(K+2): K=0 -> 1/2, K=1 -> 1/3, K=2 -> 1/4; admitted wait bounded by K x mean S, far below the 100 ms budget for every level",
+    "zero_delay_1x": "All arms zero terminal rejection, sub-0.11 ms p95; the objective does not distinguish K.",
+    "five_ms_1x_198_per_s": "Now executable. hygiene-only terminal blocking 0.187, p95 585.2 ms. A K=1: blocking 0, A 1.01, p95 10.0 ms, permit-wait p95 4.94 ms. K=2: blocking 0, p95 11.1 ms, permit-wait p95 6.12 ms.",
+    "twenty_five_ms_1x_40_per_s": "hygiene-only terminal blocking 0.163, p95 541.4 ms. A K=1: blocking 0, A 1.0, p95 28.5 ms, permit-wait p95 3.51 ms. K=2: blocking 0, p95 28.7 ms, permit-wait p95 3.70 ms.",
+    "baseline_strict_note": "Pre-change baseline has zero terminal blocking at 1.0x because it retries without an attempt budget (amplification 3.11-4.21, p95 0.58-1.07 s). Against the hygiene-only reference arm, K=1 removes terminal blocking entirely. K=1 is the smallest K whose model-guided blocking (1/3) improves on the measured baseline attempt-level rejection and whose model-guided p95 wait is below 100 ms.",
+    "evidence": "analysis/queue-objective.json"
+  },
+  "usl_gate": "USL not applicable — two repetitions without confidence intervals; gate requires at least five repetitions with CIs",
+  "selection": {
+    "variant": "a+c",
+    "k": 1,
+    "provisional": true,
+    "unmet_gate": "R16 production-bundle confirmatory run; failing condition: magic-context-c50.8 not landed (IN_PROGRESS)",
+    "reference_arm": "hygiene-only",
+    "nine_criteria": {
+      "1_frozen_contract": "PASS — docs/perf/synapse-tail-contract.md frozen before treatment collection; no decision rule changed this epoch",
+      "2_wire_accounting": "PASS — every retained repetition satisfies offered = completed + terminal rejections + timeouts +- in-flight and the attempt ledger; raw row counts match every summary",
+      "3_matrices_with_raw_samples": "PASS — full A/A and treatment schedules attempted; 2288/2304 valid; both modes demonstrated: A removes the 100 ms retry staircase (query 1.0x p95 541->28.5 ms at 25 ms S, 585->10.0 ms at 5 ms S, amplification -> 1.0) and C removes the 50 ms poll quantization (batch closed-1 p95 51.6->13.6 ms at 5 ms S); absolute quantiles with two-block ranges reported; no pass threshold invented",
+      "4_bounds_from_queueing_theory": "PASS — K=1 derived from measured mean S and the frozen blocking objective via M/M/1/K bound-shaped guidance; K in {1,2} exercised; behavior at full remains explicit queue_full (2x overload: bounded rejection, amplification 2.9-3.3 on the query arm)",
+      "5_no_busy_poll": "PASS as evidence — 10 ms escalation floor enforced (fast-first exempt per R10); host CPU ticks and voluntary/nonvoluntary context switches reported beside latency; C roughly doubles voluntary context switches at 25 ms S (433-444 vs 220-230 per closed-1 hold) and adds polls under overload (poll max 27 vs 24); no repository verdict absent an owner policy",
+      "6_deterministic_tests": "PASS — cargo test -p mc-host 584 passed; plugin bun test 5481 passed; typecheck clean; lint 5 warnings; clippy clean",
+      "7_usl_gate": "PASS — correctly marked: USL not applicable — two repetitions without confidence intervals; gate requires at least five repetitions with CIs",
+      "8_production_bundle": "GATE-BLOCKED — magic-context-c50.8 IN_PROGRESS; selection recorded as provisional per the frozen stop condition",
+      "9_docs_retention": "PASS — frozen contract, manifest, raw evidence, invalid index, rejected alternatives, residual risks, and this provisional decision retained under docs/perf/"
+    },
+    "why_not_alternatives": {
+      "baseline": "unbounded retry amplification (A up to 7.4 at 2x query overload) and 0.5-1.6 s p95 staircase",
+      "hygiene-only": "reference arm; bounded but terminal blocking 0.16-0.19 at 1.0x with 525-631 ms p95 staircase intact",
+      "a": "removes the query staircase but leaves the 50 ms batch poll quantization untouched (batch closed-1 p95 stays 51.6 ms at 5 ms S)",
+      "b": "keeps loss semantics: terminal blocking 0.15-0.25 at 1.0x, p95 294-310 ms; improves clustering only",
+      "c": "removes poll quantization but leaves the query staircase (query 1.0x p95 525-589 ms)",
+      "a+c_k2": "indistinguishable from K=1 on every 1.0x outcome (p95 within 1.7 ms); K=1 is the smallest feasible bound per the frozen rule"
+    },
+    "tradeoffs_recorded": [
+      "C imposes its ~2 ms fast-first delay on already-ready batch paths: zero-delay closed-1 p95 rises 0.18->2.29 ms (1x16) and 0.35->2.44 ms (1x64)",
+      "C raises voluntary context switches (~2x at 25 ms S, ~3.7x at 5 ms S on closed-1 batch cells) and adds up to 3 polls at the overload tail",
+      "at 2x query overload a+c terminally rejects slightly more than A alone (29-30 vs 20-23 of 80) while cutting p95 from ~620 ms to ~330 ms; both are explicit bounded queue_full behavior"
+    ]
+  },
+  "amplification_bound_evidence": {
+    "requirement": "A stays bounded under sustained 2x overload in every accepted design",
+    "a_plus_c_max_amplification": 17.8,
+    "a_plus_c_max_polls_per_job": 27,
+    "location": "batch 4x16-paged, 25 ms S, 2.0x (80/s); bounded by the 4-attempt budget and the deadline-clamped escalating poll schedule",
+    "query_arm_2x_amplification": "2.88-3.31 across 5/25 ms S"
+  },
+  "beads_states": {
+    "magic-context-18r": "OPEN",
+    "magic-context-chj": "OPEN",
+    "magic-context-ioi": "OPEN",
+    "magic-context-c50.8": "IN_PROGRESS"
+  },
+  "verification": {
+    "cargo_test_mc_host": "PASS (584 passed, 0 failed)",
+    "plugin_bun_test": "PASS (5481 passed, 0 failed)",
+    "plugin_typecheck": "PASS",
+    "plugin_lint": "PASS with 5 warnings",
+    "cargo_clippy_mc_host": "PASS",
+    "sha256_manifest": "SHA256SUMS"
+  },
+  "contract_annotation": "none required; every frozen rate executed and the calibration reproduced the af8ef126 rates exactly, so no factual annotation was added to docs/perf/synapse-tail-contract.md"
+}

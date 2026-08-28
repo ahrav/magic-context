@@ -4,7 +4,7 @@ import {
     hasClaimMemoryFragment,
     resolveProjectIdsForIdentities,
 } from "../memory/storage-claim-current-state";
-import { uniformlyAbsentClaimSql } from "../memory/storage-claim-visibility";
+import { antiMemoryClaimSql, uniformlyAbsentClaimSql } from "../memory/storage-claim-visibility";
 import { MURAL_CUE_RENDERER_EPOCH } from "../mural/storage-mural-cues";
 import { getProjectEmbeddingSnapshot } from "../project-embedding-registry";
 import {
@@ -75,6 +75,7 @@ const ACTIVE_CLAIM_BASE_SQL = `
     JOIN claim_memory_lifecycle_heads heads
       ON heads.claim_id = claims.id AND heads.state = 'active'
    WHERE claims.project_id = ?
+     AND NOT ${antiMemoryClaimSql("claims.current_revision_id")}
      AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`;
 
 /** Latest baseline assertion with `paths_state = 'known'` and at least one

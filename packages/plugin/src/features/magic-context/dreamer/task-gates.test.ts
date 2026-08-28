@@ -3,11 +3,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createAntiMemory } from "../memory/storage-anti-memory";
 import {
     applyProjectMemoryMapping,
     computeProjectMemoryMutationToken,
     recordProjectMemoryVerification,
 } from "../memory/storage-claim-operations";
+import { ensureProject } from "../memory/storage-claims";
 import {
     createClaimReaderTestDatabase,
     type SeededProjectMemoryClaim,
@@ -271,6 +273,57 @@ describe("uniformly absent claims are not runnable work", () => {
             pending: 0,
             total: 0,
         });
+    });
+});
+
+describe("anti-memory is not maintenance work", () => {
+    test("a project holding only anti-memory reports no backlog and no gate", () => {
+        // The reader excludes anti-memory on every non-explicit surface, so a
+        // gate that still counted it would report backlog no maintenance runner
+        // can ever see, and the scheduler would reopen the work forever.
+        const database = createClaimReaderTestDatabase();
+        db = database;
+        const projectIdentity = "git:u3-anti-only";
+        const projectId = ensureProject(database, projectIdentity);
+
+        createAntiMemory(
+            database,
+            { producer: "test", operationKey: "anti" },
+            {
+                projectId,
+                payload: {
+                    trigger: "session caching work",
+                    rejectedStrategy: "use Redis",
+                    rejectionReason: "Redis adds operational cost",
+                },
+                provenance: {
+                    sourceLocator: "transcript://anti",
+                    sourceContent: "source anti",
+                    extractor: "test",
+                    extractorVersion: "1",
+                    extractorRunId: "run-anti",
+                    independenceKey: "anti",
+                    sourceTrustClass: "model_inference",
+                },
+                actor: "dreamer",
+                nowMs: Date.now(),
+            },
+        );
+
+        for (const task of ["curate", "verify", "map-memories"] as const) {
+            expect(getDreamTaskBacklog(database, projectIdentity, task)).toEqual({
+                pending: 0,
+                total: 0,
+            });
+        }
+        expect(
+            evaluateTaskGate("classify-memories", {
+                db: database,
+                projectIdentity,
+                lastRunAt: Date.now(),
+                promotionThreshold: 3,
+            }),
+        ).toBe(false);
     });
 });
 

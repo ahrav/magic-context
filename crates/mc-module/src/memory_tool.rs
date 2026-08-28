@@ -367,19 +367,20 @@ mod tests {
     use mc_store::claim_mirror::{ClaimMirrorLifecycle, ClaimMirrorSnapshot, CLAIM_MIRROR_VERSION};
     use serde_json::json;
 
-    #[test]
-    fn list_committed_claims_excludes_anti_memory_even_when_requested() {
-        let fixture = crate::test_support::FixtureBuilder::store();
-        let content = "Rejected Redis for session caching.";
+    fn mirror_claim(
+        public_claim_id: &str,
+        category: &str,
+        content: &str,
+    ) -> CommittedClaimMirrorRow {
         let content_digest = sha256_hex_utf8(content);
-        let claim = CommittedClaimMirrorRow {
-            public_claim_id: "mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        CommittedClaimMirrorRow {
+            public_claim_id: public_claim_id.to_string(),
             project_id: 41,
-            revision_locator: format!("mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/r1/{content_digest}"),
+            revision_locator: format!("{public_claim_id}/r1/{content_digest}"),
             content: content.to_string(),
             content_digest,
             attributes: json!({
-                "category": "REJECTED_APPROACH",
+                "category": category,
                 "importance": 80,
             }),
             lifecycle: ClaimMirrorLifecycle::Active,
@@ -388,7 +389,24 @@ mod tests {
             provenance_label: None,
             project_generation: 1,
             policy_generation: 1,
-        };
+        }
+    }
+
+    #[test]
+    fn list_committed_claims_excludes_anti_memory_even_when_requested() {
+        let fixture = crate::test_support::FixtureBuilder::store();
+        let anti_memory = mirror_claim(
+            "mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "REJECTED_APPROACH",
+            "Rejected Redis for session caching.",
+        );
+        // Positive control: proves the filter excludes exactly the anti-memory
+        // row rather than draining the whole mirror.
+        let positive = mirror_claim(
+            "mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "CONSTRAINTS",
+            "Session data must stay in Postgres.",
+        );
         let generations = BTreeMap::from([("41".to_string(), 1)]);
         fixture
             .store
@@ -403,7 +421,7 @@ mod tests {
                         policy_generations: generations,
                     },
                     project_checkpoints: BTreeMap::from([(41, 0)]),
-                    claims: vec![claim],
+                    claims: vec![anti_memory, positive],
                 },
                 1,
             )
@@ -416,7 +434,14 @@ mod tests {
             10,
         )
         .unwrap();
-
         assert!(rows.is_empty());
+
+        let rows = list_committed_claims(&fixture.store, &BTreeSet::new(), None, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.public_claim_id.as_str())
+                .collect::<Vec<_>>(),
+            ["mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+        );
     }
 }

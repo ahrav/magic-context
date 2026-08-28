@@ -404,7 +404,7 @@ async fn sigterm_releases_blocked_backend_and_cleans_runtime_state() {
 }
 
 #[test]
-fn cargo_metadata_has_no_ck_mc_binary() {
+fn cargo_metadata_has_only_the_ck_mc_host_binary() {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .current_dir(workspace_root())
@@ -420,12 +420,19 @@ fn cargo_metadata_has_no_ck_mc_binary() {
         .expect("mc-module package");
     let targets = package["targets"].as_array().expect("targets");
     let removed_binary = ["ck", "mc"].join("-");
-    assert!(targets.iter().all(|target| {
-        target["name"] != removed_binary
-            && !target["kind"]
+    assert!(targets
+        .iter()
+        .all(|target| target["name"] != removed_binary));
+    let bins: Vec<&str> = targets
+        .iter()
+        .filter(|target| {
+            target["kind"]
                 .as_array()
                 .expect("target kind")
                 .iter()
                 .any(|kind| kind == "bin")
-    }));
+        })
+        .map(|target| target["name"].as_str().expect("target name"))
+        .collect();
+    assert_eq!(bins, ["ck-mc-host"]);
 }

@@ -45,31 +45,155 @@ export interface MockHistorianPayloadOptions {
  * sees the whole chunk as consumed.
  */
 export function buildMockHistorianPayload(options: MockHistorianPayloadOptions): string {
-    const { start, end, title, body } = options;
-    const p2 = options.p2 ?? body;
-    const p3 = options.p3 ?? body;
-    const importance = options.importance ?? 50;
-    const episodeType = options.episodeType ?? "feature";
+    return buildMockHistorianOutput({ compartments: [options] });
+}
+
+/** One compartment of a multi-compartment historian output. */
+export interface MockHistorianCompartment {
+    start: number;
+    end: number;
+    title: string;
+    /** P1 tier text — the fullest paraphrase and the required v2 boundary. */
+    body: string;
+    /** P2 tier text (shorter paraphrase). Defaults to `body`. */
+    p2?: string;
+    /** P3 tier text (shortest paraphrase). Defaults to `body`. */
+    p3?: string;
+    importance?: number;
+    episodeType?: string;
+}
+
+export interface MockHistorianFact {
+    /**
+     * Category tag name. Must be tag-shaped (`/^[A-Z][A-Z0-9_]*$/`): the
+     * production parser scopes facts with a non-greedy `<facts>...</facts>`
+     * regex, so a category carrying `>` or `</facts>` would structurally
+     * corrupt the payload instead of exercising a wrong-category mutation.
+     * Wrong-but-well-formed categories (outside the 5-category taxonomy) are
+     * deliberately allowed for the mutation battery.
+     */
+    category: string;
+    /**
+     * Fact body. Must be non-empty, trimmed, and single-line, where "line" is
+     * ECMAScript's definition. The production parser reads facts one bullet line
+     * at a time as `unescapeXml(match.trim())` and drops empty results
+     * (`FACT_ITEM_REGEX` in compartment-parser.ts), and its `m` flag treats all
+     * four line terminators — LF, CR, U+2028, U+2029 — as line breaks while `.`
+     * refuses to cross them. So a line break either drops the continuation (an
+     * unprefixed line matches nothing) or, if the continuation starts with `* `,
+     * promotes it to a separate fact; padding round-trips shorter than authored;
+     * and blank content vanishes. Every case gives a parsed fact set different
+     * from the authored one, so a mutation or scoring test would silently
+     * exercise the wrong input.
+     */
+    content: string;
+}
+
+export interface MockHistorianOutputOptions {
+    compartments: MockHistorianCompartment[];
+    facts?: MockHistorianFact[];
+    /**
+     * Defaults to max(compartment end)+1 — "fully processed". Required when
+     * `compartments` is empty: there is no end to derive it from, and a silent
+     * default would emit a malformed tag the parser treats as absent.
+     */
+    unprocessedFrom?: number;
+}
+
+const CATEGORY_TAG_RE = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * Build a v2 tiered historian `<output>` payload with full shape control —
+ * multiple compartments, facts by category, explicit `unprocessed_from`.
+ * Deterministic tests and the historian-eval mutation battery drive this
+ * directly; `buildMockHistorianPayload` remains the minimal single-compartment
+ * wrapper the rest of the suite uses.
+ */
+export function buildMockHistorianOutput(options: MockHistorianOutputOptions): string {
+    const compartments = options.compartments
+        .map((compartment) => {
+            const body = escapeXml(compartment.body);
+            const p2 = escapeXml(compartment.p2 ?? compartment.body);
+            const p3 = escapeXml(compartment.p3 ?? compartment.body);
+            return [
+                `<compartment start="${compartment.start}" end="${compartment.end}" title="${escapeXml(compartment.title)}" importance="${compartment.importance ?? 50}" episode_type="${escapeXml(compartment.episodeType ?? "feature")}">`,
+                `<p1>${body}</p1>`,
+                `<p2>${p2}</p2>`,
+                `<p3>${p3}</p3>`,
+                "<p4/>",
+                "</compartment>",
+            ].join("\n");
+        })
+        .join("\n");
+
+    const factsByCategory = new Map<string, string[]>();
+    for (const fact of options.facts ?? []) {
+        if (!CATEGORY_TAG_RE.test(fact.category)) {
+            throw new Error(`buildMockHistorianOutput: category is not tag-shaped: ${JSON.stringify(fact.category)}`);
+        }
+        if (/[\r\n\u2028\u2029]/.test(fact.content)) {
+            throw new Error(
+                `buildMockHistorianOutput: fact content must be single-line: ${JSON.stringify(fact.content)}`,
+            );
+        }
+        // The production parser reads each item as `unescapeXml(match.trim())` and
+        // discards it when the result is empty, so padded content round-trips
+        // shorter than authored and blank content vanishes from the fact set
+        // entirely — the same silent authored-vs-parsed divergence as an embedded
+        // line break, reached a different way.
+        if (fact.content.length === 0 || fact.content !== fact.content.trim()) {
+            throw new Error(
+                `buildMockHistorianOutput: fact content must be non-empty and trimmed: ${JSON.stringify(fact.content)}`,
+            );
+        }
+        const bucket = factsByCategory.get(fact.category) ?? [];
+        bucket.push(fact.content);
+        factsByCategory.set(fact.category, bucket);
+    }
+    const facts = [...factsByCategory.entries()]
+        .map(
+            ([category, contents]) =>
+                `<${category}>\n${contents.map((content) => `* ${escapeXml(content)}`).join("\n")}\n</${category}>`,
+        )
+        .join("\n");
+
+    if (options.compartments.length === 0 && options.unprocessedFrom === undefined) {
+        throw new Error("buildMockHistorianOutput: unprocessedFrom is required when compartments is empty");
+    }
+    const unprocessedFrom =
+        options.unprocessedFrom ?? Math.max(...options.compartments.map((compartment) => compartment.end)) + 1;
 
     return [
         "<output>",
         "<compartments>",
-        `<compartment start="${start}" end="${end}" title="${escapeXml(title)}" importance="${importance}" episode_type="${escapeXml(episodeType)}">`,
-        `<p1>${escapeXml(body)}</p1>`,
-        `<p2>${escapeXml(p2)}</p2>`,
-        `<p3>${escapeXml(p3)}</p3>`,
-        "<p4/>",
-        "</compartment>",
+        compartments,
         "</compartments>",
-        "<facts></facts>",
+        `<facts>${facts ? `\n${facts}\n` : ""}</facts>`,
         "<events></events>",
-        `<unprocessed_from>${end + 1}</unprocessed_from>`,
+        `<unprocessed_from>${unprocessedFrom}</unprocessed_from>`,
         "</output>",
     ].join("\n");
 }
 
-/** Escape the five XML-special characters so arbitrary prose stays well-formed. */
+/**
+ * Escape the five XML-special characters so arbitrary prose stays well-formed.
+ *
+ * Refuses input this escaping cannot survive a round trip through the production
+ * parser. `unescapeXml` there decodes `&amp;` FIRST, so authored text containing
+ * a literal `&lt;`, `&gt;`, `&quot;`, or `&apos;` comes back as the decoded
+ * character instead: `"use &lt;token&gt;"` is emitted as `"use &amp;lt;..."` and
+ * parses as `"use <token>"`. Fixing that needs a change to the production
+ * decoder, so the builder fails loudly rather than handing a mutation or scoring
+ * test different content than it asked for. `&amp;` itself and unknown entities
+ * such as `&nbsp;` do round-trip and stay allowed.
+ */
 function escapeXml(text: string): string {
+    const unrecoverable = text.match(/&(?:lt|gt|quot|apos);/);
+    if (unrecoverable) {
+        throw new Error(
+            `buildMockHistorianOutput: text contains an entity the production parser cannot round-trip (${unrecoverable[0]}): ${JSON.stringify(text)}`,
+        );
+    }
     return text
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")

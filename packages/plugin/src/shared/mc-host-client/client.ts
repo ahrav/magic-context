@@ -1905,13 +1905,25 @@ function requireJsonReceiveBody(body: RequestTerminal["body"]): JsonReceiveBody 
     return body;
 }
 
-/** Canonical `ErrorBody {code, message}` into a `terminal` McHostCallError. */
+/** Canonical `ErrorBody {code, message, retry_after_ms?}` into a terminal error. */
 function terminalFromErrorBody(body: JsonReceiveBody): McHostCallError {
     if (typeof body.value === "object" && body.value !== null && !Array.isArray(body.value)) {
-        const parsed = body.value as { code?: unknown; message?: unknown };
+        const parsed = body.value as {
+            code?: unknown;
+            message?: unknown;
+            retry_after_ms?: unknown;
+        };
         const code = typeof parsed.code === "string" ? parsed.code : undefined;
         const message = typeof parsed.message === "string" ? parsed.message : undefined;
-        return new McHostCallError("terminal", message ?? "mc-host error", code);
+        const error = new McHostCallError("terminal", message ?? "mc-host error", code);
+        if (
+            typeof parsed.retry_after_ms === "number" &&
+            Number.isSafeInteger(parsed.retry_after_ms) &&
+            parsed.retry_after_ms >= 0
+        ) {
+            error.retry_after_ms = parsed.retry_after_ms;
+        }
+        return error;
     }
     return new McHostCallError("terminal", body.text || "mc-host error");
 }

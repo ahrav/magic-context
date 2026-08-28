@@ -73,6 +73,11 @@ pub trait CompositeComponent: Send + Sync + 'static {
 
 pub trait PrimaryComponent: CompositeComponent {
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
+
+    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged. commentlint: allow(JUDGE)
+    fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// An expected artifact fault (missing or invalid bundle) must resolve to
@@ -81,6 +86,11 @@ pub trait PrimaryComponent: CompositeComponent {
 /// `Err` is reserved for host-fatal invariant failures.
 pub trait SecondaryComponent: CompositeComponent {
     fn initialize(&self) -> impl Future<Output = Result<(), InitError>> + Send;
+
+    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged. commentlint: allow(JUDGE)
+    fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +219,18 @@ impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHa
         Ok(())
     }
 
+    async fn activate(&self) -> Result<(), InitError> {
+        // Children activate concurrently; fixed polling order preserves
+        // deterministic error precedence.
+        tokio::try_join!(
+            biased;
+            self.primary.activate(),
+            self.secondary.activate(),
+            self.tertiary.activate()
+        )?;
+        Ok(())
+    }
+
     async fn bind(
         &self,
         route: RouteHandle,
@@ -249,10 +271,10 @@ impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHa
             Some(Child::Primary) => self.primary.handle(ctx).await,
             Some(Child::Secondary) => self.secondary.handle(ctx).await,
             Some(Child::Tertiary) => self.tertiary.handle(ctx).await,
-            None => RequestOutcome::Error {
-                code: crate::control::CODE_INTERNAL_ERROR.to_owned(),
-                message: "route is not mapped to a component".to_owned(),
-            },
+            None => RequestOutcome::error(
+                crate::control::CODE_INTERNAL_ERROR,
+                "route is not mapped to a component",
+            ),
         }
     }
 

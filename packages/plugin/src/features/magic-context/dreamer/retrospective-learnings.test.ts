@@ -38,10 +38,22 @@ function identity(runId = "retro-run", batchId = "window-1"): AutonomousManifest
 }
 
 function claims(database: Database) {
+    return readClaimsForSurface(database, "maintenance_hygiene");
+}
+
+/** Anti-memories surface only here, so assertions about them must read this. */
+function searchableClaims(database: Database) {
+    return readClaimsForSurface(database, "explicit_search");
+}
+
+function readClaimsForSurface(
+    database: Database,
+    surface: "maintenance_hygiene" | "explicit_search",
+) {
     const result = readProjectMemoryCurrentState(database, {
         projectIds: resolveProjectIdsForIdentities(database, [PROJECT]),
         lifecycleStates: ["active"],
-        surface: "maintenance_hygiene",
+        surface,
         workspaceEpoch: "retro-test",
     });
     if (result.status !== "ok") throw new Error(result.reasons.join(", "));
@@ -154,7 +166,12 @@ describe("applyRetrospectiveLearnings", () => {
         ).id;
         const anti = readAntiMemory(db, publicClaimId);
         expect(anti?.payload.saferAlternative).toBe("Use the existing SQLite store");
-        expect(claims(db)[0]?.policy.originTaint).toBe("DREAMER_INFERENCE");
+        // A dreamer-written anti-memory carries the inference taint, and it is
+        // reachable only through explicit search: a maintenance lane that could
+        // see it could re-create its content under a positive category and
+        // launder a rejected approach back into auto-injected memory.
+        expect(searchableClaims(db)[0]?.policy.originTaint).toBe("DREAMER_INFERENCE");
+        expect(claims(db)).toHaveLength(0);
 
         apply(
             db,
@@ -172,7 +189,9 @@ describe("applyRetrospectiveLearnings", () => {
             },
             identity("retro-run-2", "window-2"),
         );
-        expect(claims(db)).toHaveLength(1);
+        // The repeated pair dedups onto the existing claim rather than adding a
+        // second one, and keeps the reason from the first observation.
+        expect(searchableClaims(db)).toHaveLength(1);
         expect(readAntiMemory(db, publicClaimId)?.payload.rejectionReason).toBe(
             "The deployment must remain single-process and offline-capable",
         );

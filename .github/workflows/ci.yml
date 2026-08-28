@@ -328,6 +328,73 @@ jobs:
       - name: E2E harness typecheck
         run: bun run --cwd packages/e2e-tests typecheck
 
+  release-qualification-gate:
+    name: Release contract + production-input qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The release-script suite asserts the mc-host -> mc-module dependency
+      # boundary through `cargo tree`, which needs a resolvable workspace.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      # Same script `check:all` runs, so a contributor's local pass covers
+      # exactly what this gate covers.
+      - name: Release script unit tests
+        run: bun run test:release
+
+      - name: U8 release contract drift
+        run: bun run release:contract:check
+
+      # Drift-only: byte verification needs the real production artifacts,
+      # which live on the qualifying host, so --check stays portable here and
+      # guards the committed lock/credentials/evidence digests.
+      - name: U9 production-input qualification drift
+        run: bun run release:qualify:check
+
+  # Its own job, not a step in prospective-release-holdout: steps in one job
+  # short-circuit, so an unrelated contract lane failing first would skip this
+  # one and leave the historian-eval gate silently unenforced — which is the
+  # state this job exists to end. Nothing invoked test:historian-eval-unit
+  # before: test:e2e selects --mode ts and test:opencode-e2e runs the green
+  # manifest, and neither reaches historianEvalUnitFiles(), so the contract and
+  # freeze lint could regress with every other lane green.
+  historian-eval-contracts:
+    name: Historian eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Historian eval unit contracts
+        run: bun run test:historian-eval-unit
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest

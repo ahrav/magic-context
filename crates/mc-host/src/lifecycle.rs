@@ -25,6 +25,15 @@ use crate::instance::{
 /// Canonical lifecycle-record name inside the runtime directory.
 pub const LIFECYCLE_RECORD_NAME: &str = "mc-host-lifecycle.json";
 
+/// The probe reason for a quarantined persisted record: the bytes decode to
+/// an unknown schema, so they are preserved untouched rather than repaired.
+///
+/// Exported because it is a load-bearing classification, not a diagnostic
+/// string: `InstanceGuard::acquire` refuses to start over a quarantined
+/// record, so every caller that acts on a probe must recognize this reason in
+/// both its `Stopped` (both fences free) and `Wedged` (fence held) shapes.
+pub const UNSUPPORTED_STATE_SCHEMA_REASON: &str = "unsupported_state_schema";
+
 /// Version-neutral coordination directory name directly under the data root.
 /// Every release resolves this same owner-only directory; supported code
 /// never renames, replaces, or unlinks it.
@@ -494,9 +503,8 @@ impl InstanceGuard {
 /// `run`, or the whole `cortexkit` tree cannot mint a second transaction
 /// owner. A holder that mutates named entries must still anchor those
 /// mutations to retained descriptors and abort on identity drift
-/// (`NamespaceAnchor`, crate-private); the lock alone serializes mutators,
-/// it does not
-/// prove the names still resolve to the tree the holder opened.
+/// ([`NamespaceAnchor`]); the lock alone serializes mutators, it does not prove
+/// the names still resolve to the tree the holder opened.
 ///
 /// Like the lifetime fence, the exclusion holds only among coordination-aware
 /// releases. A release that predates this token serializes transactions on the
@@ -574,18 +582,15 @@ impl LifecycleTransactionLock {
 /// resolves to the same identity — the tree was renamed or replaced — the
 /// holder must abort rather than claim a commit under the canonical names.
 ///
-/// Crate-private: publishing the anchor without a production caller would
-/// make the drift check look enforced when nothing runs it.
+/// Published because the lifecycle CLI holds the transaction lock from outside
+/// this crate and runs the check before reporting any named-namespace result,
+/// so the drift check has a production caller rather than only tests.
 ///
 /// [`verify`]: NamespaceAnchor::verify
-// Only tests call the anchor; `expect` (not `allow`) flags these
-// attributes for removal if a non-test caller is added.
-#[cfg_attr(not(test), expect(dead_code))]
-pub(crate) struct NamespaceAnchor {
+pub struct NamespaceAnchor {
     entries: Vec<AnchorEntry>,
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 struct AnchorEntry {
     path: PathBuf,
     /// Retained so mutations stay descriptor-relative for the anchor's
@@ -613,7 +618,6 @@ impl std::fmt::Debug for NamespaceAnchor {
 // `Stat` field types vary by platform (macOS `st_dev` is `i32`); the casts
 // are no-ops on Linux but load-bearing elsewhere.
 #[allow(clippy::unnecessary_cast)]
-#[cfg_attr(not(test), expect(dead_code))]
 fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
     (stat.st_dev as u64, stat.st_ino as u64)
 }
@@ -623,9 +627,8 @@ impl NamespaceAnchor {
     /// through validated no-follow descriptors and records their identities.
     /// Absent entries are simply not captured: creating them later is the
     /// mutator's own work, not drift.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn capture(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
-        let base = data_dir_path(data_dir_override)?.join("cortexkit");
+    pub fn capture(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
+        let base = crate::instance::managed_dir_path(data_dir_override)?;
         let mut entries = Vec::new();
         for path in [base.clone(), base.join("lifecycle"), base.join("run")] {
             let Some(fd) = open_validated_dir(&path, "managed namespace directory")? else {
@@ -647,8 +650,7 @@ impl NamespaceAnchor {
     /// [`InstanceError::NamespaceDrift`] when a name is gone or resolves to a
     /// different identity. Callers abort their named-namespace result on
     /// error; the retained descriptors and stable locks are unaffected.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn verify(&self) -> Result<(), InstanceError> {
+    pub fn verify(&self) -> Result<(), InstanceError> {
         for entry in &self.entries {
             let drift = || InstanceError::NamespaceDrift {
                 path: entry.path.clone(),
@@ -1052,7 +1054,7 @@ fn classify(
         // bytes are still surfaced so callers report them instead of
         // treating the root as cleanly reusable.
         let reason = if unknown_schema {
-            "unsupported_state_schema"
+            UNSUPPORTED_STATE_SCHEMA_REASON
         } else if sample.record != EvidenceFile::Absent
             || sample.publication != EvidenceFile::Absent
         {
@@ -1092,7 +1094,7 @@ fn classify(
     }
 
     if unknown_schema {
-        return wedged("unsupported_state_schema", record);
+        return wedged(UNSUPPORTED_STATE_SCHEMA_REASON, record);
     }
     if sample.record == EvidenceFile::Insecure {
         return wedged("lifecycle record failed security checks", record);
@@ -1825,25 +1827,36 @@ mod tests {
                 "the symlink target must be untouched"
             );
 
-            // A FIFO at the lock name must classify, not hang.
-            let root = temp_root();
-            let coordination = coordination_dir_path(Some(root.path())).expect("path");
-            std::fs::create_dir_all(&coordination).expect("coordination root");
-            rustix::fs::mkfifoat(
-                rustix::fs::CWD,
-                coordination.join(name).as_path(),
-                Mode::from_raw_mode(0o600),
-            )
-            .expect("plant fifo");
-            let mutator_err = if name == TRANSACTION_LOCK_NAME {
-                LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
-            } else {
-                InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).err()
-            };
-            assert!(
-                matches!(mutator_err, Some(InstanceError::Insecure { .. })),
-                "a fifo at {name} must fail closed: {mutator_err:?}"
-            );
+            // A FIFO at the lock name must classify, not hang. Linux-gated
+            // like the other two fifo cases in this module: rustix gates
+            // `mkfifoat` away from Apple targets and this crate is
+            // `deny(unsafe_code)`, so the plant has no portable in-process
+            // form. Shelling out to `mkfifo(1)` is not the answer either —
+            // forking from this test binary hands the child duplicates of the
+            // `flock`ed descriptors sibling tests hold in parallel threads,
+            // and the lock outlives its guard until the child execs and exits,
+            // which makes those siblings fail with EWOULDBLOCK.
+            #[cfg(target_os = "linux")]
+            {
+                let root = temp_root();
+                let coordination = coordination_dir_path(Some(root.path())).expect("path");
+                std::fs::create_dir_all(&coordination).expect("coordination root");
+                rustix::fs::mkfifoat(
+                    rustix::fs::CWD,
+                    coordination.join(name).as_path(),
+                    Mode::from_raw_mode(0o600),
+                )
+                .expect("plant fifo");
+                let mutator_err = if name == TRANSACTION_LOCK_NAME {
+                    LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
+                } else {
+                    InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).err()
+                };
+                assert!(
+                    matches!(mutator_err, Some(InstanceError::Insecure { .. })),
+                    "a fifo at {name} must fail closed: {mutator_err:?}"
+                );
+            }
 
             // A hard-linked lock file has an owner besides us.
             let root = temp_root();
