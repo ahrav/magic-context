@@ -29,6 +29,7 @@ import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magi
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { openTestDb } from "../test-db";
 import {
+    laneWorkspaceEpoch,
     normalizeContent,
     predicateMatches,
     type ExpectedClaim,
@@ -357,7 +358,7 @@ export function scoreRawOutput(
         });
         verifyAllActiveClaims(db, RAW_OUTPUT_PROJECT_IDENTITY, nowMs);
 
-        const visible = readVisibleClaims(db, RAW_OUTPUT_PROJECT_IDENTITY, `historian-eval:${scenario.id}`, nowMs);
+        const visible = readVisibleClaims(db, RAW_OUTPUT_PROJECT_IDENTITY, laneWorkspaceEpoch(scenario.id), nowMs);
         if (visible === null) {
             // A fresh single-writer temp DB cannot legitimately be stale.
             throw new Error("historian-eval scorer: temp-DB claim snapshot unexpectedly stale");
@@ -435,7 +436,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         const visible = readVisibleClaims(
             db,
             record.projectIdentity,
-            `historian-eval:${record.scenarioId}`,
+            laneWorkspaceEpoch(record.scenarioId),
             record.nowMs,
         );
         if (visible === null) {

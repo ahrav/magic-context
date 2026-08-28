@@ -454,6 +454,16 @@ export function normalizeContent(text: string): string {
     return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+/**
+ * Workspace-epoch token shared by the runner's injected-claim capture and
+ * the scorer's visibility reads. Both sides must present the identical
+ * token to `readAuthorizedClaimMemorySnapshot`'s staleness check, so it is
+ * built in exactly one place.
+ */
+export function laneWorkspaceEpoch(scenarioId: string): string {
+    return `historian-eval:${scenarioId}`;
+}
+
 export function predicateMatches(predicate: ContentPredicate, content: string): boolean {
     return normalizeContent(content).includes(normalizeContent(predicate.value));
 }
@@ -580,6 +590,25 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         );
     }
 
+    return diagnostics.sort();
+}
+
+/**
+ * Corpus-level admission lint shared by the per-PR `--lint` gate, freeze
+ * promotion, and the strict release consumer path. One implementation so
+ * a corpus cannot pass one gate while another gate would reject it:
+ * per-scenario lint, unique scenario ids, a non-empty corpus, and coverage
+ * of every hard-negative family (R2).
+ */
+export function lintCorpus(scenarios: readonly HistorianEvalScenario[]): string[] {
+    const diagnostics = scenarios.flatMap((scenario) => lintScenario(scenario));
+    if (scenarios.length === 0) diagnostics.push("corpus: empty");
+    const ids = new Set(scenarios.map((scenario) => scenario.id));
+    if (ids.size !== scenarios.length) diagnostics.push("corpus: duplicate scenario ids");
+    const families = new Set(scenarios.flatMap((scenario) => scenario.families));
+    for (const family of HARD_NEGATIVE_FAMILIES) {
+        if (!families.has(family)) diagnostics.push(`corpus: hard-negative family uncovered: ${family}`);
+    }
     return diagnostics.sort();
 }
 

@@ -7,10 +7,8 @@ import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-c
 import { readAuthorizedClaimMemorySnapshot } from "../../../plugin/src/features/magic-context/memory/claim-memory-render";
 import { createProjectMemoryClaim } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../../plugin/src/features/magic-context/memory/storage-claims";
-import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
-import { createClaimMemorySchema } from "../../../plugin/src/features/magic-context/storage-claim-memory-schema";
-import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
-import { Database } from "../../../plugin/src/shared/sqlite";
+import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
+import type { Database } from "../../../plugin/src/shared/sqlite";
 import { verifyAllActiveClaims } from "./verification-bridge";
 import type { HistorianEvalScenario } from "./contract";
 import { buildHistorianPayload, type PayloadFact } from "./payload";
@@ -52,10 +50,9 @@ function makeSnapshot(args: {
 }): SnapshotFixture {
     const dir = mkdtempSync(join(tmpdir(), "historian-eval-scorer-"));
     const dbPath = join(dir, "context-db-snapshot.sqlite");
-    const db = new Database(dbPath);
-    initializeDatabase(db);
-    runMigrations(db);
-    db.transaction(() => createClaimMemorySchema(db)).immediate();
+    // The full direct-format schema (claims, claim-memory, session-runtime)
+    // stamped exactly like a production bootstrap.
+    const { db } = createDirectTestDatabase({ path: dbPath });
     const nowMs = args.nowMs ?? Date.now();
     const compartments = args.compartments ?? [{ start: 1, end: 8 }];
     appendCompartments(

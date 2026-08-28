@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { buildReleaseTuple, parseScenario } from "./contract";
+import { HARD_NEGATIVE_FAMILIES, buildReleaseTuple, parseScenario } from "./contract";
 import { RELEASE_FILES, loadRelease, promoteRelease } from "./promote";
 import { validScenarioRaw } from "./test-support";
 
@@ -12,6 +12,13 @@ function corpusRaw(count = 10): Record<string, unknown>[] {
     return Array.from({ length: count }, (_, index) => {
         const raw = validScenarioRaw();
         raw.id = `hse-scenario-${index}`;
+        // Cycle the declared family (and its matching expected-absent tag)
+        // so any fixture corpus of >= 7 scenarios satisfies the corpus-level
+        // hard-negative family-coverage lint.
+        const family = HARD_NEGATIVE_FAMILIES[index % HARD_NEGATIVE_FAMILIES.length];
+        raw.families = [family];
+        const gold = raw.gold as { expectedAbsent: Array<{ family: string }> };
+        gold.expectedAbsent[0].family = family;
         return raw;
     });
 }

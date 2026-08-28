@@ -33,7 +33,7 @@ import {
     MANIFEST_SCHEMA,
     RELEASE_VERSION_RE,
     buildReleaseTuple,
-    lintScenario,
+    lintCorpus,
     parseApproval,
     parseManifest,
     parseScenario,
@@ -129,11 +129,16 @@ export function loadRelease(releaseDir: string): {
         if (scenarioFiles[index] !== `${scenario.id}.json`) {
             diagnostics.push(`release.scenarios.${scenarioFiles[index]}: filename-id-mismatch`);
         }
-        const lint = lintScenario(scenario);
-        if (lint.length > 0) diagnostics.push(...lint);
         if (manifest.tombstones.includes(scenario.id)) {
             diagnostics.push(`release.scenarios.${scenario.id}: tombstoned`);
         }
+    }
+    // Corpus-level admission lint (non-empty, unique ids, family coverage)
+    // so a hand-built or truncated release cannot pass the consumer path
+    // that the per-PR lint gate would reject.
+    diagnostics.push(...lintCorpus(scenarios));
+    if (scenarios.length < 10 || scenarios.length > 30) {
+        diagnostics.push(`release: corpus size ${scenarios.length} outside the 10-30 budget (R1)`);
     }
     if (diagnostics.length > 0) fail(diagnostics);
     const tuple = buildReleaseTuple(scenarios);
@@ -189,13 +194,18 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     if (privacyDiagnostics.length > 0) fail(privacyDiagnostics.sort());
 
     const scenarios = input.scenarios.map((raw, index) => parseScenario(raw, `scenarios[${index}]`));
-    const lintDiagnostics = scenarios.flatMap((scenario) => lintScenario(scenario));
-    if (lintDiagnostics.length > 0) fail(lintDiagnostics);
-    const ids = new Set(scenarios.map((scenario) => scenario.id));
-    if (ids.size !== scenarios.length) fail(["release: duplicate scenario ids"]);
+    // Shared corpus admission lint: the freeze gate must reject everything
+    // the per-PR `--lint` gate rejects (including hard-negative family
+    // coverage), or a release could freeze in a state that keeps
+    // `--lint --release` permanently red. The release size budget is
+    // reported in the same batch so one failure surfaces every corpus
+    // diagnostic.
+    const lintDiagnostics = lintCorpus(scenarios);
     if (scenarios.length < 10 || scenarios.length > 30) {
-        fail([`release: corpus size ${scenarios.length} outside the 10-30 budget (R1)`]);
+        lintDiagnostics.push(`release: corpus size ${scenarios.length} outside the 10-30 budget (R1)`);
     }
+    if (lintDiagnostics.length > 0) fail(lintDiagnostics.sort());
+    const ids = new Set(scenarios.map((scenario) => scenario.id));
 
     // Admission gate (R13): the battery is recomputed here rather than
     // accepted from the caller, so no scenario can enter a frozen release

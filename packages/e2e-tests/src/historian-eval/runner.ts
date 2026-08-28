@@ -32,6 +32,7 @@ import { TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
     ballastText,
+    laneWorkspaceEpoch,
     predicateMatches,
     scenarioFingerprint,
     type HistorianEvalScenario,
@@ -184,9 +185,19 @@ export interface RunScenarioOptions {
     /** Directory the run record and DB snapshot are written into. */
     artifactDir: string;
     repoCommitSha?: string;
-    /** Per-run historian completion wait. */
+    /** Per-run historian completion wait; defaults are mode-aware. */
     historianWaitMs?: number;
 }
+
+/** Historian completion wait when the historian model is scripted (mocked). */
+const SCRIPTED_HISTORIAN_WAIT_MS = 90_000;
+/**
+ * Live historian passes make up to three sequential real model calls over a
+ * ~32K-token chunk plus inter-attempt backoff. A scripted-sized wait aborts
+ * as `run-never-fired` after the API tokens are already spent, so the live
+ * default budgets for the full retry ladder.
+ */
+const LIVE_HISTORIAN_WAIT_MS = 600_000;
 
 class RunAbort extends Error {
     constructor(
@@ -710,7 +721,12 @@ class ScenarioRunner {
         try {
             await harness.waitFor(
                 () => this.historianRunRows(harness, sessionId).length >= runIndex && this.historianQuiesced(harness, sessionId),
-                { timeoutMs: this.options.historianWaitMs ?? 90_000, label: `historian run ${runIndex}` },
+                {
+                    timeoutMs:
+                        this.options.historianWaitMs ??
+                        (this.options.mode.kind === "live" ? LIVE_HISTORIAN_WAIT_MS : SCRIPTED_HISTORIAN_WAIT_MS),
+                    label: `historian run ${runIndex}`,
+                },
             );
         } catch {
             throw new RunAbort(
@@ -1088,7 +1104,7 @@ class ScenarioRunner {
                 authorizedIdentities: [identity],
                 ownIdentities: [identity],
                 sharedCategories: [],
-                workspaceEpoch: `historian-eval:${this.scenario.id}`,
+                workspaceEpoch: laneWorkspaceEpoch(this.scenario.id),
                 nowMs,
             });
             if (snapshot === null) {

@@ -575,10 +575,11 @@ jobs:
     # Gated on Docker e2e: no point exercising the deep behavior suite if
     # the simpler install+smoke path is broken.
     needs: [e2e-opencode]
-    # The manifest selection includes the incident-pool green wrapper, which
-    # runs its cases sequentially in an isolated second phase, each paying a
-    # cold harness boot; 40 minutes is too tight for that plus the host suite.
-    timeout-minutes: 60
+    # The manifest selection includes the incident-pool green wrapper and the
+    # historian-eval harness tests, both of which run their cases sequentially
+    # with a cold harness boot per case; 60 minutes is too tight for that plus
+    # the host suite, and the margin absorbs cold-runner boot variance.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 

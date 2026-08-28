@@ -246,15 +246,19 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
     // No injected claims: the gold claim was never promoted, so a miss is a
     // probe FAIL, not a trimmed ERROR (KTD6).
     const verdict = compareProbeAnswer({ probe, exchange, scenario, injectedClaims: [] });
-    if (verdict.outcome !== "fail") {
+    const expected = EXPECTED_OUTCOMES["probe-wrong-answer"];
+    if (expected.stage !== "probe-comparison") {
+        throw new Error(`probe-wrong-answer policy declares stage ${expected.stage}; only probe-comparison is scoreable here`);
+    }
+    if (verdict.outcome !== expected.outcome) {
         return {
             mutationClass: "probe-wrong-answer",
             applicable: true,
             green: false,
-            detail: `expected probe fail but got ${verdict.outcome}`,
+            detail: `expected probe ${expected.outcome} but got ${verdict.outcome}`,
         };
     }
-    return { mutationClass: "probe-wrong-answer", applicable: true, green: true, detail: "probe fail as expected" };
+    return { mutationClass: "probe-wrong-answer", applicable: true, green: true, detail: `probe ${expected.outcome} as expected` };
 }
 
 /** Construction invariant: semantic-class fixtures must be validator-clean. */

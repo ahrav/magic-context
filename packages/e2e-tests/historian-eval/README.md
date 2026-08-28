@@ -34,7 +34,7 @@ scripts/run-historian-eval.ts
 | Lane unit tests (pure data) | `bun run test:historian-eval-unit` |
 | Harness-booting runner tests | opencode-e2e standalone selection (`test:opencode-e2e`) |
 | Freeze lint over the dev split | `bun scripts/run-historian-eval.ts --lint` |
-| Mutation battery | `bun scripts/run-historian-eval.ts --mutations [--evidence <path>]` |
+| Mutation battery | `bun scripts/run-historian-eval.ts --mutations` |
 | Live lane run | `bun scripts/run-historian-eval.ts --live --release historian-eval/releases/v1` |
 
 Live runs read `ANTHROPIC_API_KEY`, `HISTORIAN_EVAL_MODEL`, and
@@ -97,10 +97,12 @@ trusting or freezing the corpus:
    three live dev runs; tighten or re-author on instability. Re-audit after
    a system-tuple change may adapt the matcher surface only; latent-truth
    expectations are immutable under re-audit.
-3. **Freeze**: generate evidence
-   (`--mutations --evidence <path>`), author the two approval files
+3. **Freeze**: confirm the battery is green (`--mutations`), author the
+   two approval files
    (`kind: privacy | gold-intent`, bound to the release-tuple fingerprint),
-   and call `promoteRelease` from `src/historian-eval/promote.ts`. Wrong
+   and call `promoteRelease` from `src/historian-eval/promote.ts`, which
+   recomputes the battery itself and publishes the evidence artifact
+   beside the corpus. Wrong
    scenario later: tombstone in vN+1; existing releases are never edited.
 
 ## Deviations from the plan (discovered at implementation time)

@@ -19,7 +19,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "nod
 import { dirname, join, resolve } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
-    lintScenario,
+    lintCorpus,
     parseScenario,
     type HistorianEvalScenario,
 } from "../src/historian-eval/contract";
@@ -86,13 +86,9 @@ function loadCorpus(args: CliArgs): { scenarios: HistorianEvalScenario[]; releas
 }
 
 function runLint(scenarios: readonly HistorianEvalScenario[]): number {
-    const diagnostics = scenarios.flatMap((scenario) => lintScenario(scenario));
-    const families = new Set(scenarios.flatMap((scenario) => scenario.families));
-    for (const family of HARD_NEGATIVE_FAMILIES) {
-        if (!families.has(family)) diagnostics.push(`corpus: hard-negative family uncovered: ${family}`);
-    }
+    const diagnostics = lintCorpus(scenarios);
     if (diagnostics.length > 0) {
-        for (const diagnostic of diagnostics.sort()) console.error(`lint: ${diagnostic}`);
+        for (const diagnostic of diagnostics) console.error(`lint: ${diagnostic}`);
         return 1;
     }
     console.log(`lint clean: ${scenarios.length} scenario(s), all ${HARD_NEGATIVE_FAMILIES.length} families covered`);
