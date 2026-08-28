@@ -648,8 +648,13 @@ export class McHostClient {
     /**
      * One strictly validated `catalog.list`: tagged generation, closed-shape
      * host `subc_ops`, and per-module id/version/roles/control_ops. Any
-     * duplicate, missing field, unknown field, or out-of-bounds value is a
-     * terminal `malformed_control_response` — never a cast.
+     * duplicate, missing field, or out-of-bounds value is a terminal
+     * `malformed_control_response` — never a cast.
+     *
+     * Unknown fields are *ignored*, not rejected: wire doc §7.1 makes forward
+     * compatibility the rule for this family, so a newer daemon adding a field
+     * must not strand an older client. The negotiation family (§7.7.1) is the
+     * one closed-shape exception and is validated elsewhere.
      */
     async catalogSnapshot(): Promise<CatalogSnapshot> {
         const deadline = Deadline.start(this.requestTimeoutMs, this.clock);
@@ -2098,6 +2103,12 @@ function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot 
         ) {
             throw malformedCatalog("module_version is not a bounded nonempty string");
         }
+        // Count-bounded but deliberately not element-validated: `roles` is an
+        // opaque pass-through the protocol requires to survive intact, so it is
+        // typed `unknown[]` rather than cast to a shape this client would be
+        // guessing at. The whole body is already capped by
+        // MAX_CONTROL_BODY_LEN, so an unvalidated element is not a resource
+        // risk; any consumer that interprets a role must narrow it itself.
         const roles = record.roles;
         if (!Array.isArray(roles) || roles.length > MAX_CATALOG_ROLES) {
             throw malformedCatalog("roles is not a bounded array");

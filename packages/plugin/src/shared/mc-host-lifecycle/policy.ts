@@ -18,6 +18,7 @@
 import { checkPlatform, type PlatformReaders } from "./bootstrap";
 import {
     classifyPreNativeRoots,
+    type DaemonCommand,
     type DaemonReason,
     type DaemonResultV1,
     type DaemonState,
@@ -425,7 +426,7 @@ export class McHostLifecyclePolicy {
                 deadlineMs: this.outerAggregateMs,
                 env: this.nativeEnv(preflight.root),
             });
-            return this.relabel(native, "probe", command);
+            return this.relabel(native, "status", command);
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
@@ -433,22 +434,27 @@ export class McHostLifecyclePolicy {
 
     /**
      * Restamp a native result with the caller-facing command, first proving the
-     * child answered the command it was actually sent.
+     * child answered the command this call is willing to accept.
      *
      * `parseDaemonResult` validates the restart-only `effects` invariant
      * against the child's own `command`, so blindly overwriting that field can
      * publish a `restart` result carrying `effects` under a `stop` or `start`
      * label. A disagreement means the child answered a different command than
      * requested — a real version-skew signal — so it becomes `internal_error`
-     * rather than being silently relabeled. Observational commands legitimately
-     * map the native read-only `probe` onto `status`/`doctor`.
+     * rather than being silently relabeled.
+     *
+     * `expected` is the command the child must *report*, which is not always the
+     * argv it was *sent*. Observational commands send the `probe` argv, but the
+     * contract's command union is exactly start/stop/restart/status/doctor, so
+     * the binary answers the read-only observation as `status` and a `probe`
+     * response would be rejected by every contract-validating consumer.
      */
     private relabel(
         native: DaemonResultV1,
-        sent: NativeLifecycleCommand,
+        expected: DaemonCommand,
         command: LifecycleCommand,
     ): DaemonResultV1 {
-        if (native.command !== sent) {
+        if (native.command !== expected) {
             return localResult(command, false, "wedged", "internal_error", false);
         }
         return { ...native, command };

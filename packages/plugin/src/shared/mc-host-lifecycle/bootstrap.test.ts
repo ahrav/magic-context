@@ -9,6 +9,7 @@ import {
     lstatSync,
     mkdirSync,
     mkdtempSync,
+    openSync,
     readdirSync,
     readFileSync,
     rmSync,
@@ -21,6 +22,7 @@ import {
     BootstrapError,
     checkCapacity,
     checkPlatform,
+    copyExactBytes,
     loadTrustIndex,
     MAX_TRUST_INDEX_BYTES,
     type PlatformReaders,
@@ -620,6 +622,90 @@ describe("bootstrap staging (U3 scenarios 3 and 6)", () => {
                 reason = (error as BootstrapError).reason;
             }
             expect(reason).toBe("insufficient_storage");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("the staging copy is bounded by the preflighted size, not the live EOF", () => {
+        // `expectedBytes` is the size capacity was approved against, so passing a
+        // value that disagrees with the file is exactly the concurrent-mutation
+        // case: smaller than the file means it grew after the preflight, larger
+        // means it was truncated. Both are the source changing under a copy that
+        // already certified it.
+        const dir = tempDir("mc-copy-exact-");
+        try {
+            const source = path.join(dir, "launcher");
+            writeFileSync(source, "a".repeat(8192));
+            const sink = path.join(dir, "sink");
+
+            // Grew: the file is 8192 but only 4096 was preflighted.
+            const grownIn = openSync(source, "r");
+            const grownOut = openSync(sink, "w");
+            try {
+                expect(() => copyExactBytes(grownIn, grownOut, 4096, createHash("sha256"))).toThrow(
+                    /grew during staging/,
+                );
+                // The bound held: nothing past the preflighted size was written.
+                expect(lstatSync(sink).size).toBe(4096);
+            } finally {
+                closeSync(grownIn);
+                closeSync(grownOut);
+            }
+
+            // Truncated: 16384 was preflighted but only 8192 is readable.
+            const shrunkIn = openSync(source, "r");
+            const shrunkOut = openSync(sink, "w");
+            try {
+                expect(() =>
+                    copyExactBytes(shrunkIn, shrunkOut, 16384, createHash("sha256")),
+                ).toThrow(/shrank during staging/);
+            } finally {
+                closeSync(shrunkIn);
+                closeSync(shrunkOut);
+            }
+
+            // An exact match copies the bytes and hashes what it copied.
+            const okIn = openSync(source, "r");
+            const okOut = openSync(sink, "w");
+            try {
+                const hash = createHash("sha256");
+                copyExactBytes(okIn, okOut, 8192, hash);
+                expect(hash.digest("hex")).toBe(sha256("a".repeat(8192)));
+                expect(lstatSync(sink).size).toBe(8192);
+            } finally {
+                closeSync(okIn);
+                closeSync(okOut);
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("an unmapped filesystem error still becomes a closed lifecycle reason", () => {
+        // A dangling-symlink destination makes mkdirSync throw EEXIST before the
+        // no-follow open can reject it. Left raw it escapes as a bare Error with
+        // no `reason`, and every caller branching on the closed union
+        // mishandles it.
+        const dir = tempDir("mc-stage-unmapped-");
+        try {
+            const source = path.join(dir, "launcher");
+            writeFileSync(source, "bytes");
+            const dest = path.join(dir, "store");
+            symlinkSync(path.join(dir, "nonexistent-target"), dest);
+            let error: unknown = null;
+            try {
+                stageBootstrap({
+                    sourcePath: source,
+                    destDir: dest,
+                    expectedSha256: sha256("bytes"),
+                    availableBytesOverride: 1n << 40n,
+                });
+            } catch (caught) {
+                error = caught;
+            }
+            expect(error).toBeInstanceOf(BootstrapError);
+            expect((error as BootstrapError).reason).toBe("native_payload_invalid");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

@@ -49,7 +49,11 @@ function fakeBinary(
     writeFileSync(
         binary,
         `#!/bin/sh\necho "$1" >> ${invocationLog}\n${sleep}case "$1" in\n` +
-            `  probe) echo '${startResultJson("probe").replace("started", "healthy")}';;\n` +
+            // The real binary accepts the `probe` argv but answers `status`,
+            // the contracted name for the read-only observation. A fixture that
+            // echoed `probe` back would only prove the client agrees with
+            // itself.
+            `  probe) echo '${startResultJson("status").replace("started", "healthy")}';;\n` +
             `  *) echo '${startResultJson("start")}' | sed "s/\\"command\\":\\"start\\"/\\"command\\":\\"$1\\"/";;\n` +
             "esac\nexit 0\n",
     );
@@ -512,11 +516,14 @@ describe("native result labeling and indeterminate effects", () => {
     test("a child answering a different command is internal_error, not relabeled", async () => {
         const root = tempDir("mc-policy-mislabel-");
         try {
-            // Always answers `probe`, whatever it was asked.
+            // Always answers `stop`, whatever it was asked. `stop` is inside the
+            // contract's command union, so the payload parses and the
+            // disagreement is caught by the label check rather than by the
+            // schema.
             const binary = path.join(root, "mislabeling-host.sh");
             writeFileSync(
                 binary,
-                `#!/bin/sh\necho '${startResultJson("probe").replace("started", "healthy")}'\nexit 0\n`,
+                `#!/bin/sh\necho '${startResultJson("stop").replace("started", "stopped")}'\nexit 0\n`,
             );
             chmodSync(binary, 0o700);
             const policy = policyFor({

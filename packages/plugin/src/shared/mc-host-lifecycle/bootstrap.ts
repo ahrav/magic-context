@@ -8,7 +8,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import {
     closeSync,
     fchmodSync,
@@ -610,6 +610,48 @@ function invalid(detail: string): BootstrapError {
 }
 
 /**
+ * Copy exactly `expectedBytes` from `sourceFd` to `outFd`, hashing as it goes,
+ * and prove the source was neither longer nor shorter than that.
+ *
+ * The byte count is the one capacity was preflighted against. Following the
+ * live EOF instead would let a source still being appended to drag the copy
+ * past the reserve `checkCapacity` approved — without bound, since a writer
+ * that never stops appending means `readSync` never returns 0 and staging
+ * never returns.
+ *
+ * The digest cannot stand in for either check: it is computed over whatever was
+ * actually read, so a grown source yields a mismatch that reads as corruption
+ * rather than as the concurrent mutation it is. Reaching EOF early is the same
+ * event seen from the other side.
+ */
+export function copyExactBytes(
+    sourceFd: number,
+    outFd: number,
+    expectedBytes: number,
+    hash: Hash,
+): void {
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    while (position < expectedBytes) {
+        const want = Math.min(buffer.length, expectedBytes - position);
+        const read = readSync(sourceFd, buffer, 0, want, position);
+        if (read === 0) throw invalid("launcher source shrank during staging");
+        hash.update(buffer.subarray(0, read));
+        let written = 0;
+        while (written < read) {
+            written += writeSync(outFd, buffer, written, read - written);
+        }
+        position += read;
+    }
+    // One readable byte past the preflighted size means the source grew while it
+    // was being staged, so the bytes just copied are a prefix of a file that no
+    // longer matches what was certified.
+    if (readSync(sourceFd, buffer, 0, 1, position) !== 0) {
+        throw invalid("launcher source grew during staging");
+    }
+}
+
+/**
  * Complete revalidation of a retained digest-addressed bootstrap: owner-only
  * regular file, single link, owner-executable, and byte-for-byte digest
  * match through one retained O_NOFOLLOW descriptor whose identity is checked
@@ -755,18 +797,7 @@ export function stageBootstrap(options: {
         );
         const hash = createHash("sha256");
         try {
-            const buffer = Buffer.alloc(64 * 1024);
-            let position = 0;
-            for (;;) {
-                const read = readSync(sourceFd, buffer, 0, buffer.length, position);
-                if (read === 0) break;
-                hash.update(buffer.subarray(0, read));
-                let written = 0;
-                while (written < read) {
-                    written += writeSync(outFd, buffer, written, read - written);
-                }
-                position += read;
-            }
+            copyExactBytes(sourceFd, outFd, before.size, hash);
             const digest = hash.digest("hex");
             if (digest !== expectedSha256) throw invalid("launcher source digest mismatch");
             const after = fstatSync(sourceFd);
@@ -795,6 +826,21 @@ export function stageBootstrap(options: {
         }
         fsyncSync(destFd);
         return revalidateRetainedBootstrap(finalPath, expectedSha256);
+    } catch (error) {
+        // This module's contract is that every failure is one closed lifecycle
+        // reason, but the syscalls above can still fail in ways no explicit
+        // check anticipates — a dangling-symlink `destDir` makes `mkdirSync`
+        // throw EEXIST before the no-follow open can reject it, and
+        // statfs/fsync/rename can fail for reasons of their own. Left raw,
+        // those escape as a bare `Error` with no `reason` and every caller
+        // branching on the closed union mishandles them. Storage exhaustion
+        // keeps its own reason; anything else is an untrusted payload.
+        if (error instanceof BootstrapError) throw error;
+        const code = (error as { code?: string } | null)?.code;
+        if (code === "ENOSPC" || code === "EDQUOT") {
+            throw new BootstrapError("insufficient_storage", `staging failed: ${code}`);
+        }
+        throw invalid(`staging failed: ${code ?? "unknown filesystem error"}`);
     } finally {
         closeSync(sourceFd);
         if (destFd !== null) closeSync(destFd);

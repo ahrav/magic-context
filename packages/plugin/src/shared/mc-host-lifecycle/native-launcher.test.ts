@@ -19,7 +19,9 @@ function scriptBinary(dir: string, body: string): string {
 function probeResultJson(ok: boolean): string {
     return JSON.stringify({
         schema: "magic-context.daemon/v1",
-        command: "probe",
+        // The `probe` argv is answered as `status`: that is the contracted name
+        // for the read-only observation, and the command union has no `probe`.
+        command: "status",
         ok,
         state: ok ? "running" : "stopped",
         reason: ok ? "healthy" : "not_running",

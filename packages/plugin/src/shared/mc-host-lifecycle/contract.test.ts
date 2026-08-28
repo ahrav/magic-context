@@ -55,11 +55,30 @@ describe("parseDaemonResult", () => {
         expect(parsed.versions.daemon).toBe("mc-host/0.1.0");
     });
 
-    test("accepts the native binary's probe command and null readiness", () => {
+    test("rejects a probe command in a result and accepts the status it really emits", () => {
+        // `probe` is an accepted argv spelling, but the contract's command union
+        // is start/stop/restart/status/doctor, and the binary answers the
+        // read-only observation as `status`. Tolerating `probe` in a *result*
+        // would let the client accept a payload no contract consumer admits.
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        command: "probe",
+                        ok: false,
+                        state: "stopped",
+                        reason: "not_running",
+                        remediation: "run_daemon_start",
+                        readiness: null,
+                        checks: [],
+                    }),
+                ),
+            ),
+        ).toThrow(/command is outside the closed union/);
         const parsed = parseDaemonResult(
             JSON.stringify(
                 validResult({
-                    command: "probe",
+                    command: "status",
                     ok: false,
                     state: "stopped",
                     reason: "not_running",
@@ -69,8 +88,45 @@ describe("parseDaemonResult", () => {
                 }),
             ),
         );
-        expect(parsed.command).toBe("probe");
+        expect(parsed.command).toBe("status");
         expect(parsed.readiness).toBeNull();
+    });
+
+    test("rejects a remediation borrowed from another reason", () => {
+        // Both values are inside their own closed unions; only the pairing is
+        // wrong. Accepting it sends an operator to free storage when the native
+        // payload is simply absent.
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        command: "start",
+                        ok: false,
+                        state: "stopped",
+                        reason: "native_payload_missing",
+                        remediation: "free_storage",
+                        readiness: null,
+                        checks: [],
+                    }),
+                ),
+            ),
+        ).toThrow(/remediation does not match its reason/);
+        // A success carries no remediation at all.
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        command: "start",
+                        ok: true,
+                        state: "running",
+                        reason: "started",
+                        remediation: "wait_and_retry",
+                        readiness: null,
+                        checks: [],
+                    }),
+                ),
+            ),
+        ).toThrow(/remediation does not match its reason/);
     });
 
     test("rejects every malformed shape fail-closed", () => {

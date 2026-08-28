@@ -13,8 +13,6 @@ import { releaseContract } from "./generated-contract";
 import { coordinationDirPath, runtimeDirPath } from "./paths";
 
 export type DaemonCommand = (typeof releaseContract.cli.commands)[number];
-/** The native binary additionally emits `probe` for its read-only command. */
-export type NativeCommand = DaemonCommand | "probe";
 export type DaemonState = (typeof releaseContract.cli.states)[number];
 export type CheckId = (typeof releaseContract.cli.check_ids)[number];
 export type CheckStatus = (typeof releaseContract.cli.check_statuses)[number];
@@ -124,7 +122,7 @@ export interface DaemonVersions {
 /** One validated `magic-context.daemon/v1` result object. */
 export interface DaemonResultV1 {
     schema: typeof DAEMON_RESULT_SCHEMA;
-    command: NativeCommand;
+    command: DaemonCommand;
     ok: boolean;
     state: DaemonState;
     reason: DaemonReason;
@@ -224,7 +222,11 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     );
     if (record.schema !== DAEMON_RESULT_SCHEMA) fail("schema is not magic-context.daemon/v1");
     const command = record.command;
-    if (typeof command !== "string" || !(COMMANDS.has(command) || command === "probe")) {
+    // The contract's command union is exactly start/stop/restart/status/doctor.
+    // `probe` is an accepted argv spelling of the read-only observation, but the
+    // binary answers it as `status`, so a `probe` in a *result* is a
+    // nonconforming payload rather than a dialect to tolerate.
+    if (typeof command !== "string" || !COMMANDS.has(command)) {
         fail("command is outside the closed union");
     }
     if (typeof record.ok !== "boolean") fail("ok is not a boolean");
@@ -253,6 +255,14 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         (typeof remediation !== "string" || !REMEDIATIONS.has(remediation))
     ) {
         fail("remediation is outside the closed union");
+    }
+    // Membership alone admits a valid remediation borrowed from a *different*
+    // reason — `native_payload_missing` paired with `free_storage` — which sends
+    // an operator to fix storage when the payload is absent. The contract's
+    // reason-to-remediation mapping is total and single-valued, so the reason
+    // already determines the only legal remediation; anything else is skew.
+    if (remediation !== (remediationForReason(reason) as string | null)) {
+        fail("remediation does not match its reason");
     }
     let effects: RestartEffects | null = null;
     if (record.effects !== null) {
@@ -306,6 +316,15 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         ) {
             fail("check remediation is outside the closed union");
         }
+        // Same reason-determines-remediation rule as the top-level result: a
+        // per-check remediation borrowed from another reason misdirects the
+        // operator just as effectively.
+        if (
+            checkRemediation !==
+            (remediationForReason(checkReason as DaemonReason) as string | null)
+        ) {
+            fail("check remediation does not match its reason");
+        }
         return {
             id: id as CheckId,
             status: status as CheckStatus,
@@ -334,7 +353,7 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     };
     return {
         schema: DAEMON_RESULT_SCHEMA,
-        command: command as NativeCommand,
+        command: command as DaemonCommand,
         ok: record.ok,
         state: state as DaemonState,
         reason: reason as DaemonReason,

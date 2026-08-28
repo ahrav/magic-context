@@ -128,12 +128,26 @@ export function redactLifecyclePath(value: string, sensitiveRoots: string[]): st
 // Filesystem admission (KTD11 / R27).
 // ---------------------------------------------------------------------------
 
+/**
+ * A rejection carries the reason class it actually earned. Only a host whose
+ * platform the release qualifies can have its filesystem judged, so a
+ * platform this function cannot judge for is reported as `unsupported_platform`
+ * rather than as a filesystem verdict: telling an operator to
+ * `set_data_directory` on a platform where no data directory can ever be
+ * admitted names a remedy that cannot work.
+ */
 export type FilesystemAdmission =
     | { ok: true }
     | {
           ok: false;
           reason: "unsupported_filesystem";
           remediation: "set_data_directory";
+          detail: string;
+      }
+    | {
+          ok: false;
+          reason: "unsupported_platform";
+          remediation: "use_supported_platform";
           detail: string;
       };
 
@@ -263,8 +277,9 @@ const defaultAdmissionIo: AdmissionIo = {
  * execution). Linux classification runs against the canonicalized root, so
  * `..` segments and symlinked ancestors are judged on the mount the kernel
  * traverses rather than the one the literal string names. macOS admission is
- * release-qualified rather than runtime-probed and passes here. Admission
- * failure is exactly `unsupported_filesystem`/`set_data_directory` and never
+ * release-qualified rather than runtime-probed and passes here. A platform the
+ * release does not qualify is rejected as `unsupported_platform`; every other
+ * rejection is `unsupported_filesystem`/`set_data_directory`. Nothing here
  * mutates anything.
  */
 export function admitLifecycleFilesystem(
@@ -279,7 +294,17 @@ export function admitLifecycleFilesystem(
     });
     if (!path.isAbsolute(dataRoot)) return rejected("data root is not absolute");
     if (io.platform === "darwin") return { ok: true };
-    if (io.platform !== "linux") return rejected("unqualified platform for lifecycle filesystems");
+    if (io.platform !== "linux") {
+        // Not a filesystem judgment: the mount table this function reads is
+        // Linux-specific, so on any other platform there is no filesystem to
+        // admit or reject. The platform itself is what fails.
+        return {
+            ok: false,
+            reason: "unsupported_platform",
+            remediation: "use_supported_platform",
+            detail: "platform is outside the release's qualified set",
+        };
+    }
     let mounts: MountEntry[];
     try {
         mounts = parseMounts(io.readMounts());

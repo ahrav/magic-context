@@ -108,6 +108,38 @@ describe("filesystem admission (KTD11)", () => {
         expect(verdict).toEqual({ ok: true });
     });
 
+    test("an unqualified platform is unsupported_platform, not a filesystem verdict", () => {
+        // The mount table this function reads is Linux-specific, so on any other
+        // platform there is no filesystem to judge. Reporting
+        // `unsupported_filesystem`/`set_data_directory` here would tell an
+        // operator to change the data directory on a host where no data
+        // directory can ever be admitted.
+        for (const platform of ["win32", "freebsd", "aix"]) {
+            const verdict = admitLifecycleFilesystem("/data", {
+                platform,
+                readMounts: () => {
+                    throw new Error("the mount table must not be consulted");
+                },
+            });
+            expect(verdict.ok).toBe(false);
+            if (!verdict.ok) {
+                expect(verdict.reason).toBe("unsupported_platform");
+                expect(verdict.remediation).toBe("use_supported_platform");
+            }
+        }
+    });
+
+    test("a relative root is still a filesystem verdict on an unqualified platform", () => {
+        // Absoluteness is a property of the string, not of the host, so it is
+        // decided before the platform can matter.
+        const verdict = admitLifecycleFilesystem("relative/data", {
+            platform: "win32",
+            readMounts: () => "",
+        });
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.reason).toBe("unsupported_filesystem");
+    });
+
     test("remote filesystem types are unsupported_filesystem / set_data_directory", () => {
         for (const fsType of ["nfs4", "cifs", "fuse.sshfs", "9p"]) {
             const verdict = admitLifecycleFilesystem(
