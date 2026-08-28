@@ -241,6 +241,19 @@ export class McHostLifecyclePolicy {
         const key = rootResolution.ok ? rootResolution.root : "\u0000no-root";
         let shared = this.inflightStarts.get(key);
         if (!shared) {
+            // Checked before the start is created, not just inside `raceWaiter`.
+            // `start()` is async, but its synchronous prefix runs through
+            // `runNativeLifecycle` to `spawn()` before any await, so calling it
+            // first would launch a mutating child on behalf of a caller that is
+            // already gone — work with no live waiter to own it.
+            //
+            // Only the create path is gated. A caller joining an existing start
+            // keeps the detach-only behavior, because that work is already in
+            // flight and owned by whoever started it.
+            if (request.signal?.aborted) throw new WaiterDetachedError("aborted");
+            if (request.deadlineMs !== undefined && request.deadlineMs <= 0) {
+                throw new WaiterDetachedError("deadline");
+            }
             shared = this.start();
             this.inflightStarts.set(key, shared);
             void shared

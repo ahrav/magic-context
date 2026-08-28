@@ -244,6 +244,51 @@ describe("native invocation mapping", () => {
         }
     });
 
+    test("an already-inactive first demand never spawns the daemon", async () => {
+        // `start()` is async, but its synchronous prefix runs all the way through
+        // runNativeLifecycle to spawn() before the first await. Detaching only
+        // inside raceWaiter would therefore leave a mutating child running for a
+        // caller that was already gone, with no live waiter to own it.
+        const root = tempDir("mc-policy-inactive-demand-");
+        try {
+            const { binary, invocationLog } = fakeBinary(root);
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+            });
+            const aborted = AbortSignal.abort();
+            let abortKind: string | null = null;
+            try {
+                await policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    signal: aborted,
+                });
+            } catch (error) {
+                abortKind = (error as WaiterDetachedError).cause_kind;
+            }
+            expect(abortKind).toBe("aborted");
+
+            let deadlineKind: string | null = null;
+            try {
+                await policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs: 0,
+                });
+            } catch (error) {
+                deadlineKind = (error as WaiterDetachedError).cause_kind;
+            }
+            expect(deadlineKind).toBe("deadline");
+
+            // The load-bearing assertion: no native invocation happened at all.
+            expect(invocations(invocationLog)).toEqual([]);
+            expect(policy.inflightStartCount).toBe(0);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
     test("preflight time is deducted from the native aggregate", async () => {
         // The aggregate is a request-to-transport bound, so a slow synchronous
         // preflight must shrink the child's share of it rather than being
