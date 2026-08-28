@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+    chmodSync,
     cpSync,
     mkdirSync,
     mkdtempSync,
@@ -20,6 +21,7 @@ import {
 import {
     buildDevPayload,
     buildTrustArtifacts,
+    hostTarget,
     LAUNCHER_PATH,
     loadReleaseContext,
     OUTPUT_PATHS,
@@ -401,6 +403,10 @@ describe("staged payload verification", () => {
         writeFileSync(launcher, bytes);
         manifest.files[0].size = Buffer.byteLength(bytes);
         manifest.files[0].sha256 = sha256Hex(bytes);
+        // A staged tree that contradicts its own manifest's declared mode is
+        // not a valid starting point for the drift cases below: the mode check
+        // would fire first and mask the mutation each one targets.
+        chmodSync(launcher, Number.parseInt(manifest.files[0].mode, 8));
         return root;
     }
 
@@ -410,6 +416,26 @@ describe("staged payload verification", () => {
         expect(() => verifyPayloadDir(root, manifest)).not.toThrow();
         writeFileSync(join(root, LAUNCHER_PATH), "mc-hosT\n");
         expect(() => verifyPayloadDir(root, manifest)).toThrow(/digest drift/);
+    });
+
+    test("declared mode is enforced, not just the bytes", () => {
+        const manifest = devManifest();
+        const root = stage(manifest, "mc-host\n");
+        const launcher = join(root, LAUNCHER_PATH);
+        expect(() => verifyPayloadDir(root, manifest)).not.toThrow();
+        // Right bytes, wrong permissions: a launcher staged non-executable
+        // still carries the manifest digest that certifies the tree.
+        chmodSync(launcher, 0o644);
+        expect(() => verifyPayloadDir(root, manifest)).toThrow(
+            /mode drift \(644 != 755\)/,
+        );
+        // Over-permissive fails the same way; the manifest names one mode.
+        chmodSync(launcher, 0o777);
+        expect(() => verifyPayloadDir(root, manifest)).toThrow(
+            /mode drift \(777 != 755\)/,
+        );
+        chmodSync(launcher, 0o755);
+        expect(() => verifyPayloadDir(root, manifest)).not.toThrow();
     });
 
     test("unlisted extra file fails", () => {
@@ -668,6 +694,36 @@ describe("trust index", () => {
 });
 
 describe("dev payload build", () => {
+    // `process.platform` reads "linux" on musl systems too, so the only signal
+    // separating them is whether the running process is glibc-linked.
+    function withReportHeader<T>(header: unknown, body: () => T): T {
+        const host = process as unknown as { report?: unknown };
+        const original = host.report;
+        host.report = { getReport: () => ({ header }) };
+        try {
+            return body();
+        } finally {
+            host.report = original;
+        }
+    }
+
+    test("a Linux host that cannot prove glibc is refused, not labeled -gnu", () => {
+        if (process.platform !== "linux") {
+            // The gate only guards the matrix's `-gnu` target.
+            expect(hostTarget().target).not.toMatch(/-gnu$/);
+            return;
+        }
+        expect(withReportHeader({ glibcVersionRuntime: "2.28" }, () => hostTarget().target)).toBe(
+            "linux-x64-gnu",
+        );
+        // A musl host reports no runtime glibc version. Selecting linux-x64-gnu
+        // anyway would stamp a musl-linked launcher with the glibc floor.
+        expect(() => withReportHeader({}, () => hostTarget())).toThrow(/not glibc-linked/);
+        expect(() => withReportHeader(undefined, () => hostTarget())).toThrow(
+            /not glibc-linked/,
+        );
+    });
+
     test("dev payload manifest recomputes to the same digest from disk", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);
