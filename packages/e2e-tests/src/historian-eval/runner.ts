@@ -21,7 +21,10 @@ import {
     extractLatestAssistantText,
 } from "../../../plugin/src/shared/assistant-message-extractor";
 import { extractLatestHistorianReasoning } from "../../../plugin/src/hooks/magic-context/compartment-runner-historian";
-import { hasClaimMemoryFragment } from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
+import {
+    hasClaimMemoryFragment,
+    resolveProjectIdsForIdentities,
+} from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
 import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import { createClaimMemorySchema } from "../../../plugin/src/features/magic-context/storage-claim-memory-schema";
 import {
@@ -33,6 +36,8 @@ import { TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
     EXECUTE_THRESHOLD_PERCENTAGE,
+    MAX_PADDING_TURNS,
+    MIN_BUILD_TURNS,
     PROBE_CHOICE_SEPARATOR,
     matchesGold,
     scenarioFingerprint,
@@ -77,8 +82,7 @@ const HISTORIAN_SYSTEM_MARKER = requireSignature(MAGIC_CONTEXT_INTERNAL_AGENT_SI
 /** OpenCode's auxiliary title-generation agent, from the canonical signature list. */
 const TITLE_SYSTEM_MARKER = requireSignature(INTERNAL_OPENCODE_AGENT_SIGNATURES, "title generator");
 
-/** Build turns before the spike; the v3 protected-tail boundary needs mass. */
-const MIN_BUILD_TURNS = 10;
+
 
 /**
  * Ordinals the scenario's authored turns occupy in the rendered transcript.
@@ -313,7 +317,7 @@ export function findOrdinalRange(body: Record<string, unknown>): { start: number
     return { start: Number(header[1]), end: Number(header[2]) };
 }
 
-function buildProbePrompt(probe: Probe): string {
+export function buildProbePrompt(probe: Probe): string {
     const shared =
         "Answer strictly from the project memory and session history already available to you in this conversation. " +
         "Reply with the answer inside an <answer></answer> envelope. Put nothing else inside the envelope.";
@@ -408,6 +412,49 @@ export function rangeCoveredByCompartments(
         }
     }
     return true;
+}
+
+/**
+ * Raw gold text surviving in a captured probe payload, or null.
+ *
+ * Exported so the scorer can reapply the gate to a persisted artifact's recorded
+ * payload: a stored record never passes through the live check, and a copied or
+ * older record whose captured request still holds raw gold text would otherwise
+ * score from that leaked answer.
+ *
+ * Injected Magic Context blocks are excluded, since a summary may legitimately
+ * restate an authored sentence verbatim — unless the transcript authors those
+ * tags itself, in which case a tag span is not evidence of injection and
+ * stripping could hide a real leak. The probe prompt is removed because it is in
+ * the payload by construction and may quote its own gold source turn. An empty
+ * authored side is skipped: `includes("")` matches everything, and an empty
+ * message has no bytes to survive the splice.
+ */
+export function goldRangeLeak(args: {
+    scenario: HistorianEvalScenario;
+    goldClaims: ReadonlyArray<{ id: string; sourceTurnRange: readonly [number, number] }>;
+    payloadText: string | null;
+    probePrompt: string;
+}): string | null {
+    const { scenario, goldClaims, payloadText, probePrompt } = args;
+    if (payloadText === null) return null;
+    const authoredCarriesTag = scenario.transcript.turns.some(
+        (turn) => carriesInjectedBlockTag(turn.user) || carriesInjectedBlockTag(turn.assistant),
+    );
+    const withoutPrompt = probePrompt.length === 0 ? payloadText : payloadText.split(probePrompt).join("\n");
+    const rawHistory = authoredCarriesTag ? withoutPrompt : stripInjectedBlocks(withoutPrompt);
+    for (const claim of goldClaims) {
+        for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
+            const authored = scenario.transcript.turns[turn];
+            for (const raw of [authored.user, authored.assistant]) {
+                if (raw.trim().length === 0) continue;
+                if (rawHistory.includes(raw)) {
+                    return `raw transcript text of gold turn ${turn} survived in the probe payload`;
+                }
+            }
+        }
+    }
+    return null;
 }
 
 /** Ids of the messages in a session-messages response. */
@@ -669,12 +716,22 @@ class ScenarioRunner {
             executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
             usagePercentage: (trigger.spikeUsageTokens / trigger.modelContextLimit) * 100,
         });
-        const tokensPerTurn = Math.max(100, trigger.ballastTokensPerTurn);
+        // Sized from the ballast the padding turns actually carry. Assuming a
+        // 100-token floor over-counted every turn's contribution whenever the
+        // recipe configured less (the contract admits zero), so the padding came
+        // out short, the protected tail still covered the authored gold, and the
+        // scenario ended as `run-never-fired` or `probe-gold-uncovered` instead of
+        // evaluating anything. The prose itself is a few tokens, which is not
+        // enough to close that gap and is deliberately not counted as if it were.
+        const tokensPerTurn = Math.max(1, trigger.ballastTokensPerTurn);
         // One extra turn absorbs rounding; the spike turn itself also carries
         // ballast and joins the tail. Capped so degenerate pressure numbers
         // (huge context limits push the tail target to its 96K ceiling)
         // cannot stretch a scenario into hundreds of padding turns.
-        return Math.min(32, Math.ceil(target.N / tokensPerTurn) + 1);
+        // The cap can still leave the tail short; `lintScenario` reports that at
+        // freeze time, where it does not pre-empt the runtime diagnostics a
+        // genuinely unreachable trigger produces on its own.
+        return Math.min(MAX_PADDING_TURNS, Math.ceil(target.N / tokensPerTurn) + 1);
     }
 
     private systemTuple(): SystemVersionTuple {
@@ -1235,11 +1292,35 @@ class ScenarioRunner {
             .reduce((sum, run) => sum + run.factsEmitted, 0);
         if (totalFacts === 0) return;
         try {
-            const row = harness
-                .contextDb()
-                .prepare("SELECT COUNT(*) AS n FROM claims")
-                .get() as { n: number } | null;
-            if ((row?.n ?? 0) === 0) {
+            // Scoped to the scenario's project, not the whole database. The
+            // verification bridge and the authoritative claim read are both scoped
+            // to this identity, so claims promoted under a different one — after
+            // session-directory or identity-normalization drift — satisfy a global
+            // count while leaving those reads empty. The scorer would then report
+            // FAIL:recall, charging a project-routing fault to the historian.
+            // Opened through `openTestDb` rather than `harness.contextDb()`:
+            // `resolveProjectIdsForIdentities` is a production reader and takes the
+            // plugin's Database type, which the harness handle is not.
+            const db = openTestDb(harness.contextDbPath(), { readonly: true });
+            let claimCount: number;
+            try {
+                const projectIds = resolveProjectIdsForIdentities(db, [
+                    resolveProjectIdentity(harness.opencode.env.workdir),
+                ]);
+                claimCount =
+                    projectIds.length === 0
+                        ? 0
+                        : ((
+                              db
+                                  .prepare(
+                                      `SELECT COUNT(*) AS n FROM claims WHERE project_id IN (${projectIds.map(() => "?").join(", ")})`,
+                                  )
+                                  .get(...projectIds) as { n: number } | null
+                          )?.n ?? 0);
+            } finally {
+                db.close();
+            }
+            if (claimCount === 0) {
                 throw new RunAbort(
                     "no-op-promotion",
                     `${totalFacts} fact(s) emitted across runs but zero claims reached the store`,
@@ -1473,34 +1554,13 @@ class ScenarioRunner {
      * can over-report but never conceals surviving raw text.
      */
     private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null, probePrompt: string): void {
-        if (payloadText === null) return;
-        const authoredCarriesTag = this.scenario.transcript.turns.some(
-            (turn) => carriesInjectedBlockTag(turn.user) || carriesInjectedBlockTag(turn.assistant),
-        );
-        // The probe prompt the runner just sent is part of the captured payload
-        // by construction. A probe question may quote its own gold source turn,
-        // so leaving it in makes the gate report the question it just asked as
-        // surviving history even when every historical copy was removed.
-        const withoutPrompt = payloadText.split(probePrompt).join("\n");
-        const rawHistory = authoredCarriesTag ? withoutPrompt : stripInjectedBlocks(withoutPrompt);
-        for (const claim of this.probeGoldClaims(probe)) {
-            for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
-                const authored = this.scenario.transcript.turns[turn];
-                for (const raw of [authored.user, authored.assistant]) {
-                    // Either side of a turn may be empty, and `includes("")` is
-                    // always true — which would abort every probe backed by
-                    // such a range with a leak that cannot happen. An empty
-                    // message has no raw bytes to survive the splice.
-                    if (raw.trim().length === 0) continue;
-                    if (rawHistory.includes(raw)) {
-                        throw new RunAbort(
-                            "gold-range-leak",
-                            `probe ${probe.id}: raw transcript text of gold turn ${turn} survived in the probe payload`,
-                        );
-                    }
-                }
-            }
-        }
+        const leak = goldRangeLeak({
+            scenario: this.scenario,
+            goldClaims: this.probeGoldClaims(probe),
+            payloadText,
+            probePrompt,
+        });
+        if (leak !== null) throw new RunAbort("gold-range-leak", `probe ${probe.id}: ${leak}`);
     }
 
 

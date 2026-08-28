@@ -19,6 +19,7 @@ import {
     PRIVACY_POLICY_VERSION,
     SANITIZER_VERSION,
 } from "../../../plugin/scripts/retrieval-benchmark/privacy";
+import { deriveProtectedTailTokenTarget } from "../../../plugin/src/hooks/magic-context/protected-tail-boundary";
 import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
@@ -250,6 +251,16 @@ export const MAX_PROBE_CHOICES = 10;
 
 /** Separator the probe prompt renders multiple-choice options with. */
 export const PROBE_CHOICE_SEPARATOR = " | ";
+
+/**
+ * Ceiling on the harness-owned padding turns the runner appends after the
+ * epilogue. Owned here so the freeze lint can tell whether a recipe's real
+ * padding mass can clear its protected tail within the cap.
+ */
+export const MAX_PADDING_TURNS = 32;
+
+/** Build turns the runner prepends to reach its minimum; see `MIN_BUILD_TURNS`. */
+export const MIN_BUILD_TURNS = 10;
 
 function turnText(value: unknown, label: string): string {
     const result = string(value, label);
@@ -1004,6 +1015,25 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     if (spikePercentage < EXECUTE_THRESHOLD_PERCENTAGE) {
         diagnostics.push(
             `${label}.trigger.spikeUsageTokens: spike-below-threshold (${spikePercentage.toFixed(2)}% < ${EXECUTE_THRESHOLD_PERCENTAGE}%)`,
+        );
+    }
+
+    // Padding mass (KTD3): the runner appends padding turns after the epilogue to
+    // push the protected tail past the authored content, each carrying
+    // `ballastTokensPerTurn`. The turn count is capped, so a recipe with light
+    // ballast against a large tail target cannot build the tail it needs — and the
+    // symptom is an unrelated-looking `run-never-fired` or `probe-gold-uncovered`
+    // rather than anything naming the recipe.
+    const tailTarget = deriveProtectedTailTokenTarget({
+        contextLimit: scenario.trigger.modelContextLimit,
+        executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
+        usagePercentage: (scenario.trigger.spikeUsageTokens / scenario.trigger.modelContextLimit) * 100,
+    });
+    const paddingTokensPerTurn = Math.max(1, scenario.trigger.ballastTokensPerTurn);
+    const paddingTurnsNeeded = Math.ceil(tailTarget.N / paddingTokensPerTurn) + 1;
+    if (paddingTurnsNeeded > MAX_PADDING_TURNS) {
+        diagnostics.push(
+            `${label}.trigger.ballastTokensPerTurn: padding-cannot-clear-protected-tail (${paddingTurnsNeeded} turns at ${paddingTokensPerTurn} token(s) needed for a ${tailTarget.N}-token tail, cap ${MAX_PADDING_TURNS})`,
         );
     }
 

@@ -40,7 +40,13 @@ import {
 } from "./contract";
 import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
-import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor, rangeCoveredByCompartments } from "./runner";
+import {
+    RUN_RECORD_SCHEMA,
+    authoredTurnOrdinalsFor,
+    buildProbePrompt,
+    goldRangeLeak,
+    rangeCoveredByCompartments,
+} from "./runner";
 import type {
     HistorianEvalRunRecord,
     InjectedClaimRecord,
@@ -868,6 +874,35 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // makes its public id an accepted answer for a claim-id probe. With the
         // real claim still visible, recall stays complete and precision does not
         // fail on its own, so the scenario would PASS on a forged answer.
+        // A set, not a bag. The comparisons below key on locator and iterate
+        // `visible`, so an APPENDED entry — reusing a real public id under a
+        // fabricated locator — is examined by neither: existence passes on the
+        // reused id, and the entry never appears in `visible`. That fabricated
+        // locator can then enter a probe's locator set carrying gold-matching
+        // content, and `compareProbeAnswer` accepts an unrelated claim id as the
+        // answer. `readInjectedClaims` yields one entry per claim, so a repeat of
+        // either identifier cannot come from a real run.
+        const duplicateIdentifiers = [
+            ...new Set(
+                [
+                    ...record.injectedClaims
+                        .map((claim) => claim.publicClaimId)
+                        .filter((id, index, ids) => ids.indexOf(id) !== index),
+                    ...record.injectedClaims
+                        .map((claim) => claim.revisionLocator)
+                        .filter((locator, index, locators) => locators.indexOf(locator) !== index),
+                ],
+            ),
+        ].sort();
+        if (duplicateIdentifiers.length > 0) {
+            return errorScore(
+                record.scenarioId,
+                "record-snapshot-mismatch",
+                `run record repeats injected-claim identifier(s): [${duplicateIdentifiers.slice(0, 5).join(", ")}]`,
+                record.system,
+            );
+        }
+
         const recordedByLocator = new Map(record.injectedClaims.map((claim) => [claim.revisionLocator, claim]));
         const divergent = visible
             .filter((item) => {
@@ -1000,6 +1035,38 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                     `probe ${probe.id}: gold claim ${goldClaim.id} ordinal range ${range[0]}-${range[1]} not covered by the snapshot's compartments`,
                     record.system,
                 );
+            }
+        }
+
+        // The runner's leak gate, reapplied to the recorded payload. A stored
+        // record never passes through the live check, so a copied or older
+        // artifact whose captured request still holds raw gold text would score
+        // from that leaked answer as long as the snapshot has coverage.
+        const scriptedProbes = record.system.probeModelId === "scripted-mock";
+        for (const probe of scenario.probes) {
+            const exchange = record.probes.find((entry) => entry.probeId === probe.id);
+            if (exchange === undefined) continue;
+            if (exchange.payloadText === null) {
+                // Scripted runs capture the payload; live runs cannot, and that
+                // limitation is the live-mode gap recorded in the runner.
+                if (!scriptedProbes) continue;
+                return errorScore(
+                    record.scenarioId,
+                    "harness-failure",
+                    `probe ${probe.id}: scripted record carries no captured payload, so the leak gate cannot be reapplied`,
+                    record.system,
+                );
+            }
+            const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
+            const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === reference);
+            const leak = goldRangeLeak({
+                scenario,
+                goldClaims: goldClaim === undefined ? [] : [goldClaim],
+                payloadText: exchange.payloadText,
+                probePrompt: buildProbePrompt(probe),
+            });
+            if (leak !== null) {
+                return errorScore(record.scenarioId, "gold-range-leak", `probe ${probe.id}: ${leak}`, record.system);
             }
         }
 

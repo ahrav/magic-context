@@ -14,7 +14,7 @@ import type { HistorianEvalScenario } from "./contract";
 import { scenarioFingerprint } from "./contract";
 import { buildMockHistorianOutput, type MockHistorianFact } from "../mock-historian";
 import type { HistorianEvalRunRecord, HistorianRunArtifact, InjectedClaimRecord, ProbeExchange } from "./runner";
-import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor } from "./runner";
+import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor, buildProbePrompt } from "./runner";
 import {
     buildLaneReport,
     compareProbeAnswer,
@@ -178,7 +178,16 @@ function makeRecord(
             answerRaw,
             reAsked: false,
             injectedRevisionLocators: locators,
-            payloadText: null,
+            // A scripted run always captures its probe request, and the scorer
+            // reapplies the leak gate to it. Representative content: the prompt
+            // the runner sent plus the injected claim block — compartment-derived
+            // text, never the raw authored transcript the splice removed.
+            payloadText: [
+                buildProbePrompt(probe),
+                "<project-memory>",
+                ...fixture.injectedClaims.map((claim) => `${claim.publicClaimId}: ${claim.content}`),
+                "</project-memory>",
+            ].join("\n"),
         };
     });
     const record = buildRecord();
@@ -950,6 +959,56 @@ describe("scoreRunRecord", () => {
             );
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("unreadable-snapshot");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an appended injected-claim entry reusing a real public id is rejected", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // Existence passes on the reused public id and the entry never appears
+            // in `visible`, so neither the existence nor the divergence check sees
+            // it — but its fabricated locator could then carry gold-matching
+            // content into a probe's locator set.
+            const forged = {
+                ...record,
+                injectedClaims: [
+                    ...record.injectedClaims,
+                    { ...record.injectedClaims[0], revisionLocator: "loc-fabricated" },
+                ],
+            };
+            const score = scoreRunRecord(forged, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("raw gold text in a recorded payload is a leak, not a scored answer", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // The live runner would have aborted this run; a stored artifact
+            // never passed through that gate.
+            const leaked = {
+                ...record,
+                probes: record.probes.map((exchange, index) =>
+                    index === 0
+                        ? {
+                              ...exchange,
+                              payloadText: `${exchange.payloadText}\n${scenario.transcript.turns[2].user}`,
+                          }
+                        : exchange,
+                ),
+            };
+            const score = scoreRunRecord(leaked, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("gold-range-leak");
         } finally {
             fixture.cleanup();
         }

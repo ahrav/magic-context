@@ -430,6 +430,18 @@ describe("lintScenario", () => {
         ).toBe(true);
     });
 
+    test("flags a recipe whose padding cannot clear the protected tail within the cap", () => {
+        const raw = validScenarioRaw();
+        // Light ballast against the same tail target: the capped padding turns
+        // cannot build the tail, and the symptom at runtime would be an
+        // unrelated-looking run-never-fired or probe-gold-uncovered.
+        (raw.trigger as Record<string, unknown>).ballastTokensPerTurn = 1;
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(
+            diagnostics.some((entry) => entry.includes("padding-cannot-clear-protected-tail")),
+        ).toBe(true);
+    });
+
     test("flags a trigger recipe whose spike never crosses the execution threshold", () => {
         const raw = validScenarioRaw();
         // Below 40%, so no run ever launches and the scenario can only end as
