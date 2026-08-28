@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
     admitLifecycleFilesystem,
@@ -76,7 +78,27 @@ describe("canonical lifecycle paths", () => {
 });
 
 describe("filesystem admission (KTD11)", () => {
-    const mounts = (text: string) => ({ platform: "linux" as const, readMounts: () => text });
+    // The fabricated mount tables below name paths this host does not have, so
+    // the canonicalizer defaults to identity and mount selection stays decided
+    // by the table. Cases that exercise canonicalization pass their own.
+    const mounts = (text: string, realpath: (value: string) => string = (value) => value) => ({
+        platform: "linux" as const,
+        readMounts: () => text,
+        realpath,
+    });
+
+    /**
+     * A canonicalizer where `existing` resolves to `canonical` and anything
+     * below it reports ENOENT, the way a not-yet-created root does.
+     */
+    const resolvesOnly =
+        (existing: string, canonical: string) =>
+        (value: string): string => {
+            if (value === existing) return canonical;
+            const error = new Error(`ENOENT: ${value}`) as NodeJS.ErrnoException;
+            error.code = "ENOENT";
+            throw error;
+        };
 
     test("a local mount without noexec is admitted", () => {
         const verdict = admitLifecycleFilesystem(
@@ -153,6 +175,100 @@ describe("filesystem admission (KTD11)", () => {
         const entries = parseMounts("/dev/sdd1 /mnt/with\\040space ext4 rw 0 0\n");
         expect(entries[0]?.mountPoint).toBe("/mnt/with space");
     });
+
+    test("a `..` segment is judged on the mount of the effective path", () => {
+        // `/local/../remote-data` is `/remote-data`: matching the literal string
+        // would admit the ext4 mount the traversal never reaches.
+        const table =
+            "/dev/root / ext4 rw 0 0\n/dev/sdb1 /local ext4 rw 0 0\nremote:/x /remote-data nfs4 rw 0 0\n";
+        const verdict = admitLifecycleFilesystem("/local/../remote-data/cortexkit", mounts(table));
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.detail).toBe("unsupported filesystem type nfs4");
+    });
+
+    test("a symlinked ancestor is canonicalized before mount lookup", () => {
+        const table =
+            "/dev/root / ext4 rw 0 0\n/dev/sdb1 /local ext4 rw 0 0\nremote:/x /remote-data nfs4 rw 0 0\n";
+        const verdict = admitLifecycleFilesystem(
+            "/local/link/share",
+            mounts(table, (value) =>
+                value === "/local/link" || value.startsWith("/local/link/")
+                    ? `/remote-data${value.slice("/local/link".length)}`
+                    : value,
+            ),
+        );
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.detail).toBe("unsupported filesystem type nfs4");
+    });
+
+    test("a missing multi-level tail rejoins deepest-last onto its resolved ancestor", () => {
+        // `/remote-data/cortexkit` is remote while `/remote-data/deep` is local,
+        // so a tail rejoined in the wrong order would be admitted.
+        const table =
+            "/dev/root / ext4 rw 0 0\nremote:/x /remote-data/cortexkit nfs4 rw 0 0\n/dev/sdc1 /remote-data/deep ext4 rw 0 0\n";
+        const verdict = admitLifecycleFilesystem(
+            "/local/store/cortexkit/run/deep",
+            mounts(table, resolvesOnly("/local/store", "/remote-data")),
+        );
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.detail).toBe("unsupported filesystem type nfs4");
+    });
+
+    test("the default canonicalizer resolves a symlinked ancestor of an absent root", () => {
+        const base = mkdtempSync(path.join(os.tmpdir(), "mc-host-paths-"));
+        try {
+            const store = path.join(base, "store");
+            mkdirSync(store);
+            const link = path.join(base, "via-link");
+            symlinkSync(store, link);
+            // Only the canonical directory carries the remote mount; the
+            // symlinked spelling matches nothing but `/`.
+            const table = `/dev/root / ext4 rw 0 0\nremote:/x ${realpathSync.native(store)} nfs4 rw 0 0\n`;
+            const verdict = admitLifecycleFilesystem(path.join(link, "cortexkit", "run"), {
+                platform: "linux",
+                readMounts: () => table,
+            });
+            expect(verdict.ok).toBe(false);
+            if (!verdict.ok) expect(verdict.detail).toBe("unsupported filesystem type nfs4");
+        } finally {
+            rmSync(base, { recursive: true, force: true });
+        }
+    });
+
+    test("a resolution failure other than a missing leaf fails closed", () => {
+        const verdict = admitLifecycleFilesystem(
+            "/denied/share",
+            mounts("/dev/root / ext4 rw 0 0\n", () => {
+                const error = new Error("EACCES") as NodeJS.ErrnoException;
+                error.code = "EACCES";
+                throw error;
+            }),
+        );
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.detail).toBe("data root cannot be resolved");
+    });
+
+    test("the latest mount at a shared point governs, shadowing earlier entries", () => {
+        // Stacked mounts share a mount point and the table lists them in
+        // ascending mount order, so the last equal-length entry is on top.
+        const shadowedByNoexec = admitLifecycleFilesystem(
+            "/data/cortexkit",
+            mounts(
+                "/dev/root / ext4 rw 0 0\n/dev/sdb1 /data ext4 rw,relatime 0 0\n/dev/sdb1 /data ext4 rw,noexec 0 0\n",
+            ),
+        );
+        expect(shadowedByNoexec.ok).toBe(false);
+        if (!shadowedByNoexec.ok) {
+            expect(shadowedByNoexec.detail).toBe("data root mount is noexec");
+        }
+        const shadowedByLocal = admitLifecycleFilesystem(
+            "/data/cortexkit",
+            mounts(
+                "/dev/root / ext4 rw 0 0\nremote:/x /data nfs4 rw 0 0\n/dev/sdb1 /data ext4 rw 0 0\n",
+            ),
+        );
+        expect(shadowedByLocal).toEqual({ ok: true });
+    });
 });
 
 describe("path redaction roots (R35)", () => {
@@ -163,6 +279,30 @@ describe("path redaction roots (R35)", () => {
             "<data-root>/cortexkit/run",
         );
         expect(redactLifecyclePath("/elsewhere/file", roots)).toBe("/elsewhere/file");
+    });
+
+    test("the root itself redacts to the bare placeholder", () => {
+        expect(redactLifecyclePath("/xdg-root", ["/xdg-root"])).toBe("<data-root>");
+    });
+
+    test("a sibling sharing the root's leading characters keeps its own name", () => {
+        expect(redactLifecyclePath("/xdg-root-backup/secret", ["/xdg-root"])).toBe(
+            "/xdg-root-backup/secret",
+        );
+        // Under HOME the sibling still redacts, but at the HOME boundary and
+        // with its own directory name intact.
+        const roots = sensitiveRootsFor("/home/u/.local/share", { HOME: "/home/u" });
+        expect(redactLifecyclePath("/home/u/.local/share-backup/secret", roots)).toBe(
+            "<data-root>/.local/share-backup/secret",
+        );
+    });
+
+    test("an already-redacted value is not measured against a later root", () => {
+        // The placeholder is not a path; resolving it against cwd under a root
+        // that contains cwd would substitute a second placeholder.
+        expect(redactLifecyclePath("/xdg-root/cortexkit", ["/xdg-root", path.resolve(".")])).toBe(
+            "<data-root>/cortexkit",
+        );
     });
 });
 

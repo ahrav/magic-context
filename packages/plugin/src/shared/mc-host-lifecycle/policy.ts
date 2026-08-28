@@ -6,9 +6,9 @@
  * Ownership rules (KTD13/KTD17): only `managed-default` connection origin may
  * reach {@link McHostLifecyclePolicy.demandStart}; explicit connection files
  * and injected clients never construct a policy call. Concurrent managed
- * demands coalesce on one shared native start keyed by data root plus
- * capability; each caller races the shared promise against its own
- * signal/deadline, and a detaching caller never cancels the native work.
+ * demands coalesce on one shared native start keyed by data root; each caller
+ * races the shared promise against its own signal/deadline, and a detaching
+ * caller never cancels the native work.
  *
  * Every operation returns one KTD12 v1 result object. Pre-native failures are
  * synthesized locally with the bounded no-follow root classifier; no raw
@@ -119,6 +119,20 @@ function localResult(
     };
 }
 
+/**
+ * Reason for a native command whose child was killed at the deadline, keyed by
+ * the caller-facing command. `status` and `doctor` run no startup or shutdown:
+ * the killed child was the read-only probe, so the daemon was left unobserved
+ * rather than left mid-transaction.
+ */
+const TIMEOUT_REASON: Record<LifecycleCommand, DaemonReason> = {
+    start: "startup_timeout",
+    restart: "startup_timeout",
+    stop: "shutdown_timeout",
+    status: "native_probe_unavailable",
+    doctor: "native_probe_unavailable",
+};
+
 export interface DemandStartRequest {
     origin: ConnectionOrigin;
     capability: "magic-context" | "synapse";
@@ -184,11 +198,11 @@ export class McHostLifecyclePolicy {
 
     /**
      * Managed demand-start with KTD17 coalescing. Only `managed-default`
-     * origin is accepted; the shared native start is keyed by data root plus
-     * capability, callers race it against their own signal/deadline, and a
-     * settled promise is evicted so no rejection becomes a permanent latch.
-     * For the `magic-context` capability, the outcome additionally reports
-     * storage readiness after waiting at most the 5-second hard budget.
+     * origin is accepted; the shared native start is keyed by data root,
+     * callers race it against their own signal/deadline, and a settled promise
+     * is evicted so no rejection becomes a permanent latch. For the
+     * `magic-context` capability, the outcome additionally reports storage
+     * readiness after waiting at most the 5-second hard budget.
      */
     async demandStart(request: DemandStartRequest): Promise<DemandStartOutcome> {
         if (!mayDemandStart(request.origin)) {
@@ -196,7 +210,11 @@ export class McHostLifecyclePolicy {
         }
         const startedAt = Date.now();
         const rootResolution = resolveLifecycleDataRoot(this.env);
-        const key = `${rootResolution.ok ? rootResolution.root : "\u0000no-root"}\u0000${request.capability}`;
+        // The data root alone identifies the host: `start()` takes no
+        // capability and one daemon serves them all, so keying on capability
+        // would launch a second native start that only collides with the
+        // first on the transaction lock.
+        const key = rootResolution.ok ? rootResolution.root : "\u0000no-root";
         let shared = this.inflightStarts.get(key);
         if (!shared) {
             shared = this.start();
@@ -223,9 +241,9 @@ export class McHostLifecyclePolicy {
      * listener by the time the start resolves, so without this the probe would
      * be both unbounded and uncancellable: a hanging probe would keep
      * `demandStart` pending forever with the caller's signal and deadline no
-     * longer watching. Expiry, abort, and rejection all degrade to
-     * `unavailable` — never to `ready` — and the already-successful start
-     * result is still returned.
+     * longer watching. Expiry, abort, and probe failure — rejected or thrown
+     * synchronously — all degrade to `unavailable`, never to `ready`, and the
+     * already-successful start result is still returned.
      */
     private async boundedStorageProbe(
         request: DemandStartRequest,
@@ -255,10 +273,17 @@ export class McHostLifecyclePolicy {
                     onAbort = () => finish("unavailable");
                     request.signal.addEventListener("abort", onAbort, { once: true });
                 }
-                this.storageProbe(remaining).then(
-                    (value) => finish(value),
-                    () => finish("unavailable"),
-                );
+                // A probe that throws before returning its promise fails the
+                // same way a rejection does; letting it escape the executor
+                // would reject `demandStart` instead of reporting readiness.
+                try {
+                    this.storageProbe(remaining).then(
+                        (value) => finish(value),
+                        () => finish("unavailable"),
+                    );
+                } catch {
+                    finish("unavailable");
+                }
             });
         } finally {
             if (timer !== null) clearTimeout(timer);
@@ -293,6 +318,14 @@ export class McHostLifecyclePolicy {
                 signal.addEventListener("abort", onAbort, { once: true });
             }
             if (deadlineMs !== undefined) {
+                // An already-expired budget detaches here: a timer of 0 fires
+                // in a later macrotask, so an already-settled shared start
+                // would resolve this waiter through the microtask queue first
+                // and hand it a result it had no time left to wait for.
+                if (deadlineMs <= 0) {
+                    detach("deadline");
+                    return;
+                }
                 timer = setTimeout(() => detach("deadline"), deadlineMs);
             }
             shared.then(
@@ -318,6 +351,15 @@ export class McHostLifecyclePolicy {
     // Shared preflight and native invocation.
     // ------------------------------------------------------------------
 
+    /**
+     * Root resolution, filesystem admission, and the platform gate: the
+     * pre-native checks every command shares.
+     *
+     * Observational commands gate on the platform too. A host outside the
+     * supported target table has no retained-descriptor exec path, so probing
+     * it or answering with the no-probe classifier would report a daemon state
+     * for a host the release cannot run on at all.
+     */
     private preflight(
         command: LifecycleCommand,
     ): { ok: true; root: string } | { ok: false; result: DaemonResultV1 } {
@@ -331,7 +373,15 @@ export class McHostLifecyclePolicy {
             const state = preNativeState(classifyPreNativeRoots(root));
             return {
                 ok: false,
-                result: localResult(command, false, state, "unsupported_filesystem"),
+                result: localResult(command, false, state, admission.reason),
+            };
+        }
+        const platform = checkPlatform(this.platformReaders);
+        if (!platform.ok) {
+            const state = preNativeState(classifyPreNativeRoots(root));
+            return {
+                ok: false,
+                result: localResult(command, false, state, platform.reason),
             };
         }
         return { ok: true, root };
@@ -340,11 +390,6 @@ export class McHostLifecyclePolicy {
     private async mutatingCommand(command: "start" | "stop" | "restart"): Promise<DaemonResultV1> {
         const preflight = this.preflight(command);
         if (!preflight.ok) return preflight.result;
-        const platform = checkPlatform(this.platformReaders);
-        if (!platform.ok) {
-            const state = preNativeState(classifyPreNativeRoots(preflight.root));
-            return localResult(command, false, state, "unsupported_platform");
-        }
         if (this.launchTarget === null) {
             const state = preNativeState(classifyPreNativeRoots(preflight.root));
             return localResult(command, false, state, "native_payload_missing");
@@ -421,15 +466,9 @@ export class McHostLifecyclePolicy {
         if (error instanceof NativeLaunchError) {
             switch (error.code) {
                 case "timeout":
-                    // The native transaction was SIGKILLed mid-flight, so its
-                    // committed effects are unknown, not `false`.
-                    return localResult(
-                        command,
-                        false,
-                        state === "stopped" ? "stopped" : "wedged",
-                        command === "stop" ? "shutdown_timeout" : "startup_timeout",
-                        false,
-                    );
+                    // The child was SIGKILLed mid-flight, so whatever it had
+                    // committed is unknown, not `false`.
+                    return localResult(command, false, state, TIMEOUT_REASON[command], false);
                 case "unsupported_platform":
                     // The platform has no retained-descriptor exec path; the
                     // binary was never invoked, so nothing committed.

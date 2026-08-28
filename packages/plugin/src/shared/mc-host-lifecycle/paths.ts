@@ -15,7 +15,7 @@
  * honoring `MAGIC_CONTEXT_TEST_DATA_DIR` the same way `data-path.ts` does.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { releaseContract } from "./generated-contract";
 
@@ -100,13 +100,26 @@ export function sensitiveRootsFor(
     return roots;
 }
 
-/** Replace any sensitive-root prefix with a stable placeholder. */
+/**
+ * Replace a sensitive root with a stable placeholder, matching on path
+ * boundaries rather than characters: a sibling that merely starts with the
+ * root's text (`<root>-backup`) is a different directory and keeps its own
+ * name, so only the root itself and paths beneath it are replaced.
+ */
 export function redactLifecyclePath(value: string, sensitiveRoots: string[]): string {
     let redacted = value;
     for (const root of sensitiveRoots) {
-        if (redacted.startsWith(root)) {
-            redacted = `<data-root>${redacted.slice(root.length)}`;
-        }
+        // A placeholder already stands in for the leading segments. It is not a
+        // path, and re-measuring it would resolve it against cwd and can redact
+        // a second time.
+        if (!path.isAbsolute(redacted)) break;
+        const relative = path.relative(root, redacted);
+        const beneathRoot =
+            relative !== ".." &&
+            !relative.startsWith(`..${path.sep}`) &&
+            !path.isAbsolute(relative);
+        if (!beneathRoot) continue;
+        redacted = relative === "" ? "<data-root>" : `<data-root>${path.sep}${relative}`;
     }
     return redacted;
 }
@@ -172,6 +185,13 @@ export function parseMounts(text: string): MountEntry[] {
     return entries;
 }
 
+/**
+ * The mount whose options govern `root`: the longest containing mount point,
+ * and among equal-length points the last entry in the table. Stacked mounts
+ * share a mount point and `/proc/self/mounts` lists them in ascending mount
+ * order, so the final equal-length match is the one currently on top and the
+ * only one the kernel traverses.
+ */
 function longestMountFor(root: string, mounts: MountEntry[]): MountEntry | null {
     let best: MountEntry | null = null;
     for (const entry of mounts) {
@@ -180,30 +200,72 @@ function longestMountFor(root: string, mounts: MountEntry[]): MountEntry | null 
             point === "/" ||
             root === point ||
             root.startsWith(point.endsWith("/") ? point : `${point}/`);
-        if (contains && (best === null || point.length > best.mountPoint.length)) {
+        if (contains && (best === null || point.length >= best.mountPoint.length)) {
             best = entry;
         }
     }
     return best;
 }
 
+/**
+ * The path the kernel actually traverses for `root`: lexically resolved, then
+ * with its deepest existing ancestor replaced by that ancestor's realpath. A
+ * `..` segment or a symlinked ancestor otherwise leaves the lookup naming a
+ * mount that does not carry the effective path, so admission would describe a
+ * different filesystem than the daemon writes to.
+ *
+ * A missing tail is expected, because the root is created on first start, and
+ * is rejoined onto the resolved ancestor. `missing` collects basenames from the
+ * leaf upward, so each shallower segment is unshifted ahead of the deeper ones
+ * already held and the join order stays deepest-last. Every other resolution
+ * failure propagates so the caller can fail closed.
+ */
+function mountLookupPath(root: string, realpath: (value: string) => string): string {
+    let cursor = path.resolve(root);
+    const missing: string[] = [];
+    for (;;) {
+        try {
+            return path.join(realpath(cursor), ...missing);
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+            const parent = path.dirname(cursor);
+            if (parent === cursor) throw error;
+            missing.unshift(path.basename(cursor));
+            cursor = parent;
+        }
+    }
+}
+
+const nativeRealpath = (value: string): string => realpathSync.native(value);
+
 export interface AdmissionIo {
     platform: NodeJS.Platform;
     readMounts: () => string;
+    /**
+     * Canonicalizer applied to the data root before mount lookup, defaulting
+     * to `realpathSync.native`. Substituting it keeps mount selection decidable
+     * against a fabricated mount table that names paths this host does not have.
+     */
+    realpath?: (value: string) => string;
 }
 
 const defaultAdmissionIo: AdmissionIo = {
     platform: process.platform,
     readMounts: () => readFileSync("/proc/self/mounts", "utf8"),
+    realpath: nativeRealpath,
 };
 
 /**
  * Practical bounded admission of the selected data root: the root must be
  * absolute and, on Linux, sit on a local mount that is neither a known
  * remote/synthetic filesystem type nor mounted `noexec` (retained-object
- * execution). macOS admission is release-qualified rather than runtime-probed
- * and passes here. Admission failure is exactly
- * `unsupported_filesystem`/`set_data_directory` and never mutates anything.
+ * execution). Linux classification runs against the canonicalized root, so
+ * `..` segments and symlinked ancestors are judged on the mount the kernel
+ * traverses rather than the one the literal string names. macOS admission is
+ * release-qualified rather than runtime-probed and passes here. Admission
+ * failure is exactly `unsupported_filesystem`/`set_data_directory` and never
+ * mutates anything.
  */
 export function admitLifecycleFilesystem(
     dataRoot: string,
@@ -226,7 +288,13 @@ export function admitLifecycleFilesystem(
     }
     // The root may not exist yet on a first start; classify by the nearest
     // mount containing the would-be path, which is what the kernel will use.
-    const mount = longestMountFor(dataRoot, mounts);
+    let lookupRoot: string;
+    try {
+        lookupRoot = mountLookupPath(dataRoot, io.realpath ?? nativeRealpath);
+    } catch {
+        return rejected("data root cannot be resolved");
+    }
+    const mount = longestMountFor(lookupRoot, mounts);
     if (!mount) return rejected("no mount contains the data root");
     const baseType = mount.fsType.toLowerCase();
     if (UNSUPPORTED_FS_TYPES.has(baseType) || baseType.startsWith("nfs")) {

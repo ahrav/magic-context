@@ -11,8 +11,8 @@
  * target is constructed by policy, not configuration.
  *
  * Output handling is fail-closed: stdout must be exactly one v1 JSON object,
- * the exit code must agree with `ok`, and stderr is tainted — captured only
- * to a bounded buffer and never propagated into errors or results.
+ * the exit code must agree with `ok`, and stderr is tainted — drained and
+ * discarded, so it never reaches an error or result.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -68,7 +68,6 @@ export interface NativeLaunchOptions {
 }
 
 const MAX_STDOUT_BYTES = 256 * 1024;
-const MAX_STDERR_BYTES = 64 * 1024;
 const STDIO_FLUSH_GRACE_MS = 250;
 
 interface CollectedExit {
@@ -97,7 +96,6 @@ function retainedFdExecPath(platform: NodeJS.Platform): string | null {
 function collectChild(child: ChildProcess, deadlineMs: number): Promise<CollectedExit> {
     return new Promise((resolve, reject) => {
         let stdoutLen = 0;
-        let stderrLen = 0;
         const stdoutChunks: Buffer[] = [];
         let timedOut = false;
         let outputCapExceeded = false;
@@ -120,12 +118,12 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
             }
             stdoutChunks.push(chunk);
         });
-        // Stderr is tainted diagnostics: drain it so the child cannot block,
-        // bound it, and drop it — it never reaches an error or result.
-        child.stderr?.on("data", (chunk: Buffer) => {
-            stderrLen += chunk.length;
-            if (stderrLen > MAX_STDERR_BYTES) child.stderr?.destroy();
-        });
+        // Stderr is tainted diagnostics: drain it so a child writing more than
+        // one pipe buffer cannot block, and discard every byte — it never
+        // reaches an error or result. Draining keeps the read end open for the
+        // child's whole run; closing it early would make the next child-side
+        // write take EPIPE/SIGPIPE and turn a healthy run into a signal exit.
+        child.stderr?.resume();
         child.on("error", (error) => {
             if (settled) return;
             settled = true;
@@ -173,6 +171,29 @@ export async function runNativeLifecycle(
         args.push("--payload-dir", options.payloadDir);
     }
     const env = options.env ?? {};
+    // The envelope is serialized before anything is spawned: a value with no
+    // JSON form must fail as a typed error with no child in flight, and the
+    // stdin `error` listener below only sees stream errors, never a synchronous
+    // throw from this call. `JSON.stringify` also answers `undefined` rather
+    // than throwing for values that have no JSON form at all, such as a bare
+    // function, so both outcomes are rejected the same way.
+    let serializedEnvelope: string | undefined;
+    if (options.envelope !== undefined && options.envelope !== null) {
+        try {
+            serializedEnvelope = JSON.stringify(options.envelope);
+        } catch {
+            throw new NativeLaunchError(
+                "usage_error",
+                "native startup envelope is not JSON-serializable",
+            );
+        }
+        if (serializedEnvelope === undefined) {
+            throw new NativeLaunchError(
+                "usage_error",
+                "native startup envelope is not JSON-serializable",
+            );
+        }
+    }
     let child: ChildProcess;
     const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "pipe"];
     let executable: string;
@@ -204,10 +225,10 @@ export async function runNativeLifecycle(
     // `error` is an uncaught exception in the host, so an ordinary child-side
     // failure would crash the process instead of surfacing as NativeLaunchError.
     child.stdin?.on("error", () => {});
-    if (options.envelope !== undefined && options.envelope !== null) {
-        child.stdin?.end(JSON.stringify(options.envelope));
-    } else {
+    if (serializedEnvelope === undefined) {
         child.stdin?.end();
+    } else {
+        child.stdin?.end(serializedEnvelope);
     }
     const collected = await collectChild(child, options.deadlineMs);
     if (collected.timedOut) {

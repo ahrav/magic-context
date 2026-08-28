@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { PlatformReaders } from "./bootstrap";
 import { McHostLifecyclePolicy, type WaiterDetachedError } from "./policy";
 
 function tempDir(prefix: string): string {
@@ -66,6 +67,18 @@ function policyFor(
     return new McHostLifecyclePolicy(options);
 }
 
+/** A Linux host whose kernel sits below the contract floor. */
+function unsupportedPlatformReaders(): PlatformReaders {
+    return {
+        platform: "linux",
+        arch: "x64",
+        kernelRelease: () => "4.17.0",
+        glibcVersion: () => "2.34",
+        procSelfFdUsable: () => true,
+        macosProductVersion: () => null,
+    };
+}
+
 describe("pre-native outcomes", () => {
     test("no absolute root: unavailable/no_data_dir, restart effects false,false", async () => {
         const policy = policyFor({ env: { HOME: "relative-home" } });
@@ -108,18 +121,40 @@ describe("pre-native outcomes", () => {
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
-                platformReaders: {
-                    platform: "linux",
-                    arch: "x64",
-                    kernelRelease: () => "4.17.0",
-                    glibcVersion: () => "2.34",
-                    procSelfFdUsable: () => true,
-                    macosProductVersion: () => null,
-                },
+                platformReaders: unsupportedPlatformReaders(),
             });
             const result = await policy.start();
             expect(result.reason).toBe("unsupported_platform");
             expect(invocations(invocationLog)).toEqual([]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("an unsupported platform gates status and doctor too", async () => {
+        const root = tempDir("mc-policy-platform-observational-");
+        const { binary, invocationLog } = fakeBinary(root);
+        try {
+            const gated = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                platformReaders: unsupportedPlatformReaders(),
+            });
+            for (const op of ["status", "doctor"] as const) {
+                const result = await gated[op]();
+                expect(result.reason).toBe("unsupported_platform");
+                expect(result.remediation).toBe("use_supported_platform");
+                expect(result.ok).toBe(false);
+            }
+            expect(invocations(invocationLog)).toEqual([]);
+            // Without a launch target the platform rejection still outranks the
+            // no-probe classifier: an unrunnable host has no daemon state.
+            const noTarget = policyFor({
+                env: { XDG_DATA_HOME: root },
+                platformReaders: unsupportedPlatformReaders(),
+            });
+            const status = await noTarget.status();
+            expect(status.reason).toBe("unsupported_platform");
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -247,6 +282,29 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         }
     }, 20_000);
 
+    test("demands for different capabilities share the one host of their data root", async () => {
+        const root = tempDir("mc-policy-coalesce-capability-");
+        const { binary, invocationLog } = fakeBinary(root, { sleepSeconds: 1 });
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                storageProbe: async () => "ready",
+            });
+            const [magic, synapse] = await Promise.all([
+                policy.demandStart({ origin: "managed-default", capability: "magic-context" }),
+                policy.demandStart({ origin: "managed-default", capability: "synapse" }),
+            ]);
+            expect(magic.result.reason).toBe("started");
+            expect(synapse.result.reason).toBe("started");
+            // One daemon serves every capability, so a capability-keyed second
+            // start would race the first for the transaction lock.
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
     test("a detaching waiter neither cancels the start nor blocks later waiters", async () => {
         const root = tempDir("mc-policy-detach-");
         const { binary, invocationLog } = fakeBinary(root, { sleepSeconds: 1 });
@@ -292,6 +350,26 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
             rmSync(root, { recursive: true, force: true });
         }
     }, 20_000);
+
+    test("an already-expired deadline detaches instead of taking a settled result", async () => {
+        // This root resolution fails synchronously, so the shared start is
+        // already settled when the waiter attaches and only the guard can stop
+        // its microtask from beating the timer.
+        const policy = policyFor({ env: { HOME: "relative-home" } });
+        for (const deadlineMs of [0, -50]) {
+            let kind: string | null = null;
+            try {
+                await policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs,
+                });
+            } catch (error) {
+                kind = (error as WaiterDetachedError).cause_kind;
+            }
+            expect(kind).toBe("deadline");
+        }
+    });
 
     test("settled shared promises are evicted: a later demand starts again", async () => {
         const root = tempDir("mc-policy-evict-");
@@ -404,6 +482,30 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
             rmSync(root, { recursive: true, force: true });
         }
     }, 20_000);
+
+    test("a synchronously throwing storage probe degrades to unavailable", async () => {
+        const root = tempDir("mc-policy-storage-throw-sync-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                // Throws before it ever returns a promise, so no rejection
+                // handler on the probe can catch it.
+                storageProbe: () => {
+                    throw new Error("probe exploded synchronously");
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+            expect(outcome.result.reason).toBe("started");
+            expect(outcome.storage).toBe("unavailable");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
 });
 
 describe("native result labeling and indeterminate effects", () => {
@@ -449,6 +551,38 @@ describe("native result labeling and indeterminate effects", () => {
             // The native transaction was SIGKILLed mid-flight: the stop may
             // already have committed, so its effects are unknown.
             expect(result.effects).toBeNull();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("a child killed at the deadline reports the reason its command earned", async () => {
+        const root = tempDir("mc-policy-timeout-reasons-");
+        try {
+            const binary = path.join(root, "hanging-host.sh");
+            writeFileSync(binary, "#!/bin/sh\nsleep 30\n");
+            chmodSync(binary, 0o700);
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: 250,
+            });
+            const expected = {
+                start: "startup_timeout",
+                restart: "startup_timeout",
+                stop: "shutdown_timeout",
+                // A read-only probe ran out of time; no startup was attempted.
+                status: "native_probe_unavailable",
+                doctor: "native_probe_unavailable",
+            } as const;
+            for (const op of ["start", "restart", "stop", "status", "doctor"] as const) {
+                const result = await policy[op]();
+                expect(result.command).toBe(op);
+                expect(result.reason).toBe(expected[op]);
+                // The classifier state travels unchanged: these roots are
+                // wholly absent.
+                expect(result.state).toBe("stopped");
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

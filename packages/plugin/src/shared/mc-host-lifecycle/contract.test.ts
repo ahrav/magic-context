@@ -141,6 +141,13 @@ describe("parseDaemonResult", () => {
                 },
             }),
             non_boolean_ok: validResult({ ok: "yes" }),
+            ok_true_with_failing_reason: validResult({ reason: "internal_error" }),
+            ok_false_with_non_failing_reason: validResult({
+                ok: false,
+                state: "stopped",
+                readiness: null,
+                checks: [],
+            }),
         };
         for (const [name, body] of Object.entries(cases)) {
             let rejected = false;
@@ -211,6 +218,29 @@ describe("exit/result agreement", () => {
         expect(exitAgreesWithResult(0, failResult)).toBe(false);
         expect(exitAgreesWithResult(1, failResult)).toBe(true);
         expect(exitAgreesWithResult(2, okResult)).toBe(false);
+    });
+
+    test("agreement cannot be reached by a failing reason wearing ok:true", () => {
+        // Agreement reads `ok` alone, so a result pairing `ok:true` with a
+        // failing reason would agree with exit 0 and let callers proceed on a
+        // failure. Parsing rejects the pairing, so no such result exists.
+        expect(() =>
+            parseDaemonResult(JSON.stringify(validResult({ reason: "internal_error" }))),
+        ).toThrow(ContractViolation);
+        const paired = parseDaemonResult(
+            JSON.stringify(
+                validResult({
+                    ok: false,
+                    state: "wedged",
+                    reason: "internal_error",
+                    remediation: "report_bug",
+                    readiness: null,
+                    checks: [],
+                }),
+            ),
+        );
+        expect(exitAgreesWithResult(0, paired)).toBe(false);
+        expect(exitAgreesWithResult(1, paired)).toBe(true);
     });
 });
 

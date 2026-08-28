@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { NativeLaunchError, runNativeLifecycle } from "./native-launcher";
@@ -176,6 +176,71 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         expect(result.reason).toBe("not_running");
     });
 
+    test("an envelope that cannot be serialized fails before a child exists", async () => {
+        const sentinel = path.join(dir, "unserializable-envelope-child-ran");
+        const binary = scriptBinary(dir, `: > "${sentinel}"\nsleep 2`);
+        const envelope: Record<string, unknown> = {};
+        envelope.self = envelope;
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 250, envelope },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.code).toBe("usage_error");
+        // Serializing after the spawn would let the raw serialization throw
+        // escape with a live child that nothing collects or kills; the absent
+        // marker proves no child ever ran.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect(existsSync(sentinel)).toBe(false);
+    }, 10_000);
+
+    test("an envelope with no JSON form is typed, not a silently empty stdin", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000, envelope: () => "no json form" },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.code).toBe("usage_error");
+    });
+
+    test("stderr past the cap is discarded without killing a healthy child", async () => {
+        // Stderr must stay drained, not closed: this child writes far past the
+        // cap and then its conforming object, so a closed read end would take
+        // the write side down with EPIPE/SIGPIPE before stdout ever arrives.
+        const binary = scriptBinary(
+            dir,
+            [
+                "chunk=xxxxxxxxxxxxxxxx",
+                "chunk=$chunk$chunk$chunk$chunk",
+                "chunk=$chunk$chunk$chunk$chunk",
+                "chunk=$chunk$chunk$chunk$chunk",
+                "i=0",
+                "while [ $i -lt 512 ]; do",
+                '  echo "$chunk" >&2',
+                "  i=$((i + 1))",
+                "done",
+                `echo '${probeResultJson(false)}'`,
+                "exit 1",
+            ].join("\n"),
+        );
+        const result = await runNativeLifecycle(
+            { kind: "test-binary", path: binary },
+            { command: "probe", deadlineMs: 10_000 },
+        );
+        expect(result.reason).toBe("not_running");
+    }, 15_000);
+
     test("spawn failure for a missing binary is typed", async () => {
         let error: NativeLaunchError | null = null;
         try {
@@ -219,6 +284,7 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         // On this linux host /dev/fd/3 is not an executable image, so the
         // spawn fails; the point is that it was attempted at all rather than
         // rejected as an unsupported platform.
+        expect(error).toBeInstanceOf(NativeLaunchError);
         expect(error?.code).not.toBe("unsupported_platform");
     });
 });

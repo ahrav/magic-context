@@ -2,11 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+    chmodSync,
     closeSync,
+    existsSync,
     linkSync,
     lstatSync,
     mkdirSync,
     mkdtempSync,
+    readdirSync,
     readFileSync,
     rmSync,
     symlinkSync,
@@ -19,6 +22,7 @@ import {
     checkCapacity,
     checkPlatform,
     loadTrustIndex,
+    MAX_TRUST_INDEX_BYTES,
     type PlatformReaders,
     resolvePayloadPackageDir,
     revalidateRetainedBootstrap,
@@ -31,6 +35,31 @@ function tempDir(prefix: string): string {
 
 function sha256(bytes: Buffer | string): string {
     return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * Run `body` on a host that cannot report a uid, which is what a platform
+ * without `process.getuid` looks like to every ownership check.
+ */
+function withoutGetuid<T>(body: () => T): T {
+    const holder = process as { getuid?: () => number };
+    const original = holder.getuid;
+    holder.getuid = undefined;
+    try {
+        return body();
+    } finally {
+        holder.getuid = original;
+    }
+}
+
+/** The lifecycle reason a call failed with, or `null` when it succeeded. */
+function reasonOf(body: () => unknown): string | null {
+    try {
+        body();
+        return null;
+    } catch (error) {
+        return (error as BootstrapError).reason;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +268,79 @@ describe("install layout resolution (U3 scenario 4)", () => {
             rmSync(root, { recursive: true, force: true });
         }
     });
+
+    test("a store directory whose name merely ends in node_modules is not certified", () => {
+        const root = tempDir("mc-layout-bun-suffix-");
+        try {
+            // `xnode_modules` shares the textual suffix but is not a
+            // `node_modules` path component, so the link is not a Bun store
+            // path and must not certify as one.
+            const store = path.join(
+                root,
+                "node_modules",
+                ".bun",
+                "@cortexkit+mc-host-linux-x64-gnu@0.38.0",
+                "xnode_modules",
+                ...PKG.split("/"),
+            );
+            mkdirSync(store, { recursive: true });
+            mkdirSync(path.join(root, "node_modules", "@cortexkit"), { recursive: true });
+            symlinkSync(store, path.join(root, "node_modules", PKG));
+            const resolved = resolvePayloadPackageDir({
+                declaringParentRoot: root,
+                packageName: PKG,
+            });
+            expect(resolved.ok).toBe(false);
+            if (!resolved.ok) expect(resolved.reason).toBe("unsupported_install_layout");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("an uninspectable nearer candidate stops the walk, never yielding to an ancestor", () => {
+        const root = tempDir("mc-layout-inaccessible-");
+        try {
+            // The ancestor holds a real payload directory. The nearer
+            // candidate sits behind a self-referential `node_modules`
+            // symlink, so probing it fails ELOOP rather than reporting the
+            // absence that would license climbing to the ancestor.
+            mkdirSync(path.join(root, "node_modules", PKG), { recursive: true });
+            const child = path.join(root, "child");
+            mkdirSync(child);
+            symlinkSync("node_modules", path.join(child, "node_modules"));
+            const resolved = resolvePayloadPackageDir({
+                declaringParentRoot: child,
+                packageName: PKG,
+            });
+            expect(resolved.ok).toBe(false);
+            if (!resolved.ok) expect(resolved.reason).toBe("unsupported_install_layout");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("a non-directory ancestor component is absence, so the walk still climbs", () => {
+        const root = tempDir("mc-layout-notdir-");
+        try {
+            mkdirSync(path.join(root, "node_modules", PKG), { recursive: true });
+            const child = path.join(root, "child");
+            mkdirSync(child);
+            // A regular file at `node_modules` cannot contain the candidate,
+            // which is ENOTDIR and therefore absence.
+            writeFileSync(path.join(child, "node_modules"), "not a dir");
+            const resolved = resolvePayloadPackageDir({
+                declaringParentRoot: child,
+                packageName: PKG,
+            });
+            expect(resolved).toEqual({
+                ok: true,
+                layout: "npm_hoisted",
+                packageDir: path.join(root, "node_modules", PKG),
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -334,6 +436,62 @@ describe("payload trust index", () => {
                 writeFileSync(indexPath, typeof body === "string" ? body : JSON.stringify(body));
                 expect(() => loadTrustIndex(indexPath)).toThrow(BootstrapError);
             });
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("file shape decides provenance before the schema is parsed", () => {
+        const dir = tempDir("mc-trust-shape-");
+        try {
+            // Every file below carries the same schema-valid document, so only
+            // file type, link count, write bits, and size distinguish an index
+            // this process could have written from one it could not.
+            const body = JSON.stringify(validIndex);
+            const target = path.join(dir, "target.json");
+            writeFileSync(target, body);
+            const symlinked = path.join(dir, "symlinked.json");
+            symlinkSync(target, symlinked);
+
+            const shared = path.join(dir, "shared.json");
+            writeFileSync(shared, body);
+            linkSync(shared, path.join(dir, "shared-alias.json"));
+            expect(lstatSync(shared).nlink).toBe(2);
+
+            const writable = path.join(dir, "writable.json");
+            writeFileSync(writable, body);
+            chmodSync(writable, 0o666);
+
+            // JSON parsing ignores trailing whitespace, so an oversize index
+            // is rejected by the byte cap alone.
+            const oversize = path.join(dir, "oversize.json");
+            writeFileSync(oversize, `${body}${" ".repeat(MAX_TRUST_INDEX_BYTES + 1)}`);
+
+            const cases: Array<[string, string]> = [
+                ["symlinked", symlinked],
+                ["shared link", shared],
+                ["group/world writable", writable],
+                ["oversize", oversize],
+            ];
+            for (const [name, candidate] of cases) {
+                expect({ name, reason: reasonOf(() => loadTrustIndex(candidate)) }).toEqual({
+                    name,
+                    reason: "native_payload_invalid",
+                });
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("a host without process.getuid cannot certify an index at all", () => {
+        const dir = tempDir("mc-trust-nouid-");
+        try {
+            const indexPath = path.join(dir, "index.json");
+            writeFileSync(indexPath, JSON.stringify(validIndex));
+            expect(loadTrustIndex(indexPath)?.entries.length).toBe(1);
+            const reason = withoutGetuid(() => reasonOf(() => loadTrustIndex(indexPath)));
+            expect(reason).toBe("unsupported_platform");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -512,5 +670,100 @@ describe("bootstrap staging (U3 scenarios 3 and 6)", () => {
             reason = (error as BootstrapError).reason;
         }
         expect(reason).toBe("native_payload_missing");
+    });
+
+    test("a symlinked or group-writable destination is rejected before any output exists", () => {
+        const dir = tempDir("mc-stage-dest-");
+        try {
+            const source = path.join(dir, "launcher");
+            const bytes = Buffer.from("destination-hardening\n");
+            writeFileSync(source, bytes, { mode: 0o755 });
+            const digest = sha256(bytes);
+            const stage = (destDir: string): string | null =>
+                reasonOf(() =>
+                    stageBootstrap({
+                        sourcePath: source,
+                        destDir,
+                        expectedSha256: digest,
+                        availableBytesOverride: 1n << 40n,
+                    }),
+                );
+
+            // A followed symlink at the destination would redirect both the
+            // temp create and the rename into the link target.
+            const realStore = path.join(dir, "real-store");
+            mkdirSync(realStore, { mode: 0o700 });
+            const symlinkedStore = path.join(dir, "symlinked-store");
+            symlinkSync(realStore, symlinkedStore);
+            expect(stage(symlinkedStore)).toBe("native_payload_invalid");
+            expect(readdirSync(realStore)).toEqual([]);
+
+            // `mkdirSync` applies its mode only when it creates the directory,
+            // so an existing group/world-writable destination reaches the
+            // descriptor check with its insecure mode intact.
+            const openStore = path.join(dir, "open-store");
+            mkdirSync(openStore, { mode: 0o700 });
+            chmodSync(openStore, 0o777);
+            expect(stage(openStore)).toBe("native_payload_invalid");
+            expect(readdirSync(openStore)).toEqual([]);
+
+            // A regular file at the destination name is not a directory.
+            const fileStore = path.join(dir, "file-store");
+            writeFileSync(fileStore, "not a dir");
+            expect(stage(fileStore)).not.toBeNull();
+
+            // An owner-only directory the process created still stages.
+            const goodStore = path.join(dir, "good-store");
+            const staged = stageBootstrap({
+                sourcePath: source,
+                destDir: goodStore,
+                expectedSha256: digest,
+                availableBytesOverride: 1n << 40n,
+            });
+            closeSync(staged.fd);
+            expect(readFileSync(staged.path)).toEqual(bytes);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("a host without process.getuid is unsupported_platform before any staging effect", () => {
+        const dir = tempDir("mc-stage-nouid-");
+        try {
+            const source = path.join(dir, "launcher");
+            const bytes = Buffer.from("no-uid-launcher\n");
+            writeFileSync(source, bytes, { mode: 0o755 });
+            const digest = sha256(bytes);
+
+            const destDir = path.join(dir, "store");
+            const stageReason = withoutGetuid(() =>
+                reasonOf(() =>
+                    stageBootstrap({
+                        sourcePath: source,
+                        destDir,
+                        expectedSha256: digest,
+                        availableBytesOverride: 1n << 40n,
+                    }),
+                ),
+            );
+            expect(stageReason).toBe("unsupported_platform");
+            // Missing uid support is a platform property, so the failure lands
+            // before the destination directory or any temp object is created.
+            expect(existsSync(destDir)).toBe(false);
+
+            const staged = stageBootstrap({
+                sourcePath: source,
+                destDir: path.join(dir, "ok-store"),
+                expectedSha256: digest,
+                availableBytesOverride: 1n << 40n,
+            });
+            closeSync(staged.fd);
+            const retainedReason = withoutGetuid(() =>
+                reasonOf(() => revalidateRetainedBootstrap(staged.path, staged.sha256)),
+            );
+            expect(retainedReason).toBe("unsupported_platform");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 });

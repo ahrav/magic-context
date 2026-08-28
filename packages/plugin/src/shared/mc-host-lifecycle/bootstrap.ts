@@ -49,6 +49,22 @@ export class BootstrapError extends Error {
     }
 }
 
+/**
+ * The uid every ownership check in this module compares against. A host
+ * without `process.getuid` cannot express file ownership, which is an
+ * unsupported platform and not a property of any inspected file: comparing a
+ * numeric `stat.uid` against a missing function yields `undefined` and would
+ * misreport every correctly-owned object as foreign. Callers resolve the uid
+ * before their first filesystem effect so such a host fails without leaving
+ * a directory or a temp object behind.
+ */
+function currentUid(): number {
+    if (typeof process.getuid !== "function") {
+        throw new BootstrapError("unsupported_platform", "cannot determine process uid");
+    }
+    return process.getuid();
+}
+
 // ---------------------------------------------------------------------------
 // Platform gate (R24). Runs before any package byte is opened.
 // ---------------------------------------------------------------------------
@@ -229,18 +245,87 @@ export interface TrustIndex {
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
+/** Byte cap for the trust index; an oversize file is invalid, not truncated. */
+export const MAX_TRUST_INDEX_BYTES = 1024 * 1024;
+
+/**
+ * Read at most one byte past the cap through the descriptor, so an oversize
+ * file is caught from the bytes actually read rather than from metadata a
+ * concurrent writer can have already invalidated.
+ */
+function readTrustIndexText(fd: number): string {
+    const buffer = Buffer.alloc(MAX_TRUST_INDEX_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+        const read = readSync(fd, buffer, total, buffer.length - total, total);
+        if (read === 0) break;
+        total += read;
+    }
+    if (total > MAX_TRUST_INDEX_BYTES) {
+        throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
+    }
+    return buffer.subarray(0, total).toString("utf8");
+}
+
 /**
  * Strict decode of `release/mc-host-payload-index.json`. `null` means the
  * file is absent (payload staging then fails `native_payload_missing`);
  * a present-but-invalid index is `native_payload_invalid`, never a fallback.
+ *
+ * Provenance is established from file shape before any byte is parsed: one
+ * retained O_NOFOLLOW descriptor supplies the bytes, its metadata must show a
+ * single-link regular file owned by this process with no group or other write
+ * bit and within the byte cap, and the path identity is re-checked against
+ * that descriptor after the read. A schema-valid document proves only that
+ * someone wrote well-formed JSON, so a symlinked, foreign-owned, shared-link,
+ * or group-writable index is rejected on shape and never reaches the parser.
  */
 export function loadTrustIndex(indexPath: string): TrustIndex | null {
-    let text: string;
+    const uid = currentUid();
+    let fd: number;
     try {
-        text = readFileSync(indexPath, "utf8");
+        fd = openSync(
+            indexPath,
+            // O_NOFOLLOW so a symlink at this name fails the open instead of
+            // redirecting the read; O_NONBLOCK so a FIFO fails fstat instead
+            // of blocking the open until a writer appears.
+            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+        );
     } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw new BootstrapError("native_payload_invalid", "trust index is unreadable");
+    }
+    let text: string;
+    try {
+        const before = fstatSync(fd);
+        if (!before.isFile()) {
+            throw new BootstrapError("native_payload_invalid", "trust index is not a regular file");
+        }
+        if (before.nlink !== 1) {
+            throw new BootstrapError("native_payload_invalid", "trust index is not single-link");
+        }
+        if (before.uid !== uid) {
+            throw new BootstrapError("native_payload_invalid", "trust index has a foreign owner");
+        }
+        if ((before.mode & 0o022) !== 0) {
+            throw new BootstrapError(
+                "native_payload_invalid",
+                "trust index is group/world writable",
+            );
+        }
+        if (before.size > MAX_TRUST_INDEX_BYTES) {
+            throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
+        }
+        text = readTrustIndexText(fd);
+        const after = lstatSync(indexPath);
+        if (after.dev !== before.dev || after.ino !== before.ino) {
+            throw new BootstrapError(
+                "native_payload_invalid",
+                "trust index identity drifted during the read",
+            );
+        }
+    } finally {
+        closeSync(fd);
     }
     let parsed: unknown;
     try {
@@ -319,14 +404,26 @@ export type LayoutResolution =
           detail: string;
       };
 
-function classifyEntry(entryPath: string): "dir" | "symlink" | "absent" | "other" {
+type EntryKind = "dir" | "symlink" | "absent" | "other" | "inaccessible";
+
+/**
+ * Classify one candidate path by its own metadata. Only a genuine absence is
+ * `absent`, because absence is the single kind that lets the hoist walk climb
+ * past a candidate: EACCES on a parent directory, ELOOP on an intermediate
+ * component, descriptor exhaustion, and I/O faults all mean a nearer candidate
+ * may exist but cannot be certified, so reporting them as absence would let a
+ * more distant ancestor package win. ENOTDIR is absence because a
+ * non-directory ancestor cannot contain the candidate at all.
+ */
+function classifyEntry(entryPath: string): EntryKind {
     try {
         const stat = lstatSync(entryPath);
         if (stat.isSymbolicLink()) return "symlink";
         if (stat.isDirectory()) return "dir";
         return "other";
-    } catch {
-        return "absent";
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "inaccessible";
     }
 }
 
@@ -390,6 +487,13 @@ export function resolvePayloadPackageDir(options: {
                 detail: "payload entry is not a directory",
             };
         }
+        if (kind === "inaccessible") {
+            return {
+                ok: false,
+                reason: "unsupported_install_layout",
+                detail: "payload entry is not inspectable",
+            };
+        }
         const parent = path.dirname(current);
         if (parent === current) break;
         current = parent;
@@ -421,10 +525,11 @@ function resolveBunLink(
         return null;
     }
     const withinStore = resolved.startsWith(`${bunStoreReal}${path.sep}`);
-    const expectedTail = path.join("node_modules", ...segments);
-    if (!withinStore || !resolved.endsWith(`${path.sep}${expectedTail}`.replace(/^\//, path.sep))) {
-        if (!withinStore || !resolved.endsWith(expectedTail)) return null;
-    }
+    // The suffix is anchored on a separator so only a real `node_modules`
+    // path component certifies: a bare suffix match also accepts a sibling
+    // directory whose name merely ends in `node_modules`.
+    const expectedSuffix = `${path.sep}${path.join("node_modules", ...segments)}`;
+    if (!withinStore || !resolved.endsWith(expectedSuffix)) return null;
     return { ok: true, layout: "bun_physical_link", packageDir: resolved };
 }
 
@@ -517,6 +622,7 @@ export function revalidateRetainedBootstrap(
     expectedSha256: string,
 ): RetainedBootstrap {
     if (!SHA256_HEX.test(expectedSha256)) throw invalid("expected digest is noncanonical");
+    const uid = currentUid();
     let fd: number;
     try {
         fd = openSync(
@@ -533,8 +639,7 @@ export function revalidateRetainedBootstrap(
         const stat = fstatSync(fd);
         if (!stat.isFile()) throw invalid("retained bootstrap is not a regular file");
         if (stat.nlink !== 1) throw invalid("retained bootstrap is not single-link");
-        if (stat.uid !== process.getuid?.())
-            throw invalid("retained bootstrap has a foreign owner");
+        if (stat.uid !== uid) throw invalid("retained bootstrap has a foreign owner");
         if ((stat.mode & 0o077) !== 0)
             throw invalid("retained bootstrap is group/world accessible");
         if ((stat.mode & 0o100) === 0) throw invalid("retained bootstrap is not owner-executable");
@@ -552,14 +657,59 @@ export function revalidateRetainedBootstrap(
 }
 
 /**
+ * Open the staging destination through one retained descriptor and prove it is
+ * an owner-only real directory. `O_NOFOLLOW` makes a symlink at `destDir` fail
+ * the open instead of redirecting every path built beneath it, `O_DIRECTORY`
+ * rejects a non-directory at the same name, and the owner and write-bit checks
+ * reject an existing insecure directory — `mkdirSync` with a mode applies that
+ * mode only when it creates the directory and never chmods one that is
+ * already there.
+ *
+ * The proof binds to this descriptor. What it does NOT establish: Node exposes
+ * no `openat`/`renameat`, so the temp create and the rename below still address
+ * the destination by pathname and an attacker who can replace `destDir` or any
+ * of its ancestors between this check and those operations is not excluded.
+ * The identity re-check after the rename detects such a swap after the fact
+ * rather than preventing it. Race-free staging requires component-wise
+ * `openat(O_DIRECTORY|O_NOFOLLOW)` plus `renameat`, which lives in the native
+ * layer.
+ */
+function openStagingDir(destDir: string, uid: number): number {
+    let fd: number;
+    try {
+        fd = openSync(
+            destDir,
+            fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+        );
+    } catch {
+        throw invalid("staging destination is not an openable real directory");
+    }
+    try {
+        const stat = fstatSync(fd);
+        if (!stat.isDirectory()) throw invalid("staging destination is not a directory");
+        if (stat.uid !== uid) throw invalid("staging destination has a foreign owner");
+        if ((stat.mode & 0o022) !== 0) {
+            throw invalid("staging destination is group/world writable");
+        }
+        return fd;
+    } catch (error) {
+        closeSync(fd);
+        throw error;
+    }
+}
+
+/**
  * Stage a package launcher into an owner-only digest-addressed bootstrap:
  * one O_NOFOLLOW source descriptor supplies both the hash and the copied
  * bytes (a hardlinked package-cache source is acceptable as bytes only),
  * output goes through an exclusive owner-only temp plus fsync plus atomic
  * rename, and the promoted object is completely revalidated before its
- * retained descriptor is returned. Capacity is preflighted with the checked
- * reserve before the temp is created; post-preflight failures remove only
- * the owned temp.
+ * retained descriptor is returned. The destination is proved to be an
+ * owner-only real directory through a retained descriptor before any output
+ * exists, with the residual pathname race documented on
+ * {@link openStagingDir}. Capacity is preflighted with the checked reserve
+ * before the temp is created; post-preflight failures remove only the owned
+ * temp.
  */
 export function stageBootstrap(options: {
     sourcePath: string;
@@ -569,6 +719,9 @@ export function stageBootstrap(options: {
 }): RetainedBootstrap {
     const { sourcePath, destDir, expectedSha256 } = options;
     if (!SHA256_HEX.test(expectedSha256)) throw invalid("expected digest is noncanonical");
+    // The uid is resolved before the first filesystem effect so a host that
+    // cannot report one fails without creating the destination or a temp.
+    const uid = currentUid();
     let sourceFd: number;
     try {
         sourceFd = openSync(
@@ -579,10 +732,13 @@ export function stageBootstrap(options: {
         throw new BootstrapError("native_payload_missing", "launcher source is not openable");
     }
     let tempPath: string | null = null;
+    let destFd: number | null = null;
     try {
         const before = fstatSync(sourceFd);
         if (!before.isFile()) throw invalid("launcher source is not a regular file");
         mkdirSync(destDir, { recursive: true, mode: 0o700 });
+        destFd = openStagingDir(destDir, uid);
+        const destBefore = fstatSync(destFd);
         const capacity = checkCapacity(
             BigInt(before.size),
             options.availableBytesOverride ?? availableBytesFor(destDir),
@@ -630,15 +786,18 @@ export function stageBootstrap(options: {
         const finalPath = path.join(destDir, expectedSha256);
         renameSync(tempPath, finalPath);
         tempPath = null;
-        const dirFd = openSync(destDir, fsConstants.O_RDONLY);
-        try {
-            fsyncSync(dirFd);
-        } finally {
-            closeSync(dirFd);
+        // The retained descriptor is the identity the checks above certified,
+        // so comparing it against the path now reports a destination that was
+        // swapped while the pathname-addressed temp and rename ran.
+        const destAfter = lstatSync(destDir);
+        if (destAfter.dev !== destBefore.dev || destAfter.ino !== destBefore.ino) {
+            throw invalid("staging destination identity drifted during staging");
         }
+        fsyncSync(destFd);
         return revalidateRetainedBootstrap(finalPath, expectedSha256);
     } finally {
         closeSync(sourceFd);
+        if (destFd !== null) closeSync(destFd);
         if (tempPath !== null) {
             try {
                 unlinkSync(tempPath);

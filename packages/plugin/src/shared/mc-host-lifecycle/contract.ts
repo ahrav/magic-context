@@ -236,6 +236,14 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     if (typeof reason !== "string" || !isDaemonReason(reason)) {
         fail("reason is outside the closed union");
     }
+    // `ok` is the boolean summary of the reason's class, so exactly one of the
+    // two pairings is legal: a non-failing reason with `ok:true`, a failing
+    // reason with `ok:false`. Validating the two fields independently admits
+    // `{ok:true, reason:"internal_error"}`, which agrees with exit 0 and reads
+    // as success to every consumer that branches on `ok`.
+    if (record.ok !== NON_FAILING_REASONS.has(reason)) {
+        fail("ok disagrees with reason class");
+    }
     if (state === "unavailable" && reason !== "no_data_dir") {
         fail("unavailable is legal only with no_data_dir");
     }

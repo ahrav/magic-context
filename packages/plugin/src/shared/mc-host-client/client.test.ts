@@ -28,7 +28,7 @@ import {
     waitUntil,
     writeConnectionFile,
 } from "./test-support/test-util";
-import type { BindIdentity, RouteTarget } from "./types";
+import type { BindIdentity, CatalogSnapshot, RouteTarget } from "./types";
 
 const IDENTITY: BindIdentity = {
     project_root: "/workspace/project",
@@ -1826,6 +1826,26 @@ describe("transport negotiation", () => {
         expect(corrs.slice(2).every((corr) => corr >= 3n)).toBe(true);
     });
 
+    test("a promoted candidate keeps the bootstrap's authenticated identity", async () => {
+        const provider = createFakePairedProvider();
+        provider.host.onFrame = candidateAutoResponder(GRANT_TOKEN);
+        const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody()) });
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        const client = await McHostClient.connect({
+            connectionFile: filePath,
+            transportProviders: [provider],
+        });
+        clients.push(client);
+        expect(provider.connectCount).toBe(1);
+        // The candidate channel runs no handshake: its setup reports
+        // "fake-candidate/1" and no daemon id. Promotion carries the
+        // bootstrap's authenticated identity across the barrier, so neither
+        // provider-supplied value may reach the published connection.
+        expect(client.authenticated?.daemonVer).toBe("fake-peer/0.0.1");
+        expect(Array.from(client.authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
+    });
+
     const decodeRejections: [string, (frame: PeerFrame) => unknown][] = [
         [
             "a selection without a selected entry",
@@ -2271,16 +2291,22 @@ describe("authenticated state retention (U3/KTD6)", () => {
         expect(typeof publication?.pid).toBe("number");
     });
 
-    test("a divergent publication daemon_ver never masks the authenticated value", async () => {
-        const peer = await startPeer({ daemonVer: "mc-host/9.9.9-auth" });
+    test("a handshake daemon_ver diverging from the connection file rejects the dial", async () => {
+        const peer = await startPeer({ daemonVer: "mc-host/999.0.0" });
         const filePath = freshFilePath();
-        // writeConnectionFile pins the publication daemon_ver to
-        // "fake-peer/0.0.1", so the two transcripts disagree on purpose.
+        // writeConnectionFile pins the file's daemon_ver to "fake-peer/0.0.1",
+        // so the peer reports a version the file never published. daemon_ver is
+        // outside the proof input, so the transcript's HMAC is still valid and
+        // only the connection-file comparison can reject this peer.
         await writeConnectionFile(filePath, peer);
-        const client = await McHostClient.connect({ connectionFile: filePath });
-        clients.push(client);
-        expect(client.authenticated?.daemonVer).toBe("mc-host/9.9.9-auth");
-        expect(client.publication?.daemonVer).toBe("fake-peer/0.0.1");
+        const error = await rejection(McHostClient.connect({ connectionFile: filePath }));
+        expect((error as Error).name).toBe("AuthError");
+        expect((error as { code?: string }).code).toBe("daemon_ver_mismatch");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        // No ClientAuth reached the peer: the client emits none once a check
+        // fails, so the peer never observed a client proof at all.
+        expect(conn.clientAuthValid).toBeNull();
     });
 
     test("the getter hands out a copy, so a caller cannot poison the identity", async () => {
@@ -2304,6 +2330,15 @@ describe("strict catalog parsing (U3 scenario 10)", () => {
         return expectCallError(await rejection(catalogPromise), "terminal");
     }
 
+    async function catalogSnapshotOf(body: unknown): Promise<CatalogSnapshot> {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const snapshotPromise = client.catalogSnapshot();
+        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
+        await sendResponse(conn, catalogFrame.corr, body);
+        return await snapshotPromise;
+    }
+
     const validEntry = {
         module_id: "magic-context",
         module_version: "0.1.0",
@@ -2320,31 +2355,46 @@ describe("strict catalog parsing (U3 scenario 10)", () => {
     test("rejects every malformed catalog shape without casting", async () => {
         const cases: Record<string, unknown> = {
             missing_generation: { ...valid, generation: undefined },
+            non_number_generation: { ...valid, generation: "1" },
             fractional_generation: { ...valid, generation: 1.5 },
             negative_generation: { ...valid, generation: -1 },
             missing_subc_ops: { ...valid, subc_ops: undefined },
+            non_array_subc_ops: { ...valid, subc_ops: "route.open" },
             empty_subc_ops: { ...valid, subc_ops: [] },
             non_string_subc_ops: { ...valid, subc_ops: [7] },
             duplicate_subc_ops: { ...valid, subc_ops: ["route.open", "route.open"] },
-            unknown_top_level_field: { ...valid, extra: true },
+            missing_modules: { ...valid, modules: undefined },
             non_array_modules: { ...valid, modules: {} },
             module_not_object: { ...valid, modules: [7] },
             missing_module_version: {
                 ...valid,
                 modules: [{ module_id: "m", roles: [], control_ops: [] }],
             },
+            non_string_module_version: {
+                ...valid,
+                modules: [{ ...validEntry, module_version: 1 }],
+            },
             empty_module_version: { ...valid, modules: [{ ...validEntry, module_version: "" }] },
             missing_module_id: {
                 ...valid,
                 modules: [{ module_version: "0.1.0", roles: [], control_ops: [] }],
             },
+            non_string_module_id: { ...valid, modules: [{ ...validEntry, module_id: 7 }] },
             oversized_module_id: {
                 ...valid,
                 modules: [{ ...validEntry, module_id: "x".repeat(129) }],
             },
             duplicate_module_id: { ...valid, modules: [validEntry, validEntry] },
-            unknown_module_field: { ...valid, modules: [{ ...validEntry, extra: 1 }] },
+            missing_control_ops: {
+                ...valid,
+                modules: [{ module_id: "m", module_version: "0.1.0", roles: [] }],
+            },
+            non_array_control_ops: { ...valid, modules: [{ ...validEntry, control_ops: "x" }] },
             malformed_control_ops: { ...valid, modules: [{ ...validEntry, control_ops: [""] }] },
+            missing_roles: {
+                ...valid,
+                modules: [{ module_id: "m", module_version: "0.1.0", control_ops: [] }],
+            },
             non_array_roles: { ...valid, modules: [{ ...validEntry, roles: "admin" }] },
         };
         for (const [name, body] of Object.entries(cases)) {
@@ -2356,13 +2406,30 @@ describe("strict catalog parsing (U3 scenario 10)", () => {
         }
     }, 30_000);
 
+    test("an unknown top-level field is ignored and the known fields still parse", async () => {
+        const snapshot = await catalogSnapshotOf({
+            ...valid,
+            catalog_digest: "sha256:abc",
+            limits: { max_modules: 64 },
+        });
+        expect(snapshot).toEqual({
+            generation: 1,
+            subcOps: ["route.open", "catalog.list", "host.shutdown", "transport.negotiate"],
+            modules: [validEntry],
+        });
+    });
+
+    test("an unknown module-entry field is ignored and the known fields still parse", async () => {
+        const snapshot = await catalogSnapshotOf({
+            ...valid,
+            modules: [{ ...validEntry, readiness: "degraded", data_ops: ["query.run"] }],
+        });
+        expect(snapshot.generation).toBe(1);
+        expect(snapshot.modules).toEqual([validEntry]);
+    });
+
     test("a valid catalog yields the tagged snapshot", async () => {
-        const { client, conn } = await connected();
-        const cursor = frameCursor(conn);
-        const snapshotPromise = client.catalogSnapshot();
-        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
-        await sendResponse(conn, catalogFrame.corr, valid);
-        const snapshot = await snapshotPromise;
+        const snapshot = await catalogSnapshotOf(valid);
         expect(snapshot.generation).toBe(1);
         expect(snapshot.subcOps).toEqual([
             "route.open",

@@ -481,15 +481,19 @@ fn publication_daemon_ver(observed: &LifecycleProbe) -> Option<String> {
 /// The accepted shape must stay byte-for-byte identical to
 /// `evaluateDaemonCompatibility` in
 /// `packages/plugin/src/shared/mc-host-lifecycle/compatibility.ts`, whose
-/// `^(\d+)\.(\d+)\.(\d+)$` regex gates the same authenticated `daemon_ver`
-/// against the same contract range. The two must agree on every input or one
-/// side reports a daemon compatible while the other rejects it, so `triple`
-/// rejects anything but three pure-ASCII-digit components — `u64::from_str`
-/// alone would accept a leading `+`, which the regex does not.
+/// `^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$` regex gates the same
+/// authenticated `daemon_ver` against the same contract range. The two must
+/// agree on every input or one side reports a daemon compatible while the other
+/// rejects it, so `triple` rejects anything but three components that are pure
+/// ASCII digits with no redundant leading zero — `u64::from_str` alone would
+/// accept a leading `+` and `007`, neither of which the regex does.
 fn daemon_version_compatible(daemon_ver: &str) -> bool {
     fn triple(version: &str) -> Option<[u64; 3]> {
         fn component(part: &str) -> Option<u64> {
-            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            if part.is_empty()
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+            {
                 return None;
             }
             part.parse().ok()
@@ -1470,7 +1474,14 @@ mod tests {
         assert!(!daemon_version_compatible("mc-host/0.1.0 "));
         assert!(!daemon_version_compatible("mc-host/0.1.0-rc1"));
         assert!(!daemon_version_compatible("mc-host/0.1.0.0"));
-        // Leading zeros are digits on both sides, so both accept them.
-        assert!(daemon_version_compatible("mc-host/0.01.0"));
+        // A redundant leading zero is not the canonical spelling, and the
+        // mismatch detail both sides emit calls the grammar canonical, so
+        // neither side may accept it.
+        assert!(!daemon_version_compatible("mc-host/0.01.0"));
+        assert!(!daemon_version_compatible("mc-host/00.1.0"));
+        assert!(!daemon_version_compatible("mc-host/0.1.00"));
+        assert!(!daemon_version_compatible("mc-host/01.2.3"));
+        // A single zero component is canonical and stays accepted.
+        assert!(daemon_version_compatible("mc-host/0.1.0"));
     }
 }
