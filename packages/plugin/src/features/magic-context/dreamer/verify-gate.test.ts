@@ -66,24 +66,31 @@ function seedClaim(db: Database, content: string, key: string): string {
     return (result.result.payload as { claim: { publicClaimId: string } }).claim.publicClaimId;
 }
 
-function seedAntiMemory(db: Database): string {
+function seedAntiMemory(
+    db: Database,
+    overrides: { rootCause?: string; rejectedStrategy?: string } = {},
+): string {
     const result = createAntiMemory(
         db,
-        { producer: "gate-test", operationKey: "seed-anti" },
+        {
+            producer: "gate-test",
+            operationKey: `seed-anti-${overrides.rejectedStrategy ?? "default"}`,
+        },
         {
             projectId: ensureProject(db, PROJECT),
             payload: {
                 trigger: "session caching",
                 rejectedStrategy: "Redis",
                 rejectionReason: "split ownership",
+                ...overrides,
             },
             provenance: {
-                sourceLocator: "test://gate/anti",
+                sourceLocator: `test://gate/anti-${overrides.rejectedStrategy ?? "default"}`,
                 sourceContent: "Redis rejected",
                 extractor: "test",
                 extractorVersion: "1",
                 extractorRunId: "seed",
-                independenceKey: "anti",
+                independenceKey: `anti-${overrides.rejectedStrategy ?? "default"}`,
                 sourceTrustClass: "explicit_user",
             },
             actor: "user:test",
@@ -183,6 +190,33 @@ describe("claim-current verify gate", () => {
                 category: "REJECTED_APPROACH",
                 mappedFiles: [],
             });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("excludes an oversized anti-memory so one record cannot fail the batch", async () => {
+        const db = freshDb();
+        const dir = projectDir();
+        try {
+            const ordinary = seedAntiMemory(db);
+            const oversized = seedAntiMemory(db, {
+                rejectedStrategy: "Memcached",
+                rootCause: "why ".repeat(4_000),
+            });
+            __setVerificationPathsTestHooks({
+                execFile: async () => Promise.reject(new Error("git unavailable")),
+            });
+
+            const gate = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 3_000,
+            });
+
+            expect(gate.inScopeIds).toEqual([ordinary]);
+            expect(gate.inScopeIds).not.toContain(oversized);
         } finally {
             closeQuietly(db);
         }

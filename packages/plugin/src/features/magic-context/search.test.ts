@@ -545,6 +545,44 @@ describe("unifiedSearch", () => {
         ).toEqual([]);
     });
 
+    it("retries a stale current-state read instead of dropping the warning lane", async () => {
+        const project = "git:anti-stale-read";
+        const anti = seedAntiMemory(db, project, "stale-read");
+        const realRead = claimCurrentState.readProjectMemoryCurrentState;
+        let reads = 0;
+        // `stale` is what the provider reports when a generation moves during
+        // hydration, which any concurrent claim write can cause.
+        const spy = spyOn(claimCurrentState, "readProjectMemoryCurrentState").mockImplementation(
+            (database, request) => {
+                reads += 1;
+                if (reads === 1) return { status: "stale", reasons: ["test"] };
+                return realRead(database, request);
+            },
+        );
+        try {
+            const results = await unifiedSearch(
+                db,
+                "session-anti",
+                project,
+                "Redis session caching",
+                {
+                    sources: ["memory"],
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    memoryPolicySurface: "explicit_search",
+                },
+            );
+            expect(results).toHaveLength(1);
+            expect(results[0]).toMatchObject({
+                source: "anti_memory",
+                publicClaimId: anti.publicClaimId,
+            });
+            expect(reads).toBeGreaterThan(1);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     it("does not match a prompt on the exception where the rejection does not apply", async () => {
         const project = "git:anti-nonapplicable";
         seedAntiMemory(db, project, "nonapplicable", Date.now(), {

@@ -29,6 +29,11 @@ function minOf(values: readonly number[]): number {
     return values.reduce((minimum, value) => Math.min(minimum, value), Number.POSITIVE_INFINITY);
 }
 
+/** Per-claim content ceiling for inclusion in a verification batch. A batch
+ *  interpolates up to VERIFY_BATCH_SIZE contents into one prompt, so this bounds
+ *  the request a single record can demand. */
+const MAX_VERIFY_CLAIM_CONTENT_BYTES = 8192;
+
 function ensureBroadCycleStart(args: {
     db: Database;
     projectIdentity: string;
@@ -101,9 +106,21 @@ export async function partitionVerifyScope(args: {
     // demoted anti-memory reads as never-verified (`verifiedAt() === 0`) and
     // re-enters every subsequent batch, re-asking the model a question it
     // already answered until the TTL lapses.
+    //
+    // Oversized content is also excluded. `buildVerifyPrompt` interpolates each
+    // claim's content whole and a batch holds up to VERIFY_BATCH_SIZE records,
+    // and anti-memory payload fields carry no write-side length ceiling — so one
+    // outsized warning can push the request past the verifier's limit and fail
+    // the entire batch, repeatedly, because an unverified record stays eligible
+    // for the next pass. Truncating instead would be worse than skipping: the
+    // prompt asks for the complete field-labeled content back on UPDATE, so a
+    // shortened copy would round-trip into the stored record. A skipped record
+    // stays visible to explicit search, labeled, and stays out of automatic
+    // surfaces for want of VERIFIED maturity.
     const candidates = active.filter((claim) =>
         claim.category === ANTI_MEMORY_CATEGORY
-            ? claim.verification.latestOutcome !== "stale"
+            ? claim.verification.latestOutcome !== "stale" &&
+              Buffer.byteLength(claim.content, "utf8") <= MAX_VERIFY_CLAIM_CONTENT_BYTES
             : mappedFiles(claim).length > 0,
     );
 

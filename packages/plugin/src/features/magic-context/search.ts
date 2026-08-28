@@ -860,22 +860,32 @@ async function searchAntiMemories(args: {
     // One closure = one authorization/surface/lifecycle setting, shared by the
     // hydration read and the post-embedding recheck below, so the two reads
     // cannot drift: the provider stays the single authority on visibility.
+    //
+    // `stale` is a routine outcome, not a failure: the provider reports it when
+    // a project, policy, or workspace generation moves during hydration, which
+    // any concurrent claim write can cause. Giving up on the first one would
+    // drop the whole warning lane for an unrelated write, so it is retried once
+    // against the new snapshot — the same two-attempt shape the locator lane
+    // uses. Persisting past that returns null and the caller fails closed.
     const readAntiMemoryState = (publicClaimIds: readonly string[]) => {
-        const result = readProjectMemoryCurrentState(args.db, {
-            publicClaimIds: [...publicClaimIds],
-            projectIds,
-            workspaceAuthorization: {
-                ownProjectIds,
-                sharedCategories: workspace.shareCategories ?? [],
-            },
-            workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
-            workspaceIdentities: workspace.identities,
-            surface: "explicit_search",
-            lifecycleStates: ["active"],
-        });
-        return result.status === "ok"
-            ? result.items.filter((item) => item.category === ANTI_MEMORY_CATEGORY)
-            : null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const result = readProjectMemoryCurrentState(args.db, {
+                publicClaimIds: [...publicClaimIds],
+                projectIds,
+                workspaceAuthorization: {
+                    ownProjectIds,
+                    sharedCategories: workspace.shareCategories ?? [],
+                },
+                workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+                workspaceIdentities: workspace.identities,
+                surface: "explicit_search",
+                lifecycleStates: ["active"],
+            });
+            if (result.status === "ok") {
+                return result.items.filter((item) => item.category === ANTI_MEMORY_CATEGORY);
+            }
+        }
+        return null;
     };
     // The state read uses the explicit-search surface (the only surface whose
     // candidate query includes anti-memory), so the automatic-surface policy
