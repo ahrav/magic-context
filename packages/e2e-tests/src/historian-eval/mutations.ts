@@ -260,52 +260,62 @@ function runFalseAuthoritativeClass(
 }
 
 /**
- * Aggregate one positive-claim mutation applied to EVERY expected claim.
+ * Aggregate one mutation applied across every variant it has, requiring all of
+ * them to be caught.
  *
- * A scenario may declare several, and mutating only the first leaves the rest
- * unexercised: a scorer regression that stops enforcing the second or third claim
- * still trips on the first, so admission evidence stays green while the release
- * ships claims whose enforcement nothing ever demonstrated. The count is recorded
- * in the detail so a regression back to first-claim-only is visible in the
+ * Mutating a single variant leaves the rest unexercised: a scorer regression that
+ * stops enforcing the second expected claim, or one specific wrong-category
+ * pairing, still trips on the variant that IS mutated, so admission evidence stays
+ * green while the release ships enforcement nothing demonstrated. The count is
+ * recorded in the detail so a regression back to one variant is visible in the
  * published artifact.
  */
-function aggregatePerClaim(
+function aggregateChecks(
     mutationClass: MutationClass,
+    unit: string,
     checks: readonly { green: boolean; detail: string }[],
 ): MutationResult {
+    if (checks.length === 0) {
+        return { mutationClass, applicable: true, green: false, detail: `no ${unit} to mutate` };
+    }
     const failure = checks.findIndex((check) => !check.green);
     if (failure !== -1) {
         return {
             mutationClass,
             applicable: true,
             green: false,
-            detail: `expected claim ${failure + 1} of ${checks.length}: ${checks[failure].detail}`,
+            detail: `${unit} ${failure + 1} of ${checks.length}: ${checks[failure].detail}`,
         };
     }
     return {
         mutationClass,
         applicable: true,
         green: true,
-        detail: `all ${checks.length} expected claim(s) caught: ${checks[0].detail}`,
+        detail: `all ${checks.length} ${unit}(s) caught: ${checks[0].detail}`,
     };
 }
 
 function runWrongCategory(scenario: HistorianEvalScenario): MutationResult {
-    const checks = scenario.gold.expectedClaims.map((target, index) => {
-        const facts = goldSatisfyingFacts(scenario);
-        // Derived from the production taxonomy, never a hardcoded name:
-        // `promoteSessionFactsDurable` silently DROPS facts whose category is
-        // outside `V2_MEMORY_CATEGORIES`, so a drifted literal would land at the
-        // same scored/recall outcome as dropped-gold-fact and this class would
-        // silently stop testing miscategorization.
-        const wrongCategory = V2_MEMORY_CATEGORIES.find((category) => category !== target.category);
-        if (wrongCategory === undefined) {
-            throw new Error("wrong-category mutation requires at least two promotable categories");
-        }
-        facts[index] = { ...facts[index], category: wrongCategory };
-        return checkMutationOutcome("wrong-category", baselineOutput(scenario, facts), scenario);
-    });
-    return aggregatePerClaim("wrong-category", checks);
+    // Every claim against every OTHER category, not one representative pairing.
+    // Picking the first non-matching category sent every non-PROJECT_RULES claim
+    // to PROJECT_RULES and PROJECT_RULES claims to ARCHITECTURE, so category
+    // enforcement was demonstrated for one pairing per claim: a scorer that
+    // wrongly accepted NAMING for a CONFIG_VALUES expectation was never tested.
+    //
+    // Categories come from the production taxonomy, never hardcoded names:
+    // `promoteSessionFactsDurable` silently DROPS facts whose category is outside
+    // `V2_MEMORY_CATEGORIES`, so a drifted literal would land at the same
+    // scored/recall outcome as dropped-gold-fact and this class would silently
+    // stop testing miscategorization.
+    const checks = scenario.gold.expectedClaims.flatMap((target, index) =>
+        V2_MEMORY_CATEGORIES.filter((category) => category !== target.category).map((wrongCategory) => {
+            const facts = goldSatisfyingFacts(scenario);
+            facts[index] = { ...facts[index], category: wrongCategory };
+            const check = checkMutationOutcome("wrong-category", baselineOutput(scenario, facts), scenario);
+            return { ...check, detail: `${target.id} as ${wrongCategory}: ${check.detail}` };
+        }),
+    );
+    return aggregateChecks("wrong-category", "category pairing", checks);
 }
 
 function runDroppedGoldFact(scenario: HistorianEvalScenario): MutationResult {
@@ -313,7 +323,7 @@ function runDroppedGoldFact(scenario: HistorianEvalScenario): MutationResult {
         const facts = goldSatisfyingFacts(scenario).filter((_fact, factIndex) => factIndex !== index);
         return checkMutationOutcome("dropped-gold-fact", baselineOutput(scenario, facts), scenario);
     });
-    return aggregatePerClaim("dropped-gold-fact", checks);
+    return aggregateChecks("dropped-gold-fact", "expected claim", checks);
 }
 
 function runNearMiss(scenario: HistorianEvalScenario): MutationResult {
@@ -329,7 +339,7 @@ function runNearMiss(scenario: HistorianEvalScenario): MutationResult {
         facts[index] = { ...facts[index], content: `Recorded decision: ${perturbed}.` };
         return checkMutationOutcome("near-miss-perturbation", baselineOutput(scenario, facts), scenario);
     });
-    return aggregatePerClaim("near-miss-perturbation", checks);
+    return aggregateChecks("near-miss-perturbation", "expected claim", checks);
 }
 
 function runStructuralOverlap(scenario: HistorianEvalScenario): MutationResult {

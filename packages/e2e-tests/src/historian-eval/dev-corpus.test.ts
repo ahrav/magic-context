@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildReleaseTuple, lintScenario, parseScenario, type HistorianEvalScenario } from "./contract";
+import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
 import { runMutationBattery } from "./mutations";
 import { CORPUS_SIZE_BUDGET } from "./promote";
 
@@ -60,6 +61,34 @@ describe("dev corpus", () => {
         expect(records.length).toBeGreaterThan(0);
         for (const record of records) {
             expect(record.shared.length).toBeGreaterThan(0);
+        }
+    });
+
+    test("positive-claim mutations cover every expected claim and every wrong category", () => {
+        const multi = parseCorpus().filter((scenario) => scenario.gold.expectedClaims.length > 1);
+        // Most of the corpus declares several expected claims, so mutating only
+        // index 0 left the rest unexercised: a scorer regression that stopped
+        // enforcing the second or third claim would still trip on the first and
+        // the evidence would stay green.
+        expect(multi.length).toBeGreaterThan(0);
+        const artifact = runMutationBattery(multi);
+        expect(artifact.green).toBe(true);
+        for (const [index, entry] of artifact.scenarios.entries()) {
+            const claimCount = multi[index].gold.expectedClaims.length;
+            for (const mutationClass of ["dropped-gold-fact", "near-miss-perturbation"]) {
+                const result = entry.results.find((candidate) => candidate.mutationClass === mutationClass);
+                expect(result).toBeDefined();
+                // The detail records how many variants were actually mutated, so a
+                // regression to one variant is visible in the evidence.
+                expect(result!.detail).toContain(`all ${claimCount} expected claim(s)`);
+            }
+            // wrong-category is a matrix, not one representative pairing: a scorer
+            // may enforce categories for one pair and not another.
+            const wrongCategory = entry.results.find((candidate) => candidate.mutationClass === "wrong-category");
+            expect(wrongCategory).toBeDefined();
+            expect(wrongCategory!.detail).toContain(
+                `all ${claimCount * (V2_MEMORY_CATEGORIES.length - 1)} category pairing(s)`,
+            );
         }
     });
 
