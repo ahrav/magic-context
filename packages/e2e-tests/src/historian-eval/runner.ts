@@ -435,9 +435,28 @@ function resolveRepoCommitSha(): string {
     if (cachedRepoCommitSha !== null) return cachedRepoCommitSha;
     let sha = "unknown";
     try {
-        const result = Bun.spawnSync(["git", "rev-parse", "HEAD"], { stdout: "pipe", stderr: "ignore" });
-        const candidate = result.success ? result.stdout.toString().trim() : "";
-        if (/^[0-9a-f]{40}$/.test(candidate)) sha = candidate;
+        const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { stdout: "pipe", stderr: "ignore" });
+        const candidate = head.success ? head.stdout.toString().trim() : "";
+        if (/^[0-9a-f]{40}$/.test(candidate)) {
+            sha = candidate;
+            // A dirty worktree did not execute HEAD. Recording the clean SHA
+            // would let two experiments built from different uncommitted trees
+            // carry the same system tuple and be combined into one report, so the
+            // local modifications become part of the identity: the digest covers
+            // the tracked diff plus the porcelain status, which names untracked
+            // files (their contents stay outside it).
+            const status = Bun.spawnSync(["git", "status", "--porcelain"], { stdout: "pipe", stderr: "ignore" });
+            const porcelain = status.success ? status.stdout.toString() : "";
+            if (porcelain.trim().length > 0) {
+                const diff = Bun.spawnSync(["git", "diff", "HEAD"], { stdout: "pipe", stderr: "ignore" });
+                const digest = new Bun.CryptoHasher("sha256")
+                    .update(porcelain)
+                    .update(diff.success ? diff.stdout.toString() : "")
+                    .digest("hex")
+                    .slice(0, 12);
+                sha = `${candidate}-dirty.${digest}`;
+            }
+        }
     } catch {
         sha = "unknown";
     }
@@ -1192,8 +1211,24 @@ class ScenarioRunner {
         // gate inspects only what the probe turns themselves add.
         const seed = await harness.client.session.messages({ path: { id: sessionId } });
         for (const id of messageIds(seed.data)) this.seenProbeMessageIds.add(id);
+        // Probe turns are ordinary prompts, so the transform can start another
+        // historian pass on one — reachable whenever a probe reply's usage crosses
+        // the execution threshold. That pass is invisible to everything that has
+        // already run: `assertNoScriptDrift` is done, `collectedRuns` is closed,
+        // and the claim snapshot is taken after this loop, so its compartments and
+        // claims would reach structural, recall, and later-probe scoring without
+        // appearing in the run inventory. The declared schedule is the experiment,
+        // so an extra pass invalidates the run rather than adding to it.
+        const runRowsBefore = this.historianRunRows(harness, sessionId).length;
         for (const probe of this.scenario.probes) {
             exchanges.push(await this.driveProbe(harness, sessionId, probe));
+        }
+        const runRowsAfter = this.historianRunRows(harness, sessionId).length;
+        if (runRowsAfter !== runRowsBefore) {
+            throw new RunAbort(
+                "harness-failure",
+                `${runRowsAfter - runRowsBefore} undeclared historian run(s) fired during the probe phase; the scenario's declared schedule is ${this.scenario.trigger.expectedHistorianRuns}`,
+            );
         }
         return exchanges;
     }
@@ -1334,7 +1369,16 @@ class ScenarioRunner {
     private capturedProbePayload(harness: TestHarness, requestCountBefore: number): string | null {
         if (this.options.mode.kind === "live") return null;
         const probeRequests = harness.mock.requests().slice(requestCountBefore);
-        if (probeRequests.length === 0) return null;
+        // Scripted mode IS the capture-capable route, so zero captured requests
+        // is capture drift, not an absent payload. Returning null would make
+        // `assertNoGoldRangeLeak` skip silently and let the probe take a normal
+        // PASS with the evidence its verdict depends on never collected.
+        if (probeRequests.length === 0) {
+            throw new RunAbort(
+                "harness-failure",
+                "scripted probe turn captured no provider request; the leak gate has no payload to inspect",
+            );
+        }
         const chunks: string[] = [];
         for (const request of probeRequests) {
             const messages = Array.isArray(request.body.messages) ? request.body.messages : [];

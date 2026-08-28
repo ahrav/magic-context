@@ -186,9 +186,16 @@ export interface HistorianEvalScenario {
 function parsePredicate(raw: unknown, label: string): ContentPredicate {
     const value = record(raw, label);
     exact(value, ["kind", "value"], label);
+    const text = string(value.value, `${label}.value`);
+    // Bounded for the same reason the transcript maxima exist: a predicate value
+    // is normalized and substring-scanned repeatedly — per visible claim during
+    // scoring, and all-pairs during the freeze lint's subsumption check — so an
+    // unbounded value multiplies through those scans and can stall lint ahead of
+    // every semantic check. Well beyond any authored formation.
+    if (text.length > MAX_PREDICATE_VALUE_CHARS) fail(`${label}.value: above-operational-maximum`);
     return {
         kind: enumeration(value.kind, ["normalized-substring"], `${label}.kind`),
-        value: string(value.value, `${label}.value`),
+        value: text,
     };
 }
 
@@ -211,6 +218,9 @@ export const MAX_TURN_TEXT_CHARS = 20_000;
  * cap is enforced before the arrays are mapped, so the parse itself stays cheap.
  */
 export const MAX_EXPECTATION_ENTRIES = 100;
+
+/** Operational maximum for one predicate value; see `parsePredicate`. */
+export const MAX_PREDICATE_VALUE_CHARS = 2_000;
 /**
  * Reject a gold answer the answer envelope cannot carry.
  *
@@ -426,12 +436,20 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
     // matching the longer necessarily matches the shorter — one injected fact
     // credits both expectations, giving full recall for half the formation. The
     // check above cannot see it because the strings differ.
-    for (const [leftIndex, left] of expectedClaims.entries()) {
-        for (const right of expectedClaims.slice(leftIndex + 1)) {
+    //
+    // Normalized once per claim, not once per pair: the comparison is all-pairs,
+    // so normalizing inside the inner loop would rescan the same values O(n^2)
+    // times. `parseExpectedClaim` bounds each value's length, which is what keeps
+    // the remaining containment scans bounded too.
+    const normalizedPredicates = expectedClaims.map((claim) => ({
+        id: claim.id,
+        category: claim.category,
+        value: normalizeContent(claim.predicate.value),
+    }));
+    for (const [leftIndex, left] of normalizedPredicates.entries()) {
+        for (const right of normalizedPredicates.slice(leftIndex + 1)) {
             if (left.category !== right.category) continue;
-            const leftValue = normalizeContent(left.predicate.value);
-            const rightValue = normalizeContent(right.predicate.value);
-            if (leftValue.includes(rightValue) || rightValue.includes(leftValue)) {
+            if (left.value.includes(right.value) || right.value.includes(left.value)) {
                 fail(
                     `${label}.gold.expectedClaims: subsumed-predicate (${left.id} and ${right.id} share category ${left.category} and one predicate contains the other)`,
                 );

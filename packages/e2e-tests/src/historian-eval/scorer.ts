@@ -660,6 +660,73 @@ function probeCoverageError(
 }
 
 /**
+ * Recorded per-run telemetry must agree with the snapshot's `historian_runs`.
+ *
+ * `healingFindings` decides structural verdicts entirely from the record's
+ * `discardedLast`, `emittedCompartments`, and `lookaheadMargin`, and the snapshot
+ * that travels beside the record retains the authoritative rows — so trusting
+ * the record means a hand-edited `discardedLast: false` with a widened margin
+ * silently suppresses an unhealed-discard or forced-keep finding. The derived
+ * fields are recomputed from the rows rather than compared, since that is how the
+ * runner produced them.
+ *
+ * Row COUNT is part of the agreement: an undeclared historian pass — one that
+ * fired during the probe phase, after the run inventory was assembled — leaves an
+ * extra row whose compartments and claims still reach scoring.
+ */
+function telemetryMismatch(
+    record: HistorianEvalRunRecord,
+    rows: ReadonlyArray<{
+        status: string;
+        failureReason: string | null;
+        chunkStartOrdinal: number | null;
+        chunkEndOrdinal: number | null;
+        compartmentsProduced: number | null;
+        factsEmitted: number | null;
+        discardedLast: number;
+    }>,
+    maxPersistedEnd: number | null,
+): string | null {
+    if (rows.length !== record.historianRuns.length) {
+        return `snapshot holds ${rows.length} historian run row(s), record carries ${record.historianRuns.length}`;
+    }
+    for (const [index, run] of record.historianRuns.entries()) {
+        const row = rows[index];
+        const discardedLast = row.discardedLast === 1;
+        const persisted = row.compartmentsProduced ?? 0;
+        const expected = {
+            status: row.status,
+            failureReason: row.failureReason,
+            chunkStartOrdinal: row.chunkStartOrdinal,
+            chunkEndOrdinal: row.chunkEndOrdinal,
+            persistedCompartments: persisted,
+            factsEmitted: row.factsEmitted ?? 0,
+            discardedLast,
+            emittedCompartments: persisted + (discardedLast ? 1 : 0),
+            lookaheadMargin:
+                row.chunkEndOrdinal !== null && maxPersistedEnd !== null
+                    ? row.chunkEndOrdinal - maxPersistedEnd
+                    : null,
+        };
+        const actual = {
+            status: run.status,
+            failureReason: run.failureReason,
+            chunkStartOrdinal: run.chunkStartOrdinal,
+            chunkEndOrdinal: run.chunkEndOrdinal,
+            persistedCompartments: run.persistedCompartments,
+            factsEmitted: run.factsEmitted,
+            discardedLast: run.discardedLast,
+            emittedCompartments: run.emittedCompartments,
+            lookaheadMargin: run.lookaheadMargin,
+        };
+        if (canonicalJson(actual) !== canonicalJson(expected)) {
+            return `run ${run.runIndex} telemetry ${canonicalJson(actual)} disagrees with its snapshot row ${canonicalJson(expected)}`;
+        }
+    }
+    return null;
+}
+
+/**
  * Score a run record produced by the replay runner. ERROR-flagged records
  * propagate their reason with no rates computed (R6). A live historian
  * whose every attempt failed validation is model behavior, not
@@ -827,6 +894,65 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 record.scenarioId,
                 "record-snapshot-mismatch",
                 `run record and snapshot disagree on the claim behind ${divergent.length} locator(s): [${divergent.slice(0, 5).join(", ")}]`,
+                record.system,
+            );
+        }
+
+        // Telemetry cross-check before any structural verdict is derived from it.
+        let runRows: Array<{
+            status: string;
+            failureReason: string | null;
+            chunkStartOrdinal: number | null;
+            chunkEndOrdinal: number | null;
+            compartmentsProduced: number | null;
+            factsEmitted: number | null;
+            discardedLast: number;
+        }>;
+        let maxPersistedEnd: number | null;
+        try {
+            runRows = db
+                .prepare(
+                    `SELECT status, failure_reason AS failureReason, chunk_start_ordinal AS chunkStartOrdinal,
+                            chunk_end_ordinal AS chunkEndOrdinal, compartments_produced AS compartmentsProduced,
+                            facts_emitted AS factsEmitted, discarded_last AS discardedLast
+                       FROM historian_runs WHERE session_id = ? ORDER BY id ASC`,
+                )
+                .all(record.sessionId) as typeof runRows;
+            const maxRow = db
+                .prepare("SELECT MAX(end_message) AS m FROM compartments WHERE session_id = ?")
+                .get(record.sessionId) as { m: number | null } | null;
+            maxPersistedEnd = maxRow?.m ?? null;
+        } catch (error) {
+            return errorScore(
+                record.scenarioId,
+                "unreadable-snapshot",
+                `context DB snapshot ${record.contextDbSnapshotPath} could not be queried for run telemetry: ${errorMessage(error)}`,
+                record.system,
+            );
+        }
+        const mismatch = telemetryMismatch(record, runRows, maxPersistedEnd);
+        if (mismatch !== null) {
+            return errorScore(record.scenarioId, "record-snapshot-mismatch", mismatch, record.system);
+        }
+
+        // Per-probe locator sets must name claims the record actually recorded as
+        // injected. Editing one converts a genuine wrong answer into
+        // `error-trimmed` — excluding it from scored metrics — or admits a
+        // claim-id answer for a claim that was never injected. This bounds the
+        // set to real, snapshot-backed claims; it cannot prove a locator was
+        // injected for THIS turn, which needs per-probe evidence the runner does
+        // not persist verifiably today.
+        const recordedLocatorSet = new Set(record.injectedClaims.map((claim) => claim.revisionLocator));
+        const foreignProbeLocators = record.probes.flatMap((exchange) =>
+            exchange.injectedRevisionLocators
+                .filter((locator) => !recordedLocatorSet.has(locator))
+                .map((locator) => `${exchange.probeId}:${locator}`),
+        );
+        if (foreignProbeLocators.length > 0) {
+            return errorScore(
+                record.scenarioId,
+                "record-snapshot-mismatch",
+                `probe injected-locator set names ${foreignProbeLocators.length} claim(s) absent from the record's injected claims: [${foreignProbeLocators.slice(0, 5).join(", ")}]`,
                 record.system,
             );
         }

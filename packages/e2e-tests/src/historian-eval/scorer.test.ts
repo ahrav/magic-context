@@ -128,7 +128,7 @@ function makeSnapshot(args: {
 }
 
 function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunArtifact {
-    return {
+    const run: HistorianRunArtifact = {
         runIndex: 1,
         rawOutput: goldenRawOutput(),
         status: "success",
@@ -136,14 +136,20 @@ function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunA
         repairUsed: false,
         attemptCount: 1,
         discardedLast: false,
-        lookaheadMargin: 5,
+        lookaheadMargin: 0,
         emittedCompartments: 1,
         persistedCompartments: 1,
         factsEmitted: 2,
         chunkStartOrdinal: 1,
-        chunkEndOrdinal: 8,
+        chunkEndOrdinal: 20,
         ...overrides,
     };
+    // A discarding run emitted one more compartment than it persisted, which is
+    // how the runner derives the field. Deriving it here keeps every override
+    // coherent instead of requiring each call site to remember the pairing.
+    return overrides.emittedCompartments !== undefined
+        ? run
+        : { ...run, emittedCompartments: run.persistedCompartments + (run.discardedLast ? 1 : 0) };
 }
 
 function makeRecord(
@@ -152,6 +158,12 @@ function makeRecord(
     overrides: Partial<HistorianEvalRunRecord> = {},
 ): HistorianEvalRunRecord {
     const locators = fixture.injectedClaims.map((claim) => claim.revisionLocator);
+    const maxPersistedEnd =
+        (
+            fixture.db
+                .prepare("SELECT MAX(end_message) AS m FROM compartments WHERE session_id = ?")
+                .get(SESSION_ID) as { m: number | null } | null
+        )?.m ?? null;
     const probes: ProbeExchange[] = scenario.probes.map((probe) => {
         let answerRaw = "4096";
         if (probe.answerType === "multiple-choice") answerRaw = probe.goldAnswer;
@@ -167,7 +179,36 @@ function makeRecord(
             payloadText: null,
         };
     });
-    return {
+    const record = buildRecord();
+    // A real snapshot always carries the `historian_runs` rows the record was
+    // derived from, and the scorer now cross-checks the two. Writing them here
+    // from the record's own runs keeps the fixture representative; `chunkEndOrdinal`
+    // is normalized so each run's `lookaheadMargin` is the margin the snapshot's
+    // compartments actually imply, whatever ranges a test supplies.
+    fixture.db.prepare("DELETE FROM historian_runs WHERE session_id = ?").run(SESSION_ID);
+    const insertRun = fixture.db.prepare(
+        `INSERT INTO historian_runs
+             (session_id, run_kind, status, failure_reason, chunk_start_ordinal, chunk_end_ordinal,
+              compartments_produced, facts_emitted, discarded_last, created_at)
+         VALUES (?, 'incremental', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const run of record.historianRuns) {
+        insertRun.run(
+            SESSION_ID,
+            run.status,
+            run.failureReason,
+            run.chunkStartOrdinal,
+            run.chunkEndOrdinal,
+            run.persistedCompartments,
+            run.factsEmitted,
+            run.discardedLast ? 1 : 0,
+            fixture.nowMs,
+        );
+    }
+    return record;
+
+    function buildRecord(): HistorianEvalRunRecord {
+      const draft = {
         schema: RUN_RECORD_SCHEMA,
         scenarioId: scenario.id,
         scenarioFingerprint: scenarioFingerprint(scenario),
@@ -200,7 +241,16 @@ function makeRecord(
         contextDbSnapshotPath: fixture.dbPath,
         error: null,
         ...overrides,
-    };
+      } satisfies HistorianEvalRunRecord;
+      return {
+          ...draft,
+          historianRuns: draft.historianRuns.map((run) =>
+              run.lookaheadMargin === null || maxPersistedEnd === null
+                  ? run
+                  : { ...run, chunkEndOrdinal: maxPersistedEnd + run.lookaheadMargin },
+          ),
+      };
+    }
 }
 
 /**
@@ -867,6 +917,75 @@ describe("scoreRunRecord", () => {
                 ],
             });
             expect(scoreRunRecord(invalid, scenario).verdict).not.toBe("ERROR");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("edited healing telemetry is caught against the snapshot's own run rows", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const honest = makeRecord(fixture, scenario, {
+                historianRuns: [goldenRun(), goldenRun({ runIndex: 2, discardedLast: true })],
+            });
+            expect(scoreRunRecord(honest, scenario).failReasons).toContain("structural");
+
+            // Flip the discard flag off, as a hand-edited artifact would, to
+            // suppress the unhealed-discard finding. The snapshot still holds the
+            // authoritative row.
+            const edited = {
+                ...honest,
+                historianRuns: honest.historianRuns.map((run) =>
+                    run.runIndex === 2 ? { ...run, discardedLast: false, emittedCompartments: 1 } : run,
+                ),
+            };
+            const score = scoreRunRecord(edited, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an extra historian run in the snapshot is caught by row-count disagreement", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // An undeclared pass — one that fired during the probe phase, after
+            // the inventory was assembled — leaves a row the record cannot name.
+            fixture.db
+                .prepare(
+                    `INSERT INTO historian_runs
+                         (session_id, run_kind, status, compartments_produced, facts_emitted, discarded_last, created_at)
+                     VALUES (?, 'incremental', 'success', 1, 1, 0, ?)`,
+                )
+                .run(SESSION_ID, fixture.nowMs);
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a probe locator set naming a claim the record never recorded is ERROR", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const forged = {
+                ...record,
+                probes: record.probes.map((exchange, index) =>
+                    index === 0
+                        ? { ...exchange, injectedRevisionLocators: [...exchange.injectedRevisionLocators, "loc-forged"] }
+                        : exchange,
+                ),
+            };
+            const score = scoreRunRecord(forged, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
         } finally {
             fixture.cleanup();
         }
