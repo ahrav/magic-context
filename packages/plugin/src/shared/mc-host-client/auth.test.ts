@@ -19,12 +19,12 @@ const DAEMON_ID = byteRange(0x60, 0x70);
 const DAEMON_VER = "mc-host/0.1.0";
 
 const SERVER_PROOF_LITERAL = Uint8Array.from([
-    234, 174, 245, 201, 145, 181, 54, 105, 225, 195, 92, 24, 185, 58, 79, 43, 27, 172, 41, 84, 85,
-    12, 15, 144, 129, 65, 174, 41, 163, 57, 206, 192,
+    64, 154, 84, 68, 23, 100, 116, 189, 2, 121, 137, 79, 177, 172, 107, 52, 108, 174, 152, 208, 218,
+    25, 249, 160, 154, 212, 42, 68, 91, 108, 85, 131,
 ]);
 const CLIENT_AUTH_LITERAL = Uint8Array.from([
-    168, 51, 199, 61, 160, 183, 32, 109, 223, 82, 6, 97, 222, 1, 81, 240, 135, 27, 140, 91, 196,
-    171, 21, 161, 69, 59, 214, 117, 64, 99, 228, 205,
+    184, 138, 243, 55, 0, 189, 88, 52, 54, 27, 4, 112, 129, 214, 202, 57, 252, 146, 75, 221, 119,
+    177, 247, 0, 193, 206, 206, 26, 90, 147, 247, 187,
 ]);
 
 function fakeClock(startMs = 0): { clock: MonotonicClock; advance: (ms: number) => void } {
@@ -131,12 +131,26 @@ async function expectAuthFailure(
 
 describe("computeProof literal vectors", () => {
     test("reproduces the committed server proof", () => {
-        const proof = computeProof(KEY, "subc-server-v1", CLIENT_NONCE, SERVER_NONCE, DAEMON_ID);
+        const proof = computeProof(
+            KEY,
+            "subc-server-v1",
+            CLIENT_NONCE,
+            SERVER_NONCE,
+            DAEMON_VER,
+            DAEMON_ID,
+        );
         expect(Array.from(proof)).toEqual(Array.from(SERVER_PROOF_LITERAL));
     });
 
     test("reproduces the committed client auth proof", () => {
-        const proof = computeProof(KEY, "subc-client-v1", CLIENT_NONCE, SERVER_NONCE, DAEMON_ID);
+        const proof = computeProof(
+            KEY,
+            "subc-client-v1",
+            CLIENT_NONCE,
+            SERVER_NONCE,
+            DAEMON_VER,
+            DAEMON_ID,
+        );
         expect(Array.from(proof)).toEqual(Array.from(CLIENT_AUTH_LITERAL));
     });
 
@@ -147,14 +161,50 @@ describe("computeProof literal vectors", () => {
             return copy;
         };
         const baseline = Array.from(
-            computeProof(KEY, "subc-server-v1", CLIENT_NONCE, SERVER_NONCE, DAEMON_ID),
+            computeProof(KEY, "subc-server-v1", CLIENT_NONCE, SERVER_NONCE, DAEMON_VER, DAEMON_ID),
         );
         const perturbed = [
-            computeProof(flip(KEY), "subc-server-v1", CLIENT_NONCE, SERVER_NONCE, DAEMON_ID),
-            computeProof(KEY, "subc-client-v1", CLIENT_NONCE, SERVER_NONCE, DAEMON_ID),
-            computeProof(KEY, "subc-server-v1", flip(CLIENT_NONCE), SERVER_NONCE, DAEMON_ID),
-            computeProof(KEY, "subc-server-v1", CLIENT_NONCE, flip(SERVER_NONCE), DAEMON_ID),
-            computeProof(KEY, "subc-server-v1", CLIENT_NONCE, SERVER_NONCE, flip(DAEMON_ID)),
+            computeProof(
+                flip(KEY),
+                "subc-server-v1",
+                CLIENT_NONCE,
+                SERVER_NONCE,
+                DAEMON_VER,
+                DAEMON_ID,
+            ),
+            computeProof(KEY, "subc-client-v1", CLIENT_NONCE, SERVER_NONCE, DAEMON_VER, DAEMON_ID),
+            computeProof(
+                KEY,
+                "subc-server-v1",
+                flip(CLIENT_NONCE),
+                SERVER_NONCE,
+                DAEMON_VER,
+                DAEMON_ID,
+            ),
+            computeProof(
+                KEY,
+                "subc-server-v1",
+                CLIENT_NONCE,
+                flip(SERVER_NONCE),
+                DAEMON_VER,
+                DAEMON_ID,
+            ),
+            computeProof(
+                KEY,
+                "subc-server-v1",
+                CLIENT_NONCE,
+                SERVER_NONCE,
+                DAEMON_VER,
+                flip(DAEMON_ID),
+            ),
+            computeProof(
+                KEY,
+                "subc-server-v1",
+                CLIENT_NONCE,
+                SERVER_NONCE,
+                `${DAEMON_VER}-changed`,
+                DAEMON_ID,
+            ),
         ];
         for (const proof of perturbed) {
             expect(Array.from(proof)).not.toEqual(baseline);
@@ -267,6 +317,14 @@ describe("authenticateClient transcript", () => {
         expect(io.writes.length).toBe(1);
     });
 
+    test("changing only daemon_ver invalidates the server proof", async () => {
+        const io = new FakeIo(
+            frameJson(serverProofMessage({ daemon_ver: `${DAEMON_VER}-mutated` })),
+        );
+        await expectAuthFailure(io, "proof_mismatch");
+        expect(io.writes.length).toBe(1);
+    });
+
     test("a daemon-id mismatch after a valid proof produces no ClientAuth", async () => {
         // The server proves knowledge of the key over a DIFFERENT daemon id:
         // the proof check passes, the identity check must still fail.
@@ -276,6 +334,7 @@ describe("authenticateClient transcript", () => {
             "subc-server-v1",
             CLIENT_NONCE,
             SERVER_NONCE,
+            DAEMON_VER,
             otherDaemonId,
         );
         const io = new FakeIo(

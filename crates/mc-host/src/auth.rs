@@ -137,12 +137,18 @@ pub fn compute_proof(
     domain: &str,
     client_nonce: &[u8; NONCE_LEN],
     server_nonce: &[u8; NONCE_LEN],
+    daemon_ver: &str,
     daemon_id: &[u8],
 ) -> [u8; PROOF_LEN] {
+    let daemon_ver_bytes = daemon_ver.as_bytes();
+    let daemon_ver_len =
+        u32::try_from(daemon_ver_bytes.len()).expect("auth messages bound daemon_ver to u32");
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(domain.as_bytes());
     mac.update(client_nonce);
     mac.update(server_nonce);
+    mac.update(&daemon_ver_len.to_be_bytes());
+    mac.update(daemon_ver_bytes);
     mac.update(daemon_id);
     mac.finalize().into_bytes().into()
 }
@@ -243,6 +249,7 @@ where
         SERVER_PROOF_DOMAIN,
         &hello.client_nonce,
         &server_nonce,
+        daemon_ver,
         daemon_id,
     );
 
@@ -265,6 +272,7 @@ where
         CLIENT_AUTH_DOMAIN,
         &hello.client_nonce,
         &server_nonce,
+        daemon_ver,
         daemon_id,
     );
     if !constant_time_eq(&expected_client_auth, &client_auth.client_auth) {
@@ -323,6 +331,7 @@ where
         SERVER_PROOF_DOMAIN,
         &client_nonce,
         &server_proof.server_nonce,
+        &server_proof.daemon_ver,
         &server_proof.daemon_id,
     );
     if !constant_time_eq(&expected_server_proof, &server_proof.server_proof) {
@@ -337,6 +346,7 @@ where
         CLIENT_AUTH_DOMAIN,
         &client_nonce,
         &server_proof.server_nonce,
+        &server_proof.daemon_ver,
         &server_proof.daemon_id,
     );
     write_message(
@@ -699,14 +709,21 @@ mod tests {
         for (domain, expected) in [
             (
                 SERVER_PROOF_DOMAIN,
-                "ea06076a980bc7558e45017df86de89f3d2fc09861f8460795dea31eadf40527",
+                "aae98ec5fcb04b243159e51f082ed655daf75f15172dd45ec4550782d8cc5312",
             ),
             (
                 CLIENT_AUTH_DOMAIN,
-                "a3bc64784dbd94c4f52799e0c66f7b2b8183aa4655594630245c5d4a2fa387a9",
+                "c2329009bf0e672c3948c134ab83d69f71642f7b4f7acc085163e426af5be0ee",
             ),
         ] {
-            let proof = compute_proof(&key, domain, &client_nonce, &server_nonce, &daemon_id);
+            let proof = compute_proof(
+                &key,
+                domain,
+                &client_nonce,
+                &server_nonce,
+                TEST_DAEMON_VER,
+                &daemon_id,
+            );
             let actual: String = proof.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(
                 actual, expected,
@@ -892,6 +909,7 @@ mod tests {
             CLIENT_AUTH_DOMAIN,
             &client_nonce,
             &server_proof.server_nonce,
+            &server_proof.daemon_ver,
             &server_proof.daemon_id,
         );
         write_auth_json(&mut client, &ClientAuth { client_auth }).await;
@@ -967,6 +985,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_auth_is_bound_to_the_server_reported_daemon_version() {
+        let key = vec![0x5a; MIN_KEY_LEN];
+        let daemon_id = [0x6b; DAEMON_ID_LEN];
+        let (mut client, mut server) = duplex(4096);
+        let key_task = key.clone();
+        let server_task = tokio::spawn(async move {
+            authenticate_server(
+                &mut server,
+                &key_task,
+                &daemon_id,
+                TEST_DAEMON_VER,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        let client_nonce = [0x11; NONCE_LEN];
+        write_auth_json(
+            &mut client,
+            &ClientHello {
+                client_nonce,
+                role: TEST_ROLE.to_owned(),
+            },
+        )
+        .await;
+        let server_proof: ServerProof = read_auth_json(&mut client).await;
+        let client_auth = compute_proof(
+            &key,
+            CLIENT_AUTH_DOMAIN,
+            &client_nonce,
+            &server_proof.server_nonce,
+            "mc-host-auth-test-mutated",
+            &server_proof.daemon_id,
+        );
+        write_auth_json(&mut client, &ClientAuth { client_auth }).await;
+
+        assert!(matches!(
+            server_task
+                .await
+                .expect("join")
+                .expect_err("a version-substituted client proof must fail"),
+            AuthError::InvalidClientAuth
+        ));
+    }
+
+    #[tokio::test]
     async fn over_cap_auth_message_is_rejected_before_allocation() {
         let key = vec![0x5a; MIN_KEY_LEN];
         let daemon_id = [0x6b; DAEMON_ID_LEN];
@@ -1031,6 +1095,7 @@ mod tests {
                 SERVER_PROOF_DOMAIN,
                 &hello.client_nonce,
                 &server_nonce,
+                TEST_DAEMON_VER,
                 &server_daemon_id,
             )
         } else {

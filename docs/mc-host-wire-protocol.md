@@ -193,18 +193,21 @@ Canonical JSON shapes:
 ```
 
 ```json
-{"daemon_id":[96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111],"server_nonce":[64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95],"daemon_ver":"mc-host/0.1.0","server_proof":[234,174,245,201,145,181,54,105,225,195,92,24,185,58,79,43,27,172,41,84,85,12,15,144,129,65,174,41,163,57,206,192]}
+{"daemon_id":[96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111],"server_nonce":[64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95],"daemon_ver":"mc-host/0.1.0","server_proof":[64,154,84,68,23,100,116,189,2,121,137,79,177,172,107,52,108,174,152,208,218,25,249,160,154,212,42,68,91,108,85,131]}
 ```
 
 ```json
-{"client_auth":[168,51,199,61,160,183,32,109,223,82,6,97,222,1,81,240,135,27,140,91,196,171,21,161,69,59,214,117,64,99,228,205]}
+{"client_auth":[184,138,243,55,0,189,88,52,54,27,4,112,129,214,202,57,252,146,75,221,119,177,247,0,193,206,206,26,90,147,247,187]}
 ```
 
-Those proofs use key bytes `00..1f`, client nonce `20..3f`, server nonce `40..5f`, and daemon ID `60..6f`. For domain `D`, proof bytes are:
+Those proofs use key bytes `00..1f`, client nonce `20..3f`, server nonce `40..5f`, daemon version `mc-host/0.1.0`, and daemon ID `60..6f`. For domain `D`, proof bytes are:
 
 ```text
-HMAC-SHA256(key, ASCII(D) || client_nonce || server_nonce || daemon_id)
+HMAC-SHA256(key, ASCII(D) || client_nonce || server_nonce ||
+            u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)
 ```
+
+`u32be(len(daemon_ver))` is the byte length of the UTF-8 `daemon_ver` encoded as a **big-endian** `u32`. It is the only big-endian integer in this otherwise little-endian protocol; the length prefix keeps the transcript injective because `daemon_ver` is the only variable-length field between the fixed-length nonces and the trailing `daemon_id`. Binding `daemon_ver` into both proofs means a peer without the key cannot tamper with the reported daemon version: a substituted version fails the server-proof check on the client and the client-auth check on the host.
 
 The client MUST compare server proof in constant time, then require `ServerProof.daemon_id` to equal the connection-file daemon ID. It MUST emit no `ClientAuth` until both checks succeed. The server MUST compare client proof in constant time. `role` is unverified reporting metadata and MUST NOT affect privilege, admission, or capacity.
 
