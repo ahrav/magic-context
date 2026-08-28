@@ -315,6 +315,37 @@ function findOrdinalRange(body: Record<string, unknown>): { start: number; end: 
     return { start: Math.min(...ordinals), end: Math.max(...ordinals) };
 }
 
+/**
+ * Envelopes production injects summarized content into. Their bodies are
+ * compartment summaries and claim-backed memories — derived text, not
+ * surviving raw history.
+ */
+const INJECTED_MEMORY_WRAPPERS = [
+    "session-history",
+    "session-history-since",
+    "new-compartments",
+    "project-memory",
+    "user-profile",
+    "new-user-profile",
+] as const;
+
+/**
+ * Drop injected-memory blocks so the leak gate sees only raw history.
+ *
+ * The gate asks whether a gold-bearing raw message SURVIVED the splice. A
+ * valid historian may quote a gold turn verbatim in a compartment summary or
+ * a promoted claim, and that text is then legitimately re-injected as memory
+ * after the raw message was removed — searching the whole payload would read
+ * that as a leak and turn correct output into an infrastructure ERROR.
+ */
+function stripInjectedMemoryBlocks(payloadText: string): string {
+    let text = payloadText;
+    for (const wrapper of INJECTED_MEMORY_WRAPPERS) {
+        text = text.replaceAll(new RegExp(`<${wrapper}>[\\s\\S]*?</${wrapper}>`, "g"), " ");
+    }
+    return text;
+}
+
 function buildProbePrompt(probe: Probe): string {
     const shared =
         "Answer strictly from the project memory and session history already available to you in this conversation. " +
@@ -1154,11 +1185,12 @@ class ScenarioRunner {
      */
     private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null): void {
         if (payloadText === null) return;
+        const rawOnly = stripInjectedMemoryBlocks(payloadText);
         for (const claim of this.probeGoldClaims(probe)) {
             for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
                 const authored = this.scenario.transcript.turns[turn];
                 for (const raw of [authored.user, authored.assistant]) {
-                    if (payloadText.includes(raw)) {
+                    if (rawOnly.includes(raw)) {
                         throw new RunAbort(
                             "gold-range-leak",
                             `probe ${probe.id}: raw transcript text of gold turn ${turn} survived in the probe payload`,

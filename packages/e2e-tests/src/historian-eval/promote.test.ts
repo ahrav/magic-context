@@ -317,7 +317,34 @@ describe("promoteRelease", () => {
             writeEvidence(inapplicableMandatory);
             expect(() => loadRelease(releaseDir)).toThrow(/inapplicable-class-dropped-gold-fact/);
 
+            // An artifact whose own aggregate says the battery is red is not
+            // loadable, however green its per-scenario entries are.
             writeFileSync(evidencePath, original);
+            const globallyRed = readEvidence();
+            globallyRed.scenarios.push({
+                scenarioId: "hse-scenario-not-in-release",
+                scenarioFingerprint: "a".repeat(64),
+                green: false,
+                results: [{ mutationClass: "battery-coverage", applicable: true, green: false, detail: "red" }],
+            });
+            globallyRed.green = false;
+            writeEvidence(globallyRed);
+            expect(() => loadRelease(releaseDir)).toThrow(/mutation-evidence: not-green/);
+
+            // And an entry for a scenario outside the release is evidence
+            // about something the release does not contain.
+            writeFileSync(evidencePath, original);
+            const extraGreen = readEvidence();
+            extraGreen.scenarios.push({
+                ...extraGreen.scenarios[0],
+                scenarioId: "hse-scenario-not-in-release",
+                scenarioFingerprint: "b".repeat(64),
+            });
+            writeEvidence(extraGreen);
+            expect(() => loadRelease(releaseDir)).toThrow(/not-in-release/);
+
+            writeFileSync(evidencePath, original);
+            expect(() => loadRelease(releaseDir)).not.toThrow();
         });
     });
 

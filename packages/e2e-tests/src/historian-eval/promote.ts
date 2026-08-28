@@ -90,13 +90,29 @@ function checkMutationEvidence(
     scenarios: readonly HistorianEvalScenario[],
 ): void {
     const diagnostics: string[] = [];
+    // An artifact that declares its own battery red is not loadable, whatever
+    // its per-scenario entries say. Without this, valid green entries for every
+    // release scenario plus one extra red entry is internally consistent with
+    // `green: false` and still passes.
+    if (!evidence.green) diagnostics.push("mutation-evidence: not-green");
     const byFingerprint = new Map(evidence.scenarios.map((entry) => [entry.scenarioFingerprint, entry]));
+    const matched = new Set<string>();
     for (const scenario of scenarios) {
-        const entry = byFingerprint.get(scenarioFingerprint(scenario));
+        const fingerprint = scenarioFingerprint(scenario);
+        const entry = byFingerprint.get(fingerprint);
         if (entry === undefined) {
             diagnostics.push(`mutation-evidence.${scenario.id}: missing`);
         } else if (!entry.green) {
             diagnostics.push(`mutation-evidence.${scenario.id}: not-green`);
+        } else {
+            matched.add(fingerprint);
+        }
+    }
+    // One-to-one: an entry for a scenario outside the release is evidence
+    // about something the release does not contain.
+    for (const entry of evidence.scenarios) {
+        if (!matched.has(entry.scenarioFingerprint)) {
+            diagnostics.push(`mutation-evidence.${entry.scenarioId}: not-in-release`);
         }
     }
     if (diagnostics.length > 0) fail(diagnostics);
