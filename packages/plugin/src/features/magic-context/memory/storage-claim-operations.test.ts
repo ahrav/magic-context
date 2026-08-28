@@ -195,6 +195,57 @@ describe("claim operations: create (scenario 1)", () => {
 });
 
 describe("claim operations: revise (scenario 2)", () => {
+    test("a dedup-identity-only revision is not treated as unchanged", () => {
+        const ctx = setup();
+        try {
+            const created = createClaimOp(ctx, "op-create", "The project uses bun.");
+            const publicId = publicIdOf(created);
+            const r1 = getProjectMemoryClaimByPublicId(ctx.db, publicId);
+            if (!r1) throw new Error("unreachable");
+            const hashOf = (revisionId: number) =>
+                (
+                    ctx.db
+                        .prepare(
+                            "SELECT normalized_hash AS hash FROM claim_memory_revision_attributes WHERE revision_id = ?",
+                        )
+                        .get(revisionId) as { hash: string }
+                ).hash;
+            const hash1 = hashOf(r1.currentRevisionId);
+
+            // Same bytes, same attributes, different dedup preimage: the claim
+            // moves to another (project, category, hash) slot, so the fast path
+            // must not swallow it and leave the stale hash on the head.
+            const revised = reviseProjectMemoryClaim(
+                ctx.db,
+                { producer: "test", operationKey: "op-dedup-text" },
+                {
+                    token: computeProjectMemoryMutationToken(ctx.db, publicId),
+                    dedupText: "bun runtime identity",
+                    provenance: provenance("ik-dedup-text", "run-2"),
+                    actor: "user:test",
+                },
+            );
+
+            expect(revised.outcome).toBe("applied");
+            const r2 = getProjectMemoryClaimByPublicId(ctx.db, publicId);
+            expect(r2?.revision).toBe(2);
+            expect(r2?.contentDigest).toBe(r1.contentDigest);
+            const hash2 = hashOf(r2?.currentRevisionId as number);
+            expect(hash2).not.toBe(hash1);
+            expect(
+                (
+                    ctx.db
+                        .prepare(
+                            "SELECT normalized_hash AS hash FROM claim_memory_current_heads WHERE claim_id = ?",
+                        )
+                        .get(r1.claimId) as { hash: string }
+                ).hash,
+            ).toBe(hash2);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("content and category changes append revisions and leave revision-1 bytes unchanged", () => {
         const ctx = setup();
         try {
@@ -1587,6 +1638,23 @@ describe("claim operations: mapping and verification (scenario 14)", () => {
 });
 
 describe("claim usage telemetry (R3)", () => {
+    test("empty usage batches do not open a transaction", () => {
+        const ctx = setup();
+        try {
+            const originalTransaction = ctx.db.transaction.bind(ctx.db);
+            let transactions = 0;
+            ctx.db.transaction = ((callback: () => unknown) => {
+                transactions += 1;
+                return originalTransaction(callback);
+            }) as typeof ctx.db.transaction;
+
+            recordClaimUsage(ctx.db, { publicClaimIds: [], kind: "retrieved" });
+            expect(transactions).toBe(0);
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+
     test("counters mutate without receipts or generation movement", () => {
         const ctx = setup();
         try {

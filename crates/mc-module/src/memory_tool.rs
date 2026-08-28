@@ -14,6 +14,8 @@ use mc_store::{
     ClaimIntentRecord, McStore, McStoreError, StoredCompartmentSearchRow, StoredNoteSearchRow,
 };
 
+use crate::memory_render::is_positive_memory_category;
+
 pub use mc_core::claim_operation::{
     ClaimCommandIdentity, ClaimIntentAckKind, ClaimIntentAckRequest, ClaimIntentAckResponse,
     ClaimIntentBinding, ClaimIntentInspectRequest, ClaimIntentInspectResponse,
@@ -66,6 +68,12 @@ pub fn list_committed_claims(
         .into_iter()
         .filter(|row| {
             public_claim_ids.is_empty() || public_claim_ids.contains(&row.public_claim_id)
+        })
+        .filter(|row| {
+            row.attributes
+                .get("category")
+                .and_then(Value::as_str)
+                .is_some_and(is_positive_memory_category)
         })
         // Category narrowing precedes truncation so a requested category is not
         // crowded out of the limit by rows the caller did not ask for.
@@ -348,4 +356,92 @@ fn snippet_around_match(text: &str, query: &str) -> String {
     let prefix = if start > 0 { "…" } else { "" };
     let suffix = if end < text.len() { "…" } else { "" };
     format!("{prefix}{}{suffix}", snippet.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use mc_core::claim_operation::{sha256_hex_utf8, SnapshotVector};
+    use mc_store::claim_mirror::{ClaimMirrorLifecycle, ClaimMirrorSnapshot, CLAIM_MIRROR_VERSION};
+    use serde_json::json;
+
+    fn mirror_claim(
+        public_claim_id: &str,
+        category: &str,
+        content: &str,
+    ) -> CommittedClaimMirrorRow {
+        let content_digest = sha256_hex_utf8(content);
+        CommittedClaimMirrorRow {
+            public_claim_id: public_claim_id.to_string(),
+            project_id: 41,
+            revision_locator: format!("{public_claim_id}/r1/{content_digest}"),
+            content: content.to_string(),
+            content_digest,
+            attributes: json!({
+                "category": category,
+                "importance": 80,
+            }),
+            lifecycle: ClaimMirrorLifecycle::Active,
+            applicability: json!({}),
+            policy: json!({}),
+            provenance_label: None,
+            project_generation: 1,
+            policy_generation: 1,
+        }
+    }
+
+    #[test]
+    fn list_committed_claims_excludes_anti_memory_even_when_requested() {
+        let fixture = crate::test_support::FixtureBuilder::store();
+        let anti_memory = mirror_claim(
+            "mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "REJECTED_APPROACH",
+            "Rejected Redis for session caching.",
+        );
+        // Positive control: proves the filter excludes exactly the anti-memory
+        // row rather than draining the whole mirror.
+        let positive = mirror_claim(
+            "mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "CONSTRAINTS",
+            "Session data must stay in Postgres.",
+        );
+        let generations = BTreeMap::from([("41".to_string(), 1)]);
+        fixture
+            .store
+            .replace_claim_mirror_snapshot(
+                &ClaimMirrorSnapshot {
+                    mirror_version: CLAIM_MIRROR_VERSION,
+                    vector: SnapshotVector {
+                        vector_version: 1,
+                        database_incarnation_id: "0123456789abcdef0123456789abcdef".to_string(),
+                        workspace_epoch: "workspace-epoch-1".to_string(),
+                        project_generations: generations.clone(),
+                        policy_generations: generations,
+                    },
+                    project_checkpoints: BTreeMap::from([(41, 0)]),
+                    claims: vec![anti_memory, positive],
+                },
+                1,
+            )
+            .unwrap();
+
+        let rows = list_committed_claims(
+            &fixture.store,
+            &BTreeSet::new(),
+            Some("REJECTED_APPROACH"),
+            10,
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+
+        let rows = list_committed_claims(&fixture.store, &BTreeSet::new(), None, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.public_claim_id.as_str())
+                .collect::<Vec<_>>(),
+            ["mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+        );
+    }
 }

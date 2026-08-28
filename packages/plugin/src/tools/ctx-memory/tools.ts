@@ -1,7 +1,7 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
-import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory";
+import { WRITABLE_MEMORY_CATEGORIES } from "../../features/magic-context/memory";
 import { getProjectEmbeddingSnapshot } from "../../features/magic-context/memory/embedding";
 import {
     ClaimOperationInputError,
@@ -13,11 +13,13 @@ import {
 } from "../../plugin/rust-tool-backends";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {
+    assertCtxMemoryWriteShape,
     createCtxMemoryProducerIdentity,
     executeCtxMemoryClaimAction,
     executeCtxMemoryClaimActionWithCommit,
 } from "./claim-actions";
 import {
+    CTX_MEMORY_ANTI_MEMORY_RULE,
     CTX_MEMORY_DESCRIPTION,
     CTX_MEMORY_MUTATION_TOKEN_RULE,
     CTX_MEMORY_TOOL_NAME,
@@ -42,6 +44,19 @@ const mutationTokenShape = {
     policyHeadsDigest: tool.schema.string(),
 };
 
+const antiMemoryShape = {
+    trigger: tool.schema.string(),
+    rejectedStrategy: tool.schema.string(),
+    rejectionReason: tool.schema.string(),
+    saferAlternative: tool.schema.string().nullable().optional(),
+    preconditions: tool.schema.string().nullable().optional(),
+    attemptedApproach: tool.schema.string().nullable().optional(),
+    observedFailure: tool.schema.string().nullable().optional(),
+    rootCause: tool.schema.string().nullable().optional(),
+    recovery: tool.schema.string().nullable().optional(),
+    nonApplicableWhen: tool.schema.string().nullable().optional(),
+};
+
 const ctxMemoryArgsShape = {
     action: tool.schema
         .enum([...CTX_MEMORY_DREAMER_ACTIONS])
@@ -49,9 +64,15 @@ const ctxMemoryArgsShape = {
         .describe("create, get, list, revise, archive, restore, or merge"),
     content: tool.schema.string().optional().describe("Claim content for create/revise/merge"),
     category: tool.schema
-        .enum([...V2_MEMORY_CATEGORIES])
+        .enum([...WRITABLE_MEMORY_CATEGORIES])
         .optional()
         .describe("Claim category for create/revise or list filter"),
+    antiMemory: tool.schema
+        .object(antiMemoryShape)
+        .optional()
+        .describe(
+            "Rejected-approach payload. Required with category REJECTED_APPROACH, and content must be omitted; invalid with any other category.",
+        ),
     publicClaimId: tool.schema
         .string()
         .optional()
@@ -91,7 +112,8 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 args = unwrapImitatedReducedArgs(args, ["action"], {
                     action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
                     content: "string",
-                    category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+                    category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
+                    antiMemory: CTX_MEMORY_ANTI_MEMORY_RULE,
                     publicClaimId: "string",
                     publicClaimIds: { type: "array", items: "string", maxItems: 20 },
                     mutationToken: CTX_MEMORY_MUTATION_TOKEN_RULE,
@@ -120,6 +142,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
                 const action = rawAction as CtxMemoryAction;
                 args.action = action;
+                assertCtxMemoryWriteShape(args);
                 const projectIdentity = deps.resolveProjectPath(toolContext.directory);
                 if (!projectIdentity) {
                     return "Error: Could not resolve project identity for memory action.";
@@ -168,6 +191,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             projectIdentity,
                             ...(args.content !== undefined ? { content: args.content } : {}),
                             ...(args.category !== undefined ? { category: args.category } : {}),
+                            ...(args.antiMemory !== undefined
+                                ? { antiMemory: args.antiMemory }
+                                : {}),
                             ...(args.publicClaimId !== undefined
                                 ? { publicClaimId: args.publicClaimId }
                                 : {}),

@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import {
+    createAntiMemory,
+    readAntiMemory,
+} from "../../features/magic-context/memory/storage-anti-memory";
+import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import * as searchModule from "../../features/magic-context/search";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
@@ -85,6 +90,90 @@ describe("auto-search-runner", () => {
         }
     });
 
+    test("bumps anti-memory usage once after the hint decision commits", async () => {
+        const created = createAntiMemory(
+            db,
+            { producer: "runner-test", operationKey: "anti-warning" },
+            {
+                projectId: ensureProject(db, baseOptions.projectPath),
+                payload: {
+                    trigger: "session caching",
+                    rejectedStrategy: "Redis",
+                    rejectionReason: "split ownership",
+                    saferAlternative: "use SQLite",
+                },
+                provenance: {
+                    sourceLocator: "test://runner/anti",
+                    sourceContent: "Redis rejected",
+                    extractor: "test",
+                    extractorVersion: "1",
+                    extractorRunId: "seed",
+                    independenceKey: "anti",
+                    sourceTrustClass: "explicit_user",
+                },
+                actor: "user:test",
+            },
+        );
+        const publicClaimId = (created.result.payload as { claim: { publicClaimId: string } }).claim
+            .publicClaimId;
+        const anti = readAntiMemory(db, publicClaimId);
+        if (anti === null) throw new Error("missing anti-memory");
+        const warning = {
+            source: "anti_memory" as const,
+            score: 0.95,
+            publicClaimId,
+            revisionLocator: anti.revisionLocator,
+            contentDigest: anti.contentDigest,
+            claimId: anti.claimId,
+            normalizedHash: anti.normalizedHash,
+            trigger: anti.payload.trigger,
+            rejectedStrategy: anti.payload.rejectedStrategy,
+            rejectionReason: anti.payload.rejectionReason,
+            saferAlternative: anti.payload.saferAlternative,
+            matchType: "lexical" as const,
+        };
+        const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([warning]);
+        try {
+            const messages = [makeUserMsg("u-warning", "please add Redis backed session caching")];
+            expect(
+                await runAutoSearchHint({
+                    sessionId: "s-warning",
+                    db,
+                    messages,
+                    options: baseOptions,
+                }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(messages[0])).toContain("⚠ Previously rejected: Redis");
+            expect(
+                db
+                    .prepare(
+                        `SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
+                         JOIN claim_public_ids public ON public.claim_id = usage.claim_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(publicClaimId),
+            ).toEqual({ count: 1 });
+
+            await runAutoSearchHint({
+                sessionId: "s-warning",
+                db,
+                messages,
+                options: baseOptions,
+            });
+            expect(
+                db
+                    .prepare(
+                        `SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
+                         JOIN claim_public_ids public ON public.claim_id = usage.claim_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(publicClaimId),
+            ).toEqual({ count: 1 });
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     test("excludes Primers from transform-time auto-search hints", async () => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
         try {
@@ -104,6 +193,7 @@ describe("auto-search-runner", () => {
 
             const options = spy.mock.calls[0]?.[4];
             expect(options?.sources).toEqual(["memory", "message", "git_commit"]);
+            expect(options?.memoryPolicySurface).toBe("auto_search");
         } finally {
             spy.mockRestore();
         }
@@ -764,6 +854,80 @@ describe("executeAutoSearchDelivery", () => {
             expect(delivery.hintText).toBeNull();
             expect(delivery.prePack).toEqual(results);
             expect(delivery.delivered).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("a sub-threshold warning is not promoted behind another lane's strong hit", async () => {
+        const warning = {
+            source: "anti_memory",
+            publicClaimId: "claim-weak-warning",
+            revisionLocator: "claim-weak-warning/r1/digest",
+            contentDigest: "digest",
+            claimId: 11,
+            normalizedHash: "hash",
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "it creates split ownership",
+            saferAlternative: "use SQLite",
+            score: 0.5,
+            matchType: "lexical",
+        };
+        const strong = {
+            source: "memory",
+            content: "the historian runs on a lease",
+            score: 0.9,
+            memoryId: 4,
+            category: "ARCHITECTURE_DECISIONS",
+            matchType: "hybrid",
+        };
+        const results = [strong, warning] as Awaited<ReturnType<typeof searchModule.unifiedSearch>>;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("delivered");
+            expect(delivery.hintText).not.toContain("Previously rejected");
+            expect(delivery.delivered).toEqual([strong]);
+            expect(delivery.prePack).toEqual(results);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("a warning that clears the threshold still takes the reserved first slot", async () => {
+        const warning = {
+            source: "anti_memory",
+            publicClaimId: "claim-strong-warning",
+            revisionLocator: "claim-strong-warning/r1/digest",
+            contentDigest: "digest",
+            claimId: 12,
+            normalizedHash: "hash",
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "it creates split ownership",
+            saferAlternative: "use SQLite",
+            score: 0.7,
+            matchType: "lexical",
+        };
+        const strong = {
+            source: "memory",
+            content: "the historian runs on a lease",
+            score: 0.9,
+            memoryId: 5,
+            category: "ARCHITECTURE_DECISIONS",
+            matchType: "hybrid",
+        };
+        const results = [strong, warning] as Awaited<ReturnType<typeof searchModule.unifiedSearch>>;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.hintText).toContain("Previously rejected");
+            expect(delivery.delivered[0]).toEqual(warning);
         } finally {
             spy.mockRestore();
         }

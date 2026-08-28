@@ -126,10 +126,7 @@ impl CompositeComponent for FakeComponent {
         let body = serde_json::json!({"served_by": self.id});
         let encoded = serde_json::to_vec(&body).expect("body serializes");
         let Ok(mut output) = ctx.reserve_output(encoded.len()).await else {
-            return RequestOutcome::Error {
-                code: "internal_error".to_owned(),
-                message: "reservation failed".to_owned(),
-            };
+            return RequestOutcome::error("internal_error", "reservation failed");
         };
         output
             .extend_from_slice(&encoded)
@@ -743,10 +740,7 @@ impl McHostHandler for BadManifestHandler {
     }
 
     async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
-        RequestOutcome::Error {
-            code: "internal_error".to_owned(),
-            message: "unreachable".to_owned(),
-        }
+        RequestOutcome::error("internal_error", "unreachable")
     }
 
     async fn route_gone(&self, _route: RouteHandle) {}
@@ -833,10 +827,7 @@ impl CompositeComponent for PanickingShutdownChild {
     }
 
     async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
-        RequestOutcome::Error {
-            code: "internal_error".to_owned(),
-            message: "unreachable".to_owned(),
-        }
+        RequestOutcome::error("internal_error", "unreachable")
     }
 
     async fn route_gone(&self, _route: RouteHandle) {}
@@ -971,10 +962,7 @@ impl CompositeComponent for PanickingHealthChild {
     }
 
     async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
-        RequestOutcome::Error {
-            code: "internal_error".to_owned(),
-            message: "unreachable".to_owned(),
-        }
+        RequestOutcome::error("internal_error", "unreachable")
     }
 
     async fn route_gone(&self, _route: RouteHandle) {}

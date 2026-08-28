@@ -28,7 +28,7 @@ import {
     waitUntil,
     writeConnectionFile,
 } from "./test-support/test-util";
-import type { BindIdentity, RouteTarget } from "./types";
+import type { BindIdentity, CatalogSnapshot, RouteTarget } from "./types";
 
 const IDENTITY: BindIdentity = {
     project_root: "/workspace/project",
@@ -190,13 +190,14 @@ function sendErrorBody(
     code: string,
     channel = 0,
     epoch = 0,
+    extra: Record<string, unknown> = {},
 ): Promise<void> {
     return conn.send({
         ty: PeerFrameType.Error,
         channel,
         epoch,
         corr,
-        body: jsonBody({ code, message: `error ${code}` }),
+        body: jsonBody({ code, message: `error ${code}`, ...extra }),
     });
 }
 
@@ -277,7 +278,12 @@ describe("McHostClient facade", () => {
         const catalogPromise = client.catalogList();
         const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
         expect(catalogFrame.body.toString("utf8")).toBe('{"op":"catalog.list"}');
-        const entry = { module_id: "magic-context", roles: [], control_ops: ["route.open"] };
+        const entry = {
+            module_id: "magic-context",
+            module_version: "0.1.0",
+            roles: [],
+            control_ops: ["route.open"],
+        };
         await sendResponse(conn, catalogFrame.corr, {
             op: "catalog.list",
             generation: 1,
@@ -374,6 +380,34 @@ describe("McHostClient facade", () => {
         const requestFrame = await cursor.next(isRoutedRequest(7));
         await sendErrorBody(conn, requestFrame.corr, "store_unavailable", 7, 77);
         expectCallError(await rejection(requestPromise), "terminal", "store_unavailable");
+    });
+
+    test("error response metadata is additive and retry_after_ms is surfaced when present", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+
+        const oldBodyPromise = client.routeOpen(TOOL_TARGET, IDENTITY);
+        const oldBodyFrame = await cursor.next(isRouteOpen);
+        await sendErrorBody(conn, oldBodyFrame.corr, "unknown_module");
+        const oldBodyError = expectCallError(
+            await rejection(oldBodyPromise),
+            "terminal",
+            "unknown_module",
+        );
+        expect(oldBodyError.retry_after_ms).toBeUndefined();
+
+        const extendedBodyPromise = client.routeOpen(TOOL_TARGET, IDENTITY);
+        const extendedBodyFrame = await cursor.next(isRouteOpen);
+        await sendErrorBody(conn, extendedBodyFrame.corr, "server_busy", 0, 0, {
+            retry_after_ms: 73,
+            future_metadata: true,
+        });
+        const extendedBodyError = expectCallError(
+            await rejection(extendedBodyPromise),
+            "terminal",
+            "server_busy",
+        );
+        expect(extendedBodyError.retry_after_ms).toBe(73);
     });
 
     test("artifact_invalid bind rejection is permanent: one route.open, no retry", async () => {
@@ -502,7 +536,12 @@ describe("McHostClient facade", () => {
         await conn2.authenticated;
         const cursor2 = frameCursor(conn2);
         const catalogFrame = await cursor2.next((f) => isControlOp(f, "catalog.list"));
-        await sendResponse(conn2, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn2, catalogFrame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         expect(await catalogPromise).toEqual([]);
     });
 
@@ -1583,7 +1622,12 @@ describe("transport negotiation", () => {
         const catalogPromise = client.catalogList();
         const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
         expect(catalogFrame.corr).toBe(2n);
-        await sendResponse(conn, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn, catalogFrame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         expect(await catalogPromise).toEqual([]);
     });
 
@@ -1641,7 +1685,12 @@ describe("transport negotiation", () => {
 
         const catalogPromise = client.catalogList();
         const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
-        await sendResponse(conn, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn, catalogFrame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         await catalogPromise;
         expect(conn.frames.filter(isNegotiate).length).toBe(1);
         expect(provider.connectCount).toBe(0);
@@ -1654,7 +1703,12 @@ describe("transport negotiation", () => {
         expect(conn2.clientAuthValid).toBe(true);
         const cursor2 = frameCursor(conn2);
         const catalogFrame2 = await cursor2.next((f) => isControlOp(f, "catalog.list"));
-        await sendResponse(conn2, catalogFrame2.corr, { op: "catalog.list", modules: [] });
+        await sendResponse(conn2, catalogFrame2.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
         expect(await catalog2).toEqual([]);
         expect(conn2.frames.filter(isNegotiate).length).toBe(1);
         expect(peer.connections.length).toBe(2);
@@ -1707,7 +1761,12 @@ describe("transport negotiation", () => {
                 op?: string;
             };
             if (parsed.op === "catalog.list") {
-                host.respondJson(frame.header.corr, { op: "catalog.list", modules: [] });
+                host.respondJson(frame.header.corr, {
+                    op: "catalog.list",
+                    generation: 1,
+                    modules: [],
+                    subc_ops: ["route.open"],
+                });
             } else if (parsed.op === "route.open") {
                 host.respondJson(frame.header.corr, {
                     op: "route.open",
@@ -1765,6 +1824,26 @@ describe("transport negotiation", () => {
             .map((f) => f.header.corr);
         expect(corrs.slice(0, 2)).toEqual([1n, 2n]);
         expect(corrs.slice(2).every((corr) => corr >= 3n)).toBe(true);
+    });
+
+    test("a promoted candidate keeps the bootstrap's authenticated identity", async () => {
+        const provider = createFakePairedProvider();
+        provider.host.onFrame = candidateAutoResponder(GRANT_TOKEN);
+        const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody()) });
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        const client = await McHostClient.connect({
+            connectionFile: filePath,
+            transportProviders: [provider],
+        });
+        clients.push(client);
+        expect(provider.connectCount).toBe(1);
+        // The candidate channel runs no handshake: its setup reports
+        // "fake-candidate/1" and no daemon id. Promotion carries the
+        // bootstrap's authenticated identity across the barrier, so neither
+        // provider-supplied value may reach the published connection.
+        expect(client.authenticated?.daemonVer).toBe("fake-peer/0.0.1");
+        expect(Array.from(client.authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
     });
 
     const decodeRejections: [string, (frame: PeerFrame) => unknown][] = [
@@ -2192,5 +2271,205 @@ describe("shm re-upgrade probe eligibility (R11)", () => {
         const shadow = peer.connections[1] as FakePeerConnection;
         await shadow.authenticated;
         expect(shadow.clientAuthValid).toBe(true);
+    });
+});
+
+describe("authenticated state retention (U3/KTD6)", () => {
+    test("authenticated identity comes from the handshake, publication from the file", async () => {
+        const { client, peer } = await connected();
+        // The connection file's daemon_ver is written by test-util as
+        // "fake-peer/0.0.1" and the peer reports the same string in its
+        // ServerProof by default; the two surfaces must still be separate
+        // objects sourced from different transcripts.
+        const authenticated = client.authenticated;
+        expect(authenticated).not.toBeNull();
+        expect(authenticated?.daemonVer).toBe("fake-peer/0.0.1");
+        expect(authenticated?.proof).toBe("current");
+        expect(Array.from(authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
+        const publication = client.publication;
+        expect(publication?.daemonVer).toBe("fake-peer/0.0.1");
+        expect(typeof publication?.pid).toBe("number");
+    });
+
+    test("a handshake daemon_ver diverging from the connection file rejects the dial", async () => {
+        const peer = await startPeer({ daemonVer: "mc-host/999.0.0" });
+        const filePath = freshFilePath();
+        // writeConnectionFile pins the file's daemon_ver to "fake-peer/0.0.1",
+        // so the peer reports a version the file never published. daemon_ver is
+        // outside the proof input, so the transcript's HMAC is still valid and
+        // only the connection-file comparison can reject this peer.
+        await writeConnectionFile(filePath, peer);
+        const error = await rejection(McHostClient.connect({ connectionFile: filePath }));
+        expect((error as Error).name).toBe("AuthError");
+        expect((error as { code?: string }).code).toBe("daemon_ver_mismatch");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        // No ClientAuth reached the peer: the client emits none once a check
+        // fails, so the peer never observed a client proof at all.
+        expect(conn.clientAuthValid).toBeNull();
+    });
+
+    test("the getter hands out a copy, so a caller cannot poison the identity", async () => {
+        const { client, peer } = await connected();
+        const borrowed = client.authenticated?.daemonId;
+        expect(borrowed).not.toBeUndefined();
+        // The retained identity authorizes compatibility and fencing; mutating
+        // what the getter returned must not reach it.
+        (borrowed as Uint8Array).fill(0);
+        expect(Array.from(client.authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
+    });
+});
+
+describe("strict catalog parsing (U3 scenario 10)", () => {
+    async function catalogRejection(body: unknown): Promise<McHostCallError> {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const catalogPromise = client.catalogList();
+        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
+        await sendResponse(conn, catalogFrame.corr, body);
+        return expectCallError(await rejection(catalogPromise), "terminal");
+    }
+
+    async function catalogSnapshotOf(body: unknown): Promise<CatalogSnapshot> {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const snapshotPromise = client.catalogSnapshot();
+        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
+        await sendResponse(conn, catalogFrame.corr, body);
+        return await snapshotPromise;
+    }
+
+    const validEntry = {
+        module_id: "magic-context",
+        module_version: "0.1.0",
+        roles: [],
+        control_ops: ["route.open"],
+    };
+    const valid = {
+        op: "catalog.list",
+        generation: 1,
+        modules: [validEntry],
+        subc_ops: ["route.open", "catalog.list", "host.shutdown", "transport.negotiate"],
+    };
+
+    test("rejects every malformed catalog shape without casting", async () => {
+        const cases: Record<string, unknown> = {
+            missing_generation: { ...valid, generation: undefined },
+            non_number_generation: { ...valid, generation: "1" },
+            fractional_generation: { ...valid, generation: 1.5 },
+            negative_generation: { ...valid, generation: -1 },
+            missing_subc_ops: { ...valid, subc_ops: undefined },
+            non_array_subc_ops: { ...valid, subc_ops: "route.open" },
+            empty_subc_ops: { ...valid, subc_ops: [] },
+            non_string_subc_ops: { ...valid, subc_ops: [7] },
+            duplicate_subc_ops: { ...valid, subc_ops: ["route.open", "route.open"] },
+            missing_modules: { ...valid, modules: undefined },
+            non_array_modules: { ...valid, modules: {} },
+            module_not_object: { ...valid, modules: [7] },
+            missing_module_version: {
+                ...valid,
+                modules: [{ module_id: "m", roles: [], control_ops: [] }],
+            },
+            non_string_module_version: {
+                ...valid,
+                modules: [{ ...validEntry, module_version: 1 }],
+            },
+            empty_module_version: { ...valid, modules: [{ ...validEntry, module_version: "" }] },
+            missing_module_id: {
+                ...valid,
+                modules: [{ module_version: "0.1.0", roles: [], control_ops: [] }],
+            },
+            non_string_module_id: { ...valid, modules: [{ ...validEntry, module_id: 7 }] },
+            oversized_module_id: {
+                ...valid,
+                modules: [{ ...validEntry, module_id: "x".repeat(129) }],
+            },
+            duplicate_module_id: { ...valid, modules: [validEntry, validEntry] },
+            missing_control_ops: {
+                ...valid,
+                modules: [{ module_id: "m", module_version: "0.1.0", roles: [] }],
+            },
+            non_array_control_ops: { ...valid, modules: [{ ...validEntry, control_ops: "x" }] },
+            malformed_control_ops: { ...valid, modules: [{ ...validEntry, control_ops: [""] }] },
+            missing_roles: {
+                ...valid,
+                modules: [{ module_id: "m", module_version: "0.1.0", control_ops: [] }],
+            },
+            non_array_roles: { ...valid, modules: [{ ...validEntry, roles: "admin" }] },
+        };
+        for (const [name, body] of Object.entries(cases)) {
+            const error = await catalogRejection(JSON.parse(JSON.stringify(body)));
+            expect({ name, code: error.code }).toEqual({
+                name,
+                code: "malformed_control_response",
+            });
+        }
+    }, 30_000);
+
+    test("an unknown top-level field is ignored and the known fields still parse", async () => {
+        const snapshot = await catalogSnapshotOf({
+            ...valid,
+            catalog_digest: "sha256:abc",
+            limits: { max_modules: 64 },
+        });
+        expect(snapshot).toEqual({
+            generation: 1,
+            subcOps: ["route.open", "catalog.list", "host.shutdown", "transport.negotiate"],
+            modules: [validEntry],
+        });
+    });
+
+    test("an unknown module-entry field is ignored and the known fields still parse", async () => {
+        const snapshot = await catalogSnapshotOf({
+            ...valid,
+            modules: [{ ...validEntry, readiness: "degraded", data_ops: ["query.run"] }],
+        });
+        expect(snapshot.generation).toBe(1);
+        expect(snapshot.modules).toEqual([validEntry]);
+    });
+
+    test("a valid catalog yields the tagged snapshot", async () => {
+        const snapshot = await catalogSnapshotOf(valid);
+        expect(snapshot.generation).toBe(1);
+        expect(snapshot.subcOps).toEqual([
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "transport.negotiate",
+        ]);
+        expect(snapshot.modules).toEqual([validEntry]);
+    });
+});
+
+describe("host.shutdown (U3 scenario 11)", () => {
+    test("hostShutdown sends one tagged request and resolves on the echoed response", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const shutdownPromise = client.hostShutdown();
+        const frame = await cursor.next((f) => isControlOp(f, "host.shutdown"));
+        expect(frame.body.toString("utf8")).toBe('{"op":"host.shutdown"}');
+        await sendResponse(conn, frame.corr, { op: "host.shutdown" });
+        await shutdownPromise;
+    });
+
+    test("a response that does not echo the operation is a typed failure", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const shutdownPromise = client.hostShutdown();
+        const frame = await cursor.next((f) => isControlOp(f, "host.shutdown"));
+        await sendResponse(conn, frame.corr, {
+            op: "catalog.list",
+            generation: 1,
+            modules: [],
+            subc_ops: ["route.open"],
+        });
+        expectCallError(await rejection(shutdownPromise), "terminal", "malformed_control_response");
+    });
+
+    test("ordinary close never sends host.shutdown", async () => {
+        const { client, conn } = await connected();
+        await client.closeAsync();
+        const shutdownFrames = conn.frames.filter((f) => isControlOp(f, "host.shutdown"));
+        expect(shutdownFrames).toEqual([]);
     });
 });

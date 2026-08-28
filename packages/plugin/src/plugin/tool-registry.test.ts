@@ -90,6 +90,7 @@ describe("createToolRegistry — memory gating", () => {
                 "action",
                 "content",
                 "category",
+                "antiMemory",
                 "publicClaimId",
                 "publicClaimIds",
                 "mutationToken",

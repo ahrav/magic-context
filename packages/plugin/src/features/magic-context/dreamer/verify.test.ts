@@ -7,6 +7,7 @@ import path from "node:path";
 
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createAntiMemory, readAntiMemory } from "../memory/storage-anti-memory";
 import {
     applyProjectMemoryMapping,
     computeProjectMemoryMutationToken,
@@ -56,6 +57,34 @@ function seedClaim(db: Database, projectIdentity: string, content: string, key: 
                 sourceTrustClass: "explicit_user",
             },
             actor: "user:test",
+        },
+    );
+    return (result.result.payload as { claim: { publicClaimId: string } }).claim.publicClaimId;
+}
+
+function seedAntiMemory(db: Database, projectIdentity: string, key: string): string {
+    const result = createAntiMemory(
+        db,
+        { producer: "verify-test", operationKey: `anti-${key}` },
+        {
+            projectId: ensureProject(db, projectIdentity),
+            payload: {
+                trigger: `${key} session caching`,
+                rejectedStrategy: `Redis ${key}`,
+                rejectionReason: "split ownership",
+                saferAlternative: "use SQLite",
+            },
+            provenance: {
+                sourceLocator: `test://verify/${key}`,
+                sourceContent: "Redis rejected",
+                extractor: "test",
+                extractorVersion: "1",
+                extractorRunId: key,
+                independenceKey: key,
+                sourceTrustClass: "explicit_user",
+            },
+            actor: "user:test",
+            nowMs: Date.now() - 60 * 24 * 60 * 60 * 1_000,
         },
     );
     return (result.result.payload as { claim: { publicClaimId: string } }).claim.publicClaimId;
@@ -120,6 +149,118 @@ afterEach(() => {
 });
 
 describe("claim-native verification", () => {
+    test("verified anti-memory extends TTL while archive demotes another to stale", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-anti";
+            const dir = tempProject();
+            const verifiedId = seedAntiMemory(db, projectIdentity, "verified");
+            const staleId = seedAntiMemory(db, projectIdentity, "stale");
+            const beforeExpiry = readAntiMemory(db, verifiedId)?.expiresAt ?? 0;
+            const batch = promptBatch(db, projectIdentity);
+
+            expect(
+                await applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    batch,
+                    `<verify><verified claim="${verifiedId}" files=""/><archive claim="${staleId}" reason="rejection no longer applies"/></verify>`,
+                ),
+            ).toEqual({ verified: 1, updated: 0, archived: 1 });
+
+            const verified = readAntiMemory(db, verifiedId);
+            expect(verified?.revision).toBe(2);
+            expect(verified?.expiresAt).toBeGreaterThan(beforeExpiry);
+            const revisionsAfterFirstVerify = (
+                db
+                    .prepare(
+                        `SELECT COUNT(*) AS count FROM claim_revisions revisions
+                          JOIN claim_public_ids public ON public.claim_id = revisions.claim_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(verifiedId) as { count: number }
+            ).count;
+            const secondBatch = promptBatch(db, projectIdentity).filter(
+                (memory) => memory.publicClaimId === verifiedId,
+            );
+            expect(
+                await applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    secondBatch,
+                    `<verify><verified claim="${verifiedId}" files=""/></verify>`,
+                ),
+            ).toEqual({ verified: 1, updated: 0, archived: 0 });
+            expect(readAntiMemory(db, verifiedId)?.revision).toBe(2);
+            expect(
+                (
+                    db
+                        .prepare(
+                            `SELECT COUNT(*) AS count FROM claim_revisions revisions
+                              JOIN claim_public_ids public ON public.claim_id = revisions.claim_id
+                             WHERE public.public_id = ?`,
+                        )
+                        .get(verifiedId) as { count: number }
+                ).count,
+            ).toBe(revisionsAfterFirstVerify);
+            const outcomes = db
+                .prepare(
+                    `SELECT public.public_id AS publicClaimId, events.outcome
+                       FROM verification_events events
+                       JOIN claim_revisions revisions ON revisions.id = events.revision_id
+                       JOIN claim_public_ids public ON public.claim_id = revisions.claim_id
+                      WHERE public.public_id IN (?, ?) ORDER BY public.public_id`,
+                )
+                .all(verifiedId, staleId) as Array<{ publicClaimId: string; outcome: string }>;
+            expect(outcomes.find((row) => row.publicClaimId === verifiedId)?.outcome).toBe(
+                "verified",
+            );
+            expect(outcomes.find((row) => row.publicClaimId === staleId)?.outcome).toBe("stale");
+            expect(
+                db
+                    .prepare(
+                        `SELECT heads.state FROM claim_memory_lifecycle_heads heads
+                         JOIN claim_public_ids public ON public.claim_id = heads.claim_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(staleId),
+            ).toEqual({ state: "active" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("update verdict renews the validity window of a corrected anti-memory", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-anti-update-ttl";
+            const dir = tempProject();
+            const updatedId = seedAntiMemory(db, projectIdentity, "ttl");
+            const beforeExpiry = readAntiMemory(db, updatedId)?.expiresAt ?? 0;
+            const batch = promptBatch(db, projectIdentity);
+            const corrected = [
+                "Trigger: ttl session caching",
+                "Rejected strategy: Redis ttl",
+                "Rejection reason: split ownership still holds after review",
+                "Safer alternative: use SQLite",
+            ].join("\n");
+
+            expect(
+                await applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    batch,
+                    `<verify><update claim="${updatedId}" files="">${corrected}</update></verify>`,
+                ),
+            ).toEqual({ verified: 0, updated: 1, archived: 0 });
+
+            const revised = readAntiMemory(db, updatedId);
+            expect(revised?.payload.rejectionReason).toBe(
+                "split ownership still holds after review",
+            );
+            expect(revised?.expiresAt ?? 0).toBeGreaterThan(beforeExpiry);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("verified, update, and archive commit exact events under one receipt", async () => {
         const db = freshDb();
         try {

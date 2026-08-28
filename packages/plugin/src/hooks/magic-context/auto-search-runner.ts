@@ -23,6 +23,7 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
+import { recordDeliveredAntiMemoryUsage } from "../../features/magic-context/memory/storage-claim-operations";
 import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
 import type {
     UnifiedSearchOptions,
@@ -37,7 +38,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { packAutoSearchHint } from "./auto-search-hint";
+import { collectAntiMemoryWarningFragments, packAutoSearchHint } from "./auto-search-hint";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -184,10 +185,14 @@ export async function executeAutoSearchDelivery(args: {
     if (results[0].score < args.scoreThreshold) {
         return emptyDelivery("below-threshold", results);
     }
-    const packed = packAutoSearchHint(
-        results,
-        args.packNowMs === undefined ? {} : { nowMs: args.packNowMs },
-    );
+    // The gate above tests only the top result, and the packer reserves the
+    // first fragment for a warning. Handing it the threshold is what stops a
+    // strong hit from another lane promoting a weakly matched rejection warning
+    // to the head of the hint; the packer owns it so both harnesses inherit it.
+    const packed = packAutoSearchHint(results, {
+        warningScoreThreshold: args.scoreThreshold,
+        ...(args.packNowMs === undefined ? {} : { nowMs: args.packNowMs }),
+    });
     if (packed.text === null) {
         return emptyDelivery("packer-empty", results);
     }
@@ -235,7 +240,7 @@ export function collectUserPromptParts(message: MessageLike): string {
  *  or auto-hint block — in which case auto-search should skip so we don't double
  *  up. This runs on the RAW text (before stripping) because the whole point is
  *  to detect what the stripper would remove. Exported so candidate recovery
- *  applies the same eligibility gate the live path applies. */
+ *  applies the same stacked-augmentation gate as the live path. */
 export function hasStackedAugmentation(rawText: string): boolean {
     return (
         rawText.includes("<sidekick-augmentation>") ||
@@ -298,16 +303,14 @@ export async function runAutoSearchHint(args: {
     if (!userMsg || typeof userMsg.info.id !== "string") return AUTO_SEARCH_OK;
     const userMsgId = userMsg.info.id;
 
-    // A persisted hint replays only while every contributing memory is still
-    // auto_search-eligible: the initial policy filter ran once at compute
-    // time, and a later quarantine/contradiction/rejection must not keep
-    // sending the fragment on defer/retry passes through the stored text.
+    // Persisted anti-memory warnings never replay; each warning requires a
+    // fresh search. Ordinary hints carry no memory fragments and can replay.
     const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
         if (decision.decision !== "hint") return;
         if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
             sessionLog(
                 sessionId,
-                `auto-search: suppressing persisted hint for ${decision.messageId} — a contributing memory is no longer eligible`,
+                `auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
             );
             return;
         }
@@ -447,11 +450,11 @@ export async function runAutoSearchHint(args: {
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.
     const payload = `\n\n${hintText}`;
-    // Automatic search suppresses its claim-hint lane while no retrieval
-    // projection exists: unified search serves no project-memory claims on
-    // this path, so a fresh hint never carries claim fragments. The
-    // eligibility gate below still verifies previously persisted decisions.
-    const memoryFragments: Array<{ id: number; hash: string }> = [];
+    // Any anti-memory fragment marks the persisted decision as non-replayable.
+    // Warning delivery always requires a fresh search rather than stored text.
+    const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
+        delivery.delivered,
+    );
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
@@ -462,12 +465,14 @@ export async function runAutoSearchHint(args: {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    // Both the CAS-winning fresh decision and a concurrently persisted one go
-    // through the same eligibility gate: a contributing memory can be
-    // quarantined, rejected, or rewritten between the search lane's recheck
-    // and this persist, and the current prompt must never receive a fragment
-    // the policy has since hidden.
-    replayHintIfEligible(outcome.decision);
+    // Deliver this call's fresh CAS winner directly. Concurrently persisted
+    // decisions replay only when they contain no anti-memory fragment.
+    if (outcome.kind === "appended" && warningResults.length > 0) {
+        appendReminderToUserMessageById(messages, userMsgId, payload);
+        recordDeliveredAntiMemoryUsage(db, warningResults);
+    } else {
+        replayHintIfEligible(outcome.decision);
+    }
     sessionLog(
         sessionId,
         `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,

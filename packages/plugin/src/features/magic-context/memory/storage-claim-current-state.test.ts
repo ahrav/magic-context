@@ -8,6 +8,7 @@ import { createDirectTestDatabase } from "../test-database";
 import { computeWorkspaceEpochFingerprint } from "../workspaces";
 import { readAuthorizedClaimMemorySnapshot } from "./claim-memory-render";
 import { CLAIM_POLICY_VERSION } from "./claim-visibility-policy";
+import { createAntiMemory } from "./storage-anti-memory";
 import { readProjectMemoryCurrentState } from "./storage-claim-current-state";
 import {
     type ClaimEvidenceProvenance,
@@ -139,6 +140,65 @@ describe("current-state provider: hydration", () => {
             expect(second.snapshotVector.projectGenerations[String(ctx.projectId)]).toBe(
                 (first.snapshotVector.projectGenerations[String(ctx.projectId)] as number) + 1,
             );
+        } finally {
+            closeQuietly(ctx.db);
+        }
+    });
+});
+
+describe("current-state provider: anti-memory surface exclusion", () => {
+    test("denies auto-inject and hygiene while preserving explicit search and verification", () => {
+        const ctx = setup();
+        try {
+            const positive = createClaimOp(ctx, "positive", "Positive fact.");
+            const anti = createAntiMemory(
+                ctx.db,
+                { producer: "test", operationKey: "anti" },
+                {
+                    projectId: ctx.projectId,
+                    payload: {
+                        trigger: "cache work",
+                        rejectedStrategy: "use Redis",
+                        rejectionReason: "operational burden",
+                    },
+                    provenance: provenance("anti", "run-anti", "explicit_user"),
+                    actor: "host:user-corroborated",
+                    nowMs: 1,
+                },
+            );
+            const antiId = publicIdOf(anti);
+
+            // Laundering happens when a lane re-creates content it consumed
+            // into a NEW row: the rewrite can drop the negation and resurrect
+            // the rejected approach under a positive category. Curate and
+            // hygiene do that, so they must never see a warning.
+            for (const surface of ["auto_inject", "maintenance_hygiene"] as const) {
+                const automatic = readProjectMemoryCurrentState(ctx.db, {
+                    projectIds: [ctx.projectId],
+                    surface,
+                    nowMs: 2,
+                });
+                expect(automatic.status).toBe("ok");
+                if (automatic.status !== "ok") throw new Error("unreachable");
+                expect(automatic.items.map((item) => item.publicClaimId)).toEqual([
+                    publicIdOf(positive),
+                ]);
+            }
+
+            // Verification re-judges a warning in place — renew, demote, or
+            // revise under the same category through the typed writer — so it
+            // cannot mint a positive-category copy and must see the row. Denying
+            // it would leave a warning un-re-judged until its TTL lapsed.
+            for (const surface of ["explicit_search", "maintenance_verification"] as const) {
+                const visible = readProjectMemoryCurrentState(ctx.db, {
+                    projectIds: [ctx.projectId],
+                    surface,
+                    nowMs: 2,
+                });
+                expect(visible.status).toBe("ok");
+                if (visible.status !== "ok") throw new Error("unreachable");
+                expect(visible.items.map((item) => item.publicClaimId)).toContain(antiId);
+            }
         } finally {
             closeQuietly(ctx.db);
         }

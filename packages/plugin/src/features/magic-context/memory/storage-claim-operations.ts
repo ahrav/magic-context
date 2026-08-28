@@ -55,6 +55,7 @@ import {
     classifyFineTaint,
     TAINT_CLASSIFIER_METHOD,
 } from "./claim-policy.ts";
+import { ANTI_MEMORY_CATEGORY } from "./constants.ts";
 import { computeNormalizedHash } from "./normalize-hash.ts";
 import {
     type ApplicabilityPathsInput,
@@ -745,7 +746,12 @@ function writeEvidenceChain(
     });
 }
 
-function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJsonValue {
+/**
+ * Canonical provenance shape for claim-operation request digests. Shared with
+ * the typed anti-memory writer so both digest the same field set; a field
+ * added to `ClaimEvidenceProvenance` must land here exactly once.
+ */
+export function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJsonValue {
     return {
         extractor: provenance.extractor,
         extractorRunId: provenance.extractorRunId,
@@ -758,7 +764,14 @@ function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJ
     };
 }
 
-function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue {
+/**
+ * Project a mutation token onto the exact fields that identify the request.
+ * Digesting a caller's token object directly would fold in any extra property
+ * it happens to carry, so two spellings of the same token — one built here,
+ * one round-tripped through JSON by a retrying caller — would digest
+ * differently and turn an honest replay into `ClaimOperationKeyReuseError`.
+ */
+export function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue {
     return {
         applicabilityHeadsDigest: token.applicabilityHeadsDigest,
         contentDigest: token.contentDigest,
@@ -782,8 +795,16 @@ export interface ProjectMemoryAttributes {
     expiresAt: number | null;
 }
 
+/**
+ * Importance applied when a create request omits it. Exported so typed writers
+ * that build their own request digests can digest the same resolved value this
+ * module persists, keeping an omitted importance and an explicit `50` one
+ * request rather than two.
+ */
+export const DEFAULT_MEMORY_IMPORTANCE = 50;
+
 const DEFAULT_ATTRIBUTES: Omit<ProjectMemoryAttributes, "category"> = {
-    importance: 50,
+    importance: DEFAULT_MEMORY_IMPORTANCE,
     memoryScope: "project",
     sharing: "private",
     expiresAt: null,
@@ -974,8 +995,9 @@ function attachEvidenceStage(
     claim: ProjectMemoryClaimRef,
     provenance: ClaimEvidenceProvenance,
     nowMs: number,
+    extractedText: string = claim.content,
 ): ClaimOperationStageOutcome {
-    const observationId = writeEvidenceChain(db, claim.projectId, provenance, claim.content);
+    const observationId = writeEvidenceChain(db, claim.projectId, provenance, extractedText);
     db.prepare(
         "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
     ).run(claim.currentRevisionId, observationId, nowMs);
@@ -1014,6 +1036,8 @@ function attachEvidenceStage(
 export interface CreateProjectMemoryClaimInput {
     projectId: number;
     content: string;
+    /** Optional normalized-hash preimage when display content is not dedup identity. */
+    dedupText?: string;
     category: string;
     importance?: number;
     memoryScope?: MemoryScope;
@@ -1024,6 +1048,12 @@ export interface CreateProjectMemoryClaimInput {
     userInferred?: boolean;
     requestScope?: string;
     nowMs?: number;
+    /**
+     * Set only by the typed anti-memory writer (`storage-anti-memory.ts`).
+     * The stage refuses `REJECTED_APPROACH` rows without it so no generic
+     * caller can mint an anti-memory revision that lacks its payload row.
+     */
+    antiMemoryWriter?: boolean;
 }
 
 export interface ProducerIdentity {
@@ -1094,7 +1124,12 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
     nowMs: number,
 ): ClaimOperationStageOutcome {
     const attributes = resolveAttributes(input);
-    const normalizedHash = computeNormalizedHash(input.content);
+    if (attributes.category === ANTI_MEMORY_CATEGORY && input.antiMemoryWriter !== true) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory creation is refused; use the typed anti-memory API",
+        );
+    }
+    const normalizedHash = computeNormalizedHash(input.dedupText ?? input.content);
     const holder = db
         .prepare(
             `SELECT public_id AS publicClaimId FROM claim_memory_current_heads
@@ -1112,7 +1147,7 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
                 `current-head row points at unknown claim ${holder.publicClaimId}`,
             );
         }
-        return attachEvidenceStage(db, claim, input.provenance, nowMs);
+        return attachEvidenceStage(db, claim, input.provenance, nowMs, input.content);
     }
 
     const publicClaimId = generatePublicClaimId();
@@ -1208,6 +1243,7 @@ export function createProjectMemoryClaim(
             actor: input.actor,
             attributes: attributesRequestShape(attributes),
             content: input.content,
+            dedupText: input.dedupText ?? null,
             operation: "create-project-memory-claim",
             projectId: input.projectId,
             provenance: provenanceRequestShape(input.provenance),
@@ -1227,6 +1263,8 @@ export function createProjectMemoryClaim(
 export interface ReviseProjectMemoryClaimInput {
     token: ClaimMutationToken;
     content?: string;
+    /** Optional normalized-hash preimage when display content is not dedup identity. */
+    dedupText?: string;
     category?: string;
     importance?: number;
     memoryScope?: MemoryScope;
@@ -1238,6 +1276,14 @@ export interface ReviseProjectMemoryClaimInput {
     userInferred?: boolean;
     requestScope?: string;
     nowMs?: number;
+    /**
+     * Set only by the typed anti-memory writer (`storage-anti-memory.ts`).
+     * The stage refuses `REJECTED_APPROACH` revisions without it: a generic
+     * revise would advance the current revision with no
+     * `claim_anti_memory_revision_payloads` row, permanently breaking the
+     * typed reader for that claim (the payload table is append-only).
+     */
+    antiMemoryWriter?: boolean;
 }
 
 /** Transaction-local domain stage for composition inside one outer claim operation. */
@@ -1268,9 +1314,35 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         sharing: input.sharing ?? current.sharing,
         expiresAt: input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
     };
+    if (
+        (current.category === ANTI_MEMORY_CATEGORY ||
+            nextAttributes.category === ANTI_MEMORY_CATEGORY) &&
+        input.antiMemoryWriter !== true
+    ) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory revision is refused; use the typed anti-memory API",
+        );
+    }
+    if (
+        (current.category === ANTI_MEMORY_CATEGORY) !==
+        (nextAttributes.category === ANTI_MEMORY_CATEGORY)
+    ) {
+        throw new ClaimOperationInputError(
+            "anti-memory category conversion is refused; use the typed anti-memory API",
+        );
+    }
     const contentUnchanged = sha256Utf8Hex(nextContent) === claim.contentDigest;
+    const normalizedHash = computeNormalizedHash(input.dedupText ?? nextContent);
+    // `dedupText` decouples deduplication identity from display content, so a
+    // revision can leave the content bytes and every attribute untouched and
+    // still move the claim to a different (project, category, hash) slot. That
+    // has to count as a change: the early return skips the revision append, so
+    // `normalized_hash` would keep the superseded preimage in both the
+    // attributes row and the current head, and the duplicate check for the new
+    // identity would never run.
     const unchanged =
         contentUnchanged &&
+        normalizedHash === current.normalizedHash &&
         nextAttributes.category === current.category &&
         nextAttributes.importance === current.importance &&
         nextAttributes.memoryScope === current.memoryScope &&
@@ -1279,7 +1351,6 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
     if (unchanged) {
         return attachEvidenceStage(db, claim, input.provenance, nowMs);
     }
-    const normalizedHash = computeNormalizedHash(nextContent);
     assertNoLiveDuplicate(db, {
         projectId: claim.projectId,
         category: nextAttributes.category,
@@ -1391,6 +1462,7 @@ export function reviseProjectMemoryClaim(
             actor: input.actor,
             category: input.category ?? null,
             content: input.content ?? null,
+            dedupText: input.dedupText ?? null,
             expiresAt: input.expiresAt === undefined ? "keep" : input.expiresAt,
             importance: input.importance ?? null,
             memoryScope: input.memoryScope ?? null,
@@ -1581,6 +1653,11 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
             `claim revision ${target.currentRevisionId} has no attributes row; direct-SQL corruption`,
         );
     }
+    if (targetAttributes.category === ANTI_MEMORY_CATEGORY) {
+        throw new ClaimOperationInputError(
+            "generic anti-memory merge is refused; revise or archive it through the typed anti-memory API",
+        );
+    }
     const normalizedHash = computeNormalizedHash(mergedContent);
     // A merge keeps the target's category and terminally retires every source,
     // so merging across categories destroys the source category's live fact.
@@ -1597,6 +1674,11 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         if (!attributes) {
             throw new ClaimGraphCorruptionError(
                 `claim revision ${source.currentRevisionId} has no attributes row; direct-SQL corruption`,
+            );
+        }
+        if (attributes.category === ANTI_MEMORY_CATEGORY) {
+            throw new ClaimOperationInputError(
+                "generic anti-memory merge is refused; revise or archive it through the typed anti-memory API",
             );
         }
         if (attributes.category !== targetAttributes.category) {
@@ -1827,6 +1909,30 @@ export interface ApplyProjectMemoryMappingInput {
     nowMs?: number;
 }
 
+/**
+ * Refuse a generic revision-scoped operation against an anti-memory claim.
+ *
+ * Anti-memory revisions carry a typed payload row and revision-bound state
+ * that only the typed writer in `storage-anti-memory.ts` knows how to keep
+ * whole. Verification and applicability both attach to one exact revision, so
+ * letting a generic caller attach them here produces state the typed writer
+ * silently drops the next time it appends a revision — a verified,
+ * path-scoped warning quietly loses its authority and scope on its next TTL
+ * extension. Refuse instead, so the gap is a failed call rather than a
+ * downgrade nobody sees.
+ */
+function refuseGenericAntiMemoryRevisionAccess(
+    db: Database,
+    revisionId: number,
+    operation: string,
+): void {
+    if (readRevisionAttributes(db, revisionId)?.category === ANTI_MEMORY_CATEGORY) {
+        throw new ClaimOperationInputError(
+            `generic anti-memory ${operation} is refused; use the typed anti-memory API`,
+        );
+    }
+}
+
 /** Transaction-local domain stage for composition inside one outer claim operation. */
 export function stageApplyProjectMemoryMappingInCurrentTransaction(
     db: Database,
@@ -1845,6 +1951,7 @@ export function stageApplyProjectMemoryMappingInCurrentTransaction(
             reason: `revision: mapping targets ${input.revisionLocator} but current is ${expectedLocator}`,
         };
     }
+    refuseGenericAntiMemoryRevisionAccess(db, claim.currentRevisionId, "applicability mapping");
     const sync = syncRevisionApplicabilityPathsInCurrentTransaction(db, {
         revisionId: claim.currentRevisionId,
         projectId: claim.projectId,
@@ -1916,10 +2023,11 @@ export interface RecordProjectMemoryVerificationInput {
 }
 
 /** Transaction-local domain stage for composition inside one outer claim operation. */
-export function stageRecordProjectMemoryVerificationInCurrentTransaction(
+function stageVerificationEventInCurrentTransaction(
     db: Database,
     input: RecordProjectMemoryVerificationInput,
     nowMs: number,
+    antiMemory: "refuse" | "require",
 ): ClaimOperationStageOutcome {
     const validation = validateProjectMemoryMutationToken(db, input.token);
     if (!validation.ok) {
@@ -1932,6 +2040,18 @@ export function stageRecordProjectMemoryVerificationInCurrentTransaction(
             kind: "stale",
             reason: `revision: verification targets ${input.revisionLocator} but current is ${expectedLocator}`,
         };
+    }
+    // Each entry point admits exactly one category class, so neither is a side
+    // door into the other: the generic recorder refuses anti-memory, and the
+    // typed recorder accepts nothing else.
+    if (antiMemory === "refuse") {
+        refuseGenericAntiMemoryRevisionAccess(db, claim.currentRevisionId, "verification");
+    } else if (
+        readRevisionAttributes(db, claim.currentRevisionId)?.category !== ANTI_MEMORY_CATEGORY
+    ) {
+        throw new ClaimOperationInputError(
+            "typed anti-memory verification requires an anti-memory claim",
+        );
     }
     db.prepare(
         `INSERT INTO verification_events (revision_id, observation_id, outcome, verifier, created_at)
@@ -1955,6 +2075,33 @@ export function stageRecordProjectMemoryVerificationInCurrentTransaction(
         ],
         policyRevisionIds: [claim.currentRevisionId],
     };
+}
+
+export function stageRecordProjectMemoryVerificationInCurrentTransaction(
+    db: Database,
+    input: RecordProjectMemoryVerificationInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    return stageVerificationEventInCurrentTransaction(db, input, nowMs, "refuse");
+}
+
+/**
+ * Record a verification outcome against an anti-memory claim.
+ *
+ * The generic recorder refuses this category because a generic revision path
+ * drops the TTL, outcome, and scope invariants the typed writer maintains. A
+ * verification event carries none of that state — it appends an outcome against
+ * the current revision and touches neither content nor category — so the
+ * verification lane needs an entry point that is allowed to record one. This is
+ * the API that refusal message names; re-exported from `storage-anti-memory.ts`
+ * so the typed surface is where a caller looks for it.
+ */
+export function stageAntiMemoryVerificationInCurrentTransaction(
+    db: Database,
+    input: RecordProjectMemoryVerificationInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    return stageVerificationEventInCurrentTransaction(db, input, nowMs, "require");
 }
 
 /** Append one verification event against the exact current revision and
@@ -1995,6 +2142,7 @@ export function recordClaimUsage(
         nowMs?: number;
     },
 ): void {
+    if (args.publicClaimIds.length === 0) return;
     const nowMs = args.nowMs ?? Date.now();
     const column = args.kind === "seen" ? "seen_count" : "retrieval_count";
     const stamp = args.kind === "seen" ? "last_seen_at" : "last_retrieved_at";
@@ -2010,6 +2158,33 @@ export function recordClaimUsage(
             update.run(nowMs, nowMs, publicClaimId);
         }
     }).immediate();
+}
+
+/**
+ * Count each DELIVERED anti-memory warning exactly once as `retrieved`.
+ *
+ * The shared search resolver deliberately counts only `memory`-source usage,
+ * so warning retrieval telemetry is a delivery-surface obligation. Every
+ * surface that renders packed results (explicit tools, auto-search runners)
+ * must call this one entry point instead of restating the filter, or a new
+ * consumer silently loses warning counters.
+ */
+export function recordDeliveredAntiMemoryUsage(
+    db: Database,
+    delivered: readonly { source: string; publicClaimId?: string }[],
+    nowMs?: number,
+): void {
+    const publicClaimIds = delivered.flatMap((result) =>
+        result.source === "anti_memory" && result.publicClaimId !== undefined
+            ? [result.publicClaimId]
+            : [],
+    );
+    if (publicClaimIds.length === 0) return;
+    recordClaimUsage(db, {
+        publicClaimIds,
+        kind: "retrieved",
+        ...(nowMs === undefined ? {} : { nowMs }),
+    });
 }
 
 // ---------------------------------------------------------------------------

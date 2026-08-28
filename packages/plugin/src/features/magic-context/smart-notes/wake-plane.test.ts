@@ -26,8 +26,22 @@ function freshDb(): Database {
 
 function catalog(hasWakePlane: boolean) {
     return hasWakePlane
-        ? [{ module_id: "scheduled-wakes", roles: [], control_ops: [WAKE_PLANE_CAPABILITY] }]
-        : [{ module_id: "other-module", roles: [], control_ops: ["other.operation"] }];
+        ? [
+              {
+                  module_id: "scheduled-wakes",
+                  module_version: "0.1.0",
+                  roles: [],
+                  control_ops: [WAKE_PLANE_CAPABILITY],
+              },
+          ]
+        : [
+              {
+                  module_id: "other-module",
+                  module_version: "0.1.0",
+                  roles: [],
+                  control_ops: ["other.operation"],
+              },
+          ];
 }
 
 function dueCompiledNote(db: Database) {

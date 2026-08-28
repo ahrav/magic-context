@@ -103,6 +103,7 @@ describe("registerMagicContextTools", () => {
 					"action",
 					"content",
 					"category",
+					"antiMemory",
 					"publicClaimId",
 					"publicClaimIds",
 					"mutationToken",

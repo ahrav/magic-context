@@ -68,6 +68,7 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
 
     let component = SynapseComponent::new(Some(SynapseConfig {
         bundle_dir: dir.path().to_path_buf(),
+        bundle_manifest_sha256: None,
         ort_library: PathBuf::from("/nonexistent/libonnxruntime.so"),
         ort_library_sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
             .to_owned(),
@@ -90,10 +91,7 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
     // excluded so wake-plane probes fail open (AE10).
     support::assert_control_ops(&body["modules"], &[]);
 
-    let err = client
-        .route_open_target("management_surface", "synapse", ROOT, "opencode", "s1")
-        .await
-        .expect_err("corrupt bundles reject the synapse bind");
+    let err = support::synapse::open_synapse_route_rejection(&mut client).await;
     assert_eq!(err, "artifact_invalid");
 
     // Magic Context requests still complete.
@@ -127,6 +125,7 @@ async fn all_four_operations_serve_certified_vectors_over_the_wire() {
     };
     let component = SynapseComponent::new(Some(SynapseConfig {
         bundle_dir: fixture_dir(),
+        bundle_manifest_sha256: None,
         ort_library,
         ort_library_sha256: ort_hash,
         limits: SynapseLimits {
@@ -193,6 +192,7 @@ async fn all_four_operations_serve_certified_vectors_over_the_wire() {
         fingerprint: manifest["fingerprint"].as_str().expect("fp").to_owned(),
         table_epoch: manifest["table_epoch"].as_u64().expect("epoch"),
         dims: manifest["dims"].as_u64().expect("dims") as usize,
+        execution_provider: "cpu",
         max_tokens: manifest["max_tokens"].as_u64().expect("max_tokens") as u32,
         max_text_bytes: SynapseLimits::default().max_text_bytes,
         provenance: serde_json::Value::Null,

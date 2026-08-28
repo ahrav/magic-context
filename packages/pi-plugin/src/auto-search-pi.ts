@@ -54,6 +54,7 @@ import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
+import { recordDeliveredAntiMemoryUsage } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import type {
 	UnifiedSearchOptions,
@@ -66,7 +67,10 @@ import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { packAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import {
+	collectAntiMemoryWarningFragments,
+	packAutoSearchHint,
+} from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -275,7 +279,7 @@ export async function runAutoSearchHintForPi(args: {
 		if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
 			sessionLog(
 				sessionId,
-				`auto-search: suppressing persisted hint for ${decision.messageId} — a contributing memory is no longer eligible`,
+				`auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
 			);
 			return;
 		}
@@ -400,7 +404,9 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
-	const packed = packAutoSearchHint(results);
+	const packed = packAutoSearchHint(results, {
+		warningScoreThreshold: scoreThreshold,
+	});
 	if (!packed.text) {
 		writeNoHintAndReconcile("empty");
 		return messages;
@@ -409,11 +415,11 @@ export async function runAutoSearchHintForPi(args: {
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode lines 268-270.
 	const payload = `\n\n${packed.text}`;
-	// Automatic search suppresses its claim-hint lane while no retrieval
-	// projection exists: unified search serves no project-memory claims on
-	// this path, so a fresh hint never carries claim fragments. The
-	// eligibility gate below still verifies previously persisted decisions.
-	const memoryFragments: Array<{ id: number; hash: string }> = [];
+	// Any anti-memory fragment marks the persisted decision as non-replayable.
+	// Warning delivery always requires a fresh search rather than stored text.
+	const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
+		packed.delivered,
+	);
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",
@@ -421,12 +427,15 @@ export async function runAutoSearchHintForPi(args: {
 		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	// Both the CAS-winning fresh decision and a concurrently persisted one go
-	// through the same eligibility gate: a contributing memory can be
-	// quarantined, rejected, or rewritten between the search lane's recheck
-	// and this persist, and the current prompt must never receive a fragment
-	// the policy has since hidden.
-	replayHintIfEligible(outcome.decision);
+	// Deliver this call's fresh CAS winner directly. Concurrently persisted
+	// decisions replay only when they contain no anti-memory fragment.
+	// Mirrors the OpenCode runner's delivery contract.
+	if (outcome.kind === "appended" && warningResults.length > 0) {
+		appendHintToUserMessage(userMsg, payload);
+		recordDeliveredAntiMemoryUsage(db, warningResults);
+	} else {
+		replayHintIfEligible(outcome.decision);
+	}
 	sessionLog(
 		sessionId,
 		`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,

@@ -1,4 +1,5 @@
 import type { ClaimMutationToken } from "../../features/magic-context/memory/claim-operation-contract";
+import type { AntiMemoryPayload } from "../../features/magic-context/memory/storage-anti-memory";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
@@ -22,6 +23,7 @@ export interface CtxMemoryArgs extends ImitatedReducedArgs {
     action?: CtxMemoryAction;
     content?: string;
     category?: string;
+    antiMemory?: AntiMemoryPayload;
     /** Single target for revise/archive/restore. */
     publicClaimId?: string;
     /** Targets for get; ordered [target, ...sources] for merge. */

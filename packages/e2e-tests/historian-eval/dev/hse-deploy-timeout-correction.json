@@ -12,7 +12,7 @@
         "assistant": "Set: health-check timeout is 30 seconds."
       },
       {
-        "user": "Correction — I misread the runbook. The health-check timeout must be 45 seconds, not 30. The 30 value was wrong.",
+        "user": "Correction \u2014 I misread the runbook. The health-check timeout must be 45 seconds, not 30. The 30 value was wrong.",
         "assistant": "Corrected: health-check timeout is 45 seconds. The earlier 30-second value is superseded."
       },
       {
@@ -84,15 +84,15 @@
       "sourceClaimRef": "exp-timeout-45"
     },
     {
-      "id": "probe-timeout-mc",
-      "question": "Which value is the final health-check timeout?",
+      "id": "probe-az-rollout",
+      "question": "How do rollouts proceed across availability zones?",
       "answerType": "multiple-choice",
       "choices": [
-        "30 seconds",
-        "45 seconds"
+        "all availability zones at once",
+        "one availability zone at a time"
       ],
-      "goldAnswer": "45 seconds",
-      "sourceClaimRef": "exp-timeout-45"
+      "goldAnswer": "one availability zone at a time",
+      "sourceClaimRef": "exp-az-rollout"
     }
   ]
 }

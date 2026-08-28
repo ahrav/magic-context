@@ -1,7 +1,6 @@
-import { join } from "node:path";
-
 import { getDataDir } from "../../../shared/data-path";
 import { McHostClient } from "../../../shared/mc-host-client";
+import { defaultConnectionFilePath } from "../../../shared/mc-host-lifecycle/paths";
 
 /** The sole wire-level coupling between standalone smart notes and scheduled wakes. */
 export const WAKE_PLANE_CAPABILITY = "wake.create";
@@ -27,7 +26,7 @@ let catalogProbe: CatalogProbe = probeWakePlaneCatalog;
 let now = () => Date.now();
 
 function connectionFile(): string {
-    return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+    return defaultConnectionFilePath(getDataDir());
 }
 
 async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {

@@ -337,12 +337,14 @@ ${renderRetrospectiveEvents(args.events)}
 - Do NOT quote the user, include dates, or preserve anger/frustration wording.
 - Write in plain prose with NO quotation marks at all — not around the user's words, and not around illustrative trigger words. Describe trigger conditions directly (write: when the user asks you to investigate or diagnose without requesting a fix — not: when the user says "investigate"). A learning containing any quotation marks is rejected.
 - Use route="memory" for project-specific agent behavior/rules, with category one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING.
+- Use route="anti_memory" when the durable lesson is that a concrete strategy was rejected. Supply trigger, rejected_strategy, rejection_reason, and safer_alternative when one exists. Never flatten a rejection into a positive memory.
 - Use route="observation" only for recurring user workflow/preferences that belong in the global user profile.
 - Zero learnings is acceptable and should be represented by an empty learnings block.
 
 Return only XML in this exact shape:
 <learnings>
   <learning route="memory" category="PROJECT_RULES">one durable actionable correction</learning>
+  <learning route="anti_memory"><trigger>semantic work scope</trigger><rejected_strategy>discarded strategy</rejected_strategy><rejection_reason>why it was rejected</rejection_reason><safer_alternative>preferred alternative</safer_alternative></learning>
   <learning route="observation">one recurring user preference</learning>
 </learnings>`;
 }

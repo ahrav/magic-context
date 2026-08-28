@@ -13,7 +13,9 @@ pub mod client;
 pub mod composite;
 pub mod config;
 pub mod connection_file;
+pub mod generation;
 pub mod handler;
+pub mod harness_closure;
 pub mod lifecycle;
 #[doc(hidden)]
 pub mod provider_recovery;
@@ -46,15 +48,16 @@ pub mod wire;
 
 pub use auth::{
     authenticate_client, authenticate_server, compute_proof, AuthError, AuthStage, Authenticated,
-    ClientAuth, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE,
-    MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
+    ClientAuth, ClientAuthenticated, ClientHello, ServerProof, CLIENT_AUTH_DOMAIN,
+    DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
 };
 pub use client::{
-    CallError, Client, ClientError, RequestOptions, Response, ResponseStream, SendOutcome,
-    StreamItem, CLIENT_CONTROL_QUEUE_FRAMES, CLIENT_DATA_QUEUE_FRAMES, CLIENT_FRAME_TIMEOUT,
-    CLIENT_HANDSHAKE_TIMEOUT, CLIENT_MAX_LIVE_STREAMS, CLIENT_MAX_PENDING_REQUESTS,
-    CLIENT_QUEUED_BYTES, CLIENT_REQUEST_TIMEOUT, CLIENT_RETAINED_RESPONSE_BYTES,
-    CLIENT_ROUTE_OPEN_TIMEOUT, CLIENT_SHUTDOWN_TIMEOUT, CLIENT_STREAM_QUEUE_ITEMS,
+    CallError, Client, ClientError, HostStatusSnapshot, RequestOptions, Response, ResponseStream,
+    SendOutcome, StreamItem, CLIENT_CONTROL_QUEUE_FRAMES, CLIENT_DATA_QUEUE_FRAMES,
+    CLIENT_FRAME_TIMEOUT, CLIENT_HANDSHAKE_TIMEOUT, CLIENT_MAX_LIVE_STREAMS,
+    CLIENT_MAX_PENDING_REQUESTS, CLIENT_QUEUED_BYTES, CLIENT_REQUEST_TIMEOUT,
+    CLIENT_RETAINED_RESPONSE_BYTES, CLIENT_ROUTE_OPEN_TIMEOUT, CLIENT_SHUTDOWN_TIMEOUT,
+    CLIENT_STREAM_QUEUE_ITEMS,
 };
 pub use composite::{
     CompositeComponent, PrimaryComponent, SecondaryComponent, ShutdownError, StaticComposite,
@@ -69,12 +72,16 @@ pub use handler::{
     OutputBuffer, RequestCtx, RequestOutcome, ResourceDeclaration, RouteClass, RouteHandle,
     RouteIdentity, RouteTarget, StreamClosed, TargetKind,
 };
-pub use instance::{runtime_dir_path, InstanceError, CONNECTION_FILE_NAME};
+pub use instance::{
+    data_dir_path, managed_dir_path, runtime_dir_path, InstanceError, CONNECTION_FILE_NAME,
+    MANAGED_DIR_NAME,
+};
 pub use lifecycle::{
     coordination_dir_path, is_canonical_payload_digest, lifecycle_dir_path, probe_lifecycle,
     LifecyclePhase, LifecycleProbe, LifecycleRecord, LifecycleState, LifecycleTransactionLock,
-    ProbeFreshness, PublicationSummary, COORDINATION_DIR_NAME, LIFECYCLE_RECORD_NAME,
-    LIFETIME_LOCK_NAME, PAYLOAD_MANIFEST_DIGEST_LEN, TRANSACTION_LOCK_NAME,
+    NamespaceAnchor, ProbeFreshness, PublicationSummary, COORDINATION_DIR_NAME,
+    LIFECYCLE_RECORD_NAME, LIFETIME_LOCK_NAME, PAYLOAD_MANIFEST_DIGEST_LEN, TRANSACTION_LOCK_NAME,
+    UNSUPPORTED_STATE_SCHEMA_REASON,
 };
 pub use runtime::{run, HostError};
 /// The version-2 body cap. Published so a consumer preparing an output can

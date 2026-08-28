@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
 use crate::decay_render::{extract_m0_block, DecayRenderCompartment};
 use crate::memory_render::{
-    render_claim_memory_block, render_claim_memory_line, render_m0, M0Inputs, MirroredClaimMemory,
+    is_positive_memory_category, render_claim_memory_block, render_claim_memory_line, render_m0,
+    M0Inputs, MirroredClaimMemory,
 };
 use crate::project_docs::read_project_docs_canonical;
 
@@ -160,7 +161,17 @@ pub(crate) fn trim_claims_to_budget(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Vec<MirroredClaimMemory> {
     let budget = budget_tokens.max(1.0);
-    let mut ordered = claims.to_vec();
+    // Selection is the record of what m0 rendered: callers derive
+    // `rendered_revision_locators` from the result. Dropping non-positive
+    // categories here keeps that record aligned with
+    // `render_claim_memory_block`, which refuses to render them, so a
+    // hand-assembled warning claim cannot consume budget or be reported as
+    // rendered content it never became.
+    let mut ordered = claims
+        .iter()
+        .filter(|claim| is_positive_memory_category(&claim.category))
+        .cloned()
+        .collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
         right
             .importance

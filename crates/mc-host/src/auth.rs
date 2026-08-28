@@ -129,6 +129,11 @@ pub enum AuthError {
     },
     InvalidServerProof,
     DaemonIdMismatch,
+    /// The peer reported a `daemon_ver` other than the one in the connection-file
+    /// snapshot this handshake authenticated against. `daemon_ver` is not an
+    /// input to either proof, so this comparison is what binds the reported
+    /// version to that snapshot and makes it usable for compatibility gating.
+    DaemonVerMismatch,
     InvalidClientAuth,
 }
 
@@ -274,11 +279,16 @@ where
     Ok(Authenticated)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuthenticated {
+    pub daemon_ver: String,
+}
+
 pub async fn authenticate_client<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
     deadline: Duration,
-) -> Result<(), AuthError>
+) -> Result<ClientAuthenticated, AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -294,7 +304,7 @@ async fn authenticate_client_inner<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
     deadline: Deadline,
-) -> Result<(), AuthError>
+) -> Result<ClientAuthenticated, AuthError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -326,6 +336,16 @@ where
     if server_proof.daemon_id != conn.daemon_id {
         return Err(AuthError::DaemonIdMismatch);
     }
+    // Wire protocol §5.2: the client MUST require `ServerProof.daemon_ver` to
+    // equal the connection-file `daemon_ver`, and MUST emit no `ClientAuth`
+    // until all three checks succeed. `daemon_ver` is not an input to either
+    // proof, so without this comparison the returned version is whatever the
+    // peer claimed rather than the version of the snapshot that was
+    // authenticated — and a consumer gating compatibility on it would be
+    // trusting an unbound field.
+    if server_proof.daemon_ver != conn.daemon_ver {
+        return Err(AuthError::DaemonVerMismatch);
+    }
 
     let client_auth = compute_proof(
         &conn.key,
@@ -340,7 +360,10 @@ where
         &ClientAuth { client_auth },
         deadline,
     )
-    .await
+    .await?;
+    Ok(ClientAuthenticated {
+        daemon_ver: server_proof.daemon_ver,
+    })
 }
 
 fn validate_key(key: &[u8]) -> Result<(), AuthError> {
@@ -580,6 +603,9 @@ impl fmt::Display for AuthError {
             }
             Self::InvalidServerProof => write!(f, "invalid server auth proof"),
             Self::DaemonIdMismatch => write!(f, "server daemon_id did not match connection file"),
+            Self::DaemonVerMismatch => {
+                write!(f, "server daemon_ver did not match connection file")
+            }
             Self::InvalidClientAuth => write!(f, "invalid client auth proof"),
         }
     }
@@ -597,6 +623,7 @@ impl Error for AuthError {
             | Self::KeyTooShort { .. }
             | Self::InvalidServerProof
             | Self::DaemonIdMismatch
+            | Self::DaemonVerMismatch
             | Self::InvalidDeadline { .. }
             | Self::InvalidClientAuth => None,
         }

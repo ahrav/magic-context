@@ -1,0 +1,26 @@
+{
+  "schema": "magic-context.mc-host-harness-closure/v1",
+  "harness": "opencode",
+  "package": "opencode-ai",
+  "version": "1.18.22",
+  "argument_variant": "run_prompt",
+  "source_roots": [
+    "opencode-install"
+  ],
+  "executable": "bin/opencode",
+  "interpreter": null,
+  "entrypoint": null,
+  "extensions": [],
+  "nodes": [
+    {
+      "path": "bin/opencode",
+      "source_root": "opencode-install",
+      "source_path": "bin/opencode",
+      "kind": "executable",
+      "mode": 448,
+      "size_bytes": 8,
+      "sha256": "62f8e1ec095e1857446d403d1431007de8813aea9553a56ccd4552a131b1f297",
+      "dependencies": []
+    }
+  ]
+}

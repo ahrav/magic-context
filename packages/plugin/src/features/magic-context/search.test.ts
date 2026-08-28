@@ -10,6 +10,7 @@ const rawMessagesBySession = new Map<
     Array<{ ordinal: number; id: string; role: string; parts: unknown[] }>
 >();
 
+import { packAutoSearchHint } from "../../hooks/magic-context/auto-search-hint";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     chunkCanonicalText,
@@ -17,15 +18,27 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
-import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
+import {
+    _resetEmbeddingConfigForTests,
+    embedTextForProject,
+    initializeEmbedding,
+} from "./memory/embedding";
+import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import { createAntiMemory, readAntiMemory } from "./memory/storage-anti-memory";
 import * as claimCurrentState from "./memory/storage-claim-current-state";
 import {
     computeProjectMemoryMutationToken,
     setProjectMemoryClaimLifecycle,
 } from "./memory/storage-claim-operations";
+import {
+    recordDispositionEventInCurrentTransaction,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "./memory/storage-claim-policy";
+import { ensureProject } from "./memory/storage-claims";
 import { ensureMessagesIndexed } from "./message-index";
 import {
     _resetProjectEmbeddingRegistryForTests,
+    _setTestProviderFactoryForProject,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
 import {
@@ -118,6 +131,51 @@ function createTestDb(): Database {
     return createClaimReaderTestDatabase();
 }
 
+function seedAntiMemory(
+    db: Database,
+    projectIdentity: string,
+    key: string,
+    nowMs = Date.now(),
+    pair: {
+        trigger: string;
+        rejectedStrategy: string;
+        nonApplicableWhen?: string;
+        rootCause?: string;
+    } = {
+        trigger: "session caching",
+        rejectedStrategy: "Redis",
+    },
+) {
+    const result = createAntiMemory(
+        db,
+        { producer: "search-test", operationKey: `anti-${key}` },
+        {
+            projectId: ensureProject(db, projectIdentity),
+            payload: {
+                ...pair,
+                rejectionReason: "it creates split ownership",
+                saferAlternative: "use SQLite",
+            },
+            provenance: {
+                sourceLocator: `test://search/${key}`,
+                sourceContent: "Redis rejected for session caching",
+                extractor: "test",
+                extractorVersion: "1",
+                extractorRunId: key,
+                independenceKey: key,
+                sourceTrustClass: "explicit_user",
+            },
+            actor: "user:test",
+            nowMs,
+        },
+    );
+    const publicClaimId = (result.result.payload as { claim: { publicClaimId: string } }).claim
+        .publicClaimId;
+    const record = readAntiMemory(db, publicClaimId);
+    if (record === null) throw new Error("anti-memory seed failed");
+    return record;
+}
+
 afterEach(() => {
     queryEmbedding = null;
     embeddingQueries.length = 0;
@@ -204,6 +262,466 @@ describe("unifiedSearch", () => {
                 /\bmemories(?:_fts)?\b|\bmemory_stats\b|\bmemory_verifications\b/i.test(sql),
             ),
         ).toBeFalse();
+    });
+
+    it("matches active anti-memory text and preserves warning shape for exact locators", async () => {
+        const project = "git:anti-search";
+        const anti = seedAntiMemory(db, project, "active");
+
+        const matching = await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            memoryPolicySurface: "explicit_search",
+        });
+        expect(matching).toHaveLength(1);
+        expect(matching[0]).toMatchObject({
+            source: "anti_memory",
+            publicClaimId: anti.publicClaimId,
+            rejectedStrategy: "Redis",
+            rejectionReason: "it creates split ownership",
+            saferAlternative: "use SQLite",
+            matchType: "lexical",
+        });
+        expect(
+            await unifiedSearch(db, "session-anti", project, "button colors", {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: false,
+            }),
+        ).toEqual([]);
+
+        const exact = resolveClaimsByLocatorsForSearch({
+            db,
+            projectPath: project,
+            locators: [anti.revisionLocator],
+            limit: 10,
+        });
+        expect(exact?.[0]).toMatchObject({
+            source: "anti_memory",
+            publicClaimId: anti.publicClaimId,
+            rejectedStrategy: "Redis",
+            matchType: "exact",
+        });
+
+        // A human-rejected disposition hides the record from every surface.
+        const target = db
+            .prepare(
+                `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                   FROM claim_public_ids public
+                   JOIN claims ON claims.id = public.claim_id
+                  WHERE public.public_id = ?`,
+            )
+            .get(anti.publicClaimId) as { revisionId: number; projectId: number };
+        db.transaction(() => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: target.revisionId,
+                projectId: target.projectId,
+                disposition: "rejected",
+                action: "assert",
+                actor: "user:test",
+                reason: "false warning",
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, target.revisionId);
+        }).immediate();
+        expect(
+            await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                memoryPolicySurface: "explicit_search",
+            }),
+        ).toEqual([]);
+    });
+
+    it("matches anti-memory through auto-search embedding without lexical token overlap", async () => {
+        const project = "git:anti-semantic-search";
+        const anti = seedAntiMemory(db, project, "semantic");
+        const embeddedPassages: string[][] = [];
+        queryEmbedding = new Float32Array([1, 0]);
+
+        const semantic = await unifiedSearch(
+            db,
+            "session-anti",
+            project,
+            "accelerate login state with distributed key-value infrastructure",
+            {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: true,
+                memoryPolicySurface: "auto_search",
+                embedQuery,
+                embedPassages: async (texts, _signal, purpose) => {
+                    expect(purpose).toBe("passage");
+                    embeddedPassages.push(texts);
+                    return texts.map(() => new Float32Array([1, 0]));
+                },
+                isEmbeddingRuntimeEnabled,
+            },
+        );
+
+        expect(semantic).toHaveLength(1);
+        expect(semantic[0]).toMatchObject({
+            source: "anti_memory",
+            publicClaimId: anti.publicClaimId,
+            matchType: "semantic",
+            score: 1,
+        });
+        expect(embeddedPassages).toHaveLength(1);
+        expect(embeddedPassages[0]?.[0]).toContain("session caching");
+
+        expect(
+            await unifiedSearch(
+                db,
+                "session-anti",
+                project,
+                "accelerate login state with distributed key-value infrastructure",
+                {
+                    sources: ["memory"],
+                    memoryEnabled: true,
+                    embeddingEnabled: true,
+                    memoryPolicySurface: "explicit_search",
+                    embedQuery,
+                    embedPassages: async () => {
+                        throw new Error("explicit search must remain lexical-only");
+                    },
+                    isEmbeddingRuntimeEnabled,
+                },
+            ),
+        ).toEqual([]);
+    });
+
+    it("reserves an auto-search slot for anti-memory before the global limit", async () => {
+        const project = "git:anti-global-limit";
+        const anti = seedAntiMemory(db, project, "global-limit");
+        const query =
+            "session caching alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma";
+        rawMessagesBySession.set(
+            "session-anti-limit",
+            Array.from({ length: 12 }, (_, index) => ({
+                ordinal: index + 1,
+                id: `strong-${index}`,
+                role: "assistant",
+                parts: [{ type: "text", text: `${query} candidate ${index}` }],
+            })),
+        );
+        ensureMessagesIndexed(db, "session-anti-limit", readMessages);
+        const options = {
+            limit: 3,
+            sources: ["memory", "message"] as Array<"memory" | "message">,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages,
+        };
+
+        const automatic = await unifiedSearch(db, "session-anti-limit", project, query, {
+            ...options,
+            memoryPolicySurface: "auto_search",
+        });
+        expect(automatic).toHaveLength(3);
+        expect(automatic.filter((result) => result.source === "message")).toHaveLength(2);
+        expect(automatic.find((result) => result.source === "anti_memory")).toMatchObject({
+            publicClaimId: anti.publicClaimId,
+        });
+
+        const packed = packAutoSearchHint(automatic);
+        expect(packed.delivered[0]).toMatchObject({
+            source: "anti_memory",
+            publicClaimId: anti.publicClaimId,
+        });
+        expect(packed.text).toContain("⚠ Previously rejected: Redis");
+
+        const explicit = await unifiedSearch(db, "session-anti-limit", project, query, {
+            ...options,
+            limit: 4,
+            memoryPolicySurface: "explicit_search",
+        });
+        expect(explicit).toHaveLength(4);
+        expect(explicit.every((result) => result.source === "message")).toBe(true);
+    });
+
+    it("embeds anti-memory query and passages through one project provider and fails open", async () => {
+        const project = "git:anti-project-lane";
+        seedAntiMemory(db, project, "project-lane");
+        const calls: Array<{ kind: "query" | "batch"; purpose?: EmbeddingPurpose }> = [];
+        let failBatch = false;
+        const provider: EmbeddingProvider = {
+            modelId: "local:project-lane",
+            initialize: async () => true,
+            embed: async (_text, _signal, purpose) => {
+                calls.push({ kind: "query", purpose });
+                return new Float32Array([1, 0]);
+            },
+            embedBatch: async (texts, _signal, purpose) => {
+                calls.push({ kind: "batch", purpose });
+                if (failBatch) throw new Error("passage lane unavailable");
+                return texts.map(() => new Float32Array([1, 0]));
+            },
+            dispose: async () => {},
+            isLoaded: () => true,
+        };
+        _setTestProviderFactoryForProject(() => provider);
+        registerEmbeddingProject(db, project);
+
+        const options = {
+            sources: ["memory"] as Array<"memory">,
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search" as const,
+            embedQuery: (text: string, signal?: AbortSignal, purpose?: EmbeddingPurpose) =>
+                embedTextForProject(project, text, signal, purpose),
+            isEmbeddingRuntimeEnabled,
+        };
+        const query = "distributed key-value login acceleration";
+        const semantic = await unifiedSearch(db, "session-anti", project, query, options);
+        expect(semantic[0]).toMatchObject({ source: "anti_memory", matchType: "semantic" });
+        expect(calls).toEqual([
+            { kind: "query", purpose: "query" },
+            { kind: "batch", purpose: "passage" },
+        ]);
+
+        calls.length = 0;
+        failBatch = true;
+        expect(await unifiedSearch(db, "session-anti", project, query, options)).toEqual([]);
+        expect(calls.map((call) => call.kind)).toEqual(["query", "batch"]);
+    });
+
+    it("labels stale anti-memory only in explicit search and omits expired records", async () => {
+        const project = "git:anti-lifecycle";
+        const stale = seedAntiMemory(db, project, "stale");
+        const staleRevision = db
+            .prepare(
+                `SELECT revisions.id AS id FROM claim_public_ids public
+                 JOIN claims ON claims.id = public.claim_id
+                 JOIN claim_revisions revisions ON revisions.id = claims.current_revision_id
+                 WHERE public.public_id = ?`,
+            )
+            .get(stale.publicClaimId) as { id: number };
+        db.prepare(
+            "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'test', ?)",
+        ).run(staleRevision.id, Date.now());
+        const expired = seedAntiMemory(
+            db,
+            project,
+            "expired",
+            Date.now() - 91 * 24 * 60 * 60 * 1_000,
+            { trigger: "session cache expiry", rejectedStrategy: "Memcached" },
+        );
+        expect(expired.publicClaimId).not.toBe(stale.publicClaimId);
+
+        const explicit = await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            memoryPolicySurface: "explicit_search",
+        });
+        expect(explicit).toHaveLength(1);
+        expect(explicit[0].source).toBe("anti_memory");
+        if (explicit[0].source === "anti_memory") {
+            expect(explicit[0].policyLabel).toContain("stale");
+        }
+
+        const automatic = await unifiedSearch(
+            db,
+            "session-anti",
+            project,
+            "Redis session caching",
+            {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                memoryPolicySurface: "auto_search",
+            },
+        );
+        expect(automatic).toEqual([]);
+
+        expect(
+            await unifiedSearch(db, "session-anti", project, "Memcached session cache expiry", {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                memoryPolicySurface: "explicit_search",
+            }),
+        ).toEqual([]);
+    });
+
+    it("retries a stale current-state read instead of dropping the warning lane", async () => {
+        const project = "git:anti-stale-read";
+        const anti = seedAntiMemory(db, project, "stale-read");
+        const realRead = claimCurrentState.readProjectMemoryCurrentState;
+        let reads = 0;
+        // `stale` is what the provider reports when a generation moves during
+        // hydration, which any concurrent claim write can cause.
+        const spy = spyOn(claimCurrentState, "readProjectMemoryCurrentState").mockImplementation(
+            (database, request) => {
+                reads += 1;
+                if (reads === 1) return { status: "stale", reasons: ["test"] };
+                return realRead(database, request);
+            },
+        );
+        try {
+            const results = await unifiedSearch(
+                db,
+                "session-anti",
+                project,
+                "Redis session caching",
+                {
+                    sources: ["memory"],
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    memoryPolicySurface: "explicit_search",
+                },
+            );
+            expect(results).toHaveLength(1);
+            expect(results[0]).toMatchObject({
+                source: "anti_memory",
+                publicClaimId: anti.publicClaimId,
+            });
+            expect(reads).toBeGreaterThan(1);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("does not match a prompt on the exception where the rejection does not apply", async () => {
+        const project = "git:anti-nonapplicable";
+        seedAntiMemory(db, project, "nonapplicable", Date.now(), {
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            nonApplicableWhen: "the deployment is a single ephemeral preview box",
+        });
+
+        // The warning is not rendered with its exception, so retrieving it for
+        // the prompt that states the exception would assert the opposite of the
+        // stored guidance.
+        expect(
+            await unifiedSearch(
+                db,
+                "session-anti",
+                project,
+                "single ephemeral preview box deployment",
+                {
+                    sources: ["memory"],
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    memoryPolicySurface: "explicit_search",
+                },
+            ),
+        ).toEqual([]);
+
+        const onTrigger = await unifiedSearch(
+            db,
+            "session-anti",
+            project,
+            "Redis session caching",
+            {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                memoryPolicySurface: "explicit_search",
+            },
+        );
+        expect(onTrigger).toHaveLength(1);
+        expect(onTrigger[0].source).toBe("anti_memory");
+    });
+
+    it("bounds the bytes of each anti-memory passage sent to the embedder", async () => {
+        const project = "git:anti-passage-bytes";
+        seedAntiMemory(db, project, "oversized", Date.now(), {
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rootCause: "why ".repeat(20_000),
+        });
+        const embedded: string[][] = [];
+        queryEmbedding = new Float32Array([1, 0]);
+
+        await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search",
+            embedQuery,
+            embedPassages: async (texts) => {
+                embedded.push(texts);
+                return texts.map(() => new Float32Array([1, 0]));
+            },
+            isEmbeddingRuntimeEnabled,
+        });
+
+        expect(embedded).toHaveLength(1);
+        expect(embedded[0]).toHaveLength(1);
+        for (const text of embedded[0]) {
+            expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
+        }
+    });
+
+    it("keeps a sub-threshold passage similarity out of the anti-memory score", async () => {
+        const project = "git:anti-subthreshold";
+        seedAntiMemory(db, project, "subthreshold");
+        const query = "caching ownership alpha bravo charlie delta echo foxtrot golf hotel";
+
+        const lexicalOnly = await unifiedSearch(db, "session-anti", project, query, {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            memoryPolicySurface: "explicit_search",
+        });
+        expect(lexicalOnly).toHaveLength(1);
+        const lexicalScore = lexicalOnly[0].score;
+
+        // Cosine 0.65 sits below ANTI_MEMORY_SEMANTIC_THRESHOLD but above the
+        // lexical score, so folding it in would rank this warning on similarity
+        // the lane already judged too weak to count as a match.
+        queryEmbedding = new Float32Array([1, 0]);
+        const automatic = await unifiedSearch(db, "session-anti", project, query, {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search",
+            embedQuery,
+            embedPassages: async (texts) =>
+                texts.map(() => new Float32Array([0.65, Math.sqrt(1 - 0.65 * 0.65)])),
+            isEmbeddingRuntimeEnabled,
+        });
+
+        expect(lexicalScore).toBeLessThan(0.65);
+        expect(automatic).toHaveLength(1);
+        expect(automatic[0]).toMatchObject({ source: "anti_memory", matchType: "lexical" });
+        expect(automatic[0].score).toBeCloseTo(lexicalScore, 10);
+    });
+
+    it("drops an anti-memory retired while its passage embedding was in flight", async () => {
+        const project = "git:anti-inflight-retire";
+        const anti = seedAntiMemory(db, project, "inflight");
+        queryEmbedding = new Float32Array([1, 0]);
+
+        const results = await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search",
+            embedQuery,
+            embedPassages: async (texts) => {
+                // A concurrent writer demotes the warning while this provider
+                // call is outstanding, so every candidate hydrated before the
+                // await is now pre-transition content.
+                const revision = db
+                    .prepare(
+                        `SELECT revisions.id AS id FROM claim_public_ids public
+                         JOIN claims ON claims.id = public.claim_id
+                         JOIN claim_revisions revisions ON revisions.id = claims.current_revision_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(anti.publicClaimId) as { id: number };
+                db.prepare(
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'test', ?)",
+                ).run(revision.id, Date.now());
+                return texts.map(() => new Float32Array([1, 0]));
+            },
+            isEmbeddingRuntimeEnabled,
+        });
+
+        expect(results).toEqual([]);
     });
 
     it("suppresses the project-memory lane in unified search until retrieval activates", async () => {

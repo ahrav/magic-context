@@ -21,6 +21,7 @@ import {
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { recordDeliveredAntiMemoryUsage } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import {
 	parseLocatorShapedQuery,
 	resolveClaimsByLocatorsForSearch,
@@ -34,7 +35,7 @@ import {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getVisibleRevisionLocators } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
-import { formatSearchResults } from "@magic-context/core/tools/ctx-search/render";
+import { packSearchResults } from "@magic-context/core/tools/ctx-search/render";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -43,7 +44,7 @@ const ParamsSchema = Type.Object(
 		query: Type.Optional(
 			Type.String({
 				description:
-					"Search query. Matches against Primers, git commit messages, notes, and raw user/assistant message text. Project-memory claims are NOT text-searchable; a query that is only opaque public claim ids (mcm_<32hex>) or full revision locators resolves those claims directly.",
+					"Search query. Matches rejected-approach warnings, Primers, git commit messages, notes, and raw user/assistant message text. Positive project-memory claims require an opaque public claim id (mcm_<32hex>) or full revision locator.",
 			}),
 		),
 		limit: Type.Optional(
@@ -62,7 +63,7 @@ const ParamsSchema = Type.Object(
 				]),
 				{
 					description:
-						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] is accepted but returns nothing: broad project-memory retrieval is disabled until the claim retrieval projection is active. Omit for a broad search across all enabled sources.',
+						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] searches rejected-approach warnings and resolves exact positive-memory locators; broad positive-memory text retrieval remains disabled. Omit for all enabled sources.',
 				},
 			),
 		),
@@ -178,6 +179,13 @@ export function createCtxSearchTool(
 				deps.db,
 				sessionId,
 			);
+			const renderDelivered = (
+				results: Awaited<ReturnType<typeof unifiedSearch>>,
+			) => {
+				const packed = packSearchResults(query, results, sessionId);
+				recordDeliveredAntiMemoryUsage(deps.db, packed.delivered);
+				return packed.text;
+			};
 
 			// Exact-locator short-circuit (parity with OpenCode ctx_search):
 			// when the whole query is one or more claim/revision locators,
@@ -210,7 +218,7 @@ export function createCtxSearchTool(
 						content: [
 							{
 								type: "text",
-								text: formatSearchResults(query, locatorResults, sessionId),
+								text: renderDelivered(locatorResults),
 							},
 						],
 						details: undefined,
@@ -251,7 +259,7 @@ export function createCtxSearchTool(
 				content: [
 					{
 						type: "text",
-						text: formatSearchResults(query, results, sessionId),
+						text: renderDelivered(results),
 					},
 				],
 				details: undefined,

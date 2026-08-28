@@ -67,7 +67,7 @@
         "family": "explored-never-accepted",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "use cursor-based pagination"
+          "value": "cursor-based"
         }
       },
       {
@@ -75,7 +75,7 @@
         "family": "explored-never-accepted",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "use keyset pagination"
+          "value": "keyset"
         }
       }
     ],

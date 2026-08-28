@@ -151,6 +151,51 @@ describe("pure format-family classification", () => {
         expect(classification.reasons).toContain("unregistered schema object: memories");
     });
 
+    it("refuses the prior direct format after the anti-memory component changes identity", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const current = inspectDatabaseForClassification(db);
+            if (current.marker.status !== "present") throw new Error("missing current marker");
+            const antiMemoryObjects = new Set([
+                "claim_anti_memory_payloads_append_only_delete",
+                "claim_anti_memory_payloads_append_only_insert_collision",
+                "claim_anti_memory_payloads_append_only_update",
+                "claim_anti_memory_payloads_category_guard",
+                "claim_anti_memory_revision_payloads",
+            ]);
+            const { markerDigest: _currentDigest, ...currentMarker } = current.marker.marker;
+            const priorMarker = {
+                ...currentMarker,
+                componentManifestDigest:
+                    "7006b7e53e06ae463b46963c125a7b6629238d19c90b37e6c81db133b1be7767",
+            };
+            const prior: FormatFamilyInspection = {
+                ...current,
+                schemaObjectNames: current.schemaObjectNames.filter(
+                    (name) => !antiMemoryObjects.has(name),
+                ),
+                marker: {
+                    status: "present",
+                    marker: {
+                        ...priorMarker,
+                        markerDigest: computeMarkerDigest(priorMarker),
+                    },
+                },
+            };
+
+            const classification = classifyDatabaseFormatFamily(prior, EXPECTED);
+            expect(classification.family).toBe("unsupported");
+            expect(classification.reasons).toContain(
+                "marker component manifest digest does not match this build's manifest",
+            );
+            expect(classification.reasons).toContain(
+                "missing registered schema object: claim_anti_memory_revision_payloads",
+            );
+        } finally {
+            db.close();
+        }
+    });
+
     it("refuses a malformed marker before any other verdict", () => {
         const { db } = createDirectTestDatabase();
         try {
@@ -318,8 +363,16 @@ describe("reset marker and interrupted quarantine", () => {
             ]);
 
             const walDestination = join(quarantineDirPath, "context.db-wal");
-            rmSync(walDestination);
-            writeFileSync(walDestination, "replacement");
+            // Identity is dev+inode, so a replacement must land on a DIFFERENT
+            // inode for this to test anything. Deleting first and recreating
+            // leaves that to the filesystem, which recycles the just-freed inode
+            // often enough that CI saw the replacement classified as a clean
+            // move. Staging a sibling file while the original still holds its
+            // inode forces a distinct one, then renaming it into place keeps it.
+            const replacement = `${walDestination}.replacement`;
+            writeFileSync(replacement, "replacement");
+            expect(statSync(replacement).ino).not.toBe(statSync(walDestination).ino);
+            renameSync(replacement, walDestination);
             const replaced = verifyResetMarkerFamily(marker);
             expect(replaced.files).toContainEqual({ role: "wal", status: "mismatch" });
             expect(replaced.problems.join("\n")).toContain("changed identity");

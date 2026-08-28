@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { acquireLease } from "../dreamer/lease";
+import { createAntiMemory } from "../memory/storage-anti-memory";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
@@ -13,6 +14,7 @@ import {
     computeProjectMemoryMutationToken,
     reviseProjectMemoryClaim,
 } from "../memory/storage-claim-operations";
+import { ensureProject } from "../memory/storage-claims";
 import { createClaimReaderTestDatabase, seedProjectMemoryClaim } from "../test-claim-database";
 import {
     applyCues,
@@ -182,6 +184,47 @@ function seedClaims(db: Database, projectIdentity: string, count: number): void 
 }
 
 describe("runCompressCues disposition", () => {
+    test("never sends a verified rejected approach to cue compression", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const projectIdentity = "git:cues-anti-memory";
+            seedClaims(db, projectIdentity, 1);
+            const anti = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "cues-anti" },
+                {
+                    projectId: ensureProject(db, projectIdentity),
+                    payload: {
+                        trigger: "cache work",
+                        rejectedStrategy: "use Redis",
+                        rejectionReason: "operational burden",
+                    },
+                    provenance: {
+                        sourceLocator: "transcript://cues-anti",
+                        sourceContent: "user rejected Redis",
+                        extractor: "test",
+                        extractorVersion: "1",
+                        extractorRunId: "cues-anti",
+                        independenceKey: "cues-anti",
+                        sourceTrustClass: "explicit_user",
+                    },
+                    actor: "host:user-corroborated",
+                    nowMs: 1,
+                },
+            );
+            const antiId = (anti.result.payload as { claim: { publicClaimId: string } }).claim
+                .publicClaimId;
+            const args = cueArgs(db, projectIdentity);
+            args.client = successfulCueClient() as never;
+
+            const result = await runCompressCues(args);
+            expect(result.compressed).toBe(1);
+            expect(cueStateOf(db, antiId)).toBeUndefined();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("banks a completed chunk and reports the deadline remainder", async () => {
         const db = createClaimReaderTestDatabase();
         try {

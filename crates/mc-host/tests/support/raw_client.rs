@@ -159,6 +159,11 @@ impl RawFrame {
             .expect("error body has a code")
             .to_owned()
     }
+
+    /// Server retry hint carried by an error terminal, when present.
+    pub fn error_retry_after_ms(&self) -> Option<u64> {
+        self.json()["retry_after_ms"].as_u64()
+    }
 }
 
 /// Contents of a published connection file, parsed independently.
@@ -489,6 +494,26 @@ impl RawClient {
         harness: &str,
         session: &str,
     ) -> Result<(u16, u32), String> {
+        self.route_open_target_with_fingerprints(
+            kind,
+            module_id,
+            project_root,
+            harness,
+            session,
+            serde_json::Map::new(),
+        )
+        .await
+    }
+
+    pub async fn route_open_target_with_fingerprints(
+        &mut self,
+        kind: &str,
+        module_id: &str,
+        project_root: &str,
+        harness: &str,
+        session: &str,
+        credential_fingerprints: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(u16, u32), String> {
         let corr = self
             .control(&serde_json::json!({
                 "op": "route.open",
@@ -496,7 +521,8 @@ impl RawClient {
                 "identity": {
                     "project_root": project_root,
                     "harness": harness,
-                    "session": session
+                    "session": session,
+                    "credential_fingerprints": credential_fingerprints,
                 }
             }))
             .await

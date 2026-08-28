@@ -468,8 +468,15 @@ export interface FrameChannel {
     stats(): FrameChannelStats;
 }
 
+/**
+ * A {@link FrameChannel} with a bounded setup phase ahead of frame delivery.
+ *
+ * `start()` reports nothing. Peer identity is proven by a handshake, and only
+ * the channel that ran one can name it — through its own accessor — so a
+ * setup channel cannot report an identity it never authenticated.
+ */
 export interface SetupFrameChannel extends FrameChannel {
-    start(deadline: Deadline): Promise<{ daemonVer: string }>;
+    start(deadline: Deadline): Promise<void>;
     beginFrames(): void;
 }
 

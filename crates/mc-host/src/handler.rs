@@ -6,6 +6,7 @@
 //! route allocation, and the host owns lifecycle transitions, terminal
 //! arbitration, and wire emission (plan KTD2).
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -94,6 +95,16 @@ pub struct ResourceDeclaration {
     /// example Broca's 64 MiB replay budget). An accounting reservation
     /// subtracted from ingress; the module enforces its own internal budget.
     pub retained_resident_bytes: u64,
+    /// Upper bound on general-class handler tasks this module can hold
+    /// concurrently parked on internal admission (for example Synapse's
+    /// one running query plus its FIFO waiters, each awaiting a lane permit
+    /// inside its handler task until the request deadline). Not a carve-out:
+    /// the tasks still draw on the general pool. Startup checked-sums these
+    /// bounds and refuses a configuration whose parked tasks could consume
+    /// every general slot, which would let one module's waiting traffic
+    /// starve every other route of dispatch capacity. Zero declares no
+    /// long-parked general tasks.
+    pub general_task_hold_bound: usize,
     /// The permit class every route bound to this module dispatches under.
     pub route_class: RouteClass,
 }
@@ -115,6 +126,7 @@ pub struct RouteIdentity {
     pub consumer_launch_nonce: Option<String>,
     pub consumer_capabilities: Vec<String>,
     pub admission_facts: Option<serde_json::Value>,
+    pub credential_fingerprints: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for RouteIdentity {
@@ -132,6 +144,10 @@ impl std::fmt::Debug for RouteIdentity {
             )
             .field("consumer_capabilities", &self.consumer_capabilities.len())
             .field("admission_facts", &self.admission_facts.is_some())
+            .field(
+                "credential_fingerprints",
+                &self.credential_fingerprints.len(),
+            )
             .finish()
     }
 }
@@ -207,10 +223,39 @@ pub enum RequestOutcome {
     /// items.
     Response { body: OutputBuffer, binary: bool },
     /// Application failure; the host emits one canonical `Error` terminal.
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+        /// Advisory delay before retrying this operation.
+        retry_after_ms: Option<u64>,
+    },
     /// Stream items were emitted through [`RequestCtx::stream`]; the host
     /// emits the `StreamEnd` terminal.
     Streamed,
+}
+
+impl RequestOutcome {
+    /// Constructs an error without retry timing metadata.
+    pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Error {
+            code: code.into(),
+            message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+
+    /// Constructs an error with an advisory retry delay.
+    pub fn error_retry_after(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retry_after_ms: u64,
+    ) -> Self {
+        Self::Error {
+            code: code.into(),
+            message: message.into(),
+            retry_after_ms: Some(retry_after_ms),
+        }
+    }
 }
 
 impl std::fmt::Debug for RequestOutcome {
@@ -224,10 +269,15 @@ impl std::fmt::Debug for RequestOutcome {
                 .field("body", body)
                 .field("binary", binary)
                 .finish(),
-            Self::Error { code, message } => f
+            Self::Error {
+                code,
+                message,
+                retry_after_ms,
+            } => f
                 .debug_struct("Error")
                 .field("code_len", &code.len())
                 .field("message_len", &message.len())
+                .field("retry_after_ms", retry_after_ms)
                 .finish(),
             Self::Streamed => f.write_str("Streamed"),
         }
@@ -516,7 +566,16 @@ pub trait McHostHandler: Send + Sync + 'static {
         vec![ResourceDeclaration::default(); self.manifests().len()]
     }
 
+    /// Installs the incarnation bearer for protocol-internal credential-row
+    /// fingerprints before any component initialization or route bind.
+    fn install_connection_key(&self, _key: [u8; 32]) {}
+
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
+
+    /// Runs once after transport publication, before the accept loop, and is never awaited for readiness: storage opening and model construction belong here rather than in `initialize`, so transport never waits behind them. An expected artifact fault resolves to `Ok(())` with that lane internally degraded; `Err`, panic, and task loss are invariant failures that reach the host-fatal channel. Shutdown abandons an unfinished activation future, so long-running work must live in component-owned trackers that `shutdown` drains. commentlint: allow(JUDGE)
+    fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
+        async { Ok(()) }
+    }
 
     fn bind(
         &self,

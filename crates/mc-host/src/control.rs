@@ -5,6 +5,7 @@
 //! reservation, or filesystem work (protocol §7.1). Metadata never grants
 //! authority; the bearer key already did.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::handler::{ManifestSnapshot, RouteClass, RouteIdentity, RouteTarget, TargetKind};
@@ -21,6 +22,7 @@ pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 pub const OP_ROUTE_OPEN: &str = "route.open";
 pub const OP_CATALOG_LIST: &str = "catalog.list";
 pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
+pub const OP_HOST_STATUS: &str = "host.status";
 pub const OP_TRANSPORT_NEGOTIATE: &str = crate::transport_negotiation::OP_TRANSPORT_NEGOTIATE;
 
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
@@ -57,6 +59,7 @@ const MAX_SESSION_LEN: usize = 256;
 const MAX_LAUNCH_NONCE_LEN: usize = 256;
 const MAX_CAPABILITY_LEN: usize = 64;
 const MAX_CAPABILITIES: usize = 32;
+const MAX_CREDENTIAL_FINGERPRINTS: usize = 3;
 const MAX_ADMISSION_FACTS_BYTES: usize = 8192;
 const MAX_ADMISSION_FACTS_DEPTH: usize = 32;
 /// Whole-request nesting bound: the root object plus a maximal
@@ -80,6 +83,7 @@ pub enum ControlAction {
         identity: RouteIdentity,
     },
     HostShutdown,
+    HostStatus,
     TransportNegotiate(
         Result<
             crate::transport_negotiation::NegotiateRequest,
@@ -230,6 +234,7 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
         OP_CATALOG_LIST => parse_catalog_list(&fields),
         OP_ROUTE_OPEN => parse_route_open(&fields, targets),
         OP_HOST_SHUTDOWN => ControlAction::HostShutdown,
+        OP_HOST_STATUS => ControlAction::HostStatus,
         OP_TRANSPORT_NEGOTIATE => ControlAction::TransportNegotiate(
             crate::transport_negotiation::decode_negotiate_request(body),
         ),
@@ -365,6 +370,34 @@ fn parse_route_open(
         }
     };
 
+    let credential_fingerprints = match identity.get("credential_fingerprints") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(serde_json::Value::Object(entries)) => {
+            if entries.len() > MAX_CREDENTIAL_FINGERPRINTS {
+                return invalid("too many credential fingerprints");
+            }
+            let mut out = BTreeMap::new();
+            for (provider, value) in entries {
+                if !matches!(provider.as_str(), "anthropic" | "google" | "openai") {
+                    return invalid("credential fingerprint provider is unsupported");
+                }
+                let Some(fingerprint) = value.as_str() else {
+                    return invalid("credential fingerprint must be a string");
+                };
+                if fingerprint.len() != 64
+                    || !fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return invalid("credential fingerprint must be 64 lowercase hex");
+                }
+                out.insert(provider.clone(), fingerprint.to_owned());
+            }
+            out
+        }
+        Some(_) => return invalid("credential_fingerprints must be an object"),
+    };
+
     // Classification runs only after every bound held, so a hostile body
     // cannot pick its rejection code to probe the catalog cheaply.
     let Some(parsed_kind) = TargetKind::parse(kind) else {
@@ -399,6 +432,7 @@ fn parse_route_open(
             consumer_launch_nonce,
             consumer_capabilities,
             admission_facts,
+            credential_fingerprints,
         },
     }
 }
@@ -546,7 +580,7 @@ fn serialize_catalog_response(
         op: &'static str,
         generation: u64,
         modules: &'a [CatalogModule<'a>],
-        subc_ops: [&'static str; 4],
+        subc_ops: [&'static str; 5],
     }
 
     let modules: Vec<CatalogModule<'_>> = manifests
@@ -572,6 +606,7 @@ fn serialize_catalog_response(
                 OP_ROUTE_OPEN,
                 OP_CATALOG_LIST,
                 OP_HOST_SHUTDOWN,
+                OP_HOST_STATUS,
                 OP_TRANSPORT_NEGOTIATE,
             ],
         },
@@ -600,6 +635,71 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
 
 pub fn host_shutdown_response_json() -> Vec<u8> {
     br#"{"op":"host.shutdown"}"#.to_vec()
+}
+
+pub fn host_status_response_json(report: &crate::handler::HealthReport) -> Vec<u8> {
+    let health = match report.status {
+        crate::handler::HealthStatus::Ok => "ok",
+        crate::handler::HealthStatus::Degraded => "degraded",
+        crate::handler::HealthStatus::Failing => "failing",
+    };
+    let mut components = serde_json::Map::new();
+    let raw_components = report
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.get("components"))
+        .and_then(serde_json::Value::as_object);
+    for (module, state_key, allowed) in [
+        (
+            "magic-context",
+            "storage_state",
+            &["ready", "starting", "unavailable"][..],
+        ),
+        (
+            "synapse",
+            "synapse_state",
+            &["ready", "starting", "degraded", "unsupported"][..],
+        ),
+        ("broca", "broca_state", &["ready", "unavailable"][..]),
+    ] {
+        let Some(component) = raw_components.and_then(|all| all.get(module)) else {
+            continue;
+        };
+        let Some(status) = component.get("status").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !matches!(status, "ok" | "degraded" | "failing") {
+            continue;
+        }
+        let Some(state) = component
+            .get("metrics")
+            .and_then(|metrics| metrics.get(state_key))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !allowed.contains(&state) {
+            continue;
+        }
+        let mut sanitized_metrics = serde_json::Map::new();
+        sanitized_metrics.insert(
+            state_key.to_owned(),
+            serde_json::Value::String(state.to_owned()),
+        );
+        components.insert(
+            module.to_owned(),
+            serde_json::json!({
+                "status": status,
+                "metrics": sanitized_metrics,
+            }),
+        );
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "op": OP_HOST_STATUS,
+        "health": health,
+        "metrics": {"components": components},
+    }))
+    .expect("host status serialization cannot fail")
 }
 
 /// Strict JSON parsing: UTF-8 only (serde_json enforces), rejects duplicate
@@ -772,6 +872,39 @@ mod tests {
         assert_eq!(identity.session, "session-1");
         assert!(identity.consumer_capabilities.is_empty());
         assert!(identity.admission_facts.is_none());
+        assert!(identity.credential_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn credential_fingerprints_are_closed_and_bounded() {
+        let mut request = minimal_route_open();
+        request["identity"]["credential_fingerprints"] = serde_json::json!({
+            "anthropic": "a".repeat(64),
+            "openai": "b".repeat(64),
+        });
+        let ControlAction::RouteOpen { identity, .. } = parse(&request) else {
+            panic!("expected credential-bound route open");
+        };
+        assert_eq!(
+            identity.credential_fingerprints["anthropic"],
+            "a".repeat(64)
+        );
+
+        for invalid in [
+            serde_json::json!({"custom": "a".repeat(64)}),
+            serde_json::json!({"anthropic": "A".repeat(64)}),
+            serde_json::json!({"anthropic": "a".repeat(63)}),
+            serde_json::json!({
+                "anthropic": "a".repeat(64),
+                "google": "b".repeat(64),
+                "openai": "c".repeat(64),
+                "extra": "d".repeat(64),
+            }),
+        ] {
+            let mut request = minimal_route_open();
+            request["identity"]["credential_fingerprints"] = invalid;
+            assert_eq!(reject_code(parse(&request)), CODE_INVALID_CONTROL_REQUEST);
+        }
     }
 
     #[test]
@@ -1056,6 +1189,40 @@ mod tests {
     }
 
     #[test]
+    fn host_status_is_an_authenticated_control_operation() {
+        assert_eq!(
+            parse(&serde_json::json!({"op": "host.status"})),
+            ControlAction::HostStatus
+        );
+        let report = crate::handler::HealthReport {
+            status: crate::handler::HealthStatus::Degraded,
+            detail: Some("secret detail".to_owned()),
+            metrics: Some(serde_json::json!({
+                "components": {
+                    "magic-context": {
+                        "status": "degraded",
+                        "metrics": {"storage_state": "starting"}
+                    }
+                }
+            })),
+        };
+        let response: serde_json::Value =
+            serde_json::from_slice(&host_status_response_json(&report)).expect("status JSON");
+        assert_eq!(response["op"], "host.status");
+        assert_eq!(response["health"], "degraded");
+        assert_eq!(
+            response["metrics"]["components"]["magic-context"]["metrics"]["storage_state"],
+            "starting"
+        );
+        assert!(
+            !String::from_utf8(host_status_response_json(&report))
+                .expect("UTF-8")
+                .contains("secret detail"),
+            "handler detail is tainted and never exposed"
+        );
+    }
+
+    #[test]
     fn catalog_filters() {
         assert_eq!(
             parse(&serde_json::json!({"op": "catalog.list"})),
@@ -1132,6 +1299,7 @@ mod tests {
                 "route.open",
                 "catalog.list",
                 "host.shutdown",
+                "host.status",
                 "transport.negotiate"
             ])
         );

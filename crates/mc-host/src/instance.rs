@@ -133,30 +133,50 @@ pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -
     }
 }
 
-/// Resolves the data root: the override, a nonempty `$XDG_DATA_HOME`, or a
-/// nonempty `$HOME/.local/share`, in that order.
-pub(crate) fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
+/// Resolves the data root: the override, an absolute `$XDG_DATA_HOME`, or an
+/// absolute `$HOME/.local/share`, in that order.
+///
+/// Relative or empty `XDG_DATA_HOME`/`HOME` values are ignored rather than
+/// used, so a poisoned `XDG_DATA_HOME=./x` cannot select a cwd-dependent
+/// lifecycle root.
+///
+/// Public so out-of-crate launchers can name the same data root this crate
+/// uses instead of reconstructing it by walking parents off a derived path;
+/// that inversion silently breaks whenever the managed layout gains or loses
+/// a level.
+pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
+    fn absolute(value: std::ffi::OsString) -> Option<PathBuf> {
+        let path = PathBuf::from(value);
+        path.is_absolute().then_some(path)
+    }
     match data_dir_override {
         Some(dir) => Ok(dir.to_path_buf()),
-        None => match std::env::var_os("XDG_DATA_HOME") {
-            Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-            _ => match std::env::var_os("HOME") {
-                Some(home) if !home.is_empty() => {
-                    Ok(PathBuf::from(home).join(".local").join("share"))
-                }
-                _ => Err(InstanceError::NoDataDir),
+        None => match std::env::var_os("XDG_DATA_HOME").and_then(absolute) {
+            Some(dir) => Ok(dir),
+            None => match std::env::var_os("HOME").and_then(absolute) {
+                Some(home) => Ok(home.join(".local").join("share")),
+                None => Err(InstanceError::NoDataDir),
             },
         },
     }
 }
 
-/// Resolves `${dataDir}/cortexkit/run`, where dataDir is the override, a
-/// nonempty `$XDG_DATA_HOME`, or a nonempty `$HOME/.local/share`, in that
+/// The single managed subtree segment under the data root. Every managed
+/// path derives from this one definition so a rename cannot leave part of
+/// the tree behind.
+pub const MANAGED_DIR_NAME: &str = "cortexkit";
+
+/// Resolves `${dataDir}/cortexkit`: the replaceable managed subtree that
+/// holds the runtime directory, the lifecycle root, and module storage.
+pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
+    Ok(data_dir_path(data_dir_override)?.join(MANAGED_DIR_NAME))
+}
+
+/// Resolves `${dataDir}/cortexkit/run`, where dataDir is the override, an
+/// absolute `$XDG_DATA_HOME`, or an absolute `$HOME/.local/share`, in that
 /// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
-    Ok(data_dir_path(data_dir_override)?
-        .join("cortexkit")
-        .join("run"))
+    Ok(managed_dir_path(data_dir_override)?.join("run"))
 }
 
 /// One secured host incarnation: validated directory descriptor, held lock,
@@ -378,6 +398,65 @@ impl Drop for InstanceGuard {
         self.remove_publication();
         self.remove_lifecycle_record();
     }
+}
+
+/// Traverses an existing managed directory path without following symlinks
+/// and without creating anything. `Ok(None)` means a component is absent, so
+/// the subtree has not been created yet; an `Err` means a component that does
+/// exist is not replacement-proof or not ours.
+///
+/// Observational callers need this distinction: mapping an insecure or
+/// unreadable component onto the same answer as an absent one would let
+/// hostile persisted state be reported as "nothing installed yet", which
+/// prescribes the wrong remediation and hides the shape that caused it. Every
+/// component is resolved relative to the previous pinned descriptor, so no
+/// intermediate symlink can redirect the traversal after the anchor is taken.
+pub(crate) fn open_secure_dir_existing(dir_path: &Path) -> Result<Option<OwnedFd>, InstanceError> {
+    let mut current = open_safe_anchor(dir_path)
+        .map_err(|e| io_err("open_anchor", dir_path, e))?
+        .ok_or_else(|| InstanceError::Insecure {
+            what: "managed directory ancestor",
+            path: dir_path.to_path_buf(),
+        })?;
+    let mut walked = if dir_path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::new()
+    };
+    let names = normal_components(dir_path).ok_or_else(|| InstanceError::Insecure {
+        what: "managed directory path",
+        path: dir_path.to_path_buf(),
+    })?;
+    if names.is_empty() {
+        return Err(InstanceError::Insecure {
+            what: "managed directory path",
+            path: dir_path.to_path_buf(),
+        });
+    }
+    let last = names.len() - 1;
+    for (index, name) in names.into_iter().enumerate() {
+        walked.push(name);
+        let next = match openat(&current, name, HARDENED_DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(e) => return Err(io_err("open_component", &walked, e)),
+        };
+        // Same intermediate rule as the creating traversal: a component another
+        // principal can rename or swap can redirect the pathname after we pin
+        // ours. The final component is left to the caller's own predicate.
+        if index != last {
+            let stat =
+                rustix::fs::fstat(&next).map_err(|e| io_err("fstat_component", &walked, e))?;
+            if !is_safe_ancestor(&stat) {
+                return Err(InstanceError::Insecure {
+                    what: "managed directory ancestor",
+                    path: walked.clone(),
+                });
+            }
+        }
+        current = next;
+    }
+    Ok(Some(current))
 }
 
 /// Traverses and validates the runtime path without following symlinks,
@@ -631,6 +710,7 @@ pub(crate) const S_IFMT: u32 = 0o170000;
 const S_ISVTX: u32 = 0o1000;
 pub(crate) const S_IFDIR: u32 = 0o040000;
 pub(crate) const S_IFREG: u32 = 0o100000;
+pub(crate) const S_IFLNK: u32 = 0o120000;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
@@ -840,12 +920,30 @@ mod tests {
             PathBuf::from("/xdg-root/cortexkit/run")
         );
 
-        std::env::remove_var("XDG_DATA_HOME");
+        // A relative or empty XDG_DATA_HOME must never be joined to cwd.
         std::env::set_var("HOME", "/home-root");
+        for ignored in ["relative/xdg", "./xdg", ""] {
+            std::env::set_var("XDG_DATA_HOME", ignored);
+            assert_eq!(
+                runtime_dir_path(None).expect("relative xdg falls back to home"),
+                PathBuf::from("/home-root/.local/share/cortexkit/run"),
+                "XDG_DATA_HOME={ignored:?}"
+            );
+        }
+
+        std::env::remove_var("XDG_DATA_HOME");
         assert_eq!(
             runtime_dir_path(None).expect("home"),
             PathBuf::from("/home-root/.local/share/cortexkit/run")
         );
+
+        // A relative HOME is equally ignored: with no absolute root at all,
+        // the result is exactly NoDataDir.
+        std::env::set_var("HOME", "relative-home");
+        assert!(matches!(
+            runtime_dir_path(None),
+            Err(InstanceError::NoDataDir)
+        ));
 
         std::env::remove_var("HOME");
         assert!(matches!(

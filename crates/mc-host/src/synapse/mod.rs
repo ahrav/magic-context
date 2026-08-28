@@ -38,6 +38,10 @@ pub const SYNAPSE_MODULE_ID: &str = "synapse";
 /// select these; they live in trusted startup configuration only.
 #[derive(Debug, Clone)]
 pub struct SynapseLimits {
+    /// Queries allowed to wait behind the one running query. Zero preserves
+    /// loss-system admission: one query may run and every concurrent query is
+    /// rejected immediately.
+    pub max_waiting_queries: usize,
     pub max_queued_jobs: usize,
     pub max_queued_request_bytes: u64,
     pub max_retained_jobs: usize,
@@ -49,9 +53,31 @@ pub struct SynapseLimits {
     pub max_page_encoded_bytes: usize,
     pub retention: std::time::Duration,
     pub retry_after_ms: u64,
+    pub query_retry_after_ms: u64,
 }
 
 impl SynapseLimits {
+    /// Maximum resident charge retained by one admitted query while it waits
+    /// for or uses the CPU lane. JSON decoding may retain twice the decoded
+    /// text length as `String` capacity, and the handler keeps response
+    /// scratch until its terminal is encoded.
+    pub fn per_waiter_charge_bound(&self) -> Option<u64> {
+        u64::try_from(self.max_text_bytes)
+            .ok()?
+            .checked_mul(2)?
+            .checked_add(RESPONSE_SCRATCH_BYTES as u64)
+    }
+
+    /// Semaphore permits for query admission: the one running query plus
+    /// every allowed waiter. `None` when the count overflows or exceeds the
+    /// semaphore's supported maximum. The single derivation of the permit
+    /// rule; startup validation and both construction paths consume it.
+    pub(crate) fn query_admission_permits(&self) -> Option<usize> {
+        self.max_waiting_queries
+            .checked_add(1)
+            .filter(|permits| *permits <= tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
     /// The most items one result page can attainably hold: a job never
     /// holds more than `max_batch_items` items so no page can either, and
     /// the pager always places at least one item per page. Shared by the
@@ -68,6 +94,7 @@ impl Default for SynapseLimits {
     fn default() -> Self {
         let max_batch_items = 64;
         Self {
+            max_waiting_queries: 0,
             max_queued_jobs: 64,
             max_queued_request_bytes: 64 * 1024 * 1024,
             max_retained_jobs: 64,
@@ -79,6 +106,7 @@ impl Default for SynapseLimits {
             max_page_encoded_bytes: 2 * 1024 * 1024,
             retention: std::time::Duration::from_secs(15 * 60),
             retry_after_ms: 50,
+            query_retry_after_ms: 50,
         }
     }
 }
@@ -88,6 +116,11 @@ impl Default for SynapseLimits {
 #[derive(Debug, Clone)]
 pub struct SynapseConfig {
     pub bundle_dir: PathBuf,
+    /// The digest an outer trust root committed for `bundle_dir/manifest.json`,
+    /// when it has one. The daemon supplies the selected generation's, which is
+    /// what binds every bundle artifact to the generation it was staged into;
+    /// hermetic fixtures with no such root supply `None`.
+    pub bundle_manifest_sha256: Option<String>,
     pub ort_library: PathBuf,
     pub ort_library_sha256: String,
     pub limits: SynapseLimits,
@@ -100,6 +133,7 @@ pub struct LaneInfo {
     pub fingerprint: String,
     pub table_epoch: u64,
     pub dims: usize,
+    pub execution_provider: &'static str,
     /// Token window inference truncates at; published so clients chunk to
     /// the real boundary instead of a hardcoded guess.
     pub max_tokens: u32,
@@ -119,6 +153,7 @@ impl LaneInfo {
             fingerprint: manifest.fingerprint.clone(),
             table_epoch: manifest.table_epoch,
             dims: manifest.dims as usize,
+            execution_provider: "cpu",
             // Bounded by the manifest schema (at most 1_048_576), so the
             // narrowing cast is lossless.
             max_tokens: manifest.max_tokens as u32,
@@ -151,11 +186,19 @@ struct ReadyLane {
 #[derive(Debug, Clone)]
 pub enum SynapseStatus {
     Ready(LaneInfo),
-    Disabled { reason: String },
-    Failing { reason: String },
+    /// Post-publication activation has not settled the lane yet: bundle
+    /// verification, ORT load, or model construction is still running.
+    Starting,
+    Disabled {
+        reason: String,
+    },
+    Failing {
+        reason: String,
+    },
 }
 
 enum LaneState {
+    Starting,
     Disabled { reason: String },
     Ready(Arc<ReadyLane>),
     Failing { reason: String },
@@ -163,14 +206,21 @@ enum LaneState {
 
 struct SynapseInner {
     config: Option<SynapseConfig>,
+    unsupported_reason: Option<&'static str>,
     limits: SynapseLimits,
     state: Mutex<LaneState>,
     jobs: JobTable,
-    /// One permit: at most one native inference call runs at a time, and
-    /// waiters are served FIFO.
+    /// One permit: at most one native inference call runs at a time. Tokio's
+    /// semaphore is fair, so waiters are served in the order they register on
+    /// it. That order is what bounds a waiter's wait and rules out starvation;
+    /// it is not a claim that it matches the order the host admitted the
+    /// queries, because each admitted query registers from its own task and
+    /// concurrent requests have no wire-level total order to be faithful to.
     cpu: Arc<tokio::sync::Semaphore>,
-    /// At most one query may wait for or use the serialized CPU lane. Batch
-    /// work is bounded separately by the job table.
+    /// One running query plus at most `max_waiting_queries` waiters may use the
+    /// serialized CPU lane. Admission is a non-blocking count: it decides
+    /// whether a query may wait at all, never where in the queue it lands.
+    /// Batch work is bounded separately by the job table.
     query_admission: Arc<tokio::sync::Semaphore>,
     /// Owns every started native call through shutdown.
     tracker: TaskTracker,
@@ -188,13 +238,37 @@ impl SynapseComponent {
             .as_ref()
             .map(|config| config.limits.clone())
             .unwrap_or_default();
+        // Invalid configured limits fail `initialize` before any bundle
+        // work. Keep construction non-panicking until that typed validation
+        // can report the owner error.
+        let query_admission_permits = limits.query_admission_permits().unwrap_or(1);
         Self {
             inner: Arc::new(SynapseInner {
                 config,
+                unsupported_reason: None,
                 jobs: JobTable::new(limits.clone()),
                 limits,
                 state: Mutex::new(LaneState::Disabled {
                     reason: "not initialized".to_owned(),
+                }),
+                cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
+                tracker: TaskTracker::new(),
+                closing: CancellationToken::new(),
+            }),
+        }
+    }
+
+    pub fn unsupported(reason: &'static str) -> Self {
+        let limits = SynapseLimits::default();
+        Self {
+            inner: Arc::new(SynapseInner {
+                config: None,
+                unsupported_reason: Some(reason),
+                jobs: JobTable::new(limits.clone()),
+                limits,
+                state: Mutex::new(LaneState::Disabled {
+                    reason: reason.to_owned(),
                 }),
                 cpu: Arc::new(tokio::sync::Semaphore::new(1)),
                 query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -204,17 +278,29 @@ impl SynapseComponent {
         }
     }
 
-    /// Test seam: a component whose lane is immediately ready over the
-    /// supplied engine, bypassing bundle loading and ORT.
+    /// Test and example seam: a component whose lane is immediately ready
+    /// over the supplied engine, bypassing bundle loading and ORT.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`bundle::BundleError`] when the lane and serving limits cannot
+    /// satisfy the same startup bounds enforced for a loaded bundle.
     pub fn ready_with_engine(
         mut lane: LaneInfo,
         engine: Arc<dyn EmbeddingEngine>,
         limits: SynapseLimits,
-    ) -> Self {
+    ) -> Result<Self, bundle::BundleError> {
+        bundle::validate_serving_limits(lane.dims, lane.recommended_rows as usize, &limits)?;
+        // The validator's first check rejects limits whose permit count
+        // overflows, so a validated configuration always has a count.
+        let query_admission_permits = limits
+            .query_admission_permits()
+            .expect("validate_serving_limits proves the permit count");
         lane.max_text_bytes = limits.max_text_bytes;
-        Self {
+        Ok(Self {
             inner: Arc::new(SynapseInner {
                 config: None,
+                unsupported_reason: None,
                 jobs: JobTable::new(limits.clone()),
                 limits,
                 state: Mutex::new(LaneState::Ready(Arc::new(ReadyLane {
@@ -222,16 +308,17 @@ impl SynapseComponent {
                     lane,
                 }))),
                 cpu: Arc::new(tokio::sync::Semaphore::new(1)),
-                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
             }),
-        }
+        })
     }
 
     pub fn status(&self) -> SynapseStatus {
         match &*self.inner.state.lock().expect("synapse state lock") {
             LaneState::Ready(lane) => SynapseStatus::Ready(lane.lane.clone()),
+            LaneState::Starting => SynapseStatus::Starting,
             LaneState::Disabled { reason } => SynapseStatus::Disabled {
                 reason: reason.clone(),
             },
@@ -255,6 +342,7 @@ impl SynapseComponent {
         let Some(lane) = self.ready_lane() else {
             let reason = match self.status() {
                 SynapseStatus::Disabled { reason } | SynapseStatus::Failing { reason } => reason,
+                SynapseStatus::Starting => STARTING_REASON.to_owned(),
                 SynapseStatus::Ready(_) => unreachable!("ready lanes embed"),
             };
             return Err(InferenceError::Artifact(reason));
@@ -278,9 +366,13 @@ fn mark_failing(inner: &SynapseInner, reason: String) {
 fn lane_failure_reason(inner: &SynapseInner) -> Option<String> {
     match &*inner.state.lock().expect("synapse state lock") {
         LaneState::Ready(_) => None,
+        LaneState::Starting => Some(STARTING_REASON.to_owned()),
         LaneState::Disabled { reason } | LaneState::Failing { reason } => Some(reason.clone()),
     }
 }
+
+/// Bounded static reason reported while activation has not settled the lane.
+const STARTING_REASON: &str = "the synapse lane is still starting";
 
 fn embed_via(
     inner: &SynapseInner,
@@ -408,16 +500,28 @@ pub(crate) fn owned_input_bytes(request: &Request) -> usize {
 }
 
 fn request_error(error: RequestError) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: error.code.to_owned(),
-        message: error.message,
-    }
+    RequestOutcome::error(error.code, error.message)
 }
 
 fn app_error(code: &str, message: &str) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: code.to_owned(),
-        message: message.to_owned(),
+    RequestOutcome::error(code, message)
+}
+
+/// The expiry response for a query whose deadline has passed, attributed from
+/// whatever verdict the worker managed to deliver.
+///
+/// A `Timeout` fault is the worker's own queued-deadline arm reporting that the
+/// query never obtained the CPU permit; anything else — including a vector from
+/// an engine call that completed after the deadline — means the query was
+/// already running, and the result is discarded rather than returned. Both
+/// escape paths from the deadline share this function so the two messages cannot
+/// drift apart.
+fn expired_query(result: Option<&Result<Vec<Vec<f32>>, QueryFault>>) -> RequestOutcome {
+    match result {
+        Some(Err(QueryFault::Timeout)) => {
+            app_error("timeout", "the query deadline expired while queued")
+        }
+        _ => app_error("timeout", "the query deadline expired awaiting the result"),
     }
 }
 
@@ -476,7 +580,11 @@ impl SynapseComponent {
             return app_error("cancelled", "the host is shutting down");
         }
         let Ok(query_permit) = Arc::clone(&self.inner.query_admission).try_acquire_owned() else {
-            return app_error("queue_full", "query admission capacity is exhausted");
+            return RequestOutcome::error_retry_after(
+                "queue_full",
+                "query admission capacity is exhausted",
+                self.inner.limits.query_retry_after_ms,
+            );
         };
         // The handler copy keeps the query lane charged while the response is
         // produced; the worker copy keeps the charge through a native call
@@ -535,11 +643,36 @@ impl SynapseComponent {
             let _ = tx.send(result);
         });
 
-        let result = match tokio::time::timeout_at(deadline, rx).await {
-            Err(_) => return app_error("timeout", "the query deadline expired host-side"),
-            Ok(Err(_)) => return app_error("internal_error", "the inference task was lost"),
-            Ok(Ok(result)) => result,
+        let mut rx = rx;
+        let result = tokio::select! {
+            biased;
+            result = &mut rx => match result {
+                Err(_) => return app_error("internal_error", "the inference task was lost"),
+                Ok(result) => result,
+            },
+            () = tokio::time::sleep_until(deadline) => {
+                // The worker's queued-deadline arm shares this exact instant,
+                // and its verdict distinguishes a query that never started
+                // from one still running. One yield lets that same-instant
+                // verdict land before the expiry is attributed.
+                tokio::task::yield_now().await;
+                return expired_query(rx.try_recv().ok().as_ref());
+            }
         };
+        // The expired timer outranks a result that raced it, whichever arm
+        // produced the value. `biased` polls the receiver first, so a handler
+        // descheduled past its deadline resumes with both arms ready and never
+        // polls the timer at all: without this check a vector sent after the
+        // deadline is returned as a success, which is the same defect the
+        // deadline arm above exists to prevent, reached by a different path.
+        //
+        // Cancellation is exempt because it is not a deadline event: the host
+        // is shutting down, and that is the more actionable verdict for a
+        // caller whose deadline happened to lapse at the same time.
+        if tokio::time::Instant::now() >= deadline && !matches!(result, Err(QueryFault::Cancelled))
+        {
+            return expired_query(Some(&result));
+        }
         match result {
             Ok(vectors) => match vectors.first() {
                 Some(vector) => {
@@ -560,7 +693,7 @@ impl SynapseComponent {
             },
             Err(QueryFault::Cancelled) => app_error("cancelled", "the host is shutting down"),
             Err(QueryFault::Timeout) => {
-                app_error("timeout", "the query deadline expired host-side")
+                app_error("timeout", "the query deadline expired while queued")
             }
             Err(QueryFault::Engine(InferenceError::Input(reason))) => {
                 app_error("schema_violation", &reason)
@@ -741,7 +874,7 @@ impl SynapseComponent {
             PollOutcome::BadCursor => {
                 app_error("schema_violation", "cursor is not valid for this job")
             }
-            PollOutcome::Failed { code, message } => RequestOutcome::Error { code, message },
+            PollOutcome::Failed { code, message } => RequestOutcome::error(code, message),
             PollOutcome::Pending { status } => {
                 respond(
                     ctx,
@@ -798,9 +931,38 @@ impl CompositeComponent for SynapseComponent {
         }
     }
 
+    fn resources(&self) -> crate::handler::ResourceDeclaration {
+        // A query holds its general handler task while it waits on the
+        // admission semaphore, up to the request deadline, so the running
+        // query plus every allowed waiter can sit parked concurrently.
+        // Declaring the bound lets startup refuse a `max_waiting_queries`
+        // that could park away every general handler-task slot.
+        //
+        // A component with no bundle configuration and no ready lane can
+        // never reach the parking path: `bind` rejects every route and
+        // `handle` answers `artifact_invalid` without touching admission,
+        // and only `initialize` over a `SynapseConfig` can publish a lane.
+        // Declaring a hold it cannot take would let a disabled lane fail
+        // startup for a host that reserves exactly one general slot.
+        if self.inner.config.is_none() && self.ready_lane().is_none() {
+            return crate::handler::ResourceDeclaration::default();
+        }
+        crate::handler::ResourceDeclaration {
+            general_task_hold_bound: self.inner.limits.max_waiting_queries.saturating_add(1),
+            ..Default::default()
+        }
+    }
+
     async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
         match self.status() {
             SynapseStatus::Ready(_) => BindOutcome::Accept,
+            // Retryable: the client's route-open backoff retries
+            // `module_reloading`, so a demand that races activation settles
+            // once the lane loads instead of failing terminally.
+            SynapseStatus::Starting => BindOutcome::Reject {
+                code: "module_reloading".to_owned(),
+                message: STARTING_REASON.to_owned(),
+            },
             SynapseStatus::Disabled { .. } | SynapseStatus::Failing { .. } => BindOutcome::Reject {
                 code: "artifact_invalid".to_owned(),
                 message: "the synapse model bundle is unavailable".to_owned(),
@@ -899,16 +1061,31 @@ impl CompositeComponent for SynapseComponent {
 
     async fn health(&self) -> HealthReport {
         match self.status() {
-            SynapseStatus::Ready(_) => HealthReport::ok(),
+            SynapseStatus::Ready(_) => HealthReport {
+                status: HealthStatus::Ok,
+                detail: None,
+                metrics: Some(serde_json::json!({"synapse_state": "ready"})),
+            },
+            SynapseStatus::Starting => HealthReport {
+                status: HealthStatus::Degraded,
+                detail: Some(STARTING_REASON.to_owned()),
+                metrics: Some(serde_json::json!({"synapse_state": "starting"})),
+            },
             SynapseStatus::Disabled { reason } => HealthReport {
                 status: HealthStatus::Degraded,
+                metrics: Some(serde_json::json!({
+                    "synapse_state": if reason == "synapse_unsupported" {
+                        "unsupported"
+                    } else {
+                        "degraded"
+                    }
+                })),
                 detail: Some(reason),
-                metrics: None,
             },
             SynapseStatus::Failing { reason } => HealthReport {
                 status: HealthStatus::Failing,
                 detail: Some(reason),
-                metrics: None,
+                metrics: Some(serde_json::json!({"synapse_state": "degraded"})),
             },
         }
     }
@@ -929,26 +1106,54 @@ impl CompositeComponent for SynapseComponent {
 
 impl SecondaryComponent for SynapseComponent {
     async fn initialize(&self) -> Result<(), InitError> {
-        let Some(config) = self.inner.config.clone() else {
-            let mut state = self.inner.state.lock().expect("synapse state lock");
-            // A pre-readied lane (the test seam) has no configuration to
-            // load and stays ready.
-            if !matches!(&*state, LaneState::Ready(_)) {
-                *state = LaneState::Disabled {
-                    reason: "no bundle configured".to_owned(),
-                };
+        let mut state = self.inner.state.lock().expect("synapse state lock");
+        // A pre-readied lane (the test seam) has no configuration to load
+        // and stays ready.
+        if matches!(&*state, LaneState::Ready(_)) {
+            return Ok(());
+        }
+        *state = if self.inner.config.is_some() {
+            // Bundle verification, ORT load, and model construction are
+            // post-publication activation work: transport must not wait
+            // behind them, so pre-publication bootstrap only records that
+            // the lane is still starting.
+            LaneState::Starting
+        } else if let Some(reason) = self.inner.unsupported_reason {
+            LaneState::Disabled {
+                reason: reason.to_owned(),
             }
+        } else {
+            LaneState::Disabled {
+                reason: "no bundle configured".to_owned(),
+            }
+        };
+        Ok(())
+    }
+
+    async fn activate(&self) -> Result<(), InitError> {
+        let Some(config) = self.inner.config.clone() else {
             return Ok(());
         };
+        // Limits are trusted operator startup configuration: an infeasible
+        // combination is a config error the operator must see, not an
+        // artifact fault, so it fails initialization instead of silently
+        // disabling the lane while the host reports healthy.
+        if let Err(error) = bundle::validate_limits(&config.limits) {
+            return Err(InitError(format!("synapse limits are invalid: {error}")));
+        }
         // Blocking work (file reads, hashing, native model construction,
         // probe inference) leaves the async lifecycle thread. Blocking tasks
         // detach on drop and cannot be stopped once running, so completion is
         // routed through the incarnation tracker: if this future is dropped
-        // at the await (initialization abort), the tracked wrapper still owns
-        // the closure's completion, and `shutdown`'s tracker drain holds
-        // until the native load actually stops.
+        // at the await (activation abandoned at shutdown), the tracked
+        // wrapper still owns the closure's completion, and `shutdown`'s
+        // tracker drain holds until the native load actually stops.
         let blocking = tokio::task::spawn_blocking(move || {
-            let bundle = bundle::load_bundle(&config.bundle_dir, &config.limits)?;
+            let bundle = bundle::load_bundle(
+                &config.bundle_dir,
+                &config.limits,
+                config.bundle_manifest_sha256.as_deref(),
+            )?;
             let ort = OrtIdentity {
                 library: config.ort_library.clone(),
                 sha256: config.ort_library_sha256.clone(),
@@ -967,7 +1172,7 @@ impl SecondaryComponent for SynapseComponent {
         let loaded = match self.inner.tracker.spawn(blocking).await {
             Ok(joined) => joined,
             // The wrapper never panics and is never aborted, so a lost
-            // wrapper is the same initialization failure as a lost closure.
+            // wrapper is the same activation failure as a lost closure.
             Err(join_error) => Err(join_error),
         };
         let mut state = self.inner.state.lock().expect("synapse state lock");
@@ -977,7 +1182,7 @@ impl SecondaryComponent for SynapseComponent {
                 Ok(())
             }
             // An expected artifact fault is isolated degradation, never a
-            // host-fatal initialization error.
+            // host-fatal activation error.
             Ok(Err(error)) => {
                 *state = LaneState::Disabled {
                     reason: error.to_string(),
@@ -985,7 +1190,7 @@ impl SecondaryComponent for SynapseComponent {
                 Ok(())
             }
             Err(join_error) => Err(InitError(format!(
-                "synapse initialization task failed: {join_error}"
+                "synapse activation task failed: {join_error}"
             ))),
         }
     }

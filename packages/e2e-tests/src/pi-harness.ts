@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { Database } from "../../plugin/src/shared/sqlite";
+import { ballastProse } from "./ballast";
 import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "./initialize-context-db";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
@@ -95,30 +96,14 @@ export class PiTestHarness {
   }
 
   /**
-   * Generate ~`tokens` tokens of varied prose ballast. Mirror of
-   * TestHarness.ballast (see harness.ts): the v3 protected-tail boundary
-   * measures TRUE-RAW content, not mock usage numbers, so pressure-driving
-   * turns must carry real content mass or the boundary resolves no eligible
-   * head and the historian (correctly) never starts.
+   * Generate ~`tokens` tokens of varied prose ballast. Delegates to the shared
+   * generator (see ballast.ts): the v3 protected-tail boundary measures
+   * TRUE-RAW content, not mock usage numbers, so pressure-driving turns must
+   * carry real content mass or the boundary resolves no eligible head and the
+   * historian (correctly) never starts.
    */
   ballast(tokens: number): string {
-    const words = [
-      "boundary", "historian", "compartment", "schedule", "pressure",
-      "tokens", "window", "publish", "transform", "session", "marker",
-      "budget", "eligible", "protected", "ordinal", "snapshot", "replay",
-      "decision", "threshold", "baseline", "measure", "archive", "deliver",
-    ];
-    const target = Math.max(0, Math.round(tokens * 4)); // ~4 chars/token
-    const parts: string[] = [];
-    let length = 0;
-    let i = 0;
-    while (length < target) {
-      const w = words[i % words.length];
-      parts.push(`${w}${i % 17 === 0 ? "." : ""}`);
-      length += w.length + 1;
-      i += 1;
-    }
-    return parts.join(" ");
+    return ballastProse(tokens);
   }
 
   async sendPrompt(

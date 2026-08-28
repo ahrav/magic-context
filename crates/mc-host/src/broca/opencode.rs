@@ -8,7 +8,7 @@
 //! project-controlled configuration are never read or written.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +20,7 @@ use super::config::MAX_OPENCODE_CONFIG_BYTES;
 use super::subprocess::{
     self, commit_terminal, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
 };
+use crate::harness_closure::ValidatedHarnessClosure;
 
 /// Environment guard the globally installed OpenCode plugin checks at the
 /// very start of its entry (KTD7): a Broca child must exit Magic Context
@@ -33,16 +34,11 @@ pub const MAGIC_CONTEXT_BROCA_CHILD_ENV: &str = "MAGIC_CONTEXT_BROCA_CHILD";
 /// selected with `--agent`.
 pub const OPENCODE_BROCA_AGENT: &str = "broca";
 
-/// Trusted OpenCode runtime descriptor. `magic-context-c50.8` resolves the
-/// installed absolute executable path and any configured variant arguments;
-/// this crate defines and tests the contract with fixtures.
+/// Trusted daemon-owned OpenCode runtime closure.
 #[derive(Clone, Debug)]
 pub struct OpenCodeRuntime {
-    /// Trusted absolute path to the `opencode` executable.
-    pub executable: PathBuf,
-    /// Configured variant arguments appended verbatim after the fixed argv
-    /// (R15 "configured variant arguments").
-    pub variant_args: Vec<String>,
+    pub closure: Arc<ValidatedHarnessClosure>,
+    pub executable_node: String,
 }
 
 /// [`LlmExecutionBackend`] adapter that runs `opencode run` under the
@@ -129,6 +125,12 @@ async fn run_opencode(
     events: EventSink,
     cancel: CancellationToken,
 ) -> BackendTerminal {
+    let mut child_env = match env.provider_row("opencode", &request.provider) {
+        Ok(row) => row,
+        Err(error) => {
+            return subprocess::credential_failure(HarnessName::OpenCode, error);
+        }
+    };
     let config_content = inline_config(&request);
     // Linux caps one env string at MAX_ARG_STRLEN (~128 KiB); a config over
     // that fails exec(2) with E2BIG, an opaque permanent spawn failure.
@@ -150,7 +152,7 @@ async fn run_opencode(
         Err(err) => return subprocess::spawn_failure(HarnessName::OpenCode, &err),
     };
 
-    let mut args = vec![
+    let args = vec![
         "run".to_owned(),
         "--model".to_owned(),
         // The canonical `provider/model` reaches OpenCode unchanged (plan
@@ -161,9 +163,16 @@ async fn run_opencode(
         "--format".to_owned(),
         "json".to_owned(),
     ];
-    args.extend(runtime.variant_args.iter().cloned());
+    let executable = match runtime.closure.resolve_node(&runtime.executable_node) {
+        Ok(path) => path,
+        Err(_) => {
+            return subprocess::harness_unavailable_failure(
+                HarnessName::OpenCode,
+                "closure_incomplete",
+            )
+        }
+    };
 
-    let mut child_env: Vec<(OsString, OsString)> = env.vars().to_vec();
     child_env.push((
         OsString::from("OPENCODE_DB"),
         dir.path().join("opencode.db").into_os_string(),
@@ -183,12 +192,13 @@ async fn run_opencode(
         OsString::from(MAGIC_CONTEXT_BROCA_CHILD_ENV),
         OsString::from("1"),
     ));
+    child_env.push((OsString::from("HOME"), dir.path().as_os_str().to_owned()));
 
     let spec = SubprocessSpec {
-        executable: runtime.executable,
+        executable,
         args,
         env: child_env,
-        working_dir: request.project_root.clone(),
+        working_dir: dir.path().to_path_buf(),
         stdin: request.prompt.clone().into_bytes(),
     };
 

@@ -182,7 +182,23 @@ pub struct VerifiedBundle {
     pub corpus: Corpus,
 }
 
-pub fn load_bundle(dir: &Path, limits: &SynapseLimits) -> Result<VerifiedBundle, BundleError> {
+/// Loads and verifies a bundle directory.
+///
+/// `expected_manifest_sha256` is the digest an outer trust root already
+/// committed for `manifest.json` — the generation manifest, in the daemon. The
+/// bundle's own manifest names and hashes every artifact underneath it, so
+/// binding these bytes to the outer digest is what extends that trust root over
+/// the whole bundle. Without it, this function proves only that a bundle is
+/// internally self-consistent: a directory swapped in after the generation was
+/// validated would carry its own coherent manifest and serve different
+/// embedding bytes while the daemon still reported the selected generation as
+/// valid. `None` is for callers that have no outer digest to offer, which is the
+/// hermetic-fixture case, never a production lane.
+pub fn load_bundle(
+    dir: &Path,
+    limits: &SynapseLimits,
+    expected_manifest_sha256: Option<&str>,
+) -> Result<VerifiedBundle, BundleError> {
     let metadata =
         std::fs::symlink_metadata(dir).map_err(|_| err("bundle directory is missing"))?;
     if !metadata.is_dir() {
@@ -190,9 +206,23 @@ pub fn load_bundle(dir: &Path, limits: &SynapseLimits) -> Result<VerifiedBundle,
     }
 
     let manifest_bytes = read_artifact(dir, "manifest.json", MAX_MANIFEST_BYTES)?;
+    // Checked against the bytes this call actually parsed, so a later
+    // replacement of the pathname cannot substitute a manifest behind the
+    // artifacts verified below.
+    if let Some(expected) = expected_manifest_sha256 {
+        if sha256_hex(&manifest_bytes) != expected {
+            return Err(err(
+                "bundle manifest does not match the digest its generation committed",
+            ));
+        }
+    }
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
-    validate_serving_limits(&manifest, limits)?;
+    validate_serving_limits(
+        manifest.dims as usize,
+        manifest.recommended_batch.rows as usize,
+        limits,
+    )?;
 
     let mut listed: Vec<&ArtifactRef> = vec![&manifest.model_file, &manifest.corpus];
     listed.extend(manifest.external_initializers.iter());
@@ -327,10 +357,80 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), BundleError> {
     Ok(())
 }
 
-fn validate_serving_limits(
-    manifest: &BundleManifest,
+/// Worst-case request-input bytes the full queued-job set can hold beyond
+/// its item texts: per-job key copies plus per-item id/hash charges. The
+/// queued-text budget (`max_queued_request_bytes`) counts text bytes only,
+/// while the runtime charges each admitted job [`jobs::job_input_bytes`] —
+/// which also holds both key copies, the decoded id and hash capacities,
+/// and their admission-time metadata copies — so startup must budget this
+/// term too or a validated configuration can still exhaust scratch.
+///
+/// Derived by running the runtime's own accounting over worst-case-shaped
+/// inputs rather than re-stating its terms, so the two cannot drift apart.
+fn max_queued_metadata_bytes(limits: &SynapseLimits) -> Option<u64> {
+    // JSON decoding may retain up to twice the decoded length as String
+    // capacity — the same factor `per_waiter_charge_bound` assumes.
+    fn worst_decoded(len: usize) -> String {
+        let mut decoded = String::with_capacity(len.saturating_mul(2));
+        decoded.extend(std::iter::repeat_n('a', len));
+        decoded
+    }
+    let worst_item = jobs::BatchItem {
+        id: worst_decoded(jobs::MAX_ITEM_ID_BYTES),
+        content_sha256: worst_decoded(jobs::CONTENT_SHA256_BYTES),
+        // Text bytes are budgeted separately by `max_queued_request_bytes`.
+        text: String::new(),
+    };
+    // The canonical request key is validated to 64 lowercase hex characters,
+    // and the job charges its length (twice), never its capacity.
+    let key = "a".repeat(64);
+    let per_item = u64::try_from(jobs::job_input_bytes("", std::slice::from_ref(&worst_item)))
+        .expect("one item's charge fits u64");
+    let per_job_key =
+        u64::try_from(jobs::job_input_bytes(&key, &[])).expect("the key charge fits u64");
+    let per_job = per_item
+        .checked_mul(u64::try_from(limits.max_batch_items).ok()?)?
+        .checked_add(per_job_key)?;
+    u64::try_from(limits.max_queued_jobs)
+        .ok()?
+        .checked_mul(per_job)
+}
+
+pub(crate) fn validate_serving_limits(
+    dims: usize,
+    recommended_rows: usize,
     limits: &SynapseLimits,
 ) -> Result<(), BundleError> {
+    validate_limits(limits)?;
+
+    if recommended_rows > limits.max_batch_items {
+        return Err(err(format!(
+            "recommended batch rows ({recommended_rows}) exceed the host's max batch items ({})",
+            limits.max_batch_items
+        )));
+    }
+
+    let max_result_bytes = jobs::max_result_bytes(limits.max_batch_items, dims)
+        .ok_or_else(|| err("maximum retained result size overflows"))?;
+    if max_result_bytes > limits.max_retained_result_bytes {
+        return Err(err(format!(
+            "maximum batch result ({max_result_bytes} bytes) exceeds the host's retained-result \
+             limit ({} bytes)",
+            limits.max_retained_result_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// The manifest-independent half of serving validation: every bound that is
+/// a pure function of the configured [`SynapseLimits`]. Limits are trusted
+/// startup configuration, so a violation here is operator error that must
+/// fail initialization loudly; only manifest-dependent bounds (dimensions,
+/// recommended rows) may degrade the lane instead.
+pub(crate) fn validate_limits(limits: &SynapseLimits) -> Result<(), BundleError> {
+    if limits.query_admission_permits().is_none() {
+        return Err(err("query admission capacity exceeds the semaphore limit"));
+    }
     if limits.max_text_bytes < 4 {
         return Err(err("host max text bytes must hold one UTF-8 code point"));
     }
@@ -356,24 +456,6 @@ fn validate_serving_limits(
     // A tokenizer token can span multiple UTF-8 bytes, so no token-to-byte
     // conversion is universally safe. The validated byte cap travels with
     // the bundle and is advertised beside max_tokens instead.
-
-    let recommended_rows = manifest.recommended_batch.rows as usize;
-    if recommended_rows > limits.max_batch_items {
-        return Err(err(format!(
-            "recommended batch rows ({recommended_rows}) exceed the host's max batch items ({})",
-            limits.max_batch_items
-        )));
-    }
-
-    let max_result_bytes = jobs::max_result_bytes(limits.max_batch_items, manifest.dims as usize)
-        .ok_or_else(|| err("maximum retained result size overflows"))?;
-    if max_result_bytes > limits.max_retained_result_bytes {
-        return Err(err(format!(
-            "maximum batch result ({max_result_bytes} bytes) exceeds the host's retained-result \
-             limit ({} bytes)",
-            limits.max_retained_result_bytes
-        )));
-    }
 
     // Retained job metadata (keys plus id/hash copies) lives for the whole
     // retention window inside the scratch pool, in a slice reserved for it;
@@ -438,9 +520,11 @@ fn validate_serving_limits(
             )
             .saturating_add(BODY_ENVELOPE_BYTES),
     );
+    let mut worst_parse_reservation = 0u64;
     for worst_body in [worst_query_body, worst_batch_body] {
         let reservation = super::protocol::parse_reservation_bytes(worst_body, limits)
             .ok_or_else(|| err("the worst-case parse reservation overflows"))?;
+        worst_parse_reservation = worst_parse_reservation.max(reservation as u64);
         if reservation as u64 > reservable_scratch {
             return Err(err(format!(
                 "the parse reservation for a maximal advertised request ({reservation} bytes \
@@ -449,6 +533,33 @@ fn validate_serving_limits(
                 reservable_scratch
             )));
         }
+    }
+
+    // Every admitted query retains its decoded String capacity and response
+    // scratch while waiting. The active query and all K waiters must coexist
+    // with a full queued-batch budget (text bytes plus the worst per-job key
+    // and metadata charge), and the largest parse reservation.
+    let query_slots = limits
+        .query_admission_permits()
+        .and_then(|permits| u64::try_from(permits).ok())
+        .ok_or_else(|| err("query admission capacity overflows"))?;
+    let waiter_bound = limits
+        .per_waiter_charge_bound()
+        .ok_or_else(|| err("per-query resident charge bound overflows"))?;
+    let queued_metadata = max_queued_metadata_bytes(limits)
+        .ok_or_else(|| err("worst-case queued job metadata overflows"))?;
+    let required_scratch = query_slots
+        .checked_mul(waiter_bound)
+        .and_then(|queries| queries.checked_add(limits.max_queued_request_bytes))
+        .and_then(|used| used.checked_add(queued_metadata))
+        .and_then(|used| used.checked_add(worst_parse_reservation))
+        .ok_or_else(|| err("combined query and queue resident bound overflows"))?;
+    if required_scratch > reservable_scratch {
+        return Err(err(format!(
+            "query admission capacity requires {required_scratch} scratch bytes but only \
+             {reservable_scratch} are reservable; lower max_waiting_queries, \
+             max_queued_jobs, max_queued_request_bytes, max_batch_items, or the text limits"
+        )));
     }
 
     // A full retention set that overflowed its reserved slice would starve
@@ -703,13 +814,33 @@ fn validate_tokenizer_config(bytes: &[u8], max_tokens: u64) -> Result<(), Bundle
         serde_json::from_slice(bytes).map_err(|_| err("tokenizer_config is not JSON"))?;
     let declared = value
         .get("model_max_length")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(serde_json::Value::as_number)
         .ok_or_else(|| err("tokenizer_config lacks model_max_length"))?;
-    // Two competing maximum lengths would make the truncation boundary
-    // depend on which one a code path consults.
-    if declared != max_tokens {
+    // The manifest is the serving boundary. Hugging Face uses a very large
+    // model_max_length sentinel for tokenizers without a smaller tokenizer
+    // limit; that does not compete with a stricter manifest limit. A lower
+    // tokenizer ceiling would make truncation depend on which path wins.
+    let below_manifest = match declared.as_u64() {
+        Some(declared) => declared < max_tokens,
+        // Not representable as u64: either that oversized integer sentinel or a
+        // malformed value. A token-count ceiling is an integer, so a finite
+        // non-integral value is rejected outright rather than compared — `8192.5`
+        // against a manifest limit of `8192` otherwise read as "not below" and
+        // was accepted, leaving bundle validation to disagree with whatever the
+        // tokenizer implementation does with the fraction.
+        None => {
+            let declared = declared
+                .as_f64()
+                .ok_or_else(|| err("tokenizer_config model_max_length is not a number"))?;
+            if declared.is_finite() && declared.fract() != 0.0 {
+                return Err(err("tokenizer_config model_max_length is not an integer"));
+            }
+            !declared.is_finite() || declared < max_tokens as f64
+        }
+    };
+    if below_manifest {
         return Err(err(
-            "tokenizer_config model_max_length disagrees with manifest max_tokens",
+            "tokenizer_config model_max_length is below manifest max_tokens",
         ));
     }
     if value
@@ -766,6 +897,44 @@ fn parse_corpus(bytes: &[u8], dims: usize) -> Result<Corpus, BundleError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tokenizer_ceiling_may_exceed_the_manifest_limit() {
+        let unlimited =
+            br#"{"model_max_length":1000000000000000019884624838656,"pad_token":"[PAD]"}"#;
+        assert!(validate_tokenizer_config(unlimited, 8192).is_ok());
+
+        let lower = br#"{"model_max_length":4096,"pad_token":"[PAD]"}"#;
+        assert_eq!(
+            validate_tokenizer_config(lower, 8192)
+                .expect_err("a lower tokenizer ceiling must fail")
+                .0,
+            "tokenizer_config model_max_length is below manifest max_tokens"
+        );
+    }
+
+    /// A token count is an integer. The oversized-integer sentinel and a
+    /// fraction both fail `as_u64`, so only the fractional part separates the
+    /// value the manifest tolerates from the one it must refuse.
+    #[test]
+    fn fractional_tokenizer_ceilings_are_rejected() {
+        for body in [
+            br#"{"model_max_length":8192.5,"pad_token":"[PAD]"}"#.as_slice(),
+            br#"{"model_max_length":16384.25,"pad_token":"[PAD]"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_tokenizer_config(body, 8192)
+                    .expect_err("a fractional ceiling must fail")
+                    .0,
+                "tokenizer_config model_max_length is not an integer"
+            );
+        }
+
+        // An integral value written with a fractional part is still an integer
+        // ceiling, and a whole-number float is what a JSON encoder may emit.
+        let integral = br#"{"model_max_length":8192.0,"pad_token":"[PAD]"}"#;
+        assert!(validate_tokenizer_config(integral, 8192).is_ok());
+    }
+
     fn manifest() -> BundleManifest {
         let artifact = |name: &str| ArtifactRef {
             name: name.to_owned(),
@@ -800,6 +969,17 @@ mod tests {
             },
             corpus: artifact("corpus.json"),
         }
+    }
+
+    fn validate_test_serving(
+        manifest: &BundleManifest,
+        limits: &SynapseLimits,
+    ) -> Result<(), BundleError> {
+        validate_serving_limits(
+            manifest.dims as usize,
+            manifest.recommended_batch.rows as usize,
+            limits,
+        )
     }
 
     #[test]
@@ -839,13 +1019,13 @@ mod tests {
             .expect("bounded result size");
 
         assert!(limits.max_retained_result_bytes >= exact);
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
 
         limits.max_retained_result_bytes = exact;
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
 
         limits.max_retained_result_bytes = exact - 1;
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("one byte below the maximum result is invalid");
         assert!(error.0.contains("maximum batch result"));
     }
@@ -868,7 +1048,7 @@ mod tests {
             max_retained_result_bytes: u64::MAX,
             ..SynapseLimits::default()
         };
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("a page bound above the scratch pool is a permanent outage");
         assert!(error.0.contains("result-page metadata"));
 
@@ -878,7 +1058,7 @@ mod tests {
             max_page_vectors: boundary,
             ..SynapseLimits::default()
         };
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
     /// A configuration whose advertised limits permit a request the fixed
@@ -894,17 +1074,20 @@ mod tests {
             max_retained_result_bytes: u64::MAX,
             ..SynapseLimits::default()
         };
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("an unservable advertised request is a permanent outage");
         assert!(error.0.contains("parse reservation"));
 
-        // A large advertised query alone (default item cap) stays valid:
-        // the reservation's item term is what overflows the pool.
+        // A moderately larger advertised query stays valid when the queued
+        // metadata term is halved beside it (the queued-job set and the
+        // query lane share one scratch pool): the reservation's item term is
+        // what overflows the pool, not the larger text alone.
         let limits = SynapseLimits {
-            max_text_bytes: 8 * 1024 * 1024,
+            max_text_bytes: 2 * 1024 * 1024,
+            max_queued_jobs: 32,
             ..SynapseLimits::default()
         };
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
     /// A retention set whose worst metadata overflows its reserved slice
@@ -922,7 +1105,7 @@ mod tests {
             max_retained_result_bytes: u64::MAX,
             ..SynapseLimits::default()
         };
-        let error = validate_serving_limits(&manifest, &limits)
+        let error = validate_test_serving(&manifest, &limits)
             .expect_err("an oversized retention set is a permanent outage");
         assert!(error.0.contains("retained job metadata"));
 
@@ -934,7 +1117,7 @@ mod tests {
             max_retained_jobs: 32,
             ..SynapseLimits::default()
         };
-        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+        assert!(validate_test_serving(&manifest, &limits).is_ok());
     }
 
     #[test]

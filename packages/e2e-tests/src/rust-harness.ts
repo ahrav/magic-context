@@ -15,6 +15,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { ballastProse } from "./ballast";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import type { VerifiedReleaseRoot } from "./prospective-holdout/release-root";
 import {
@@ -318,47 +319,13 @@ export class RustTestHarness {
     }
 
     /**
-     * Generate ~`tokens` tokens of varied prose ballast. Copied from the TS
-     * harness: the protected-tail boundary measures true-raw content, so pressure
-     * turns must carry real mass, and varied prose tokenizes at a stable rate.
+     * Generate ~`tokens` tokens of varied prose ballast. Delegates to the
+     * shared generator (see ballast.ts): the protected-tail boundary measures
+     * true-raw content, so pressure turns must carry real mass, and varied
+     * prose tokenizes at a stable rate.
      */
     ballast(tokens: number): string {
-        const words = [
-            "boundary",
-            "historian",
-            "compartment",
-            "schedule",
-            "pressure",
-            "tokens",
-            "window",
-            "publish",
-            "transform",
-            "session",
-            "marker",
-            "budget",
-            "eligible",
-            "protected",
-            "ordinal",
-            "snapshot",
-            "replay",
-            "decision",
-            "threshold",
-            "baseline",
-            "measure",
-            "archive",
-            "deliver",
-        ];
-        const target = Math.max(0, Math.round(tokens * 4));
-        const parts: string[] = [];
-        let length = 0;
-        let i = 0;
-        while (length < target) {
-            const w = words[i % words.length]!;
-            parts.push(`${w}${i % 17 === 0 ? "." : ""}`);
-            length += w.length + 1;
-            i += 1;
-        }
-        return parts.join(" ");
+        return ballastProse(tokens);
     }
 
     /**

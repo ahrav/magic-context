@@ -1,5 +1,4 @@
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
 import type {
     AuthorityDrainResponse,
     AuthorityStatus,
@@ -23,6 +22,7 @@ import {
     SocketTimeoutError,
     StaleRouteHandleError,
 } from "../../shared/mc-host-client";
+import { defaultConnectionFilePath } from "../../shared/mc-host-lifecycle/paths";
 import { isRecord } from "../../shared/record-type-guard";
 import {
     buildClaimEffectDeliveryWireBody,
@@ -65,7 +65,7 @@ const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
 function getDefaultConnectionFile(): string {
-    return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+    return defaultConnectionFilePath(getDataDir());
 }
 
 function errorChainSome(

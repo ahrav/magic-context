@@ -34,6 +34,7 @@ export type PhysicalLocatorKind = (typeof PHYSICAL_LOCATOR_KINDS)[number];
  */
 export const SOURCE_LOCATOR_KIND = {
     memory: "memory",
+    anti_memory: "memory",
     message: "message",
     compartment: "chunk",
     git_commit: "commit",
@@ -51,6 +52,7 @@ export interface PhysicalResultLocator {
 export function encodePhysicalResultLocator(result: UnifiedSearchResult): string {
     switch (result.source) {
         case "memory":
+        case "anti_memory":
             return `${SOURCE_LOCATOR_KIND.memory}:${result.publicClaimId}`;
         case "message":
             return `${SOURCE_LOCATOR_KIND.message}:${result.messageId}`;

@@ -1,4 +1,7 @@
-import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory";
+import {
+    ANTI_MEMORY_CATEGORY,
+    WRITABLE_MEMORY_CATEGORIES,
+} from "../../features/magic-context/memory";
 import {
     type CanonicalJsonValue,
     type ClaimMutationToken,
@@ -6,6 +9,12 @@ import {
     formatRevisionLocator,
     isValidPublicClaimId,
 } from "../../features/magic-context/memory/claim-operation-contract";
+import {
+    createAgentAntiMemory,
+    readAntiMemory,
+    renderAntiMemoryContent,
+    reviseAntiMemory,
+} from "../../features/magic-context/memory/storage-anti-memory";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
@@ -180,12 +189,34 @@ function authorizeOwnClaims(
  */
 function requireTaxonomyCategory(category: string | undefined): string | undefined {
     if (category === undefined || category === "") return undefined;
-    if (!(V2_MEMORY_CATEGORIES as readonly string[]).includes(category)) {
+    if (!(WRITABLE_MEMORY_CATEGORIES as readonly string[]).includes(category)) {
         throw new ClaimOperationInputError(
-            `unknown claim category: ${category} (expected one of ${V2_MEMORY_CATEGORIES.join(", ")})`,
+            `unknown claim category: ${category} (expected one of ${WRITABLE_MEMORY_CATEGORIES.join(", ")})`,
         );
     }
     return category;
+}
+
+export function assertCtxMemoryWriteShape(args: CtxMemoryArgs): void {
+    if (args.action !== "create" && args.action !== "revise") return;
+    const category = requireTaxonomyCategory(args.category?.trim());
+    const antiArm = category === ANTI_MEMORY_CATEGORY || args.antiMemory !== undefined;
+    if (antiArm) {
+        if (category !== ANTI_MEMORY_CATEGORY || !args.antiMemory || args.content !== undefined) {
+            throw new ClaimOperationInputError(
+                `${args.action} anti-memory requires category ${ANTI_MEMORY_CATEGORY}, antiMemory payload, and no content`,
+            );
+        }
+        return;
+    }
+    if (args.antiMemory !== undefined) {
+        throw new ClaimOperationInputError(
+            `${args.action} positive memory cannot carry antiMemory`,
+        );
+    }
+    if (args.action === "create" && (!category || !args.content?.trim())) {
+        throw new ClaimOperationInputError("create requires non-empty content and category");
+    }
 }
 
 function provenance(
@@ -217,8 +248,13 @@ function mutationTokenView(token: ClaimMutationToken): CanonicalJsonValue {
     };
 }
 
-function claimView(item: ProjectMemoryClaimSnapshot): CanonicalJsonValue {
+function claimView(db: Database, item: ProjectMemoryClaimSnapshot): CanonicalJsonValue {
+    const antiMemory =
+        item.category === ANTI_MEMORY_CATEGORY
+            ? readAntiMemory(db, item.publicClaimId)?.payload
+            : null;
     return {
+        ...(antiMemory ? { antiMemory: { ...antiMemory } } : {}),
         category: item.category,
         content: item.content,
         contentDigest: item.contentDigest,
@@ -317,13 +353,14 @@ function mutationResult(action: CtxMemoryAction, operation: ClaimOperationRunRes
 }
 
 function readResult(
+    db: Database,
     action: "get" | "list",
     claims: readonly ProjectMemoryClaimSnapshot[],
     missingPublicClaimIds: readonly string[] = [],
 ): string {
     return canonicalJsonEncode({
         action,
-        claims: claims.map(claimView),
+        claims: claims.map((claim) => claimView(db, claim)),
         effects: [],
         generation: null,
         missingPublicClaimIds: [...missingPublicClaimIds],
@@ -399,7 +436,7 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
             throw new ClaimOperationInputError(`get requires 1-${GET_MAX_CLAIMS} publicClaimIds`);
         }
         const result = getClaims(db, projectIdentity, ids);
-        return readResult("get", result.claims, result.missing);
+        return readResult(db, "get", result.claims, result.missing);
     }
 
     if (action === "list") {
@@ -418,16 +455,32 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
         })
             .filter((item) => !category || item.category === category)
             .slice(0, normalizeLimit(args.limit));
-        return readResult("list", claims);
+        return readResult(db, "list", claims);
     }
 
     const { requestScope, ...producer } = createCtxMemoryProducerIdentity(identity);
     if (action === "create") {
-        const content = args.content?.trim();
-        const category = requireTaxonomyCategory(args.category?.trim());
-        if (!content || !category) {
-            throw new ClaimOperationInputError("create requires non-empty content and category");
+        assertCtxMemoryWriteShape(args);
+        if (args.category?.trim() === ANTI_MEMORY_CATEGORY && args.antiMemory) {
+            const sourceContent = renderAntiMemoryContent(args.antiMemory);
+            const { sourceTrustClass: _sourceTrustClass, ...agentProvenance } = provenance(
+                identity,
+                producer,
+                sourceContent,
+            );
+            const operation = createAgentAntiMemory(db, producer, {
+                projectId: ownProjectId,
+                payload: args.antiMemory,
+                provenance: agentProvenance,
+                actor: input.actor,
+                requestScope,
+            });
+            return mutationResult(action, operation);
         }
+        // assertCtxMemoryWriteShape above already rejected this arm unless it
+        // carries non-empty content and a positive taxonomy category.
+        const content = (args.content as string).trim();
+        const category = requireTaxonomyCategory(args.category?.trim()) as string;
         const operation = createProjectMemoryClaim(db, producer, {
             projectId: ownProjectId,
             content,
@@ -474,6 +527,18 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
     }
 
     if (action === "revise") {
+        assertCtxMemoryWriteShape(args);
+        if (args.category?.trim() === ANTI_MEMORY_CATEGORY && args.antiMemory) {
+            const sourceContent = renderAntiMemoryContent(args.antiMemory);
+            const operation = reviseAntiMemory(db, producer, {
+                token: target.token,
+                payload: args.antiMemory,
+                provenance: provenance(identity, producer, sourceContent),
+                actor: input.actor,
+                requestScope,
+            });
+            return mutationResult(action, operation);
+        }
         const content = args.content?.trim();
         const category = requireTaxonomyCategory(args.category?.trim());
         if (!content && !category) {

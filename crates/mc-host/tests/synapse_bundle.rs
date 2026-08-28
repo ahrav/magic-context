@@ -15,7 +15,7 @@ use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits, SynapseSt
 use mc_host::{CompositeComponent, HostError, SecondaryComponent, StaticComposite};
 use sha2::{Digest, Sha256};
 
-use support::synapse::EchoPrimary;
+use support::synapse::{test_lane, DeterministicEngine, EchoPrimary};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synapse-tiny")
@@ -41,6 +41,23 @@ fn ort_library() -> Option<(PathBuf, String)> {
     Some((path, hash))
 }
 
+#[tokio::test]
+async fn host_only_platform_reports_exact_synapse_unsupported_state() {
+    let component = SynapseComponent::unsupported("synapse_unsupported");
+    SecondaryComponent::initialize(&component)
+        .await
+        .expect("unsupported lane initializes");
+    assert!(matches!(
+        component.status(),
+        SynapseStatus::Disabled { reason } if reason == "synapse_unsupported"
+    ));
+    let health = CompositeComponent::health(&component).await;
+    assert_eq!(
+        health.metrics.expect("metrics")["synapse_state"],
+        "unsupported"
+    );
+}
+
 fn copy_fixture_to(dir: &Path) {
     for entry in std::fs::read_dir(fixture_dir()).expect("fixture dir") {
         let entry = entry.expect("fixture entry");
@@ -51,6 +68,7 @@ fn copy_fixture_to(dir: &Path) {
 fn config_for(dir: &Path, ort: &(PathBuf, String)) -> SynapseConfig {
     SynapseConfig {
         bundle_dir: dir.to_path_buf(),
+        bundle_manifest_sha256: None,
         ort_library: ort.0.clone(),
         ort_library_sha256: ort.1.clone(),
         limits: SynapseLimits::default(),
@@ -72,6 +90,9 @@ async fn initialize(config: SynapseConfig) -> SynapseComponent {
         .initialize()
         .await
         .expect("expected artifact faults never fail initialization");
+    SecondaryComponent::activate(&component)
+        .await
+        .expect("expected artifact faults never fail activation");
     component
 }
 
@@ -94,16 +115,88 @@ async fn expect_disabled_with(mutate: impl FnOnce(&Path), expected_fragment: &st
     );
 }
 
-async fn expect_limits_disabled(mutate: impl FnOnce(&mut SynapseLimits), expected_fragment: &str) {
+/// Infeasible limits are operator configuration error: startup must fail the
+/// host loudly rather than disable the lane while the host reports healthy.
+///
+/// The check runs in `activate`, not `initialize`: bundle verification, ORT
+/// load, and model construction are post-publication work, so `initialize`
+/// only records that the lane is starting. An `Err` from `activate` is a
+/// host-fatal invariant failure — the same loud outcome, one phase later —
+/// which is why both phases are driven here rather than just the first.
+async fn expect_limits_fail_startup(
+    mutate: impl FnOnce(&mut SynapseLimits),
+    expected_fragment: &str,
+) {
     let dir = tempfile::tempdir().expect("temp bundle dir");
     copy_fixture_to(dir.path());
     let mut config = config_for(dir.path(), &pre_ort_identity());
     mutate(&mut config.limits);
-    let reason = disabled_reason(&initialize(config).await);
+    let component = SynapseComponent::new(Some(config));
+    component
+        .initialize()
+        .await
+        .expect("bootstrap defers bundle work and cannot fail on limits");
+    assert!(
+        matches!(component.status(), SynapseStatus::Starting),
+        "bootstrap must leave the lane starting, not decided"
+    );
+    let error = component
+        .activate()
+        .await
+        .expect_err("infeasible limits must fail activation");
+    let reason = error.to_string();
     assert!(
         reason.contains(expected_fragment),
-        "reason {reason:?} does not mention {expected_fragment:?}"
+        "error {reason:?} does not mention {expected_fragment:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_query_memory_bound_rejects_both_construction_paths() {
+    // The startup scratch formula at default limits, pinned so a formula or
+    // pool change must recompute this boundary deliberately:
+    //   reservable = SCRATCH_RESERVED_BYTES (184,616,192)
+    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 182,519,040
+    //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
+    //   queued text bytes = max_queued_request_bytes          =  67,108,864
+    //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
+    //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
+    //   K = 4: 182,244,608 <= 182,519,040 (feasible boundary)
+    //   K = 5: 184,342,016 >  182,519,040 (rejected)
+    const BOUNDARY: usize = 4;
+
+    // The accepted twin: the largest feasible K constructs on both paths.
+    let accepted = SynapseLimits {
+        max_waiting_queries: BOUNDARY,
+        ..SynapseLimits::default()
+    };
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &accepted, None)
+        .expect("the boundary configuration loads through the bundle path");
+    SynapseComponent::ready_with_engine(test_lane(), DeterministicEngine::new(), accepted)
+        .expect("the boundary configuration constructs through the engine path");
+
+    // One waiter past the boundary fails both paths with the scratch bound.
+    expect_limits_fail_startup(
+        |limits| limits.max_waiting_queries = BOUNDARY + 1,
+        "query admission capacity requires",
+    )
+    .await;
+
+    let limits = SynapseLimits {
+        max_waiting_queries: BOUNDARY + 1,
+        ..SynapseLimits::default()
+    };
+    let error = match SynapseComponent::ready_with_engine(
+        test_lane(),
+        DeterministicEngine::new(),
+        limits,
+    ) {
+        Ok(_) => panic!("the ready-engine seam must apply serving-limit validation"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("query admission capacity requires"));
 }
 
 fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
@@ -156,6 +249,27 @@ async fn unconfigured_component_is_disabled_not_fatal() {
         component.health().await.status,
         mc_host::HealthStatus::Degraded
     );
+    // A lane that rejects every bind never parks a general handler task on
+    // query admission, so it must not spend one of the host's general
+    // handler-task slots: a host reserving all but one slot still starts.
+    assert_eq!(
+        component.resources().general_task_hold_bound,
+        0,
+        "a disabled lane must declare no parked general handler tasks"
+    );
+    // The bound survives for a lane that can serve: the running query plus
+    // every allowed waiter.
+    let ready = SynapseComponent::ready_with_engine(
+        test_lane(),
+        DeterministicEngine::new(),
+        SynapseLimits {
+            max_waiting_queries: 2,
+            max_queued_request_bytes: 8 * 1024 * 1024,
+            ..SynapseLimits::default()
+        },
+    )
+    .expect("two waiters fit the default scratch pool");
+    assert_eq!(ready.resources().general_task_hold_bound, 3);
 }
 
 fn identity() -> mc_host::RouteIdentity {
@@ -167,6 +281,7 @@ fn identity() -> mc_host::RouteIdentity {
         consumer_launch_nonce: None,
         consumer_capabilities: Vec::new(),
         admission_facts: None,
+        credential_fingerprints: std::collections::BTreeMap::new(),
     }
 }
 
@@ -277,13 +392,42 @@ fn the_committed_fixture_carries_its_canonical_fingerprint() {
         max_text_bytes: 123_456,
         ..SynapseLimits::default()
     };
-    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits)
+    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, None)
         .expect("the committed fixture bundle loads");
     assert_eq!(bundle.max_text_bytes, limits.max_text_bytes);
     assert_eq!(
         bundle.manifest.fingerprint,
         mc_host::synapse::bundle::canonical_fingerprint(&bundle.manifest),
         "regenerate the fixture with generate-synapse-tiny.py"
+    );
+}
+
+/// The bundle manifest is the hinge between the two trust roots: the generation
+/// manifest hashes it, and it hashes every artifact. A load that accepts any
+/// self-consistent manifest at the pathname breaks that chain, so a bundle
+/// swapped in after the generation was validated could serve different
+/// embedding bytes under a selection the daemon still reported as valid.
+#[test]
+fn a_bundle_manifest_outside_the_committed_digest_does_not_load() {
+    let limits = SynapseLimits::default();
+    let manifest_bytes =
+        std::fs::read(fixture_dir().join("manifest.json")).expect("fixture manifest");
+    let committed = sha256_hex(&manifest_bytes);
+
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, Some(&committed))
+        .expect("the digest the generation committed admits the bundle it names");
+
+    let other = sha256_hex(b"a manifest this generation never staged");
+    let Err(error) = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, Some(&other))
+    else {
+        panic!("a manifest outside the committed digest must not load");
+    };
+    assert!(
+        error
+            .0
+            .contains("does not match the digest its generation committed"),
+        "unexpected rejection: {}",
+        error.0
     );
 }
 
@@ -322,11 +466,11 @@ async fn retained_result_cap_below_the_manifest_batch_bound_disables_before_ort(
 }
 
 #[tokio::test]
-async fn incoherent_host_serving_limits_disable_before_ort() {
-    expect_limits_disabled(|limits| limits.max_text_bytes = 3, "UTF-8 code point").await;
-    expect_limits_disabled(|limits| limits.max_batch_items = 0, "max batch items").await;
-    expect_limits_disabled(|limits| limits.max_retained_jobs = 0, "retained job count").await;
-    expect_limits_disabled(
+async fn incoherent_host_serving_limits_fail_startup_before_ort() {
+    expect_limits_fail_startup(|limits| limits.max_text_bytes = 3, "UTF-8 code point").await;
+    expect_limits_fail_startup(|limits| limits.max_batch_items = 0, "max batch items").await;
+    expect_limits_fail_startup(|limits| limits.max_retained_jobs = 0, "retained job count").await;
+    expect_limits_fail_startup(
         |limits| limits.max_queued_request_bytes = limits.max_batch_text_bytes as u64 - 1,
         "queued request bytes",
     )
@@ -513,6 +657,53 @@ async fn certified_bundle_loads_and_serves_expected_vectors() {
 }
 
 #[tokio::test]
+async fn production_bundle_from_environment_certifies_offline() {
+    let Some(bundle_dir) = std::env::var_os("MC_SYNAPSE_PRODUCTION_BUNDLE").map(PathBuf::from)
+    else {
+        eprintln!("skipping: MC_SYNAPSE_PRODUCTION_BUNDLE is unset");
+        return;
+    };
+    let Some(ort) = ort_library() else { return };
+    let component = initialize(config_for(&bundle_dir, &ort)).await;
+    let lane = match component.status() {
+        SynapseStatus::Ready(lane) => lane,
+        other => panic!("production bundle did not certify: {other:?}"),
+    };
+    assert_eq!(lane.model, "gte-modernbert-base-f16");
+    assert_eq!(lane.dims, 768);
+    assert_eq!(lane.table_epoch, 1);
+
+    let corpus: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir.join("corpus.json")).expect("production corpus"),
+    )
+    .expect("production corpus json");
+    let tolerance = corpus["tolerance"].as_f64().expect("tolerance") as f32;
+    let mut captured = Vec::new();
+    for item in corpus["items"].as_array().expect("items") {
+        let text = item["text"].as_str().expect("text");
+        let expected: Vec<f32> = item["expected"]
+            .as_array()
+            .expect("expected")
+            .iter()
+            .map(|value| value.as_f64().expect("component") as f32)
+            .collect();
+        let vectors = component.embed_blocking(&[text]).expect("embed");
+        captured.push(serde_json::json!({"text": text, "expected": vectors[0]}));
+        for (got, expected) in vectors[0].iter().zip(expected) {
+            assert!((got - expected).abs() <= tolerance);
+        }
+    }
+    if let Some(path) = std::env::var_os("MC_SYNAPSE_CAPTURE_CORPUS") {
+        let output = serde_json::json!({"tolerance": 0.0001, "items": captured});
+        std::fs::write(
+            path,
+            serde_json::to_vec(&output).expect("serialize captured corpus"),
+        )
+        .expect("write captured corpus");
+    }
+}
+
+#[tokio::test]
 async fn wrong_but_dimension_compatible_output_fails_certification() {
     let Some(ort) = ort_library() else { return };
     let dir = tempfile::tempdir().expect("temp bundle dir");
@@ -586,25 +777,26 @@ fn blocking_pool_gate() -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle
 }
 
 #[test]
-fn a_dropped_initialize_keeps_shutdown_waiting_for_the_blocking_load() {
+fn a_dropped_activate_keeps_shutdown_waiting_for_the_blocking_load() {
     single_blocking_thread_runtime().block_on(async {
         let dir = tempfile::tempdir().expect("temp bundle dir");
         copy_fixture_to(dir.path());
         let component = SynapseComponent::new(Some(config_for(dir.path(), &pre_ort_identity())));
+        component.initialize().await.expect("initialize");
         let (gate_tx, gate) = blocking_pool_gate();
 
         // One poll spawns the queued blocking load and the tracked wrapper
-        // that owns its completion; the drop then abandons `initialize`
+        // that owns its completion; the drop then abandons `activate`
         // exactly at its await on that wrapper.
-        let mut init = Box::pin(component.initialize());
+        let mut activate = Box::pin(SecondaryComponent::activate(&component));
         tokio::select! {
             biased;
-            _ = init.as_mut() => {
-                panic!("initialize cannot complete while the blocking thread is occupied")
+            _ = activate.as_mut() => {
+                panic!("activate cannot complete while the blocking thread is occupied")
             }
             () = tokio::task::yield_now() => {}
         }
-        drop(init);
+        drop(activate);
 
         // The load has not run, so the incarnation tracker still owns it and
         // shutdown's drain must hold.
@@ -621,9 +813,10 @@ fn a_dropped_initialize_keeps_shutdown_waiting_for_the_blocking_load() {
             .expect("shutdown completes once the blocking load stopped")
             .expect("synapse shutdown returns cleanly");
 
-        // The dropped initialize never installed a lane: the load's result
-        // was discarded at the tracked wrapper.
-        assert!(matches!(component.status(), SynapseStatus::Disabled { .. }));
+        // The dropped activate never installed a lane: the load's result
+        // was discarded at the tracked wrapper, so the lane still reports
+        // its pre-activation starting state.
+        assert!(matches!(component.status(), SynapseStatus::Starting));
     });
 }
 
@@ -649,7 +842,7 @@ fn probe_composite() -> StaticComposite<EchoPrimary, SynapseComponent, support::
 }
 
 #[test]
-fn an_aborted_initialization_holds_the_instance_lock_until_the_blocking_load_stops() {
+fn an_abandoned_activation_holds_the_instance_lock_until_the_blocking_load_stops() {
     single_blocking_thread_runtime().block_on(async {
         let bundle_dir = tempfile::tempdir().expect("temp bundle dir");
         copy_fixture_to(bundle_dir.path());
@@ -666,23 +859,28 @@ fn an_aborted_initialization_holds_the_instance_lock_until_the_blocking_load_sto
         .expect("distinct component ids");
         let shutdown = mc_host::CancellationToken::new();
         let run_shutdown = shutdown.clone();
-        let config = host_config(data_root.path());
+        let mut config = host_config(data_root.path());
+        config.timing.shutdown_deadline = Duration::from_secs(20);
+        let publication = mc_host::runtime_dir_path(Some(data_root.path()))
+            .expect("runtime dir")
+            .join(mc_host::CONNECTION_FILE_NAME);
         let host = tokio::spawn(async move { mc_host::run(composite, config, run_shutdown).await });
 
-        // The first poll of the initialization task queues the blocking load
-        // and parks on the tracked join; the sleep yields far more than one
-        // scheduling pass before the abort.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown.cancel();
-        let result = host.await.expect("run task joins");
-        assert!(
-            matches!(result, Err(HostError::InitFailed(_))),
-            "shutdown during initialization fails startup, got {result:?}"
-        );
+        // Transport publishes while the gated blocking load is still queued:
+        // activation never delays publication.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read(&publication).is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "host must publish while activation is still blocked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
-        // `run` returned, but the reaper still owns the guard and is draining
-        // the component, whose tracker holds the queued blocking load: the
-        // lock must refuse a successor.
+        // Shutdown abandons the activation future, but the component's
+        // tracker still owns the queued blocking load: the lock must refuse
+        // a successor until that load stops.
+        shutdown.cancel();
         let refused = mc_host::run(
             probe_composite(),
             host_config(data_root.path()),
@@ -694,10 +892,16 @@ fn an_aborted_initialization_holds_the_instance_lock_until_the_blocking_load_sto
             "the lock must stay held while the blocking load is owned, got {refused:?}"
         );
 
-        // Releasing the gate lets the load run to completion; only then does
-        // the reaper drop the guard.
+        // Releasing the gate lets the load run to completion; only then can
+        // shutdown drain and the guard drop.
         drop(gate_tx);
         gate.await.expect("gate closure joins");
+        let result = host.await.expect("run task joins");
+        assert!(
+            result.is_ok(),
+            "shutdown after publication drains gracefully, got {result:?}"
+        );
+
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             // A pre-cancelled token makes each probe self-contained: `run`

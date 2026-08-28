@@ -67,7 +67,7 @@
         "family": "conflicting-evidence",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "line length is 100"
+          "value": "100 characters"
         }
       }
     ],

@@ -1,12 +1,12 @@
 import { realpathSync, statSync } from "node:fs";
 import {
-    getMemoryById,
-    insertMemory,
+    readProjectMemoryCurrentState,
+    recordProjectMemoryVerification,
     resolveProjectIdentity,
-    updateMemoryVerification,
-    type Memory,
     type MemoryCategory,
+    type ProjectMemoryClaimSnapshot,
 } from "../../../plugin/src/features/magic-context/memory";
+import { seedProjectMemoryClaim } from "../../../plugin/src/features/magic-context/test-claim-database";
 import { openTestDb } from "../test-db";
 
 export interface GoldMemoryRow {
@@ -27,11 +27,22 @@ export interface SeedGoldMemoriesOptions {
  *
  * The database must already exist; opening a missing SQLite path would create a
  * schemaless file and turn a disabled-plugin baseline into misleading test data.
- * Inserts are intentionally not idempotent or transactional as a group. A
- * duplicate normalized hash surfaces the store's UNIQUE error after earlier
- * rows have committed, matching repeated direct `insertMemory` calls.
+ *
+ * Rows are seeded with the conservative `model_inference` trust class so the
+ * maturity ladder — not the seeder — decides surface eligibility: an unverified
+ * claim stays CANDIDATE and reaches explicit search only, and `verified` rows
+ * become auto-injectable only after the real verification API records the
+ * outcome against their exact current revision.
+ *
+ * Each row is its own claim operation, so a failure part-way through leaves the
+ * earlier rows committed. A row whose normalized hash already has a live claim
+ * in the same (project, category) slot resolves onto that claim and attaches its
+ * provenance as independent evidence instead of creating a second claim, so the
+ * returned array can name the same claim twice.
  */
-export function seedGoldMemories(options: SeedGoldMemoriesOptions): Memory[] {
+export function seedGoldMemories(
+    options: SeedGoldMemoriesOptions,
+): ProjectMemoryClaimSnapshot[] {
     let db: ReturnType<typeof openTestDb>;
     try {
         db = openTestDb(options.dbPath, { readwrite: true, create: false });
@@ -52,23 +63,61 @@ export function seedGoldMemories(options: SeedGoldMemoriesOptions): Memory[] {
     }
     try {
         const projectPath = resolveProjectIdentity(realpathSync(options.workdir));
-        return options.rows.map((row) => {
-            const inserted = insertMemory(db, {
-                projectPath,
+        const seeded = options.rows.map((row) => {
+            const claim = seedProjectMemoryClaim(db, {
+                projectIdentity: projectPath,
                 category: row.category,
                 content: row.content,
-                importance: row.importance,
+                ...(row.importance === undefined
+                    ? {}
+                    : { importance: row.importance }),
+                provenance: { sourceTrustClass: "model_inference" },
             });
-            if (options.verification === "candidate") return inserted;
+            if (options.verification === "verified") {
+                const result = recordProjectMemoryVerification(
+                    db,
+                    {
+                        producer: "oracle-gold",
+                        operationKey: `verify:${claim.publicClaimId}:${crypto.randomUUID()}`,
+                    },
+                    {
+                        token: claim.token,
+                        revisionLocator: claim.revisionLocator,
+                        outcome: "verified",
+                        verifier: "oracle-arm",
+                    },
+                );
+                if (result.outcome !== "applied") {
+                    throw new Error(
+                        `seedGoldMemories: verification of ${claim.publicClaimId} returned ${result.outcome}`,
+                    );
+                }
+            }
+            return claim;
+        });
 
-            updateMemoryVerification(db, inserted.id, "verified");
-            const verified = getMemoryById(db, inserted.id);
-            if (!verified) {
+        // Explicit search is the only surface that carries CANDIDATE claims, so
+        // reading it returns both verification modes with one request.
+        const state = readProjectMemoryCurrentState(db, {
+            publicClaimIds: [...new Set(seeded.map((claim) => claim.publicClaimId))],
+            surface: "explicit_search",
+        });
+        if (state.status !== "ok") {
+            throw new Error(
+                `seedGoldMemories: current-state read is stale: ${state.reasons.join(", ")}`,
+            );
+        }
+        const byPublicClaimId = new Map(
+            state.items.map((item) => [item.publicClaimId, item]),
+        );
+        return seeded.map((claim) => {
+            const snapshot = byPublicClaimId.get(claim.publicClaimId);
+            if (!snapshot) {
                 throw new Error(
-                    `seedGoldMemories: inserted memory ${inserted.id} disappeared after verification`,
+                    `seedGoldMemories: seeded claim ${claim.publicClaimId} is not visible to explicit search`,
                 );
             }
-            return verified;
+            return snapshot;
         });
     } finally {
         db.close();

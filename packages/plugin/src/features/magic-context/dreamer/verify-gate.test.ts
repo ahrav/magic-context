@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { __resetVerificationPathsForTests, __setVerificationPathsTestHooks } from "../memory";
+import { createAntiMemory } from "../memory/storage-anti-memory";
 import {
     applyProjectMemoryMapping,
     computeProjectMemoryMutationToken,
@@ -57,6 +58,39 @@ function seedClaim(db: Database, content: string, key: string): string {
                 extractorVersion: "1",
                 extractorRunId: "seed",
                 independenceKey: key,
+                sourceTrustClass: "explicit_user",
+            },
+            actor: "user:test",
+        },
+    );
+    return (result.result.payload as { claim: { publicClaimId: string } }).claim.publicClaimId;
+}
+
+function seedAntiMemory(
+    db: Database,
+    overrides: { rootCause?: string; rejectedStrategy?: string } = {},
+): string {
+    const result = createAntiMemory(
+        db,
+        {
+            producer: "gate-test",
+            operationKey: `seed-anti-${overrides.rejectedStrategy ?? "default"}`,
+        },
+        {
+            projectId: ensureProject(db, PROJECT),
+            payload: {
+                trigger: "session caching",
+                rejectedStrategy: "Redis",
+                rejectionReason: "split ownership",
+                ...overrides,
+            },
+            provenance: {
+                sourceLocator: `test://gate/anti-${overrides.rejectedStrategy ?? "default"}`,
+                sourceContent: "Redis rejected",
+                extractor: "test",
+                extractorVersion: "1",
+                extractorRunId: "seed",
+                independenceKey: `anti-${overrides.rejectedStrategy ?? "default"}`,
                 sourceTrustClass: "explicit_user",
             },
             actor: "user:test",
@@ -128,6 +162,108 @@ describe("claim-current verify gate", () => {
                 mappedFiles: ["a.ts"],
             });
             expect(gate.inScope[0]?.revisionLocator).toContain(`${mapped}/r1/`);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("includes file-independent anti-memories without widening ordinary claim scope", async () => {
+        const db = freshDb();
+        const dir = projectDir();
+        try {
+            const anti = seedAntiMemory(db);
+            seedClaim(db, "Unmapped ordinary claim.", "ordinary-unmapped");
+            __setVerificationPathsTestHooks({
+                execFile: async () => Promise.reject(new Error("git unavailable")),
+            });
+
+            const gate = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 3_000,
+            });
+
+            expect(gate.inScopeIds).toEqual([anti]);
+            expect(gate.inScope[0]).toMatchObject({
+                publicClaimId: anti,
+                category: "REJECTED_APPROACH",
+                mappedFiles: [],
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("excludes an oversized anti-memory so one record cannot fail the batch", async () => {
+        const db = freshDb();
+        const dir = projectDir();
+        try {
+            const ordinary = seedAntiMemory(db);
+            const oversized = seedAntiMemory(db, {
+                rejectedStrategy: "Memcached",
+                rootCause: "why ".repeat(4_000),
+            });
+            __setVerificationPathsTestHooks({
+                execFile: async () => Promise.reject(new Error("git unavailable")),
+            });
+
+            const gate = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 3_000,
+            });
+
+            expect(gate.inScopeIds).toEqual([ordinary]);
+            expect(gate.inScopeIds).not.toContain(oversized);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("excludes a demoted anti-memory from every subsequent verification scope", async () => {
+        const db = freshDb();
+        const dir = projectDir();
+        try {
+            const anti = seedAntiMemory(db);
+            const claim = getProjectMemoryClaimByPublicId(db, anti);
+            if (!claim) throw new Error("missing anti-memory claim");
+            // The archive verdict for an anti-memory records outcome "stale"
+            // and leaves the record lifecycle-active until its TTL lapses.
+            // The gate must treat that as terminal, not as never-verified.
+            //
+            // Written directly because the generic operation refuses this
+            // category: production records it through the typed staging path
+            // inside the verification transaction. What this test pins is how
+            // the gate READS a stale outcome, not how the event was produced.
+            db.prepare(
+                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'gate-test', ?)",
+            ).run(claim.currentRevisionId, 2_000);
+            __setVerificationPathsTestHooks({
+                execFile: async () => Promise.reject(new Error("git unavailable")),
+            });
+
+            const incremental = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 3_000,
+            });
+            expect(incremental.inScopeIds).toEqual([]);
+
+            seedTaskScheduleState(db, PROJECT, "verify-broad", null, null, "0 3 * * 0");
+            const state = getTaskScheduleState(db, PROJECT, "verify-broad");
+            if (!state) throw new Error("missing schedule state");
+            writeTaskScheduleState(db, { ...state, lastBroadRunAt: 2_500 });
+            const broad = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                forceBroad: true,
+                now: 3_000,
+            });
+            expect(broad.inScopeIds).toEqual([]);
         } finally {
             closeQuietly(db);
         }

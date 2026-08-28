@@ -19,13 +19,13 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "nod
 import { dirname, join, resolve } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
-    lintCorpus,
+    lintScenario,
     parseModelRoute,
     parseScenario,
     type HistorianEvalScenario,
 } from "../src/historian-eval/contract";
 import { runMutationBattery } from "../src/historian-eval/mutations";
-import { loadRelease } from "../src/historian-eval/promote";
+import { checkFamilyCoverage, loadRelease } from "../src/historian-eval/promote";
 import { runScenario, type LiveHistorianMode, type SystemVersionTuple } from "../src/historian-eval/runner";
 import { buildLaneReport, laneExitCode, scoreRunRecord, type ScenarioScore } from "../src/historian-eval/scorer";
 import { E2E_ROOT } from "./validate-mode-manifest";
@@ -86,8 +86,26 @@ function loadCorpus(args: CliArgs): { scenarios: HistorianEvalScenario[]; releas
     return { scenarios, releaseVersion: null };
 }
 
+/**
+ * Corpus admission for the per-PR gate, built from the same rules freeze
+ * promotion applies: per-scenario lint, unique ids, and hard-negative family
+ * coverage. Mirroring promotion is the point — a corpus this gate accepts but
+ * promotion would reject could never be frozen, and the reverse would let a
+ * release freeze in a state that keeps this gate permanently red. The release
+ * size budget is promotion-only: the dev split is deliberately smaller than a
+ * releasable corpus.
+ */
+function corpusDiagnostics(scenarios: readonly HistorianEvalScenario[]): string[] {
+    const diagnostics = scenarios.flatMap((scenario) => lintScenario(scenario));
+    if (scenarios.length === 0) diagnostics.push("corpus: empty");
+    const ids = new Set(scenarios.map((scenario) => scenario.id));
+    if (ids.size !== scenarios.length) diagnostics.push("corpus: duplicate scenario ids");
+    diagnostics.push(...checkFamilyCoverage(scenarios));
+    return diagnostics.sort();
+}
+
 function runLint(scenarios: readonly HistorianEvalScenario[]): number {
-    const diagnostics = lintCorpus(scenarios);
+    const diagnostics = corpusDiagnostics(scenarios);
     if (diagnostics.length > 0) {
         for (const diagnostic of diagnostics) console.error(`lint: ${diagnostic}`);
         return 1;
@@ -175,10 +193,7 @@ async function runLive(args: CliArgs): Promise<number> {
             opencodeVersion: opencode,
         });
         system = record.system;
-        // The record's snapshot path is relative to the record's own
-        // directory, so re-scoring the archived artifact elsewhere resolves it
-        // against wherever it was unpacked.
-        const score = scoreRunRecord(record, scenario, { recordDir: artifactDir });
+        const score = scoreRunRecord(record, scenario);
         scores.push(score);
         console.log(
             `${scenario.id}: ${score.verdict}${score.failReasons.length > 0 ? ` [${score.failReasons.join(",")}]` : ""}${score.errorReason ? ` (${score.errorReason})` : ""}`,

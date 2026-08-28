@@ -2,19 +2,21 @@ import { describe, expect, test } from "bun:test";
 import {
     EXPECTED_OUTCOMES,
     MUTATION_CLASSES,
+    MUTATION_EVIDENCE_SCHEMA,
     checkMutationOutcome,
+    parseMutationEvidence,
     perturbPredicateValue,
     runMutationBattery,
     runScenarioMutationBattery,
 } from "./mutations";
 import { normalizeContent, predicateMatches } from "./contract";
-import { buildHistorianPayload } from "./payload";
+import { buildMockHistorianOutput } from "../mock-historian";
 import { goldFacts, goldenRawOutput, validScenario } from "./test-support";
 
 function overlappingPayload(): string {
     const scenario = validScenario();
     const messageCount = scenario.transcript.turns.length * 2;
-    return buildHistorianPayload({
+    return buildMockHistorianOutput({
         compartments: [
             { start: 1, end: messageCount - 2, title: "A", body: "a" },
             { start: messageCount - 3, end: messageCount, title: "B", body: "b" },
@@ -111,5 +113,158 @@ describe("mutation battery (R13/KTD5)", () => {
         expect(artifact.green).toBe(true);
         expect(artifact.scenarios).toHaveLength(1);
         expect(artifact.scenarios[0].scenarioFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    test("evidence parser round-trips a real battery artifact", () => {
+        const artifact = runMutationBattery([validScenario()]);
+        const parsed = parseMutationEvidence(JSON.parse(JSON.stringify(artifact)));
+        expect(parsed.green).toBe(true);
+        expect(parsed.scenarios).toHaveLength(1);
+    });
+
+    test("evidence parser rejects a green entry without full class coverage (forged shell)", () => {
+        // Internally consistent but truncated: one skipped-class row is the
+        // cheapest shape a forger could hand-write.
+        const forged = {
+            schema: MUTATION_EVIDENCE_SCHEMA,
+            green: true,
+            scenarios: [
+                {
+                    scenarioId: "hse-forged",
+                    scenarioFingerprint: "0".repeat(64),
+                    green: true,
+                    results: [
+                        {
+                            mutationClass: "speculation-promoted",
+                            applicable: false,
+                            green: true,
+                            detail: "",
+                        },
+                    ],
+                },
+            ],
+        };
+        expect(() => parseMutationEvidence(forged)).toThrow(/green-without-full-class-coverage/);
+    });
+
+    test("evidence parser rejects a green entry where no false-authoritative class applied", () => {
+        const results = MUTATION_CLASSES.map((mutationClass) => ({
+            mutationClass,
+            applicable: false,
+            green: true,
+            detail: "",
+        }));
+        const forged = {
+            schema: MUTATION_EVIDENCE_SCHEMA,
+            green: true,
+            scenarios: [
+                {
+                    scenarioId: "hse-forged",
+                    scenarioFingerprint: "0".repeat(64),
+                    green: true,
+                    results,
+                },
+            ],
+        };
+        expect(() => parseMutationEvidence(forged)).toThrow(
+            /green-without-applicable-false-authoritative-class/,
+        );
+    });
+
+    test("evidence parser rejects a green entry that marks an unconditionally applied class skipped", () => {
+        // Full class coverage AND an applied false-authoritative class, but
+        // one always-applied class flipped to skipped: the shape that claims
+        // green while demonstrating only part of the battery.
+        const results = MUTATION_CLASSES.map((mutationClass) => ({
+            mutationClass,
+            applicable: mutationClass !== "wrong-category",
+            green: true,
+            detail: "",
+        }));
+        const forged = {
+            schema: MUTATION_EVIDENCE_SCHEMA,
+            green: true,
+            scenarios: [
+                {
+                    scenarioId: "hse-forged",
+                    scenarioFingerprint: "0".repeat(64),
+                    green: true,
+                    results,
+                },
+            ],
+        };
+        expect(() => parseMutationEvidence(forged)).toThrow(/green-with-skipped-required-class-wrong-category/);
+    });
+
+    test("evidence parser rejects duplicate scenario entries that would mask a red result", () => {
+        // The masking shape: a real red entry followed by a green entry for the
+        // SAME scenario. `checkMutationEvidence` indexes by scenarioFingerprint
+        // into a Map, where the later duplicate wins, so the admission gate would
+        // read this scenario as green. Artifact-level `green` stays false and
+        // internally consistent throughout, so uniqueness is the only check that
+        // can see it.
+        const artifact = runMutationBattery([validScenario()]);
+        const green = JSON.parse(JSON.stringify(artifact.scenarios[0])) as Record<string, unknown>;
+        const red = JSON.parse(JSON.stringify(green)) as {
+            green: boolean;
+            results: Array<{ green: boolean }>;
+        };
+        red.green = false;
+        red.results[0].green = false;
+        const forged = {
+            schema: MUTATION_EVIDENCE_SCHEMA,
+            green: false,
+            scenarios: [red, green],
+        };
+        expect(() => parseMutationEvidence(forged)).toThrow(/scenarioId: duplicate/);
+
+        // Re-keying the duplicate to dodge the id check must not get through
+        // either: the fingerprint is what the promotion-side Map indexes on.
+        const renamed = { ...red, scenarioId: "hse-other" };
+        expect(() => parseMutationEvidence({ ...forged, scenarios: [renamed, green] })).toThrow(
+            /scenarioFingerprint: duplicate/,
+        );
+    });
+
+    test("probe mutation exercises every probe, including the claim-id comparison path", () => {
+        const scenario = validScenario();
+        expect(scenario.probes.map((probe) => probe.answerType)).toEqual(["exact", "multiple-choice", "claim-id"]);
+        const evidence = runScenarioMutationBattery(scenario);
+        const probe = evidence.results.find((result) => result.mutationClass === "probe-wrong-answer");
+        expect(probe?.green).toBe(true);
+        expect(probe?.detail).toContain(`all ${scenario.probes.length} probe(s)`);
+        // claim-id only ever appears after another probe in the corpus, so a
+        // probes[0]-only battery would never reach this comparison branch.
+        expect(probe?.detail).toContain("claim-id");
+    });
+
+    test("a LATER probe that accepts the wrong answer turns the probe class red", () => {
+        const scenario = validScenario();
+        // Gold answer equal to the battery's wrong answer: the comparison
+        // PASSES, so the mutation is not detected. Placed last, this is
+        // invisible to a battery that only mutates probes[0].
+        const colliding = {
+            id: "probe-collides",
+            question: "Which marker does the battery send?",
+            answerType: "exact" as const,
+            goldAnswer: "historian-eval-mutation-wrong-answer",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const evidence = runScenarioMutationBattery({ ...scenario, probes: [...scenario.probes, colliding] });
+        const probe = evidence.results.find((result) => result.mutationClass === "probe-wrong-answer");
+        expect(probe?.green).toBe(false);
+        expect(probe?.detail).toContain("probe-collides");
+        expect(evidence.green).toBe(false);
+    });
+
+    test("baseline satisfies gold.compartments.minCount above one (higher minimums stay promotable)", () => {
+        const scenario = validScenario();
+        const raised = { ...scenario, gold: { ...scenario.gold, compartments: { minCount: 3 } } };
+        const evidence = runScenarioMutationBattery(raised);
+        // A fixed single-compartment baseline would trip the scorer's
+        // compartment-count structural finding, so every mutation would be
+        // red for the wrong reason and promotion would reject the scenario.
+        expect(evidence.results.some((result) => result.mutationClass === "baseline-fixture")).toBe(false);
+        expect(evidence.green).toBe(true);
     });
 });

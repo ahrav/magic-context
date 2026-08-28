@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -20,7 +21,9 @@ use crate::connection::{run_connection, GenerationCore};
 use crate::dispatch::{
     finish_route_close, force_close_all_routes, send_connection_goodbye, settle_route,
 };
-use crate::handler::{McHostHandler, ResourceDeclaration, RouteClass, TargetKind};
+use crate::handler::{
+    HealthReport, HealthStatus, McHostHandler, ResourceDeclaration, RouteClass, TargetKind,
+};
 use crate::instance::{ConnectionKey, InstanceError, InstanceGuard};
 use crate::routing::RouteRegistry;
 use crate::wire::ByteBudget;
@@ -95,6 +98,9 @@ pub struct HostShared<H> {
     pub liveness: Option<LivenessPolicy>,
     pub targets: crate::control::TargetIndex,
     pub catalog: crate::control::CatalogCache,
+    /// Last completed sanitized component health snapshot. Authenticated
+    /// `host.status` reads this without invoking a lifecycle callback.
+    pub health_snapshot: RwLock<HealthReport>,
     pub providers: crate::transport_provider::TransportProviders,
     pub registry: RouteRegistry,
     /// Admits inbound frame bodies. The only budget with a blocking
@@ -476,6 +482,10 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
 struct Reservations {
     pending: usize,
     tasks: usize,
+    /// Checked sum of every module's declared bound on concurrently parked
+    /// general-class handler tasks. Not a carve-out — validated against the
+    /// general task pool so declared parking can never consume every slot.
+    general_task_holds: usize,
     retained_bytes: u64,
 }
 
@@ -500,6 +510,7 @@ fn build_target_index(
     let mut reservations = Reservations {
         pending: 0,
         tasks: 0,
+        general_task_holds: 0,
         retained_bytes: 0,
     };
     let mut target_entries: Vec<(Box<str>, Vec<TargetKind>, RouteClass)> =
@@ -552,6 +563,12 @@ fn build_target_index(
             .checked_add(declaration.reserved_handler_tasks)
             .ok_or_else(|| {
                 HostError::InitFailed("reserved handler-task sum overflows".to_owned())
+            })?;
+        reservations.general_task_holds = reservations
+            .general_task_holds
+            .checked_add(declaration.general_task_hold_bound)
+            .ok_or_else(|| {
+                HostError::InitFailed("general handler-task hold sum overflows".to_owned())
             })?;
         reservations.retained_bytes = reservations
             .retained_bytes
@@ -653,6 +670,7 @@ pub async fn run<H: McHostHandler>(
         .map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
+    handler.install_connection_key(*guard.key().bytes());
     let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
     let declarations = crate::panic_boundary::redact_sync(|| handler.resource_declarations());
     let (targets, reservations) = build_target_index(&manifests, &declarations)?;
@@ -669,6 +687,19 @@ pub async fn run<H: McHostHandler>(
         return Err(HostError::InitFailed(
             "reserved handler tasks leave no general handler-task slot".to_owned(),
         ));
+    }
+    // Declared long-parked general tasks (for example Synapse's running
+    // query plus its FIFO waiters) draw on the general pool. If they could
+    // fill it, one module's waiting traffic would starve every other route,
+    // so the sum must leave at least one free general task slot.
+    let general_task_slots = config.limits.max_handler_tasks - reservations.tasks;
+    if reservations.general_task_holds >= general_task_slots {
+        return Err(HostError::InitFailed(format!(
+            "declared parked handler tasks ({}) leave no free general handler-task slot \
+             ({general_task_slots} available); lower max_waiting_queries or raise \
+             max_handler_tasks",
+            reservations.general_task_holds
+        )));
     }
     // Bounded during serialization, not after: an over-limit manifest must be
     // refused without ever materializing a full copy of its catalog.
@@ -831,6 +862,11 @@ pub async fn run<H: McHostHandler>(
         liveness: config.liveness.clone(),
         targets,
         catalog,
+        health_snapshot: RwLock::new(HealthReport {
+            status: HealthStatus::Degraded,
+            detail: None,
+            metrics: Some(serde_json::json!({"components": {}})),
+        }),
         providers: config.transport_providers.clone(),
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
@@ -869,6 +905,7 @@ pub async fn run<H: McHostHandler>(
     let mut abandon_guard = AbandonGuard {
         inner: Some((Arc::clone(&shared), guard)),
     };
+    spawn_activation_task(&shared);
     spawn_health_task(&shared);
     accept_loop(&shared, listener).await;
     let graceful = shutdown_sequence(&shared, abandon_guard.guard_mut()).await;
@@ -901,6 +938,52 @@ pub async fn run<H: McHostHandler>(
 /// Delay before retrying a failed `accept()`, preventing a tight error loop
 /// when the listener stays ready under persistent resource exhaustion.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs the handler's post-publication activation exactly once, tracked but
+/// never awaited by startup: transport is already published and the accept
+/// loop starts regardless of activation progress. An `Err`, panic, or task
+/// loss trips the fatal latch; shutdown abandons an unfinished activation
+/// future at the inner select, and the component-owned trackers it started
+/// are drained by the handler shutdown callback.
+fn spawn_activation_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
+    let outer = Arc::clone(shared);
+    let shared = Arc::clone(shared);
+    outer.spawn_tracked(async move {
+        let handler = Arc::clone(&shared.handler);
+        let watchdog = Arc::clone(&shared);
+        // Abort-exempt: forced-shutdown `abort_all` must not turn an
+        // in-flight activation into a spurious task loss. The inner select
+        // self-bounds on the shutdown token instead; there is deliberately
+        // no lifecycle deadline here because model construction and
+        // certification own separate post-publication budgets.
+        let task = shared.spawn_lifecycle(async move {
+            let callback = crate::panic_boundary::redact_sync(|| handler.activate());
+            tokio::select! {
+                biased;
+                () = watchdog.shutdown.cancelled() => {}
+                result = crate::panic_boundary::redact(callback) => {
+                    if let Err(err) = result {
+                        // The handler-authored message can carry component
+                        // detail; fatal diagnostics get bounded structure
+                        // only (protocol V24).
+                        watchdog.fatal.trip(
+                            &watchdog.shutdown,
+                            format!(
+                                "activation invariant failure ({} bytes of detail redacted)",
+                                err.0.len()
+                            ),
+                        );
+                    }
+                }
+            }
+        });
+        if task.await.is_err() {
+            shared
+                .fatal
+                .trip(&shared.shutdown, "activation task lost".to_owned());
+        }
+    });
+}
 
 /// Accepts sockets until shutdown. Each accept result is synchronously
 /// registered with the task tracker before the next await — the
@@ -940,13 +1023,37 @@ async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: Tc
 /// Dedicated internal health probe: never a routed request, never a client
 /// JSON operation (protocol §9.3). Callback failure is host-fatal.
 fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
+    fn activation_in_progress(report: &HealthReport) -> bool {
+        let components = report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("components"))
+            .and_then(serde_json::Value::as_object);
+        components.is_some_and(|components| {
+            components.values().any(|component| {
+                let metrics = component
+                    .get("metrics")
+                    .and_then(serde_json::Value::as_object);
+                metrics.is_some_and(|metrics| {
+                    metrics
+                        .get("storage_state")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("starting")
+                        || metrics
+                            .get("synapse_state")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("starting")
+                })
+            })
+        })
+    }
+
     let shared = Arc::clone(shared);
     let shared_outer = Arc::clone(&shared);
     shared_outer.spawn_tracked(async move {
         loop {
-            tokio::select! {
-                () = shared.shutdown.cancelled() => return,
-                () = tokio::time::sleep(shared.timing.health_interval) => {}
+            if shared.shutdown.is_cancelled() {
+                return;
             }
             let handler = Arc::clone(&shared.handler);
             let deadline = shared.timing.lifecycle_callback_deadline;
@@ -965,21 +1072,43 @@ fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
                     // not a lifecycle failure — an abort-exempt probe that
                     // ignored shutdown would hold the tracker past the whole
                     // shutdown budget.
-                    () = watchdog.shutdown.cancelled() => {}
+                    () = watchdog.shutdown.cancelled() => None,
                     result = timeout(deadline, crate::panic_boundary::redact(callback)) => {
-                        if result.is_err() {
-                            watchdog.fatal.trip(
-                                &watchdog.shutdown,
-                                "health callback deadline expired".to_owned(),
-                            );
+                        match result {
+                            Ok(report) => Some(report),
+                            Err(_) => {
+                                watchdog.fatal.trip(
+                                    &watchdog.shutdown,
+                                    "health callback deadline expired".to_owned(),
+                                );
+                                None
+                            }
                         }
                     }
                 }
             });
             // The report itself is informational; degraded storage must not
             // make transport unready (protocol §8.1, AE9).
-            if shared.lifecycle_join("health", probe).await.is_err() {
-                return;
+            let activation_in_progress = match shared.lifecycle_join("health", probe).await {
+                Ok(Some(report)) => {
+                    let activation_in_progress = activation_in_progress(&report);
+                    *shared
+                        .health_snapshot
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
+                    activation_in_progress
+                }
+                Ok(None) => return,
+                Err(_) => return,
+            };
+            let interval = if activation_in_progress {
+                Duration::from_millis(50)
+            } else {
+                shared.timing.health_interval
+            };
+            tokio::select! {
+                () = shared.shutdown.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
             }
         }
     });

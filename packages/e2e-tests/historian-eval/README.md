@@ -62,15 +62,18 @@ verdicts. Recall drives FAIL; precision is reported but never fails alone;
 an expected-absent predicate matching any injection-visible active claim is
 `FAIL:false-authoritative` and always run-fatal (R7/R8/KTD8).
 
-Re-scoring an archived run needs both halves of its pairing to hold.
-`contextDbSnapshotPath` is stored **relative to the run record's own
-directory**, so a downloaded artifact re-scores at whatever path an operator
-unpacked it to; `scoreRunRecord` takes that directory as `recordDir` and
-resolves the snapshot against it. It also refuses a record whose schema,
-scenario id, or `scenarioFingerprint` does not match the scenario passed in —
-otherwise re-scoring a run whose same-id scenario was since edited would
-evaluate an old database against new gold and return a verdict that looks
-valid.
+Re-scoring an archived run is guarded by the record's own identity, not just
+its bytes: `scoreRunRecord` validates the record shape, then refuses a record
+whose schema, scenario id, or `scenarioFingerprint` does not match the
+scenario passed in, and a record whose historian-run inventory does not match
+the declared run count. Without those checks, re-scoring a run whose same-id
+scenario was since edited would evaluate an old database against new gold and
+return a verdict that looks valid.
+
+`contextDbSnapshotPath` is still an absolute runner-local path, so a
+downloaded artifact does not re-score in place — the snapshot has to be put
+back at the recorded path, or the path rewritten. Tracked as
+`magic-context-bg4`.
 
 ## The raw-output scorer seam (for task x4l.13)
 
@@ -89,16 +92,23 @@ vector set the repo has (reuse deferred, see plan scope).
 
 Per scenario: `PASS | FAIL | ERROR`. FAIL reasons: `false-authoritative`,
 `recall`, `structural`, `probe`, `invalid-output`. ERRORs are infra causes
-(R6: lease lost, silent no-op promotion, fallback engagement, script drift,
-gold-range leak, stale snapshot, run never fired, historian infrastructure
-failure, trimmed-by-injection-budget) and are excluded from all rates. A live
-historian whose every attempt is *rejected by validation* is model behavior:
-`FAIL:invalid-output`. Production reuses the same `failed` run status for
-chunk-coverage rejections, no-forward-progress, and publish exceptions, so a
-terminal run set whose reasons are not validation rejections becomes
-`ERROR:historian-infrastructure-failure` instead — an unrecognized reason
-classifies as infrastructure, because excluding one scenario is recoverable
-while booking an outage as model quality is not.
+(R6) and are excluded from all rates. The runner raises `lease-lost`,
+`no-op-promotion`, `fallback-engaged`, `script-drift`, `gold-range-leak`,
+`stale-snapshot`, `run-never-fired`, `probe-envelope-malformed`,
+`probe-gold-uncovered`, `probe-response-leak`, `probe-tool-use`, and
+`harness-failure`; the scorer adds the record-integrity reasons
+`record-malformed`, `record-schema-unsupported`, `record-scenario-mismatch`,
+`record-runs-incomplete`, `record-probes-incomplete`, and
+`record-snapshot-mismatch`.
+
+A live historian whose every attempt is *rejected by validation* is model
+behavior: `FAIL:invalid-output`. Production reuses the same `failed` run
+status for chunk-coverage rejections, no-forward-progress, and publish
+exceptions, so a run that did not evaluate the historian is not a quality
+verdict — the scorer's run inventory admits only a success or a
+`validation: `-prefixed failure and reports anything else as
+`ERROR:record-runs-incomplete`. Excluding one scenario is recoverable;
+booking an outage as model quality is not.
 Frozen-release run verdict: red iff any FAIL or any ERROR; exit codes:
 0 green, 1 red, 2 run-fatal (false-authoritative).
 

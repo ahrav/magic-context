@@ -18,6 +18,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { ballastProse } from "./ballast";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import {
     spawnOpencode,
@@ -241,47 +242,11 @@ export class TestHarness {
      * (production-unreachable) state. Pressure-driving turns must therefore
      * carry real content mass: `sendPrompt(id, prefix + h.ballast(N))`.
      *
-     * Varied word bank (not single-char repeats): BPE tokenizers degrade
-     * pathologically on degenerate repeats, and varied prose tokenizes at a
-     * stable ~4 chars/token so the size math holds.
+     * Delegates to the shared generator (see ballast.ts) so every consumer —
+     * harnesses and the historian-eval freeze lint — measures the same bytes.
      */
     ballast(tokens: number): string {
-        const words = [
-            "boundary",
-            "historian",
-            "compartment",
-            "schedule",
-            "pressure",
-            "tokens",
-            "window",
-            "publish",
-            "transform",
-            "session",
-            "marker",
-            "budget",
-            "eligible",
-            "protected",
-            "ordinal",
-            "snapshot",
-            "replay",
-            "decision",
-            "threshold",
-            "baseline",
-            "measure",
-            "archive",
-            "deliver",
-        ];
-        const target = Math.max(0, Math.round(tokens * 4)); // ~4 chars/token
-        const parts: string[] = [];
-        let length = 0;
-        let i = 0;
-        while (length < target) {
-            const w = words[i % words.length];
-            parts.push(`${w}${i % 17 === 0 ? "." : ""}`);
-            length += w.length + 1;
-            i += 1;
-        }
-        return parts.join(" ");
+        return ballastProse(tokens);
     }
 
     async sendPrompt(
