@@ -52,6 +52,12 @@ export interface CreateAntiMemoryInput {
     actor: string;
     importance?: number;
     requestScope?: string;
+    /**
+     * Expiry anchor override. Backfill consumers anchor to the source event's
+     * age so harvesting old history does not re-animate stale warnings; when
+     * absent, expiry starts at the write clock.
+     */
+    expiresAt?: number;
     nowMs?: number;
 }
 
@@ -100,7 +106,13 @@ function optionalText(value: unknown, field: string): string | null {
     return requiredText(value, field);
 }
 
-function normalizePayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
+/**
+ * Trim and null-normalize a payload, rejecting empty required fields. Exported
+ * so consumers that validate or fingerprint payload text can derive the field
+ * set from the payload itself instead of hand-enumerating it (a hand-kept list
+ * fails open when a field is added).
+ */
+export function normalizeAntiMemoryPayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
     return {
         trigger: requiredText(payload.trigger, "trigger"),
         rejectedStrategy: requiredText(payload.rejectedStrategy, "rejectedStrategy"),
@@ -116,7 +128,7 @@ function normalizePayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
 }
 
 export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
-    const stored = normalizePayload(payload);
+    const stored = normalizeAntiMemoryPayload(payload);
     const lines = [
         `Trigger: ${stored.trigger}`,
         `Rejected strategy: ${stored.rejectedStrategy}`,
@@ -193,7 +205,7 @@ export function stageCreateAntiMemoryInCurrentTransaction(
     input: CreateAntiMemoryInput,
     nowMs: number,
 ): ClaimOperationStageOutcome {
-    const payload = normalizePayload(input.payload);
+    const payload = normalizeAntiMemoryPayload(input.payload);
     const staged = stageCreateProjectMemoryClaimInCurrentTransaction(
         db,
         {
@@ -204,7 +216,7 @@ export function stageCreateAntiMemoryInCurrentTransaction(
             importance: input.importance,
             memoryScope: "project",
             sharing: "private",
-            expiresAt: nowMs + ANTI_MEMORY_DEFAULT_TTL_MS,
+            expiresAt: input.expiresAt ?? nowMs + ANTI_MEMORY_DEFAULT_TTL_MS,
             provenance: input.provenance,
             actor: input.actor,
             requestScope: input.requestScope,
@@ -226,7 +238,7 @@ export function createAntiMemory(
     producer: ProducerIdentity,
     input: CreateAntiMemoryInput,
 ): ClaimOperationRunResult {
-    const payload = normalizePayload(input.payload);
+    const payload = normalizeAntiMemoryPayload(input.payload);
     const nowMs = input.nowMs ?? Date.now();
     return runClaimOperation(
         db,
@@ -322,7 +334,7 @@ export function reviseAntiMemory(
     if (current === null) throw new ClaimOperationInputError("unknown anti-memory claim");
     return reviseWithPayload(db, producer, {
         input,
-        payload: normalizePayload(input.payload),
+        payload: normalizeAntiMemoryPayload(input.payload),
         operation: "revise-anti-memory",
     });
 }

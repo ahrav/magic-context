@@ -108,12 +108,35 @@ export function getCompartmentEvents(db: Database, sessionId: string): StoredCom
     }));
 }
 
-/** Read project-scoped events oldest first for idempotent background consumers. */
+/**
+ * Read project-scoped events oldest first for idempotent background consumers.
+ *
+ * `pendingForProducer` excludes events the producer already receipted under the
+ * `event:<id>` operation-key convention, so consumed events are never re-read
+ * and per-call cost stays proportional to the unconsumed backlog rather than
+ * project lifetime. `limit` bounds one call so a large backlog drains across
+ * runs instead of inside one long write transaction.
+ */
 export function getProjectCompartmentEvents(
     db: Database,
     projectIdentity: string,
     kind: string,
+    options: { pendingForProducer?: string; limit?: number } = {},
 ): ProjectCompartmentEvent[] {
+    const receiptFilter = options.pendingForProducer
+        ? `AND NOT EXISTS (
+               SELECT 1 FROM claim_operation_receipts receipts
+                WHERE receipts.producer = ?
+                  AND receipts.operation_key = 'event:' || events.id
+           )`
+        : "";
+    const params: Array<string | number> = [projectIdentity, kind];
+    if (options.pendingForProducer) params.push(options.pendingForProducer);
+    let limitClause = "";
+    if (options.limit !== undefined) {
+        limitClause = "LIMIT ?";
+        params.push(options.limit);
+    }
     const rows = db
         .prepare(
             `SELECT DISTINCT events.id, events.session_id, events.compartment_id, events.kind,
@@ -125,9 +148,11 @@ export function getProjectCompartmentEvents(
                  ON compartments.id = events.compartment_id
                 AND compartments.session_id = events.session_id
               WHERE projects.project_path = ? AND events.kind = ?
-              ORDER BY events.id ASC`,
+                ${receiptFilter}
+              ORDER BY events.id ASC
+              ${limitClause}`,
         )
-        .all(projectIdentity, kind) as Array<{
+        .all(...params) as Array<{
         id: number;
         session_id: string;
         compartment_id: number | null;

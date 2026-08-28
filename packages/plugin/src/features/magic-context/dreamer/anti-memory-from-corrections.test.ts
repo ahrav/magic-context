@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { insertCompartmentEvents } from "../compartment-events";
-import { readAntiMemory } from "../memory/storage-anti-memory";
+import { ANTI_MEMORY_DEFAULT_TTL_MS, readAntiMemory } from "../memory/storage-anti-memory";
 import { createClaimReaderTestDatabase } from "../test-claim-database";
 import {
     countPendingCorrectionEvents,
@@ -18,7 +18,12 @@ afterEach(() => {
     db = null;
 });
 
-function seedSession(database: Database, sessionId: string, userText: string): number {
+function seedSession(
+    database: Database,
+    sessionId: string,
+    userText: string,
+    userOrdinal = 1,
+): number {
     database
         .prepare(
             "INSERT INTO session_projects (session_id, project_path, updated_at, harness) VALUES (?, ?, ?, 'opencode')",
@@ -41,9 +46,9 @@ function seedSession(database: Database, sessionId: string, userText: string): n
     );
     database
         .prepare(
-            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'u1', 'user', ?)",
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, 'u1', 'user', ?)",
         )
-        .run(sessionId, userText);
+        .run(sessionId, userOrdinal, userText);
     return compartmentId;
 }
 
@@ -55,12 +60,25 @@ function correctionFields(overrides: Record<string, string> = {}): Record<string
         correction_signal: 'U: "Never persist this quote"',
         after_strategy: "Use the existing SQLite store",
         evidence: "The cache must remain offline capable",
+        reason_for_change: "Redis would add a network dependency this project cannot assume",
         ...overrides,
     };
 }
 
+function runHarvest(nowMs?: number) {
+    return db
+        ?.transaction(() =>
+            harvestAntiMemoriesFromCorrections({
+                db: db as Database,
+                projectIdentity: PROJECT,
+                ...(nowMs === undefined ? {} : { nowMs }),
+            }),
+        )
+        .immediate();
+}
+
 describe("historian trajectory-correction anti-memory harvest", () => {
-    test("corroborates explicit user trust without persisting correction_signal", () => {
+    test("corroborates explicit user trust without persisting correction_signal or the evidence quote", () => {
         db = createClaimReaderTestDatabase();
         const compartmentId = seedSession(
             db,
@@ -75,14 +93,7 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         );
         expect(countPendingCorrectionEvents(db, PROJECT)).toBe(1);
 
-        const result = db
-            .transaction(() =>
-                harvestAntiMemoriesFromCorrections({
-                    db: db as Database,
-                    projectIdentity: PROJECT,
-                }),
-            )
-            .immediate();
+        const result = runHarvest();
         expect(result).toMatchObject({ consumed: 1, skipped: 0 });
         expect(countPendingCorrectionEvents(db, PROJECT)).toBe(0);
         const publicClaimId = (
@@ -91,8 +102,13 @@ describe("historian trajectory-correction anti-memory harvest", () => {
             }
         ).id;
         const anti = readAntiMemory(db, publicClaimId);
-        expect(anti?.payload.rejectionReason).toBe("The cache must remain offline capable");
+        expect(anti?.payload.rejectionReason).toBe(
+            "Redis would add a network dependency this project cannot assume",
+        );
+        // The user's own words corroborate trust but must never be persisted:
+        // not the correction signal, and not the verbatim evidence quote.
         expect(JSON.stringify(anti)).not.toContain("Never persist this quote");
+        expect(JSON.stringify(anti)).not.toContain("must remain offline capable");
         expect(
             db
                 .prepare(
@@ -102,6 +118,75 @@ describe("historian trajectory-correction anti-memory harvest", () => {
                 )
                 .get(),
         ).toEqual({ trust: "explicit_user" });
+    });
+
+    test("rejects a rejection reason transcribed from the user's own words", () => {
+        db = createClaimReaderTestDatabase();
+        const compartmentId = seedSession(
+            db,
+            "ses-transcribed",
+            "The cache must remain offline capable, so use SQLite.",
+        );
+        insertCompartmentEvents(
+            db,
+            "ses-transcribed",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    // No distilled reason: the fallback is the evidence quote,
+                    // which is a verbatim run of the user's message and must be
+                    // rejected by the source-overlap privacy gate.
+                    fields: correctionFields({ reason_for_change: "" }),
+                },
+            ],
+            [compartmentId],
+        );
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+    });
+
+    test("does not let a forged ord_span widen corroboration beyond the compartment", () => {
+        db = createClaimReaderTestDatabase();
+        // The corroborating user message sits at ordinal 5, outside the
+        // compartment's host-recorded 1-2 message range.
+        const compartmentId = seedSession(
+            db,
+            "ses-span",
+            "The cache must remain offline capable, so use SQLite.",
+            5,
+        );
+        insertCompartmentEvents(
+            db,
+            "ses-span",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    fields: correctionFields({ ord_span: "1-9007199254740991" }),
+                },
+            ],
+            [compartmentId],
+        );
+        expect(runHarvest()).toMatchObject({ consumed: 1, skipped: 0 });
+        expect(
+            db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
+        ).toEqual({ trust: "model_inference" });
+    });
+
+    test("skips events whose event-anchored TTL already expired", () => {
+        db = createClaimReaderTestDatabase();
+        const compartmentId = seedSession(db, "ses-expired", "Unrelated user request");
+        insertCompartmentEvents(
+            db,
+            "ses-expired",
+            [{ kind: "trajectory_correction", atCompartment: 1, fields: correctionFields() }],
+            [compartmentId],
+        );
+        const afterExpiry = Date.now() + ANTI_MEMORY_DEFAULT_TTL_MS + 1;
+        expect(runHarvest(afterExpiry)).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(0);
     });
 
     test("downgrades forged user source and receipts poison skips without blocking", () => {
@@ -124,18 +209,9 @@ describe("historian trajectory-correction anti-memory harvest", () => {
             ],
             [compartmentId],
         );
-        const run = () =>
-            db
-                ?.transaction(() =>
-                    harvestAntiMemoriesFromCorrections({
-                        db: db as Database,
-                        projectIdentity: PROJECT,
-                    }),
-                )
-                .immediate();
-        const first = run();
+        const first = runHarvest();
         expect(first).toMatchObject({ consumed: 1, skipped: 1 });
-        expect(run()).toEqual({ consumed: 0, skipped: 0, effects: [] });
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 0, effects: [] });
         expect(db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get()).toEqual({
             count: 2,
         });

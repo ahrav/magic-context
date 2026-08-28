@@ -38,3 +38,28 @@ export const CTX_MEMORY_MUTATION_TOKEN_RULE: ImitatedArgRule = {
         policyHeadsDigest: "string",
     },
 };
+
+/**
+ * Shape of a rejected-approach payload for reduced-argument decoding, shared by
+ * every adapter so no adapter's decode schema can drift from the advertised
+ * antiMemory schema. Must list every field the tool schemas advertise: a decode
+ * rule that omits an optional field (e.g. saferAlternative) rejects the whole
+ * imitated call and loses the action.
+ */
+export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
+    type: "object",
+    fields: {
+        trigger: "string",
+        rejectedStrategy: "string",
+        rejectionReason: "string",
+    },
+    optionalFields: {
+        saferAlternative: "string",
+        preconditions: "string",
+        attemptedApproach: "string",
+        observedFailure: "string",
+        rootCause: "string",
+        recovery: "string",
+        nonApplicableWhen: "string",
+    },
+};

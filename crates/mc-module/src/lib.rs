@@ -15726,6 +15726,18 @@ fn ctx_memory_schema() -> Value {
         "CONFIG_VALUES",
         "NAMING"
     ]);
+    // The advertised enum is derived, never hand-written: every advertised
+    // category must match a oneOf write arm (positive arms use
+    // `positive_categories`; REJECTED_APPROACH has its own arms). A second
+    // hand-kept list could drift and advertise a category no arm accepts.
+    let all_categories = {
+        let mut categories = positive_categories
+            .as_array()
+            .expect("positive categories are a json array")
+            .clone();
+        categories.push(json!("REJECTED_APPROACH"));
+        categories
+    };
     let anti_memory = json!({
         "type": "object",
         "additionalProperties": false,
@@ -15753,7 +15765,7 @@ fn ctx_memory_schema() -> Value {
             },
             "category": {
                 "type": "string",
-                "enum": ["PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALUES", "NAMING", "REJECTED_APPROACH"]
+                "enum": all_categories
             },
             "content": { "type": "string", "maxLength": 65536 },
             "antiMemory": anti_memory,
@@ -25490,11 +25502,23 @@ mod tests {
             Some(5),
             "ctx_memory write arms must stay discriminated"
         );
-        assert!(
-            by_name["ctx_memory"].schema["properties"]["category"]["enum"]
+        {
+            // Every advertised category must match a oneOf write arm: the enum
+            // must equal the positive-arm categories plus REJECTED_APPROACH.
+            let ctx_memory_schema = &by_name["ctx_memory"].schema;
+            let advertised = ctx_memory_schema["properties"]["category"]["enum"]
                 .as_array()
-                .is_some_and(|categories| categories.contains(&json!("REJECTED_APPROACH")))
-        );
+                .expect("ctx_memory category enum");
+            let mut expected = ctx_memory_schema["oneOf"][0]["properties"]["category"]["enum"]
+                .as_array()
+                .expect("ctx_memory create arm positive categories")
+                .clone();
+            expected.push(json!("REJECTED_APPROACH"));
+            assert_eq!(
+                advertised, &expected,
+                "ctx_memory category enum must be the positive write-arm categories plus REJECTED_APPROACH"
+            );
+        }
 
         for (name, expected) in expected_fields {
             let tool = by_name

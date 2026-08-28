@@ -3,15 +3,36 @@ import { getProjectCompartmentEvents, type ProjectCompartmentEvent } from "../co
 import type { ClaimOperationResultEffect } from "../memory/claim-operation-contract";
 import { computeClaimOperationRequestDigest } from "../memory/claim-operation-contract";
 import {
+    ANTI_MEMORY_DEFAULT_TTL_MS,
     type AntiMemoryPayload,
+    normalizeAntiMemoryPayload,
     renderAntiMemoryContent,
     stageCreateAntiMemoryInCurrentTransaction,
 } from "../memory/storage-anti-memory";
-import { runClaimOperationInCurrentTransaction } from "../memory/storage-claim-operations";
+import {
+    ClaimOperationKeyReuseError,
+    runClaimOperationInCurrentTransaction,
+} from "../memory/storage-claim-operations";
 import { ensureProject } from "../memory/storage-claims";
 import { validateRetrospectiveLearningText } from "./retrospective-learnings";
 
 const CORRECTION_CONSUMER = "dreamer-correction-harvest-v1";
+
+/**
+ * Per-run event budget. Bounds the single write transaction the harvest runs
+ * inside (a first deploy can face months of unreceipted backlog); the receipt
+ * filter keeps the remainder pending, so the backlog drains across scheduled
+ * runs instead of holding the SQLite write lock for one giant drain.
+ */
+const MAX_CORRECTION_EVENTS_PER_RUN = 50;
+
+/**
+ * Minimum normalized word count before an evidence quote can corroborate a
+ * user correction. A short common phrase appearing anywhere in the user's
+ * messages must not be able to mint `explicit_user` trust for an otherwise
+ * model-authored record.
+ */
+const MIN_CORROBORATION_WORDS = 5;
 
 export interface CorrectionHarvestResult {
     consumed: number;
@@ -40,21 +61,28 @@ export function countPendingCorrectionEvents(db: Database, projectIdentity: stri
 function mappedPayload(event: ProjectCompartmentEvent): AntiMemoryPayload | null {
     const trigger = event.fields.summary?.trim();
     const rejectedStrategy = event.fields.before_strategy?.trim();
-    const rejectionReason = event.fields.evidence?.trim();
+    // The historian's `reason_for_change` is the field that carries WHY the
+    // approach was rejected; `evidence` is a quote/paraphrase proving the event
+    // and is only a fallback when no explicit reason was extracted.
+    const rejectionReason = event.fields.reason_for_change?.trim() || event.fields.evidence?.trim();
     if (!trigger || !rejectedStrategy || !rejectionReason) return null;
     const saferAlternative = event.fields.after_strategy?.trim() || null;
     return { trigger, rejectedStrategy, rejectionReason, saferAlternative };
 }
 
-function validationReason(payload: AntiMemoryPayload): string | null {
-    for (const value of [
-        payload.trigger,
-        payload.rejectedStrategy,
-        payload.rejectionReason,
-        payload.saferAlternative,
-    ]) {
-        if (!value) continue;
-        const reason = validateRetrospectiveLearningText(value);
+/**
+ * Run every persisted payload field through the retrospective privacy gate,
+ * including the source-overlap ("distill, don't transcribe") check against the
+ * event span's own user messages. Deriving the field set from the normalized
+ * payload means a future payload field cannot silently bypass the gate.
+ */
+function validationReason(
+    payload: AntiMemoryPayload,
+    spanUserTexts: readonly string[],
+): string | null {
+    for (const value of Object.values(normalizeAntiMemoryPayload(payload))) {
+        if (typeof value !== "string") continue;
+        const reason = validateRetrospectiveLearningText(value, spanUserTexts);
         if (reason) return reason;
     }
     return null;
@@ -68,35 +96,39 @@ function normalizedEvidence(text: string): string {
         .trim();
 }
 
+/**
+ * Message-ordinal window for host corroboration. The compartment bounds are the
+ * host-recorded authority; the historian's optional `ord_span` may only narrow
+ * them. An event whose compartment bounds are unknown gets no window (and so no
+ * trust upgrade): the model-authored span must never choose its own search
+ * range.
+ */
 function eventSpan(event: ProjectCompartmentEvent): [number, number] | null {
+    const compartmentStart = event.compartmentStartMessage;
+    const compartmentEnd = event.compartmentEndMessage;
+    if (compartmentStart === null || compartmentEnd === null || compartmentEnd < compartmentStart) {
+        return null;
+    }
     const raw = event.fields.ord_span?.trim();
     const match = raw?.match(/^(\d+)\s*-\s*(\d+)$/);
     if (match) {
         const start = Number(match[1]);
         const end = Number(match[2]);
         if (Number.isSafeInteger(start) && Number.isSafeInteger(end) && start > 0 && end >= start) {
-            return [start, end];
+            const clampedStart = Math.max(start, compartmentStart);
+            const clampedEnd = Math.min(end, compartmentEnd);
+            if (clampedStart <= clampedEnd) return [clampedStart, clampedEnd];
         }
     }
-    if (
-        event.compartmentStartMessage !== null &&
-        event.compartmentEndMessage !== null &&
-        event.compartmentEndMessage >= event.compartmentStartMessage
-    ) {
-        return [event.compartmentStartMessage, event.compartmentEndMessage];
-    }
-    return null;
+    return [compartmentStart, compartmentEnd];
 }
 
-function hostCorroboratesUserCorrection(
+function spanUserTexts(
     db: Database,
     event: ProjectCompartmentEvent,
-    evidence: string,
-): boolean {
-    if (event.fields.correction_source?.trim() !== "user") return false;
-    const span = eventSpan(event);
-    const needle = normalizedEvidence(evidence);
-    if (!span || needle.length < 8) return false;
+    span: [number, number] | null,
+): string[] {
+    if (!span) return [];
     const rows = db
         .prepare(
             `SELECT content FROM message_history_fts
@@ -104,7 +136,26 @@ function hostCorroboratesUserCorrection(
                 AND CAST(message_ordinal AS INTEGER) BETWEEN ? AND ?`,
         )
         .all(event.sessionId, span[0], span[1]) as Array<{ content: string }>;
-    return rows.some((row) => normalizedEvidence(row.content).includes(needle));
+    return rows.map((row) => row.content);
+}
+
+/**
+ * True when the historian's evidence quote is a substantial (≥
+ * MIN_CORROBORATION_WORDS words) verbatim run of an in-span user message.
+ * Corroboration reads the `evidence` field — the quote proving the correction —
+ * not the persisted payload: the persisted reason must be a distillation, and
+ * the privacy gate rejects it when it transcribes the user.
+ */
+function hostCorroboratesUserCorrection(
+    event: ProjectCompartmentEvent,
+    userTexts: readonly string[],
+): boolean {
+    if (event.fields.correction_source?.trim() !== "user") return false;
+    const evidence = event.fields.evidence?.trim();
+    if (!evidence) return false;
+    const needle = normalizedEvidence(evidence);
+    if (needle.length < 8 || needle.split(" ").length < MIN_CORROBORATION_WORDS) return false;
+    return userTexts.some((text) => normalizedEvidence(text).includes(needle));
 }
 
 export function harvestAntiMemoriesFromCorrections(args: {
@@ -126,76 +177,96 @@ export function harvestAntiMemoriesFromCorrections(args: {
         args.db,
         args.projectIdentity,
         "trajectory_correction",
+        { pendingForProducer: CORRECTION_CONSUMER, limit: MAX_CORRECTION_EVENTS_PER_RUN },
     )) {
-        const payload = mappedPayload(event);
-        const reason = payload ? validationReason(payload) : "missing_warning_core";
         const operationKey = `event:${event.id}`;
-        if (!payload || reason) {
+        const expiresAt = event.createdAt + ANTI_MEMORY_DEFAULT_TTL_MS;
+        const payload = expiresAt > nowMs ? mappedPayload(event) : null;
+        const span = payload ? eventSpan(event) : null;
+        const userTexts = payload ? spanUserTexts(args.db, event, span) : [];
+        const reason = payload
+            ? validationReason(payload, userTexts)
+            : expiresAt > nowMs
+              ? "missing_warning_core"
+              : "expired";
+        try {
+            if (!payload || reason) {
+                const operation = runClaimOperationInCurrentTransaction(
+                    args.db,
+                    {
+                        producer: CORRECTION_CONSUMER,
+                        operationKey,
+                        requestDigest: computeClaimOperationRequestDigest({
+                            eventId: event.id,
+                            operation: "skip-trajectory-correction",
+                            reason: reason ?? "missing_warning_core",
+                        }),
+                    },
+                    () => ({ kind: "stale", reason: reason ?? "missing_warning_core" }),
+                    nowMs,
+                );
+                if (!operation.replayed) skipped += 1;
+                continue;
+            }
+
+            const sourceTrustClass = hostCorroboratesUserCorrection(event, userTexts)
+                ? "explicit_user"
+                : "model_inference";
+            const sourceContent = renderAntiMemoryContent(payload);
             const operation = runClaimOperationInCurrentTransaction(
                 args.db,
                 {
                     producer: CORRECTION_CONSUMER,
                     operationKey,
+                    // Digest inputs must be derivable from the immutable event row
+                    // alone. Values derived from mutable state (message index rows,
+                    // compartment recomputation, project identity) would make a
+                    // replay compute a different digest and throw
+                    // ClaimOperationKeyReuseError.
                     requestDigest: computeClaimOperationRequestDigest({
                         eventId: event.id,
-                        operation: "skip-trajectory-correction",
-                        reason: reason ?? "missing_warning_core",
+                        operation: "harvest-trajectory-correction",
+                        payload,
                     }),
                 },
-                () => ({ kind: "stale", reason: reason ?? "missing_warning_core" }),
+                () =>
+                    stageCreateAntiMemoryInCurrentTransaction(
+                        args.db,
+                        {
+                            projectId,
+                            payload,
+                            provenance: {
+                                sourceLocator: `compartment-event://${event.sessionId}/${event.id}`,
+                                sourceContent,
+                                sourceSessionId: event.sessionId,
+                                extractor: CORRECTION_CONSUMER,
+                                extractorVersion: "1",
+                                extractorRunId: operationKey,
+                                independenceKey: `${CORRECTION_CONSUMER}:${event.id}`,
+                                sourceTrustClass,
+                            },
+                            actor: args.actor ?? CORRECTION_CONSUMER,
+                            // Anchor expiry to the event, not the harvest clock:
+                            // backfilling old history must not re-animate stale
+                            // corrections as fresh warnings.
+                            expiresAt,
+                            nowMs,
+                        },
+                        nowMs,
+                    ),
                 nowMs,
             );
-            if (!operation.replayed) skipped += 1;
-            continue;
-        }
-
-        const sourceTrustClass = hostCorroboratesUserCorrection(
-            args.db,
-            event,
-            payload.rejectionReason,
-        )
-            ? "explicit_user"
-            : "model_inference";
-        const sourceContent = renderAntiMemoryContent(payload);
-        const operation = runClaimOperationInCurrentTransaction(
-            args.db,
-            {
-                producer: CORRECTION_CONSUMER,
-                operationKey,
-                requestDigest: computeClaimOperationRequestDigest({
-                    eventId: event.id,
-                    operation: "harvest-trajectory-correction",
-                    payload,
-                    projectId,
-                    sourceTrustClass,
-                }),
-            },
-            () =>
-                stageCreateAntiMemoryInCurrentTransaction(
-                    args.db,
-                    {
-                        projectId,
-                        payload,
-                        provenance: {
-                            sourceLocator: `compartment-event://${event.sessionId}/${event.id}`,
-                            sourceContent,
-                            sourceSessionId: event.sessionId,
-                            extractor: CORRECTION_CONSUMER,
-                            extractorVersion: "1",
-                            extractorRunId: operationKey,
-                            independenceKey: `${CORRECTION_CONSUMER}:${event.id}`,
-                            sourceTrustClass,
-                        },
-                        actor: args.actor ?? CORRECTION_CONSUMER,
-                        nowMs,
-                    },
-                    nowMs,
-                ),
-            nowMs,
-        );
-        if (!operation.replayed) {
-            effects.push(...operation.result.effects);
-            consumed += 1;
+            if (!operation.replayed) {
+                effects.push(...operation.result.effects);
+                consumed += 1;
+            }
+        } catch (error) {
+            // A stored receipt whose digest no longer matches marks the event as
+            // already consumed under different derived inputs. Treat it as done
+            // rather than aborting the transaction: an uncaught throw here would
+            // deterministically fail every future retrospective run.
+            if (error instanceof ClaimOperationKeyReuseError) continue;
+            throw error;
         }
     }
 
