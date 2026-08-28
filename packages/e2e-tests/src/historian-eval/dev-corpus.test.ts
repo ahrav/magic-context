@@ -29,6 +29,29 @@ function parseCorpus(): HistorianEvalScenario[] {
 }
 
 describe("dev corpus", () => {
+    test("positive-claim mutations cover every expected claim, not just the first", () => {
+        const multi = parseCorpus().filter((scenario) => scenario.gold.expectedClaims.length > 1);
+        // Most of the corpus declares several expected claims, so mutating only
+        // index 0 left the rest unexercised: a scorer regression that stopped
+        // enforcing the second or third claim would still trip on the first and
+        // the evidence would stay green.
+        expect(multi.length).toBeGreaterThan(0);
+        const artifact = runMutationBattery(multi);
+        expect(artifact.green).toBe(true);
+        const perClaimClasses = ["wrong-category", "dropped-gold-fact", "near-miss-perturbation"];
+        for (const [index, entry] of artifact.scenarios.entries()) {
+            const claimCount = multi[index].gold.expectedClaims.length;
+            for (const mutationClass of perClaimClasses) {
+                const result = entry.results.find((candidate) => candidate.mutationClass === mutationClass);
+                expect(result).toBeDefined();
+                // The detail records how many claims were actually mutated, so a
+                // regression to first-claim-only is visible in the evidence.
+                expect(result!.detail).toContain(`all ${claimCount} expected claim(s)`);
+            }
+        }
+    });
+
+
     test("scenarios declaring several hard negatives in one family have every one mutated", () => {
         const multi = parseCorpus().filter((scenario) => {
             const perFamily = new Map<string, number>();

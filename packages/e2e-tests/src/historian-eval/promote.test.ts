@@ -4,7 +4,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { buildReleaseTuple, parseScenario, releaseApprovalFingerprint } from "./contract";
+import { HARD_NEGATIVE_FAMILIES, buildReleaseTuple, parseScenario, releaseApprovalFingerprint } from "./contract";
 import { RELEASE_FILES, loadRelease, promoteRelease, releaseArtifactFingerprint } from "./promote";
 import { validScenarioRaw } from "./test-support";
 
@@ -20,6 +20,15 @@ function corpusRaw(count = 10): Record<string, unknown>[] {
         // authored before the epilogue) intact.
         const turns = (raw.transcript as { turns: Array<{ user: string }> }).turns;
         turns[0].user = `${turns[0].user} Filed under ticket ${index}.`;
+        // Promotion requires the corpus-wide family union to be complete, so the
+        // clones cycle through every family. Only the family LABEL moves: the
+        // absent predicate keeps the reference scenario's authored text, which the
+        // freeze lint requires to appear before the epilogue and to not contradict
+        // any gold claim.
+        const family = HARD_NEGATIVE_FAMILIES[index % HARD_NEGATIVE_FAMILIES.length];
+        raw.families = [family];
+        const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
+        gold.expectedAbsent = gold.expectedAbsent.map((absent) => ({ ...absent, family }));
         return raw;
     });
 }
@@ -144,12 +153,25 @@ describe("promoteRelease", () => {
     test("refuses a corpus whose recomputed mutation battery is not green", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
-            // A one-character predicate survives its own near-miss
-            // perturbation ("a" is a substring of "a-alt-"), so the battery
-            // flags the matcher as non-discriminating; lint stays clean.
+            // A one-character predicate survives its own near-miss perturbation
+            // ("y" is a substring of "y-alt-"), so the battery flags the matcher as
+            // non-discriminating. Added as an EXTRA claim that no probe references:
+            // weakening a probe-backed claim would instead trip the freeze lint,
+            // which requires each probe's answer to be required by its backing
+            // claim, and the battery would never run.
             (
-                scenarios[0].gold as { expectedClaims: Array<{ predicate: { value: string } }> }
-            ).expectedClaims[0].predicate.value = "a";
+                scenarios[0].gold as {
+                    expectedClaims: Array<Record<string, unknown>>;
+                }
+            ).expectedClaims.push({
+                id: "exp-nondiscriminating",
+                // A category no other claim uses: the parser rejects two
+                // same-category predicates where one contains the other, and a
+                // single character is contained by almost anything.
+                category: "NAMING",
+                predicate: { kind: "normalized-substring", value: "y" },
+                sourceTurnRange: [1, 1],
+            });
             expect(() =>
                 promoteRelease({
                     scenarios,
@@ -575,6 +597,31 @@ describe("promoteRelease", () => {
             renameSync(manifestPath, outsideManifest);
             symlinkSync(outsideManifest, manifestPath);
             expect(promoteV2).toThrow(/release\.v1\.manifest: not-a-regular-file/);
+        });
+    });
+
+    test("refuses a corpus that omits hard-negative families, however clean each scenario is", () => {
+        withRoot((root) => {
+            // Ten unique, lint-clean scenarios inside the size budget, every one
+            // declaring the same family. Per-scenario lint and the battery only
+            // ever assert what a scenario claims, so nothing else in the pipeline
+            // notices that user-correction, prompt-injection, and the rest are
+            // absent from the release entirely.
+            const single = HARD_NEGATIVE_FAMILIES[0];
+            const scenarios = corpusRaw().map((raw) => {
+                raw.families = [single];
+                const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
+                gold.expectedAbsent = gold.expectedAbsent.map((absent) => ({ ...absent, family: single }));
+                return raw;
+            });
+            expect(() =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios),
+                    releasesRoot: root,
+                    releaseVersion: "v1",
+                }),
+            ).toThrow(/release\.families: missing-/);
         });
     });
 

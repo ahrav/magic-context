@@ -9,7 +9,7 @@
     "turns": [
       {
         "user": "Reminder of where we came from: releases used to go out weekly on Fridays with a manual checklist.",
-        "assistant": "Yes — the weekly Friday release train with the manual checklist was the old process."
+        "assistant": "Yes \u2014 the weekly Friday release train with the manual checklist was the old process."
       },
       {
         "user": "Now it is different: we ship daily through the canary pipeline, with the canary at 5 percent traffic for the first hour.",
@@ -20,7 +20,7 @@
         "assistant": "Noted: automatic rollback when the canary error rate doubles."
       },
       {
-        "user": "That covers release process — thanks.",
+        "user": "That covers release process \u2014 thanks.",
         "assistant": "Release-process notes captured; closing."
       }
     ],
@@ -41,7 +41,7 @@
         "category": "PROJECT_RULES",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "canary pipeline"
+          "value": "daily releases via the canary pipeline; canary holds 5 percent traffic"
         },
         "sourceTurnRange": [
           1,

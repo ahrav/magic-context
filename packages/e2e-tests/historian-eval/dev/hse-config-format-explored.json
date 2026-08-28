@@ -12,7 +12,7 @@
         "assistant": "Candidates: TOML for first-class comments, YAML for familiarity, JSON5 for minimal migration. All three are viable and none is a clear winner without a spike."
       },
       {
-        "user": "Table the format question — no decision yet. What IS decided: config is loaded once at startup and never hot-reloaded.",
+        "user": "Table the format question \u2014 no decision yet. What IS decided: config is loaded once at startup and never hot-reloaded.",
         "assistant": "Recorded: config loads once at startup with no hot reload. The file format remains an open question."
       },
       {
@@ -41,7 +41,7 @@
         "category": "CONSTRAINTS",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "once at startup"
+          "value": "loaded once at startup"
         },
         "sourceTurnRange": [
           1,

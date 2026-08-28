@@ -763,6 +763,28 @@ describe("gold and probe freeze guards", () => {
     });
 });
 
+describe("lintScenario probe backing", () => {
+    test("flags a probe answer the backing gold claim does not require", () => {
+        const raw = validScenarioRaw();
+        const gold = raw.gold as { expectedClaims: Array<{ id: string; predicate: { value: string } }> };
+        // Still authored in the claim's source range, so the existing
+        // not-authored-in-source-range rule stays quiet; what changes is that a
+        // claim satisfying this predicate need not carry the probe's answer.
+        // The historian then gets full recall while no injected claim bears the
+        // answer, and the probe tier reports error-trimmed — an infrastructure
+        // outcome excluded from scoring — instead of failing the extraction.
+        gold.expectedClaims[0].predicate.value = "in-process";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics.some((entry) => /probe-store\.goldAnswer: not-required-by-exp-lru-cache/.test(entry))).toBe(
+            true,
+        );
+    });
+
+    test("the reference scenario requires every probe answer in its backing claim", () => {
+        expect(lintScenario(parseScenario(validScenarioRaw()))).toEqual([]);
+    });
+});
+
 describe("lintScenario", () => {
     test("flags a trigger recipe whose build turns cross the execution threshold", () => {
         const raw = validScenarioRaw();

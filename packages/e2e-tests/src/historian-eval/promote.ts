@@ -29,6 +29,7 @@ import { hasGitAncestor } from "../../../plugin/scripts/retrieval-benchmark/fs-b
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
 import {
     APPROVAL_KINDS,
+    HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
     RELEASE_VERSION_RE,
@@ -195,6 +196,26 @@ export function releaseArtifactFingerprint(
     return canonicalFingerprint({ manifest, mutationEvidence: evidence, scenarios: ordered });
 }
 
+/**
+ * Corpus-wide hard-negative coverage: the union of declared families must be the
+ * whole set.
+ *
+ * Per-scenario lint only proves each scenario exercises the families IT declares,
+ * so a corpus of unique, lint-clean scenarios inside the size budget can cover a
+ * single family and still pass every other gate — the promotion tests demonstrate
+ * exactly that shape, promoting ten semantic variants of one reference scenario.
+ * A release could then omit user-correction, current-vs-historical, or
+ * prompt-injection coverage entirely while publishing green mutation evidence,
+ * because the battery only ever asserts what each scenario claims. Family names
+ * come from `HARD_NEGATIVE_FAMILIES`, not the corpus, so naming the missing ones
+ * echoes no artifact content.
+ */
+function checkFamilyCoverage(scenarios: readonly HistorianEvalScenario[]): string[] {
+    const declared = new Set(scenarios.flatMap((scenario) => scenario.families));
+    const missing = HARD_NEGATIVE_FAMILIES.filter((family) => !declared.has(family));
+    return missing.length > 0 ? [`release.families: missing-${missing.join(",")}`] : [];
+}
+
 /** Real regular file — not a symlink whose target lives outside the frozen tree. */
 function assertRegularFile(path: string, label: string): void {
     if (!lstatSync(path).isFile()) fail([`${label}: not-a-regular-file`]);
@@ -340,6 +361,7 @@ export function loadRelease(
             diagnostics.push(`release.scenarios.${scenario.id}: tombstoned`);
         }
     }
+    diagnostics.push(...checkFamilyCoverage(scenarios));
     if (diagnostics.length > 0) fail(diagnostics);
     const tuple = buildReleaseTuple(scenarios);
     if (canonicalFingerprint(tuple) !== canonicalFingerprint(manifest.releaseTuple)) {
@@ -381,6 +403,17 @@ function versionOrdinal(version: string): number {
  * Fails closed on a version-named directory without a loadable manifest: a
  * corrupt releases root read as "carries no tombstones" would silently
  * re-admit a retracted scenario into vN+1.
+ *
+ * Prior lineage is trusted as filesystem state, and that is the boundary of what
+ * this check can reach. The symlink guards prove the bytes live inside the
+ * releases root; nothing proves they are the bytes that were approved, so an
+ * in-place canonical rewrite that drops a tombstone would be inherited as a
+ * smaller set. The external artifact anchor cannot close this: verifying one
+ * would mean re-certifying a predecessor through `parseManifest`, which is the
+ * policy-rotation trap this function exists to avoid. Closing it needs trusted
+ * prior state — the append-only tombstone registry `assertReleaseSuccession`
+ * already names — which would supply the lineage instead of the predecessor's
+ * own manifest.
  */
 function installedReleases(releasesRoot: string): ReleaseLineage[] {
     if (!existsSync(releasesRoot)) return [];
@@ -464,6 +497,8 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; art
             `release: corpus size ${scenarios.length} outside the ${CORPUS_SIZE_BUDGET.min}-${CORPUS_SIZE_BUDGET.max} budget (R1)`,
         ]);
     }
+    const familyDiagnostics = checkFamilyCoverage(scenarios);
+    if (familyDiagnostics.length > 0) fail(familyDiagnostics);
 
     // Cheap rejection gates run before the battery: tombstone conflicts,
     // approval binding, and version collisions each reject in microseconds,
