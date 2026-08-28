@@ -859,6 +859,80 @@ describe("executeAutoSearchDelivery", () => {
         }
     });
 
+    test("a sub-threshold warning is not promoted behind another lane's strong hit", async () => {
+        const warning = {
+            source: "anti_memory",
+            publicClaimId: "claim-weak-warning",
+            revisionLocator: "claim-weak-warning/r1/digest",
+            contentDigest: "digest",
+            claimId: 11,
+            normalizedHash: "hash",
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "it creates split ownership",
+            saferAlternative: "use SQLite",
+            score: 0.5,
+            matchType: "lexical",
+        };
+        const strong = {
+            source: "memory",
+            content: "the historian runs on a lease",
+            score: 0.9,
+            memoryId: 4,
+            category: "ARCHITECTURE_DECISIONS",
+            matchType: "hybrid",
+        };
+        const results = [strong, warning] as Awaited<ReturnType<typeof searchModule.unifiedSearch>>;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("delivered");
+            expect(delivery.hintText).not.toContain("Previously rejected");
+            expect(delivery.delivered).toEqual([strong]);
+            expect(delivery.prePack).toEqual(results);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("a warning that clears the threshold still takes the reserved first slot", async () => {
+        const warning = {
+            source: "anti_memory",
+            publicClaimId: "claim-strong-warning",
+            revisionLocator: "claim-strong-warning/r1/digest",
+            contentDigest: "digest",
+            claimId: 12,
+            normalizedHash: "hash",
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "it creates split ownership",
+            saferAlternative: "use SQLite",
+            score: 0.7,
+            matchType: "lexical",
+        };
+        const strong = {
+            source: "memory",
+            content: "the historian runs on a lease",
+            score: 0.9,
+            memoryId: 5,
+            category: "ARCHITECTURE_DECISIONS",
+            matchType: "hybrid",
+        };
+        const results = [strong, warning] as Awaited<ReturnType<typeof searchModule.unifiedSearch>>;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.hintText).toContain("Previously rejected");
+            expect(delivery.delivered[0]).toEqual(warning);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     test("timeout is a completed empty delivery with a deadline reason (AE8)", async () => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
             () => new Promise(() => {}) as unknown as ReturnType<typeof searchModule.unifiedSearch>,

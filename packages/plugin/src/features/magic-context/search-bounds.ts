@@ -62,9 +62,13 @@ export function renderAntiMemoryWarningLine(args: {
     boundField: (text: string) => string;
     citation?: string;
 }): string {
-    const alternative = args.saferAlternative
-        ? ` Safer alternative: ${args.boundField(args.saferAlternative)}.`
-        : "";
+    // Emptiness is decided after bounding, not before: `boundField` belongs to
+    // the caller, so this helper cannot assume it returns a non-empty string for
+    // a non-empty input. Testing the raw value alone would render a clause with
+    // nothing in it (" Safer alternative: .").
+    const boundedAlternative = args.saferAlternative ? args.boundField(args.saferAlternative) : "";
+    const alternative =
+        boundedAlternative.length > 0 ? ` Safer alternative: ${boundedAlternative}.` : "";
     const citation = args.citation ? ` (see ${args.citation})` : "";
     return `⚠ Previously rejected: ${args.boundField(args.rejectedStrategy)}. Reason: ${args.boundField(args.rejectionReason)}.${alternative} Verify before proceeding: confirm the rejection no longer applies to ${args.boundField(args.trigger)}.${citation}`;
 }

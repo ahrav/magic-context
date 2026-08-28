@@ -837,9 +837,15 @@ async function searchAntiMemories(args: {
     // project claim set just to keep the anti-memory category would make this
     // per-prompt lane O(all active claims). The id list is capped like every
     // sibling lane and scopes the provider read below to anti-memory claims.
+    //
+    // Listed from the caller's own projects, not the expanded workspace set.
+    // Anti-memory records are written `sharing: "private"`, so a co-member's
+    // warning can never clear the authorization step below — including it here
+    // would let newer foreign rows consume the ceiling and then be dropped,
+    // hiding the caller's own warnings behind claims they can never see.
     const candidateIds = listActiveAntiMemoryPublicIds(
         args.db,
-        projectIds,
+        ownProjectIds,
         MAX_LANE_CANDIDATES,
         Date.now(),
     );
