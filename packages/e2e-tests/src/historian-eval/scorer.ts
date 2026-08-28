@@ -1154,8 +1154,12 @@ function telemetryMismatch(
 }
 
 /**
- * Public claim ids named in the LAST `<project-memory>` block of a captured probe
- * payload, or `null` when the payload carries no complete block.
+ * Public claim ids named in the LAST `<project-memory>` block of ONE captured request,
+ * or `null` when it carries no complete block.
+ *
+ * One request, not a probe's whole window: across a re-ask the last block in the
+ * concatenated text can belong to the discarded attempt, which describes nothing about
+ * what the answering request carried.
  *
  * `null` and the empty set are different answers and callers must not conflate
  * them: no block means no per-turn evidence was captured (nothing injected, or a
@@ -1582,8 +1586,14 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // closing tag was lost to budget trimming is not matched here at all. Both
         // would become spurious ERRORs.
         for (const exchange of record.probes) {
-            if (exchange.payloadText === null) continue;
-            const rendered = renderedClaimIdsInLastMemoryBlock(exchange.payloadText);
+            // The FINAL request, like the locator set it is checked against. Reading the
+            // concatenated window found the last block in COMBINED text, which on a re-ask is
+            // the discarded first attempt's whenever the retry withheld its own — so a
+            // genuine record whose locators correctly describe only the retry was rejected as
+            // a mismatch. "Last block in the payload" is the final request's block only when
+            // the final request rendered one, which is exactly what cannot be assumed here.
+            if (exchange.finalRequestPayloadText === null) continue;
+            const rendered = renderedClaimIdsInLastMemoryBlock(exchange.finalRequestPayloadText);
             if (rendered === null) continue;
             const injectedForTurn = new Set(exchange.injectedRevisionLocators);
             const unclaimed = record.injectedClaims

@@ -153,18 +153,22 @@ function withAnswer(exchange: ProbeExchange, answerRaw: string): ProbeExchange {
  * alone would therefore test the integrity gate, not trimming.
  */
 function withoutInjectedClaim(exchange: ProbeExchange, claim: InjectedClaimRecord): ProbeExchange {
+    const withoutLine = (text: string | null): string | null =>
+        text === null
+            ? null
+            : text
+                  .split("\n")
+                  .filter((line) => !line.startsWith(`${claim.publicClaimId}:`))
+                  .join("\n");
     return {
         ...exchange,
         injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
             (locator) => locator !== claim.revisionLocator,
         ),
-        payloadText:
-            exchange.payloadText === null
-                ? null
-                : exchange.payloadText
-                      .split("\n")
-                      .filter((line) => !line.startsWith(`${claim.publicClaimId}:`))
-                      .join("\n"),
+        payloadText: withoutLine(exchange.payloadText),
+        // Both payloads, since the per-turn evidence check reads the FINAL request while the
+        // leak gate reads the window. Trimming only one describes a turn no run produces.
+        finalRequestPayloadText: withoutLine(exchange.finalRequestPayloadText),
     };
 }
 

@@ -381,6 +381,23 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(raw)).toThrow(/shared-answer-surface/);
     });
 
+    test("rejects two choices that differ only by XML encoding", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // `compareProbeAnswer` decodes before comparing, so these are ONE option as far as
+        // scoring is concerned — and a model picking the nominally-wrong encoding would be
+        // scored correct. Normalizing alone accepted the pair.
+        probes.push({
+            id: "probe-encoded-choices",
+            question: "Which marker was used?",
+            answerType: "multiple-choice",
+            choices: ["A&B", "A&amp;B"],
+            goldAnswer: "A&B",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).toThrow(/choices/);
+    });
+
     test("rejects a multiple-choice option that exposes another claim's exact answer", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];

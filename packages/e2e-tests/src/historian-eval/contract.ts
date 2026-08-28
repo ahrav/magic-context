@@ -410,7 +410,13 @@ function parseProbe(raw: unknown, label: string): Probe {
         // whitespace as the same answer, so `"Redis"` beside `" redis "` would be
         // two indistinguishable options in one question, and a model picking the
         // non-gold spelling of the same option would be scored wrong.
-        unique(choices.map(normalizeContent), `${label}.choices`);
+        // Canonicalized the way `compareProbeAnswer` compares: it decodes entities before
+        // equality, so `A&B` and `A&amp;B` are ONE option as far as scoring is concerned.
+        // Normalizing alone accepted both, and a model picking the nominally-wrong encoding
+        // of the same option was then scored correct. Gold membership stays raw-exact on
+        // purpose — an author must write the gold as one of the literal choices, and
+        // loosening that would hide a genuine mismatch.
+        unique(choices.map((choice) => normalizeContent(decodeXmlEntities(choice))), `${label}.choices`);
         // Every choice, not only the gold one: the model may legitimately reply
         // with any of them, and a delimiter-bearing choice would be read back
         // truncated and scored wrong.
