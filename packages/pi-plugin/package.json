@@ -58,6 +58,11 @@
 		"@types/node": "^22.20.0",
 		"typescript": "^5.8.0"
 	},
+	"optionalDependencies": {
+		"@cortexkit/mc-host-darwin-arm64": "0.38.0",
+		"@cortexkit/mc-host-darwin-x64": "0.38.0",
+		"@cortexkit/mc-host-linux-x64-gnu": "0.38.0"
+	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "^0.80.2",
 		"@earendil-works/pi-tui": "^0.80.2"

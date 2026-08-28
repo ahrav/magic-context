@@ -6,10 +6,35 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { computeNormalizedHash } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
-import { filterMemoriesByPolicy } from "../../../plugin/src/features/magic-context/memory/storage-claim-visibility";
+import {
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+    type ProjectMemorySurface,
+} from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
 import { initializeIsolatedContextDb } from "../initialize-context-db";
 import { openTestDb } from "../test-db";
 import { seedGoldMemories } from "./seed-gold-memories";
+
+/** Public claim IDs the policy surface admits for the seeded project. */
+function surfaceClaimIds(
+    dbPath: string,
+    identity: string,
+    surface: ProjectMemorySurface,
+): string[] {
+    const db = openTestDb(dbPath, { readonly: true });
+    try {
+        const state = readProjectMemoryCurrentState(db, {
+            projectIds: resolveProjectIdsForIdentities(db, [identity]),
+            surface,
+        });
+        if (state.status !== "ok") {
+            throw new Error(`current-state read is stale: ${state.reasons.join(", ")}`);
+        }
+        return state.items.map((item) => item.publicClaimId);
+    } finally {
+        db.close();
+    }
+}
 
 describe("seedGoldMemories", () => {
     it("seeds verified rows for the canonical workdir identity", () => {
@@ -39,12 +64,10 @@ describe("seedGoldMemories", () => {
 
             const expectedIdentity = resolveProjectIdentity(realpathSync(workdirAlias));
             expect(rows).toHaveLength(2);
-            expect(rows.every((row) => row.status === "active")).toBe(true);
-            expect(rows.every((row) => row.verificationStatus === "verified")).toBe(true);
-            expect(rows.map((row) => row.projectPath)).toEqual([
-                expectedIdentity,
-                expectedIdentity,
-            ]);
+            expect(rows.every((row) => row.lifecycleState === "active")).toBe(true);
+            expect(
+                rows.every((row) => row.verification.latestOutcome === "verified"),
+            ).toBe(true);
             expect(new Set(rows.map((row) => row.normalizedHash)).size).toBe(2);
             expect(rows[1]?.importance).toBe(87);
 
@@ -55,11 +78,25 @@ describe("seedGoldMemories", () => {
                         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_effective_policy'",
                     ).get(),
                 ).toBeDefined();
-                expect(filterMemoriesByPolicy(db, rows, "explicit_search").memories).toEqual(rows);
-                expect(filterMemoriesByPolicy(db, rows, "auto_inject").memories).toEqual(rows);
+                // The alias and its realpath resolve to one canonical identity, so
+                // every seeded claim lands in that identity's project.
+                const projectIds = resolveProjectIdsForIdentities(db, [expectedIdentity]);
+                expect(projectIds).toHaveLength(1);
+                expect(rows.map((row) => row.projectId)).toEqual([
+                    projectIds[0],
+                    projectIds[0],
+                ]);
             } finally {
                 db.close();
             }
+
+            const seededIds = rows.map((row) => row.publicClaimId);
+            expect(surfaceClaimIds(dbPath, expectedIdentity, "explicit_search")).toEqual(
+                seededIds,
+            );
+            expect(surfaceClaimIds(dbPath, expectedIdentity, "auto_inject")).toEqual(
+                seededIds,
+            );
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -81,8 +118,9 @@ describe("seedGoldMemories", () => {
                 rows: [{ category: "PROJECT_RULES", content: "Candidate-only search fact." }],
             });
             if (!candidate) throw new Error("candidate seed returned no row");
-            expect(candidate.verificationStatus).toBe("unverified");
+            expect(candidate.verification.latestOutcome).toBeNull();
 
+            const identity = resolveProjectIdentity(realpathSync(workdir));
             const db = openTestDb(dbPath, { readonly: true });
             try {
                 expect(
@@ -90,13 +128,13 @@ describe("seedGoldMemories", () => {
                         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_effective_policy'",
                     ).get(),
                 ).toBeDefined();
-                expect(filterMemoriesByPolicy(db, [candidate], "explicit_search").memories).toEqual(
-                    [candidate],
-                );
-                expect(filterMemoriesByPolicy(db, [candidate], "auto_inject").memories).toEqual([]);
             } finally {
                 db.close();
             }
+            expect(surfaceClaimIds(dbPath, identity, "explicit_search")).toEqual([
+                candidate.publicClaimId,
+            ]);
+            expect(surfaceClaimIds(dbPath, identity, "auto_inject")).toEqual([]);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -124,7 +162,7 @@ describe("seedGoldMemories", () => {
         }
     });
 
-    it("surfaces duplicate content and leaves the first insert intact", () => {
+    it("resolves duplicate content onto the live claim and leaves its revision intact", () => {
         const root = mkdtempSync(join(tmpdir(), "oracle-duplicate-"));
         const dataDir = join(root, "data");
         const workdir = join(root, "work");
@@ -133,28 +171,38 @@ describe("seedGoldMemories", () => {
         try {
             mkdirSync(workdir, { recursive: true });
             initializeIsolatedContextDb(dataDir);
-            expect(() =>
-                seedGoldMemories({
-                    workdir,
-                    dbPath,
-                    verification: "candidate",
-                    rows: [
-                        { category: "PROJECT_RULES", content: "Duplicate gold fact." },
-                        { category: "PROJECT_RULES", content: "  duplicate   GOLD fact.  " },
-                    ],
-                }),
-            ).toThrow(/UNIQUE constraint failed/);
+            // The second row normalizes to the first row's hash in the same
+            // (project, category) slot, so the claims kernel attaches its
+            // provenance as independent evidence instead of opening a rival claim.
+            const rows = seedGoldMemories({
+                workdir,
+                dbPath,
+                verification: "candidate",
+                rows: [
+                    { category: "PROJECT_RULES", content: "Duplicate gold fact." },
+                    { category: "PROJECT_RULES", content: "  duplicate   GOLD fact.  " },
+                ],
+            });
 
-            const db = openTestDb(dbPath, { readonly: true });
-            try {
-                const normalizedHash = computeNormalizedHash("Duplicate gold fact.");
-                const row = db
-                    .prepare("SELECT COUNT(*) AS count FROM memories WHERE normalized_hash = ?")
-                    .get(normalizedHash) as { count: number };
-                expect(row.count).toBe(1);
-            } finally {
-                db.close();
-            }
+            expect(rows).toHaveLength(2);
+            expect(new Set(rows.map((row) => row.publicClaimId)).size).toBe(1);
+            // Evidence attaches without superseding the claim, so the surviving
+            // revision is still the first row's content at revision 1.
+            expect(rows.map((row) => row.revision)).toEqual([1, 1]);
+            expect(rows.map((row) => row.content)).toEqual([
+                "Duplicate gold fact.",
+                "Duplicate gold fact.",
+            ]);
+            const expectedHash = computeNormalizedHash("Duplicate gold fact.");
+            expect(rows.map((row) => row.normalizedHash)).toEqual([
+                expectedHash,
+                expectedHash,
+            ]);
+
+            const identity = resolveProjectIdentity(realpathSync(workdir));
+            expect(surfaceClaimIds(dbPath, identity, "explicit_search")).toEqual([
+                rows[0]?.publicClaimId,
+            ]);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

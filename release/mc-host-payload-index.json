@@ -1,0 +1,82 @@
+{
+  "entries": [
+    {
+      "bootstrap_launcher_digest": null,
+      "package": "@cortexkit/mc-host-darwin-arm64",
+      "payload_manifest_digest": null,
+      "platform_floor": {
+        "dev_fd_exec": true,
+        "os_min": "13.5"
+      },
+      "published": false,
+      "qualified": false,
+      "size_budget_bytes": {
+        "compressed_max": 62914560,
+        "unpacked_max": 157286400
+      },
+      "synapse": "unsupported",
+      "target": "darwin-arm64",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "version": "0.38.0"
+    },
+    {
+      "bootstrap_launcher_digest": null,
+      "package": "@cortexkit/mc-host-darwin-x64",
+      "payload_manifest_digest": null,
+      "platform_floor": {
+        "dev_fd_exec": true,
+        "os_min": "13.5"
+      },
+      "published": false,
+      "qualified": false,
+      "size_budget_bytes": {
+        "compressed_max": 62914560,
+        "unpacked_max": 157286400
+      },
+      "synapse": "unsupported",
+      "target": "darwin-x64",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "version": "0.38.0"
+    },
+    {
+      "bootstrap_launcher_digest": null,
+      "package": "@cortexkit/mc-host-linux-x64-gnu",
+      "payload_manifest_digest": null,
+      "platform_floor": {
+        "glibc_min": "2.28",
+        "kernel_min": "4.18",
+        "procfs_self_fd_exec": true
+      },
+      "published": false,
+      "qualified": false,
+      "size_budget_bytes": {
+        "compressed_max": 471859200,
+        "unpacked_max": 734003200
+      },
+      "synapse": "certified_cpu",
+      "target": "linux-x64-gnu",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "version": "0.38.0"
+    }
+  ],
+  "production_inputs_lock_sha256": "5348c49b7041a2e4db3179ca00caa3e0a0c8b57edecf8edb1913fd620e38442a",
+  "production_qualified": false,
+  "publication": {
+    "order": [
+      "@cortexkit/mc-host-darwin-arm64",
+      "@cortexkit/mc-host-darwin-x64",
+      "@cortexkit/mc-host-linux-x64-gnu",
+      "@cortexkit/magic-context",
+      "@cortexkit/opencode-magic-context",
+      "@cortexkit/pi-magic-context"
+    ],
+    "payloads_before_parents": true,
+    "published": false
+  },
+  "release": {
+    "id": "mc-host-release",
+    "version": "0.38.0"
+  },
+  "release_contract_sha256": "a2f7c195f769d369e4495c55806a1645a4ca575cad351b5f2b7a751d83b8eda4",
+  "schema": "magic-context.mc-host-payload-index/v1"
+}

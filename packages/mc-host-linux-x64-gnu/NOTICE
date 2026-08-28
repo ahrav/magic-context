@@ -1,0 +1,18 @@
+Third-party notices for @cortexkit/mc-host-linux-x64-gnu
+=========================================================
+
+This package ships, once release inputs are production-qualified
+(release/mc-host-production-inputs.lock.json, production_qualified: true):
+
+- ck-mc-host (this repository) — MIT. See LICENSE.
+- ONNX Runtime (CPU shared library, payload/ort/) — MIT.
+  Copyright (c) Microsoft Corporation.
+  https://github.com/microsoft/onnxruntime/blob/main/LICENSE
+- gte-modernbert-base-f16 model, tokenizer, and configuration files
+  (payload/model/gte-modernbert-base-f16/) — Apache-2.0.
+  https://huggingface.co/Alibaba-NLP/gte-modernbert-base
+
+Exact artifact hashes, provenance, and redistribution-approval records are
+locked in release/mc-host-production-inputs.lock.json before any production
+payload build. No third-party bytes are committed to this repository; the
+slots above remain empty until qualification.

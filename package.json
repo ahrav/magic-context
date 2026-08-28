@@ -34,8 +34,10 @@
     "release:qualify": "bun scripts/qualify-mc-host-production-inputs.ts",
     "release:qualify:check": "bun scripts/qualify-mc-host-production-inputs.ts --check",
     "release:qualify:require": "bun scripts/qualify-mc-host-production-inputs.ts --require-qualified --verify-bytes",
-    "test:release": "bun test scripts/generate-mc-host-release-manifest.test.ts scripts/qualify-mc-host-production-inputs.test.ts",
-    "check:all": "bun run test && bun run test:release && bun run test:rust && bun run release:contract:check && bun run release:qualify:check && cargo clippy --workspace --all-targets -- -D warnings",
+    "release:payload": "bun scripts/build-mc-host-payload.ts",
+    "release:payload:check": "bun scripts/build-mc-host-payload.ts --check",
+    "test:release": "bun test scripts/generate-mc-host-release-manifest.test.ts scripts/qualify-mc-host-production-inputs.test.ts scripts/build-mc-host-payload.test.ts",
+    "check:all": "bun run test && bun run test:release && bun run test:rust && bun run release:contract:check && bun run release:qualify:check && bun run release:payload:check && cargo clippy --workspace --all-targets -- -D warnings",
     "build:dists": "bun run --cwd packages/plugin build && bun run --cwd packages/pi-plugin build"
   }
 }

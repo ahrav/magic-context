@@ -367,6 +367,14 @@ jobs:
       - name: U9 production-input qualification drift
         run: bun run release:qualify:check
 
+      # The payload packages carry the optionalDependencies that resolve native
+      # bytes, and the trust index is what bootstrap decides against. Without
+      # this step, edited payload package metadata, exact-pin drift in a
+      # parent's optionalDependencies, or a hand-edited trust artifact merges
+      # unchecked.
+      - name: U6 payload package + trust index drift
+        run: bun run release:payload:check
+
   # Its own job, not a step in prospective-release-holdout: steps in one job
   # short-circuit, so an unrelated contract lane failing first would skip this
   # one and leave the historian-eval gate silently unenforced — which is the
