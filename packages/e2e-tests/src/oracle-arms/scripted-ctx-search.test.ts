@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { parseRecordedMemoryBlockIds } from "../../../plugin/src/features/magic-context/memory/storage-claim-visibility";
+import { getVisibleRevisionLocators } from "../../../plugin/src/hooks/magic-context/inject-compartments";
 import { TestHarness } from "../harness";
 import { openTestDb } from "../test-db";
 import { mcOffOptions } from "./presets";
@@ -23,9 +23,18 @@ afterEach(async () => {
 });
 
 describe("scriptedCtxSearchTurn", () => {
+    const claimId = (suffix: string): string => `mcm_${suffix.repeat(32).slice(0, 32)}`;
+
     it("rejects oversized id sets before using a harness", async () => {
         await expect(
-            scriptedCtxSearchTurn(null as never, "unused", [1, 2, 3, 4, 5, 6]),
+            scriptedCtxSearchTurn(null as never, "unused", [
+                claimId("1"),
+                claimId("2"),
+                claimId("3"),
+                claimId("4"),
+                claimId("5"),
+                claimId("6"),
+            ]),
         ).rejects.toThrow("accepts at most 5 ids per turn");
     });
 
@@ -33,7 +42,7 @@ describe("scriptedCtxSearchTurn", () => {
         await expect(
             scriptedCtxSearchTurn(null as never, "unused", []),
         ).rejects.toThrow("requires at least one id");
-        for (const id of [0, -1, 1.5, Number.NaN]) {
+        for (const id of ["", "1", "#1", "mcm_", "mcm_notlongenough", claimId("g")]) {
             await expect(
                 scriptedCtxSearchTurn(null as never, "unused", [id]),
             ).rejects.toThrow("received invalid memory id");
@@ -71,16 +80,18 @@ describe("scriptedCtxSearchTurn", () => {
         expect(candidateResult).toContain("Candidate oracle fact epsilon.");
 
         const visibleSession = await harness.createSession();
-        const visibleResult = await scriptedCtxSearchTurn(harness, visibleSession, [injected.id]);
+        const visibleResult = await scriptedCtxSearchTurn(harness, visibleSession, [injected]);
         const db = openTestDb(harness.contextDbPath(), { readonly: true });
         try {
             const row = db
                 .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
                 .get(visibleSession) as { memory_block_ids: string } | null;
             expect(row).not.toBeNull();
-            const visibleIds = parseRecordedMemoryBlockIds(row?.memory_block_ids);
-            expect(visibleIds).not.toBeNull();
-            expect(visibleIds).toContain(injected.id);
+            // Injection records the revision locator of every rendered claim, and
+            // that locator set is what `ctx_search` hard-filters against.
+            const visibleLocators = getVisibleRevisionLocators(db, visibleSession);
+            expect(visibleLocators).not.toBeNull();
+            expect([...(visibleLocators ?? [])]).toContain(injected.revisionLocator);
         } finally {
             db.close();
         }
