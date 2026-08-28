@@ -888,6 +888,35 @@ struct ResolvedGeneration {
     launcher: Option<std::os::fd::OwnedFd>,
 }
 
+/// Opens the generation's own launcher, or reports that it has none.
+///
+/// `.ok()` on the verification result conflated two different states: a dev
+/// fixture that legitimately ships no launcher, and a production payload whose
+/// launcher was deleted, truncated, or rewritten since staging. Both reached
+/// `spawn_detached` as `None`, which reads that as permission to re-exec the
+/// *running* binary — so a tampered launcher produced a successful start from
+/// bytes outside the selected generation instead of failing closed.
+///
+/// The manifest separates the two: a launcher it names must verify, and one it
+/// does not name does not exist.
+fn generation_launcher(
+    validated: &mc_host::generation::ValidatedGeneration,
+) -> Result<Option<std::os::fd::OwnedFd>, (&'static str, &'static str)> {
+    const PRODUCTION_LAUNCHER: &str = "payload/bin/ck-mc-host";
+    if !validated
+        .manifest
+        .files
+        .iter()
+        .any(|file| file.path == PRODUCTION_LAUNCHER)
+    {
+        return Ok(None);
+    }
+    validated
+        .open_verified_file(PRODUCTION_LAUNCHER)
+        .map(Some)
+        .map_err(|_| ("stopped", "native_payload_invalid"))
+}
+
 /// An explicit verified payload root stages a candidate. Without one, only a
 /// fully valid retained current generation may start.
 ///
@@ -897,7 +926,6 @@ fn resolve_generation(
     payload_dir: Option<&Path>,
     payload_manifest_digest: Option<&str>,
 ) -> Result<ResolvedGeneration, (&'static str, &'static str)> {
-    const PRODUCTION_LAUNCHER: &str = "payload/bin/ck-mc-host";
     // Platform support is decided before any payload state is inspected. The
     // contract orders `unsupported_platform` ahead of `native_payload_missing`
     // in its failing-reason precedence, and on an unsupported target a fresh
@@ -939,7 +967,7 @@ fn resolve_generation(
                 .validate(&digest)
                 .map_err(|e| generation_failure(&e))?;
             generation_identity_matches(&validated.manifest, target)?;
-            let launcher = validated.open_verified_file(PRODUCTION_LAUNCHER).ok();
+            let launcher = generation_launcher(&validated)?;
             Ok(ResolvedGeneration { digest, launcher })
         }
         None => {
@@ -952,12 +980,17 @@ fn resolve_generation(
                         .validate(&digest)
                         .map_err(|e| generation_failure(&e))?;
                     generation_identity_matches(&validated.manifest, target)?;
+                    // A caller naming the digest it expects is asserting which payload
+                    // the successor must come from, so a generation that disagrees —
+                    // or that predates the field and cannot answer at all — is not
+                    // the one that was asked for.
                     if payload_manifest_digest.is_some_and(|expected| {
-                        validated.manifest.source_payload_manifest_sha256 != expected
+                        validated.manifest.source_payload_manifest_sha256.as_deref()
+                            != Some(expected)
                     }) {
                         return Err(("stopped", "native_payload_invalid"));
                     }
-                    let launcher = validated.open_verified_file(PRODUCTION_LAUNCHER).ok();
+                    let launcher = generation_launcher(&validated)?;
                     Ok(ResolvedGeneration { digest, launcher })
                 }
                 mc_host::generation::CurrentProfile::Absent => {
@@ -1076,11 +1109,13 @@ fn trusted_payload_sources(
         || manifest.package.version != release_contract::RELEASE_VERSION
         || manifest.package.target != target
         || manifest.launcher != "payload/bin/ck-mc-host"
-        || manifest.production_inputs_lock_sha256.len() != 64
-        || !manifest
-            .production_inputs_lock_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        // The qualified lock is compiled into this executable, so the payload has to
+        // cite that exact one. Checking only that the value was well-formed hex let a
+        // manifest label arbitrary model, ORT, or harness bytes as production while
+        // naming an unrelated lock, and the generation then persisted that unverified
+        // claim as its own provenance.
+        || manifest.production_inputs_lock_sha256
+            != mc_module::production_inputs::PRODUCTION_INPUTS_LOCK_SHA256
     {
         return Err(invalid);
     }
@@ -1828,7 +1863,10 @@ mod tests {
             "schema": "magic-context.mc-host-payload-manifest/v1",
             "release": {"id": "mc-host-release", "version": release_contract::RELEASE_VERSION},
             "release_contract_sha256": release_contract::RELEASE_CONTRACT_SHA256,
-            "production_inputs_lock_sha256": "b".repeat(64),
+            // The payload must cite the lock compiled into this binary; any other
+            // well-formed digest is rejected.
+            "production_inputs_lock_sha256":
+                mc_module::production_inputs::PRODUCTION_INPUTS_LOCK_SHA256,
             "mode": "production",
             "package": {
                 "name": package_name,

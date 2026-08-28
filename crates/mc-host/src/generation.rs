@@ -153,7 +153,17 @@ pub struct GenerationManifest {
     pub target: String,
     pub release_contract_sha256: String,
     pub inputs_lock_sha256: String,
-    pub source_payload_manifest_sha256: String,
+    /// The payload manifest this generation was staged from, or `None` for a
+    /// generation staged before the field existed.
+    ///
+    /// Schema 1 shipped without it and the schema number did not change when it
+    /// was added, so requiring it would decode every retained predecessor as
+    /// corrupt and fail the first no-`--payload-dir` start after an upgrade with
+    /// `native_payload_invalid` — refusing a payload that is intact. A generation
+    /// that cannot name its source instead fails only the checks that actually
+    /// need that name, which is what `Option` makes explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_payload_manifest_sha256: Option<String>,
     pub files: Vec<ManifestFile>,
 }
 
@@ -789,7 +799,7 @@ impl GenerationStore {
             target: meta.target.clone(),
             release_contract_sha256: meta.release_contract_sha256.clone(),
             inputs_lock_sha256: meta.inputs_lock_sha256.clone(),
-            source_payload_manifest_sha256: meta.source_payload_manifest_sha256.clone(),
+            source_payload_manifest_sha256: Some(meta.source_payload_manifest_sha256.clone()),
             files,
         };
         let bytes = manifest.canonical_bytes();
@@ -1339,6 +1349,26 @@ mod tests {
 
     fn store_at(root: &Path) -> GenerationStore {
         GenerationStore::open(Some(root)).expect("open store")
+    }
+
+    #[test]
+    fn a_generation_staged_before_the_source_digest_field_still_decodes() {
+        // Schema 1 shipped without `source_payload_manifest_sha256`, and the schema
+        // number did not change when it was added. Decoding a retained predecessor
+        // as corrupt would make the first no-`--payload-dir` start after an upgrade
+        // report `native_payload_invalid` for a payload that is perfectly intact.
+        let predecessor = br#"{"schema":1,"target":"linux-x64-gnu","release_contract_sha256":"aa","inputs_lock_sha256":"bb","files":[]}"#;
+        let decoded = match decode_with_schema::<GenerationManifest>(predecessor) {
+            SchemaDecode::Valid(manifest) => manifest,
+            SchemaDecode::UnknownSchema => panic!("schema 1 must stay readable"),
+            SchemaDecode::Malformed => {
+                panic!("a predecessor generation is not corrupt merely for predating a field")
+            }
+        };
+        assert_eq!(decoded.source_payload_manifest_sha256, None);
+        // Absence is not serialized back, so a predecessor manifest round-trips to
+        // its own bytes and keeps the digest that names its directory.
+        assert_eq!(decoded.canonical_bytes(), predecessor);
     }
 
     fn meta() -> StageMeta {

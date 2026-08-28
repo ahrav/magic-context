@@ -387,6 +387,13 @@ fn read_envelope() -> Result<StartupEnvelope, &'static str> {
 }
 
 pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
+    // A terminal never sends EOF on its own, so reading to end would hang an
+    // interactive `ck-mc-host start` forever. A TTY carries no envelope by
+    // definition — the launcher always redirects or closes stdin — so treat it as
+    // the absent envelope it is rather than blocking on a human.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(LauncherEnvelope::empty());
+    }
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()

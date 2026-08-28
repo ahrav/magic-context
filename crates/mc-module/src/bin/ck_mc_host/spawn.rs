@@ -262,8 +262,14 @@ pub fn spawn_detached(
             }
             // Close every other inherited descriptor. close_range needs
             // kernel >= 5.9; the plan floor is 4.18, so fall back to a
-            // bounded close loop up to the process descriptor limit.
-            if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0 {
+            // bounded close loop up to the process descriptor limit — which is also
+            // the only path on a target where `libc` defines no `SYS_close_range`
+            // at all, as the macOS branch below attests this file compiles for.
+            #[cfg(target_os = "linux")]
+            let closed_range = libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) >= 0;
+            #[cfg(not(target_os = "linux"))]
+            let closed_range = false;
+            if !closed_range {
                 for fd in 4..=close_ceiling {
                     libc::close(fd);
                 }
