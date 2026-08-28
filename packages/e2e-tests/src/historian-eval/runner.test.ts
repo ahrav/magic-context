@@ -151,17 +151,32 @@ describe("probeResponseLeak", () => {
         ).toContain("probe-store");
     });
 
-    test("an ACCEPTED envelope is still exempt when it is the only one", () => {
-        // The accepted answer is the point of the exchange; only that envelope is
-        // excluded, and here it is a later probe's value legitimately answered by
-        // this probe's own turn being asked first.
+    test("an envelope holding the probe's OWN correct answer is exempt", () => {
+        // Answering its own question is the point of the exchange, so that envelope is
+        // excluded — but only because the value is this probe's gold. Syntax alone is not
+        // the test: the case above shows a valid envelope holding another probe's value
+        // being scanned.
         expect(
             probeResponseLeak({
                 probes,
                 probeIndex: capacityIndex,
-                responseText: "<answer>in-process lru</answer>",
+                responseText: "<answer>4096</answer>",
             }),
         ).toBeNull();
+    });
+
+    test("a syntactically valid but WRONG envelope is scanned, not exempted", () => {
+        // probe-store's gold is "in-process lru". A reply of `<answer>4096</answer>` is a
+        // single valid envelope, so it was exempted for syntax alone — but it is a wrong
+        // answer that happens to state another probe's value, and probe-capacity comes
+        // after it here, so the exemption handed that value over.
+        expect(
+            probeResponseLeak({
+                probes: [probes[storeIndex], probes[capacityIndex]],
+                probeIndex: 0,
+                responseText: "<answer>4096</answer>",
+            }),
+        ).toContain("probe-capacity");
     });
 
     test("claim-id answers are not checked here; the deferred pass owns them", () => {

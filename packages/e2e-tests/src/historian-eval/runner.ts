@@ -44,6 +44,7 @@ import {
     PROBE_PROMPT_SHARED,
     containsCompleteValue,
     matchesGold,
+    normalizeContent,
     scenarioFingerprint,
     triggerFingerprint,
     triggerTurnUsage,
@@ -196,7 +197,12 @@ export function probeResponseLeak(args: {
 }): string | null {
     const { probes, probeIndex, responseText } = args;
     if (responseText === null) return null;
-    const outside = outsideAcceptedEnvelope(responseText);
+    const own = probes[probeIndex];
+    const outside = outsideAcceptedEnvelope(responseText, (content) =>
+        own !== undefined &&
+        own.answerType !== "claim-id" &&
+        normalizeContent(content) === normalizeContent(own.goldAnswer),
+    );
     for (const later of probes.slice(probeIndex + 1)) {
         // Claim-id answers are not checked here. Their accepted value is a runtime id
         // whose acceptance depends on the LATER probe's own injected set, which does not
@@ -213,18 +219,28 @@ export function probeResponseLeak(args: {
 }
 
 /**
- * The reply text a later probe can copy from: everything except the envelope this
- * probe's answer was ACCEPTED from.
+ * The reply text a later probe can copy from: everything except an envelope holding
+ * a CORRECT answer to the probe that sent it.
  *
- * Only the accepted envelope is exempt. `extractAnswerEnvelope` accepts a reply
- * only when it carries exactly one non-empty envelope, so any other shape was
- * rejected as an answer and re-asked — and it stays in the shared session all the
- * same. Stripping every envelope would exempt text that is not this probe's answer
- * and never will be.
+ * Two conditions, and both are load-bearing. Syntactic acceptance alone is not
+ * enough — an envelope is exempt because a probe answering its own question is the
+ * point of the exchange, and a reply of `<answer>4096</answer>` from a probe whose
+ * gold is `in-process lru` is not that. It is a wrong answer that happens to state
+ * some other probe's value, so exempting it let the later probe copy it. And a reply
+ * that `extractAnswerEnvelope` rejected — two envelopes, or an empty one — was never
+ * this probe's answer and never will be, yet it was still sent and still sits in the
+ * shared session, so nothing in it is exempt either.
+ *
+ * `isCorrectAnswer` is supplied because correctness is per probe type: an exact or
+ * multiple-choice answer compares against the authored gold, while a claim-id answer
+ * is a runtime id only the deferred scan can resolve. A caller that cannot decide
+ * returns false, which scans the envelope too — conservative in the direction that
+ * cannot hide a leak.
  */
-function outsideAcceptedEnvelope(responseText: string): string {
+function outsideAcceptedEnvelope(responseText: string, isCorrectAnswer: (content: string) => boolean): string {
     const accepted = extractAnswerEnvelope(responseText);
-    const envelope = accepted === null ? null : /<answer>[\s\S]*?<\/answer>/.exec(responseText);
+    if (accepted === null || !isCorrectAnswer(accepted)) return responseText;
+    const envelope = /<answer>[\s\S]*?<\/answer>/.exec(responseText);
     return envelope === null ? responseText : responseText.replace(envelope[0], " ");
 }
 
@@ -244,6 +260,29 @@ function outsideAcceptedEnvelope(responseText: string): string {
  * Shared by the runner (after its claim capture) and the scorer (over the stored
  * record), so the live abort and the replay refusal resolve acceptance identically.
  */
+/**
+ * Runtime public claim ids `compareProbeAnswer` would credit for one claim-id probe:
+ * claims matching its gold whose locator is in THAT probe's injected set.
+ *
+ * Both halves matter. Matching alone names claims the probe was never shown, and the
+ * locator set alone names claims that answer a different expectation — crediting
+ * either would flag a value that could not have produced a PASS.
+ */
+function acceptedClaimIds(
+    scenario: HistorianEvalScenario,
+    probe: Probe,
+    exchange: ProbeExchange | undefined,
+    injectedClaims: readonly InjectedClaimRecord[],
+): string[] {
+    if (probe.answerType !== "claim-id" || exchange === undefined) return [];
+    const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === probe.expectedClaimRef);
+    if (goldClaim === undefined) return [];
+    const injectedForProbe = new Set(exchange.injectedRevisionLocators);
+    return injectedClaims
+        .filter((item) => matchesGold(goldClaim, item) && injectedForProbe.has(item.revisionLocator))
+        .map((item) => item.publicClaimId);
+}
+
 export function probeResponseClaimIdLeak(args: {
     scenario: HistorianEvalScenario;
     exchanges: readonly ProbeExchange[];
@@ -261,17 +300,24 @@ export function probeResponseClaimIdLeak(args: {
             ...(earlierExchange.responseText === null ? [] : [earlierExchange.responseText]),
         ];
         if (replies.length === 0) continue;
-        const outside = replies.map((reply) => outsideAcceptedEnvelope(reply)).join("\n");
+        // The earlier probe's OWN correct answers, so its envelope is exempt for the
+        // same reason an exact probe's is: answering its own question is the exchange.
+        // For a claim-id probe that means the ids accepted for IT, which this pass can
+        // resolve because it holds the same evidence.
+        const ownCorrect = new Set(
+            acceptedClaimIds(scenario, earlier, exchangeById.get(earlier.id), injectedClaims).map(normalizeContent),
+        );
+        if (earlier.answerType !== "claim-id") ownCorrect.add(normalizeContent(earlier.goldAnswer));
+        const outside = replies
+            .map((reply) => outsideAcceptedEnvelope(reply, (content) => ownCorrect.has(normalizeContent(content))))
+            .join("\n");
         for (const later of scenario.probes.slice(index + 1)) {
             if (later.answerType !== "claim-id") continue;
             const laterExchange = exchangeById.get(later.id);
             if (laterExchange === undefined) continue;
             const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === later.expectedClaimRef);
             if (goldClaim === undefined) continue;
-            const injectedForLater = new Set(laterExchange.injectedRevisionLocators);
-            const accepted = injectedClaims
-                .filter((item) => matchesGold(goldClaim, item) && injectedForLater.has(item.revisionLocator))
-                .map((item) => item.publicClaimId);
+            const accepted = acceptedClaimIds(scenario, later, laterExchange, injectedClaims);
             if (accepted.some((id) => containsCompleteValue(outside, id))) {
                 return `probe ${earlier.id}: response text outside the answer envelope states a claim id accepted for a later probe (${later.id})`;
             }

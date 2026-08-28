@@ -1328,6 +1328,32 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a discarded malformed reply carrying a later gold is refused on replay", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // The first reply was rejected (two envelopes) and re-asked, so it is not
+            // `responseText` — but it was sent, so probe-store still read it. Replaying
+            // only the survivor left this record scoring clean.
+            record.probes = record.probes.map((exchange) =>
+                exchange.probeId === "probe-capacity"
+                    ? {
+                          ...exchange,
+                          answerRaw: "4096",
+                          responseText: "<answer>4096</answer>",
+                          discardedResponseTexts: ["<answer>4096</answer><answer>in-process lru</answer>"],
+                      }
+                    : exchange,
+            );
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("probe-response-leak");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a chatty recorded reply that leaks nothing still scores", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -1869,6 +1895,52 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
             compareProbeAnswer({ probe, exchange: exchange(probe.id, "mem-cap01"), scenario, injectedClaims: injected })
                 .outcome,
         ).toBe("fail");
+    });
+
+    test("a correct answer on an unavailable claim is error-trimmed, not a PASS", () => {
+        const probe = scenario.probes[0];
+        // The capacity claim was promoted but is not in this probe's injected set and no
+        // compartment states it, so the probe had no surface to recover 4096 from — it
+        // guessed. Counting that as a PASS while the same probe answering wrongly is
+        // excluded can only bias the tier upward, and a multiple-choice prompt renders
+        // every option, so a right guess is a 1-in-N event.
+        const verdict = compareProbeAnswer({
+            probe,
+            exchange: exchange(probe.id, "4096", ["loc-lru01"]),
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("error-trimmed");
+    });
+
+    test("a correct answer stays a PASS when the claim was injected for the probe", () => {
+        const probe = scenario.probes[0];
+        // The gate must not swallow an ordinary PASS: the capacity locator IS in this
+        // probe's injected set, so the answer rests on injected memory.
+        const verdict = compareProbeAnswer({
+            probe,
+            exchange: exchange(probe.id, "4096"),
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("pass");
+    });
+
+    test("a correct answer stays a PASS when a compartment states the fact", () => {
+        const probe = scenario.probes[0];
+        // Trimmed from the claim surface but stated in a compartment summary, which the
+        // prompt tells the probe it may use — so the answer is recoverable and scores.
+        const verdict = compareProbeAnswer({
+            probe,
+            exchange: {
+                ...exchange(probe.id, "4096", ["loc-lru01"]),
+                payloadText:
+                    "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
+            },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("pass");
     });
 
     test("a trimmed claim whose fact a compartment still states is a model FAIL, not trimmed", () => {

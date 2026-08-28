@@ -249,6 +249,38 @@ function healingFindings(record: HistorianEvalRunRecord): string[] {
     return findings;
 }
 
+/**
+ * Whether a compartment block in this probe's own captured payload states the gold
+ * fact — the other surface a probe may answer from when the claim budget dropped its
+ * claim.
+ *
+ * Searched in the compartment blocks only, never the whole payload. A predicate like
+ * "4096" can appear incidentally in prompt text, ordinals, or filler, and a false
+ * "available" turns an infrastructure ERROR into a model FAIL — the R6 violation in
+ * reverse. Historian-authored summary text is the surface whose match actually means
+ * the fact was recoverable.
+ *
+ * False for a claim-id probe unconditionally. Its answer is the runtime public claim
+ * id, which `renderClaimMemoryLine` emits into `<project-memory>` and nowhere else; a
+ * compartment block is prose about the transcript, written before promotion assigned
+ * any id, so a summary stating the fact does not make the id recoverable.
+ *
+ * False for a payload-less exchange. Live routes cannot capture the request, so there
+ * is no evidence the fact was reachable, and assuming it was would charge the model on
+ * an absence of proof — the same live-mode capture gap the replayed leak gate carries.
+ */
+function goldStatedInCompartments(
+    goldClaim: ExpectedClaim,
+    probe: Probe,
+    exchange: ProbeExchange,
+): boolean {
+    if (probe.answerType === "claim-id" || exchange.payloadText === null) return false;
+    return predicateMatches(
+        goldClaim.predicate,
+        injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS),
+    );
+}
+
 /** Resolve a gold expected-claim reference to concrete injected claims. */
 function claimsMatchingGold(claim: ExpectedClaim, items: readonly InjectedClaimRecord[]): InjectedClaimRecord[] {
     return items.filter((item) => matchesGold(claim, item));
@@ -273,6 +305,29 @@ export function compareProbeAnswer(args: {
     const goldClaimId = probe.answerType === "claim-id" ? probe.expectedClaimRef : (probe.sourceClaimRef ?? null);
     const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === goldClaimId) ?? null;
 
+    // Availability BEFORE acceptance, so the two answers to "was this probe
+    // measurable?" cannot disagree.
+    //
+    // `error-trimmed` used to be reachable only through a FAILING answer, so an
+    // unmeasurable probe that happened to answer correctly counted as a PASS while the
+    // same probe answering wrongly was excluded from the tier. That asymmetry can only
+    // bias probe accuracy upward, and a multiple-choice prompt renders every option, so
+    // guessing right is a 1-in-N event rather than a remote one. A probe with no
+    // surface to recover its answer from is unmeasurable whichever way it answered.
+    //
+    // Scoped to a claim that WAS promoted. With nothing promoted there is no injection
+    // loss to attribute: the facts tier reports the recall miss and a probe verdict on
+    // it is ordinary model evidence.
+    if (goldClaim !== null) {
+        const promoted = claimsMatchingGold(goldClaim, injectedClaims);
+        const injectedForProbe = promoted.some((item) => injectedLocators.has(item.revisionLocator));
+        if (promoted.length > 0 && !injectedForProbe && !goldStatedInCompartments(goldClaim, probe, exchange)) {
+            const expected =
+                probe.answerType === "claim-id" ? "<no injected gold claim>" : probe.goldAnswer;
+            return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
+        }
+    }
+
     let expected: string;
     let pass: boolean;
     if (probe.answerType === "claim-id") {
@@ -291,50 +346,8 @@ export function compareProbeAnswer(args: {
     }
     if (pass) return { probeId: probe.id, outcome: "pass", expected, actual: exchange.answerRaw };
 
-    // Trimmed-by-injection-budget (KTD6): the gold claim exists among the
-    // injection-eligible claims but was not in the probe turn's injected set.
-    if (goldClaim !== null) {
-        const promoted = claimsMatchingGold(goldClaim, injectedClaims);
-        if (promoted.length > 0 && promoted.every((item) => !injectedLocators.has(item.revisionLocator))) {
-            // The claim surface is not the only surface the probe may use. The prompt
-            // says "project memory AND session history", and the injection splices
-            // compartment-derived blocks alongside `<project-memory>` — so a gold fact
-            // the claim budget dropped can still be stated in a compartment summary the
-            // probe read. Calling that `error-trimmed` takes an ANSWERABLE model miss
-            // out of scored metrics.
-            //
-            // Searched in the compartment blocks only, not the whole payload. A
-            // predicate like "4096" can appear incidentally in prompt text, ordinals,
-            // or filler, and a false "answerable" here converts an infrastructure
-            // ERROR into a model FAIL — the R6 violation in reverse. Historian-authored
-            // summary text is the surface whose match actually means the fact was
-            // available.
-            //
-            // A payload-less exchange keeps `error-trimmed`: live routes cannot capture
-            // the request, so there is no evidence the fact was reachable, and assuming
-            // it was would charge the model on an absence of proof. That is the same
-            // live-mode capture gap the replayed leak gate already carries.
-            //
-            // A claim-id probe keeps it unconditionally. Its answer is the runtime
-            // public claim id, which `renderClaimMemoryLine` emits into
-            // `<project-memory>` and nowhere else — compartment summaries are
-            // historian-authored prose about the transcript and cannot contain an id
-            // the store assigned at promotion time. So a summary stating the fact does
-            // not make the id recoverable: `injectedMatching` is still empty, `expected`
-            // is still `<no injected gold claim>`, and falling through would charge the
-            // model for a probe that had no answer available.
-            const answerableFromCompartments =
-                probe.answerType !== "claim-id" &&
-                exchange.payloadText !== null &&
-                predicateMatches(
-                    goldClaim.predicate,
-                    injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS),
-                );
-            if (!answerableFromCompartments) {
-                return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
-            }
-        }
-    }
+    // Past the gate the probe WAS measurable — the claim was injected for it, or a
+    // compartment states the fact — so a wrong answer is the model's.
     return { probeId: probe.id, outcome: "fail", expected, actual: exchange.answerRaw };
 }
 
@@ -1516,18 +1529,25 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             // which probes could still read this reply.
             const probeIndex = scenario.probes.findIndex((probe) => probe.id === exchange.probeId);
             if (probeIndex !== -1) {
-                const responseLeak = probeResponseLeak({
-                    probes: scenario.probes,
-                    probeIndex,
-                    responseText: exchange.responseText,
-                });
-                if (responseLeak !== null) {
-                    return errorScore(
-                        record.scenarioId,
-                        "probe-response-leak",
-                        `probe ${exchange.probeId}: ${responseLeak}`,
-                        record.system,
-                    );
+                // Every reply the probe sent, matching the runner. It scans each attempt
+                // as it happens; the record keeps the survivor in `responseText` and the
+                // rejected ones in `discardedResponseTexts`, and a discarded reply was
+                // still sent — so replaying only the survivor left a stored record whose
+                // malformed first reply carried a later probe's gold scoring clean.
+                for (const reply of [exchange.responseText, ...exchange.discardedResponseTexts]) {
+                    const responseLeak = probeResponseLeak({
+                        probes: scenario.probes,
+                        probeIndex,
+                        responseText: reply,
+                    });
+                    if (responseLeak !== null) {
+                        return errorScore(
+                            record.scenarioId,
+                            "probe-response-leak",
+                            `probe ${exchange.probeId}: ${responseLeak}`,
+                            record.system,
+                        );
+                    }
                 }
             }
         }
