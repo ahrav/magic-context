@@ -45,6 +45,13 @@ export interface StoredCompartmentEvent extends CompartmentEventInput {
 export interface ProjectCompartmentEvent extends StoredCompartmentEvent {
     compartmentStartMessage: number | null;
     compartmentEndMessage: number | null;
+    /**
+     * Harness that wrote the event. Required to read anything else keyed by
+     * session id: the same session id can belong to a different project per
+     * harness, so a consumer joining on session id alone reads another
+     * project's rows.
+     */
+    harness: string;
 }
 
 /**
@@ -149,7 +156,7 @@ export function getProjectCompartmentEvents(
         .prepare(
             `SELECT DISTINCT events.id, events.session_id, events.compartment_id, events.kind,
                     events.at_compartment, events.fields_json, events.created_at,
-                    compartments.start_message, compartments.end_message
+                    events.harness, compartments.start_message, compartments.end_message
                FROM compartment_events events
                JOIN session_projects projects
                  ON projects.session_id = events.session_id
@@ -171,6 +178,7 @@ export function getProjectCompartmentEvents(
         at_compartment: number | null;
         fields_json: string;
         created_at: number;
+        harness: string;
         start_message: number | null;
         end_message: number | null;
     }>;
@@ -182,6 +190,7 @@ export function getProjectCompartmentEvents(
         atCompartment: row.at_compartment,
         fields: parseFields(row.fields_json),
         createdAt: row.created_at,
+        harness: row.harness,
         compartmentStartMessage: row.start_message,
         compartmentEndMessage: row.end_message,
     }));

@@ -148,13 +148,32 @@ function spanUserTexts(
     span: [number, number] | null,
 ): string[] {
     if (!span) return [];
+    // `message_history_fts` carries the text but has no harness column, while
+    // `message_history_source` carries harness but only a content hash. Joining
+    // them on (session_id, message_id) is what makes the text harness-scoped.
+    //
+    // Session id alone is not enough here for the same reason the event-to-project
+    // join needs harness: one session id can be bound to a different project per
+    // harness. Reading the other harness's messages would corrupt both consumers
+    // of this list — an unrelated message could trigger `source_overlap` and
+    // permanently skip a valid correction, or satisfy the evidence match in
+    // `hostCorroboratesUserCorrection` and mint `explicit_user` trust for a
+    // model-authored record.
+    //
+    // Both tables are written together by `message-index.ts`, so the join does
+    // not drop rows the FTS index legitimately holds.
     const rows = db
         .prepare(
-            `SELECT content FROM message_history_fts
-              WHERE session_id = ? AND role = 'user'
-                AND CAST(message_ordinal AS INTEGER) BETWEEN ? AND ?`,
+            `SELECT fts.content AS content
+               FROM message_history_fts fts
+               JOIN message_history_source src
+                 ON src.session_id = fts.session_id
+                AND src.message_id = fts.message_id
+              WHERE fts.session_id = ? AND fts.role = 'user'
+                AND src.harness = ?
+                AND CAST(fts.message_ordinal AS INTEGER) BETWEEN ? AND ?`,
         )
-        .all(event.sessionId, span[0], span[1]) as Array<{ content: string }>;
+        .all(event.sessionId, event.harness, span[0], span[1]) as Array<{ content: string }>;
     return rows.map((row) => row.content);
 }
 

@@ -152,6 +152,27 @@ export function countCompartmentsSince(db: Database, projectPath: string, since:
     return row?.cnt ?? 0;
 }
 
+/**
+ * The watermark the retrospective task should measure "new work" against.
+ *
+ * A null watermark makes `countProjectSessionsSince` count every session for the
+ * project's lifetime, so falling back to the persisted content watermark is what
+ * keeps an omitted option from reading as "no watermark". Both the activity gate
+ * and the backlog probe resolve it here so they cannot disagree about how much
+ * work is pending.
+ */
+function resolveRetrospectiveWatermark(
+    db: Database,
+    projectPath: string,
+    supplied: number | null | undefined,
+): number | null {
+    return (
+        supplied ??
+        getTaskScheduleState(db, projectPath, "retrospective")?.retrospectiveWatermarkMs ??
+        null
+    );
+}
+
 export function countProjectSessionsSince(
     db: Database,
     projectPath: string,
@@ -346,16 +367,11 @@ export function getDreamTaskBacklog(
             return { pending: countUnclassifiedActiveMemories(db, projectPath), total };
         }
         case "retrospective": {
-            // Fall back to the persisted content watermark when the caller did
-            // not supply one, the same way verify-broad reads its cycle state
-            // above. `countProjectSessionsSince` with a null watermark counts
-            // every session for the project's lifetime, so a status query that
-            // passes no options would otherwise report a backlog that only ever
-            // grows instead of the sessions since the last retrospective.
-            const watermarkMs =
-                options.retrospectiveWatermarkMs ??
-                getTaskScheduleState(db, projectPath, "retrospective")?.retrospectiveWatermarkMs ??
-                null;
+            const watermarkMs = resolveRetrospectiveWatermark(
+                db,
+                projectPath,
+                options.retrospectiveWatermarkMs,
+            );
             const pendingSessions = countProjectSessionsSince(db, projectPath, watermarkMs);
             const pending = pendingSessions + countPendingCorrectionEvents(db, projectPath);
             return { pending, total: pending };
@@ -450,9 +466,21 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // session updated mid-run would otherwise be skipped. The executor's
             // raw provider does the precise typed-user-message scan and bails
             // before any child session if empty. Never-run → "sessions exist".
+            //
+            // Falls back to the persisted watermark for the same reason
+            // `getDreamTaskBacklog` does: a null watermark makes
+            // `countProjectSessionsSince` count every session for the project's
+            // lifetime, so a caller that omits the field would keep admitting
+            // runs whose executor then finds nothing new. Every current caller
+            // supplies it; resolving it here keeps the gate and the backlog
+            // probe from drifting apart if one ever stops.
             return (
                 countPendingCorrectionEvents(db, project) > 0 ||
-                countProjectSessionsSince(db, project, ctx.retrospectiveWatermarkMs ?? null) > 0
+                countProjectSessionsSince(
+                    db,
+                    project,
+                    resolveRetrospectiveWatermark(db, project, ctx.retrospectiveWatermarkMs),
+                ) > 0
             );
 
         case "maintain-docs":

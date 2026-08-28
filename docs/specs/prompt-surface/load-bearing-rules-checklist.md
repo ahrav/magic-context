@@ -1170,7 +1170,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
 - **Operative condition:** A fact must survive this session.
-- **Mechanism:** Create one durable project claim with category and content.
+- **Mechanism:** Create one durable project claim: content plus a positive category, or category REJECTED_APPROACH plus an antiMemory payload and no content.
 - **Consequence:** Future sessions can use the memory without reconstructing this conversation.
 - **Source evidence:** `create a claim (content + category, or antiMemory)`
 

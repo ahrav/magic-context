@@ -49,6 +49,17 @@ function seedSession(
             "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, 'u1', 'user', ?)",
         )
         .run(sessionId, userOrdinal, userText);
+    // Production indexes both tables together (`message-index.ts`), and
+    // corroboration joins them to scope message text by harness, so a fixture
+    // that seeds only the FTS side would silently supply no user texts.
+    database
+        .prepare(
+            `INSERT INTO message_history_source
+                (session_id, message_id, message_ordinal, source_version,
+                 normalized_content_hash, role, harness, updated_at)
+             VALUES (?, 'u1', ?, 'v1', ?, 'user', 'opencode', 1)`,
+        )
+        .run(sessionId, userOrdinal, `hash-${sessionId}-${userOrdinal}`);
     return compartmentId;
 }
 
@@ -288,6 +299,45 @@ describe("historian trajectory-correction anti-memory harvest", () => {
                 .prepare("SELECT COUNT(*) AS count FROM observations WHERE extracted_text LIKE ?")
                 .get("%air-gapped installs%"),
         ).toEqual({ count: 0 });
+    });
+
+    test("never corroborates trust from another harness's messages on the same session id", () => {
+        db = createClaimReaderTestDatabase();
+        const evidenceQuote = "the cache must remain offline capable for air-gapped installs";
+        // The event belongs to opencode and its own span carries no user message.
+        const compartmentId = seedSession(db, "ses-xh", "unrelated opencode chatter", 1);
+        db.prepare("DELETE FROM message_history_fts WHERE session_id = ?").run("ses-xh");
+        db.prepare("DELETE FROM message_history_source WHERE session_id = ?").run("ses-xh");
+        // A pi message on the SAME session id sits inside the same ordinal span
+        // and contains the evidence quote verbatim. It must not be visible here.
+        db.prepare(
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'pi1', 'user', ?)",
+        ).run("ses-xh", evidenceQuote);
+        db.prepare(
+            `INSERT INTO message_history_source
+                (session_id, message_id, message_ordinal, source_version,
+                 normalized_content_hash, role, harness, updated_at)
+             VALUES (?, 'pi1', 1, 'v1', 'h', 'user', 'pi', 1)`,
+        ).run("ses-xh");
+        insertCompartmentEvents(
+            db,
+            "ses-xh",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    fields: correctionFields({ evidence: evidenceQuote }),
+                },
+            ],
+            [compartmentId],
+        );
+
+        expect(runHarvest()).toMatchObject({ consumed: 1, skipped: 0 });
+        // Trust must stay model_inference: the only message matching the
+        // evidence quote belongs to the other harness.
+        expect(
+            db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
+        ).toEqual({ trust: "model_inference" });
     });
 
     test("never harvests an event whose harness binds the session to another project", () => {
