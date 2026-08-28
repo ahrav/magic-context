@@ -317,6 +317,38 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         expect(againstRecordedChunk.score.recall).toBe(1);
     });
 
+    test("a replayed chunk scopes the gold minimum to the authored span, like scoreRunRecord", () => {
+        // Two compartments in the replayed runtime chunk, only one of which
+        // intersects the authored transcript. Both entry points must agree that
+        // gold's minimum of 2 is unmet.
+        const base = validScenario();
+        const scenario: HistorianEvalScenario = {
+            ...base,
+            gold: { ...base.gold, compartments: { minCount: 2 } },
+        };
+        const output = buildMockHistorianOutput({
+            compartments: [
+                { start: 21, end: 28, title: "Authored", body: "Chose the in-process LRU cache over Redis; capacity 4096." },
+                { start: 29, end: 40, title: "Padding", body: "Housekeeping acknowledged." },
+            ],
+            facts: goldFacts(),
+        });
+        const result = scoreRawOutput(output, scenario, {
+            chunkStartOrdinal: 21,
+            chunkEndOrdinal: 40,
+            authoredStartOrdinal: 21,
+            authoredEndOrdinal: 28,
+        });
+        expect(result.stage).toBe("scored");
+        if (result.stage !== "scored") return;
+        expect(result.score.failReasons).toContain("structural");
+        expect(
+            result.score.structuralFindings.some((finding) =>
+                finding.includes("1 persisted across the authored transcript"),
+            ),
+        ).toBe(true);
+    });
+
     test("a chunk range supplied half-way is a caller error, not a silent authored-space fallback", () => {
         expect(() => scoreRawOutput(goldenRawOutput(), validScenario(), { chunkStartOrdinal: 21 })).toThrow(
             /chunkStartOrdinal and chunkEndOrdinal must be supplied together/,
@@ -476,8 +508,8 @@ describe("scoreRunRecord", () => {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
-                    goldenRun({ status: "failed", failureReason: "validation failed", rawOutput: "garbage" }),
-                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation failed", rawOutput: "garbage" }),
+                    goldenRun({ status: "failed", failureReason: "validation: no parsable compartment", rawOutput: "garbage" }),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation: no parsable compartment", rawOutput: "garbage" }),
                 ],
             });
             const score = scoreRunRecord(record, scenario);
@@ -541,8 +573,8 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario, {
                 error: { reason: "script-drift", detail: "2 scripted turns never consumed" },
                 historianRuns: [
-                    goldenRun({ status: "failed", failureReason: "validation failed" }),
-                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation failed" }),
+                    goldenRun({ status: "failed", failureReason: "validation: no parsable compartment" }),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation: no parsable compartment" }),
                 ],
             });
             const score = scoreRunRecord(record, scenario);
@@ -803,6 +835,70 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a stored record carrying a run that never evaluated the historian is ERROR", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            // The runner rejects these while driving, but an independently
+            // stored record never passes through those guards, and the run keeps
+            // its expected index so the inventory check sees nothing wrong.
+            const noop = makeRecord(fixture, scenario, {
+                historianRuns: [goldenRun(), goldenRun({ runIndex: 2, status: "noop" })],
+            });
+            expect(scoreRunRecord(noop, scenario).errorReason).toBe("record-runs-incomplete");
+
+            const infraFailure = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun(),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "stale_snapshot" }),
+                ],
+            });
+            expect(scoreRunRecord(infraFailure, scenario).errorReason).toBe("record-runs-incomplete");
+
+            // A validation failure is model behavior and stays scoreable.
+            const invalid = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun(),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation: no parsable compartment" }),
+                ],
+            });
+            expect(scoreRunRecord(invalid, scenario).verdict).not.toBe("ERROR");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("record-controlled authored ordinals are validated against the scenario", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // Each of these would otherwise widen or disable the authored-span
+            // scoping that decides which compartments count toward gold.
+            for (const ordinals of [
+                [] as Array<[number, number]>,
+                [[1, 8]] as Array<[number, number]>,
+                [
+                    [1, 2],
+                    [3, 4],
+                    [5, 6],
+                ] as Array<[number, number]>,
+                [
+                    [1, 20],
+                    [3, 4],
+                    [5, 6],
+                    [7, 8],
+                ] as Array<[number, number]>,
+            ]) {
+                const score = scoreRunRecord({ ...record, authoredTurnOrdinals: ordinals }, scenario);
+                expect(score.verdict).toBe("ERROR");
+                expect(score.errorReason).toBe("record-scenario-mismatch");
+            }
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an edited recorded claim is caught even when its locator and public id still match", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -912,7 +1008,7 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ discardedLast: true }),
-                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation failed" }),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation: no parsable compartment" }),
                 ],
             });
             const score = scoreRunRecord(record, scenario);
@@ -1142,6 +1238,12 @@ describe("buildLaneReport", () => {
         };
         expect(JSON.stringify(permuted)).not.toBe(JSON.stringify(system));
         expect(() => buildLaneReport([{ ...passScore("hse-a"), system: permuted }], { system })).not.toThrow();
+    });
+
+    test("an empty score set is refused rather than reported green", () => {
+        // `some` is false on an empty list, so this would otherwise be non-red
+        // and exit 0 having evaluated nothing.
+        expect(() => buildLaneReport([])).toThrow(/empty lane report cannot be green/);
     });
 
     test("a duplicated scenario score is refused rather than double-weighted", () => {

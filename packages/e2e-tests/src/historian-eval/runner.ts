@@ -887,6 +887,7 @@ class ScenarioRunner {
     ): Promise<HistorianRunArtifact> {
         const trigger = this.scenario.trigger;
         const invocationsBefore = this.countHistorianInvocations(harness, sessionId);
+        const markerHitsBefore = this.historianMarkerMockHits;
 
         await this.scriptedTurn(
             harness,
@@ -918,10 +919,27 @@ class ScenarioRunner {
         if (row.status === "failed" && /lease/i.test(row.failure_reason ?? "")) {
             throw new RunAbort("lease-lost", row.failure_reason ?? "lease lost");
         }
-        if (this.options.mode.kind === "live" && this.historianMarkerMockHits > 0) {
+        // Fallback detection must not consume the evidence it sits in front of.
+        //
+        // Production's fallback chain ends at the live SESSION model as a last
+        // resort, and this runner drives the source session with the
+        // MockProvider — so a live historian that returns invalid output on both
+        // its attempts necessarily lands a marker request on the mock. Aborting
+        // on that alone converted precisely the live model behavior this lane
+        // measures into `ERROR:fallback-engaged`, so `FAIL:invalid-output` could
+        // never be recorded for a live run. A row that already failed validation
+        // is that evidence, and it takes precedence.
+        //
+        // Counted per run rather than cumulatively: the marker counter spans the
+        // whole scenario, so an earlier run's fallback would otherwise abort a
+        // later, healthy one.
+        const markerHitsDuringRun = this.historianMarkerMockHits - markerHitsBefore;
+        const failedValidation =
+            row.status === "failed" && (row.failure_reason ?? "").startsWith("validation: ");
+        if (this.options.mode.kind === "live" && markerHitsDuringRun > 0 && !failedValidation) {
             throw new RunAbort(
                 "fallback-engaged",
-                `${this.historianMarkerMockHits} historian-marker request(s) reached the MockProvider during a live run`,
+                `${markerHitsDuringRun} historian-marker request(s) reached the MockProvider during a live run`,
             );
         }
         // `status: "failed"` is not by itself model behavior. Production records
@@ -945,7 +963,7 @@ class ScenarioRunner {
                 `historian run ${runIndex} recorded a no-op (${row.failure_reason ?? "no reason recorded"}); no historian request was made`,
             );
         }
-        if (row.status === "failed" && !(row.failure_reason ?? "").startsWith("validation: ")) {
+        if (row.status === "failed" && !failedValidation) {
             throw new RunAbort(
                 "harness-failure",
                 `historian run ${runIndex} failed for a non-validation reason: ${row.failure_reason ?? "<none recorded>"}`,
@@ -1405,7 +1423,18 @@ class ScenarioRunner {
         if (!Array.isArray(parsed)) {
             throw new RunAbort("harness-failure", `probe injection metadata is not an array: ${typeof parsed}`);
         }
-        return parsed.filter((entry): entry is string => typeof entry === "string");
+        // Filtering a wrong-typed entry out would reproduce the same silent
+        // evidence loss one level down: `[42]` would become an empty injected
+        // set, and a correctly answered exact or multiple-choice probe passes
+        // without ever consulting locators.
+        const malformed = parsed.filter((entry) => typeof entry !== "string");
+        if (malformed.length > 0) {
+            throw new RunAbort(
+                "harness-failure",
+                `probe injection metadata has ${malformed.length} non-string entr(ies): ${JSON.stringify(malformed.slice(0, 3))}`,
+            );
+        }
+        return parsed as string[];
     }
 
     /**

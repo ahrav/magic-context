@@ -365,16 +365,35 @@ const RAW_OUTPUT_PROJECT_IDENTITY = "dir:/historian-eval/raw-output";
  * Pass `chunkStartOrdinal`/`chunkEndOrdinal` when replaying a captured
  * artifact; see `syntheticChunk` for why the recorded ordinals are required
  * there and the authored-transcript default is not.
+ *
+ * `authoredStartOrdinal`/`authoredEndOrdinal` scope gold's compartment minimum
+ * to the authored transcript, as `scoreRunRecord` does from the record's
+ * `authoredTurnOrdinals`. A replayed runtime chunk spans harness-owned filler
+ * and padding, so without them this seam would count compartments toward the
+ * minimum that `scoreRunRecord` excludes — the same structural output scoring
+ * differently through the two entry points. The authored-transcript default
+ * needs no span because there the chunk IS the authored space.
  */
 export function scoreRawOutput(
     rawOutput: string,
     scenario: HistorianEvalScenario,
-    options: { nowMs?: number; chunkStartOrdinal?: number; chunkEndOrdinal?: number } = {},
+    options: {
+        nowMs?: number;
+        chunkStartOrdinal?: number;
+        chunkEndOrdinal?: number;
+        authoredStartOrdinal?: number;
+        authoredEndOrdinal?: number;
+    } = {},
 ): RawOutputStageResult {
     const nowMs = options.nowMs ?? Date.now();
     const hasRange = options.chunkStartOrdinal !== undefined || options.chunkEndOrdinal !== undefined;
     if (hasRange && (options.chunkStartOrdinal === undefined || options.chunkEndOrdinal === undefined)) {
         throw new Error("historian-eval scorer: chunkStartOrdinal and chunkEndOrdinal must be supplied together");
+    }
+    const hasAuthoredSpan =
+        options.authoredStartOrdinal !== undefined || options.authoredEndOrdinal !== undefined;
+    if (hasAuthoredSpan && (options.authoredStartOrdinal === undefined || options.authoredEndOrdinal === undefined)) {
+        throw new Error("historian-eval scorer: authoredStartOrdinal and authoredEndOrdinal must be supplied together");
     }
     const chunk = syntheticChunk(
         scenario,
@@ -382,6 +401,15 @@ export function scoreRawOutput(
             ? { startOrdinal: options.chunkStartOrdinal as number, endOrdinal: options.chunkEndOrdinal as number }
             : null,
     );
+    // Default: the chunk is the authored transcript, so it is its own span.
+    const authoredSpan = hasAuthoredSpan
+        ? {
+              startMessage: options.authoredStartOrdinal as number,
+              endMessage: options.authoredEndOrdinal as number,
+          }
+        : hasRange
+          ? null
+          : { startMessage: chunk.startIndex, endMessage: chunk.endIndex };
     const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, chunk, [], 1);
     if (!validated.ok) {
         return { stage: "validation-rejected", error: validated.error };
@@ -427,6 +455,7 @@ export function scoreRawOutput(
                     rows,
                     scenario.gold.compartments.minCount,
                     chunk.startIndex > 1 ? { startMessage: 1, endMessage: chunk.startIndex - 1 } : null,
+                    authoredSpan,
                 ),
                 probeVerdicts: [],
                 allAttemptsInvalid: false,
@@ -465,8 +494,9 @@ function errorScore(
 
 /**
  * Ordinal span the scenario's authored turns occupy in the rendered transcript,
- * from the record's own `authoredTurnOrdinals`. Null when the record carries
- * none, which leaves the count unscoped rather than silently empty.
+ * from the record's own `authoredTurnOrdinals`, which `recordIdentityError` has
+ * already validated against the scenario. Null only for a scenario with no
+ * authored turns, where there is no span to scope to.
  */
 function authoredOrdinalSpan(
     record: HistorianEvalRunRecord,
@@ -538,6 +568,28 @@ function recordIdentityError(
             record.system,
         );
     }
+    // `authoredTurnOrdinals` decides which compartments count toward gold's
+    // minimum, and nothing else binds it: the fingerprint covers the scenario,
+    // not the record's copy of the rendered layout. An empty array falls back to
+    // counting every filler and padding compartment, and a widened pair does the
+    // same, so the field is checked against the shape the runner can produce —
+    // one pair per authored turn, each `[u, u + 1]`, successive pairs two apart,
+    // the first offset by a whole number of harness-owned filler turns.
+    const ordinals = record.authoredTurnOrdinals;
+    const turnCount = scenario.transcript.turns.length;
+    const wellFormed =
+        ordinals.length === turnCount &&
+        ordinals.every(([user, assistant]) => Number.isInteger(user) && assistant === user + 1) &&
+        ordinals.every(([user], index) => index === 0 || user === ordinals[index - 1][0] + 2) &&
+        (turnCount === 0 || (ordinals[0][0] >= 1 && (ordinals[0][0] - 1) % 2 === 0));
+    if (!wellFormed) {
+        return errorScore(
+            record.scenarioId,
+            "record-scenario-mismatch",
+            `run record's authoredTurnOrdinals do not describe ${turnCount} authored turn(s) of the rendered transcript: ${JSON.stringify(ordinals)}`,
+            record.system,
+        );
+    }
     return null;
 }
 
@@ -556,6 +608,26 @@ function recordInventoryError(record: HistorianEvalRunRecord): ScenarioScore | n
             record.scenarioId,
             "record-runs-incomplete",
             `run record declares ${record.expectedHistorianRuns} historian run(s) but carries indices [${indices.join(", ")}]`,
+            record.system,
+        );
+    }
+    // Indices alone do not prove a run evaluated the historian. The runner
+    // rejects a `noop` row and a non-validation failure while it is driving the
+    // scenario, but an independently stored record never passes through those
+    // guards — and such a run keeps its expected index, so the check above sees
+    // nothing wrong. Left unchecked, `[success, noop]` scores a normal PASS off
+    // the successful run's snapshot for a declared run that never ran.
+    const nonExecuted = record.historianRuns.filter(
+        (run) => run.status !== "success" && !(run.status === "failed" && (run.failureReason ?? "").startsWith("validation: ")),
+    );
+    if (nonExecuted.length > 0) {
+        return errorScore(
+            record.scenarioId,
+            "record-runs-incomplete",
+            `run record carries ${nonExecuted.length} run(s) that did not evaluate the historian: ` +
+                nonExecuted
+                    .map((run) => `run ${run.runIndex} ${run.status}${run.failureReason === null ? "" : ` (${run.failureReason})`}`)
+                    .join(", "),
             record.system,
         );
     }
@@ -858,6 +930,13 @@ export function buildLaneReport(
     scores: readonly ScenarioScore[],
     options: { releaseVersion?: string; system?: SystemVersionTuple } = {},
 ): LaneReport {
+    // A report over no scenarios is a broken invocation — failed discovery,
+    // artifact loading, or over-filtering — not a green run. `some` is false on
+    // an empty list, so it would otherwise be non-red and exit 0 having
+    // evaluated nothing.
+    if (scores.length === 0) {
+        throw new Error("historian-eval report: no scenario scores; an empty lane report cannot be green");
+    }
     const system = resolveReportSystem(scores, options.system);
     // One result per frozen scenario. A duplicate — an original plus a retry of
     // the same scenario, say — is weighted twice in every micro-averaged rate
