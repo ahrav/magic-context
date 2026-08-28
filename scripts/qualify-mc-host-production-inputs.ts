@@ -32,7 +32,10 @@
 import { createHash } from "node:crypto";
 import {
     closeSync,
+    constants as fsConstants,
     existsSync,
+    fstatSync,
+    lstatSync,
     mkdirSync,
     openSync,
     readFileSync,
@@ -41,12 +44,14 @@ import {
     statSync,
     writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { dirname, isAbsolute, join, normalize, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 import {
     buildContract,
     canonicalJson,
+    compareDotted,
     evaluatePlatform,
     exactKeysAsserter,
     generate as generateReleaseOutputs,
@@ -66,6 +71,9 @@ export const OUTPUT_PATHS = {
     lock: "release/mc-host-production-inputs.lock.json",
     credentials: "release/mc-host-provider-credentials.json",
     evidence: "docs/evidence/mc-host-release-qualification.json",
+    closureCatalog:
+        "packages/plugin/src/shared/mc-host-lifecycle/generated-production-inputs.ts",
+    closureCatalogRust: "release/generated/mc-host-harness-closures.rs",
 } as const;
 
 const RELEASE_CONTRACT_PATH = "release/mc-host-release.json";
@@ -150,7 +158,7 @@ export const QUALIFICATION_PINS = {
             procfs_self_fd_exec: true,
         },
     },
-    harness_runtimes: { bun: "1.3.14", node: "24.x", npm: "11.x" },
+    harness_runtimes: { bun: "1.3.14", node: "24.18.0", npm: "11.x" },
     install_layouts: [
         "bun_physical_link",
         "compiled_bun_external",
@@ -282,6 +290,55 @@ export const VALUE_CAP_BYTES = 16384;
 export const ROW_CAP_BYTES = 65536;
 
 const VARIABLE_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+
+export const HARNESS_CLOSURE_SCHEMA =
+    "magic-context.mc-host-harness-closure/v1";
+
+// The closure manifest's closed sets, published into the credentials doc's
+// `closure_manifest_schema` and enforced verbatim by
+// `validateClosureManifest`. Field lists are alphabetical because the
+// published document is canonically sorted.
+export const HARNESS_CLOSURE_MANIFEST_FIELDS = [
+    "argument_variant",
+    "entrypoint",
+    "executable",
+    "extensions",
+    "harness",
+    "interpreter",
+    "nodes",
+    "package",
+    "schema",
+    "source_roots",
+    "version",
+] as const;
+
+export const HARNESS_CLOSURE_NODE_FIELDS = [
+    "dependencies",
+    "kind",
+    "mode",
+    "path",
+    "sha256",
+    "size_bytes",
+    "source_path",
+    "source_root",
+] as const;
+
+export const HARNESS_CLOSURE_DEPENDENCY_FIELDS = ["kind", "path"] as const;
+
+export const HARNESS_CLOSURE_NODE_KINDS = [
+    "data",
+    "executable",
+    "extension",
+    "interpreter",
+    "module",
+    "native_addon",
+] as const;
+
+export const HARNESS_CLOSURE_DEPENDENCY_KINDS = [
+    "finite_dynamic",
+    "native",
+    "static",
+] as const;
 
 const CREDENTIALS_DOC = {
     schema: "magic-context.mc-host-provider-credentials/v1",
@@ -516,24 +573,22 @@ const CREDENTIALS_DOC = {
     },
     // Closed harness runtime-closure manifest schema (KTD21). U2 materializes a
     // daemon-owned content-addressed closure matching this shape; runtime code
-    // never discovers new dependencies.
+    // never discovers new dependencies. Every closed set below is the same
+    // constant `validateClosureManifest` enforces, so the published schema
+    // and the enforced schema cannot drift apart.
     closure_manifest_schema: {
-        id: "magic-context.mc-host-harness-closure/v1",
+        id: HARNESS_CLOSURE_SCHEMA,
         closed: true,
-        fields: [
-            "entrypoint",
-            "extensions",
-            "harness",
-            "interpreter",
-            "modules",
-            "native_addons",
-            "package",
-            "version",
-        ],
+        fields: HARNESS_CLOSURE_MANIFEST_FIELDS,
         node: {
-            fields: ["path", "sha256"],
+            fields: HARNESS_CLOSURE_NODE_FIELDS,
             path_rules: ["relative", "no_parent_segments", "no_symlink_escape"],
         },
+        dependency: {
+            fields: HARNESS_CLOSURE_DEPENDENCY_FIELDS,
+            kinds: HARNESS_CLOSURE_DEPENDENCY_KINDS,
+        },
+        node_kinds: HARNESS_CLOSURE_NODE_KINDS,
         extensions_ordered: true,
         rules: {
             finite_dynamic_imports_only: true,
@@ -917,6 +972,7 @@ export function renderArgumentVariant(
 // ---------------------------------------------------------------------------
 
 export const INPUT_KEYS = [
+    "bundle_manifest",
     "config",
     "corpus",
     "model_onnx",
@@ -937,6 +993,9 @@ const JSON_SHAPED_INPUTS: ReadonlySet<string> = new Set([
 ]);
 
 const APPROVED_SPDX = ["Apache-2.0", "MIT"] as const;
+const PRODUCTION_LICENSE_APPROVERS = [
+    "mc-host U9 SPDX allowlist",
+] as const;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 /**
  * Ref names that identify a moving target rather than one immutable revision.
@@ -1167,6 +1226,137 @@ function resolveVerifyPath(
     return resolved;
 }
 
+const QUALIFIED_NONLITERAL_DYNAMIC_IMPORT_SITES: ReadonlyMap<
+    string,
+    {
+        sha256: string;
+        expressions: readonly string[];
+        mode: "finite" | "builtin" | "unsupported_provider" | "host_extension";
+        targets: readonly string[];
+    }
+> = new Map([
+    [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/api/bedrock-converse-stream.lazy.js",
+        {
+            sha256: "fc0052380edeeb83d148d89030ed47762bebde39f25f71c6632a1a883c7ab8fd",
+            expressions: [
+                "import(__rewriteRelativeImportExtension(runtimeSpecifier))",
+            ],
+            mode: "unsupported_provider",
+            targets: ["./bedrock-converse-stream.js"],
+        },
+    ],
+    [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js",
+        {
+            sha256: "0333478c984f786afe17e6a22d3da8bcf0528f83dccfcdf8e28abb071aae4a37",
+            expressions: [
+                "import(__rewriteRelativeImportExtension(specifier))",
+            ],
+            mode: "builtin",
+            targets: ["node:os"],
+        },
+    ],
+    [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/auth/context.js",
+        {
+            sha256: "5d0ea91a2fd2acf84e3b9717ce59e75006933c68d8efa91873894a9d963d41a0",
+            expressions: [
+                "import(__rewriteRelativeImportExtension(specifier))",
+            ],
+            mode: "builtin",
+            targets: ["node:fs/promises", "node:os"],
+        },
+    ],
+    [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/env-api-keys.js",
+        {
+            sha256: "102c2b8622b18c8fc3e1f961e5cc2a6c83104a85c5d693f08e419a05d99beaac",
+            expressions: [
+                "import(__rewriteRelativeImportExtension(specifier))",
+            ],
+            mode: "builtin",
+            targets: ["node:fs", "node:os", "node:path"],
+        },
+    ],
+    [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/utils/oauth/load.js",
+        {
+            sha256: "235f9498265ebd02edfce4d4ec6a5542892fc17e300700a19eeefee5219929a7",
+            expressions: [
+                "import(__rewriteRelativeImportExtension(runtimeSpecifier))",
+            ],
+            mode: "finite",
+            targets: [
+                "./anthropic.js",
+                "./github-copilot.js",
+                "./openai-codex.js",
+            ],
+        },
+    ],
+    [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti-static.mjs",
+        {
+            sha256: "0d873b8be0c9e08e1136ea428175de8cf8a200c67b6b83283a009b3f46ff4a3a",
+            expressions: ["import(id)"],
+            mode: "host_extension",
+            targets: [
+                "embedded:pi-broca-extension:16814ddc9b0578e0f53cdf324d4624066b1e59d5c33276d2590d937a2a601b3a",
+            ],
+        },
+    ],
+]);
+
+export type HarnessClosureName = "opencode" | "pi";
+export type HarnessClosureNodeKind =
+    (typeof HARNESS_CLOSURE_NODE_KINDS)[number];
+export type HarnessClosureDependencyKind =
+    (typeof HARNESS_CLOSURE_DEPENDENCY_KINDS)[number];
+
+export interface HarnessClosureDependency {
+    path: string;
+    kind: HarnessClosureDependencyKind;
+}
+
+export interface HarnessClosureNode {
+    path: string;
+    source_root: string;
+    source_path: string;
+    kind: HarnessClosureNodeKind;
+    mode: number;
+    size_bytes: number;
+    sha256: string;
+    dependencies: HarnessClosureDependency[];
+}
+
+export interface HarnessClosureManifest {
+    schema: typeof HARNESS_CLOSURE_SCHEMA;
+    harness: HarnessClosureName;
+    package: string;
+    version: string;
+    argument_variant: string;
+    source_roots: string[];
+    executable: string | null;
+    interpreter: string | null;
+    entrypoint: string | null;
+    extensions: string[];
+    nodes: HarnessClosureNode[];
+}
+
+interface HarnessSource {
+    package: string;
+    version: string | null;
+    unqualified_reason?: string;
+    closure?: HarnessClosureManifest;
+    closure_manifest?: {
+        path: string;
+        sha256: string;
+    };
+    closure_platforms?: string[];
+    closure_verify_roots?: Record<string, string>;
+    closure_unqualified_reason?: string;
+}
+
 interface QualifiedArtifact {
     qualified: true;
     source: string;
@@ -1196,6 +1386,9 @@ export interface OracleEvidence {
         target: string;
         kernel: string;
         glibc: string;
+        /** Whether the recorded kernel and glibc are the certified floor exactly
+         *  rather than merely at or above it. */
+        exact_floor: boolean;
         /** The certified Linux lane executes the sealed ORT object through
          *  `/proc/self/fd`; an oracle on a host that cannot must not qualify it. */
         procfs_self_fd_exec: boolean;
@@ -1221,6 +1414,28 @@ export interface OracleEvidence {
      * oracle then names bytes that are no longer in the lock.
      */
     bound_inputs: Record<string, string>;
+    smoke_report: {
+        path: string;
+        sha256: string;
+    };
+}
+
+interface SynapseSmokeReport {
+    schema: "magic-context.mc-host-synapse-smoke/v1";
+    mode: "production";
+    model_fingerprint: string;
+    table_epoch: number;
+    execution_provider: string;
+    host: OracleEvidence["host"];
+    inputs: Record<"ort_runtime" | "model_onnx" | "bundle_manifest" | "semantic_corpus", string>;
+    observed_vectors: number;
+    max_abs_error: number;
+    tolerance: number;
+    operations: string[];
+    restart_fenced: boolean;
+    degraded_isolated: boolean;
+    durable_receipts: boolean;
+    network_access: string;
 }
 
 export interface SourceManifest {
@@ -1231,21 +1446,334 @@ export interface SourceManifest {
     inputs: Record<(typeof INPUT_KEYS)[number], ArtifactSource>;
     oracle: OracleEvidence | null;
     harnesses: {
-        opencode: {
-            package: string;
-            version: string | null;
-            unqualified_reason?: string;
-        };
-        pi: {
-            package: string;
-            version: string | null;
-            unqualified_reason?: string;
-        };
+        opencode: HarnessSource;
+        pi: HarnessSource;
     };
 }
 
-function isPlaceholderSha256(hash: string): boolean {
+export function isPlaceholderSha256(hash: string): boolean {
     return /^(.)\1{63}$/.test(hash);
+}
+
+function assertSafeRelativePath(value: unknown, where: string): asserts value is string {
+    if (
+        typeof value !== "string" ||
+        value.length === 0 ||
+        value.startsWith("/") ||
+        value.endsWith("/") ||
+        value.includes("\\") ||
+        value.includes("\0")
+    ) {
+        fail(`${where} must be a safe relative POSIX path`);
+    }
+    const segments = value.split("/");
+    if (
+        segments.some(
+            (segment) =>
+                segment.length === 0 || segment === "." || segment === "..",
+        )
+    ) {
+        fail(`${where} must be a safe relative POSIX path without dot segments`);
+    }
+}
+
+function assertNullableSafeRelativePath(
+    value: unknown,
+    where: string,
+): asserts value is string | null {
+    if (value !== null) assertSafeRelativePath(value, where);
+}
+
+function assertSortedUnique(
+    values: readonly string[],
+    where: string,
+): void {
+    for (let index = 0; index < values.length; index += 1) {
+        const value = values[index];
+        if (index > 0 && values[index - 1] >= value) {
+            fail(`${where} must be sorted and unique`);
+        }
+    }
+}
+
+function expectedHarnessPackage(harness: HarnessClosureName): string {
+    return CREDENTIALS_DOC.harnesses[harness].package;
+}
+
+/**
+ * Validate one closed, content-addressable harness closure graph.
+ *
+ * The graph is sorted to make its identity reproducible. Extension order is
+ * intentionally semantic and is therefore preserved rather than sorted.
+ */
+export function validateClosureManifest(
+    manifest: unknown,
+    expected?: {
+        harness: HarnessClosureName;
+        package: string;
+        version: string;
+    },
+): asserts manifest is HarnessClosureManifest {
+    assertExactKeys(manifest, [...HARNESS_CLOSURE_MANIFEST_FIELDS], "closure");
+    const closure = manifest as HarnessClosureManifest;
+    if (closure.schema !== HARNESS_CLOSURE_SCHEMA) {
+        fail("closure: unknown schema");
+    }
+    if (closure.harness !== "opencode" && closure.harness !== "pi") {
+        fail("closure: harness must be opencode or pi");
+    }
+    if (closure.package !== expectedHarnessPackage(closure.harness)) {
+        fail(
+            `closure: package must be ${expectedHarnessPackage(closure.harness)} for ${closure.harness}`,
+        );
+    }
+    if (!/^\d+\.\d+\.\d+$/.test(closure.version)) {
+        fail("closure: version must be exact semver");
+    }
+    const variants =
+        CREDENTIALS_DOC.harnesses[closure.harness].argument_variants.variants;
+    if (!(closure.argument_variant in variants)) {
+        fail(
+            `closure: argument_variant ${JSON.stringify(closure.argument_variant)} is not qualified for ${closure.harness}`,
+        );
+    }
+    if (expected !== undefined) {
+        if (
+            closure.harness !== expected.harness ||
+            closure.package !== expected.package ||
+            closure.version !== expected.version
+        ) {
+            fail("closure: identity does not match its harness source record");
+        }
+    }
+
+    if (
+        !Array.isArray(closure.source_roots) ||
+        closure.source_roots.length === 0
+    ) {
+        fail("closure.source_roots must be a non-empty array");
+    }
+    for (const [index, root] of closure.source_roots.entries()) {
+        if (
+            typeof root !== "string" ||
+            !/^[a-z][a-z0-9_-]*$/.test(root)
+        ) {
+            fail(
+                `closure.source_roots[${index}] must be a lowercase source-root id`,
+            );
+        }
+    }
+    assertSortedUnique(closure.source_roots, "closure.source_roots");
+
+    assertNullableSafeRelativePath(closure.executable, "closure.executable");
+    assertNullableSafeRelativePath(closure.interpreter, "closure.interpreter");
+    assertNullableSafeRelativePath(closure.entrypoint, "closure.entrypoint");
+    if (!Array.isArray(closure.extensions)) {
+        fail("closure.extensions must be an array");
+    }
+    const extensionSet = new Set<string>();
+    for (const [index, extension] of closure.extensions.entries()) {
+        assertSafeRelativePath(extension, `closure.extensions[${index}]`);
+        if (extensionSet.has(extension)) {
+            fail("closure.extensions must be unique while preserving order");
+        }
+        extensionSet.add(extension);
+    }
+
+    if (!Array.isArray(closure.nodes) || closure.nodes.length === 0) {
+        fail("closure.nodes must be a non-empty array");
+    }
+    const nodes = new Map<string, HarnessClosureNode>();
+    for (const [index, node] of closure.nodes.entries()) {
+        const where = `closure.nodes[${index}]`;
+        assertExactKeys(node, [...HARNESS_CLOSURE_NODE_FIELDS], where);
+        assertSafeRelativePath(node.path, `${where}.path`);
+        assertSafeRelativePath(node.source_path, `${where}.source_path`);
+        if (!closure.source_roots.includes(node.source_root)) {
+            fail(`${where}.source_root does not name a declared source root`);
+        }
+        if (
+            !(HARNESS_CLOSURE_NODE_KINDS as readonly unknown[]).includes(
+                node.kind,
+            )
+        ) {
+            fail(`${where}.kind is not a qualified node kind`);
+        }
+        const expectedMode =
+            node.kind === "executable" || node.kind === "interpreter"
+                ? 0o700
+                : 0o600;
+        if (node.mode !== expectedMode) {
+            fail(`${where}.mode must be owner-only ${expectedMode.toString(8)}`);
+        }
+        if (
+            !Number.isSafeInteger(node.size_bytes) ||
+            node.size_bytes < 0
+        ) {
+            fail(`${where}.size_bytes must be a non-negative integer`);
+        }
+        if (
+            typeof node.sha256 !== "string" ||
+            !SHA256_RE.test(node.sha256) ||
+            isPlaceholderSha256(node.sha256)
+        ) {
+            fail(`${where}.sha256 must be a real 64-lowercase-hex digest`);
+        }
+        if (!Array.isArray(node.dependencies)) {
+            fail(`${where}.dependencies must be an array`);
+        }
+        const dependencyKeys: string[] = [];
+        const dependencyPaths = new Set<string>();
+        for (const [dependencyIndex, dependency] of node.dependencies.entries()) {
+            const dependencyWhere = `${where}.dependencies[${dependencyIndex}]`;
+            assertExactKeys(
+                dependency,
+                [...HARNESS_CLOSURE_DEPENDENCY_FIELDS],
+                dependencyWhere,
+            );
+            assertSafeRelativePath(dependency.path, `${dependencyWhere}.path`);
+            if (
+                !(
+                    HARNESS_CLOSURE_DEPENDENCY_KINDS as readonly unknown[]
+                ).includes(dependency.kind)
+            ) {
+                fail(`${dependencyWhere}.kind is not a qualified dependency kind`);
+            }
+            if (dependencyPaths.has(dependency.path)) {
+                fail(`${where}.dependencies must name each target once`);
+            }
+            dependencyPaths.add(dependency.path);
+            dependencyKeys.push(`${dependency.path}\0${dependency.kind}`);
+        }
+        assertSortedUnique(dependencyKeys, `${where}.dependencies`);
+        if (nodes.has(node.path)) {
+            fail("closure.nodes paths must be unique");
+        }
+        nodes.set(node.path, node);
+    }
+    assertSortedUnique(
+        closure.nodes.map((node) => node.path),
+        "closure.nodes",
+    );
+
+    const requiredRoots: [string, string | null, HarnessClosureNodeKind][] = [];
+    if (closure.harness === "opencode") {
+        if (
+            closure.executable === null ||
+            closure.interpreter !== null ||
+            closure.entrypoint !== null ||
+            closure.extensions.length !== 0
+        ) {
+            fail(
+                "closure: opencode requires only one executable root and no extensions",
+            );
+        }
+        requiredRoots.push(["executable", closure.executable, "executable"]);
+    } else {
+        if (
+            closure.executable !== null ||
+            closure.interpreter === null ||
+            closure.entrypoint === null
+        ) {
+            fail(
+                "closure: pi requires interpreter and entrypoint roots without an executable root",
+            );
+        }
+        requiredRoots.push(
+            ["interpreter", closure.interpreter, "interpreter"],
+            ["entrypoint", closure.entrypoint, "module"],
+        );
+        for (const extension of closure.extensions) {
+            requiredRoots.push(["extension", extension, "extension"]);
+        }
+    }
+
+    const reachable = new Set<string>();
+    const pending: string[] = [];
+    for (const [label, path, kind] of requiredRoots) {
+        const node = path === null ? undefined : nodes.get(path);
+        if (node === undefined) {
+            fail(`closure: ${label} root ${JSON.stringify(path)} is missing`);
+        }
+        if (node.kind !== kind) {
+            fail(`closure: ${label} root must have node kind ${kind}`);
+        }
+        if (
+            (kind === "executable" || kind === "interpreter") &&
+            (node.mode & 0o111) === 0
+        ) {
+            fail(`closure: ${label} root must have an executable mode`);
+        }
+        pending.push(node.path);
+    }
+
+    const nativeTargets = new Set<string>();
+    while (pending.length > 0) {
+        const path = pending.pop();
+        if (path === undefined || reachable.has(path)) continue;
+        reachable.add(path);
+        const node = nodes.get(path);
+        if (node === undefined) {
+            fail(`closure: dependency target ${JSON.stringify(path)} is missing`);
+        }
+        for (const dependency of node.dependencies) {
+            const target = nodes.get(dependency.path);
+            if (target === undefined) {
+                fail(
+                    `closure: dependency target ${JSON.stringify(dependency.path)} is missing`,
+                );
+            }
+            if (
+                (dependency.kind === "native") !==
+                (target.kind === "native_addon")
+            ) {
+                fail(
+                    `closure: native dependency kind must correspond exactly to a native_addon target`,
+                );
+            }
+            if (dependency.kind === "native") {
+                nativeTargets.add(dependency.path);
+            }
+            pending.push(dependency.path);
+        }
+    }
+    for (const node of closure.nodes) {
+        if (!reachable.has(node.path)) {
+            fail(`closure: node ${JSON.stringify(node.path)} is unreachable`);
+        }
+        if (
+            node.kind === "native_addon" &&
+            !nativeTargets.has(node.path)
+        ) {
+            fail(
+                `closure: native addon ${JSON.stringify(node.path)} lacks an explicit native dependency edge`,
+            );
+        }
+    }
+}
+
+/** Canonical bytes used as the content-addressed closure identity. */
+export function canonicalClosureManifest(
+    manifest: HarnessClosureManifest,
+): string {
+    return canonicalJson(manifest);
+}
+
+/** Deterministic SHA-256 over the canonical closure manifest bytes. */
+export function closureManifestDigest(
+    manifest: HarnessClosureManifest,
+): string {
+    return sha256Hex(canonicalClosureManifest(manifest));
+}
+
+function rustRawString(value: string): string {
+    for (let hashes = 1; hashes <= 32; hashes += 1) {
+        const fence = "#".repeat(hashes);
+        if (!value.includes(`"${fence}`)) {
+            return `r${fence}"${value}"${fence}`;
+        }
+    }
+    fail("closure manifest cannot be represented as a bounded Rust raw string");
 }
 
 /** Recursively collect every 64-hex value from the committed tiny fixture
@@ -1304,35 +1832,28 @@ function tinyFixtureHashBlacklist(
     return blacklist;
 }
 
-function validateQualifiedArtifact(
-    rootDir: string,
+/**
+ * Every immutability, credential, and reachability rule that only means anything
+ * for a retrievable `https` source.
+ *
+ * Split out of {@link validateQualifiedArtifact} because a content-addressed
+ * `urn:sha256:` input has no host, path, query, or fragment to judge: running
+ * these rules over one would reject a source its own digest already proves.
+ */
+function validateArtifactSourceUrl(
     key: string,
-    artifact: QualifiedArtifact,
+    source: string,
+    sha256: string,
     mode: SourceManifest["mode"],
-    blacklist: Set<string>,
 ): void {
-    assertExactKeys(
-        artifact,
-        [
-            "qualified",
-            "source",
-            "size_bytes",
-            "sha256",
-            "provenance",
-            "license",
-            "verify_local_path",
-        ],
-        `inputs.${key}`,
-    );
-    if (
-        typeof artifact.source !== "string" ||
-        !artifact.source.startsWith("https://")
-    ) {
-        fail(`inputs.${key}: source must be an https URL naming one artifact`);
+    if (!source.startsWith("https://")) {
+        fail(
+            `inputs.${key}: source must be an https URL naming one artifact or a urn:sha256 identity`,
+        );
     }
     // Compare per path segment so a mutable ref is caught in any position.
     // The host is excluded deliberately: only the path names the revision.
-    const sourceUrl = parseSourceUrl(key, artifact.source);
+    const sourceUrl = parseSourceUrl(key, source);
     // Judged on the parsed path rather than the spelling. A dot segment moves the
     // trailing slash out of the string — `…/<digest>/model.onnx/..` parses to
     // `/…/<digest>/` — and the digest survives as a segment, so the
@@ -1428,7 +1949,7 @@ function validateQualifiedArtifact(
     if (mode === "production") {
         const addressed = sourcePathSegments(sourceUrl).some(
             (segment) =>
-                segment.toLowerCase() === artifact.sha256 ||
+                segment.toLowerCase() === sha256 ||
                 /^[0-9a-f]{40,}$/i.test(segment),
         );
         if (!addressed) {
@@ -1447,6 +1968,43 @@ function validateQualifiedArtifact(
     // value into a malformed-escape rejection.
     for (const [, value] of sourceUrl.searchParams) {
         for (const token of value.split(/[\\/,;:@]+/)) rejectMutableRef(token);
+    }
+}
+
+function validateQualifiedArtifact(
+    rootDir: string,
+    key: string,
+    artifact: QualifiedArtifact,
+    mode: SourceManifest["mode"],
+    blacklist: Set<string>,
+): void {
+    assertExactKeys(
+        artifact,
+        [
+            "qualified",
+            "source",
+            "size_bytes",
+            "sha256",
+            "provenance",
+            "license",
+            "verify_local_path",
+        ],
+        `inputs.${key}`,
+    );
+    if (typeof artifact.source !== "string") {
+        fail(`inputs.${key}: source must be an immutable artifact identity`);
+    }
+    // A locally built input — the sealed ORT object, the bundle manifest, the
+    // semantic corpus — is not retrievable from anywhere, so it names itself by
+    // content instead of by URL. The digest *is* the identity there, so the only
+    // thing left to prove is that it agrees with the artifact's own hash; every
+    // rule in `validateArtifactSourceUrl` reads URL structure a `urn:` identity
+    // does not have.
+    const contentAddress = artifact.source.match(/^urn:sha256:([0-9a-f]{64})$/);
+    if (contentAddress === null) {
+        validateArtifactSourceUrl(key, artifact.source, artifact.sha256, mode);
+    } else if (contentAddress[1] !== artifact.sha256) {
+        fail(`inputs.${key}: content-addressed source disagrees with sha256`);
     }
     if (
         !Number.isSafeInteger(artifact.size_bytes) ||
@@ -1488,6 +2046,14 @@ function validateQualifiedArtifact(
     if (!isFilledText(license.approved_by)) {
         fail(`inputs.${key}: license approval must name an approver`);
     }
+    if (
+        mode === "production" &&
+        !(PRODUCTION_LICENSE_APPROVERS as readonly string[]).includes(
+            license.approved_by,
+        )
+    ) {
+        fail(`inputs.${key}: license approver is not a production policy`);
+    }
     const verifyPath = artifact.verify_local_path;
     if (!isFilledText(verifyPath)) {
         fail(`inputs.${key}: qualified entries must verify real local bytes`);
@@ -1498,6 +2064,7 @@ function validateQualifiedArtifact(
 export function checkOracleEvidence(
     oracle: OracleEvidence,
     contract: ReleaseContract,
+    report: SynapseSmokeReport,
     inputs: Record<(typeof INPUT_KEYS)[number], ArtifactSource>,
 ): void {
     assertExactKeys(
@@ -1514,6 +2081,7 @@ export function checkOracleEvidence(
             "vectors_compared",
             "observed_max_error",
             "bound_inputs",
+            "smoke_report",
         ],
         "oracle",
     );
@@ -1537,7 +2105,7 @@ export function checkOracleEvidence(
     // rather than as the typo it is.
     assertExactKeys(
         oracle.host,
-        ["target", "kernel", "glibc", "procfs_self_fd_exec"],
+        ["target", "kernel", "glibc", "exact_floor", "procfs_self_fd_exec"],
         "oracle.host",
     );
     if (oracle.host?.target !== "linux-x64-gnu") {
@@ -1563,6 +2131,31 @@ export function checkOracleEvidence(
             "oracle: recorded host does not satisfy the certified linux-x64-gnu lane",
         );
     }
+    if (typeof oracle.host.exact_floor !== "boolean") {
+        fail("oracle: host exact_floor must be boolean");
+    }
+    // `evaluatePlatform` above proves the host is at or above the floor. Claiming
+    // it *is* the floor is a stronger, separate statement, and only a comparison
+    // against the contract's pins can check it.
+    const linuxFloor = contract.platforms.supported.find(
+        (p) => p.target === "linux-x64-gnu",
+    );
+    if (linuxFloor === undefined || !("kernel_min" in linuxFloor)) {
+        fail("oracle: U8 contract lacks the linux floor");
+    }
+    // Compared at the floor's own precision, not by string equality: a distro
+    // spells the floor kernel `4.18.0-513.el8.x86_64`, and that host *is* at the
+    // floor. `compareDotted` is the same reader the platform gate uses, so the
+    // two cannot disagree about what a version means.
+    const atFloor = (probe: unknown, floor: string): boolean =>
+        typeof probe === "string" && compareDotted(probe, floor) === 0;
+    if (
+        oracle.host.exact_floor &&
+        (!atFloor(oracle.host.kernel, linuxFloor.kernel_min) ||
+            !atFloor(oracle.host.glibc, linuxFloor.glibc_min))
+    ) {
+        fail("oracle: exact-floor evidence must name the exact Linux floor");
+    }
     if (
         !Number.isSafeInteger(oracle.expected_vectors) ||
         oracle.expected_vectors < 1
@@ -1577,8 +2170,92 @@ export function checkOracleEvidence(
     ) {
         fail("oracle: tolerance must be finite in (0, 0.1]");
     }
-    if (oracle.network_access !== "none") {
-        fail("oracle: recorded network access must be none");
+    if (oracle.network_access !== "none" && oracle.network_access !== "available") {
+        fail("oracle: recorded network access must be none or available");
+    }
+    assertExactKeys(oracle.smoke_report, ["path", "sha256"], "oracle.smoke_report");
+    assertSafeRelativePath(oracle.smoke_report.path, "oracle.smoke_report.path");
+    if (
+        !SHA256_RE.test(oracle.smoke_report.sha256) ||
+        isPlaceholderSha256(oracle.smoke_report.sha256)
+    ) {
+        fail("oracle: smoke report must carry a real SHA-256");
+    }
+    assertExactKeys(
+        report,
+        [
+            "schema",
+            "mode",
+            "model_fingerprint",
+            "table_epoch",
+            "execution_provider",
+            "host",
+            "inputs",
+            "observed_vectors",
+            "max_abs_error",
+            "tolerance",
+            "operations",
+            "restart_fenced",
+            "degraded_isolated",
+            "durable_receipts",
+            "network_access",
+        ],
+        "oracle smoke report",
+    );
+    if (
+        report.schema !== "magic-context.mc-host-synapse-smoke/v1" ||
+        report.mode !== "production"
+    ) {
+        fail("oracle: smoke report schema or mode is invalid");
+    }
+    if (
+        report.model_fingerprint !== oracle.model_fingerprint ||
+        report.table_epoch !== oracle.table_epoch ||
+        report.execution_provider !== oracle.execution_provider ||
+        canonicalJson(report.host) !== canonicalJson(oracle.host)
+    ) {
+        fail("oracle: smoke report identity or host does not match the source manifest");
+    }
+    assertExactKeys(
+        report.inputs,
+        ["ort_runtime", "model_onnx", "bundle_manifest", "semantic_corpus"],
+        "oracle smoke report inputs",
+    );
+    for (const [reportKey, inputKey] of [
+        ["ort_runtime", "ort_runtime"],
+        ["model_onnx", "model_onnx"],
+        ["bundle_manifest", "bundle_manifest"],
+        ["semantic_corpus", "corpus"],
+    ] as const) {
+        const artifact = inputs[inputKey];
+        // An unqualified input is skipped for the same reason `bound_inputs` skips
+        // it: it already forces `production_qualified: false`, and aborting here
+        // would make the incremental state release engineering works in
+        // unrepresentable.
+        if (!artifact.qualified) continue;
+        if (report.inputs[reportKey] !== artifact.sha256) {
+            fail(`oracle: smoke report input ${reportKey} does not match the locked artifact`);
+        }
+    }
+    if (
+        report.observed_vectors !== oracle.expected_vectors ||
+        report.tolerance !== oracle.tolerance ||
+        typeof report.max_abs_error !== "number" ||
+        !Number.isFinite(report.max_abs_error) ||
+        report.max_abs_error < 0 ||
+        report.max_abs_error > oracle.tolerance
+    ) {
+        fail("oracle: smoke report vector observations exceed the pinned oracle");
+    }
+    if (
+        canonicalJson(report.operations) !==
+            canonicalJson(["embed.batch", "embed.query", "embed.result", "models.list"]) ||
+        report.restart_fenced !== true ||
+        report.degraded_isolated !== true ||
+        report.durable_receipts !== true ||
+        report.network_access !== oracle.network_access
+    ) {
+        fail("oracle: smoke report does not prove the complete offline lifecycle");
     }
     // Everything above describes how the oracle was *run*. None of it says the
     // comparison passed, and a run that failed or never happened produces exactly
@@ -1638,10 +2315,226 @@ export function checkOracleEvidence(
     }
 }
 
+function readOracleSmokeReport(
+    rootDir: string,
+    oracle: OracleEvidence,
+): SynapseSmokeReport {
+    const reportPath = join(rootDir, oracle.smoke_report.path);
+    let bytes: Buffer;
+    try {
+        bytes = readFileSync(reportPath);
+    } catch {
+        fail("oracle: smoke report is missing");
+    }
+    if (createHash("sha256").update(bytes).digest("hex") !== oracle.smoke_report.sha256) {
+        fail("oracle: smoke report digest mismatch");
+    }
+    try {
+        return JSON.parse(bytes.toString("utf8")) as SynapseSmokeReport;
+    } catch {
+        fail("oracle: smoke report is malformed JSON");
+    }
+}
+
+function verifyClosureSourceBytes(
+    rootDir: string,
+    harness: HarnessClosureName,
+    closure: HarnessClosureManifest,
+    roots: Record<string, string> | undefined,
+    mode: SourceManifest["mode"],
+): void {
+    if (roots === undefined) {
+        if (mode === "production") {
+            fail(`harnesses.${harness}: qualified closure requires closure_verify_roots`);
+        }
+        return;
+    }
+    const expectedRoots = [...closure.source_roots].sort();
+    const actualRoots = Object.keys(roots).sort();
+    if (JSON.stringify(expectedRoots) !== JSON.stringify(actualRoots)) {
+        fail(`harnesses.${harness}: closure verify roots do not match the manifest`);
+    }
+    const openedRoots = new Map<string, string>();
+    for (const rootName of expectedRoots) {
+        const configured = roots[rootName];
+        if (typeof configured !== "string" || configured.length === 0) {
+            fail(`harnesses.${harness}: closure verify root is invalid`);
+        }
+        const root = isAbsolute(configured) ? configured : join(rootDir, configured);
+        if (mode === "production" && !isAbsolute(configured)) {
+            fail(`harnesses.${harness}: production closure verify roots must be absolute`);
+        }
+        let stat: ReturnType<typeof lstatSync>;
+        try {
+            stat = lstatSync(root);
+        } catch {
+            fail(`harnesses.${harness}: closure verify root is missing`);
+        }
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+            fail(`harnesses.${harness}: closure verify root is not a physical directory`);
+        }
+        openedRoots.set(rootName, root);
+    }
+
+    for (const node of closure.nodes) {
+        const root = openedRoots.get(node.source_root);
+        if (root === undefined) {
+            fail(`harnesses.${harness}: closure node source root is missing`);
+        }
+        let current = root;
+        for (const component of node.source_path.split("/")) {
+            current = join(current, component);
+            let stat: ReturnType<typeof lstatSync>;
+            try {
+                stat = lstatSync(current);
+            } catch {
+                fail(`harnesses.${harness}: closure source node is missing`);
+            }
+            if (stat.isSymbolicLink()) {
+                fail(`harnesses.${harness}: closure source node follows a symlink`);
+            }
+        }
+        let fd: number;
+        try {
+            fd = openSync(
+                current,
+                fsConstants.O_RDONLY |
+                    fsConstants.O_NOFOLLOW |
+                    fsConstants.O_NONBLOCK,
+            );
+        } catch {
+            fail(`harnesses.${harness}: closure source node cannot be opened`);
+        }
+        try {
+            const stat = fstatSync(fd);
+            if (!stat.isFile() || stat.size !== node.size_bytes) {
+                fail(`harnesses.${harness}: closure source node size changed`);
+            }
+            const bytes = readFileSync(fd);
+            const digest = createHash("sha256").update(bytes).digest("hex");
+            if (digest !== node.sha256) {
+                fail(`harnesses.${harness}: closure source node hash changed`);
+            }
+            if (
+                node.kind === "module" &&
+                /\.(?:c|m)?js$/.test(node.source_path)
+            ) {
+                validateQualifiedDynamicImports(
+                    rootDir,
+                    closure,
+                    node,
+                    harness,
+                    node.source_path,
+                    node.sha256,
+                    bytes.toString("utf8"),
+                );
+            }
+        } finally {
+            closeSync(fd);
+        }
+    }
+}
+
+export function validateQualifiedDynamicImports(
+    rootDir: string,
+    closure: HarnessClosureManifest,
+    node: HarnessClosureNode,
+    harness: HarnessClosureName,
+    sourcePath: string,
+    sourceSha256: string,
+    source: string,
+): void {
+    const file = ts.createSourceFile(
+        sourcePath,
+        source,
+        ts.ScriptTarget.ESNext,
+        false,
+        ts.ScriptKind.JS,
+    );
+    const unresolved: string[] = [];
+    const visit = (node: ts.Node): void => {
+        const argument = ts.isCallExpression(node)
+            ? node.arguments[0]
+            : undefined;
+        if (
+            ts.isCallExpression(node) &&
+            node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+            (node.arguments.length !== 1 ||
+                argument === undefined ||
+                !ts.isStringLiteralLike(argument))
+        ) {
+            unresolved.push(node.getText(file));
+            return;
+        }
+        ts.forEachChild(node, visit);
+    };
+    visit(file);
+    if (unresolved.length === 0) return;
+    const policy = QUALIFIED_NONLITERAL_DYNAMIC_IMPORT_SITES.get(sourcePath);
+    if (
+        harness !== "pi" ||
+        policy === undefined ||
+        policy.sha256 !== sourceSha256 ||
+        JSON.stringify([...unresolved].sort()) !==
+            JSON.stringify([...policy.expressions].sort())
+    ) {
+        fail(
+            `harnesses.${harness}: closure module contains an unresolved dynamic import`,
+        );
+    }
+    const finiteEdges = node.dependencies
+        .filter((dependency) => dependency.kind === "finite_dynamic")
+        .map((dependency) => dependency.path)
+        .sort();
+    if (policy.mode === "finite") {
+        const targets = policy.targets
+            .map((target) =>
+                posix.normalize(posix.join(posix.dirname(sourcePath), target)),
+            )
+            .sort();
+        if (
+            JSON.stringify(finiteEdges) !== JSON.stringify(targets) ||
+            targets.some(
+                (target) =>
+                    !closure.nodes.some((candidate) => candidate.path === target),
+            )
+        ) {
+            fail(
+                `harnesses.${harness}: finite dynamic import targets are not closed by graph edges`,
+            );
+        }
+    } else if (finiteEdges.length !== 0) {
+        fail(
+            `harnesses.${harness}: non-finite dynamic import policy carries graph edges`,
+        );
+    } else if (policy.mode === "builtin") {
+        if (!policy.targets.every((target) => target.startsWith("node:"))) {
+            fail(`harnesses.${harness}: builtin import policy is invalid`);
+        }
+    } else if (policy.mode === "unsupported_provider") {
+        if (
+            "amazon-bedrock" in
+            CREDENTIALS_DOC.harnesses.pi.providers
+        ) {
+            fail(`harnesses.${harness}: unsupported provider became qualified`);
+        }
+    } else {
+        const hook = readFileSync(
+            join(rootDir, "crates/mc-host/assets/pi-broca-extension.mjs"),
+        );
+        const target =
+            `embedded:pi-broca-extension:${createHash("sha256").update(hook).digest("hex")}`;
+        if (policy.targets.length !== 1 || policy.targets[0] !== target) {
+            fail(`harnesses.${harness}: host extension import identity drifted`);
+        }
+    }
+}
+
 export function validateSourceManifest(
     manifest: unknown,
     contract: ReleaseContract,
     rootDir: string,
+    verifyExternalBytes: boolean = true,
 ): asserts manifest is SourceManifest {
     if (manifest === null || typeof manifest !== "object") {
         fail("source manifest must be an object");
@@ -1682,7 +2575,10 @@ export function validateSourceManifest(
             fail(`inputs.${key}: qualified must be true or false`);
         }
     }
-    if (m.oracle !== null) checkOracleEvidence(m.oracle, contract, m.inputs);
+    if (m.oracle !== null) {
+        const report = readOracleSmokeReport(rootDir, m.oracle);
+        checkOracleEvidence(m.oracle, contract, report, m.inputs);
+    }
     assertExactKeys(m.harnesses, ["opencode", "pi"], "harnesses");
     const expectPackage = {
         opencode: CREDENTIALS_DOC.harnesses.opencode.package,
@@ -1692,6 +2588,11 @@ export function validateSourceManifest(
         const harness = m.harnesses[name];
         assertExactKeys(harness, ["package", "version"], `harnesses.${name}`, [
             "unqualified_reason",
+            "closure",
+            "closure_manifest",
+            "closure_platforms",
+            "closure_verify_roots",
+            "closure_unqualified_reason",
         ]);
         if (harness.package !== expectPackage[name]) {
             fail(`harnesses.${name}: package must be ${expectPackage[name]}`);
@@ -1702,11 +2603,107 @@ export function validateSourceManifest(
                     `harnesses.${name}: an unqualified version must state a reason`,
                 );
             }
+            if (harness.closure !== undefined) {
+                fail(
+                    `harnesses.${name}: an unqualified version cannot carry a closure`,
+                );
+            }
         } else if (
             typeof harness.version !== "string" ||
             !/^\d+\.\d+\.\d+$/.test(harness.version)
         ) {
             fail(`harnesses.${name}: version must be exact semver or null`);
+        } else {
+            if (harness.closure !== undefined && harness.closure_manifest !== undefined) {
+                fail(`harnesses.${name}: closure must be inline or file-backed, not both`);
+            }
+            if (harness.closure_manifest !== undefined) {
+                assertExactKeys(
+                    harness.closure_manifest,
+                    ["path", "sha256"],
+                    `harnesses.${name}.closure_manifest`,
+                );
+                assertSafeRelativePath(
+                    harness.closure_manifest.path,
+                    `harnesses.${name}.closure_manifest.path`,
+                );
+                if (
+                    !harness.closure_manifest.path.startsWith(
+                        "release/mc-host-harness-closures/",
+                    )
+                ) {
+                    fail(
+                        `harnesses.${name}: closure manifest must live under release/mc-host-harness-closures`,
+                    );
+                }
+                if (!SHA256_RE.test(harness.closure_manifest.sha256)) {
+                    fail(`harnesses.${name}: closure manifest file sha256 is invalid`);
+                }
+                const closurePath = join(rootDir, harness.closure_manifest.path);
+                if (!existsSync(closurePath)) {
+                    fail(`harnesses.${name}: closure manifest file is missing`);
+                }
+                const bytes = readFileSync(closurePath);
+                if (
+                    createHash("sha256").update(bytes).digest("hex") !==
+                    harness.closure_manifest.sha256
+                ) {
+                    fail(`harnesses.${name}: closure manifest file sha256 changed`);
+                }
+                try {
+                    harness.closure = JSON.parse(bytes.toString("utf8")) as HarnessClosureManifest;
+                } catch {
+                    fail(`harnesses.${name}: closure manifest file is malformed`);
+                }
+            }
+            if (harness.closure !== undefined) {
+            if (harness.closure_unqualified_reason !== undefined) {
+                fail(
+                    `harnesses.${name}: qualified closure cannot carry an unqualified reason`,
+                );
+            }
+            validateClosureManifest(harness.closure, {
+                harness: name,
+                package: harness.package,
+                version: harness.version,
+            });
+            if (
+                m.mode === "production" &&
+                (!Array.isArray(harness.closure_platforms) ||
+                    harness.closure_platforms.length === 0)
+            ) {
+                fail(`harnesses.${name}: qualified closure requires closure_platforms`);
+            }
+            if (harness.closure_platforms !== undefined) {
+                assertSortedUnique(
+                    harness.closure_platforms,
+                    `harnesses.${name}.closure_platforms`,
+                );
+                for (const platform of harness.closure_platforms) {
+                    if (!["linux-x64-gnu", "darwin-arm64", "darwin-x64"].includes(platform)) {
+                        fail(`harnesses.${name}: unsupported closure platform ${platform}`);
+                    }
+                }
+            }
+            if (verifyExternalBytes) {
+                verifyClosureSourceBytes(
+                    rootDir,
+                    name,
+                    harness.closure,
+                    harness.closure_verify_roots,
+                    m.mode,
+                );
+            }
+            } else if (m.mode === "production") {
+            if (
+                typeof harness.closure_unqualified_reason !== "string" ||
+                harness.closure_unqualified_reason.length === 0
+            ) {
+                fail(
+                    `harnesses.${name}: production source without a closure must state closure_unqualified_reason`,
+                );
+            }
+            }
         }
     }
 }
@@ -2965,6 +3962,16 @@ function buildLock(
             "offline semantic-oracle evidence not yet recorded against real locked ORT/model bytes";
         oracle = { qualified: false, reason };
         unqualified.push(`oracle: ${reason}`);
+    } else if (manifest.oracle.network_access !== "none") {
+        const reason =
+            "offline semantic oracle ran with network access available";
+        oracle = { qualified: false, reason, observed: manifest.oracle };
+        unqualified.push(`oracle: ${reason}`);
+    } else if (!manifest.oracle.host.exact_floor) {
+        const reason =
+            "offline semantic oracle passed above the kernel floor; exact kernel 4.18 evidence has not run";
+        oracle = { qualified: false, reason, observed: manifest.oracle };
+        unqualified.push(`oracle: ${reason}`);
     } else {
         oracle = { qualified: true, ...manifest.oracle };
     }
@@ -2979,9 +3986,33 @@ function buildLock(
             };
             unqualified.push(`harnesses.${name}: ${reason}`);
         } else {
+            const closure =
+                harness.closure === undefined
+                    ? {
+                          qualified: false,
+                          reason: harness.closure_unqualified_reason as string,
+                      }
+                    : {
+                          qualified: true,
+                          sha256: closureManifestDigest(harness.closure),
+                          source_roots: harness.closure.source_roots,
+                          platforms: harness.closure_platforms,
+                          ...(harness.closure_manifest === undefined
+                              ? {}
+                              : {
+                                    manifest_path:
+                                        harness.closure_manifest.path,
+                                }),
+                      };
+            if (harness.closure === undefined) {
+                unqualified.push(
+                    `harnesses.${name}.closure: ${harness.closure_unqualified_reason as string}`,
+                );
+            }
             harnesses[name] = {
                 package: harness.package,
                 version: harness.version,
+                closure,
             };
         }
     }
@@ -3063,14 +4094,22 @@ export function generate(
             }`,
         );
     }
-    validateSourceManifest(manifestRaw, contract, rootDir);
-    const manifest = manifestRaw;
+    // One gate, not two. `verifyExternalBytes` was never a field of `generate`'s
+    // option type, so no caller could ever set it: the release prerequisite passed
+    // `verifyBytes: true` with `check: true` and this resolved to `false`, silently
+    // skipping `verifyClosureSourceBytes` while the command reported that every
+    // production byte had been verified. Missing or modified OpenCode/Pi source
+    // roots then passed `release:qualify:require` and failed only when the daemon
+    // tried to materialize them.
+    //
     // Byte verification needs the real artifacts on disk at the manifest's
     // (absolute, in production) verify paths, which only the qualifying host
     // has. Drift checking must stay portable so CI can guard the committed
     // lock, so verify bytes in write mode and only on explicit request in
     // --check mode.
     const verifyBytes = options.verifyBytes ?? !options.check;
+    validateSourceManifest(manifestRaw, contract, rootDir, verifyBytes);
+    const manifest = manifestRaw;
     if (verifyBytes) {
         for (const key of INPUT_KEYS) {
             const artifact = manifest.inputs[key];
@@ -3116,11 +4155,104 @@ export function generate(
         unqualified,
     };
     const evidenceText = `${canonicalJson(evidence)}\n`;
+    const closureCatalog = {
+        schema: HARNESS_CLOSURE_SCHEMA,
+        harnesses: Object.fromEntries(
+            (["opencode", "pi"] as const).flatMap((name) => {
+                const harness = manifest.harnesses[name];
+                return harness.closure === undefined
+                    ? []
+                    : [
+                          [
+                              name,
+                              {
+                                  manifest_sha256: closureManifestDigest(
+                                      harness.closure,
+                                  ),
+                                  source_roots: harness.closure.source_roots,
+                                  platforms: harness.closure_platforms,
+                                  anchors: Object.fromEntries(
+                                      harness.closure.source_roots.map((root) => {
+                                          const launch = [
+                                              ["executable", harness.closure?.executable],
+                                              ["interpreter", harness.closure?.interpreter],
+                                              ["entrypoint", harness.closure?.entrypoint],
+                                              // Extensions are launch roots too:
+                                              // `validateClosureManifest` requires a node
+                                              // for every one and reaches the closure
+                                              // through it. A closure that puts its
+                                              // provider extensions in a source root of
+                                              // their own is valid there, so leaving them
+                                              // out here made `generate` reject a manifest
+                                              // the qualifier had just accepted.
+                                              ...(harness.closure?.extensions ?? []).map(
+                                                  (path) => ["extension", path] as const,
+                                              ),
+                                          ].find(([, path]) => {
+                                              const node = harness.closure?.nodes.find(
+                                                  (candidate) => candidate.path === path,
+                                              );
+                                              return node?.source_root === root;
+                                          });
+                                          if (launch === undefined) {
+                                              fail(
+                                                  `harnesses.${name}: source root ${root} has no launch anchor`,
+                                              );
+                                          }
+                                          const node = harness.closure?.nodes.find(
+                                              (candidate) =>
+                                                  candidate.path === launch[1],
+                                          );
+                                          if (node === undefined) {
+                                              fail(
+                                                  `harnesses.${name}: launch anchor node is missing`,
+                                              );
+                                          }
+                                          return [
+                                              root,
+                                              {
+                                                  from: launch[0],
+                                                  source_path: node.source_path,
+                                              },
+                                          ];
+                                      }),
+                                  ),
+                              },
+                          ],
+                      ];
+            }),
+        ),
+    };
+    const closureCatalogText =
+        `// biome-ignore-all format: generated canonical release data\n` +
+        `// Generated by scripts/qualify-mc-host-production-inputs.ts. Do not edit.\n` +
+        `export const qualifiedHarnessClosures = ${canonicalJson(closureCatalog)} as const;\n`;
+    const rustClosureEntries = (["opencode", "pi"] as const).flatMap(
+        (name) => {
+            const harness = manifest.harnesses[name];
+            if (harness.closure === undefined) return [];
+            const bytes =
+                harness.closure_manifest === undefined
+                    ? rustRawString(canonicalClosureManifest(harness.closure))
+                    : `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../${harness.closure_manifest.path}"))`;
+            return [
+                `    (${JSON.stringify(name)}, ${JSON.stringify(closureManifestDigest(harness.closure))}, ${bytes}),`,
+            ];
+        },
+    );
+    const closureCatalogRustText =
+        "// Generated by scripts/qualify-mc-host-production-inputs.ts. Do not edit.\n" +
+        `pub const PRODUCTION_INPUTS_LOCK_SHA256: &str = ${JSON.stringify(lockSha256)};\n` +
+        "pub const QUALIFIED_HARNESS_CLOSURES: &[(&str, &str, &str)] = &[\n" +
+        `${rustClosureEntries.join("\n")}\n` +
+        "];\n";
 
     const outputs = {
         lock: lockText,
         credentials: credentialsText,
         evidence: evidenceText,
+        closureCatalog: closureCatalogText,
+        closureCatalogRust: closureCatalogRustText,
     };
     const drift: string[] = [];
     for (const [key, relative] of Object.entries(OUTPUT_PATHS) as [

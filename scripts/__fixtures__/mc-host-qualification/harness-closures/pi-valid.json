@@ -1,0 +1,83 @@
+{
+  "schema": "magic-context.mc-host-harness-closure/v1",
+  "harness": "pi",
+  "package": "@earendil-works/pi-coding-agent",
+  "version": "0.80.2",
+  "argument_variant": "run_prompt",
+  "source_roots": [
+    "node-runtime",
+    "pi-install"
+  ],
+  "executable": null,
+  "interpreter": "bin/node",
+  "entrypoint": "node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+  "extensions": [
+    "node_modules/provider/ext.js"
+  ],
+  "nodes": [
+    {
+      "path": "bin/node",
+      "source_root": "node-runtime",
+      "source_path": "bin/node",
+      "kind": "interpreter",
+      "mode": 448,
+      "size_bytes": 4,
+      "sha256": "545ea538461003efdc8c81c244531b003f6f26cfccf6c0073b3239fdedf49446",
+      "dependencies": []
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      "source_root": "pi-install",
+      "source_path": "node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      "kind": "module",
+      "mode": 384,
+      "size_bytes": 3,
+      "sha256": "99bb88401742848e032fd6f51709415fb6be169a72d2e5d7fc44289255160d3c",
+      "dependencies": [
+        {
+          "path": "node_modules/@earendil-works/pi-coding-agent/dist/helper.js",
+          "kind": "static"
+        },
+        {
+          "path": "node_modules/provider/ext.js",
+          "kind": "finite_dynamic"
+        }
+      ]
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-coding-agent/dist/helper.js",
+      "source_root": "pi-install",
+      "source_path": "node_modules/@earendil-works/pi-coding-agent/dist/helper.js",
+      "kind": "module",
+      "mode": 384,
+      "size_bytes": 6,
+      "sha256": "e81d3b0e9d82feaaf5f6e55bdff24731d7eee08632ffa63801e6397290c5d20a",
+      "dependencies": [
+        {
+          "path": "node_modules/@earendil-works/pi-coding-agent/native/addon.node",
+          "kind": "native"
+        }
+      ]
+    },
+    {
+      "path": "node_modules/@earendil-works/pi-coding-agent/native/addon.node",
+      "source_root": "pi-install",
+      "source_path": "node_modules/@earendil-works/pi-coding-agent/native/addon.node",
+      "kind": "native_addon",
+      "mode": 384,
+      "size_bytes": 5,
+      "sha256": "613c3abf0f077f31505d3c8cc0fed9a94a49cf025af3e604c4d38259c1cdf4c7",
+      "dependencies": []
+    },
+    {
+      "path": "node_modules/provider/ext.js",
+      "source_root": "pi-install",
+      "source_path": "node_modules/provider/ext.js",
+      "kind": "extension",
+      "mode": 384,
+      "size_bytes": 9,
+      "sha256": "26f1de33979d065ba8d86789de634228e3540fee2f6e5a66eebf93f78d83077d",
+      "dependencies": []
+    }
+  ]
+}

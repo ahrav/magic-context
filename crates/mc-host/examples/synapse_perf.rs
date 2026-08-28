@@ -283,6 +283,7 @@ fn lane() -> LaneInfo {
         fingerprint: FINGERPRINT.to_owned(),
         table_epoch: 1,
         dims: 8,
+        execution_provider: "cpu",
         max_tokens: 512,
         max_text_bytes: 1024,
         provenance: serde_json::json!({"source": "inline delayed engine"}),

@@ -41,6 +41,23 @@ fn ort_library() -> Option<(PathBuf, String)> {
     Some((path, hash))
 }
 
+#[tokio::test]
+async fn host_only_platform_reports_exact_synapse_unsupported_state() {
+    let component = SynapseComponent::unsupported("synapse_unsupported");
+    SecondaryComponent::initialize(&component)
+        .await
+        .expect("unsupported lane initializes");
+    assert!(matches!(
+        component.status(),
+        SynapseStatus::Disabled { reason } if reason == "synapse_unsupported"
+    ));
+    let health = CompositeComponent::health(&component).await;
+    assert_eq!(
+        health.metrics.expect("metrics")["synapse_state"],
+        "unsupported"
+    );
+}
+
 fn copy_fixture_to(dir: &Path) {
     for entry in std::fs::read_dir(fixture_dir()).expect("fixture dir") {
         let entry = entry.expect("fixture entry");
@@ -51,6 +68,7 @@ fn copy_fixture_to(dir: &Path) {
 fn config_for(dir: &Path, ort: &(PathBuf, String)) -> SynapseConfig {
     SynapseConfig {
         bundle_dir: dir.to_path_buf(),
+        bundle_manifest_sha256: None,
         ort_library: ort.0.clone(),
         ort_library_sha256: ort.1.clone(),
         limits: SynapseLimits::default(),
@@ -152,7 +170,7 @@ async fn waiting_query_memory_bound_rejects_both_construction_paths() {
         max_waiting_queries: BOUNDARY,
         ..SynapseLimits::default()
     };
-    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &accepted)
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &accepted, None)
         .expect("the boundary configuration loads through the bundle path");
     SynapseComponent::ready_with_engine(test_lane(), DeterministicEngine::new(), accepted)
         .expect("the boundary configuration constructs through the engine path");
@@ -263,6 +281,7 @@ fn identity() -> mc_host::RouteIdentity {
         consumer_launch_nonce: None,
         consumer_capabilities: Vec::new(),
         admission_facts: None,
+        credential_fingerprints: std::collections::BTreeMap::new(),
     }
 }
 
@@ -373,13 +392,42 @@ fn the_committed_fixture_carries_its_canonical_fingerprint() {
         max_text_bytes: 123_456,
         ..SynapseLimits::default()
     };
-    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits)
+    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, None)
         .expect("the committed fixture bundle loads");
     assert_eq!(bundle.max_text_bytes, limits.max_text_bytes);
     assert_eq!(
         bundle.manifest.fingerprint,
         mc_host::synapse::bundle::canonical_fingerprint(&bundle.manifest),
         "regenerate the fixture with generate-synapse-tiny.py"
+    );
+}
+
+/// The bundle manifest is the hinge between the two trust roots: the generation
+/// manifest hashes it, and it hashes every artifact. A load that accepts any
+/// self-consistent manifest at the pathname breaks that chain, so a bundle
+/// swapped in after the generation was validated could serve different
+/// embedding bytes under a selection the daemon still reported as valid.
+#[test]
+fn a_bundle_manifest_outside_the_committed_digest_does_not_load() {
+    let limits = SynapseLimits::default();
+    let manifest_bytes =
+        std::fs::read(fixture_dir().join("manifest.json")).expect("fixture manifest");
+    let committed = sha256_hex(&manifest_bytes);
+
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, Some(&committed))
+        .expect("the digest the generation committed admits the bundle it names");
+
+    let other = sha256_hex(b"a manifest this generation never staged");
+    let Err(error) = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, Some(&other))
+    else {
+        panic!("a manifest outside the committed digest must not load");
+    };
+    assert!(
+        error
+            .0
+            .contains("does not match the digest its generation committed"),
+        "unexpected rejection: {}",
+        error.0
     );
 }
 
@@ -606,6 +654,53 @@ async fn certified_bundle_loads_and_serves_expected_vectors() {
         }
     }
     assert!(matches!(component.status(), SynapseStatus::Ready(_)));
+}
+
+#[tokio::test]
+async fn production_bundle_from_environment_certifies_offline() {
+    let Some(bundle_dir) = std::env::var_os("MC_SYNAPSE_PRODUCTION_BUNDLE").map(PathBuf::from)
+    else {
+        eprintln!("skipping: MC_SYNAPSE_PRODUCTION_BUNDLE is unset");
+        return;
+    };
+    let Some(ort) = ort_library() else { return };
+    let component = initialize(config_for(&bundle_dir, &ort)).await;
+    let lane = match component.status() {
+        SynapseStatus::Ready(lane) => lane,
+        other => panic!("production bundle did not certify: {other:?}"),
+    };
+    assert_eq!(lane.model, "gte-modernbert-base-f16");
+    assert_eq!(lane.dims, 768);
+    assert_eq!(lane.table_epoch, 1);
+
+    let corpus: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle_dir.join("corpus.json")).expect("production corpus"),
+    )
+    .expect("production corpus json");
+    let tolerance = corpus["tolerance"].as_f64().expect("tolerance") as f32;
+    let mut captured = Vec::new();
+    for item in corpus["items"].as_array().expect("items") {
+        let text = item["text"].as_str().expect("text");
+        let expected: Vec<f32> = item["expected"]
+            .as_array()
+            .expect("expected")
+            .iter()
+            .map(|value| value.as_f64().expect("component") as f32)
+            .collect();
+        let vectors = component.embed_blocking(&[text]).expect("embed");
+        captured.push(serde_json::json!({"text": text, "expected": vectors[0]}));
+        for (got, expected) in vectors[0].iter().zip(expected) {
+            assert!((got - expected).abs() <= tolerance);
+        }
+    }
+    if let Some(path) = std::env::var_os("MC_SYNAPSE_CAPTURE_CORPUS") {
+        let output = serde_json::json!({"tolerance": 0.0001, "items": captured});
+        std::fs::write(
+            path,
+            serde_json::to_vec(&output).expect("serialize captured corpus"),
+        )
+        .expect("write captured corpus");
+    }
 }
 
 #[tokio::test]

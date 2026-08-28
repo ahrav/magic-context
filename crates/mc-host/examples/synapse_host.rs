@@ -121,6 +121,7 @@ async fn main() {
 
     let synapse_config = (bundle_dir != "-").then(|| SynapseConfig {
         bundle_dir: std::path::PathBuf::from(bundle_dir),
+        bundle_manifest_sha256: None,
         ort_library,
         ort_library_sha256,
         limits: SynapseLimits::default(),

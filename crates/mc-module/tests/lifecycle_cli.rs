@@ -10,7 +10,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -169,6 +169,14 @@ fn version_and_release_info_are_side_effect_free() {
         info.stdout.trim(),
         mc_module::release_contract::RELEASE_CONTRACT_JSON
     );
+
+    let inputs = run(&data, &["input-lock-digest"]);
+    assert_eq!(inputs.code, 0);
+    assert_eq!(
+        inputs.stdout.trim(),
+        mc_module::production_inputs::PRODUCTION_INPUTS_LOCK_SHA256
+    );
+    assert_eq!(inputs.stdout.trim().len(), 64);
 
     assert!(!data.exists(), "metadata commands must not create the root");
 }
@@ -438,6 +446,20 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     let client = mc_host::Client::connect(&publication)
         .await
         .expect("published daemon authenticates");
+    let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = client.host_status().await.expect("host status");
+        let storage =
+            status.metrics["components"]["magic-context"]["metrics"]["storage_state"].as_str();
+        if storage == Some("ready") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < readiness_deadline,
+            "storage did not become ready; last status: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     client.close().await.expect("client closes");
 
     // status: running and healthy. The contracted verb; `probe` above covers
@@ -508,4 +530,106 @@ async fn full_dev_mode_lifecycle_roundtrip() {
         & 0o777;
     assert_eq!(mode, 0o600, "daemon log must be owner-only");
     tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigint_runs_ordered_daemon_teardown() {
+    let root = tempfile::tempdir().expect("root");
+    let data = root.path().join("data");
+    let payload = root.path().join("payload-source");
+    let launcher = payload.join("payload/bin/ck-mc-host");
+    std::fs::create_dir_all(launcher.parent().expect("launcher parent"))
+        .expect("payload launcher dir");
+    std::fs::copy(BIN, &launcher).expect("copy real launcher into payload");
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
+        .expect("launcher mode");
+    let mut janitor = DaemonJanitor {
+        root: data.clone(),
+        active: false,
+    };
+    let start = run(
+        &data,
+        &["start", "--payload-dir", payload.to_str().expect("payload")],
+    );
+    janitor.active = true;
+    assert_eq!(
+        start.code, 0,
+        "start failed: {} {}",
+        start.stdout, start.stderr
+    );
+
+    let publication = mc_host::runtime_dir_path(Some(&data))
+        .expect("runtime dir")
+        .join(mc_host::CONNECTION_FILE_NAME);
+    let published: Value =
+        serde_json::from_slice(&std::fs::read(&publication).expect("publication"))
+            .expect("publication json");
+    let pid = published["pid"].as_u64().expect("pid").to_string();
+    let signal = Command::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .expect("send SIGINT");
+    assert!(signal.success());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let probe = run(&data, &["probe"]).json();
+        if probe["state"] == "stopped" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "SIGINT teardown did not finish");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    janitor.active = false;
+    assert!(!publication.exists());
+    let probe =
+        mc_host::probe_lifecycle(Some(&data), &mc_host::ProbeFreshness::default()).expect("probe");
+    assert!(probe.instance_lock_free);
+    assert!(probe.lifetime_lock_free);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_generation_restarts_after_source_payload_deletion() {
+    let root = tempfile::tempdir().expect("root");
+    let data = root.path().join("data");
+    let payload = root.path().join("payload-source");
+    let launcher = payload.join("payload/bin/ck-mc-host");
+    std::fs::create_dir_all(launcher.parent().expect("launcher parent"))
+        .expect("payload launcher dir");
+    std::fs::copy(BIN, &launcher).expect("copy real launcher into payload");
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
+        .expect("launcher mode");
+    let payload_arg = payload.to_str().expect("payload path");
+    let mut janitor = DaemonJanitor {
+        root: data.clone(),
+        active: false,
+    };
+
+    let start = run(&data, &["start", "--payload-dir", payload_arg]);
+    janitor.active = true;
+    assert_eq!(
+        start.code, 0,
+        "staged launcher start failed: {} {}",
+        start.stdout, start.stderr
+    );
+    assert_result(&start.json(), "start", true, "running", "started");
+
+    let stop = run(&data, &["stop"]);
+    assert_eq!(stop.code, 0, "stop failed: {} {}", stop.stdout, stop.stderr);
+    janitor.active = false;
+    std::fs::remove_dir_all(&payload).expect("remove package source bytes");
+
+    let restart = run(&data, &["restart"]);
+    janitor.active = true;
+    assert_eq!(
+        restart.code, 0,
+        "retained restart failed: {} {}",
+        restart.stdout, restart.stderr
+    );
+    assert_result(&restart.json(), "restart", true, "running", "started");
+    assert_eq!(effects(&restart.json()), (false, true));
+
+    let stop = run(&data, &["stop"]);
+    assert_eq!(stop.code, 0, "final stop failed");
+    janitor.active = false;
 }

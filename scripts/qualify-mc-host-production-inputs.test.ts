@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
     cpSync,
+    existsSync,
     mkdirSync,
     mkdtempSync,
     readFileSync,
@@ -20,10 +21,13 @@ import {
     FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS,
     RUNTIME_IDENTITY,
     buildCredentialsDoc,
+    canonicalClosureManifest,
     canonicalCredentialRowEncoding,
     checkOracleEvidence,
+    closureManifestDigest,
     evaluateBrocaRun,
     generate,
+    type HarnessClosureManifest,
     assertPinnedQualifyingRuntime,
     OUTPUT_PATHS,
     QUALIFICATION_PINS,
@@ -32,7 +36,9 @@ import {
     ROW_CAP_BYTES,
     SOURCE_MANIFEST_PATH,
     VALUE_CAP_BYTES,
+    validateClosureManifest,
     validateCredentialsDoc,
+    validateQualifiedDynamicImports,
 } from "./qualify-mc-host-production-inputs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,6 +51,16 @@ const FIXTURE_MANIFEST = join(repoRoot, FIXTURE_MANIFEST_RELATIVE);
 const RELEASE_CONTRACT = "release/mc-host-release.json";
 const TINY_MANIFEST =
     "crates/mc-host/tests/fixtures/synapse-tiny/manifest.json";
+const VALID_PI_CLOSURE = join(
+    repoRoot,
+    FIXTURE_DIR,
+    "harness-closures/pi-valid.json",
+);
+const VALID_OPENCODE_CLOSURE = join(
+    repoRoot,
+    FIXTURE_DIR,
+    "harness-closures/opencode-valid.json",
+);
 
 const tempRoots: string[] = [];
 
@@ -90,12 +106,52 @@ function fixtureManifest(): any {
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: tests install mutated manifests
+/**
+ * Restate the copied smoke report over the manifest a test is about to install.
+ *
+ * The oracle's report is a separate file bound by digest, so a test that rewrote
+ * input digests or host capabilities would otherwise trip the report/manifest
+ * identity check for its own setup's reason instead of the rule under test.
+ * Tests that mean to forge a report call {@link checkOracleEvidence} with one
+ * directly and do not go through here.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
+function rebindSmokeReport(root: string, manifest: any): void {
+    const smoke = manifest.oracle?.smoke_report;
+    if (smoke === undefined || smoke === null) return;
+    const reportPath = join(root, smoke.path);
+    if (!existsSync(reportPath)) return;
+    const report = JSON.parse(readFileSync(reportPath, "utf8"));
+    report.model_fingerprint = manifest.oracle.model_fingerprint;
+    report.table_epoch = manifest.oracle.table_epoch;
+    report.execution_provider = manifest.oracle.execution_provider;
+    report.host = manifest.oracle.host;
+    // The report names the semantic corpus `semantic_corpus`; the manifest keys it
+    // `corpus`.
+    // An unqualified input carries no digest. The report's required keys are fixed,
+    // so keep what it already named instead of dropping the key and failing the
+    // setup on a shape error.
+    const digest = (key: string, reportKey: string): string =>
+        (manifest.inputs[key] as { sha256?: string }).sha256 ??
+        report.inputs[reportKey];
+    report.inputs = {
+        ort_runtime: digest("ort_runtime", "ort_runtime"),
+        model_onnx: digest("model_onnx", "model_onnx"),
+        bundle_manifest: digest("bundle_manifest", "bundle_manifest"),
+        semantic_corpus: digest("corpus", "semantic_corpus"),
+    };
+    const bytes = `${JSON.stringify(report, null, 2)}\n`;
+    writeFileSync(reportPath, bytes);
+    smoke.sha256 = createHash("sha256").update(bytes).digest("hex");
+}
+
 function installManifest(root: string, manifest: any): void {
     cpSync(
         join(repoRoot, FIXTURE_DIR, "artifacts"),
         join(root, FIXTURE_DIR, "artifacts"),
         { recursive: true },
     );
+    rebindSmokeReport(root, manifest);
     mkdirSync(join(root, dirname(SOURCE_MANIFEST_PATH)), { recursive: true });
     writeFileSync(
         join(root, SOURCE_MANIFEST_PATH),
@@ -176,6 +232,37 @@ function unblacklistDigests(manifest: any): void {
     rebindOracle(manifest);
 }
 
+/**
+ * Give every input a production-policy license approver.
+ *
+ * The fixture is approved by `test-fixture`, which production mode rejects, so a
+ * test that promotes the fixture must restate the approval or fail on the
+ * approver before reaching the rule it is exercising.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
+function useProductionApprovers(manifest: any): void {
+    for (const artifact of Object.values(manifest.inputs) as {
+        license?: { approved_by: string };
+    }[]) {
+        if (artifact.license !== undefined) {
+            artifact.license.approved_by = "mc-host U9 SPDX allowlist";
+        }
+    }
+}
+
+/**
+ * Every fixture-provenance adjustment production mode requires.
+ *
+ * The fixture names `.invalid` hosts and is approved by `test-fixture`; both are
+ * rejected in production mode, and a test that fixes one but not the other fails
+ * on the provenance it forgot rather than on the rule it is exercising.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
+function useProductionProvenance(manifest: any): void {
+    useResolvableSources(manifest);
+    useProductionApprovers(manifest);
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function installProductionManifest(
     root: string,
@@ -218,6 +305,53 @@ function installProductionManifest(
             ".mchost-release.io",
         );
     }
+    useProductionApprovers(manifest);
+    manifest.harnesses.opencode.closure = openCodeClosureFixture();
+    manifest.harnesses.pi.closure = closureFixture();
+    delete manifest.harnesses.opencode.closure_unqualified_reason;
+    delete manifest.harnesses.pi.closure_unqualified_reason;
+    const closureSources = join(root, "closure-sources");
+    const opencodeRoot = join(closureSources, "opencode");
+    const nodeRoot = join(closureSources, "node-runtime");
+    const piRoot = join(closureSources, "pi-install");
+    for (const [path, bytes] of [
+        [join(opencodeRoot, "bin/opencode"), "opencode"],
+        [join(nodeRoot, "bin/node"), "node"],
+        [
+            join(
+                piRoot,
+                "node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+            ),
+            "cli",
+        ],
+        [
+            join(
+                piRoot,
+                "node_modules/@earendil-works/pi-coding-agent/dist/helper.js",
+            ),
+            "helper",
+        ],
+        [
+            join(
+                piRoot,
+                "node_modules/@earendil-works/pi-coding-agent/native/addon.node",
+            ),
+            "addon",
+        ],
+        [join(piRoot, "node_modules/provider/ext.js"), "extension"],
+    ]) {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, bytes);
+    }
+    manifest.harnesses.opencode.closure_verify_roots = {
+        "opencode-install": opencodeRoot,
+    };
+    manifest.harnesses.opencode.closure_platforms = ["linux-x64-gnu"];
+    manifest.harnesses.pi.closure_verify_roots = {
+        "node-runtime": nodeRoot,
+        "pi-install": piRoot,
+    };
+    manifest.harnesses.pi.closure_platforms = ["linux-x64-gnu"];
     mutate?.(manifest);
     rebindOracle(manifest);
     installManifest(root, manifest);
@@ -231,6 +365,14 @@ function credentialsCopy(): any {
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the contract
 function contractCopy(): any {
     return JSON.parse(JSON.stringify(buildContract()));
+}
+
+function closureFixture(): HarnessClosureManifest {
+    return JSON.parse(readFileSync(VALID_PI_CLOSURE, "utf8"));
+}
+
+function openCodeClosureFixture(): HarnessClosureManifest {
+    return JSON.parse(readFileSync(VALID_OPENCODE_CLOSURE, "utf8"));
 }
 
 /**
@@ -351,6 +493,21 @@ describe("immutable input fail-closed rules", () => {
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).toThrow(
             /mutable source identity/,
+        );
+    });
+
+    test("content-addressed project artifacts bind source identity to sha256", () => {
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        const digest = manifest.inputs.corpus.sha256;
+        manifest.inputs.corpus.source = `urn:sha256:${digest}`;
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).not.toThrow();
+
+        manifest.inputs.corpus.source = `urn:sha256:${"a".repeat(64)}`;
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).toThrow(
+            /content-addressed source disagrees/,
         );
     });
 
@@ -623,7 +780,7 @@ describe("immutable input fail-closed rules", () => {
         const relocated = freshRoot();
         const byHash = fixtureManifest();
         byHash.mode = "production";
-        useResolvableSources(byHash);
+        useProductionProvenance(byHash);
         const staged = join(relocated, "opt/relocated-inputs");
         mkdirSync(staged, { recursive: true });
         cpSync(join(repoRoot, FIXTURE_DIR, "artifacts"), staged, {
@@ -646,7 +803,7 @@ describe("immutable input fail-closed rules", () => {
         const inPlace = freshRoot();
         const byPath = fixtureManifest();
         byPath.mode = "production";
-        useResolvableSources(byPath);
+        useProductionProvenance(byPath);
         unblacklistDigests(byPath);
         for (const artifact of Object.values(byPath.inputs) as {
             verify_local_path: string;
@@ -791,8 +948,13 @@ describe("immutable input fail-closed rules", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.mode = "production";
-        useResolvableSources(manifest);
+        useProductionProvenance(manifest);
         unblacklistDigests(manifest);
+        for (const artifact of Object.values(manifest.inputs) as {
+            license: { approved_by: string };
+        }[]) {
+            artifact.license.approved_by = "mc-host U9 SPDX allowlist";
+        }
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).toThrow(
             /requires an absolute verify path/,
@@ -805,6 +967,53 @@ describe("immutable input fail-closed rules", () => {
         expect(() => generate(rootPi, { check: false })).toThrow(
             /does not match the resolved bun\.lock pin/,
         );
+    });
+
+    test("production mode rejects an unrecognized license approver", () => {
+        const root = freshRoot();
+        installProductionManifest(root);
+        const manifest = JSON.parse(
+            readFileSync(join(root, SOURCE_MANIFEST_PATH), "utf8"),
+        );
+        manifest.inputs.model_onnx.license.approved_by = "self-asserted";
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: false })).toThrow(
+            /license approver is not a production policy/,
+        );
+    });
+
+    test("check mode does not require external production bytes", () => {
+        const root = freshRoot();
+        installProductionManifest(root);
+        const manifest = JSON.parse(
+            readFileSync(join(root, SOURCE_MANIFEST_PATH), "utf8"),
+        );
+        for (const [name, artifact] of Object.entries(manifest.inputs) as [
+            string,
+            { verify_local_path: string },
+        ][]) {
+            artifact.verify_local_path = `/missing-production-inputs/${name}`;
+        }
+        manifest.harnesses.opencode.closure_verify_roots = {
+            "opencode-install": "/missing-production-inputs/opencode",
+        };
+        manifest.harnesses.pi.closure_verify_roots = {
+            "node-runtime": "/missing-production-inputs/node",
+            "pi-install": "/missing-production-inputs/pi",
+        };
+        installManifest(root, manifest);
+        expect(() => generate(root, { check: true })).not.toThrow();
+        // `verifyBytes` is the one gate, and it is the flag `--verify-bytes` and
+        // `requireQualificationEvidence` actually pass. It previously read a
+        // `verifyExternalBytes` option that was not in `generate`'s signature, so
+        // no caller could set it and closure source bytes went unverified while
+        // the command reported that every production byte had been checked.
+        // Asserting the closure message specifically is what keeps that gate
+        // wired: a generic /missing/ passes on the artifact paths alone.
+        expect(() => generate(root, { check: true, verifyBytes: true })).toThrow(
+            /closure verify root is missing/,
+        );
+        expect(() => generate(root, { check: false })).toThrow(/missing/);
     });
 
     test("the Pi version is the one the workspace resolves, not any in the lock", () => {
@@ -1482,6 +1691,11 @@ describe("oracle evidence hook", () => {
             const root = freshRoot();
             const manifest = fixtureManifest();
             manifest.oracle.host[field] = value;
+            // The fixture records the floor exactly. These cases deliberately move
+            // the host, so the exact-floor claim stops describing it; leaving it
+            // set would fail on that claim rather than on the floor comparison
+            // this case is about.
+            manifest.oracle.host.exact_floor = false;
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).not.toThrow();
         }
@@ -1582,6 +1796,12 @@ describe("oracle evidence hook", () => {
         // input table it is being validated against.
         const inputs = fixtureManifest().inputs;
         const base = fixtureManifest().oracle;
+        const report = JSON.parse(
+            readFileSync(
+                join(repoRoot, FIXTURE_DIR, "artifacts/synapse-smoke-report.json"),
+                "utf8",
+            ),
+        );
         const cases: [(o: typeof base) => void, RegExp][] = [
             [
                 // A mis-cased nested key must be reported as an unknown key,
@@ -1611,7 +1831,7 @@ describe("oracle evidence hook", () => {
                 (o) => {
                     o.network_access = "resolved";
                 },
-                /network access must be none/,
+                /network access must be none or available/,
             ],
             [
                 (o) => {
@@ -1635,11 +1855,58 @@ describe("oracle evidence hook", () => {
         for (const [mutate, error] of cases) {
             const oracle = JSON.parse(JSON.stringify(base));
             mutate(oracle);
-            expect(() => checkOracleEvidence(oracle, contract, inputs)).toThrow(
-                error,
-            );
+            expect(() =>
+                checkOracleEvidence(oracle, contract, report, inputs),
+            ).toThrow(error);
         }
-        expect(() => checkOracleEvidence(base, contract, inputs)).not.toThrow();
+        expect(() =>
+            checkOracleEvidence(base, contract, report, inputs),
+        ).not.toThrow();
+        const forged = structuredClone(report);
+        forged.model_fingerprint = "e".repeat(64);
+        expect(() =>
+            checkOracleEvidence(base, contract, forged, inputs),
+        ).toThrow(/smoke report identity/);
+        const wrongInput = structuredClone(report);
+        wrongInput.inputs.model_onnx = "e".repeat(64);
+        expect(() =>
+            checkOracleEvidence(base, contract, wrongInput, inputs),
+        ).toThrow(/input model_onnx/);
+    });
+
+    test("above-floor oracle evidence is retained but does not qualify production", () => {
+        const root = freshRoot();
+        installProductionManifest(root);
+        const manifest = JSON.parse(
+            readFileSync(join(root, SOURCE_MANIFEST_PATH), "utf8"),
+        );
+        manifest.oracle.host.kernel = "6.12";
+        manifest.oracle.host.exact_floor = false;
+        const reportPath = join(
+            root,
+            "scripts/__fixtures__/mc-host-qualification/artifacts/synapse-smoke-report.json",
+        );
+        const report = JSON.parse(readFileSync(reportPath, "utf8"));
+        report.host.kernel = "6.12";
+        report.host.exact_floor = false;
+        const reportBytes = `${JSON.stringify(report, null, 2)}\n`;
+        manifest.oracle.smoke_report.sha256 = createHash("sha256")
+            .update(reportBytes)
+            .digest("hex");
+        installManifest(root, manifest);
+        writeFileSync(reportPath, reportBytes);
+        const result = generate(root, { check: false });
+        expect(result.productionQualified).toBe(false);
+        expect(JSON.parse(result.outputs.lock).oracle).toMatchObject({
+            qualified: false,
+            observed: {
+                host: {
+                    kernel: "6.12",
+                    glibc: "2.28",
+                    exact_floor: false,
+                },
+            },
+        });
     });
 });
 
@@ -2015,10 +2282,346 @@ describe("typed argument variants", () => {
     });
 });
 
+describe("harness runtime closure graph qualification", () => {
+    test("accepts a complete reachable graph and produces a stable canonical digest", () => {
+        const closure = closureFixture();
+        validateClosureManifest(closure);
+        validateClosureManifest(openCodeClosureFixture());
+        const reparsed = JSON.parse(canonicalClosureManifest(closure));
+        expect(closureManifestDigest(reparsed)).toBe(
+            closureManifestDigest(closure),
+        );
+        expect(closureManifestDigest(closure)).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    test("binds exact schema, harness, package, version, and argument variant", () => {
+        const cases: [
+            (closure: any) => void,
+            RegExp,
+        ][] = [
+            [
+                (closure) => {
+                    closure.schema = "magic-context.mc-host-harness-closure/v2";
+                },
+                /unknown schema/,
+            ],
+            [
+                (closure) => {
+                    closure.harness = "unknown";
+                },
+                /harness must be opencode or pi/,
+            ],
+            [
+                (closure) => {
+                    closure.package = "pi-lookalike";
+                },
+                /package must be @earendil-works\/pi-coding-agent/,
+            ],
+            [
+                (closure) => {
+                    closure.version = "0.80";
+                },
+                /version must be exact semver/,
+            ],
+            [
+                (closure) => {
+                    closure.argument_variant = "raw_argv";
+                },
+                /argument_variant .* is not qualified/,
+            ],
+            [
+                (closure) => {
+                    closure.extra = true;
+                },
+                /unknown key extra/,
+            ],
+        ];
+        for (const [mutate, error] of cases) {
+            const closure: any = closureFixture();
+            mutate(closure);
+            expect(() => validateClosureManifest(closure)).toThrow(error);
+        }
+    });
+
+    test("rejects invalid source roots, paths, hashes, sizes, modes, and node kinds", () => {
+        const cases: [
+            (closure: any) => void,
+            RegExp,
+        ][] = [
+            [
+                (closure) => {
+                    closure.source_roots.reverse();
+                },
+                /source_roots must be sorted and unique/,
+            ],
+            [
+                (closure) => {
+                    closure.nodes[0].source_root = "undeclared";
+                },
+                /does not name a declared source root/,
+            ],
+            [
+                (closure) => {
+                    closure.nodes[0].path = "../node";
+                },
+                /safe relative POSIX path/,
+            ],
+            [
+                (closure) => {
+                    closure.nodes[0].source_path = "bin\\node";
+                },
+                /safe relative POSIX path/,
+            ],
+            [
+                (closure) => {
+                    closure.nodes[0].sha256 = "0".repeat(64);
+                },
+                /real 64-lowercase-hex digest/,
+            ],
+            [
+                (closure) => {
+                    closure.nodes[0].size_bytes = -1;
+                },
+                /non-negative integer/,
+            ],
+            [
+                (closure) => {
+                    closure.nodes[0].mode = 0o1000;
+                },
+                /owner-only/,
+            ],
+            [
+                (closure) => {
+                    closure.nodes[0].kind = "script";
+                },
+                /not a qualified node kind/,
+            ],
+        ];
+        for (const [mutate, error] of cases) {
+            const closure: any = closureFixture();
+            mutate(closure);
+            expect(() => validateClosureManifest(closure)).toThrow(error);
+        }
+    });
+
+    test("rejects duplicate, unsorted, missing, and unreachable graph nodes", () => {
+        const duplicate: any = closureFixture();
+        duplicate.nodes.splice(1, 0, structuredClone(duplicate.nodes[0]));
+        expect(() => validateClosureManifest(duplicate)).toThrow(
+            /paths must be unique|must be sorted and unique/,
+        );
+
+        const unsorted: any = closureFixture();
+        unsorted.nodes.reverse();
+        expect(() => validateClosureManifest(unsorted)).toThrow(
+            /closure.nodes must be sorted and unique/,
+        );
+
+        const missing: any = closureFixture();
+        missing.nodes[1].dependencies[0].path =
+            "node_modules/missing/index.js";
+        expect(() => validateClosureManifest(missing)).toThrow(
+            /dependency target .* is missing/,
+        );
+
+        const unreachable: any = closureFixture();
+        unreachable.nodes.push({
+            ...structuredClone(unreachable.nodes.at(-1)),
+            path: "node_modules/unreachable.js",
+            source_path: "node_modules/unreachable.js",
+        });
+        expect(() => validateClosureManifest(unreachable)).toThrow(
+            /node .* is unreachable/,
+        );
+    });
+
+    test("requires explicit finite-dynamic and native-addon edges", () => {
+        const unresolvedDynamic: any = closureFixture();
+        unresolvedDynamic.nodes[1].dependencies[1].path =
+            "node_modules/provider/not-listed.js";
+        expect(() => validateClosureManifest(unresolvedDynamic)).toThrow(
+            /dependency target .* is missing/,
+        );
+
+        const wrongNativeKind: any = closureFixture();
+        wrongNativeKind.nodes[2].dependencies[0].kind = "static";
+        expect(() => validateClosureManifest(wrongNativeKind)).toThrow(
+            /native dependency kind must correspond exactly/,
+        );
+
+        const unclaimedAddon: any = closureFixture();
+        unclaimedAddon.nodes[2].dependencies = [];
+        expect(() => validateClosureManifest(unclaimedAddon)).toThrow(
+            /native\/addon\.node.*unreachable/,
+        );
+
+        const unknownDependencyKind: any = closureFixture();
+        unknownDependencyKind.nodes[1].dependencies[0].kind = "runtime_scan";
+        expect(() => validateClosureManifest(unknownDependencyKind)).toThrow(
+            /not a qualified dependency kind/,
+        );
+    });
+
+    test("validates harness-specific roots and preserves extension order in identity", () => {
+        const wrongRootKind: any = closureFixture();
+        wrongRootKind.nodes[0].kind = "executable";
+        expect(() => validateClosureManifest(wrongRootKind)).toThrow(
+            /interpreter root must have node kind interpreter/,
+        );
+
+        const missingEntrypoint: any = closureFixture();
+        missingEntrypoint.entrypoint = null;
+        expect(() => validateClosureManifest(missingEntrypoint)).toThrow(
+            /pi requires interpreter and entrypoint roots/,
+        );
+
+        const first: any = closureFixture();
+        const secondExtension = {
+            ...structuredClone(first.nodes.at(-1)),
+            path: "node_modules/provider/zext.js",
+            source_path: "node_modules/provider/zext.js",
+        };
+        first.nodes.push(secondExtension);
+        first.extensions.push(secondExtension.path);
+        validateClosureManifest(first);
+        const reordered = structuredClone(first);
+        reordered.extensions.reverse();
+        validateClosureManifest(reordered);
+        expect(closureManifestDigest(reordered)).not.toBe(
+            closureManifestDigest(first),
+        );
+
+        const duplicateExtension = structuredClone(first);
+        duplicateExtension.extensions.push(duplicateExtension.extensions[0]);
+        expect(() => validateClosureManifest(duplicateExtension)).toThrow(
+            /extensions must be unique/,
+        );
+    });
+
+    test("optional source closure is validated and locked by digest", () => {
+        const root = freshRoot();
+        const manifest = fixtureManifest();
+        manifest.harnesses.pi.closure = closureFixture();
+        delete manifest.harnesses.pi.closure_unqualified_reason;
+        installManifest(root, manifest);
+        const generated = generate(root, { check: false });
+        const lock = JSON.parse(generated.outputs.lock);
+        expect(lock.harnesses.pi.closure.sha256).toBe(
+            closureManifestDigest(manifest.harnesses.pi.closure),
+        );
+        expect(lock.harnesses.pi.closure.source_roots).toEqual(
+            manifest.harnesses.pi.closure.source_roots,
+        );
+
+        const mismatchRoot = freshRoot();
+        const mismatch = fixtureManifest();
+        mismatch.harnesses.pi.closure = closureFixture();
+        delete mismatch.harnesses.pi.closure_unqualified_reason;
+        mismatch.harnesses.pi.closure.version = "0.80.1";
+        installManifest(mismatchRoot, mismatch);
+        expect(() => generate(mismatchRoot, { check: false })).toThrow(
+            /identity does not match its harness source record/,
+        );
+    });
+
+    test("production closure qualification hashes every declared source node", () => {
+        const root = freshRoot();
+        installProductionManifest(root);
+        expect(() => generate(root, { check: false })).not.toThrow();
+
+        writeFileSync(
+            join(
+                root,
+                "closure-sources/pi-install/node_modules/@earendil-works/pi-coding-agent/dist/helper.js",
+            ),
+            "mutant",
+        );
+        expect(() => generate(root, { check: false })).toThrow(
+            /closure source node hash changed/,
+        );
+    });
+
+    test("production closure qualification rejects runtime-derived imports", () => {
+        const root = freshRoot();
+        installProductionManifest(root);
+        const source = "import(userInput)";
+        const sourcePath = join(
+            root,
+            "closure-sources/pi-install/node_modules/@earendil-works/pi-coding-agent/dist/helper.js",
+        );
+        writeFileSync(sourcePath, source);
+        const manifest = JSON.parse(
+            readFileSync(join(root, SOURCE_MANIFEST_PATH), "utf8"),
+        );
+        const helper = manifest.harnesses.pi.closure.nodes.find(
+            (node: { source_path: string }) =>
+                node.source_path.endsWith("/helper.js"),
+        );
+        helper.size_bytes = Buffer.byteLength(source);
+        helper.sha256 = createHash("sha256").update(source).digest("hex");
+        writeFileSync(
+            join(root, SOURCE_MANIFEST_PATH),
+            `${JSON.stringify(manifest, null, 2)}\n`,
+        );
+        expect(() => generate(root, { check: false })).toThrow(
+            /unresolved dynamic import/,
+        );
+    });
+
+    test("dynamic-import exceptions bind exact source digest and expression", () => {
+        const path =
+            "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/env-api-keys.js";
+        const expression =
+            "import(__rewriteRelativeImportExtension(specifier))";
+        const node = {
+            path,
+            source_root: "pi-install",
+            source_path: path,
+            kind: "module" as const,
+            mode: 0o600,
+            size_bytes: 1,
+            sha256:
+                "102c2b8622b18c8fc3e1f961e5cc2a6c83104a85c5d693f08e419a05d99beaac",
+            dependencies: [],
+        };
+        const closure = {
+            ...closureFixture(),
+            nodes: [node],
+        };
+        expect(() =>
+            validateQualifiedDynamicImports(
+                repoRoot,
+                closure,
+                node,
+                "pi",
+                path,
+                node.sha256,
+                `const load = (specifier) => ${expression};`,
+            ),
+        ).not.toThrow();
+        const mutated = `const load = (specifier) => ${expression}; import(userInput);`;
+        const mutatedNode = {
+            ...node,
+            sha256: createHash("sha256").update(mutated).digest("hex"),
+        };
+        expect(() =>
+            validateQualifiedDynamicImports(
+                repoRoot,
+                { ...closure, nodes: [mutatedNode] },
+                mutatedNode,
+                "pi",
+                path,
+                mutatedNode.sha256,
+                mutated,
+            ),
+        ).toThrow(/unresolved dynamic import/);
+    });
+});
+
 describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
-    test("committed evidence is not production-qualified and is rejected", () => {
+    test("committed qualification remains blocked on the exact kernel floor", () => {
         expect(() => requireQualificationEvidence(repoRoot)).toThrow(
-            /inputs are not production-qualified/,
+            /not production-qualified/,
         );
     });
 
@@ -2232,7 +2835,7 @@ describe("verify-path resolution", () => {
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.mode = "production";
-        useResolvableSources(manifest);
+        useProductionProvenance(manifest);
         unblacklistDigests(manifest);
 
         // Real bytes live in a developer cache; the manifest names an

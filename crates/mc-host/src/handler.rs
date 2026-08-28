@@ -6,6 +6,7 @@
 //! route allocation, and the host owns lifecycle transitions, terminal
 //! arbitration, and wire emission (plan KTD2).
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -125,6 +126,7 @@ pub struct RouteIdentity {
     pub consumer_launch_nonce: Option<String>,
     pub consumer_capabilities: Vec<String>,
     pub admission_facts: Option<serde_json::Value>,
+    pub credential_fingerprints: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for RouteIdentity {
@@ -142,6 +144,10 @@ impl std::fmt::Debug for RouteIdentity {
             )
             .field("consumer_capabilities", &self.consumer_capabilities.len())
             .field("admission_facts", &self.admission_facts.is_some())
+            .field(
+                "credential_fingerprints",
+                &self.credential_fingerprints.len(),
+            )
             .finish()
     }
 }
@@ -559,6 +565,10 @@ pub trait McHostHandler: Send + Sync + 'static {
     fn resource_declarations(&self) -> Vec<ResourceDeclaration> {
         vec![ResourceDeclaration::default(); self.manifests().len()]
     }
+
+    /// Installs the incarnation bearer for protocol-internal credential-row
+    /// fingerprints before any component initialization or route bind.
+    fn install_connection_key(&self, _key: [u8; 32]) {}
 
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
 

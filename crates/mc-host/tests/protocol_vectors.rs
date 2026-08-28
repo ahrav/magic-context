@@ -196,7 +196,7 @@ fn canonical_route_open_body_is_173_bytes() {
 fn catalog_capability_vector_includes_negotiate_but_never_the_candidate_ops() {
     let canonical = concat!(
         r#"{"op":"catalog.list","generation":1,"modules":[],"#,
-        r#""subc_ops":["route.open","catalog.list","host.shutdown","transport.negotiate"]}"#
+        r#""subc_ops":["route.open","catalog.list","host.shutdown","host.status","transport.negotiate"]}"#
     );
     let parsed: serde_json::Value = serde_json::from_str(canonical).expect("canonical JSON");
     assert_eq!(parsed["op"], "catalog.list");
@@ -206,6 +206,7 @@ fn catalog_capability_vector_includes_negotiate_but_never_the_candidate_ops() {
             "route.open",
             "catalog.list",
             "host.shutdown",
+            "host.status",
             "transport.negotiate"
         ])
     );
@@ -966,6 +967,7 @@ async fn three_component_catalog_order_is_pinned() {
             "route.open",
             "catalog.list",
             "host.shutdown",
+            "host.status",
             "transport.negotiate"
         ])
     );

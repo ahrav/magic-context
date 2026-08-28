@@ -2,11 +2,11 @@
   "artifacts": {
     "production_inputs_lock": {
       "path": "release/mc-host-production-inputs.lock.json",
-      "sha256": "5348c49b7041a2e4db3179ca00caa3e0a0c8b57edecf8edb1913fd620e38442a"
+      "sha256": "2abdc0ba8fa220e046e4dd995c617ef39d99b352462864d8a7c0d27ce1efae5a"
     },
     "provider_credentials": {
       "path": "release/mc-host-provider-credentials.json",
-      "sha256": "2dcc23d6e65d3aeebb1bb68fb8ebc8a64fc1c5dd2c6ae5e6e5d20bbb339d2ceb"
+      "sha256": "b2b77e811eb8af966e19ba4f5981a06912908b5906d7bff701c86337bb190e13"
     }
   },
   "production_qualified": false,
@@ -18,14 +18,6 @@
   "schema": "magic-context.mc-host-release-qualification/v1",
   "test_only": false,
   "unqualified": [
-    "harnesses.opencode: exact opencode-ai harness version (independent of the @opencode-ai SDK/plugin pins) not yet qualified by release engineering",
-    "inputs.config: production config.json bytes not yet qualified by release engineering",
-    "inputs.corpus: production semantic-certification corpus bytes not yet qualified by release engineering",
-    "inputs.model_onnx: production gte-modernbert-base-f16 ONNX bytes not yet qualified by release engineering",
-    "inputs.ort_runtime: exact CPU-only ONNX Runtime shared-library bytes (loaded via ort 2.0.0-rc.13 dynamic loading) not yet qualified by release engineering",
-    "inputs.special_tokens_map: production special_tokens_map.json bytes not yet qualified by release engineering",
-    "inputs.tokenizer: production tokenizer.json bytes not yet qualified by release engineering",
-    "inputs.tokenizer_config: production tokenizer_config.json bytes not yet qualified by release engineering",
     "oracle: offline semantic-oracle evidence not yet recorded against real locked ORT/model bytes"
   ]
 }

@@ -153,6 +153,17 @@ pub struct GenerationManifest {
     pub target: String,
     pub release_contract_sha256: String,
     pub inputs_lock_sha256: String,
+    /// The payload manifest this generation was staged from, or `None` for a
+    /// generation staged before the field existed.
+    ///
+    /// Schema 1 shipped without it and the schema number did not change when it
+    /// was added, so requiring it would decode every retained predecessor as
+    /// corrupt and fail the first no-`--payload-dir` start after an upgrade with
+    /// `native_payload_invalid` — refusing a payload that is intact. A generation
+    /// that cannot name its source instead fails only the checks that actually
+    /// need that name, which is what `Option` makes explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_payload_manifest_sha256: Option<String>,
     pub files: Vec<ManifestFile>,
 }
 
@@ -217,6 +228,10 @@ pub struct SourceSpec {
     pub source: PathBuf,
     /// Whether the staged copy is owner-executable (0o700 vs 0o600).
     pub executable: bool,
+    /// Optional release-manifest size for production package sources.
+    pub expected_size: Option<u64>,
+    /// Optional release-manifest SHA-256 for production package sources.
+    pub expected_sha256: Option<String>,
 }
 
 /// Non-file identity inputs committed by the staged manifest.
@@ -225,6 +240,61 @@ pub struct StageMeta {
     pub target: String,
     pub release_contract_sha256: String,
     pub inputs_lock_sha256: String,
+    pub source_payload_manifest_sha256: String,
+}
+
+/// Read-only proof that every source is present and is the byte identity its
+/// payload manifest declares.
+///
+/// `stage_and_promote` already verifies these bytes, but it verifies them while
+/// copying — which for `restart` happens only after the incumbent has been
+/// stopped. A launcher, model, or runtime file that was deleted or rewritten
+/// since the manifest was written therefore passed preflight, took the healthy
+/// daemon down, and failed during the copy, leaving `stop_committed:true` with
+/// no successor. Every check here is a read, so it belongs before the stop.
+///
+/// Only sources carrying a declared identity are hashed: an unqualified dev tree
+/// has nothing to compare against, and its existence and type are proven by the
+/// same walk that enumerated it.
+pub fn verify_sources(sources: &[SourceSpec]) -> Result<(), GenerationError> {
+    for spec in sources {
+        let fd = openat(
+            rustix::fs::CWD,
+            &*spec.source,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| invalid("payload source open failed"))?;
+        let stat = rustix::fs::fstat(&fd).map_err(|_| invalid("payload source stat failed"))?;
+        if (mode_bits(&stat) & S_IFMT) != S_IFREG {
+            return Err(invalid("payload source is not a regular file"));
+        }
+        if spec
+            .expected_size
+            .is_some_and(|size| size != stat.st_size as u64)
+        {
+            return Err(invalid("payload source size differs from payload manifest"));
+        }
+        let Some(expected) = spec.expected_sha256.as_deref() else {
+            continue;
+        };
+        let mut hasher = sha2::Sha256::new();
+        let mut reader = std::fs::File::from(fd);
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|_| invalid("payload source read failed"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        if hex(&hasher.finalize()) != expected {
+            return Err(invalid("payload source hash differs from payload manifest"));
+        }
+    }
+    Ok(())
 }
 
 /// A completely revalidated generation: the retained directory descriptor
@@ -234,9 +304,17 @@ pub struct ValidatedGeneration {
     pub digest: String,
     pub manifest: GenerationManifest,
     dir: OwnedFd,
+    path: PathBuf,
 }
 
 impl ValidatedGeneration {
+    /// Stable managed path for libraries that require pathname-based loading.
+    /// Every consumer must still perform its own no-follow/hash validation;
+    /// the retained directory descriptor remains the generation identity.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Opens one manifest-listed file through the retained validated
     /// directory descriptor, rechecking shape and hash so the returned
     /// descriptor is execution-trustworthy even if the pathname was
@@ -546,6 +624,7 @@ impl GenerationStore {
             digest: digest.to_owned(),
             manifest,
             dir,
+            path: self.generation_path(digest),
         })
     }
 
@@ -618,6 +697,13 @@ impl GenerationStore {
             }
         }
         Ok(manifest)
+    }
+
+    /// Managed pathname of one generation directory, derived from the store
+    /// root rather than resolved, so it names the same location whether or not
+    /// the directory exists yet.
+    fn generation_path(&self, name: &str) -> PathBuf {
+        self.root.join(GENERATIONS_DIR_NAME).join(name)
     }
 
     /// Available bytes for this store's destination filesystem, as seen by
@@ -767,6 +853,7 @@ impl GenerationStore {
             target: meta.target.clone(),
             release_contract_sha256: meta.release_contract_sha256.clone(),
             inputs_lock_sha256: meta.inputs_lock_sha256.clone(),
+            source_payload_manifest_sha256: Some(meta.source_payload_manifest_sha256.clone()),
             files,
         };
         let bytes = manifest.canonical_bytes();
@@ -972,6 +1059,12 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
     if (mode_bits(&before) & S_IFMT) != S_IFREG {
         return Err(invalid("staging source is not a regular file"));
     }
+    if spec
+        .expected_size
+        .is_some_and(|size| size != before.st_size as u64)
+    {
+        return Err(invalid("staging source size differs from payload manifest"));
+    }
 
     // Create intermediate directories, then the exclusive output file.
     let mut dir_path = String::new();
@@ -1063,11 +1156,19 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
     if dest_stat.st_nlink != 1 || dest_stat.st_uid != owner_uid() {
         return Err(invalid("staging output is not owner-only single-link"));
     }
+    let sha256 = hex(&hasher.finalize());
+    if spec
+        .expected_sha256
+        .as_deref()
+        .is_some_and(|expected| expected != sha256)
+    {
+        return Err(invalid("staging source hash differs from payload manifest"));
+    }
     Ok(ManifestFile {
         path: spec.rel_path.clone(),
         mode,
         size: total,
-        sha256: hex(&hasher.finalize()),
+        sha256,
     })
 }
 
@@ -1100,17 +1201,16 @@ fn write_new_file(
     Ok(())
 }
 
-/// Atomic same-filesystem directory exchange. Linux `renameat2` with
-/// `RENAME_EXCHANGE`; other platforms fail closed as `native_payload_invalid`
-/// (macOS `renamex_np(RENAME_SWAP)` support is deferred with the rest of the
-/// macOS lane).
-#[cfg(target_os = "linux")]
+/// Atomic same-filesystem directory exchange. Rustix maps `EXCHANGE` to
+/// Linux `renameat2(RENAME_EXCHANGE)` and macOS
+/// `renameatx_np(RENAME_SWAP)`; unsupported platforms fail closed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn exchange_dirs(dir: &OwnedFd, a: &str, b: &str) -> Result<(), GenerationError> {
     rustix::fs::renameat_with(dir, a, dir, b, rustix::fs::RenameFlags::EXCHANGE)
         .map_err(|_| invalid("atomic digest-target exchange failed"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn exchange_dirs(_dir: &OwnedFd, _a: &str, _b: &str) -> Result<(), GenerationError> {
     Err(invalid(
         "atomic digest-target exchange is unsupported on this platform",
@@ -1305,11 +1405,32 @@ mod tests {
         GenerationStore::open(Some(root)).expect("open store")
     }
 
+    #[test]
+    fn a_generation_staged_before_the_source_digest_field_still_decodes() {
+        // Schema 1 shipped without `source_payload_manifest_sha256`, and the schema
+        // number did not change when it was added. Decoding a retained predecessor
+        // as corrupt would make the first no-`--payload-dir` start after an upgrade
+        // report `native_payload_invalid` for a payload that is perfectly intact.
+        let predecessor = br#"{"schema":1,"target":"linux-x64-gnu","release_contract_sha256":"aa","inputs_lock_sha256":"bb","files":[]}"#;
+        let decoded = match decode_with_schema::<GenerationManifest>(predecessor) {
+            SchemaDecode::Valid(manifest) => manifest,
+            SchemaDecode::UnknownSchema => panic!("schema 1 must stay readable"),
+            SchemaDecode::Malformed => {
+                panic!("a predecessor generation is not corrupt merely for predating a field")
+            }
+        };
+        assert_eq!(decoded.source_payload_manifest_sha256, None);
+        // Absence is not serialized back, so a predecessor manifest round-trips to
+        // its own bytes and keeps the digest that names its directory.
+        assert_eq!(decoded.canonical_bytes(), predecessor);
+    }
+
     fn meta() -> StageMeta {
         StageMeta {
             target: "linux-x64-gnu".to_owned(),
             release_contract_sha256: "a".repeat(64),
             inputs_lock_sha256: "b".repeat(64),
+            source_payload_manifest_sha256: "unqualified-dev-manifest".to_owned(),
         }
     }
 
@@ -1325,11 +1446,15 @@ mod tests {
                 rel_path: "bin/ck-mc-host".to_owned(),
                 source: write_source(dir, "launcher", b"#binary-bytes"),
                 executable: true,
+                expected_size: None,
+                expected_sha256: None,
             },
             SourceSpec {
                 rel_path: "notices.txt".to_owned(),
                 source: write_source(dir, "notices", b"notice text"),
                 executable: false,
+                expected_size: None,
+                expected_sha256: None,
             },
         ]
     }
@@ -1477,6 +1602,8 @@ mod tests {
             rel_path: "bin/ck-mc-host".to_owned(),
             source: write_source(src.path(), "launcher-b", b"#successor-binary"),
             executable: true,
+            expected_size: None,
+            expected_sha256: None,
         }];
         store
             .stage_and_promote(&successor, &meta(), &BTreeSet::new())
@@ -1526,6 +1653,8 @@ mod tests {
             rel_path: "bin/ck-mc-host".to_owned(),
             source: write_source(src_b.path(), "launcher", b"#different-binary"),
             executable: true,
+            expected_size: None,
+            expected_sha256: None,
         }];
         let digest_b = store
             .stage_and_promote(&spec_b, &meta(), &BTreeSet::new())
@@ -1664,6 +1793,8 @@ mod tests {
             rel_path: "bin/x".to_owned(),
             source: link,
             executable: true,
+            expected_size: None,
+            expected_sha256: None,
         }];
         assert!(matches!(
             store.stage_and_promote(&symlink_spec, &meta(), &BTreeSet::new()),
@@ -1675,6 +1806,8 @@ mod tests {
             rel_path: "../escape".to_owned(),
             source: real.clone(),
             executable: false,
+            expected_size: None,
+            expected_sha256: None,
         }];
         assert!(store
             .stage_and_promote(&traversal, &meta(), &BTreeSet::new())
@@ -1688,6 +1821,8 @@ mod tests {
             rel_path: "bin/x".to_owned(),
             source: cache_link,
             executable: true,
+            expected_size: None,
+            expected_sha256: None,
         }];
         let digest = store
             .stage_and_promote(&spec, &meta(), &BTreeSet::new())
@@ -1800,11 +1935,15 @@ mod tests {
                 rel_path: "a/b/c/deep".to_owned(),
                 source: write_source(src.path(), "deep", b"deep bytes"),
                 executable: false,
+                expected_size: None,
+                expected_sha256: None,
             },
             SourceSpec {
                 rel_path: "a/b/sibling".to_owned(),
                 source: write_source(src.path(), "sibling", b"sibling bytes"),
                 executable: false,
+                expected_size: None,
+                expected_sha256: None,
             },
         ];
         let digest = store
@@ -1956,6 +2095,8 @@ mod tests {
             rel_path: "bin/ck-mc-host".to_owned(),
             source: write_source(src.path(), "launcher-successor", b"#successor-binary"),
             executable: true,
+            expected_size: None,
+            expected_sha256: None,
         }];
         store
             .stage_and_promote(&successor, &meta(), &BTreeSet::new())

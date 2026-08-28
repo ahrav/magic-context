@@ -5,9 +5,11 @@
 mod support;
 
 use std::sync::Arc;
+use std::{ffi::OsString, time::Duration};
 
 use mc_host::broca::backend::Harness;
 use mc_host::broca::protocol::{self, Request};
+use mc_host::broca::subprocess::EnvSnapshot;
 use mc_host::broca::{config, BrocaComponent};
 use mc_host::{BindOutcome, CompositeComponent, RouteHandle, RouteIdentity};
 
@@ -386,6 +388,7 @@ async fn bind_requires_absolute_root_nonempty_session_and_supported_harness() {
         consumer_launch_nonce: None,
         consumer_capabilities: Vec::new(),
         admission_facts: None,
+        credential_fingerprints: std::collections::BTreeMap::new(),
     };
     let route = |channel| RouteHandle { channel, epoch: 1 };
     let rejects = [
@@ -420,6 +423,69 @@ fn harness_vocabulary_is_closed() {
     for alias in ["OpenCode", "PI", "opencode ", "codex", ""] {
         assert_eq!(Harness::parse(alias), None, "{alias:?} must not parse");
     }
+}
+
+#[tokio::test]
+async fn credential_snapshot_must_match_before_backend_spawn() {
+    let env = EnvSnapshot::capture_from(vec![(
+        OsString::from("ANTHROPIC_API_KEY"),
+        OsString::from("frozen-secret"),
+    )])
+    .expect("credential snapshot");
+    let backend = ScriptedBackend::completing("out");
+    let component =
+        BrocaComponent::new_with_credentials(Arc::clone(&backend) as Arc<_>, env.clone());
+    let host = start_broca_host(component).await;
+    let mut client = host.client().await;
+
+    let (bad_ch, bad_ep) = open_broca_route(&mut client, "opencode", "bad").await;
+    let rejected = call(
+        &mut client,
+        bad_ch,
+        bad_ep,
+        "session.send",
+        send_params("prompt", None, "anthropic/model"),
+    )
+    .await;
+    assert_eq!(rejected.ty, support::raw_client::TY_ERROR);
+    assert_eq!(rejected.error_code(), "harness_unavailable");
+    assert_eq!(backend.starts(), 0, "mismatch must precede backend spawn");
+
+    let key: [u8; 32] = host.info.key.clone().try_into().expect("32-byte key");
+    let fingerprint = env
+        .credential_fingerprint(&key, "opencode", "anthropic")
+        .expect("fingerprint");
+    let mut fingerprints = serde_json::Map::new();
+    fingerprints.insert(
+        "anthropic".to_owned(),
+        serde_json::Value::String(fingerprint),
+    );
+    let (good_ch, good_ep) = client
+        .route_open_target_with_fingerprints(
+            "management_surface",
+            "broca",
+            support::broca::ROOT,
+            "opencode",
+            "good",
+            fingerprints,
+        )
+        .await
+        .expect("credential-bound route");
+    let accepted = call(
+        &mut client,
+        good_ch,
+        good_ep,
+        "session.send",
+        send_params("prompt", None, "anthropic/model"),
+    )
+    .await;
+    assert_eq!(accepted.ty, support::raw_client::TY_RESPONSE);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while backend.starts() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(backend.starts(), 1);
+    host.shutdown().await.expect("host shutdown");
 }
 
 /// One authenticated round trip through all five operations in the

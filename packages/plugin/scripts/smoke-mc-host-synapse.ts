@@ -19,9 +19,16 @@
  */
 
 import assert from "node:assert/strict";
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import {
+    existsSync,
+    mkdtempSync,
+    readFileSync,
+    realpathSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { SynapseEmbeddingProvider } from "../src/features/magic-context/memory/embedding-synapse";
@@ -31,6 +38,7 @@ import {
 } from "../src/features/magic-context/storage-embedding-measurements";
 import { createDirectTestDatabase } from "../src/features/magic-context/test-database";
 import { McHostClient } from "../src/shared/mc-host-client";
+import { detectProcSelfFd } from "../src/shared/mc-host-lifecycle/bootstrap";
 
 const OVERALL_DEADLINE_MS = 180_000;
 const READY_DEADLINE_MS = 20_000;
@@ -179,7 +187,7 @@ interface BundleManifest {
     fingerprint?: unknown;
     corpus?: { name?: unknown };
     provenance?: { production?: unknown };
-    model_file?: { sha256?: unknown };
+    model_file?: { name?: unknown; sha256?: unknown };
 }
 
 interface BundleCorpus {
@@ -339,12 +347,22 @@ async function pollJob(
 function assertClose(got: number[], expected: number[], what: string): void {
     assert.equal(got.length, expected.length, `${what}: dimension mismatch`);
     for (let index = 0; index < got.length; index += 1) {
+        const error = Math.abs(got[index] - expected[index]);
+        maxAbsError = Math.max(maxAbsError, error);
         assert.ok(
-            Math.abs(got[index] - expected[index]) <= corpus.tolerance,
+            error <= corpus.tolerance,
             `${what}: component ${index} beyond tolerance`,
         );
     }
 }
+
+let maxAbsError = 0;
+const observedOperations = new Set<string>();
+let observedVectors = 0;
+let observedExecutionProvider: string | null = null;
+let restartFenced = false;
+let degradedIsolated = false;
+let durableReceipts = false;
 
 try {
     // ---------------- Degraded lane first: no bundle configured. -----------
@@ -367,6 +385,7 @@ try {
         );
         const echoed = await client.request(handle, { echo: true });
         assert.deepEqual(echoed, { echo: true });
+        degradedIsolated = true;
         log("magic-context echo still works beside the degraded lane");
         await client.closeAsync();
     }
@@ -384,12 +403,15 @@ try {
     }));
     try {
         const models = body(await client.call("synapse", "models.list", {}, callOptions));
+        observedOperations.add("models.list");
         const entry = (models.models as Record<string, unknown>[])[0];
         assert.equal(entry.model, lane.model);
         assert.equal(entry.fingerprint, lane.fingerprint);
         assert.equal(entry.table_epoch, lane.epoch);
         assert.equal(entry.dims, lane.dims);
         assert.equal(entry.certified, true);
+        assert.equal(entry.execution_provider, "cpu");
+        observedExecutionProvider = String(entry.execution_provider);
         log("models.list pinned the certified identity");
 
         const query = body(
@@ -400,6 +422,7 @@ try {
                 callOptions,
             ),
         );
+        observedOperations.add("embed.query");
         const queryVector = (query.vectors as { vector: number[] }[])[0].vector;
         assertClose(queryVector, corpus.items[0].expected, "embed.query");
         log("embed.query matched the certified corpus vector");
@@ -415,6 +438,7 @@ try {
             })),
         };
         const first = body(await client.call("synapse", "embed.batch", batchParams, callOptions));
+        observedOperations.add("embed.batch");
         jobId = String(first.job_id);
         assert.equal(first.done, false);
         // An ambiguous send replays the same canonical page and must reuse
@@ -424,6 +448,8 @@ try {
         log(`embed.batch admitted job ${jobId}; replay reused it`);
 
         const vectors = await pollJob(client, jobId, key);
+        observedOperations.add("embed.result");
+        observedVectors = vectors.length;
         assert.deepEqual(
             vectors.map((item) => item.id),
             batchItems.map((item) => item.id),
@@ -475,6 +501,7 @@ try {
         assert.notEqual(newJob, jobId, "the replacement incarnation issues a fresh job");
         const vectors = await pollJob(restarted, newJob, key);
         assert.equal(vectors.length, batchItems.length);
+        restartFenced = true;
         log("restart returned module_restarted; resubmission completed the page");
     } finally {
         await restarted.closeAsync();
@@ -551,6 +578,7 @@ try {
             const page = getSynapseLedgerPage(db, receipt.rowId);
             assert.equal(page?.state, "complete", "receipts complete with their destination");
         }
+        durableReceipts = true;
         await provider.dispose();
         db.close();
         log("vectors and complete receipts committed in one transaction");
@@ -567,3 +595,95 @@ try {
     teardown();
 }
 console.log(`synapse-smoke: PASS (${mode} mode, all four operations, restart fence, degraded lane)`);
+
+const reportPath = process.env.MC_SYNAPSE_SMOKE_REPORT;
+if (mode === "production" && reportPath !== undefined) {
+    const kernel = execFileSync("uname", ["-r"], { encoding: "utf8" })
+        .trim()
+        .match(/^(\d+\.\d+)/)?.[1];
+    const glibc = execFileSync("ldd", ["--version"], { encoding: "utf8" })
+        .match(/(\d+\.\d+)/)?.[1];
+    if (process.platform !== "linux" || process.arch !== "x64" || !kernel || !glibc) {
+        fail("production smoke report requires a Linux x64 kernel and glibc identity");
+    }
+    const modelName = manifest.model_file?.name;
+    const corpusName = manifest.corpus?.name;
+    if (typeof modelName !== "string" || typeof corpusName !== "string") {
+        fail("production smoke report requires named model and corpus files");
+    }
+    const report = {
+        schema: "magic-context.mc-host-synapse-smoke/v1",
+        mode: "production",
+        model_fingerprint: lane.fingerprint,
+        table_epoch: lane.epoch,
+        execution_provider:
+            observedExecutionProvider ?? fail("models.list did not report an execution provider"),
+        host: {
+            target: "linux-x64-gnu",
+            kernel,
+            glibc,
+            exact_floor: kernel === "4.18" && glibc === "2.28",
+            // `checkOracleEvidence` requires this exact key and feeds it to
+            // `evaluatePlatform`, then requires the report host to equal the
+            // oracle host canonically. Omitting it made every report from this
+            // script inadmissible as production evidence on any host, however
+            // valid. Probed through the same function the lifecycle gate uses,
+            // so the recorded fact is the one that was actually evaluated.
+            procfs_self_fd_exec: detectProcSelfFd(),
+        },
+        inputs: {
+            ort_runtime: ortSha,
+            model_onnx: sha256File(join(bundleDir, modelName)),
+            bundle_manifest: sha256File(join(bundleDir, "manifest.json")),
+            semantic_corpus: sha256File(join(bundleDir, corpusName)),
+        },
+        observed_vectors: observedVectors,
+        max_abs_error: maxAbsError,
+        tolerance: corpus.tolerance,
+        operations: [...observedOperations].sort(),
+        restart_fenced: restartFenced,
+        degraded_isolated: degradedIsolated,
+        durable_receipts: durableReceipts,
+        network_access: (() => {
+            // Any route out of the namespace on any interface but loopback, in
+            // either family. The old predicate looked only for an IPv4 default
+            // route, so a namespace holding a specific IPv4 route or any IPv6
+            // route recorded `none` — and `buildLock` treats `none` as proof the
+            // oracle ran offline, letting a routable namespace mint production
+            // evidence that claims networking was disabled.
+            //
+            // This still infers isolation from the routing table rather than
+            // proving it. Enforce isolation externally where the claim has to be
+            // airtight; an unreadable table is reported as reachable because it
+            // proves nothing either way.
+            const routed = (
+                path: string,
+                header: boolean,
+                device: (fields: string[]) => string | undefined,
+            ) => {
+                let text: string;
+                try {
+                    text = readFileSync(path, "utf8");
+                } catch {
+                    return true;
+                }
+                const lines = text.split("\n");
+                return (header ? lines.slice(1) : lines)
+                    .map((line) => line.trim())
+                    .filter((line) => line.length > 0)
+                    .some((line) => {
+                        const dev = device(line.split(/\s+/));
+                        return dev !== undefined && dev !== "lo";
+                    });
+            };
+            // `/proc/net/route` carries a header row and names the interface
+            // first; `/proc/net/ipv6_route` has no header and names it last.
+            const reachable =
+                routed("/proc/net/route", true, (fields) => fields[0]) ||
+                routed("/proc/net/ipv6_route", false, (fields) => fields[fields.length - 1]);
+            return reachable ? "available" : "none";
+        })(),
+    };
+    writeFileSync(reportPath, `${stableJson(report)}\n`, { mode: 0o600 });
+    log(`wrote production smoke report ${reportPath}`);
+}
