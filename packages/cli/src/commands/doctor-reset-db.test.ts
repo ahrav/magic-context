@@ -385,8 +385,17 @@ describe("doctor reset-db U11 scenarios", () => {
                     renameSync(source, destination);
                     if (!replaced && source.endsWith("-journal")) {
                         replaced = true;
-                        rmSync(`${dbPath}-shm`, { force: true });
-                        writeFileSync(`${dbPath}-shm`, replacement);
+                        // The replacement has to land on a DIFFERENT inode, since
+                        // that is what the identity check compares. Deleting
+                        // first and recreating leaves the new inode to the
+                        // filesystem, which recycles the just-freed one often
+                        // enough that CI saw the replacement keep its recorded
+                        // identity and the quarantine proceed. Staging a sibling
+                        // while the original still holds its inode forces a
+                        // distinct one, and the rename carries it over.
+                        const staged = `${dbPath}-shm.replacement`;
+                        writeFileSync(staged, replacement);
+                        renameSync(staged, `${dbPath}-shm`);
                     }
                 },
             },
