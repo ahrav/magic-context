@@ -646,6 +646,46 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("one run exhausting validation is invalid-output even when the other satisfies every gold", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            // Run 1 publishes and satisfies the golds; run 2 exhausts validation. The
+            // old `every`-based flag was false here, so the scenario reported PASS with
+            // nothing in the score naming the declared pass that produced nothing.
+            // `recordInventoryError` proves a `failed` run is a validation exhaustion,
+            // so it is model evidence (KTD4) whether or not a sibling succeeded.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ runIndex: 1, persistedCompartments: 2, emittedCompartments: 2 }),
+                    goldenRun({
+                        runIndex: 2,
+                        status: "failed",
+                        failureReason: "validation: no parsable compartment",
+                        rawOutput: "garbage",
+                        persistedCompartments: 0,
+                        emittedCompartments: 0,
+                        factsEmitted: 0,
+                        promotionEvidenceAdded: 0,
+                        // The snapshot implies zero margin (run 1's compartments already
+                        // reach the chunk end), and the telemetry cross-check compares the
+                        // two — a null here would be refused as a snapshot mismatch before
+                        // the verdict under test is reached.
+                        lookaheadMargin: 0,
+                    }),
+                ],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("FAIL");
+            expect(score.failReasons).toContain("invalid-output");
+            // Facts still scored: run 1 published, so unlike the all-failed branch the
+            // rates are meaningful and must not be nulled.
+            expect(score.recall).toBe(1);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("ERROR-flagged run record propagates with no rates computed (R6)", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

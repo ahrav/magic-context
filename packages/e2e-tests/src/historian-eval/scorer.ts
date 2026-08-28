@@ -342,13 +342,23 @@ function assembleScore(args: {
     facts: FactsScore;
     structuralFindings: string[];
     probeVerdicts: ProbeVerdict[];
-    allAttemptsInvalid: boolean;
+    /**
+     * Any declared historian run produced no valid output.
+     *
+     * ANY, not every. `recordInventoryError` proves each recorded run is either a
+     * success or a validation exhaustion, so a failed run is always model behaviour
+     * (KTD4) — and a two-run scenario whose first pass satisfies every gold while
+     * its second exhausts validation is not a clean result. Keying this on "every
+     * run failed" let exactly that report PASS, with nothing in the score naming
+     * the pass that produced nothing.
+     */
+    anyRunInvalid: boolean;
     system: SystemVersionTuple | null;
     source: ScenarioScore["source"];
 }): ScenarioScore {
-    const { scenarioId, facts, structuralFindings, probeVerdicts, allAttemptsInvalid, system, source } = args;
+    const { scenarioId, facts, structuralFindings, probeVerdicts, anyRunInvalid, system, source } = args;
     const failReasons = new Set<FailReason>();
-    if (allAttemptsInvalid) failReasons.add("invalid-output");
+    if (anyRunInvalid) failReasons.add("invalid-output");
     if (facts.falseAuthoritativeMatches.length > 0) failReasons.add("false-authoritative");
     if (facts.recall !== null && facts.recall < 1) failReasons.add("recall");
     if (structuralFindings.length > 0) failReasons.add("structural");
@@ -538,7 +548,7 @@ export function scoreRawOutput(
                     authoredSpan,
                 ),
                 probeVerdicts: [],
-                allAttemptsInvalid: false,
+                anyRunInvalid: false,
                 system: null,
                 source: "raw-output",
             }),
@@ -1241,7 +1251,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 },
                 structuralFindings: [],
                 probeVerdicts: [],
-                allAttemptsInvalid: true,
+                anyRunInvalid: true,
                 system: record.system,
                 source: "run-record",
             });
@@ -1538,7 +1548,13 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 ...healing,
             ],
             probeVerdicts,
-            allAttemptsInvalid: false,
+            // The all-failed branch above returned early because nothing was
+            // published there and facts and probes are meaningless. A PARTIAL failure
+            // still publishes, so its facts and probes are scored — but the run that
+            // exhausted validation is model evidence all the same, and reporting only
+            // the all-failed case left a two-run scenario free to PASS on one good
+            // pass while the other produced nothing.
+            anyRunInvalid: record.historianRuns.some((run) => run.status === "failed"),
             system: record.system,
             source: "run-record",
         });

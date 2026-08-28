@@ -548,7 +548,9 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
     // whenever the later probe's answer appears anywhere in that history, which is
     // two distinct surfaces: the earlier probe's ANSWER (its gold value and, for
     // multiple-choice, its options) and the earlier probe's QUESTION text. Both are
-    // refused per ordered pair below.
+    // refused per ordered pair below, and by CONTAINMENT as well as equality — an
+    // earlier value that merely holds the later answer inside it hands it over just
+    // as completely.
     //
     // Probe uniqueness does not cover either: it includes the question text and
     // answer type, so "which cache backs sessions" as multiple-choice and a
@@ -589,6 +591,27 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
                 fail(
                     `${label}.probes: shared-answer-surface (${left.id} and ${right.id} share the answer value ${JSON.stringify(shared[0])}, so the earlier exchange answers the later probe)`,
                 );
+            }
+            // Equality is not the only way an earlier surface hands over a later
+            // answer: it can CONTAIN it. An earlier gold of "limit 4096 bytes" ahead
+            // of a probe whose gold is "4096" states that answer in the accepted
+            // envelope, and the check above compares normalized strings for equality
+            // only, so the pair passes.
+            //
+            // The accepted envelope is exactly what `probeResponseLeak` exempts at
+            // runtime — deliberately, since a probe's own answer is the point of its
+            // exchange — so nothing downstream covers this. It has to be refused here.
+            //
+            // Directional and complete-value, for the same reasons as the question
+            // check below: only the earlier reply reaches the later model, and an
+            // earlier answer of "4096" must not count as stating a later answer of "4".
+            if (right.answerType !== "claim-id") {
+                const containing = leftSurface.find((value) => containsCompleteValue(value, right.goldAnswer));
+                if (containing !== undefined) {
+                    fail(
+                        `${label}.probes: shared-answer-surface (${left.id} runs first and its answer surface value ${JSON.stringify(containing)} states ${right.id}'s gold answer ${JSON.stringify(right.goldAnswer)})`,
+                    );
+                }
             }
             // Answer surfaces are not the only part of an earlier exchange the
             // later model reads. The QUESTION text is in the same raw history, and

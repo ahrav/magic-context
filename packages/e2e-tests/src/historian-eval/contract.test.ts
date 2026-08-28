@@ -434,6 +434,54 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(validScenarioRaw())).not.toThrow();
     });
 
+    test("rejects an earlier answer value that contains a later probe's answer", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // The surfaces are not equal, so the intersection check exempts the pair —
+        // but "limit 4096 bytes" states "4096", and it states it inside the ACCEPTED
+        // envelope, which `probeResponseLeak` deliberately exempts at runtime. If this
+        // does not refuse it, nothing does.
+        probes.unshift({
+            id: "probe-limit-phrase",
+            question: "How was the cap described?",
+            answerType: "exact",
+            goldAnswer: "limit 4096 bytes",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).toThrow(/shared-answer-surface/);
+    });
+
+    test("accepts a containing answer value when it runs LAST", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Same pair, reversed. The containing value now appears only after the probe
+        // it would expose, so no reply the answering model saw carried it.
+        probes.push({
+            id: "probe-limit-phrase",
+            question: "How was the cap described?",
+            answerType: "exact",
+            goldAnswer: "limit 4096 bytes",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).not.toThrow();
+    });
+
+    test("a containing value is matched as a complete value, not a substring", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // The earlier answer holds the characters of "409" but states "4096"; a bare
+        // substring test would refuse this legitimate pair.
+        probes.unshift({
+            id: "probe-limit-phrase",
+            question: "How was the cap described?",
+            answerType: "exact",
+            goldAnswer: "limit 4096 bytes",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        (probes.find((probe) => probe.id === "probe-capacity") as Record<string, unknown>).goldAnswer = "409";
+        expect(() => parseScenario(raw)).not.toThrow();
+    });
+
     test("rejects an earlier probe whose question states a later probe's answer", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
