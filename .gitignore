@@ -96,6 +96,7 @@ packages/plugin/scripts/experiments/issue-195-repro.mjs
 packages/plugin/scripts/mural-test-output/
 # Interrupted benchmark-release promotions must never become committable.
 packages/plugin/scripts/fixtures/retrieval-benchmark/.staging-*/
+packages/e2e-tests/historian-eval/**/.staging-*/
 AgentLogs/
 .agent-logs/
 tests/docker/.generated/

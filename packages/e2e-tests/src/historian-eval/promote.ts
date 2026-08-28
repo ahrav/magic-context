@@ -15,7 +15,6 @@ import {
     existsSync,
     mkdirSync,
     mkdtempSync,
-    readFileSync,
     readdirSync,
     realpathSync,
     renameSync,
@@ -24,7 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { canonicalFingerprint, readCanonicalJsonFile } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { hasGitAncestor } from "../../../plugin/scripts/retrieval-benchmark/fs-boundary";
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
 import {
@@ -61,10 +60,24 @@ export interface PromotionInput {
     /** Errata carried forward from prior releases plus any new tombstones (R12). */
     tombstones?: readonly string[];
     forbiddenTokens?: readonly string[];
+    /** Word-bounded username/identifier deny list, forwarded to the privacy scan. */
+    forbiddenIdentifiers?: readonly string[];
 }
 
 function fail(diagnostics: string[]): never {
     throw new HistorianEvalContractError(diagnostics);
+}
+
+/**
+ * Byte-strict release read-back: fingerprints are computed over PARSED
+ * values, so a plain `JSON.parse` would let an in-place edit of an installed
+ * release (duplicate members — where a reviewer sees the first value and the
+ * code takes the last — or re-serialized bytes) pass the tamper checks.
+ * Canonical-byte verification rejects anything `writeReleaseTree` did not
+ * produce.
+ */
+function readReleaseJson(path: string, label: string): unknown {
+    return readCanonicalJsonFile(path, (code) => new HistorianEvalContractError([`${label}: ${code}`]));
 }
 
 function checkApprovals(rawApprovals: readonly unknown[], tupleFingerprint: string): { privacy: Approval; goldIntent: Approval } {
@@ -119,10 +132,10 @@ export function loadRelease(releaseDir: string): {
     if (unexpected.length > 0 || entries.length !== expected.length) {
         fail([`release: unexpected entries (${unexpected.length > 0 ? unexpected.join(", ") : "missing files"})`]);
     }
-    const manifest = parseManifest(JSON.parse(readFileSync(join(releaseDir, RELEASE_FILES.manifest), "utf8")));
+    const manifest = parseManifest(readReleaseJson(join(releaseDir, RELEASE_FILES.manifest), "release.manifest"));
     const scenarioFiles = readdirSync(join(releaseDir, RELEASE_FILES.scenariosDir)).sort();
     const scenarios = scenarioFiles.map((file) =>
-        parseScenario(JSON.parse(readFileSync(join(releaseDir, RELEASE_FILES.scenariosDir, file), "utf8")), file),
+        parseScenario(readReleaseJson(join(releaseDir, RELEASE_FILES.scenariosDir, file), `release.scenarios.${file}`), file),
     );
     const diagnostics: string[] = [];
     for (const [index, scenario] of scenarios.entries()) {
@@ -141,7 +154,7 @@ export function loadRelease(releaseDir: string): {
         fail(["release: corpus does not match the manifest release tuple"]);
     }
     const mutationEvidence = parseMutationEvidence(
-        JSON.parse(readFileSync(join(releaseDir, RELEASE_FILES.evidence), "utf8")),
+        readReleaseJson(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence"),
     );
     checkMutationEvidence(mutationEvidence, scenarios);
     return { manifest, scenarios, mutationEvidence };
@@ -166,8 +179,13 @@ function inheritedTombstones(releasesRoot: string): string[] {
     for (const entry of readdirSync(releasesRoot)) {
         if (!RELEASE_VERSION_RE.test(entry)) continue;
         const manifestPath = join(releasesRoot, entry, RELEASE_FILES.manifest);
-        if (!existsSync(manifestPath)) continue;
-        const manifest = parseManifest(JSON.parse(readFileSync(manifestPath, "utf8")));
+        // Fail closed: a version-named directory without a loadable manifest
+        // is a corrupt releases root, and skipping it would silently drop its
+        // tombstones — re-admitting a retracted scenario into vN+1.
+        if (!existsSync(manifestPath)) {
+            fail([`release: prior release ${entry} has no readable manifest; refusing to inherit tombstones`]);
+        }
+        const manifest = parseManifest(readReleaseJson(manifestPath, `release.${entry}.manifest`));
         for (const id of manifest.tombstones) tombstones.add(id);
     }
     return [...tombstones].sort();
@@ -179,13 +197,15 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     }
 
     // Privacy gate FIRST — before any parser, because schema diagnostics
-    // interpolate scenario ids and field paths.
-    const privacyDiagnostics: string[] = [];
-    for (const [index, raw] of input.scenarios.entries()) {
-        for (const violation of scanForSensitiveContent(raw, { forbiddenTokens: input.forbiddenTokens })) {
-            privacyDiagnostics.push(`privacy.${violation.category}: scenarios[${index}] ${violation.path}`);
-        }
-    }
+    // interpolate scenario ids and field paths. Approvals are scanned too:
+    // approver strings are published verbatim into the immutable manifest.
+    const privacyDiagnostics = scanForSensitiveContent(
+        { scenarios: input.scenarios, approvals: input.approvals },
+        {
+            forbiddenTokens: input.forbiddenTokens,
+            forbiddenIdentifiers: input.forbiddenIdentifiers,
+        },
+    ).map((violation) => `privacy.${violation.category}: ${violation.path}`);
     if (privacyDiagnostics.length > 0) fail(privacyDiagnostics.sort());
 
     const scenarios = input.scenarios.map((raw, index) => parseScenario(raw, `scenarios[${index}]`));
@@ -197,13 +217,9 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         fail([`release: corpus size ${scenarios.length} outside the 10-30 budget (R1)`]);
     }
 
-    // Admission gate (R13): the battery is recomputed here rather than
-    // accepted from the caller, so no scenario can enter a frozen release
-    // with forged or stale evidence; the recomputed artifact is what gets
-    // published beside the corpus.
-    const evidence = runMutationBattery(scenarios);
-    checkMutationEvidence(evidence, scenarios);
-
+    // Cheap rejection gates run before the battery: tombstone conflicts,
+    // approval binding, and version collisions each reject in microseconds,
+    // while the recomputed battery costs seconds per promotion.
     const inherited = inheritedTombstones(input.releasesRoot);
     const tombstones = [...new Set([...inherited, ...(input.tombstones ?? [])])].sort();
     for (const id of tombstones) {
@@ -213,13 +229,6 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     const releaseTuple = buildReleaseTuple(scenarios);
     const tupleFingerprint = canonicalFingerprint(releaseTuple);
     const approvals = checkApprovals(input.approvals, tupleFingerprint);
-    const manifest: ReleaseManifest = {
-        schema: MANIFEST_SCHEMA,
-        releaseVersion: input.releaseVersion,
-        releaseTuple,
-        approvals,
-        tombstones,
-    };
 
     const destination = join(input.releasesRoot, input.releaseVersion);
     if (existsSync(destination)) {
@@ -227,6 +236,21 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         // into vN+1 (R12).
         fail(["release: version already installed"]);
     }
+
+    // Admission gate (R13): the battery is recomputed here rather than
+    // accepted from the caller, so no scenario can enter a frozen release
+    // with forged or stale evidence; the recomputed artifact is what gets
+    // published beside the corpus.
+    const evidence = runMutationBattery(scenarios);
+    checkMutationEvidence(evidence, scenarios);
+
+    const manifest: ReleaseManifest = {
+        schema: MANIFEST_SCHEMA,
+        releaseVersion: input.releaseVersion,
+        releaseTuple,
+        approvals,
+        tombstones,
+    };
 
     // Owner-only review directory OUTSIDE version control: the reviewed
     // bytes must be exactly what the strict consumer path accepts.
@@ -242,6 +266,16 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     }
 
     mkdirSync(input.releasesRoot, { recursive: true });
+    // A crash between staging and rename strands a fully populated
+    // `.staging-*` tree beside the releases, where it would be committable.
+    // Staged trees are unpublished by construction (publication is the
+    // atomic rename), and promotions are operator-serial per releases root,
+    // so removing leftovers here is safe.
+    for (const entry of readdirSync(input.releasesRoot)) {
+        if (entry.startsWith(".staging-")) {
+            rmSync(join(input.releasesRoot, entry), { recursive: true, force: true });
+        }
+    }
     const staging = mkdtempSync(join(input.releasesRoot, ".staging-"));
     try {
         writeReleaseTree(staging, manifest, scenarios, evidence);

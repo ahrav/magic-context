@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -162,6 +162,30 @@ describe("promoteRelease", () => {
         });
     });
 
+    test("privacy scan covers approvals: approver strings never reach the manifest unscanned", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const approvals = approvalsFor(scenarios);
+            approvals[0].approver = "the key lives at /home/someone/secrets.pem";
+            expect(() =>
+                promoteRelease({ scenarios, approvals, releasesRoot: root, releaseVersion: "v1" }),
+            ).toThrow(/privacy\./);
+
+            // Word-bounded identifier deny list applies to approvers too.
+            const clean = corpusRaw();
+            expect(() =>
+                promoteRelease({
+                    scenarios: clean,
+                    approvals: approvalsFor(clean),
+                    releasesRoot: root,
+                    releaseVersion: "v1",
+                    forbiddenIdentifiers: ["operator-a"],
+                }),
+            ).toThrow(/privacy\.forbidden-token/);
+            expect(readdirSync(root)).toEqual([]);
+        });
+    });
+
     test("rejects a corpus outside the 10-30 budget", () => {
         withRoot((root) => {
             const scenarios = corpusRaw(3);
@@ -213,6 +237,40 @@ describe("promoteRelease", () => {
         });
     });
 
+    test("tombstone inheritance fails closed on a prior release with no readable manifest (R12)", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promote = (version: string): { releaseDir: string } =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios),
+                    releasesRoot: root,
+                    releaseVersion: version,
+                });
+            promote("v1");
+            rmSync(join(root, "v1", RELEASE_FILES.manifest));
+            // A skipped v1 would silently drop its tombstones from every
+            // later release, re-admitting retracted scenarios.
+            expect(() => promote("v2")).toThrow(/no readable manifest/);
+        });
+    });
+
+    test("interrupted promotions never accumulate: stale staging trees are swept before publishing", () => {
+        withRoot((root) => {
+            const stale = join(root, ".staging-interrupted");
+            mkdirSync(stale, { recursive: true });
+            writeFileSync(join(stale, "manifest.json"), "{}\n");
+            const scenarios = corpusRaw();
+            promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            expect(readdirSync(root)).toEqual(["v1"]);
+        });
+    });
+
     test("rejects unexpected files inside a release dir on load", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
@@ -259,6 +317,36 @@ describe("promoteRelease", () => {
             evidence.scenarios[0].results = [];
             writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
             expect(() => loadRelease(releaseDir)).toThrow(/mutation evidence/);
+        });
+    });
+
+    test("load fails closed on byte-level tampering the parsed values would hide", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            const manifestPath = join(releaseDir, RELEASE_FILES.manifest);
+            const original = readFileSync(manifestPath, "utf8");
+
+            // Duplicate member: JSON.parse keeps the LAST value while a human
+            // reviewer reads the FIRST, and fingerprints are computed over
+            // parsed values — only the canonical-byte check can catch this.
+            const duplicated = original.replace(
+                '"releaseVersion": "v1"',
+                '"releaseVersion": "v9",\n  "releaseVersion": "v1"',
+            );
+            expect(duplicated).not.toBe(original);
+            writeFileSync(manifestPath, duplicated);
+            expect(() => loadRelease(releaseDir)).toThrow(/non-canonical-bytes/);
+
+            // Re-serialized bytes (trailing whitespace) with identical parsed
+            // values also reject: an installed release is byte-immutable.
+            writeFileSync(manifestPath, `${original}\n`);
+            expect(() => loadRelease(releaseDir)).toThrow(/non-canonical-bytes/);
         });
     });
 });

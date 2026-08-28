@@ -91,7 +91,8 @@
         "30 seconds",
         "45 seconds"
       ],
-      "goldAnswer": "45 seconds"
+      "goldAnswer": "45 seconds",
+      "sourceClaimRef": "exp-timeout-45"
     }
   ]
 }

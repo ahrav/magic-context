@@ -91,7 +91,8 @@
         "100 characters",
         "120 characters"
       ],
-      "goldAnswer": "120 characters"
+      "goldAnswer": "120 characters",
+      "sourceClaimRef": "exp-line-120"
     }
   ]
 }

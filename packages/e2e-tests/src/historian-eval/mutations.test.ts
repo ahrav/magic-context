@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
     EXPECTED_OUTCOMES,
     MUTATION_CLASSES,
+    MUTATION_EVIDENCE_SCHEMA,
     checkMutationOutcome,
+    parseMutationEvidence,
     perturbPredicateValue,
     runMutationBattery,
     runScenarioMutationBattery,
@@ -111,5 +113,61 @@ describe("mutation battery (R13/KTD5)", () => {
         expect(artifact.green).toBe(true);
         expect(artifact.scenarios).toHaveLength(1);
         expect(artifact.scenarios[0].scenarioFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    test("evidence parser round-trips a real battery artifact", () => {
+        const artifact = runMutationBattery([validScenario()]);
+        const parsed = parseMutationEvidence(JSON.parse(JSON.stringify(artifact)));
+        expect(parsed.green).toBe(true);
+        expect(parsed.scenarios).toHaveLength(1);
+    });
+
+    test("evidence parser rejects a green entry without full class coverage (forged shell)", () => {
+        // Internally consistent but truncated: one skipped-class row is the
+        // cheapest shape a forger could hand-write.
+        const forged = {
+            schema: MUTATION_EVIDENCE_SCHEMA,
+            green: true,
+            scenarios: [
+                {
+                    scenarioId: "hse-forged",
+                    scenarioFingerprint: "0".repeat(64),
+                    green: true,
+                    results: [
+                        {
+                            mutationClass: "speculation-promoted",
+                            applicable: false,
+                            green: true,
+                            detail: "",
+                        },
+                    ],
+                },
+            ],
+        };
+        expect(() => parseMutationEvidence(forged)).toThrow(/green-without-full-class-coverage/);
+    });
+
+    test("evidence parser rejects a green entry where no false-authoritative class applied", () => {
+        const results = MUTATION_CLASSES.map((mutationClass) => ({
+            mutationClass,
+            applicable: false,
+            green: true,
+            detail: "",
+        }));
+        const forged = {
+            schema: MUTATION_EVIDENCE_SCHEMA,
+            green: true,
+            scenarios: [
+                {
+                    scenarioId: "hse-forged",
+                    scenarioFingerprint: "0".repeat(64),
+                    green: true,
+                    results,
+                },
+            ],
+        };
+        expect(() => parseMutationEvidence(forged)).toThrow(
+            /green-without-applicable-false-authoritative-class/,
+        );
     });
 });

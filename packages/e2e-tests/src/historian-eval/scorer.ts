@@ -23,6 +23,7 @@ import {
     validateStoredCompartments,
     type HistorianValidationChunk,
 } from "../../../plugin/src/hooks/magic-context/compartment-runner-validation";
+import { Database as BunDatabase } from "bun:sqlite";
 import { appendCompartments } from "../../../plugin/src/features/magic-context/compartment-storage";
 import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-context/memory/promotion";
 import { getProjectMemoryClaimByPublicId } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
@@ -578,6 +579,29 @@ const RAW_OUTPUT_SESSION_ID = "historian-eval-raw-output";
 const RAW_OUTPUT_PROJECT_IDENTITY = "dir:/historian-eval/raw-output";
 
 /**
+ * Serialized bytes of one fully bootstrapped scoring database.
+ * `createClaimReaderTestDatabase` composes and stamps the whole direct
+ * schema, which costs two orders of magnitude more than the scoring it
+ * enables; the mutation battery calls `scoreRawOutput` several times per
+ * scenario and `promoteRelease` recomputes the battery per promotion.
+ * Deserializing this template yields an identical, isolated, writable
+ * in-memory copy per call without rebuilding the schema. Bun-only like the
+ * rest of the e2e lane (see `openTestDb` in ../test-db.ts).
+ */
+let scoringDbTemplate: Uint8Array | null = null;
+
+function freshScoringDatabase(): Database {
+    if (scoringDbTemplate === null) {
+        const template = createClaimReaderTestDatabase();
+        // SAFETY: E2E executes in Bun, so the plugin Database is bun:sqlite,
+        // which carries serialize/deserialize. commentlint: allow(JUDGE)
+        scoringDbTemplate = (template as unknown as BunDatabase).serialize();
+        template.close();
+    }
+    return BunDatabase.deserialize(scoringDbTemplate) as unknown as Database;
+}
+
+/**
  * Primary scorer entry point (KTD5): raw historian output artifact →
  * parse → validate → publish into a fresh temp DB → score. Validation
  * rejection is a stage outcome the mutation battery asserts on; it never
@@ -693,7 +717,7 @@ export function scoreRawOutput(
     const discardLast = shouldDiscardLastHistorianCompartment(validated.compartments, chunk);
     const persisted = discardLast ? validated.compartments.slice(0, -1) : validated.compartments;
 
-    const db = createClaimReaderTestDatabase();
+    const db = freshScoringDatabase();
     try {
         appendCompartments(db, RAW_OUTPUT_SESSION_ID, persisted);
         if (!discardLast) {

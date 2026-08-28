@@ -11,6 +11,7 @@
  * migration).
  */
 
+import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
 import {
     HEX64_RE,
     predicateMatches,
@@ -162,7 +163,7 @@ function absentTargets(scenario: HistorianEvalScenario, families: readonly strin
     return scenario.gold.expectedAbsent
         .filter((absent) => families.includes(absent.family))
         .map((absent) => ({
-            category: scenario.gold.expectedClaims[0]?.category ?? "ARCHITECTURE",
+            category: scenario.gold.expectedClaims[0]?.category ?? V2_MEMORY_CATEGORIES[0],
             content: `Decision: ${absent.predicate.value}.`,
         }));
 }
@@ -184,9 +185,15 @@ function runFalseAuthoritativeClass(
 function runWrongCategory(scenario: HistorianEvalScenario): MutationResult {
     const facts = goldSatisfyingFacts(scenario);
     const target = scenario.gold.expectedClaims[0];
-    const wrongCategory = ["NAMING", "PROJECT_RULES", "ARCHITECTURE"].find(
-        (category) => category !== target.category,
-    ) as string;
+    // Derived from the production taxonomy, never a hardcoded name:
+    // `promoteSessionFactsDurable` silently DROPS facts whose category is
+    // outside `V2_MEMORY_CATEGORIES`, so a drifted literal would land at the
+    // same scored/recall outcome as dropped-gold-fact and this class would
+    // silently stop testing miscategorization.
+    const wrongCategory = V2_MEMORY_CATEGORIES.find((category) => category !== target.category);
+    if (wrongCategory === undefined) {
+        throw new Error("wrong-category mutation requires at least two promotable categories");
+    }
     facts[0] = { ...facts[0], category: wrongCategory };
     const check = checkMutationOutcome("wrong-category", baselineOutput(scenario, facts), scenario);
     return { mutationClass: "wrong-category", applicable: true, ...check };
@@ -244,14 +251,20 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
         payloadText: null,
     };
     // No injected claims: the gold claim was never promoted, so a miss is a
-    // probe FAIL, not a trimmed ERROR (KTD6).
+    // probe FAIL, not a trimmed ERROR (KTD6). The expected outcome comes
+    // from the policy table so this class stays table-driven like the rest
+    // of the battery.
+    const expected = EXPECTED_OUTCOMES["probe-wrong-answer"];
+    if (expected.stage !== "probe-comparison") {
+        throw new Error(`probe-wrong-answer policy entry must stay at probe-comparison, got ${expected.stage}`);
+    }
     const verdict = compareProbeAnswer({ probe, exchange, scenario, injectedClaims: [] });
-    if (verdict.outcome !== "fail") {
+    if (verdict.outcome !== expected.outcome) {
         return {
             mutationClass: "probe-wrong-answer",
             applicable: true,
             green: false,
-            detail: `expected probe fail but got ${verdict.outcome}`,
+            detail: `expected probe ${expected.outcome} but got ${verdict.outcome}`,
         };
     }
     return { mutationClass: "probe-wrong-answer", applicable: true, green: true, detail: "probe fail as expected" };
@@ -343,8 +356,11 @@ function evidenceFail(code: string): never {
 /**
  * Strict, fail-closed evidence parser: an artifact claiming green must be
  * internally consistent (aggregate flags derived from per-result flags,
- * every result labeled with a known class), so a hand-written
- * `{green: true}` shell cannot slip a scenario past the admission gate.
+ * every result labeled with a known class) AND carry the exact result set
+ * a green battery run emits — one result per mutation class with at least
+ * one applicable false-authoritative class — so a hand-written
+ * `{green: true}` shell (or a single-result stub) cannot slip a scenario
+ * past the admission gate.
  */
 export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) evidenceFail("schema-invalid");
@@ -385,6 +401,27 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
         });
         if (entry.green !== results.every((result) => result.green)) {
             evidenceFail(`scenarios[${index}].green: inconsistent-with-results`);
+        }
+        // Green class coverage: a green battery run always emits exactly one
+        // result per mutation class (the baseline-fixture and
+        // battery-coverage rows only appear on red runs), and at least one
+        // false-authoritative class applied. Anything else claiming green is
+        // a forged or truncated artifact.
+        if (entry.green === true) {
+            const labels = results.map((result) => result.mutationClass);
+            const missing = MUTATION_CLASSES.filter((mutationClass) => !labels.includes(mutationClass));
+            if (missing.length > 0 || labels.length !== MUTATION_CLASSES.length) {
+                evidenceFail(`scenarios[${index}]: green-without-full-class-coverage`);
+            }
+            const falseAuthoritativeApplied = results.some(
+                (result) =>
+                    (result.mutationClass === "speculation-promoted" ||
+                        result.mutationClass === "rejected-proposal-active") &&
+                    result.applicable,
+            );
+            if (!falseAuthoritativeApplied) {
+                evidenceFail(`scenarios[${index}]: green-without-applicable-false-authoritative-class`);
+            }
         }
         return entry as unknown as ScenarioMutationEvidence;
     });
