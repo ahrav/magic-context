@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -261,11 +261,82 @@ describe("promoteRelease", () => {
                 releaseVersion: "v1",
             });
             const evidencePath = join(releaseDir, RELEASE_FILES.evidence);
-            const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+            const readEvidence = (): Record<string, any> => JSON.parse(readFileSync(evidencePath, "utf8"));
+            const writeEvidence = (value: unknown): void => {
+                writeFileSync(evidencePath, `${JSON.stringify(value, null, 2)}\n`);
+            };
+            const original = readFileSync(evidencePath, "utf8");
+
             // A hand-edited "green" shell with no per-result backing.
-            evidence.scenarios[0].results = [];
-            writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+            const emptied = readEvidence();
+            emptied.scenarios[0].results = [];
+            writeEvidence(emptied);
             expect(() => loadRelease(releaseDir)).toThrow(/mutation evidence/);
+
+            // A forged entry that keeps its aggregate booleans consistent but
+            // never exercised a required class: one green result under a label
+            // the battery only emits when it fails.
+            writeFileSync(evidencePath, original);
+            const forged = readEvidence();
+            forged.scenarios[0].results = [
+                { mutationClass: "battery-coverage", applicable: true, green: true, detail: "forged" },
+            ];
+            writeEvidence(forged);
+            expect(() => loadRelease(releaseDir)).toThrow(/missing-class-/);
+
+            // Dropping a single class from an otherwise complete green entry.
+            writeFileSync(evidencePath, original);
+            const dropped = readEvidence();
+            dropped.scenarios[0].results = dropped.scenarios[0].results.filter(
+                (result: { mutationClass: string }) => result.mutationClass !== "dropped-gold-fact",
+            );
+            writeEvidence(dropped);
+            expect(() => loadRelease(releaseDir)).toThrow(/missing-class-dropped-gold-fact/);
+
+            // A green entry in which neither false-authoritative class applied
+            // means the family-to-class mapping drifted and nothing ran.
+            writeFileSync(evidencePath, original);
+            const inapplicable = readEvidence();
+            for (const result of inapplicable.scenarios[0].results) {
+                if (result.mutationClass === "speculation-promoted" || result.mutationClass === "rejected-proposal-active") {
+                    result.applicable = false;
+                }
+            }
+            writeEvidence(inapplicable);
+            expect(() => loadRelease(releaseDir)).toThrow(/no-applicable-false-authoritative-class/);
+
+            writeFileSync(evidencePath, original);
+            expect(() => loadRelease(releaseDir)).not.toThrow();
+        });
+    });
+
+    test("promotion fails closed when a prior release directory has lost its manifest", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promote = (version: string, tombstones?: string[], corpus = scenarios): { releaseDir: string } =>
+                promoteRelease({
+                    scenarios: corpus,
+                    approvals: approvalsFor(corpus),
+                    releasesRoot: root,
+                    releaseVersion: version,
+                    tombstones,
+                });
+            // Swap the tombstoned scenario for a replacement so the corpus
+            // stays inside the 10-30 release budget.
+            const v2Corpus = corpusRaw().filter((raw) => raw.id !== "hse-scenario-0");
+            const replacement = validScenarioRaw();
+            replacement.id = "hse-scenario-replacement";
+            v2Corpus.push(replacement);
+            promote("v1");
+            promote("v2", ["hse-scenario-0"], v2Corpus);
+
+            // Atomic promotion never leaves a versioned directory without a
+            // manifest, so one that exists is a partial or damaged release.
+            // Skipping it would promote v3 without inheriting v2's tombstones
+            // and let the rejected scenario back into the corpus.
+            rmSync(join(root, "v2", RELEASE_FILES.manifest));
+            expect(() => promote("v3", [], v2Corpus)).toThrow(/v2: manifest-missing/);
+            expect(existsSync(join(root, "v3"))).toBe(false);
         });
     });
 });

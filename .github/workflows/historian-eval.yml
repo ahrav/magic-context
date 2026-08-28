@@ -28,6 +28,13 @@ permissions:
 
 jobs:
   live-lane:
+    # Manual dispatch is restricted to the default branch: `actions/checkout`
+    # takes the selected ref, and a later step puts the Anthropic key in the
+    # environment. Any pushed branch could otherwise rewrite the runner script
+    # or a package lifecycle script and exfiltrate the secret without review.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     # Worst case: ~30 scenarios x (two historian runs + repair + probes) on a
     # live model.
@@ -52,6 +59,12 @@ jobs:
         run: |
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      # The installer serves the current release, so the resolved version is
+      # part of this run's system identity. The lane records it in the report's
+      # system tuple; this step surfaces it in the log too.
+      - name: Record the resolved opencode version
+        run: opencode --version
 
       - name: Build the plugin the harness loads
         run: bun run --cwd packages/plugin build

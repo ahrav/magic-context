@@ -28,6 +28,13 @@ import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context
 
 export const SCENARIO_SCHEMA = "historian-eval-scenario/v1";
 export const MANIFEST_SCHEMA = "historian-eval-manifest/v1";
+/**
+ * Run-record schema. Lives beside the other schema constants rather than in
+ * the runner so the scorer can check it without a value import from the
+ * harness-loading module (the runner imports the scorer, so that edge would
+ * be a cycle).
+ */
+export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v1";
 export const RELEASE_VERSION_RE = /^v\d+$/;
 
 export const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -469,15 +476,49 @@ export function predicateMatches(predicate: ContentPredicate, content: string): 
 }
 
 /**
- * The raw text mass the chunk builder will see for one turn. Mirrors the
- * runner's rendering (authored text plus deterministic ballast) so the
- * freeze lint's headroom check measures what actually reaches the historian.
+ * Turns the harness prepends when a scenario authors fewer, so the session
+ * has enough build history for the threshold transform to fire. Lives here
+ * rather than in the runner because the freeze lint's headroom math depends
+ * on it: a constant the runner owned privately could drift away from the
+ * gate that admits the scenario.
+ */
+export const MIN_BUILD_TURNS = 10;
+
+/** Filler turns the harness prepends for this scenario (see MIN_BUILD_TURNS). */
+export function fillerTurnCount(scenario: HistorianEvalScenario): number {
+    return Math.max(0, MIN_BUILD_TURNS - scenario.transcript.turns.length);
+}
+
+/**
+ * The raw text mass the chunk builder will see. Mirrors the runner's
+ * rendering so the freeze lint's headroom check measures what actually
+ * reaches the historian: harness-owned filler turns first, then the authored
+ * turns, each user turn carrying deterministic ballast keyed on its rendered
+ * position.
+ *
+ * The filler is not optional padding — it is the oldest content in the
+ * session, so it enters the token-capped eligible chunk *before* the authored
+ * transcript. Estimating authored turns alone lets a scenario with few turns
+ * and a large `ballastTokensPerTurn` pass this lint and still fail live with
+ * `probe-gold-uncovered`, because the chunk fills with filler before it
+ * reaches any gold range. Post-epilogue padding is excluded on purpose: it
+ * lands in the protected tail, which the historian never sees.
  */
 function renderedTranscriptText(scenario: HistorianEvalScenario): string {
     const lines: string[] = [];
+    const fillerCount = fillerTurnCount(scenario);
+    let ordinal = 1;
+    for (let index = 0; index < fillerCount; index += 1) {
+        lines.push(
+            `[${ordinal++}] user: Routine progress update. ${ballastText(scenario.trigger.ballastTokensPerTurn, index)}`,
+        );
+        lines.push(`[${ordinal++}] assistant: Noted; continuing with routine work.`);
+    }
     scenario.transcript.turns.forEach((turn, index) => {
-        lines.push(`[${index * 2 + 1}] user: ${turn.user} ${ballastText(scenario.trigger.ballastTokensPerTurn, index)}`);
-        lines.push(`[${index * 2 + 2}] assistant: ${turn.assistant}`);
+        lines.push(
+            `[${ordinal++}] user: ${turn.user} ${ballastText(scenario.trigger.ballastTokensPerTurn, fillerCount + index)}`,
+        );
+        lines.push(`[${ordinal++}] assistant: ${turn.assistant}`);
     });
     return lines.join("\n");
 }
@@ -559,6 +600,17 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         // silently skipped.
         diagnostics.push(`${label}.probes: empty`);
     }
+    for (const probe of scenario.probes) {
+        // `claim-id` probes carry `expectedClaimRef` instead. Every other
+        // probe answer is supplied by exactly one gold claim, and without the
+        // binding the scorer cannot tell "the injection budget trimmed the
+        // backing claim" (`error-trimmed`, an infra loss) from "the historian
+        // got it wrong" (probe FAIL) — so an injection-budget loss would be
+        // charged to model quality.
+        if (probe.answerType !== "claim-id" && probe.sourceClaimRef === undefined) {
+            diagnostics.push(`${label}.probes.${probe.id}: missing-source-claim-ref`);
+        }
+    }
 
     for (const absent of scenario.gold.expectedAbsent) {
         if (normalizeContent(absent.predicate.value).length === 0) {
@@ -591,6 +643,25 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     }
 
     return diagnostics.sort();
+}
+
+/**
+ * Strict `provider/model` route parsing for the live-lane environment.
+ *
+ * Splitting on "/" and checking only the provider is not enough: a value like
+ * `anthropic/` yields one empty model component, which passes that check and
+ * then fails on every request — after the expensive historian work is already
+ * done. Both halves must be non-empty before the lane spends a token.
+ */
+export function parseModelRoute(variable: string, value: string): { providerID: string; modelID: string } {
+    const [providerID, ...modelParts] = value.split("/");
+    const modelID = modelParts.join("/");
+    if (!providerID || providerID.trim().length === 0 || modelParts.length === 0 || modelID.trim().length === 0) {
+        throw new HistorianEvalContractError([
+            `${variable}: expected provider/model with both parts non-empty (got "${value}")`,
+        ]);
+    }
+    return { providerID, modelID };
 }
 
 /**

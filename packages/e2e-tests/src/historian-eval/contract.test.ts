@@ -3,10 +3,12 @@ import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
+    MIN_BUILD_TURNS,
     buildReleaseTuple,
     lintScenario,
     normalizeContent,
     parseManifest,
+    parseModelRoute,
     parseScenario,
     predicateMatches,
     scenarioFingerprint,
@@ -166,6 +168,36 @@ describe("lintScenario", () => {
         expect(diagnostics.some((d) => d.includes("exceeds-single-chunk-headroom"))).toBe(true);
     });
 
+    test("counts the harness filler turns against the single-chunk headroom", () => {
+        // The runner prepends MIN_BUILD_TURNS - authoredTurns filler turns,
+        // each carrying full ballast, and they are the OLDEST content, so they
+        // enter the token-capped chunk before the authored transcript. Sizing
+        // the ballast so authored turns alone fit but authored + filler does
+        // not must be rejected: measuring authored turns only would let this
+        // scenario freeze and then fail live with probe-gold-uncovered.
+        const raw = validScenarioRaw();
+        const authoredTurns = (raw.transcript as { turns: unknown[] }).turns.length;
+        const fillerTurns = MIN_BUILD_TURNS - authoredTurns;
+        expect(fillerTurns).toBeGreaterThan(0);
+        // 32K budget, 2K declared margin: ~7.4K/turn puts 4 authored turns
+        // under the budget and 4 + 6 filler turns well over it.
+        (raw.trigger as Record<string, unknown>).ballastTokensPerTurn = 7_400;
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics.some((d) => d.includes("exceeds-single-chunk-headroom"))).toBe(true);
+    });
+
+    test("rejects a non-claim-id probe with no sourceClaimRef", () => {
+        // Without the binding the scorer cannot separate an injection-budget
+        // loss (error-trimmed, infra) from a historian miss (probe FAIL).
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Array<Record<string, unknown>>;
+        const probe = probes.find((entry) => entry.answerType === "multiple-choice");
+        expect(probe).toBeDefined();
+        delete (probe as Record<string, unknown>).sourceClaimRef;
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain("hse-auth-rejected-redis.probes.probe-store: missing-source-claim-ref");
+    });
+
     test("rejects a scenario with zero expected-absent predicates in a declared hard-negative family", () => {
         const raw = validScenarioRaw();
         raw.families = ["proposed-but-rejected", "assistant-speculation"];
@@ -231,5 +263,28 @@ describe("release tuple and manifest", () => {
         const wrongKind = JSON.parse(JSON.stringify(manifest));
         wrongKind.approvals.privacy.kind = "gold-intent";
         expect(() => parseManifest(wrongKind)).toThrow(/wrong-kind/);
+    });
+});
+
+describe("parseModelRoute", () => {
+    test("accepts provider/model and keeps a slash-bearing model id intact", () => {
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "anthropic/claude-sonnet-4-5")).toEqual({
+            providerID: "anthropic",
+            modelID: "claude-sonnet-4-5",
+        });
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "openrouter/vendor/model-1")).toEqual({
+            providerID: "openrouter",
+            modelID: "vendor/model-1",
+        });
+    });
+
+    test.each([
+        ["empty model component", "anthropic/"],
+        ["whitespace model component", "anthropic/   "],
+        ["empty provider component", "/claude-sonnet-4-5"],
+        ["no separator", "claude-sonnet-4-5"],
+        ["empty value", ""],
+    ])("rejects %s before the lane spends a token", (_label, value) => {
+        expect(() => parseModelRoute("HISTORIAN_EVAL_PROBE_MODEL", value)).toThrow(HistorianEvalContractError);
     });
 });

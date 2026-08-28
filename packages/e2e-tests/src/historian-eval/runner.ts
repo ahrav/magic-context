@@ -31,6 +31,8 @@ import { openTestDb } from "../test-db";
 import { TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
+    MIN_BUILD_TURNS,
+    RUN_RECORD_SCHEMA,
     ballastText,
     laneWorkspaceEpoch,
     predicateMatches,
@@ -43,9 +45,18 @@ import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
 } from "../../../plugin/src/hooks/magic-context/derive-budgets";
+import { classifyTerminalRuns } from "./scorer";
 import { verifyAllActiveClaims } from "./verification-bridge";
 
-export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v1";
+export { RUN_RECORD_SCHEMA } from "./contract";
+
+/**
+ * File name of the database snapshot inside a run's artifact directory.
+ * `contextDbSnapshotPath` stores this relative name, never an absolute one:
+ * the archived directory is downloaded to a different machine at a different
+ * path, and re-scoring resolves it against wherever the run record now lives.
+ */
+export const CONTEXT_DB_SNAPSHOT_FILE = "context-db-snapshot.sqlite";
 
 /**
  * Marker-based historian request detection (pattern proven by
@@ -53,9 +64,6 @@ export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v1";
  * this phrase; its user content carries the `<new_messages>` block.
  */
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
-
-/** Build turns before the spike; the v3 protected-tail boundary needs mass. */
-const MIN_BUILD_TURNS = 10;
 
 /** Threshold the lane pins; also feeds the padding math in paddingTurnCount. */
 const EXECUTE_THRESHOLD_PERCENTAGE = 40;
@@ -73,6 +81,7 @@ export type RunErrorReason =
     | "run-never-fired"
     | "probe-envelope-malformed"
     | "probe-gold-uncovered"
+    | "historian-infrastructure-failure"
     | "harness-failure";
 
 export interface RunRecordError {
@@ -120,6 +129,14 @@ export interface ProbeExchange {
 
 export interface SystemVersionTuple {
     repoCommitSha: string;
+    /**
+     * Resolved OpenCode release the harness ran against. The installer serves
+     * whatever is current, so two otherwise identical scheduled runs can sit
+     * on different harness runtimes; without this field they would record the
+     * same system identity and appear longitudinally comparable when they are
+     * not. "unknown" when the version cannot be resolved.
+     */
+    opencodeVersion: string;
     historianModelId: string;
     probeModelId: string;
     parserImpl: "ts";
@@ -185,6 +202,8 @@ export interface RunScenarioOptions {
     /** Directory the run record and DB snapshot are written into. */
     artifactDir: string;
     repoCommitSha?: string;
+    /** Resolved `opencode --version`; recorded in the system tuple. */
+    opencodeVersion?: string;
     /** Per-run historian completion wait; defaults are mode-aware. */
     historianWaitMs?: number;
 }
@@ -416,6 +435,7 @@ class ScenarioRunner {
         const mode = this.options.mode;
         return {
             repoCommitSha: this.options.repoCommitSha ?? "unknown",
+            opencodeVersion: this.options.opencodeVersion ?? "unknown",
             historianModelId: mode.kind === "live" ? mode.historianModel : "scripted-mock",
             probeModelId:
                 mode.kind === "live" ? `${mode.probeModel.providerID}/${mode.probeModel.modelID}` : "scripted-mock",
@@ -441,11 +461,18 @@ class ScenarioRunner {
         }
         this.assertNoScriptDrift(harness);
 
-        // Live historian whose every attempt fails validation is model
-        // behavior, not infrastructure (KTD4): return a scoreable record
+        // A live historian whose every attempt was *rejected by validation* is
+        // model behavior, not infrastructure (KTD4): return a scoreable record
         // (the scorer maps it to FAIL:invalid-output). Probes and claim
-        // capture are meaningless with nothing published.
-        if (runs.every((run) => run.status === "failed")) {
+        // capture are meaningless with nothing published. Production reuses
+        // the `failed` status for chunk-coverage, no-progress, and publish
+        // exceptions too, so anything that is not validation exhaustion is an
+        // infra ERROR (R6) and stays out of the quality rates.
+        const terminal = classifyTerminalRuns(runs);
+        if (terminal.kind === "infrastructure") {
+            throw new RunAbort("historian-infrastructure-failure", terminal.detail);
+        }
+        if (terminal.kind === "validation-exhausted") {
             return {
                 ...this.baseRecord(),
                 projectIdentity: resolveProjectIdentity(harness.opencode.env.workdir),
@@ -1132,7 +1159,7 @@ class ScenarioRunner {
     }
 
     private snapshotContextDb(harness: TestHarness): string {
-        const snapshotPath = join(this.options.artifactDir, "context-db-snapshot.sqlite");
+        const snapshotPath = join(this.options.artifactDir, CONTEXT_DB_SNAPSHOT_FILE);
         // VACUUM INTO produces a complete single-file image regardless of the
         // live database's WAL state; a plain file copy would silently drop
         // committed pages still sitting in `-wal`.
@@ -1142,7 +1169,9 @@ class ScenarioRunner {
         } finally {
             db.close();
         }
-        return snapshotPath;
+        // Relative to the run record beside it, so the archived directory
+        // re-scores wherever an operator unpacks it.
+        return CONTEXT_DB_SNAPSHOT_FILE;
     }
 
     /** Teardown never fails the scenario (KTD9). */

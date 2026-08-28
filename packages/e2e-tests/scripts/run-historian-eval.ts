@@ -20,6 +20,7 @@ import { dirname, join, resolve } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
     lintCorpus,
+    parseModelRoute,
     parseScenario,
     type HistorianEvalScenario,
 } from "../src/historian-eval/contract";
@@ -120,15 +121,15 @@ function liveModeFromEnv(): LiveHistorianMode {
             "live mode needs ANTHROPIC_API_KEY, HISTORIAN_EVAL_MODEL, and HISTORIAN_EVAL_PROBE_MODEL (provider/model)",
         );
     }
-    const [providerID, ...modelParts] = probeModel.split("/");
-    if (!providerID || modelParts.length === 0) {
-        throw new Error("HISTORIAN_EVAL_PROBE_MODEL must be provider/model");
-    }
+    // The historian route is validated for shape too: it is passed through to
+    // the plugin config as a whole string, so an empty model component there
+    // also fails only once the historian is invoked.
+    parseModelRoute("HISTORIAN_EVAL_MODEL", historianModel);
     return {
         kind: "live",
         apiKey,
         historianModel,
-        probeModel: { providerID, modelID: modelParts.join("/") },
+        probeModel: parseModelRoute("HISTORIAN_EVAL_PROBE_MODEL", probeModel),
     };
 }
 
@@ -140,10 +141,26 @@ function repoCommitSha(): string {
     }
 }
 
+/**
+ * Recorded in the run report's system tuple: the installer serves whatever
+ * OpenCode release is current, so identical weekly runs can sit on different
+ * harness runtimes. Without this, their system identity would match and the
+ * reports would look longitudinally comparable when they are not.
+ */
+function opencodeVersion(): string {
+    try {
+        const version = execSync("opencode --version", { encoding: "utf8" }).trim();
+        return version.length > 0 ? version : "unknown";
+    } catch {
+        return "unknown";
+    }
+}
+
 async function runLive(args: CliArgs): Promise<number> {
     const { scenarios, releaseVersion } = loadCorpus(args);
     const mode = liveModeFromEnv();
     const sha = repoCommitSha();
+    const opencode = opencodeVersion();
     const artifactsRoot = join(dirname(resolve(args.reportPath)), "historian-eval-runs");
     const scores: ScenarioScore[] = [];
     let system: SystemVersionTuple | undefined;
@@ -151,9 +168,17 @@ async function runLive(args: CliArgs): Promise<number> {
         const artifactDir = join(artifactsRoot, scenario.id);
         rmSync(artifactDir, { recursive: true, force: true });
         console.log(`running ${scenario.id}...`);
-        const record = await runScenario(scenario, { mode, artifactDir, repoCommitSha: sha });
+        const record = await runScenario(scenario, {
+            mode,
+            artifactDir,
+            repoCommitSha: sha,
+            opencodeVersion: opencode,
+        });
         system = record.system;
-        const score = scoreRunRecord(record, scenario);
+        // The record's snapshot path is relative to the record's own
+        // directory, so re-scoring the archived artifact elsewhere resolves it
+        // against wherever it was unpacked.
+        const score = scoreRunRecord(record, scenario, { recordDir: artifactDir });
         scores.push(score);
         console.log(
             `${scenario.id}: ${score.verdict}${score.failReasons.length > 0 ? ` [${score.failReasons.join(",")}]` : ""}${score.errorReason ? ` (${score.errorReason})` : ""}`,

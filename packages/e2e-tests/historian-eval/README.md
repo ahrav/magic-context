@@ -38,9 +38,19 @@ scripts/run-historian-eval.ts
 | Live lane run | `bun scripts/run-historian-eval.ts --live --release historian-eval/releases/v1` |
 
 Live runs read `ANTHROPIC_API_KEY`, `HISTORIAN_EVAL_MODEL`, and
-`HISTORIAN_EVAL_PROBE_MODEL` (`provider/model`). Per-PR CI runs only the
+`HISTORIAN_EVAL_PROBE_MODEL` (`provider/model`; both halves must be
+non-empty, checked before any token is spent). Per-PR CI runs only the
 deterministic parts (`historian-eval-deterministic` job); live runs are
-scheduled or dispatched via `.github/workflows/historian-eval.yml` (R14).
+scheduled or dispatched via `.github/workflows/historian-eval.yml` (R14),
+and manual dispatch is restricted to the default branch because the job puts
+the API key in the environment of a checked-out ref.
+
+Each report records the system-version tuple its scores belong to: repo SHA,
+resolved `opencode --version`, historian and probe model ids, parser
+implementation, and chunk token budget. The OpenCode version is part of that
+identity because the installer serves whatever release is current, so two
+otherwise identical weekly runs can sit on different harness runtimes; a
+tuple without it would make them look longitudinally comparable.
 
 ## Scoring surface (KTD1)
 
@@ -51,6 +61,16 @@ through every read, so re-scoring a run record yields byte-identical
 verdicts. Recall drives FAIL; precision is reported but never fails alone;
 an expected-absent predicate matching any injection-visible active claim is
 `FAIL:false-authoritative` and always run-fatal (R7/R8/KTD8).
+
+Re-scoring an archived run needs both halves of its pairing to hold.
+`contextDbSnapshotPath` is stored **relative to the run record's own
+directory**, so a downloaded artifact re-scores at whatever path an operator
+unpacked it to; `scoreRunRecord` takes that directory as `recordDir` and
+resolves the snapshot against it. It also refuses a record whose schema,
+scenario id, or `scenarioFingerprint` does not match the scenario passed in —
+otherwise re-scoring a run whose same-id scenario was since edited would
+evaluate an old database against new gold and return a verdict that looks
+valid.
 
 ## The raw-output scorer seam (for task x4l.13)
 
@@ -70,9 +90,15 @@ vector set the repo has (reuse deferred, see plan scope).
 Per scenario: `PASS | FAIL | ERROR`. FAIL reasons: `false-authoritative`,
 `recall`, `structural`, `probe`, `invalid-output`. ERRORs are infra causes
 (R6: lease lost, silent no-op promotion, fallback engagement, script drift,
-gold-range leak, stale snapshot, run never fired, trimmed-by-injection-
-budget) and are excluded from all rates. A live historian whose every
-attempt fails validation is model behavior: `FAIL:invalid-output`.
+gold-range leak, stale snapshot, run never fired, historian infrastructure
+failure, trimmed-by-injection-budget) and are excluded from all rates. A live
+historian whose every attempt is *rejected by validation* is model behavior:
+`FAIL:invalid-output`. Production reuses the same `failed` run status for
+chunk-coverage rejections, no-forward-progress, and publish exceptions, so a
+terminal run set whose reasons are not validation rejections becomes
+`ERROR:historian-infrastructure-failure` instead — an unrecognized reason
+classifies as infrastructure, because excluding one scenario is recoverable
+while booking an outage as model quality is not.
 Frozen-release run verdict: red iff any FAIL or any ERROR; exit codes:
 0 green, 1 red, 2 run-fatal (false-authoritative).
 

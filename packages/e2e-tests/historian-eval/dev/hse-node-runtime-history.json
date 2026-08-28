@@ -92,7 +92,8 @@
         "npm 10",
         "yarn 4"
       ],
-      "goldAnswer": "pnpm 9"
+      "goldAnswer": "pnpm 9",
+      "sourceClaimRef": "exp-pnpm-9"
     }
   ]
 }

@@ -91,7 +91,8 @@
         "db/migrations",
         "sql/schema"
       ],
-      "goldAnswer": "db/migrations"
+      "goldAnswer": "db/migrations",
+      "sourceClaimRef": "exp-migrations-dir"
     }
   ]
 }

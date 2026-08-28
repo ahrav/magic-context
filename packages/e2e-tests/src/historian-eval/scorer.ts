@@ -16,6 +16,7 @@
  * byte-identical verdicts (KTD1).
  */
 
+import { resolve } from "node:path";
 import {
     HISTORIAN_BOUNDARY_HEALING_SLACK,
     validateHistorianOutput,
@@ -29,9 +30,11 @@ import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magi
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { openTestDb } from "../test-db";
 import {
+    RUN_RECORD_SCHEMA,
     laneWorkspaceEpoch,
     normalizeContent,
     predicateMatches,
+    scenarioFingerprint,
     type ExpectedClaim,
     type HistorianEvalScenario,
     type Probe,
@@ -39,12 +42,54 @@ import {
 import { verifyAllActiveClaims } from "./verification-bridge";
 import type {
     HistorianEvalRunRecord,
+    HistorianRunArtifact,
     InjectedClaimRecord,
     ProbeExchange,
     SystemVersionTuple,
 } from "./runner";
 
 const LANE_REPORT_SCHEMA = "historian-eval-report/v1";
+
+/**
+ * Production `historian_runs.failure_reason` values that mean "the model's
+ * output was rejected by the validator", and nothing else. Production writes
+ * the same `failed` status for chunk-coverage rejections, no-forward-progress,
+ * stale snapshots, drain-quota exhaustion, empty chunks, and publish
+ * exceptions — charging any of those to historian quality would violate R6,
+ * so only a reason led by the `validation` word may become
+ * FAIL:invalid-output. Matched on the leading word rather than an exact
+ * prefix so the classification does not hinge on the punctuation of a string
+ * built in another package.
+ */
+const VALIDATION_FAILURE_RE = /^(?:existing-)?validation\b/i;
+
+export type TerminalRunClassification =
+    | { kind: "not-terminal" }
+    | { kind: "validation-exhausted" }
+    | { kind: "infrastructure"; detail: string };
+
+/**
+ * Classify a run set in which the historian produced nothing usable.
+ *
+ * Every attempt failing is only a *quality* verdict when every failure was a
+ * validation rejection; an API, runtime, or storage fault that lands as
+ * `failed` is infrastructure and must be excluded from the rates. An
+ * unrecognized reason is treated as infrastructure on purpose: a loud ERROR
+ * that excludes one scenario is recoverable, while silently booking an outage
+ * as model failure corrupts the longitudinal quality numbers this lane exists
+ * to produce — so if production grows a new terminal reason, this fails safe.
+ */
+export function classifyTerminalRuns(runs: readonly HistorianRunArtifact[]): TerminalRunClassification {
+    if (runs.length === 0 || !runs.every((run) => run.status === "failed")) return { kind: "not-terminal" };
+    const nonValidation = runs.filter((run) => !VALIDATION_FAILURE_RE.test(run.failureReason?.trim() ?? ""));
+    if (nonValidation.length === 0) return { kind: "validation-exhausted" };
+    return {
+        kind: "infrastructure",
+        detail: nonValidation
+            .map((run) => `run ${run.runIndex}: ${run.failureReason ?? "<no failure reason recorded>"}`)
+            .join("; "),
+    };
+}
 
 /** KTD8 FAIL reason codes. */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;
@@ -404,16 +449,42 @@ function errorScore(scenarioId: string, reason: string, detail: string | null): 
 /**
  * Score a run record produced by the replay runner. ERROR-flagged records
  * propagate their reason with no rates computed (R6). A live historian
- * whose every attempt failed validation is model behavior, not
+ * whose every attempt was rejected by validation is model behavior, not
  * infrastructure: FAIL:invalid-output (KTD4/KTD8).
+ *
+ * `recordDir` is the directory the run record itself lives in;
+ * `contextDbSnapshotPath` is stored relative to it so an archived artifact
+ * re-scores after being downloaded to a different path. An absolute stored
+ * path still resolves to itself, so pre-existing records keep working.
  */
-export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: HistorianEvalScenario): ScenarioScore {
+export function scoreRunRecord(
+    record: HistorianEvalRunRecord,
+    scenario: HistorianEvalScenario,
+    options: { recordDir: string },
+): ScenarioScore {
+    // Pairing checks before anything is read: the record carries the schema,
+    // scenario id, and scenario fingerprint precisely so a record cannot be
+    // scored against a scenario it did not run. Re-scoring an archived record
+    // after its same-id scenario was edited would otherwise evaluate an old
+    // database against new gold and return an apparently valid verdict.
+    if (record.schema !== RUN_RECORD_SCHEMA) {
+        throw new Error(`historian-eval scorer: run record schema ${record.schema} is not ${RUN_RECORD_SCHEMA}`);
+    }
+    if (record.scenarioId !== scenario.id) {
+        throw new Error(
+            `historian-eval scorer: run record for ${record.scenarioId} cannot be scored against scenario ${scenario.id}`,
+        );
+    }
+    const expectedFingerprint = scenarioFingerprint(scenario);
+    if (record.scenarioFingerprint !== expectedFingerprint) {
+        throw new Error(
+            `historian-eval scorer: ${scenario.id} fingerprint drift; run record recorded ${record.scenarioFingerprint} but the scenario now fingerprints ${expectedFingerprint}`,
+        );
+    }
     if (record.error !== null) {
         return errorScore(record.scenarioId, record.error.reason, record.error.detail);
     }
-    const allAttemptsInvalid =
-        record.historianRuns.length > 0 && record.historianRuns.every((run) => run.status === "failed");
-    if (allAttemptsInvalid) {
+    if (classifyTerminalRuns(record.historianRuns).kind === "validation-exhausted") {
         return assembleScore({
             scenarioId: record.scenarioId,
             facts: {
@@ -431,7 +502,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         });
     }
 
-    const db = openTestDb(record.contextDbSnapshotPath, { readonly: true });
+    const db = openTestDb(resolve(options.recordDir, record.contextDbSnapshotPath), { readonly: true });
     try {
         const visible = readVisibleClaims(
             db,

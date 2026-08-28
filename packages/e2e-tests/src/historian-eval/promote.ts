@@ -171,7 +171,14 @@ function inheritedTombstones(releasesRoot: string): string[] {
     for (const entry of readdirSync(releasesRoot)) {
         if (!RELEASE_VERSION_RE.test(entry)) continue;
         const manifestPath = join(releasesRoot, entry, RELEASE_FILES.manifest);
-        if (!existsSync(manifestPath)) continue;
+        // Fail closed: atomic promotion never intentionally leaves a versioned
+        // directory without a manifest, so one that exists is a partial or
+        // damaged release. Skipping it would promote a later release that does
+        // not inherit its tombstones, resurrecting a scenario this function's
+        // invariant says stays rejected forever.
+        if (!existsSync(manifestPath)) {
+            fail([`release.prior.${entry}: manifest-missing`]);
+        }
         const manifest = parseManifest(JSON.parse(readFileSync(manifestPath, "utf8")));
         for (const id of manifest.tombstones) tombstones.add(id);
     }

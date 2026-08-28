@@ -10,12 +10,13 @@ import { ensureProject } from "../../../plugin/src/features/magic-context/memory
 import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { verifyAllActiveClaims } from "./verification-bridge";
-import type { HistorianEvalScenario } from "./contract";
+import { RUN_RECORD_SCHEMA, parseScenario, scenarioFingerprint, type HistorianEvalScenario } from "./contract";
 import { buildHistorianPayload, type PayloadFact } from "./payload";
+import { CONTEXT_DB_SNAPSHOT_FILE } from "./runner";
 import type { HistorianEvalRunRecord, HistorianRunArtifact, InjectedClaimRecord, ProbeExchange } from "./runner";
-import { RUN_RECORD_SCHEMA } from "./runner";
 import {
     buildLaneReport,
+    classifyTerminalRuns,
     compareProbeAnswer,
     laneExitCode,
     scoreRawOutput,
@@ -28,6 +29,8 @@ const PROJECT_IDENTITY = "dir:/historian-eval/scorer-test";
 const SESSION_ID = "ses_historianEvalScorer";
 
 interface SnapshotFixture {
+    /** Stands in for the run record's own directory. */
+    dir: string;
     dbPath: string;
     nowMs: number;
     injectedClaims: InjectedClaimRecord[];
@@ -49,7 +52,7 @@ function makeSnapshot(args: {
     mutate?: (db: Database) => void;
 }): SnapshotFixture {
     const dir = mkdtempSync(join(tmpdir(), "historian-eval-scorer-"));
-    const dbPath = join(dir, "context-db-snapshot.sqlite");
+    const dbPath = join(dir, CONTEXT_DB_SNAPSHOT_FILE);
     // The full direct-format schema (claims, claim-memory, session-runtime)
     // stamped exactly like a production bootstrap.
     const { db } = createDirectTestDatabase({ path: dbPath });
@@ -124,6 +127,7 @@ function makeSnapshot(args: {
         revision: item.revision,
     }));
     return {
+        dir,
         dbPath,
         nowMs,
         injectedClaims,
@@ -178,12 +182,13 @@ function makeRecord(
     return {
         schema: RUN_RECORD_SCHEMA,
         scenarioId: scenario.id,
-        scenarioFingerprint: "0".repeat(64),
+        scenarioFingerprint: scenarioFingerprint(scenario),
         sessionId: SESSION_ID,
         projectIdentity: PROJECT_IDENTITY,
         nowMs: fixture.nowMs,
         system: {
             repoCommitSha: "test",
+            opencodeVersion: "test",
             historianModelId: "scripted-mock",
             probeModelId: "scripted-mock",
             parserImpl: "ts",
@@ -201,7 +206,7 @@ function makeRecord(
         injectedClaims: fixture.injectedClaims,
         probes,
         verifiedClaimCount: fixture.injectedClaims.length,
-        contextDbSnapshotPath: fixture.dbPath,
+        contextDbSnapshotPath: CONTEXT_DB_SNAPSHOT_FILE,
         error: null,
         ...overrides,
     };
@@ -309,7 +314,7 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
             const scenario = validScenario();
-            const score = scoreRunRecord(makeRecord(fixture, scenario), scenario);
+            const score = scoreRunRecord(makeRecord(fixture, scenario), scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("PASS");
             expect(score.precision).toBe(1);
             expect(score.recall).toBe(1);
@@ -326,7 +331,7 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario);
             // Keep probe answers consistent so only recall fails.
             record.probes = [];
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toEqual(["recall"]);
         } finally {
@@ -359,7 +364,7 @@ describe("scoreRunRecord", () => {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
             record.probes = [];
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             // Not visible on the injection read, so no false-authoritative match (R3/KTD1).
             expect(score.falseAuthoritativeMatches).toEqual([]);
             expect(score.verdict).toBe("PASS");
@@ -380,7 +385,7 @@ describe("scoreRunRecord", () => {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
             record.probes = [];
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toContain("structural");
             expect(score.structuralFindings.some((finding) => finding.includes("overlap"))).toBe(true);
@@ -397,7 +402,7 @@ describe("scoreRunRecord", () => {
                 historianRuns: [goldenRun({ emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 })],
             });
             record.probes = [];
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.failReasons).toContain("structural");
             expect(score.structuralFindings.some((finding) => finding.includes("healing"))).toBe(true);
         } finally {
@@ -413,11 +418,121 @@ describe("scoreRunRecord", () => {
                 historianRuns: [goldenRun(), goldenRun({ runIndex: 2, discardedLast: true })],
             });
             record.probes = [];
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.failReasons).toContain("structural");
         } finally {
             fixture.cleanup();
         }
+    });
+
+    test("refuses a run record paired with a different scenario fingerprint", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // An archived dev run re-scored after its same-ID scenario was
+            // edited: the old snapshot against new gold would otherwise return
+            // an apparently valid verdict.
+            const editedRaw = validScenarioRaw();
+            (editedRaw.gold as { expectedClaims: Array<Record<string, unknown>> }).expectedClaims[0].predicate = {
+                kind: "normalized-substring",
+                value: "a different architecture decision",
+            };
+            const edited = parseScenario(editedRaw);
+            expect(scenarioFingerprint(edited)).not.toBe(record.scenarioFingerprint);
+            expect(() => scoreRunRecord(record, edited, { recordDir: fixture.dir })).toThrow(/fingerprint drift/);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("refuses a run record from a different scenario id or schema", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const wrongId = makeRecord(fixture, scenario, { scenarioId: "hse-some-other-scenario" });
+            expect(() => scoreRunRecord(wrongId, scenario, { recordDir: fixture.dir })).toThrow(
+                /cannot be scored against scenario/,
+            );
+            const wrongSchema = makeRecord(fixture, scenario, {
+                schema: "historian-eval-run-record/v0" as typeof RUN_RECORD_SCHEMA,
+            });
+            expect(() => scoreRunRecord(wrongSchema, scenario, { recordDir: fixture.dir })).toThrow(/schema/);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("scores an archived run record after its directory moves (portable snapshot path)", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        const relocated = mkdtempSync(join(tmpdir(), "historian-eval-archive-"));
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // Take the snapshot the way the runner does (VACUUM INTO yields a
+            // complete single-file image), but land it at a directory that
+            // never existed on the runner — what an operator gets after
+            // downloading the uploaded artifact.
+            const moved = join(relocated, record.contextDbSnapshotPath);
+            fixture.db.exec(`VACUUM INTO '${moved.replaceAll("'", "''")}'`);
+            const score = scoreRunRecord(record, scenario, { recordDir: relocated });
+            expect(score.verdict).toBe("PASS");
+            expect(score.recall).toBe(1);
+        } finally {
+            rmSync(relocated, { recursive: true, force: true });
+            fixture.cleanup();
+        }
+    });
+
+    test("infrastructure-caused terminal failures are not charged as invalid-output", () => {
+        // Production writes status `failed` for chunk-coverage rejections,
+        // no-forward-progress, and publish exceptions as well as validation
+        // rejection. Booking an outage as historian quality would violate R6,
+        // so only a validation reason may reach FAIL:invalid-output.
+        for (const failureReason of [
+            "chunk-coverage: chunk 1-8 not covered",
+            "no forward progress beyond raw message 7",
+            "exception: publish transaction rolled back",
+            "stale_snapshot",
+            "protected-tail drain quota exhausted",
+            null,
+        ]) {
+            const runs = [
+                goldenRun({ status: "failed", failureReason, rawOutput: null }),
+                goldenRun({ runIndex: 2, status: "failed", failureReason, rawOutput: null }),
+            ];
+            const classification = classifyTerminalRuns(runs);
+            expect(classification.kind).toBe("infrastructure");
+        }
+    });
+
+    test("a single infrastructure failure among validation rejections is still infrastructure", () => {
+        const classification = classifyTerminalRuns([
+            goldenRun({ status: "failed", failureReason: "validation: bad output" }),
+            goldenRun({ runIndex: 2, status: "failed", failureReason: "exception: storage unavailable" }),
+        ]);
+        expect(classification.kind).toBe("infrastructure");
+        if (classification.kind !== "infrastructure") return;
+        expect(classification.detail).toContain("run 2");
+        expect(classification.detail).toContain("storage unavailable");
+    });
+
+    test("validation rejections on every attempt classify as exhaustion, in both production spellings", () => {
+        for (const failureReason of ["validation: missing tiered paraphrase", "existing-validation: stored drift"]) {
+            expect(classifyTerminalRuns([goldenRun({ status: "failed", failureReason })]).kind).toBe(
+                "validation-exhausted",
+            );
+        }
+    });
+
+    test("a run set with any usable attempt is not terminal", () => {
+        expect(classifyTerminalRuns([]).kind).toBe("not-terminal");
+        expect(
+            classifyTerminalRuns([
+                goldenRun({ status: "failed", failureReason: "validation: bad" }),
+                goldenRun({ runIndex: 2, status: "success" }),
+            ]).kind,
+        ).toBe("not-terminal");
     });
 
     test("all historian attempts invalid scores FAIL:invalid-output (KTD4)", () => {
@@ -431,7 +546,7 @@ describe("scoreRunRecord", () => {
                 ],
             });
             record.probes = [];
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toEqual(["invalid-output"]);
         } finally {
@@ -446,7 +561,7 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario, {
                 error: { reason: "script-drift", detail: "2 scripted turns never consumed" },
             });
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("script-drift");
             expect(score.precision).toBeNull();
@@ -471,14 +586,14 @@ describe("scoreRunRecord", () => {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
             record.probes = [];
-            const first = scoreRunRecord(record, scenario);
-            const second = scoreRunRecord(record, scenario);
+            const first = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
+            const second = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(first.verdict).toBe("PASS");
             expect(JSON.stringify(second)).toBe(JSON.stringify(first));
             // Boundary twin: the pinned clock is the CAUSE. Advancing the
             // record's own clock past the expiry flips the verdict, so a
             // scorer substituting any other clock cannot satisfy both.
-            const advanced = scoreRunRecord({ ...record, nowMs: pinnedNowMs + 120_000 }, scenario);
+            const advanced = scoreRunRecord({ ...record, nowMs: pinnedNowMs + 120_000 }, scenario, { recordDir: fixture.dir });
             expect(advanced.verdict).toBe("FAIL");
             expect(advanced.failReasons).toEqual(["recall"]);
         } finally {
@@ -497,7 +612,7 @@ describe("scoreRunRecord", () => {
                     goldenRun({ runIndex: 2, status: "failed", failureReason: "validation failed" }),
                 ],
             });
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("script-drift");
             expect(score.failReasons).toEqual([]);
@@ -530,7 +645,7 @@ describe("scoreRunRecord", () => {
                       }
                     : exchange,
             );
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toContain("false-authoritative");
             expect(score.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
@@ -635,7 +750,7 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
                       }
                     : probeExchange,
             );
-            const score = scoreRunRecord(record, scenario);
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("trimmed-by-injection-budget");
             expect(score.precision).toBeNull();

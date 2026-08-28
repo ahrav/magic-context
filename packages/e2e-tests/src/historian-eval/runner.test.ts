@@ -12,7 +12,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseScenario, type HistorianEvalScenario } from "./contract";
 import { buildHistorianPayload } from "./payload";
-import { extractAnswerEnvelope, runScenario, type ScriptedHistorianMode } from "./runner";
+import {
+    CONTEXT_DB_SNAPSHOT_FILE,
+    extractAnswerEnvelope,
+    runScenario,
+    type ScriptedHistorianMode,
+} from "./runner";
 import { scoreRunRecord } from "./scorer";
 import { goldFacts, validScenarioRaw } from "./test-support";
 
@@ -107,7 +112,10 @@ describe("runScenario (scripted historian)", () => {
                 expect(record.verifiedClaimCount).toBeGreaterThanOrEqual(2);
                 expect(record.injectedClaims.length).toBeGreaterThanOrEqual(2);
                 expect(record.perGoldPredicate.every((entry) => entry.claimCount >= 1)).toBe(true);
-                expect(existsSync(record.contextDbSnapshotPath)).toBe(true);
+                // Stored relative to the record so an archived artifact
+                // re-scores wherever it is unpacked.
+                expect(record.contextDbSnapshotPath).toBe(CONTEXT_DB_SNAPSHOT_FILE);
+                expect(existsSync(join(dir, record.contextDbSnapshotPath))).toBe(true);
                 expect(record.probes).toHaveLength(3);
 
                 // The persisted record round-trips.
@@ -117,7 +125,7 @@ describe("runScenario (scripted historian)", () => {
                 // End-to-end: the scorer accepts the record. The claim-id
                 // probe answered a placeholder id, so the verdict is
                 // FAIL:probe — facts and structure must be clean.
-                const score = scoreRunRecord(record, scenario);
+                const score = scoreRunRecord(record, scenario, { recordDir: dir });
                 expect(score.recall).toBe(1);
                 expect(score.falseAuthoritativeMatches).toEqual([]);
                 expect(score.structuralFindings).toEqual([]);
@@ -218,8 +226,11 @@ describe("runScenario (scripted historian)", () => {
                 expect(record.error).toBeNull();
                 expect(record.historianRuns).toHaveLength(1);
                 expect(record.historianRuns[0].status).toBe("failed");
+                // Only a validation rejection may be charged to historian
+                // quality; any other terminal reason is an infra ERROR.
+                expect(record.historianRuns[0].failureReason ?? "").toMatch(/^(?:existing-)?validation:/);
                 expect(record.probes).toEqual([]);
-                const score = scoreRunRecord(record, scenario);
+                const score = scoreRunRecord(record, scenario, { recordDir: dir });
                 expect(score.verdict).toBe("FAIL");
                 expect(score.failReasons).toEqual(["invalid-output"]);
             } finally {

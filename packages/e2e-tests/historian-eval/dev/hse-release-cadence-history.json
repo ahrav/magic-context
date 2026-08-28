@@ -91,7 +91,8 @@
         "weekly",
         "daily"
       ],
-      "goldAnswer": "daily"
+      "goldAnswer": "daily",
+      "sourceClaimRef": "exp-daily-canary"
     }
   ]
 }

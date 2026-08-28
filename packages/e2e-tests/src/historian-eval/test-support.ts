@@ -80,6 +80,7 @@ export function validScenarioRaw(): Record<string, unknown> {
                 answerType: "multiple-choice",
                 choices: ["redis", "in-process lru"],
                 goldAnswer: "in-process lru",
+                sourceClaimRef: "exp-lru-cache",
             },
             {
                 id: "probe-claim",

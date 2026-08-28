@@ -345,6 +345,44 @@ function evidenceFail(code: string): never {
 }
 
 /**
+ * A scenario entry claiming green must carry exactly one result per mutation
+ * class. `runScenarioMutationBattery` only emits a short result list when it
+ * fails closed early — `baseline-fixture` on a validator-dirty baseline, or an
+ * extra `battery-coverage` red — so a green entry has no legitimate way to be
+ * missing a class. Without this check, a hand-edited artifact whose results
+ * are a single green `battery-coverage` entry is internally consistent and
+ * `loadRelease` accepts evidence that never exercised the required classes.
+ */
+function checkRequiredClassCoverage(entry: ScenarioMutationEvidence, label: string): void {
+    if (!entry.green) return;
+    const seen = new Map<string, number>();
+    for (const result of entry.results) {
+        seen.set(result.mutationClass, (seen.get(result.mutationClass) ?? 0) + 1);
+    }
+    for (const mutationClass of MUTATION_CLASSES) {
+        const count = seen.get(mutationClass) ?? 0;
+        if (count === 0) evidenceFail(`${label}.results: missing-class-${mutationClass}`);
+        if (count > 1) evidenceFail(`${label}.results: duplicate-class-${mutationClass}`);
+    }
+    for (const mutationClass of seen.keys()) {
+        if (!(MUTATION_CLASSES as readonly string[]).includes(mutationClass)) {
+            evidenceFail(`${label}.results: unexpected-class-${mutationClass}-in-green-entry`);
+        }
+    }
+    // The same invariant the battery asserts when it emits `battery-coverage`:
+    // every scenario declares a hard-negative family, so a green entry in
+    // which neither false-authoritative class was applicable means the
+    // family-to-class mapping drifted and nothing actually ran.
+    const falseAuthoritative = entry.results.filter(
+        (result) =>
+            result.mutationClass === "speculation-promoted" || result.mutationClass === "rejected-proposal-active",
+    );
+    if (falseAuthoritative.every((result) => !result.applicable)) {
+        evidenceFail(`${label}.results: no-applicable-false-authoritative-class`);
+    }
+}
+
+/**
  * Strict, fail-closed evidence parser: an artifact claiming green must be
  * internally consistent (aggregate flags derived from per-result flags,
  * every result labeled with a known class), so a hand-written
@@ -390,7 +428,9 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
         if (entry.green !== results.every((result) => result.green)) {
             evidenceFail(`scenarios[${index}].green: inconsistent-with-results`);
         }
-        return entry as unknown as ScenarioMutationEvidence;
+        const parsed = entry as unknown as ScenarioMutationEvidence;
+        checkRequiredClassCoverage(parsed, `scenarios[${index}]`);
+        return parsed;
     });
     if (root.green !== scenarios.every((entry) => entry.green)) {
         evidenceFail("green: inconsistent-with-scenarios");
