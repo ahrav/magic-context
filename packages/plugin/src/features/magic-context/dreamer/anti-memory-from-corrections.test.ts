@@ -60,6 +60,20 @@ function seedSession(
              VALUES (?, 'u1', ?, 'v1', ?, 'user', 'opencode', 1)`,
         )
         .run(sessionId, userOrdinal, `hash-${sessionId}-${userOrdinal}`);
+    // The indexer also records how far it has reconciled. Corroboration refuses
+    // to trust a span the index has not reached, so a fixture that leaves this
+    // row absent reads as "nothing indexed" and every event skips.
+    database
+        .prepare(
+            `INSERT INTO message_history_index
+                (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness)
+             VALUES (?, ?, 0, 1, 'opencode')
+             ON CONFLICT(session_id) DO UPDATE SET
+                 last_indexed_ordinal = MAX(message_history_index.last_indexed_ordinal, excluded.last_indexed_ordinal)`,
+        )
+        // Cover the whole compartment span (end_message = 2), not just this
+        // message, so the reconciliation check sees the span as searchable.
+        .run(sessionId, Math.max(userOrdinal, 2));
     return compartmentId;
 }
 
@@ -267,6 +281,40 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         expect(
             db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
         ).toEqual({ trust: "model_inference" });
+    });
+
+    test("skips a correction whose span the message index has not reconciled", () => {
+        db = createClaimReaderTestDatabase();
+        const userText = "keep the cache offline capable for air-gapped installs";
+        const compartmentId = seedSession(db, "ses-unindexed", userText);
+        // Simulate "indexer has not reached this span yet": the FTS rows are not
+        // there, and the index still has a dirty floor outstanding over the span.
+        // The span itself is valid, so only the reconciliation check can catch
+        // this — and without it the empty text list makes source-overlap pass
+        // vacuously and the transcription gets persisted.
+        db.prepare("DELETE FROM message_history_fts WHERE session_id = ?").run("ses-unindexed");
+        db.prepare("DELETE FROM message_history_source WHERE session_id = ?").run("ses-unindexed");
+        db.prepare(
+            "UPDATE message_history_index SET dirty_floor_ordinal = 1 WHERE session_id = ?",
+        ).run("ses-unindexed");
+        insertCompartmentEvents(
+            db,
+            "ses-unindexed",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    // Verbatim from the user, with no quote marks, date, or
+                    // frustration marker, so only source-overlap could reject it —
+                    // and source-overlap is exactly what an unindexed span defeats.
+                    fields: correctionFields({ reason_for_change: userText }),
+                },
+            ],
+            [compartmentId],
+        );
+
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
     });
 
     test("skips a correction with no authoritative span instead of persisting it unchecked", () => {

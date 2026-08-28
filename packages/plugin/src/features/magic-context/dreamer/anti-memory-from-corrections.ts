@@ -14,6 +14,7 @@ import {
     runClaimOperationInCurrentTransaction,
 } from "../memory/storage-claim-operations";
 import { ensureProject } from "../memory/storage-claims";
+import { isMessageIndexReconciledThrough } from "../message-index";
 import { validateRetrospectiveLearningText } from "./retrospective-learnings";
 
 const CORRECTION_CONSUMER = "dreamer-correction-harvest-v1";
@@ -221,8 +222,17 @@ export function harvestAntiMemoriesFromCorrections(args: {
         const expiresAt = event.createdAt + ANTI_MEMORY_DEFAULT_TTL_MS;
         const payload = expiresAt > nowMs ? mappedPayload(event) : null;
         const span = payload ? eventSpan(event) : null;
-        const userTexts = payload ? spanUserTexts(args.db, event, span) : [];
-        // With no authoritative span there are no source texts, and
+        // A span only bounds a trustworthy search if the message index has
+        // actually reached it. `message_history_fts` is filled asynchronously and
+        // can be re-indexed from a dirty floor, so a valid span whose rows are not
+        // yet indexed yields an empty `userTexts` and makes the source-overlap
+        // check pass vacuously — the same silent bypass as a missing span.
+        // `isMessageIndexReconciledThrough` is the authoritative predicate: the
+        // watermark covers the span AND no dirty floor is outstanding.
+        const spanIsSearchable =
+            span !== null && isMessageIndexReconciledThrough(args.db, event.sessionId, span[1]);
+        const userTexts = spanIsSearchable ? spanUserTexts(args.db, event, span) : [];
+        // With no searchable span there are no source texts, and
         // `validateRetrospectiveLearningText` silently loses its source-overlap
         // arm against an empty list: the quote, date, and frustration checks
         // still run, but a field copied verbatim from a user message without
@@ -234,7 +244,7 @@ export function harvestAntiMemoriesFromCorrections(args: {
             ? expiresAt > nowMs
                 ? "missing_warning_core"
                 : "expired"
-            : span === null
+            : !spanIsSearchable
               ? "unverifiable_span"
               : validationReason(payload, userTexts);
         try {
