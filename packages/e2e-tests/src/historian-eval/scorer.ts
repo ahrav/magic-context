@@ -32,6 +32,7 @@ import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canon
 import { openTestDb } from "../test-db";
 import {
     containsCompleteValue,
+    decodeXmlEntities,
     matchesGold,
     normalizeContent,
     predicateMatches,
@@ -363,25 +364,7 @@ function goldAnswerStatedInCompartments(probe: Probe, exchange: ProbeExchange): 
     );
 }
 
-/**
- * The XML entity forms the block renderers emit, turned back into the characters an
- * authored value is written with.
- *
- * Numeric forms are decoded too: an escaper is free to emit them, and a value the
- * comparison cannot see is a false "unavailable" — which charges an answerable probe as
- * infrastructure. `&amp;` is decoded LAST so a doubly-escaped `&amp;lt;` becomes
- * `&lt;` rather than `<`, matching how a decoder consumes one layer.
- */
-function decodeXmlEntities(text: string): string {
-    return text
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'")
-        .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
-        .replace(/&#x([0-9a-fA-F]+);/g, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)))
-        .replace(/&amp;/g, "&");
-}
+
 
 /** Resolve a gold expected-claim reference to concrete injected claims. */
 function claimsMatchingGold(claim: ExpectedClaim, items: readonly InjectedClaimRecord[]): InjectedClaimRecord[] {
@@ -460,8 +443,17 @@ export function compareProbeAnswer(args: {
             );
     } else {
         expected = probe.goldAnswer;
+        // Decoded on BOTH sides before comparing. A model that read the escaped wire form
+        // out of an injected block can answer `A&amp;B` for an authored gold of `A&B`, and
+        // the raw comparison marked that correct answer wrong — while the availability
+        // check one branch up already decodes the same text, so the two disagreed about
+        // what the value is. Both sides, not just the reply: decoding only the model's
+        // answer would break the mirror case where the gold itself is authored with an
+        // entity.
         pass =
-            exchange.answerRaw !== null && normalizeContent(exchange.answerRaw) === normalizeContent(probe.goldAnswer);
+            exchange.answerRaw !== null &&
+            normalizeContent(decodeXmlEntities(exchange.answerRaw)) ===
+                normalizeContent(decodeXmlEntities(probe.goldAnswer));
     }
     if (pass) return { probeId: probe.id, outcome: "pass", expected, actual: exchange.answerRaw };
 

@@ -44,6 +44,7 @@ import {
     PROBE_PROMPT_REASK_PREFIX,
     PROBE_PROMPT_SHARED,
     containsCompleteValue,
+    decodeXmlEntities,
     matchesGold,
     normalizeContent,
     scenarioFingerprint,
@@ -202,7 +203,10 @@ export function probeResponseLeak(args: {
     const outside = outsideAcceptedEnvelope(responseText, (content) =>
         own !== undefined &&
         own.answerType !== "claim-id" &&
-        normalizeContent(content) === normalizeContent(own.goldAnswer),
+        // The same decoded equality `compareProbeAnswer` uses. Otherwise an escaped but
+        // CORRECT answer would be scored as a pass there and scanned as foreign text here,
+        // so a probe answering its own question could report a leak against itself.
+        normalizeContent(decodeXmlEntities(content)) === normalizeContent(decodeXmlEntities(own.goldAnswer)),
     );
     for (const later of probes.slice(probeIndex + 1)) {
         // Claim-id answers are not checked here. Their accepted value is a runtime id
@@ -1833,6 +1837,7 @@ class ScenarioRunner {
         this.assertProbeGoldCovered(harness, sessionId, probe);
         const requestCountBefore = harness.mock.requests().length;
 
+        let requestCountBeforeFinalAsk = requestCountBefore;
         const first = await this.askProbe(harness, sessionId, buildProbePrompt(probe));
         let answerRaw = first.answerRaw;
         let responseText = first.responseText;
@@ -1848,6 +1853,7 @@ class ScenarioRunner {
         if (answerRaw === null) {
             reAsked = true;
             if (first.responseText !== null) discardedResponseTexts.push(first.responseText);
+            requestCountBeforeFinalAsk = harness.mock.requests().length;
             const retry = await this.askProbe(
                 harness,
                 sessionId,
@@ -1877,11 +1883,18 @@ class ScenarioRunner {
 
         const payloadText = this.capturedProbePayload(harness, requestCountBefore);
         this.assertNoGoldRangeLeak(probe, payloadText, buildProbePrompt(probe));
+        // The FINAL request alone decides whether a block was rendered for the answer that
+        // was accepted. `capturedProbePayload` concatenates every request in the window, so
+        // on a re-ask a block rendered for the discarded FIRST attempt kept the combined
+        // text looking block-bearing — and the cached locators were then recorded as
+        // evidence for a retry whose own request withheld it. The leak gate still reads the
+        // whole window, because every request's text reached the session.
+        const finalRequestPayload = this.capturedProbePayload(harness, requestCountBeforeFinalAsk);
         return {
             probeId: probe.id,
             answerRaw,
             reAsked,
-            injectedRevisionLocators: this.injectedLocatorsForTurn(harness, sessionId, payloadText),
+            injectedRevisionLocators: this.injectedLocatorsForTurn(harness, sessionId, finalRequestPayload),
             payloadText,
             responseText,
             discardedResponseTexts,

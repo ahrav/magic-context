@@ -2045,6 +2045,41 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
         expect(verdict.outcome).toBe("error-trimmed");
     });
 
+    test("an escaped answer matches an authored gold with the same character", () => {
+        // The injected block carries the escaped wire form, so a model reading it back can
+        // answer `A&amp;B` for an authored gold of `A&B`. Comparing raw marked that correct
+        // answer wrong, while the availability check one branch up already decoded the same
+        // text — so the two disagreed about what the value is.
+        const ampScenario: HistorianEvalScenario = {
+            ...scenario,
+            gold: {
+                ...scenario.gold,
+                expectedClaims: scenario.gold.expectedClaims.map((claim) =>
+                    claim.id === "exp-cache-capacity"
+                        ? { ...claim, predicate: { kind: "normalized-substring" as const, value: "A&B" } }
+                        : claim,
+                ),
+            },
+            probes: [{ ...scenario.probes[0], answerType: "exact" as const, goldAnswer: "A&B", sourceClaimRef: "exp-cache-capacity" }],
+        };
+        const ampClaims: InjectedClaimRecord[] = [
+            {
+                publicClaimId: "mem-amp",
+                revisionLocator: "loc-amp",
+                content: "The marker is A&B for the cache.",
+                category: "CONFIG_VALUES",
+                revision: 1,
+            },
+        ];
+        const verdict = compareProbeAnswer({
+            probe: ampScenario.probes[0],
+            exchange: exchange(ampScenario.probes[0].id, "A&amp;B", ["loc-amp"]),
+            scenario: ampScenario,
+            injectedClaims: ampClaims,
+        });
+        expect(verdict.outcome).toBe("pass");
+    });
+
     test("a correct answer stays a PASS when the claim was injected for the probe", () => {
         const probe = scenario.probes[0];
         // The gate must not swallow an ordinary PASS: the capacity locator IS in this

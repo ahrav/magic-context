@@ -928,6 +928,26 @@ function canonicalOrder<T>(entries: readonly T[]): T[] {
 }
 
 /** Normalization applied to both predicate values and candidate content. */
+/**
+ * The XML entity forms the block renderers emit, turned back into the characters an
+ * authored value is written with.
+ *
+ * Numeric forms are decoded too: an escaper is free to emit them, and a value the
+ * comparison cannot see is a false "unavailable" — which charges an answerable probe as
+ * infrastructure. `&amp;` is decoded LAST so a doubly-escaped `&amp;lt;` becomes
+ * `&lt;` rather than `<`, matching how a decoder consumes one layer.
+ */
+export function decodeXmlEntities(text: string): string {
+    return text
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
+        .replace(/&#x([0-9a-fA-F]+);/g, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)))
+        .replace(/&amp;/g, "&");
+}
+
 export function normalizeContent(text: string): string {
     return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
