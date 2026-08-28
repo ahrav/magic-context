@@ -40,6 +40,7 @@ import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
+import { harvestAntiMemoriesFromCorrections } from "./anti-memory-from-corrections";
 import {
     claimManifestBinding,
     dreamerInferenceProvenance,
@@ -545,6 +546,19 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 : null;
         }
 
+        /**
+         * Claim effects the correction harvest has already COMMITTED, held
+         * outside the try below so the failure path can still report them.
+         *
+         * The harvest commits in its own lease-guarded transaction before model
+         * inference runs. If inference then throws, those anti-memories and their
+         * event receipts are durable, but the failed run row would record no
+         * memory change — and the receipt filter stops any later run from
+         * rediscovering the same events, so the claims would be permanently
+         * absent from `dream_runs.memory_changes_json`.
+         */
+        let committedHarvestEffects: readonly ClaimOperationResultEffect[] = [];
+
         try {
             if (config.task === "compress-cues") {
                 if (deps.mural?.enabled !== true) {
@@ -819,6 +833,17 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
 
             if (config.task === "retrospective") {
                 const memoryBefore = censusProjectMemoryClaims(db, projectIdentity);
+                const correctionHarvest = runLeaseGuardedWrite(
+                    db,
+                    holderId,
+                    leaseKey,
+                    () => harvestAntiMemoriesFromCorrections({ db, projectIdentity }),
+                    leaseAcquisition.generation,
+                );
+                if (!correctionHarvest) {
+                    throw new Error("Dream lease lost during trajectory-correction harvest");
+                }
+                committedHarvestEffects = correctionHarvest.effects;
                 const retro = await runRetrospectiveTask(config, ctx, {
                     deps,
                     deadline,
@@ -832,7 +857,10 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 // projects still writing that table.
                 recordRun("completed", null, {
                     memoryChanges:
-                        claimEffectMemoryChanges(retro.effects) ?? computeMemoryDelta(memoryBefore),
+                        claimEffectMemoryChanges([
+                            ...correctionHarvest.effects,
+                            ...retro.effects,
+                        ]) ?? computeMemoryDelta(memoryBefore),
                 });
                 // Advance the content watermark on completion (incl. clean "n"
                 // runs) so the next run only scans newer messages.
@@ -855,7 +883,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             });
         } catch (error) {
             const { transient, brief } = classifyFailure(error);
-            recordRun("failed", brief);
+            // Report work the harvest already committed. Without this the claims
+            // exist but no run row ever names them, because the event receipts
+            // keep a retry from rediscovering the same events.
+            const harvested = claimEffectMemoryChanges([...committedHarvestEffects]);
+            recordRun("failed", brief, harvested ? { memoryChanges: harvested } : undefined);
             log(`[dreamer] task ${config.task} failed (transient=${transient}): ${brief}`);
             return { status: "failed", transient, error: brief };
         } finally {

@@ -1,5 +1,14 @@
 import { type Database, isInTransaction } from "../../../shared/sqlite";
-import type { ClaimOperationResultEffect } from "../memory/claim-operation-contract";
+import type {
+    CanonicalJsonValue,
+    ClaimOperationResultEffect,
+} from "../memory/claim-operation-contract";
+import {
+    type AntiMemoryPayload,
+    normalizeAntiMemoryPayload,
+    renderAntiMemoryContent,
+    stageCreateAntiMemoryInCurrentTransaction,
+} from "../memory/storage-anti-memory";
 import {
     type AutonomousManifestIdentity,
     runAutonomousCreationManifestInCurrentTransaction,
@@ -17,13 +26,12 @@ import { insertUserMemoryCandidates } from "../user-memory/storage-user-memory";
 const FRUSTRATION_MARKER_REGEX =
     /\b(?:not what i asked|i already (?:said|told you|explained)|you (?:ignored|missed)|that'?s wrong|this is wrong|stop (?:doing|claiming|using)|(?:no|wrong|again|stop)(?:\W+\b(?:no|wrong|again|stop)\b)+)\b|[!?]{3,}/i;
 
-export type RetrospectiveLearningRoute = "memory" | "observation";
+export type ParsedRetrospectiveLearning =
+    | { route: "memory"; content: string; category: MemoryCategory }
+    | { route: "observation"; content: string }
+    | { route: "anti_memory"; payload: AntiMemoryPayload };
 
-export interface ParsedRetrospectiveLearning {
-    route: RetrospectiveLearningRoute;
-    content: string;
-    category?: MemoryCategory;
-}
+export type RetrospectiveLearningRoute = ParsedRetrospectiveLearning["route"];
 
 export interface RetrospectiveApplyResult {
     memoryWritten: number;
@@ -60,6 +68,29 @@ export function parseRetrospectiveLearnings(text: string): ParsedRetrospectiveLe
     for (const match of block.matchAll(LEARNING_REGEX)) {
         const attrs = parseAttributes(match[1] ?? "");
         const route = attrs.route;
+        if (route === "anti_memory") {
+            const inner = match[2] ?? "";
+            const trigger = childText(inner, "trigger");
+            const rejectedStrategy = childText(inner, "rejected_strategy");
+            const rejectionReason = childText(inner, "rejection_reason");
+            if (!trigger || !rejectedStrategy || !rejectionReason) continue;
+            learnings.push({
+                route,
+                payload: {
+                    trigger,
+                    rejectedStrategy,
+                    rejectionReason,
+                    saferAlternative: childText(inner, "safer_alternative"),
+                    preconditions: childText(inner, "preconditions"),
+                    attemptedApproach: childText(inner, "attempted_approach"),
+                    observedFailure: childText(inner, "observed_failure"),
+                    rootCause: childText(inner, "root_cause"),
+                    recovery: childText(inner, "recovery"),
+                    nonApplicableWhen: childText(inner, "non_applicable_when"),
+                },
+            });
+            continue;
+        }
         if (route !== "memory" && route !== "observation") continue;
         const content = unescapeXml((match[2] ?? "").trim())
             .replace(/\s+/g, " ")
@@ -75,6 +106,24 @@ export function parseRetrospectiveLearnings(text: string): ParsedRetrospectiveLe
         }
     }
     return learnings;
+}
+
+/**
+ * Extract one child element's text.
+ *
+ * The open tag tolerates attributes and trailing whitespace (`<trigger >`,
+ * `<safer_alternative note="...">`) because a missed match on a REQUIRED field
+ * silently discards the whole learning at the caller, turning ordinary model
+ * formatting variance into lost memory. `\b` keeps the tolerance from matching a
+ * longer tag that merely starts with this name (`recovery` vs `recovery_plan`).
+ */
+function childText(inner: string, tag: string): string | null {
+    const match = inner.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}\\s*>`, "i"));
+    if (!match) return null;
+    const value = unescapeXml(match[1] ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
+    return value || null;
 }
 
 // A learning that shares a long verbatim run of words with a source user message
@@ -162,24 +211,45 @@ export function applyRetrospectiveLearnings(args: {
         throw new Error("applyRetrospectiveLearnings requires an active transaction");
     }
     const rejected: Array<{ content: string; reason: string }> = [];
-    const memories: Array<ParsedRetrospectiveLearning & { category: MemoryCategory }> = [];
+    const claims: Array<
+        | { route: "memory"; content: string; category: MemoryCategory; index: number }
+        | { route: "anti_memory"; payload: AntiMemoryPayload; content: string; index: number }
+    > = [];
     const observations: Array<{ content: string; sessionId: string }> = [];
     const sourceUserTexts = args.sourceUserTexts ?? [];
     const seenContent = new Set<string>();
 
-    for (const learning of args.learnings) {
-        const dedupeKey = `${learning.route}:${learning.category ?? ""}:${learning.content}`;
+    for (const [index, learning] of args.learnings.entries()) {
+        const content =
+            learning.route === "anti_memory"
+                ? renderAntiMemoryContent(learning.payload)
+                : learning.content;
+        const category = learning.route === "memory" ? learning.category : "";
+        const dedupeKey = `${learning.route}:${category}:${content}`;
         if (seenContent.has(dedupeKey)) continue;
         seenContent.add(dedupeKey);
-        const rejectReason = validateRetrospectiveLearningText(learning.content, sourceUserTexts);
+        // Derive the privacy-gated field set from the normalized payload itself:
+        // a hand-kept field list fails OPEN when a payload field is added, letting
+        // unvalidated text reach a durable claim.
+        const fields =
+            learning.route === "anti_memory"
+                ? Object.values(normalizeAntiMemoryPayload(learning.payload)).filter(
+                      (value): value is string => typeof value === "string",
+                  )
+                : [content];
+        const rejectReason = fields
+            .map((field) => validateRetrospectiveLearningText(field, sourceUserTexts))
+            .find((reason) => reason !== null);
         if (rejectReason) {
-            rejected.push({ content: learning.content, reason: rejectReason });
+            rejected.push({ content, reason: rejectReason });
             continue;
         }
-        if (learning.route === "memory" && learning.category) {
-            memories.push({ ...learning, category: learning.category });
+        if (learning.route === "memory") {
+            claims.push({ ...learning, index });
+        } else if (learning.route === "anti_memory") {
+            claims.push({ ...learning, content, index });
         } else if (learning.route === "observation" && args.userMemoryCollectionEnabled) {
-            observations.push({ content: learning.content, sessionId: args.sourceSessionId });
+            observations.push({ content, sessionId: args.sourceSessionId });
         }
     }
 
@@ -190,50 +260,77 @@ export function applyRetrospectiveLearnings(args: {
                   learning.route === "observation" &&
                   !rejected.some((item) => item.content === learning.content),
           ).length;
+    const manifest: CanonicalJsonValue[] = [];
+    for (const learning of args.learnings) {
+        if (learning.route === "anti_memory") {
+            manifest.push({
+                // Normalization pins every payload field (absent optionals become
+                // null), so the manifest shape cannot drift from the payload type.
+                payload: { ...normalizeAntiMemoryPayload(learning.payload) },
+                route: learning.route,
+            });
+        } else {
+            manifest.push({
+                category: learning.route === "memory" ? learning.category : null,
+                content: learning.content,
+                route: learning.route,
+            });
+        }
+    }
     const projectId = ensureProject(args.db, args.projectIdentity);
     const operation = runAutonomousCreationManifestInCurrentTransaction({
         db: args.db,
         identity: args.identity,
-        items: memories.map((learning, index) => ({
+        items: claims.map((learning) => ({
             key: {
-                category: learning.category,
+                category: learning.route === "memory" ? learning.category : "REJECTED_APPROACH",
                 contentDigest: sha256Utf8Hex(learning.content),
-                index,
+                index: learning.index,
             },
-            value: { learning, index },
+            value: learning,
         })),
-        manifest: args.learnings.map((learning) => ({
-            category: learning.category ?? null,
-            content: learning.content,
-            route: learning.route,
-        })),
+        manifest,
         resultSummary: {
             observationsDropped,
             observationsInserted: observations.length,
             rejected: rejected.length,
         },
-        stageItem: (db, item, nowMs) =>
-            stageCreateProjectMemoryClaimInCurrentTransaction(
-                db,
-                {
-                    projectId,
-                    content: item.value.learning.content,
-                    category: item.value.learning.category,
-                    provenance: {
-                        sourceLocator: `retrospective://${args.identity.runId}/${args.identity.batchId}/${item.value.index}`,
-                        sourceContent: item.value.learning.content,
-                        sourceSessionId: args.sourceSessionId,
-                        extractor: "dreamer-retrospective",
-                        extractorVersion: "direct-claims-v1",
-                        extractorRunId: args.identity.runId,
-                        independenceKey: `retrospective:${args.identity.runId}:${item.value.index}`,
-                        sourceTrustClass: "model_inference",
-                    },
-                    actor: args.identity.producer,
-                    nowMs,
-                },
-                nowMs,
-            ),
+        stageItem: (db, item, nowMs) => {
+            const provenance = {
+                sourceLocator: `retrospective://${args.identity.runId}/${args.identity.batchId}/${item.value.index}`,
+                sourceContent: item.value.content,
+                sourceSessionId: args.sourceSessionId,
+                extractor: "dreamer-retrospective",
+                extractorVersion: "direct-claims-v1",
+                extractorRunId: args.identity.runId,
+                independenceKey: `retrospective:${args.identity.runId}:${item.value.index}`,
+                sourceTrustClass: "model_inference" as const,
+            };
+            return item.value.route === "anti_memory"
+                ? stageCreateAntiMemoryInCurrentTransaction(
+                      db,
+                      {
+                          projectId,
+                          payload: item.value.payload,
+                          provenance,
+                          actor: args.identity.producer,
+                          nowMs,
+                      },
+                      nowMs,
+                  )
+                : stageCreateProjectMemoryClaimInCurrentTransaction(
+                      db,
+                      {
+                          projectId,
+                          content: item.value.content,
+                          category: item.value.category,
+                          provenance,
+                          actor: args.identity.producer,
+                          nowMs,
+                      },
+                      nowMs,
+                  );
+        },
     });
     if (!operation.operation.replayed && observations.length > 0) {
         insertUserMemoryCandidates(args.db, observations);

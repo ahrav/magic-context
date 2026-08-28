@@ -363,8 +363,16 @@ describe("reset marker and interrupted quarantine", () => {
             ]);
 
             const walDestination = join(quarantineDirPath, "context.db-wal");
-            rmSync(walDestination);
-            writeFileSync(walDestination, "replacement");
+            // Identity is dev+inode, so a replacement must land on a DIFFERENT
+            // inode for this to test anything. Deleting first and recreating
+            // leaves that to the filesystem, which recycles the just-freed inode
+            // often enough that CI saw the replacement classified as a clean
+            // move. Staging a sibling file while the original still holds its
+            // inode forces a distinct one, then renaming it into place keeps it.
+            const replacement = `${walDestination}.replacement`;
+            writeFileSync(replacement, "replacement");
+            expect(statSync(replacement).ino).not.toBe(statSync(walDestination).ino);
+            renameSync(replacement, walDestination);
             const replaced = verifyResetMarkerFamily(marker);
             expect(replaced.files).toContainEqual({ role: "wal", status: "mismatch" });
             expect(replaced.problems.join("\n")).toContain("changed identity");

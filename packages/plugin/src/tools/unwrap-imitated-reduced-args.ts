@@ -14,6 +14,13 @@ export type ImitatedArgRule =
     | {
           type: "object";
           fields: Readonly<Record<string, ImitatedArgRule>>;
+          /**
+           * Fields that may be absent or null. When present and non-null the
+           * value must validate against its rule. Without this, a decode schema
+           * that omits an advertised optional field rejects the whole imitated
+           * call and loses the action.
+           */
+          optionalFields?: Readonly<Record<string, ImitatedArgRule>>;
       }
     | {
           type: "array";
@@ -28,21 +35,32 @@ const MAX_DECODED_STRING_LENGTH = 1024 * 1024;
 const MAX_DECODED_ARRAY_ITEMS = 100;
 
 /**
- * Nested objects must match their declared field set exactly. An undeclared field
- * would reach the tool unvalidated, and a missing field would let a partial value
- * (a mutation token short one digest) through to the mutation path.
+ * Nested objects must carry every required field and nothing undeclared. An
+ * undeclared field would reach the tool unvalidated, and a missing required
+ * field would let a partial value (a mutation token short one digest) through
+ * to the mutation path. Declared optional fields may be absent or null.
  */
 function validObjectField(
     value: unknown,
     fields: Readonly<Record<string, ImitatedArgRule>>,
+    optionalFields: Readonly<Record<string, ImitatedArgRule>> = {},
 ): boolean {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
     const record = value as Record<string, unknown>;
-    const declared = Object.entries(fields);
-    if (Object.keys(record).length !== declared.length) return false;
-    return declared.every(
-        ([field, rule]) => Object.hasOwn(record, field) && validField(record[field], rule),
-    );
+    const required = Object.entries(fields);
+    if (
+        !required.every(
+            ([field, rule]) => Object.hasOwn(record, field) && validField(record[field], rule),
+        )
+    ) {
+        return false;
+    }
+    return Object.keys(record).every((field) => {
+        if (Object.hasOwn(fields, field)) return true;
+        const rule = optionalFields[field];
+        if (rule === undefined) return false;
+        return record[field] === null || validField(record[field], rule);
+    });
 }
 
 function validField(value: unknown, rule: ImitatedArgRule): boolean {
@@ -52,7 +70,7 @@ function validField(value: unknown, rule: ImitatedArgRule): boolean {
     if (rule === "number") return typeof value === "number" && Number.isFinite(value);
     if (rule === "boolean") return typeof value === "boolean";
     if (rule.type === "enum") return typeof value === "string" && rule.values.includes(value);
-    if (rule.type === "object") return validObjectField(value, rule.fields);
+    if (rule.type === "object") return validObjectField(value, rule.fields, rule.optionalFields);
     if (!Array.isArray(value) || value.length > (rule.maxItems ?? MAX_DECODED_ARRAY_ITEMS)) {
         return false;
     }
