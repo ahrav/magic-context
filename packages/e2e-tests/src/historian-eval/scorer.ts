@@ -313,11 +313,23 @@ export function compareProbeAnswer(args: {
             // the request, so there is no evidence the fact was reachable, and assuming
             // it was would charge the model on an absence of proof. That is the same
             // live-mode capture gap the replayed leak gate already carries.
-            const compartmentSurface =
-                exchange.payloadText === null
-                    ? ""
-                    : injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS);
-            if (!predicateMatches(goldClaim.predicate, compartmentSurface)) {
+            //
+            // A claim-id probe keeps it unconditionally. Its answer is the runtime
+            // public claim id, which `renderClaimMemoryLine` emits into
+            // `<project-memory>` and nowhere else — compartment summaries are
+            // historian-authored prose about the transcript and cannot contain an id
+            // the store assigned at promotion time. So a summary stating the fact does
+            // not make the id recoverable: `injectedMatching` is still empty, `expected`
+            // is still `<no injected gold claim>`, and falling through would charge the
+            // model for a probe that had no answer available.
+            const answerableFromCompartments =
+                probe.answerType !== "claim-id" &&
+                exchange.payloadText !== null &&
+                predicateMatches(
+                    goldClaim.predicate,
+                    injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS),
+                );
+            if (!answerableFromCompartments) {
                 return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
             }
         }

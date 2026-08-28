@@ -1791,6 +1791,28 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
         expect(verdict.outcome).toBe("fail");
     });
 
+    test("a trimmed claim-id probe stays error-trimmed even when a compartment states the fact", () => {
+        const probe = scenario.probes.find((entry) => entry.answerType === "claim-id");
+        if (probe === undefined) throw new Error("fixture lacks a claim-id probe");
+        // A claim-id answer is the runtime public id, which is emitted into
+        // `<project-memory>` and nowhere else — a compartment summary is prose about
+        // the transcript and cannot carry an id the store assigned at promotion time.
+        // So the fact being summarised does not make the id recoverable, and falling
+        // through to `fail` would charge the model for a probe with no answer
+        // available (`expected` is `<no injected gold claim>`).
+        const verdict = compareProbeAnswer({
+            probe,
+            exchange: {
+                ...exchange(probe.id, "mem-lru01", ["loc-cap01"]),
+                payloadText:
+                    "<new-compartments>\nSessions are cached by the in-process LRU cache.\n</new-compartments>",
+            },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("error-trimmed");
+    });
+
     test("a trimmed claim absent from every compartment stays error-trimmed", () => {
         const probe = scenario.probes[0];
         // Same trim, but no injected surface carries the fact — the probe genuinely
