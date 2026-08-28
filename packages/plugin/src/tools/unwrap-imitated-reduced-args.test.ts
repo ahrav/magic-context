@@ -254,3 +254,56 @@ describe("imitated reduced array item rules", () => {
         expect(unwrapImitatedReducedArgs(outer, ["action"], schema)).toBe(outer);
     });
 });
+
+describe("imitated reduced optional object fields", () => {
+    const rule: ImitatedArgRule = {
+        type: "object",
+        fields: {
+            trigger: "string",
+            rejectedStrategy: "string",
+            rejectionReason: "string",
+        },
+        optionalFields: {
+            saferAlternative: "string",
+            preconditions: "string",
+        },
+    };
+    const schema: ImitatedArgsSchema = {
+        action: { type: "enum", values: ["create"] },
+        antiMemory: rule,
+    };
+    const required = {
+        trigger: "Choosing a cache backend",
+        rejectedStrategy: "Use Redis",
+        rejectionReason: "The project must work offline",
+    };
+
+    for (const [name, antiMemory] of [
+        ["required fields only", required],
+        ["a present optional field", { ...required, saferAlternative: "Use SQLite" }],
+        ["a null optional field", { ...required, saferAlternative: null }],
+        [
+            "every declared optional field",
+            { ...required, saferAlternative: "Use SQLite", preconditions: null },
+        ],
+    ] as Array<[string, Record<string, unknown>]>) {
+        test(`accepts ${name}`, () => {
+            const decoded = { action: "create", antiMemory };
+            const outer = { reduced: true, summary: JSON.stringify(decoded) };
+            expect(unwrapImitatedReducedArgs(outer, ["action"], schema)).toEqual(decoded);
+        });
+    }
+
+    for (const [name, antiMemory] of [
+        ["a missing required field", { trigger: "t", rejectedStrategy: "r" }],
+        ["an undeclared field", { ...required, extra: "x" }],
+        ["a wrong-typed optional field", { ...required, saferAlternative: 7 }],
+        ["a null required field", { ...required, trigger: null }],
+    ] as Array<[string, Record<string, unknown>]>) {
+        test(`rejects ${name}`, () => {
+            const decoded = { action: "create", antiMemory };
+            const outer = { reduced: true, summary: JSON.stringify(decoded) };
+            expect(unwrapImitatedReducedArgs(outer, ["action"], schema)).toBe(outer);
+        });
+    }
+});

@@ -20,6 +20,12 @@ export type MemoryCategory =
     | "KNOWN_ISSUES";
 
 export type AntiMemoryCategory = "REJECTED_APPROACH";
+/**
+ * Every category an agent may NAME on a write, which is wider than the set the
+ * generic claim operations accept: an anti-memory category is legal here and
+ * routes to the typed anti-memory API instead.
+ */
+export type WritableMemoryCategory = MemoryCategory | AntiMemoryCategory;
 
 export type MemoryStatus = "active" | "permanent" | "archived";
 export type MemoryScope = "project" | "ecosystem" | "universe";

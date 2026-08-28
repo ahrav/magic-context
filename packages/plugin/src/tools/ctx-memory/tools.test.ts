@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DREAMER_AGENT } from "../../agents/dreamer";
+import { readAntiMemory } from "../../features/magic-context/memory/storage-anti-memory";
 import {
     computeProjectMemoryMutationToken,
     getProjectMemoryClaimByPublicId,
@@ -29,6 +30,8 @@ type JsonResult = {
         publicClaimId: string;
         revisionLocator: string;
         content: string;
+        category?: string;
+        antiMemory?: Record<string, string | null>;
         lifecycleState: string;
         mutationToken: ReturnType<typeof computeProjectMemoryMutationToken>;
     }>;
@@ -123,6 +126,79 @@ describe("ctx_memory U4 scenario 1: create uses direct claims", () => {
                 await tool.execute(createArgs("In taxonomy."), "call-good-category"),
             );
             expect(ok).toMatchObject({ action: "create", outcome: "applied" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("ctx_memory anti-memory write union", () => {
+    test("creates and revises typed anti-memory while rejecting cross-arm shapes", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const tool = harness(db);
+            const payload = {
+                trigger: "Choosing a cache backend",
+                rejectedStrategy: "Use Redis",
+                rejectionReason: "The project must work offline",
+                saferAlternative: "Use SQLite",
+            };
+            const created = parseResult(
+                await tool.execute(
+                    { action: "create", category: "REJECTED_APPROACH", antiMemory: payload },
+                    "call-anti-create",
+                ),
+            );
+            const first = created.affectedClaims?.[0];
+            if (!first) throw new Error("missing anti-memory create result");
+            expect(readAntiMemory(db, first.publicClaimId)?.payload).toMatchObject(payload);
+
+            const got = parseResult(
+                await tool.execute(
+                    { action: "get", publicClaimIds: [first.publicClaimId] },
+                    "call-anti-get",
+                ),
+            );
+            expect(got.claims?.[0]).toMatchObject({
+                category: "REJECTED_APPROACH",
+                antiMemory: payload,
+            });
+
+            const revisedPayload = {
+                ...payload,
+                rejectionReason: "Redis adds an external service",
+            };
+            const revised = parseResult(
+                await tool.execute(
+                    {
+                        action: "revise",
+                        category: "REJECTED_APPROACH",
+                        publicClaimId: first.publicClaimId,
+                        mutationToken: first.mutationToken,
+                        antiMemory: revisedPayload,
+                    },
+                    "call-anti-revise",
+                ),
+            );
+            expect(revised.affectedClaims?.[0]?.revisionLocator).toContain("/r2/");
+            expect(readAntiMemory(db, first.publicClaimId)?.payload.rejectionReason).toBe(
+                "Redis adds an external service",
+            );
+
+            for (const [callId, args] of [
+                ["call-anti-missing", { action: "create", category: "REJECTED_APPROACH" }],
+                [
+                    "call-positive-payload",
+                    {
+                        action: "create",
+                        category: "ARCHITECTURE",
+                        content: "positive",
+                        antiMemory: payload,
+                    },
+                ],
+            ] as const) {
+                expect(await tool.execute(args, callId)).toContain("Error:");
+            }
         } finally {
             closeQuietly(db);
         }

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { readAntiMemory } from "../memory/storage-anti-memory";
 import type { AutonomousManifestIdentity } from "../memory/storage-claim-autonomous";
 import {
     readProjectMemoryCurrentState,
@@ -37,10 +38,22 @@ function identity(runId = "retro-run", batchId = "window-1"): AutonomousManifest
 }
 
 function claims(database: Database) {
+    return readClaimsForSurface(database, "maintenance_hygiene");
+}
+
+/** Anti-memories surface only here, so assertions about them must read this. */
+function searchableClaims(database: Database) {
+    return readClaimsForSurface(database, "explicit_search");
+}
+
+function readClaimsForSurface(
+    database: Database,
+    surface: "maintenance_hygiene" | "explicit_search",
+) {
     const result = readProjectMemoryCurrentState(database, {
         projectIds: resolveProjectIdsForIdentities(database, [PROJECT]),
         lifecycleStates: ["active"],
-        surface: "maintenance_hygiene",
+        surface,
         workspaceEpoch: "retro-test",
     });
     if (result.status !== "ok") throw new Error(result.reasons.join(", "));
@@ -82,6 +95,67 @@ describe("parseRetrospectiveLearnings", () => {
     test("returns an empty manifest when the root is absent", () => {
         expect(parseRetrospectiveLearnings("no xml here")).toEqual([]);
     });
+
+    test("parses typed anti-memory entries without dropping valid siblings", () => {
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger>Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <safer_alternative>Use the existing SQLite store</safer_alternative>
+            </learning>
+            <learning route="anti_memory"><trigger>incomplete</trigger></learning>
+            <learning route="memory" category="PROJECT_RULES">Run focused tests before broad checks.</learning>
+        </learnings>`);
+
+        expect(learnings).toHaveLength(2);
+        expect(learnings[0]).toMatchObject({
+            route: "anti_memory",
+            payload: {
+                trigger: "Choosing a session cache backend",
+                rejectedStrategy: "Use Redis for session cache storage",
+                rejectionReason: "The deployment must remain single-process and offline-capable",
+                saferAlternative: "Use the existing SQLite store",
+            },
+        });
+        expect(learnings[1]?.route).toBe("memory");
+    });
+
+    test("tolerates attributes and stray whitespace on anti-memory child tags", () => {
+        // A required field that fails to extract discards the whole learning, so
+        // ordinary model formatting variance must not cost a memory.
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger >Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <safer_alternative note="from the pivot">Use the existing SQLite store</safer_alternative >
+            </learning>
+        </learnings>`);
+
+        expect(learnings).toHaveLength(1);
+        expect(learnings[0]).toMatchObject({
+            route: "anti_memory",
+            payload: {
+                trigger: "Choosing a session cache backend",
+                saferAlternative: "Use the existing SQLite store",
+            },
+        });
+    });
+
+    test("does not let a tolerated tag match a longer tag with the same prefix", () => {
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger>Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <recovery_plan>Not the recovery field</recovery_plan>
+            </learning>
+        </learnings>`);
+
+        expect(learnings).toHaveLength(1);
+        expect(learnings[0]).toMatchObject({ payload: { recovery: null } });
+    });
 });
 
 describe("retrospective privacy validation", () => {
@@ -105,6 +179,60 @@ describe("retrospective privacy validation", () => {
 });
 
 describe("applyRetrospectiveLearnings", () => {
+    test("writes typed anti-memory with model-inference trust and pair dedup", () => {
+        db = createClaimReaderTestDatabase();
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger>Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <safer_alternative>Use the existing SQLite store</safer_alternative>
+            </learning>
+        </learnings>`);
+        apply(db, {
+            projectIdentity: PROJECT,
+            sourceSessionId: "ses-anti",
+            learnings,
+            userMemoryCollectionEnabled: false,
+        });
+        const publicClaimId = (
+            db.prepare("SELECT public_id AS id FROM claim_public_ids LIMIT 1").get() as {
+                id: string;
+            }
+        ).id;
+        const anti = readAntiMemory(db, publicClaimId);
+        expect(anti?.payload.saferAlternative).toBe("Use the existing SQLite store");
+        // A dreamer-written anti-memory carries the inference taint, and it is
+        // reachable only through explicit search: a maintenance lane that could
+        // see it could re-create its content under a positive category and
+        // launder a rejected approach back into auto-injected memory.
+        expect(searchableClaims(db)[0]?.policy.originTaint).toBe("DREAMER_INFERENCE");
+        expect(claims(db)).toHaveLength(0);
+
+        apply(
+            db,
+            {
+                projectIdentity: PROJECT,
+                sourceSessionId: "ses-anti-2",
+                learnings: parseRetrospectiveLearnings(`<learnings>
+                    <learning route="anti_memory">
+                        <trigger>Choosing a session cache backend</trigger>
+                        <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                        <rejection_reason>A later retrospective gives a different reason</rejection_reason>
+                    </learning>
+                </learnings>`),
+                userMemoryCollectionEnabled: false,
+            },
+            identity("retro-run-2", "window-2"),
+        );
+        // The repeated pair dedups onto the existing claim rather than adding a
+        // second one, and keeps the reason from the first observation.
+        expect(searchableClaims(db)).toHaveLength(1);
+        expect(readAntiMemory(db, publicClaimId)?.payload.rejectionReason).toBe(
+            "The deployment must remain single-process and offline-capable",
+        );
+    });
+
     test("writes an inference-tainted claim and gates profile observations", () => {
         db = createClaimReaderTestDatabase();
         const learnings = parseRetrospectiveLearnings(`<learnings>

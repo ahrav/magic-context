@@ -9,6 +9,7 @@ import {
     type ClaimEvidenceProvenance,
     ClaimOperationInputError,
     type ClaimOperationRunResult,
+    type ClaimOperationStageOutcome,
     DEFAULT_MEMORY_IMPORTANCE,
     type ProducerIdentity,
     provenanceRequestShape,
@@ -55,6 +56,12 @@ export interface CreateAntiMemoryInput {
     actor: string;
     importance?: number;
     requestScope?: string;
+    /**
+     * Expiry anchor override. Backfill consumers anchor to the source event's
+     * age so harvesting old history does not re-animate stale warnings; when
+     * absent, expiry starts at the write clock.
+     */
+    expiresAt?: number;
     nowMs?: number;
 }
 
@@ -110,7 +117,13 @@ function optionalText(value: unknown, field: string): string | null {
     return requiredText(value, field);
 }
 
-function normalizePayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
+/**
+ * Trim and null-normalize a payload, rejecting empty required fields. Exported
+ * so consumers that validate or fingerprint payload text can derive the field
+ * set from the payload itself instead of hand-enumerating it (a hand-kept list
+ * fails open when a field is added).
+ */
+export function normalizeAntiMemoryPayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
     return {
         trigger: requiredText(payload.trigger, "trigger"),
         rejectedStrategy: requiredText(payload.rejectedStrategy, "rejectedStrategy"),
@@ -126,7 +139,7 @@ function normalizePayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
 }
 
 export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
-    const stored = normalizePayload(payload);
+    const stored = normalizeAntiMemoryPayload(payload);
     const lines = [
         `Trigger: ${stored.trigger}`,
         `Rejected strategy: ${stored.rejectedStrategy}`,
@@ -185,14 +198,49 @@ function insertPayload(
     );
 }
 
+export function stageCreateAntiMemoryInCurrentTransaction(
+    db: Database,
+    input: CreateAntiMemoryInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    const payload = normalizeAntiMemoryPayload(input.payload);
+    const staged = stageCreateProjectMemoryClaimInCurrentTransaction(
+        db,
+        {
+            projectId: input.projectId,
+            content: renderAntiMemoryContent(payload),
+            dedupText: antiMemoryDedupText(payload),
+            category: ANTI_MEMORY_CATEGORY,
+            importance: input.importance,
+            memoryScope: "project",
+            sharing: "private",
+            expiresAt: input.expiresAt ?? nowMs + ANTI_MEMORY_DEFAULT_TTL_MS,
+            provenance: input.provenance,
+            actor: input.actor,
+            requestScope: input.requestScope,
+            nowMs,
+            // The staging boundary refuses anti-memory category writes that do
+            // not come through this typed path, so every caller reaching the
+            // generic stage from here must carry the writer assertion.
+            antiMemoryWriter: true,
+        },
+        nowMs,
+    );
+    if (staged.kind === "effects") {
+        const created = staged.effects.find((effect) => effect.changeKind === "upsert");
+        if (created?.revisionId != null) {
+            insertPayload(db, created.revisionId, created.claimId, payload, nowMs);
+        }
+    }
+    return staged;
+}
+
 export function createAntiMemory(
     db: Database,
     producer: ProducerIdentity,
     input: CreateAntiMemoryInput,
 ): ClaimOperationRunResult {
-    const payload = normalizePayload(input.payload);
-    const content = renderAntiMemoryContent(payload);
-    const dedupText = antiMemoryDedupText(payload);
+    const payload = normalizeAntiMemoryPayload(input.payload);
     const nowMs = input.nowMs ?? Date.now();
     return runClaimOperation(
         db,
@@ -200,6 +248,19 @@ export function createAntiMemory(
             ...producer,
             requestDigest: computeClaimOperationRequestDigest({
                 actor: input.actor,
+                // A caller-supplied expiry lands in the persisted revision
+                // attributes, so it belongs to the request for the same reason
+                // importance does: without it, a second call reusing the
+                // operation key with a different explicit expiry replays the
+                // first receipt and silently keeps the old TTL.
+                //
+                // Digest what the caller REQUESTED, not the resolved value. The
+                // default is `nowMs + ANTI_MEMORY_DEFAULT_TTL_MS`, which moves
+                // with the clock, so digesting the resolved expiry would make an
+                // honest replay compute a different digest and raise
+                // ClaimOperationKeyReuseError instead of replaying. An omitted
+                // expiry therefore always digests as null.
+                expiresAt: input.expiresAt ?? null,
                 // Importance lands in the persisted revision attributes, so it
                 // is part of the request: leaving it out lets a second call
                 // that reuses the operation key with a different importance
@@ -215,34 +276,7 @@ export function createAntiMemory(
                 requestScope: input.requestScope ?? null,
             }),
         },
-        () => {
-            const staged = stageCreateProjectMemoryClaimInCurrentTransaction(
-                db,
-                {
-                    projectId: input.projectId,
-                    content,
-                    dedupText,
-                    category: ANTI_MEMORY_CATEGORY,
-                    importance: input.importance,
-                    memoryScope: "project",
-                    sharing: "private",
-                    expiresAt: nowMs + ANTI_MEMORY_DEFAULT_TTL_MS,
-                    provenance: input.provenance,
-                    actor: input.actor,
-                    requestScope: input.requestScope,
-                    nowMs,
-                    antiMemoryWriter: true,
-                },
-                nowMs,
-            );
-            if (staged.kind === "effects") {
-                const created = staged.effects.find((effect) => effect.changeKind === "upsert");
-                if (created?.revisionId != null) {
-                    insertPayload(db, created.revisionId, created.claimId, payload, nowMs);
-                }
-            }
-            return staged;
-        },
+        () => stageCreateAntiMemoryInCurrentTransaction(db, { ...input, payload }, nowMs),
         nowMs,
     );
 }
@@ -339,7 +373,7 @@ export function reviseAntiMemory(
     producer: ProducerIdentity,
     input: ReviseAntiMemoryInput,
 ): ClaimOperationRunResult {
-    const payload = normalizePayload(input.payload);
+    const payload = normalizeAntiMemoryPayload(input.payload);
     return reviseWithPayload(db, producer, {
         input,
         resolvePayload: () => {
