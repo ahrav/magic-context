@@ -219,6 +219,20 @@ pub trait LlmExecutionBackend: Send + Sync + 'static {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BackendFuture;
+
+    /// The `harness_unavailable` subreason every run on `harness` would fail
+    /// with, answered without executing anything.
+    ///
+    /// The release contract orders every descriptor and closure reason ahead of
+    /// every credential reason, so a host that verifies the credential snapshot
+    /// before dispatching has to consult the dispatched backend first. Without
+    /// this, a startup with neither a usable descriptor nor a provider
+    /// credential reported the credential reason and sent the user to
+    /// `restart_with_supported_harness` for a credential they cannot supply,
+    /// while the descriptor was the condition to fix.
+    fn unavailable_reason(&self, _harness: Harness) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Routes each run to the adapter for its ROUTE-BOUND harness.
@@ -252,6 +266,13 @@ impl LlmExecutionBackend for HarnessDispatchBackend {
             Harness::Pi => Arc::clone(&self.pi),
         };
         backend.execute(request, events, cancel)
+    }
+
+    fn unavailable_reason(&self, harness: Harness) -> Option<&'static str> {
+        match harness {
+            Harness::OpenCode => self.opencode.unavailable_reason(harness),
+            Harness::Pi => self.pi.unavailable_reason(harness),
+        }
     }
 }
 

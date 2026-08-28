@@ -116,6 +116,11 @@ impl Default for SynapseLimits {
 #[derive(Debug, Clone)]
 pub struct SynapseConfig {
     pub bundle_dir: PathBuf,
+    /// The digest an outer trust root committed for `bundle_dir/manifest.json`,
+    /// when it has one. The daemon supplies the selected generation's, which is
+    /// what binds every bundle artifact to the generation it was staged into;
+    /// hermetic fixtures with no such root supply `None`.
+    pub bundle_manifest_sha256: Option<String>,
     pub ort_library: PathBuf,
     pub ort_library_sha256: String,
     pub limits: SynapseLimits,
@@ -1144,7 +1149,11 @@ impl SecondaryComponent for SynapseComponent {
         // wrapper still owns the closure's completion, and `shutdown`'s
         // tracker drain holds until the native load actually stops.
         let blocking = tokio::task::spawn_blocking(move || {
-            let bundle = bundle::load_bundle(&config.bundle_dir, &config.limits)?;
+            let bundle = bundle::load_bundle(
+                &config.bundle_dir,
+                &config.limits,
+                config.bundle_manifest_sha256.as_deref(),
+            )?;
             let ort = OrtIdentity {
                 library: config.ort_library.clone(),
                 sha256: config.ort_library_sha256.clone(),

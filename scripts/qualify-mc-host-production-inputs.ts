@@ -4094,15 +4094,22 @@ export function generate(
             }`,
         );
     }
-    const verifyExternalBytes = options.verifyExternalBytes ?? !options.check;
-    validateSourceManifest(manifestRaw, contract, rootDir, verifyExternalBytes);
-    const manifest = manifestRaw;
+    // One gate, not two. `verifyExternalBytes` was never a field of `generate`'s
+    // option type, so no caller could ever set it: the release prerequisite passed
+    // `verifyBytes: true` with `check: true` and this resolved to `false`, silently
+    // skipping `verifyClosureSourceBytes` while the command reported that every
+    // production byte had been verified. Missing or modified OpenCode/Pi source
+    // roots then passed `release:qualify:require` and failed only when the daemon
+    // tried to materialize them.
+    //
     // Byte verification needs the real artifacts on disk at the manifest's
     // (absolute, in production) verify paths, which only the qualifying host
     // has. Drift checking must stay portable so CI can guard the committed
     // lock, so verify bytes in write mode and only on explicit request in
     // --check mode.
     const verifyBytes = options.verifyBytes ?? !options.check;
+    validateSourceManifest(manifestRaw, contract, rootDir, verifyBytes);
+    const manifest = manifestRaw;
     if (verifyBytes) {
         for (const key of INPUT_KEYS) {
             const artifact = manifest.inputs[key];
@@ -4170,6 +4177,17 @@ export function generate(
                                               ["executable", harness.closure?.executable],
                                               ["interpreter", harness.closure?.interpreter],
                                               ["entrypoint", harness.closure?.entrypoint],
+                                              // Extensions are launch roots too:
+                                              // `validateClosureManifest` requires a node
+                                              // for every one and reaches the closure
+                                              // through it. A closure that puts its
+                                              // provider extensions in a source root of
+                                              // their own is valid there, so leaving them
+                                              // out here made `generate` reject a manifest
+                                              // the qualifier had just accepted.
+                                              ...(harness.closure?.extensions ?? []).map(
+                                                  (path) => ["extension", path] as const,
+                                              ),
                                           ].find(([, path]) => {
                                               const node = harness.closure?.nodes.find(
                                                   (candidate) => candidate.path === path,

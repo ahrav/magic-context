@@ -68,6 +68,7 @@ fn copy_fixture_to(dir: &Path) {
 fn config_for(dir: &Path, ort: &(PathBuf, String)) -> SynapseConfig {
     SynapseConfig {
         bundle_dir: dir.to_path_buf(),
+        bundle_manifest_sha256: None,
         ort_library: ort.0.clone(),
         ort_library_sha256: ort.1.clone(),
         limits: SynapseLimits::default(),
@@ -169,7 +170,7 @@ async fn waiting_query_memory_bound_rejects_both_construction_paths() {
         max_waiting_queries: BOUNDARY,
         ..SynapseLimits::default()
     };
-    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &accepted)
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &accepted, None)
         .expect("the boundary configuration loads through the bundle path");
     SynapseComponent::ready_with_engine(test_lane(), DeterministicEngine::new(), accepted)
         .expect("the boundary configuration constructs through the engine path");
@@ -391,13 +392,42 @@ fn the_committed_fixture_carries_its_canonical_fingerprint() {
         max_text_bytes: 123_456,
         ..SynapseLimits::default()
     };
-    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits)
+    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, None)
         .expect("the committed fixture bundle loads");
     assert_eq!(bundle.max_text_bytes, limits.max_text_bytes);
     assert_eq!(
         bundle.manifest.fingerprint,
         mc_host::synapse::bundle::canonical_fingerprint(&bundle.manifest),
         "regenerate the fixture with generate-synapse-tiny.py"
+    );
+}
+
+/// The bundle manifest is the hinge between the two trust roots: the generation
+/// manifest hashes it, and it hashes every artifact. A load that accepts any
+/// self-consistent manifest at the pathname breaks that chain, so a bundle
+/// swapped in after the generation was validated could serve different
+/// embedding bytes under a selection the daemon still reported as valid.
+#[test]
+fn a_bundle_manifest_outside_the_committed_digest_does_not_load() {
+    let limits = SynapseLimits::default();
+    let manifest_bytes =
+        std::fs::read(fixture_dir().join("manifest.json")).expect("fixture manifest");
+    let committed = sha256_hex(&manifest_bytes);
+
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, Some(&committed))
+        .expect("the digest the generation committed admits the bundle it names");
+
+    let other = sha256_hex(b"a manifest this generation never staged");
+    let Err(error) = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits, Some(&other))
+    else {
+        panic!("a manifest outside the committed digest must not load");
+    };
+    assert!(
+        error
+            .0
+            .contains("does not match the digest its generation committed"),
+        "unexpected rejection: {}",
+        error.0
     );
 }
 

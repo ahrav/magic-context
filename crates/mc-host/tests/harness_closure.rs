@@ -568,3 +568,78 @@ fn native_edges_and_native_addons_must_correspond_exactly() {
         "native dependency kind must correspond exactly to a native addon target"
     );
 }
+
+/// Paths sort by code point, so a sibling whose next byte after the parent
+/// prefix is below `/` sits between a parent file and its nested child:
+/// `bin/node`, `bin/node.dat`, `bin/node/main.js`. Checking only the
+/// immediately preceding entry read `bin/node.dat` as the parent, missed the
+/// collision with the regular file `bin/node`, and left an unbuildable manifest
+/// to fail during materialization instead of validation.
+#[test]
+fn a_parent_file_collision_is_caught_across_an_intervening_sibling() {
+    let (_temp, _source, candidate) = setup();
+
+    let mut adjacent = candidate.manifest.clone();
+    adjacent.nodes.push(node(
+        "bin/node/main.js",
+        "bin/node/main.js",
+        NodeKind::Module,
+        b"nested under a file",
+        vec![],
+    ));
+    adjacent.nodes.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(
+        validate_manifest(&adjacent)
+            .expect_err("a child of a regular file is not materializable")
+            .detail(),
+        "manifest node path collides with a parent file"
+    );
+
+    let mut separated = adjacent.clone();
+    separated.nodes.push(node(
+        "bin/node.dat",
+        "bin/node.dat",
+        NodeKind::Data,
+        b"sorts between the parent and its child",
+        vec![],
+    ));
+    separated.nodes.sort_by(|a, b| a.path.cmp(&b.path));
+    let paths: Vec<&str> = separated
+        .nodes
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(
+        &paths[..3],
+        &["bin/node", "bin/node.dat", "bin/node/main.js"],
+        "the sibling must sort between the parent file and its child for this case to bite"
+    );
+    assert_eq!(
+        validate_manifest(&separated)
+            .expect_err("an intervening sibling must not hide the collision")
+            .detail(),
+        "manifest node path collides with a parent file"
+    );
+}
+
+/// The qualifier rejects two edges naming one target, whatever their kinds.
+/// `ClosureDependency` orders on `(path, kind)`, so `(p, Static)` then
+/// `(p, Native)` is strictly increasing as a tuple — the runtime admitted a
+/// manifest the qualifier refuses, which is the gap the native-edge rules above
+/// exist to close.
+#[test]
+fn duplicate_dependency_targets_are_rejected_across_kinds() {
+    let (_temp, _source, candidate) = setup();
+    let mut duplicated = candidate.manifest.clone();
+    duplicated.nodes[2].dependencies = vec![
+        dependency("node_modules/pi/dist/addon.node", DependencyKind::Native),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Static),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Native),
+    ];
+    assert_eq!(
+        validate_manifest(&duplicated)
+            .expect_err("one target named twice")
+            .detail(),
+        "node dependencies are not uniquely sorted by target path"
+    );
+}

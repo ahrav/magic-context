@@ -296,26 +296,40 @@ pub fn validate_manifest(manifest: &ClosureManifest) -> Result<(), HarnessClosur
         if previous_path.is_some_and(|previous| previous >= node.path.as_str()) {
             return Err(invalid("manifest nodes are not uniquely sorted by path"));
         }
-        if previous_path.is_some_and(|previous| {
-            node.path
-                .strip_prefix(previous)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-        }) {
-            return Err(invalid("manifest node path collides with a parent file"));
+        // Every ancestor, not just the immediately preceding entry. Paths sort
+        // by code point, so any sibling whose next byte after the parent
+        // prefix sorts below `/` (`.` 0x2E, `-` 0x2D, `+` 0x2B) lands between
+        // a parent file and its nested child: `bin/app`, `bin/app.dat`,
+        // `bin/app/main.js` puts `bin/app.dat` in `previous_path`, and the
+        // collision with the regular file `bin/app` goes unseen. Every
+        // ancestor of this path sorts strictly before it, so all of them are
+        // already in `by_path`.
+        let mut ancestor = node.path.as_str();
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if by_path.contains_key(parent) {
+                return Err(invalid("manifest node path collides with a parent file"));
+            }
+            ancestor = parent;
         }
         previous_path = Some(&node.path);
         if by_path.insert(node.path.as_str(), node).is_some() {
             return Err(invalid("manifest contains a duplicate node path"));
         }
-        let mut previous_dependency: Option<&ClosureDependency> = None;
+        let mut previous_dependency: Option<&str> = None;
         for dependency in &node.dependencies {
             validate_relative_path(&dependency.path)?;
-            if previous_dependency.is_some_and(|previous| previous >= dependency) {
+            // Compared on path alone. `ClosureDependency`'s derived ordering is
+            // `(path, kind)`, so two edges to the same target under different
+            // kinds — `(p, Static)` then `(p, Native)` — are strictly
+            // increasing as tuples and passed, while the qualifier's
+            // `dependencyPaths` set rejects them. The runtime must not admit a
+            // manifest the qualifier refuses.
+            if previous_dependency.is_some_and(|previous| previous >= dependency.path.as_str()) {
                 return Err(invalid(
-                    "node dependencies are not uniquely sorted by path and kind",
+                    "node dependencies are not uniquely sorted by target path",
                 ));
             }
-            previous_dependency = Some(dependency);
+            previous_dependency = Some(&dependency.path);
         }
     }
 
@@ -513,9 +527,13 @@ impl HarnessClosureStore {
                 fsync(&self.root_fd).map_err(|_| invalid("closure store fsync failed"))?;
             }
             Err(rustix::io::Errno::EXIST) | Err(rustix::io::Errno::NOTEMPTY) => {
-                let existing = self.validate(&digest)?;
+                // Reclaim the staging tree before judging the incumbent. With
+                // the order reversed, a corrupt winner made `validate` return
+                // through `?` and stranded an entire staged harness runtime —
+                // hundreds of megabytes — in the user's data root, where
+                // nothing but the next `prune` would ever find it.
                 remove_tree(&self.root_fd, &temp_name)?;
-                return Ok(existing);
+                return self.validate(&digest);
             }
             Err(_) => {
                 let _ = remove_tree(&self.root_fd, &temp_name);

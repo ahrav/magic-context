@@ -1003,9 +1003,16 @@ describe("immutable input fail-closed rules", () => {
         };
         installManifest(root, manifest);
         expect(() => generate(root, { check: true })).not.toThrow();
-        expect(() =>
-            generate(root, { check: true, verifyExternalBytes: true }),
-        ).toThrow(/missing/);
+        // `verifyBytes` is the one gate, and it is the flag `--verify-bytes` and
+        // `requireQualificationEvidence` actually pass. It previously read a
+        // `verifyExternalBytes` option that was not in `generate`'s signature, so
+        // no caller could set it and closure source bytes went unverified while
+        // the command reported that every production byte had been checked.
+        // Asserting the closure message specifically is what keeps that gate
+        // wired: a generic /missing/ passes on the artifact paths alone.
+        expect(() => generate(root, { check: true, verifyBytes: true })).toThrow(
+            /closure verify root is missing/,
+        );
         expect(() => generate(root, { check: false })).toThrow(/missing/);
     });
 

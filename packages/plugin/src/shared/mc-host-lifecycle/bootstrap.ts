@@ -96,7 +96,15 @@ function detectGlibcVersion(): string | null {
     return null;
 }
 
-function detectProcSelfFd(): boolean {
+/**
+ * Whether this host can execute a retained payload through `/proc/self/fd`,
+ * the Linux `procfs_self_fd_exec` capability the certified lane requires.
+ *
+ * Exported so qualification evidence records the same fact this gate decides:
+ * a smoke report that omits it, or derives it some other way, describes a host
+ * the platform gate never evaluated.
+ */
+export function detectProcSelfFd(): boolean {
     // Probing `/proc/self/fd/0` would report the caller's *stdin state* rather
     // than the procfs capability this gate is about: a process that closed fd 0
     // has no `/proc/self/fd/0` entry, so readlink answers ENOENT on a fully

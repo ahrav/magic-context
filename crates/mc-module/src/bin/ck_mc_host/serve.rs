@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mc_host::broca::backend::{
-    BackendError, BackendFuture, BackendRequest, BackendTerminal, ErrorClass, EventSink,
+    BackendError, BackendFuture, BackendRequest, BackendTerminal, ErrorClass, EventSink, Harness,
     HarnessDispatchBackend, LlmExecutionBackend,
 };
 use mc_host::broca::opencode::{OpenCodeBackend, OpenCodeRuntime};
@@ -335,6 +335,10 @@ impl LlmExecutionBackend for UnavailableBackend {
             })
         })
     }
+
+    fn unavailable_reason(&self, _harness: Harness) -> Option<&'static str> {
+        Some(self.subreason)
+    }
 }
 
 fn harness_backend(envelope: &StartupEnvelope, env: &EnvSnapshot) -> HarnessDispatchBackend {
@@ -504,16 +508,24 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
             return SynapseComponent::new(None);
         };
         let bundle_dir = generation.path().join(BUNDLE_DIR);
-        if !generation
+        // The generation manifest is the trust root: its digest already covers
+        // these bytes, so carrying the bundle manifest's own hash forward binds
+        // every artifact `load_bundle` verifies to the generation that was
+        // selected. Presence alone was not enough — the loader would then prove
+        // only that whatever sits at this pathname is self-consistent, so a
+        // directory replaced after validation could serve different embedding
+        // bytes under a generation the daemon still reported as valid.
+        let Some(bundle_manifest) = generation
             .manifest
             .files
             .iter()
-            .any(|entry| entry.path == format!("{BUNDLE_DIR}/manifest.json"))
-        {
+            .find(|entry| entry.path == format!("{BUNDLE_DIR}/manifest.json"))
+        else {
             return SynapseComponent::new(None);
-        }
+        };
         SynapseComponent::new(Some(SynapseConfig {
             bundle_dir,
+            bundle_manifest_sha256: Some(bundle_manifest.sha256.clone()),
             ort_library: generation.path().join(ORT_LIBRARY),
             ort_library_sha256: ort.sha256.clone(),
             limits: SynapseLimits::default(),

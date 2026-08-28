@@ -250,6 +250,17 @@ impl CompositeComponent for BrocaComponent {
         };
         match request {
             Request::Send(send) => {
+                // Contract precedence (`harness_unavailable.reasons_by_precedence`):
+                // descriptor_absent, descriptor_invalid, closure_incomplete, and
+                // argument_variant_invalid all rank ahead of every credential
+                // reason. The backend owns that verdict, so it is asked before the
+                // credential snapshot is verified — otherwise a startup with no
+                // usable descriptor and no provider row answered
+                // `credential_missing`, which names a remedy that cannot fix the
+                // descriptor the run actually lacks.
+                if let Some(reason) = self.supervisor.harness_unavailable_reason(key.harness) {
+                    return app_error("harness_unavailable", reason);
+                }
                 if let Some(verifier) = &self.credential_verifier {
                     let fingerprints = self
                         .route_fingerprints

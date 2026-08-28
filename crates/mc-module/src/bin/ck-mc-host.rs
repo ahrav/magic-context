@@ -350,6 +350,21 @@ fn generation_failure(error: &GenerationError) -> (&'static str, &'static str) {
     }
 }
 
+/// The lifecycle state to report for a failure that commits nothing.
+///
+/// A pre-commit rejection touches no daemon, so the state it reports has to be
+/// the one already on disk. Hard-coding `stopped` told a lifecycle consumer the
+/// daemon was down while it was still serving — a contradiction next to
+/// `stop_committed:false`, and exactly the shape that drives an unnecessary
+/// recovery. Probe failures are classified the way every other command
+/// classifies them.
+fn unchanged_state() -> &'static str {
+    match probe() {
+        Ok(observed) => probe_state(observed.state),
+        Err(error) => instance_failure(&error).0,
+    }
+}
+
 fn probe_state(state: LifecycleState) -> &'static str {
     match state {
         LifecycleState::Stopped => "stopped",
@@ -816,7 +831,15 @@ fn preflight_generation(
         // after the stop would commit an outage for a condition that was knowable
         // beforehand.
         Some(dir) => {
-            payload_sources(dir, payload_manifest_digest)?;
+            let payload = payload_sources(dir, payload_manifest_digest)?;
+            // Byte identity is read-only, so it is proven here rather than during
+            // the post-stop copy. Otherwise a manifest-listed launcher, model, or
+            // runtime that no longer matches what was packaged passed this
+            // preflight, `cmd_restart` committed the stop, and only
+            // `stage_and_promote` discovered the known-bad source — a hard outage
+            // for a condition that was readable before anything was touched.
+            mc_host::generation::verify_sources(&payload.sources)
+                .map_err(|e| generation_failure(&e))?;
             // No-create probe: an absent store is fine, staging creates it.
             if let Some(store) =
                 GenerationStore::open_probe(None).map_err(|e| generation_failure(&e))?
@@ -1678,7 +1701,7 @@ fn real_main() -> i32 {
                 Err(_) => emit(DaemonResult::new(
                     "start",
                     false,
-                    "stopped",
+                    unchanged_state(),
                     "internal_error",
                 )),
             }
@@ -1696,12 +1719,11 @@ fn real_main() -> i32 {
                     envelope,
                 )),
                 Err(_) => emit(
-                    DaemonResult::new("restart", false, "stopped", "internal_error").with_effects(
-                        Effects {
+                    DaemonResult::new("restart", false, unchanged_state(), "internal_error")
+                        .with_effects(Effects {
                             stop_committed: false,
                             start_committed: false,
-                        },
-                    ),
+                        }),
                 ),
             }
         }

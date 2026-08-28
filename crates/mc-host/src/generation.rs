@@ -243,6 +243,60 @@ pub struct StageMeta {
     pub source_payload_manifest_sha256: String,
 }
 
+/// Read-only proof that every source is present and is the byte identity its
+/// payload manifest declares.
+///
+/// `stage_and_promote` already verifies these bytes, but it verifies them while
+/// copying — which for `restart` happens only after the incumbent has been
+/// stopped. A launcher, model, or runtime file that was deleted or rewritten
+/// since the manifest was written therefore passed preflight, took the healthy
+/// daemon down, and failed during the copy, leaving `stop_committed:true` with
+/// no successor. Every check here is a read, so it belongs before the stop.
+///
+/// Only sources carrying a declared identity are hashed: an unqualified dev tree
+/// has nothing to compare against, and its existence and type are proven by the
+/// same walk that enumerated it.
+pub fn verify_sources(sources: &[SourceSpec]) -> Result<(), GenerationError> {
+    for spec in sources {
+        let fd = openat(
+            rustix::fs::CWD,
+            &*spec.source,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| invalid("payload source open failed"))?;
+        let stat = rustix::fs::fstat(&fd).map_err(|_| invalid("payload source stat failed"))?;
+        if (mode_bits(&stat) & S_IFMT) != S_IFREG {
+            return Err(invalid("payload source is not a regular file"));
+        }
+        if spec
+            .expected_size
+            .is_some_and(|size| size != stat.st_size as u64)
+        {
+            return Err(invalid("payload source size differs from payload manifest"));
+        }
+        let Some(expected) = spec.expected_sha256.as_deref() else {
+            continue;
+        };
+        let mut hasher = sha2::Sha256::new();
+        let mut reader = std::fs::File::from(fd);
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|_| invalid("payload source read failed"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        if hex(&hasher.finalize()) != expected {
+            return Err(invalid("payload source hash differs from payload manifest"));
+        }
+    }
+    Ok(())
+}
+
 /// A completely revalidated generation: the retained directory descriptor
 /// pins the validated tree against pathname replacement, and the manifest
 /// is the exact decoded canonical content.

@@ -182,7 +182,23 @@ pub struct VerifiedBundle {
     pub corpus: Corpus,
 }
 
-pub fn load_bundle(dir: &Path, limits: &SynapseLimits) -> Result<VerifiedBundle, BundleError> {
+/// Loads and verifies a bundle directory.
+///
+/// `expected_manifest_sha256` is the digest an outer trust root already
+/// committed for `manifest.json` — the generation manifest, in the daemon. The
+/// bundle's own manifest names and hashes every artifact underneath it, so
+/// binding these bytes to the outer digest is what extends that trust root over
+/// the whole bundle. Without it, this function proves only that a bundle is
+/// internally self-consistent: a directory swapped in after the generation was
+/// validated would carry its own coherent manifest and serve different
+/// embedding bytes while the daemon still reported the selected generation as
+/// valid. `None` is for callers that have no outer digest to offer, which is the
+/// hermetic-fixture case, never a production lane.
+pub fn load_bundle(
+    dir: &Path,
+    limits: &SynapseLimits,
+    expected_manifest_sha256: Option<&str>,
+) -> Result<VerifiedBundle, BundleError> {
     let metadata =
         std::fs::symlink_metadata(dir).map_err(|_| err("bundle directory is missing"))?;
     if !metadata.is_dir() {
@@ -190,6 +206,16 @@ pub fn load_bundle(dir: &Path, limits: &SynapseLimits) -> Result<VerifiedBundle,
     }
 
     let manifest_bytes = read_artifact(dir, "manifest.json", MAX_MANIFEST_BYTES)?;
+    // Checked against the bytes this call actually parsed, so a later
+    // replacement of the pathname cannot substitute a manifest behind the
+    // artifacts verified below.
+    if let Some(expected) = expected_manifest_sha256 {
+        if sha256_hex(&manifest_bytes) != expected {
+            return Err(err(
+                "bundle manifest does not match the digest its generation committed",
+            ));
+        }
+    }
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
     validate_serving_limits(
@@ -794,15 +820,24 @@ fn validate_tokenizer_config(bytes: &[u8], max_tokens: u64) -> Result<(), Bundle
     // model_max_length sentinel for tokenizers without a smaller tokenizer
     // limit; that does not compete with a stricter manifest limit. A lower
     // tokenizer ceiling would make truncation depend on which path wins.
-    let below_manifest = declared
-        .as_u64()
-        .map(|declared| declared < max_tokens)
-        .or_else(|| {
-            declared
+    let below_manifest = match declared.as_u64() {
+        Some(declared) => declared < max_tokens,
+        // Not representable as u64: either that oversized integer sentinel or a
+        // malformed value. A token-count ceiling is an integer, so a finite
+        // non-integral value is rejected outright rather than compared — `8192.5`
+        // against a manifest limit of `8192` otherwise read as "not below" and
+        // was accepted, leaving bundle validation to disagree with whatever the
+        // tokenizer implementation does with the fraction.
+        None => {
+            let declared = declared
                 .as_f64()
-                .map(|declared| !declared.is_finite() || declared < max_tokens as f64)
-        })
-        .unwrap_or(true);
+                .ok_or_else(|| err("tokenizer_config model_max_length is not a number"))?;
+            if declared.is_finite() && declared.fract() != 0.0 {
+                return Err(err("tokenizer_config model_max_length is not an integer"));
+            }
+            !declared.is_finite() || declared < max_tokens as f64
+        }
+    };
     if below_manifest {
         return Err(err(
             "tokenizer_config model_max_length is below manifest max_tokens",
@@ -875,6 +910,29 @@ mod tests {
                 .0,
             "tokenizer_config model_max_length is below manifest max_tokens"
         );
+    }
+
+    /// A token count is an integer. The oversized-integer sentinel and a
+    /// fraction both fail `as_u64`, so only the fractional part separates the
+    /// value the manifest tolerates from the one it must refuse.
+    #[test]
+    fn fractional_tokenizer_ceilings_are_rejected() {
+        for body in [
+            br#"{"model_max_length":8192.5,"pad_token":"[PAD]"}"#.as_slice(),
+            br#"{"model_max_length":16384.25,"pad_token":"[PAD]"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_tokenizer_config(body, 8192)
+                    .expect_err("a fractional ceiling must fail")
+                    .0,
+                "tokenizer_config model_max_length is not an integer"
+            );
+        }
+
+        // An integral value written with a fractional part is still an integer
+        // ceiling, and a whole-number float is what a JSON encoder may emit.
+        let integral = br#"{"model_max_length":8192.0,"pad_token":"[PAD]"}"#;
+        assert!(validate_tokenizer_config(integral, 8192).is_ok());
     }
 
     fn manifest() -> BundleManifest {

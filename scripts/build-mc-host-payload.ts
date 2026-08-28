@@ -80,9 +80,17 @@ const PARENT_DIRS: Record<string, string> = {
 export const LAUNCHER_PATH = "payload/bin/ck-mc-host";
 
 /** Linux-only U9-gated production slots (R25). Corpus is a certification input,
- *  not a shipped file. Populated only from qualified locked bytes; never committed. */
+ *  not a shipped file. Populated only from qualified locked bytes; never committed.
+ *
+ *  `bundle_manifest` ships because the daemon requires it: `synapse_component`
+ *  disables the lane outright when the generation carries no
+ *  `payload/model/<model>/manifest.json`, and that file is what names and hashes
+ *  every other model artifact. Omitting it from an exactly-enforced file set made
+ *  a conforming production payload one the certified Synapse lane could never
+ *  activate over, while the manifest still claimed `synapse: certified_cpu`. */
 export const LINUX_PRODUCTION_PAYLOAD_SLOTS: Record<string, string> = {
     ort_runtime: "payload/ort/libonnxruntime.so",
+    bundle_manifest: "payload/model/gte-modernbert-base-f16/manifest.json",
     model_onnx: "payload/model/gte-modernbert-base-f16/model.onnx",
     tokenizer: "payload/model/gte-modernbert-base-f16/tokenizer.json",
     tokenizer_config:

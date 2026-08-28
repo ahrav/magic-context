@@ -38,6 +38,7 @@ import {
 } from "../src/features/magic-context/storage-embedding-measurements";
 import { createDirectTestDatabase } from "../src/features/magic-context/test-database";
 import { McHostClient } from "../src/shared/mc-host-client";
+import { detectProcSelfFd } from "../src/shared/mc-host-lifecycle/bootstrap";
 
 const OVERALL_DEADLINE_MS = 180_000;
 const READY_DEADLINE_MS = 20_000;
@@ -622,6 +623,13 @@ if (mode === "production" && reportPath !== undefined) {
             kernel,
             glibc,
             exact_floor: kernel === "4.18" && glibc === "2.28",
+            // `checkOracleEvidence` requires this exact key and feeds it to
+            // `evaluatePlatform`, then requires the report host to equal the
+            // oracle host canonically. Omitting it made every report from this
+            // script inadmissible as production evidence on any host, however
+            // valid. Probed through the same function the lifecycle gate uses,
+            // so the recorded fact is the one that was actually evaluated.
+            procfs_self_fd_exec: detectProcSelfFd(),
         },
         inputs: {
             ort_runtime: ortSha,
@@ -637,11 +645,43 @@ if (mode === "production" && reportPath !== undefined) {
         degraded_isolated: degradedIsolated,
         durable_receipts: durableReceipts,
         network_access: (() => {
-            const routes = readFileSync("/proc/net/route", "utf8")
-                .split("\n")
-                .slice(1)
-                .some((line) => line.trim().split(/\s+/)[1] === "00000000");
-            return routes ? "available" : "none";
+            // Any route out of the namespace on any interface but loopback, in
+            // either family. The old predicate looked only for an IPv4 default
+            // route, so a namespace holding a specific IPv4 route or any IPv6
+            // route recorded `none` — and `buildLock` treats `none` as proof the
+            // oracle ran offline, letting a routable namespace mint production
+            // evidence that claims networking was disabled.
+            //
+            // This still infers isolation from the routing table rather than
+            // proving it. Enforce isolation externally where the claim has to be
+            // airtight; an unreadable table is reported as reachable because it
+            // proves nothing either way.
+            const routed = (
+                path: string,
+                header: boolean,
+                device: (fields: string[]) => string | undefined,
+            ) => {
+                let text: string;
+                try {
+                    text = readFileSync(path, "utf8");
+                } catch {
+                    return true;
+                }
+                const lines = text.split("\n");
+                return (header ? lines.slice(1) : lines)
+                    .map((line) => line.trim())
+                    .filter((line) => line.length > 0)
+                    .some((line) => {
+                        const dev = device(line.split(/\s+/));
+                        return dev !== undefined && dev !== "lo";
+                    });
+            };
+            // `/proc/net/route` carries a header row and names the interface
+            // first; `/proc/net/ipv6_route` has no header and names it last.
+            const reachable =
+                routed("/proc/net/route", true, (fields) => fields[0]) ||
+                routed("/proc/net/ipv6_route", false, (fields) => fields[fields.length - 1]);
+            return reachable ? "available" : "none";
         })(),
     };
     writeFileSync(reportPath, `${stableJson(report)}\n`, { mode: 0o600 });
