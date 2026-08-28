@@ -177,6 +177,48 @@ describe("filesystem admission (KTD11)", () => {
         if (!verdict.ok) expect(verdict.reason).toBe("unsupported_filesystem");
     });
 
+    test("distributed and passthrough filesystems are rejected, not treated as local", () => {
+        // The predicate is a deny-list, so anything missing from it is admitted:
+        // the check fails open on exactly the locality axis it exists to
+        // enforce. The classic remote types were listed; the distributed and
+        // object-store families were not.
+        for (const fsType of [
+            "ceph",
+            "cephfs",
+            "fuse.ceph",
+            "glusterfs",
+            "fuse.glusterfs",
+            "lustre",
+            "beegfs",
+            "gpfs",
+            "orangefs",
+            "gfs2",
+            "ocfs2",
+            "fuse.s3fs",
+            "fuse.rclone",
+            "fuse.gcsfuse",
+            "vboxsf",
+            "virtiofs",
+            "smb3",
+        ]) {
+            const verdict = admitLifecycleFilesystem(
+                "/home/user/.local/share",
+                mounts(`/dev/root / ext4 rw 0 0\nremote:/x /home ${fsType} rw 0 0\n`),
+            );
+            expect(verdict.ok).toBe(false);
+            if (!verdict.ok) expect(verdict.reason).toBe("unsupported_filesystem");
+        }
+        // Genuinely local types still pass, which is the trade the deny-list buys.
+        for (const fsType of ["ext4", "xfs", "btrfs", "zfs", "f2fs"]) {
+            expect(
+                admitLifecycleFilesystem(
+                    "/home/user/.local/share",
+                    mounts(`/dev/root / ext4 rw 0 0\n/dev/sdb1 /home ${fsType} rw 0 0\n`),
+                ),
+            ).toEqual({ ok: true });
+        }
+    });
+
     test("remote filesystem types are unsupported_filesystem / set_data_directory", () => {
         for (const fsType of ["nfs4", "cifs", "fuse.sshfs", "9p"]) {
             const verdict = admitLifecycleFilesystem(

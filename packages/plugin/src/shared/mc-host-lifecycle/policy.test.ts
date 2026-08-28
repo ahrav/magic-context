@@ -244,6 +244,56 @@ describe("native invocation mapping", () => {
         }
     });
 
+    test("a joiner with a non-finite deadline is rejected without cancelling the start", async () => {
+        // Gating only the create path left joiners reaching raceWaiter, where a
+        // non-finite budget survives the residual subtraction and setTimeout
+        // coerces it to 1ms. The discriminating case is a shared start that
+        // settles inside one microtask drain: the joiner then ADOPTS the result
+        // on an invalid budget instead of being rejected, so identical input
+        // resolves or rejects purely on whether another demand was in flight.
+        // launchTarget: null gives exactly that — start() returns a local result
+        // without spawning.
+        const root = tempDir("mc-policy-joiner-deadline-");
+        try {
+            const policy = policyFor({ env: { XDG_DATA_HOME: root }, launchTarget: null });
+            // Created in the same tick, so the joiners below observe it in flight.
+            const creator = policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                deadlineMs: 20_000,
+            });
+            expect(policy.inflightStartCount).toBe(1);
+
+            const joinerOutcomes: string[] = [];
+            for (const deadlineMs of [Number.NaN, Number.POSITIVE_INFINITY, 0, -5]) {
+                try {
+                    const outcome = await policy.demandStart({
+                        origin: "managed-default",
+                        capability: "magic-context",
+                        deadlineMs,
+                    });
+                    joinerOutcomes.push(`adopted:${outcome.result.reason}`);
+                } catch (error) {
+                    joinerOutcomes.push(`detached:${(error as WaiterDetachedError).cause_kind}`);
+                }
+            }
+            // Every joiner is rejected; none adopts a result it had no budget for.
+            expect(joinerOutcomes).toEqual([
+                "detached:deadline",
+                "detached:deadline",
+                "detached:deadline",
+                "detached:deadline",
+            ]);
+
+            // Rejecting joiners is not cancelling: the creator's start still
+            // resolves, which is the detach-only guarantee this design requires.
+            const outcome = await creator;
+            expect(outcome.result.reason).toBe("native_payload_missing");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 30_000);
+
     test("an already-inactive first demand never spawns the daemon", async () => {
         // `start()` is async, but its synchronous prefix runs all the way through
         // runNativeLifecycle to spawn() before the first await. Detaching only

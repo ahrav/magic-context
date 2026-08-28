@@ -270,7 +270,7 @@ export const MAX_TRUST_INDEX_BYTES = 1024 * 1024;
  * file is caught from the bytes actually read rather than from metadata a
  * concurrent writer can have already invalidated.
  */
-function readTrustIndexText(fd: number): string {
+function readTrustIndexText(fd: number, expectedBytes: number): string {
     const buffer = Buffer.alloc(MAX_TRUST_INDEX_BYTES + 1);
     let total = 0;
     while (total < buffer.length) {
@@ -280,6 +280,17 @@ function readTrustIndexText(fd: number): string {
     }
     if (total > MAX_TRUST_INDEX_BYTES) {
         throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
+    }
+    // The validated `fstat` said the file was `expectedBytes` long. Reading a
+    // different count means it was rewritten between the stat and the read, so
+    // the bytes below do not belong to the metadata that was checked — a
+    // truncating rewrite in particular preserves dev/ino and would otherwise
+    // decode as a shorter, still-parseable document.
+    if (total !== expectedBytes) {
+        throw new BootstrapError(
+            "native_payload_invalid",
+            "trust index changed size during the read",
+        );
     }
     // Strict, for the same reason the native-output path is: `toString("utf8")`
     // substitutes U+FFFD for an invalid byte, and the resulting document can
@@ -341,7 +352,7 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
         if (before.size > MAX_TRUST_INDEX_BYTES) {
             throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
         }
-        text = readTrustIndexText(fd);
+        text = readTrustIndexText(fd, before.size);
         // Path-addressed, unlike every check above it, so it can fail on its
         // own: the index may be unlinked, or an ancestor may lose search
         // permission, after the descriptor was opened and read. Left raw, that
@@ -362,6 +373,25 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
             throw new BootstrapError(
                 "native_payload_invalid",
                 "trust index identity drifted during the read",
+            );
+        }
+        // dev/ino prove the *name* still points at the same file; they say
+        // nothing about its contents, because an in-place rewrite preserves
+        // both. The metadata validated before the read therefore describes one
+        // generation while `text` could carry another, and the read loops, so a
+        // short read could even splice two. `stageBootstrap` already compares
+        // size and mtime across its own read for exactly this reason; the index
+        // is npm-installed at 0o644, so unlike the retained bootstrap it cannot
+        // be required to be non-owner-writable instead.
+        //
+        // Not airtight: a same-length rewrite inside one timestamp granule still
+        // evades this. A hard guarantee needs a content digest or a sealed
+        // object, which belongs to the native layer.
+        const afterFd = fstatSync(fd);
+        if (afterFd.size !== before.size || afterFd.mtimeMs !== before.mtimeMs) {
+            throw new BootstrapError(
+                "native_payload_invalid",
+                "trust index was rewritten during the read",
             );
         }
     } finally {

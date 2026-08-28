@@ -174,6 +174,44 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         expect(existsSync(sentinel)).toBe(false);
     }, 10_000);
 
+    test("relative launch paths are rejected before a child is spawned", async () => {
+        // The child runs with cwd: "/", so a relative value silently changes
+        // meaning instead of failing. A first segment colliding with a real root
+        // entry is the dangerous case: "bin/echo" resolves to /bin/echo and
+        // executes the WRONG binary, surfacing later as malformed output.
+        const sentinel = path.join(dir, "relative-path-ran");
+        const absolute = scriptBinary(dir, `touch ${sentinel}\necho '${probeResultJson(false)}'`);
+        const relative = path.relative(process.cwd(), absolute);
+        expect(path.isAbsolute(relative)).toBe(false);
+
+        let targetError: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: relative },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            targetError = caught as NativeLaunchError;
+        }
+        expect(targetError?.code).toBe("usage_error");
+        expect(targetError?.message).toContain("not absolute");
+
+        let payloadError: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: absolute },
+                { command: "start", deadlineMs: 10_000, payloadDir: "./dist" },
+            );
+        } catch (caught) {
+            payloadError = caught as NativeLaunchError;
+        }
+        expect(payloadError?.code).toBe("usage_error");
+        expect(payloadError?.message).toContain("payload directory is not absolute");
+
+        // Neither call reached a child.
+        expect(existsSync(sentinel)).toBe(false);
+    }, 10_000);
+
     test("byte-invalid stdout fails closed instead of decoding to U+FFFD", async () => {
         // Buffer.toString("utf8") substitutes U+FFFD for an invalid byte, so a
         // corrupt byte inside an otherwise well-formed JSON string would parse,

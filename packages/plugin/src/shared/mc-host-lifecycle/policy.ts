@@ -64,6 +64,25 @@ export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor
 
 export type StorageReadiness = "ready" | "starting" | "unavailable";
 
+/**
+ * Elapsed-time source for every lifecycle budget.
+ *
+ * `Date.now()` is a wall clock and can step in either direction: a backward
+ * correction makes elapsed time negative and hands the native child more than
+ * its platform's qualified aggregate, while a forward correction expires a live
+ * request that has barely started. Budgets are durations, so they are measured
+ * on a monotonic timeline — the same basis, and the same reason, as the client's
+ * `Deadline`.
+ *
+ * `performance.now()` does not advance across system suspend. That is the right
+ * trade here: it can never over-grant, and expiring on resume would need an
+ * explicit second signal rather than a clock that also jumps for timezone and
+ * NTP corrections.
+ */
+function monotonicNow(): number {
+    return performance.now();
+}
+
 export class WaiterDetachedError extends Error {
     constructor(readonly cause_kind: "aborted" | "deadline") {
         super(`managed startup waiter detached: ${cause_kind}`);
@@ -232,7 +251,29 @@ export class McHostLifecyclePolicy {
         if (!mayDemandStart(request.origin)) {
             throw new Error(`connection origin ${request.origin} is lifecycle-neutral`);
         }
-        const startedAt = Date.now();
+        const startedAt = monotonicNow();
+        // Validated at entry, for every caller, before the shared start is even
+        // looked up. A caller with no live interest must not create a start —
+        // `start()`'s synchronous prefix reaches `spawn()` before any await, so
+        // it would launch a mutating child nobody is waiting for. And a caller
+        // *joining* an existing start must not be admitted either: `raceWaiter`
+        // subtracts elapsed time and `NaN` stays `NaN`, while `setTimeout`
+        // coerces both `NaN` and `Infinity` to a 1ms delay, so a non-finite
+        // budget yields either a ~1ms detach or — if the shared start settles
+        // within one microtask drain — a result adopted on an invalid budget.
+        // Identical input would then resolve or reject depending only on whether
+        // another demand happened to be in flight.
+        //
+        // Rejecting a caller is not cancelling: the shared promise stays in the
+        // map untouched, so every other waiter is unaffected, which is the
+        // detach-only guarantee this design actually requires.
+        if (request.signal?.aborted) throw new WaiterDetachedError("aborted");
+        if (
+            request.deadlineMs !== undefined &&
+            (!Number.isFinite(request.deadlineMs) || request.deadlineMs <= 0)
+        ) {
+            throw new WaiterDetachedError("deadline");
+        }
         const rootResolution = resolveLifecycleDataRoot(this.env);
         // The data root alone identifies the host: `start()` takes no
         // capability and one daemon serves them all, so keying on capability
@@ -241,28 +282,6 @@ export class McHostLifecyclePolicy {
         const key = rootResolution.ok ? rootResolution.root : "\u0000no-root";
         let shared = this.inflightStarts.get(key);
         if (!shared) {
-            // Checked before the start is created, not just inside `raceWaiter`.
-            // `start()` is async, but its synchronous prefix runs through
-            // `runNativeLifecycle` to `spawn()` before any await, so calling it
-            // first would launch a mutating child on behalf of a caller that is
-            // already gone — work with no live waiter to own it.
-            //
-            // Only the create path is gated. A caller joining an existing start
-            // keeps the detach-only behavior, because that work is already in
-            // flight and owned by whoever started it.
-            if (request.signal?.aborted) throw new WaiterDetachedError("aborted");
-            if (
-                request.deadlineMs !== undefined &&
-                (!Number.isFinite(request.deadlineMs) || request.deadlineMs <= 0)
-            ) {
-                // Non-finite budgets are inactive too, not generous: `NaN`
-                // subtracted from anything stays `NaN`, and `setTimeout` coerces
-                // both `NaN` and `Infinity` to a 1ms delay, so the waiter would
-                // detach almost immediately and leave the start unowned — the
-                // same outcome as an expired deadline. `runNativeLifecycle`
-                // rejects the same shape for the same reason.
-                throw new WaiterDetachedError("deadline");
-            }
             shared = this.start();
             this.inflightStarts.set(key, shared);
             void shared
@@ -298,7 +317,10 @@ export class McHostLifecyclePolicy {
         const remaining =
             request.deadlineMs === undefined
                 ? STORAGE_HARD_BUDGET_MS
-                : Math.min(STORAGE_HARD_BUDGET_MS, request.deadlineMs - (Date.now() - startedAt));
+                : Math.min(
+                      STORAGE_HARD_BUDGET_MS,
+                      request.deadlineMs - (monotonicNow() - startedAt),
+                  );
         if (remaining <= 0) return "unavailable";
         let timer: ReturnType<typeof setTimeout> | null = null;
         let onAbort: (() => void) | null = null;
@@ -355,7 +377,7 @@ export class McHostLifecyclePolicy {
         const deadlineMs =
             request.deadlineMs === undefined
                 ? undefined
-                : request.deadlineMs - (Date.now() - startedAt);
+                : request.deadlineMs - (monotonicNow() - startedAt);
         if (!signal && deadlineMs === undefined) return shared;
         return new Promise<DaemonResultV1>((resolve, reject) => {
             let settled = false;
@@ -428,7 +450,7 @@ export class McHostLifecyclePolicy {
         // seconds in `sw_vers`, and handing the child a fresh full aggregate
         // afterwards let the operation overrun the budget its platform was
         // qualified against — the same mistake the demand waiter had.
-        const startedAt = Date.now();
+        const startedAt = monotonicNow();
         const rootResolution = resolveLifecycleDataRoot(this.env);
         if (!rootResolution.ok) {
             return { ok: false, result: localResult(command, false, "unavailable", "no_data_dir") };
@@ -453,7 +475,7 @@ export class McHostLifecyclePolicy {
         // The gate already resolved which qualified target this host is, so the
         // aggregate comes from that rather than from a Linux-shaped default.
         const aggregate = this.outerAggregateMs ?? aggregateForTarget(platform.target);
-        const deadlineMs = aggregate - (Date.now() - startedAt);
+        const deadlineMs = aggregate - (monotonicNow() - startedAt);
         if (deadlineMs <= 0) {
             // Preflight consumed the whole budget, so the operation is out of
             // time before the child exists. That is this command's timeout, not

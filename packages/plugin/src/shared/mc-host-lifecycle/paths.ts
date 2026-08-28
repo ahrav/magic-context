@@ -167,16 +167,26 @@ export type FilesystemAdmission =
 /**
  * Filesystem types that cannot provide the required cross-process lock,
  * no-follow, atomic-replacement, fsync, and retained-execution semantics.
- * Remote and synthetic filesystems fail admission; unknown local types pass
- * (the practical bounded check — full semantics are release-qualified, not
- * runtime-probed).
+ *
+ * A deny-list, so unknown types pass — the practical bounded check, since full
+ * semantics are release-qualified rather than runtime-probed. That trade means
+ * the list has to actually enumerate the remote families, because anything
+ * missing from it is admitted: the check fails open on exactly the locality
+ * axis the requirement is about. Distributed and network filesystems are listed
+ * alongside the classic remote ones for that reason.
+ *
+ * The release contract enumerates filesystem *capability* names
+ * (`local_filesystem`, `cross_process_locks`, ...), never filesystem types, so
+ * this set is the only implementation of the locality requirement.
  */
 const UNSUPPORTED_FS_TYPES = new Set([
+    // Classic remote/network.
     "nfs",
     "nfs4",
     "cifs",
     "smb",
     "smb2",
+    "smb3",
     "smbfs",
     "sshfs",
     "fuse.sshfs",
@@ -186,6 +196,26 @@ const UNSUPPORTED_FS_TYPES = new Set([
     "curlftpfs",
     "davfs",
     "fuse.davfs2",
+    // Distributed and cluster filesystems.
+    "ceph",
+    "cephfs",
+    "fuse.ceph",
+    "glusterfs",
+    "fuse.glusterfs",
+    "lustre",
+    "beegfs",
+    "gpfs",
+    "orangefs",
+    "moosefs",
+    "fuse.moosefs",
+    "gfs2",
+    "ocfs2",
+    // Object-store and hypervisor passthrough mounts.
+    "fuse.s3fs",
+    "fuse.rclone",
+    "fuse.gcsfuse",
+    "vboxsf",
+    "virtiofs",
 ]);
 
 export interface MountEntry {

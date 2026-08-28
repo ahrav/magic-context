@@ -16,6 +16,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
+import * as path from "node:path";
 import {
     ContractViolation,
     type DaemonResultV1,
@@ -28,6 +29,11 @@ export const LAUNCHER_CHILD_FD = 3;
 
 export type NativeLaunchTarget =
     | { kind: "retained-fd"; fd: number }
+    /**
+     * Dev/test injection point. `path` MUST be absolute: the child is spawned
+     * with `cwd: "/"`, so a relative path is resolved against the filesystem
+     * root rather than the caller's directory.
+     */
     | { kind: "test-binary"; path: string };
 
 export type NativeLifecycleCommand = "start" | "stop" | "restart" | "probe";
@@ -55,7 +61,10 @@ export class NativeLaunchError extends Error {
 
 export interface NativeLaunchOptions {
     command: NativeLifecycleCommand;
-    /** Dev/test staging source forwarded as `--payload-dir`. */
+    /**
+     * Dev/test staging source forwarded as `--payload-dir`. MUST be absolute:
+     * the child runs with `cwd: "/"` and resolves it there.
+     */
     payloadDir?: string;
     /** JSON-serializable startup envelope written to stdin, or null. */
     envelope?: unknown;
@@ -183,6 +192,19 @@ export async function runNativeLifecycle(
             "usage_error",
             "native lifecycle deadline is not a positive finite duration",
         );
+    }
+    // Path inputs are checked here for the same reason, because the child is
+    // spawned with `cwd: "/"`: a relative value silently changes meaning rather
+    // than failing. `target/debug/ck-mc-host` becomes `/target/debug/...` and
+    // fails as a missing payload, and a first segment that collides with a real
+    // root entry is worse — `bin/foo` resolves to `/bin/foo` and *executes the
+    // wrong binary*, surfacing later as malformed output. `--payload-dir` has
+    // the same hazard, staging from a directory the caller never named.
+    if (target.kind === "test-binary" && !path.isAbsolute(target.path)) {
+        throw new NativeLaunchError("usage_error", "native launch target path is not absolute");
+    }
+    if (options.payloadDir !== undefined && !path.isAbsolute(options.payloadDir)) {
+        throw new NativeLaunchError("usage_error", "native payload directory is not absolute");
     }
     // The envelope is serialized before anything is spawned: a value with no
     // JSON form must fail as a typed error with no child in flight, and the
