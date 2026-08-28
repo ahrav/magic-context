@@ -1689,6 +1689,8 @@ mod tests {
 
     #[test]
     fn hostile_shapes_at_the_lock_names_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
         for name in [TRANSACTION_LOCK_NAME, LIFETIME_LOCK_NAME] {
             // A symlink at the lock name.
             let root = temp_root();
@@ -1718,12 +1720,21 @@ mod tests {
             let root = temp_root();
             let coordination = coordination_dir_path(Some(root.path())).expect("path");
             std::fs::create_dir_all(&coordination).expect("coordination root");
-            rustix::fs::mkfifoat(
-                rustix::fs::CWD,
-                coordination.join(name).as_path(),
-                Mode::from_raw_mode(0o600),
-            )
-            .expect("plant fifo");
+            let fifo = coordination.join(name);
+            // The POSIX `mkfifo` utility, not rustix: rustix gates `mkfifoat`
+            // away from Apple targets, and this crate is `deny(unsafe_code)`, so
+            // calling `mkfifo(2)` directly is not available either. A lock name
+            // must classify as a hostile shape on every platform, so this stays
+            // compiled everywhere rather than being cfg'd out on the one whose
+            // absence let a build break reach CI unnoticed. `mkfifo` honours the
+            // umask, so the mode is set explicitly afterwards.
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo is a POSIX utility present on every supported platform");
+            assert!(made.success(), "mkfifo failed: {made:?}");
+            std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o600))
+                .expect("owner-only fifo");
             let mutator_err = if name == TRANSACTION_LOCK_NAME {
                 LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
             } else {
