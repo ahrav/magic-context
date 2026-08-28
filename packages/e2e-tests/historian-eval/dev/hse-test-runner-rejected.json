@@ -20,7 +20,7 @@
         "assistant": "Noted: test files stay co-located and use the .test.ts suffix."
       },
       {
-        "user": "Good — testing conventions are settled.",
+        "user": "Good \u2014 testing conventions are settled.",
         "assistant": "Wrapping up the testing thread."
       }
     ],
@@ -53,7 +53,7 @@
         "category": "CONSTRAINTS",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "esm transform"
+          "value": "Jest rejected because the ESM transform"
         },
         "sourceTurnRange": [
           0,

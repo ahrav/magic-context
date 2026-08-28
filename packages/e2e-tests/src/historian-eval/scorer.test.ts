@@ -2508,3 +2508,48 @@ describe("scoring database provisioning", () => {
         }
     });
 });
+
+describe("compareProbeAnswer claim-id availability", () => {
+    test("a wrong claim id fails on its merits when the backing claim IS injected", () => {
+        const scenario = validScenario();
+        const probe = scenario.probes.find((candidate) => candidate.answerType === "claim-id");
+        expect(probe).toBeDefined();
+        const backing = scenario.gold.expectedClaims.find((claim) => claim.id === probe!.expectedClaimRef);
+        expect(backing).toBeDefined();
+        const injected: InjectedClaimRecord[] = [
+            {
+                publicClaimId: "mem-backing",
+                revisionLocator: "loc-backing",
+                content: `Recorded decision: ${backing!.predicate.value}.`,
+                category: backing!.category,
+                revision: 1,
+            },
+        ];
+        const exchange: ProbeExchange = {
+            probeId: probe!.id,
+            answerRaw: "mem-some-other-claim",
+            reAsked: false,
+            injectedRevisionLocators: ["loc-backing"],
+            payloadText: null,
+            finalRequestPayloadText: null,
+            responseText: "<answer>mem-some-other-claim</answer>",
+            discardedResponseTexts: [],
+        };
+        const verdict = compareProbeAnswer({ probe: probe!, exchange, scenario, injectedClaims: injected });
+        // The property the mutation battery depends on: with a candidate present
+        // the verdict is a real comparison against that claim's id, not an
+        // availability outcome. An empty injected set instead yields
+        // "<no injected gold claim>", which fails for want of any candidate and
+        // would stay green under a comparator that accepted the wrong id.
+        expect(verdict.outcome).toBe("fail");
+        expect(verdict.expected).toBe("mem-backing");
+
+        const unavailable = compareProbeAnswer({
+            probe: probe!,
+            exchange: { ...exchange, injectedRevisionLocators: [] },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(unavailable.expected).toBe("<no injected gold claim>");
+    });
+});

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -622,6 +622,95 @@ describe("promoteRelease", () => {
                     releaseVersion: "v1",
                 }),
             ).toThrow(/release\.families: missing-/);
+        });
+    });
+
+    test("strict loading rejects a noncanonical release version the promoter would refuse", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // `parseManifest` accepts the broad `^v\d+$` shape, so an externally
+            // assembled release can declare `v01` — which shares an ordinal with
+            // `v1`, letting two directories claim one release position. Rebinding
+            // the approvals makes it internally CONSISTENT at v01, which is the
+            // case the promoter refuses to create and the loader must refuse to
+            // certify; leaving them bound to v1 would only prove the approval
+            // check works.
+            const manifestPath = join(releaseDir, RELEASE_FILES.manifest);
+            const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                releaseVersion: string;
+                releaseTuple: Parameters<typeof releaseApprovalFingerprint>[0]["releaseTuple"];
+                tombstones: string[];
+                approvals: { privacy: { releaseFingerprint: string }; goldIntent: { releaseFingerprint: string } };
+            };
+            manifest.releaseVersion = "v01";
+            const rebound = releaseApprovalFingerprint({
+                releaseVersion: "v01",
+                releaseTuple: manifest.releaseTuple,
+                tombstones: manifest.tombstones,
+            });
+            manifest.approvals.privacy.releaseFingerprint = rebound;
+            manifest.approvals.goldIntent.releaseFingerprint = rebound;
+            writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+            expect(() => loadRelease(releaseDir)).toThrow(
+                /release\.manifest\.releaseVersion: version-not-canonical/,
+            );
+        });
+    });
+
+    test("a noncanonical prior release directory is rejected before its lineage is inherited", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // `v01` matches `RELEASE_VERSION_RE` and shares v1's ordinal, so the
+            // two would sort to the same release position.
+            cpSync(join(root, "v1"), join(root, "v01"), { recursive: true });
+            const next = corpusRaw();
+            expect(() =>
+                promoteRelease({
+                    scenarios: next,
+                    approvals: approvalsFor(next, "v2"),
+                    releasesRoot: root,
+                    releaseVersion: "v2",
+                }),
+            ).toThrow(/release\.v01: version-not-canonical/);
+        });
+    });
+
+    test("promotion is serialized per releases root and releases its lock", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promote = (version: string): { releaseDir: string } =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios, version),
+                    releasesRoot: root,
+                    releaseVersion: version,
+                });
+            // A concurrent promoter's lock. Publishing under a stale lineage
+            // snapshot could put a retired scenario in a numerically later
+            // release, and the staging sweep would delete the other promoter's
+            // in-flight candidate.
+            mkdirSync(root, { recursive: true });
+            const lockPath = join(root, ".promote.lock");
+            writeFileSync(lockPath, "pid 999999\n");
+            expect(() => promote("v1")).toThrow(/another promotion holds \.promote\.lock/);
+
+            // Cleared, promotion proceeds and leaves no lock behind.
+            rmSync(lockPath);
+            promote("v1");
+            expect(existsSync(lockPath)).toBe(false);
+            expect(existsSync(join(root, "v1"))).toBe(true);
         });
     });
 

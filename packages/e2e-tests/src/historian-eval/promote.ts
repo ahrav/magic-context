@@ -221,6 +221,18 @@ function assertRegularFile(path: string, label: string): void {
     if (!lstatSync(path).isFile()) fail([`${label}: not-a-regular-file`]);
 }
 
+/**
+ * Canonical `vN` only. `v01` and `v1` share an ordinal, so accepting both would
+ * let two directory names claim the same release position and defeat the
+ * monotonicity check — and a strict load that certified `v01` would accept a
+ * release the promoter refuses to publish.
+ */
+function assertCanonicalVersion(version: string, label: string): void {
+    if (!RELEASE_VERSION_RE.test(version) || version !== `v${versionOrdinal(version)}`) {
+        fail([`${label}: version-not-canonical`]);
+    }
+}
+
 /** Real directory — not a symlink whose target lives outside the releases root. */
 function assertRealDirectory(path: string, label: string): void {
     if (!lstatSync(path).isDirectory()) fail([`${label}: not-a-real-directory`]);
@@ -336,6 +348,10 @@ export function loadRelease(
     }
 
     const manifest = parseManifest(rawManifest);
+    // `parseManifest` accepts the broad `RELEASE_VERSION_RE` shape, so an
+    // externally assembled release could declare `v01` and be certified here
+    // while `promoteRelease` refuses to publish it.
+    assertCanonicalVersion(manifest.releaseVersion, "release.manifest.releaseVersion");
     const mutationEvidence = parseMutationEvidence(rawEvidence);
     const scenarios = rawScenarios.map((raw, index) => parseScenario(raw, `release.scenarios[${index}]`));
     // Authenticity before any content is trusted, over all three artifact groups:
@@ -432,6 +448,7 @@ function installedReleases(releasesRoot: string): ReleaseLineage[] {
             // shrink the inherited set and let a retired scenario be published
             // again. Entry names are `RELEASE_VERSION_RE`-bounded, so labelling
             // them echoes no artifact content.
+            assertCanonicalVersion(entry, `release.${entry}`);
             assertRealDirectory(join(releasesRoot, entry), `release.${entry}`);
             assertRegularFile(manifestPath, `release.${entry}.manifest`);
             const lineage = parseReleaseLineage(
@@ -462,16 +479,53 @@ function inheritedTombstones(prior: readonly ReleaseLineage[]): string[] {
     return [...tombstones].sort();
 }
 
+/** Exclusive promotion lock for one releases root. */
+const PROMOTION_LOCK = ".promote.lock";
+
+/**
+ * Serialize promotion across the whole read-validate-publish window for one
+ * releases root.
+ *
+ * The lineage snapshot and the publishing rename are far apart, and everything
+ * between them assumes the snapshot is still current. Two concurrent promoters
+ * both read the same predecessor, validate independently, and publish: if one
+ * introduces a tombstone, the other never sees it and can publish the retired
+ * scenario despite being numerically later, which is exactly the state
+ * `assertReleaseSuccession` exists to prevent. The staging sweep is worse than a
+ * stale read — it deletes `.staging-*` trees unconditionally, so one promoter can
+ * destroy another's in-flight candidate. Operator-serial promotion was assumed
+ * but never enforced; this enforces it.
+ *
+ * Fails closed on an existing lock rather than stealing it: a lock whose owner is
+ * still working is precisely the case that must not proceed, and this cannot tell
+ * that apart from a crashed owner's leftover. The diagnostic names the path so an
+ * operator can clear it deliberately. `wx` makes creation the atomic test-and-set.
+ */
+function withPromotionLock<T>(releasesRoot: string, run: () => T): T {
+    mkdirSync(releasesRoot, { recursive: true });
+    const lockPath = join(releasesRoot, PROMOTION_LOCK);
+    try {
+        writeFileSync(lockPath, `pid ${process.pid}\n`, { flag: "wx" });
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            fail([
+                `release: another promotion holds ${PROMOTION_LOCK} for this releases root; remove it only after confirming no promoter is running`,
+            ]);
+        }
+        throw error;
+    }
+    try {
+        return run();
+    } finally {
+        rmSync(lockPath, { force: true });
+    }
+}
+
 export function promoteRelease(input: PromotionInput): { releaseDir: string; artifactFingerprint: string } {
     if (!RELEASE_VERSION_RE.test(input.releaseVersion)) {
         fail(["release: version-invalid"]);
     }
-    // Canonical form only: `v01` and `v1` share an ordinal, so accepting both
-    // would let two distinct directory names claim the same release position
-    // and defeat the monotonicity check below.
-    if (input.releaseVersion !== `v${versionOrdinal(input.releaseVersion)}`) {
-        fail(["release: version-not-canonical"]);
-    }
+    assertCanonicalVersion(input.releaseVersion, "release");
 
     // Privacy gate FIRST — before any parser, because schema diagnostics
     // interpolate scenario ids and field paths. Approvals and tombstones are
@@ -500,6 +554,17 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; art
     const familyDiagnostics = checkFamilyCoverage(scenarios);
     if (familyDiagnostics.length > 0) fail(familyDiagnostics);
 
+    // Everything from here reads or mutates the releases root, so it runs under
+    // the exclusive lock: the lineage snapshot below must still be current when
+    // the rename publishes.
+    return withPromotionLock(input.releasesRoot, () => promoteUnderLock(input, scenarios, ids));
+}
+
+function promoteUnderLock(
+    input: PromotionInput,
+    scenarios: readonly HistorianEvalScenario[],
+    ids: ReadonlySet<string>,
+): { releaseDir: string; artifactFingerprint: string } {
     // Cheap rejection gates run before the battery: tombstone conflicts,
     // approval binding, and version collisions each reject in microseconds,
     // while the recomputed battery costs seconds per promotion.
@@ -573,7 +638,6 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; art
         rmSync(reviewDir, { recursive: true, force: true });
     }
 
-    mkdirSync(input.releasesRoot, { recursive: true });
     // A crash between staging and rename strands a fully populated
     // `.staging-*` tree beside the releases, where it would be committable.
     // Staged trees are unpublished by construction (publication is the

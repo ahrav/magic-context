@@ -21,6 +21,7 @@ import {
     type HistorianEvalScenario,
 } from "./contract";
 import { buildMockHistorianOutput, type MockHistorianCompartment, type MockHistorianFact } from "../mock-historian";
+import type { InjectedClaimRecord } from "./claim-read";
 import type { ProbeExchange } from "./runner";
 import { compareProbeAnswer, scoreRawOutput, type FailReason } from "./scorer";
 
@@ -365,11 +366,34 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
     // claim-id comparison path unexercised, so a regression accepting a wrong
     // claim identifier would still pass the admission gate.
     const failures = scenario.probes.flatMap((probe) => {
+        // A MEASURABLE exchange: the probe's backing claim is present in the
+        // injected set and its locator is recorded, so the availability gate
+        // above the comparison passes and the wrong answer is judged on its
+        // merits. An empty injected set made every claim-id probe fail for want
+        // of any candidate id at all, so a regression accepting an id from the
+        // wrong injected claim — or one absent from the recorded locators — left
+        // this class green while real probes could pass a leaked or unavailable
+        // identifier. The claim's content carries the probe's answer, which the
+        // freeze lint now guarantees for every non-claim-id probe.
+        const backingId = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
+        const backing = scenario.gold.expectedClaims.find((claim) => claim.id === backingId);
+        const injectedClaims: InjectedClaimRecord[] =
+            backing === undefined
+                ? []
+                : [
+                      {
+                          publicClaimId: `mem-${probe.id}`,
+                          revisionLocator: `loc-${probe.id}`,
+                          content: `Recorded decision: ${backing.predicate.value}.`,
+                          category: backing.category,
+                          revision: 1,
+                      },
+                  ];
         const exchange: ProbeExchange = {
             probeId: probe.id,
             answerRaw: WRONG_PROBE_ANSWER,
             reAsked: false,
-            injectedRevisionLocators: [],
+            injectedRevisionLocators: injectedClaims.map((item) => item.revisionLocator),
             payloadText: null,
             // Synthetic exchange: there is no captured request, the answer came
             // straight from the marker reply, and nothing was re-asked.
@@ -377,7 +401,7 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
             responseText: `<answer>${WRONG_PROBE_ANSWER}</answer>`,
             discardedResponseTexts: [],
         };
-        const verdict = compareProbeAnswer({ probe, exchange, scenario, injectedClaims: [] });
+        const verdict = compareProbeAnswer({ probe, exchange, scenario, injectedClaims });
         return verdict.outcome === expected.outcome
             ? []
             : [`${probe.id} (${probe.answerType}): expected probe ${expected.outcome} but got ${verdict.outcome}`];

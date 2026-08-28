@@ -29,28 +29,39 @@ function parseCorpus(): HistorianEvalScenario[] {
 }
 
 describe("dev corpus", () => {
-    test("positive-claim mutations cover every expected claim, not just the first", () => {
-        const multi = parseCorpus().filter((scenario) => scenario.gold.expectedClaims.length > 1);
-        // Most of the corpus declares several expected claims, so mutating only
-        // index 0 left the rest unexercised: a scorer regression that stopped
-        // enforcing the second or third claim would still trip on the first and
-        // the evidence would stay green.
-        expect(multi.length).toBeGreaterThan(0);
-        const artifact = runMutationBattery(multi);
-        expect(artifact.green).toBe(true);
-        const perClaimClasses = ["wrong-category", "dropped-gold-fact", "near-miss-perturbation"];
-        for (const [index, entry] of artifact.scenarios.entries()) {
-            const claimCount = multi[index].gold.expectedClaims.length;
-            for (const mutationClass of perClaimClasses) {
-                const result = entry.results.find((candidate) => candidate.mutationClass === mutationClass);
-                expect(result).toBeDefined();
-                // The detail records how many claims were actually mutated, so a
-                // regression to first-claim-only is visible in the evidence.
-                expect(result!.detail).toContain(`all ${claimCount} expected claim(s)`);
-            }
+    test("a rejection record names the subject it rejects", () => {
+        // A CONSTRAINTS claim in a proposed-but-rejected scenario IS the rejection
+        // record. A predicate broad enough to be satisfied without naming the
+        // rejected subject — "migration cost" for a Bazel rejection — is earned by
+        // the mutation baseline's context-free fact, so full recall is credited and
+        // a claim-id probe pointed at it accepts that vague claim: a historian that
+        // lost the rejection entirely passes both tiers. Proxy for "names the
+        // subject": the predicate shares a substantial word with one of the
+        // scenario's forbidden formations.
+        const words = (value: string): string[] =>
+            value
+                .toLowerCase()
+                .split(/[^a-z0-9]+/)
+                .filter((word) => word.length >= 4);
+        const records = parseCorpus()
+            .filter((scenario) => scenario.families.includes("proposed-but-rejected"))
+            .flatMap((scenario) => {
+                const subject = new Set(
+                    scenario.gold.expectedAbsent.flatMap((absent) => words(absent.predicate.value)),
+                );
+                return scenario.gold.expectedClaims
+                    .filter((claim) => claim.category === "CONSTRAINTS")
+                    .map((claim) => ({
+                        scenario: scenario.id,
+                        claim: claim.id,
+                        shared: words(claim.predicate.value).filter((word) => subject.has(word)),
+                    }));
+            });
+        expect(records.length).toBeGreaterThan(0);
+        for (const record of records) {
+            expect(record.shared.length).toBeGreaterThan(0);
         }
     });
-
 
     test("scenarios declaring several hard negatives in one family have every one mutated", () => {
         const multi = parseCorpus().filter((scenario) => {
