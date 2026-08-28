@@ -893,6 +893,7 @@ pub async fn run<H: McHostHandler>(
     let mut abandon_guard = AbandonGuard {
         inner: Some((Arc::clone(&shared), guard)),
     };
+    spawn_activation_task(&shared);
     spawn_health_task(&shared);
     accept_loop(&shared, listener).await;
     let graceful = shutdown_sequence(&shared, abandon_guard.guard_mut()).await;
@@ -925,6 +926,52 @@ pub async fn run<H: McHostHandler>(
 /// Delay before retrying a failed `accept()`, preventing a tight error loop
 /// when the listener stays ready under persistent resource exhaustion.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs the handler's post-publication activation exactly once, tracked but
+/// never awaited by startup: transport is already published and the accept
+/// loop starts regardless of activation progress. An `Err`, panic, or task
+/// loss trips the fatal latch; shutdown abandons an unfinished activation
+/// future at the inner select, and the component-owned trackers it started
+/// are drained by the handler shutdown callback.
+fn spawn_activation_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
+    let outer = Arc::clone(shared);
+    let shared = Arc::clone(shared);
+    outer.spawn_tracked(async move {
+        let handler = Arc::clone(&shared.handler);
+        let watchdog = Arc::clone(&shared);
+        // Abort-exempt: forced-shutdown `abort_all` must not turn an
+        // in-flight activation into a spurious task loss. The inner select
+        // self-bounds on the shutdown token instead; there is deliberately
+        // no lifecycle deadline here because model construction and
+        // certification own separate post-publication budgets.
+        let task = shared.spawn_lifecycle(async move {
+            let callback = crate::panic_boundary::redact_sync(|| handler.activate());
+            tokio::select! {
+                biased;
+                () = watchdog.shutdown.cancelled() => {}
+                result = crate::panic_boundary::redact(callback) => {
+                    if let Err(err) = result {
+                        // The handler-authored message can carry component
+                        // detail; fatal diagnostics get bounded structure
+                        // only (protocol V24).
+                        watchdog.fatal.trip(
+                            &watchdog.shutdown,
+                            format!(
+                                "activation invariant failure ({} bytes of detail redacted)",
+                                err.0.len()
+                            ),
+                        );
+                    }
+                }
+            }
+        });
+        if task.await.is_err() {
+            shared
+                .fatal
+                .trip(&shared.shutdown, "activation task lost".to_owned());
+        }
+    });
+}
 
 /// Accepts sockets until shutdown. Each accept result is synchronously
 /// registered with the task tracker before the next await — the

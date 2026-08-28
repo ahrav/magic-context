@@ -263,16 +263,54 @@ impl Drop for SynapseHost {
 }
 
 pub async fn open_synapse_route(client: &mut raw_client::RawClient) -> (u16, u32) {
-    client
-        .route_open_target(
-            "management_surface",
-            SYNAPSE_MODULE_ID,
-            ROOT,
-            "opencode",
-            "s1",
-        )
-        .await
-        .expect("synapse route binds")
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        match client
+            .route_open_target(
+                "management_surface",
+                SYNAPSE_MODULE_ID,
+                ROOT,
+                "opencode",
+                "s1",
+            )
+            .await
+        {
+            Ok(handle) => return handle,
+            Err(code) if code == "module_reloading" && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(code) => panic!("synapse route binds: {code}"),
+        }
+    }
+}
+
+pub async fn open_synapse_route_rejection(client: &mut raw_client::RawClient) -> String {
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        match client
+            .route_open_target(
+                "management_surface",
+                SYNAPSE_MODULE_ID,
+                ROOT,
+                "opencode",
+                "s1",
+            )
+            .await
+        {
+            Ok(_) => panic!("synapse route unexpectedly bound"),
+            Err(code) if code == "module_reloading" && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // A transient reload code that never settled is a harness timeout,
+            // not the permanent rejection this returns. Falling through to the
+            // arm below would hand `module_reloading` back to the caller as if
+            // the route had been permanently refused for that reason.
+            Err(code) if code == "module_reloading" => {
+                panic!("synapse route still reloading at the rejection deadline")
+            }
+            Err(code) => return code,
+        }
+    }
 }
 
 /// One `{method, params}` application call over an open synapse route,

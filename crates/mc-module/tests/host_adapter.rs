@@ -44,6 +44,7 @@ async fn host_lifecycle_uses_full_route_handles() {
     PrimaryComponent::initialize(&handler, init(&descriptor))
         .await
         .unwrap();
+    PrimaryComponent::activate(&handler).await.unwrap();
 
     let old = RouteHandle {
         channel: 17,
@@ -69,6 +70,12 @@ async fn host_lifecycle_uses_full_route_handles() {
     assert!(PrimaryComponent::initialize(&handler, init(&descriptor))
         .await
         .is_err());
+    let reopened = McHandler::new();
+    PrimaryComponent::initialize(&reopened, init(&descriptor))
+        .await
+        .unwrap();
+    reopened.shutdown().await.unwrap();
+    assert!(PrimaryComponent::activate(&reopened).await.is_err());
 }
 
 #[tokio::test]
@@ -99,6 +106,7 @@ async fn shutdown_cancels_and_joins_blocked_store_open() {
     PrimaryComponent::initialize(&handler, init(&descriptor))
         .await
         .unwrap();
+    PrimaryComponent::activate(&handler).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {

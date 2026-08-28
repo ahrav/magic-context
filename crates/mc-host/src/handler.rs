@@ -562,6 +562,11 @@ pub trait McHostHandler: Send + Sync + 'static {
 
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
 
+    /// Runs once after transport publication, before the accept loop, and is never awaited for readiness: storage opening and model construction belong here rather than in `initialize`, so transport never waits behind them. An expected artifact fault resolves to `Ok(())` with that lane internally degraded; `Err`, panic, and task loss are invariant failures that reach the host-fatal channel. Shutdown abandons an unfinished activation future, so long-running work must live in component-owned trackers that `shutdown` drains. commentlint: allow(JUDGE)
+    fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
+        async { Ok(()) }
+    }
+
     fn bind(
         &self,
         route: RouteHandle,

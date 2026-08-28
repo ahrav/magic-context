@@ -566,6 +566,48 @@ impl Client {
             .await
     }
 
+    /// The host commits the stop only after the complete `host.shutdown` response frame reaches the socket, so `Ok` here is the stop linearization point the native lifecycle owner waits on; the connection itself stays open. commentlint: allow(JUDGE)
+    pub async fn host_shutdown(&self) -> Result<(), CallError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(CallError::local(
+                SendOutcome::NotSent,
+                "client_closed",
+                "client is closed",
+            ));
+        }
+        let body = br#"{"op":"host.shutdown"}"#.to_vec();
+        let deadline = Instant::now() + CLIENT_SHUTDOWN_TIMEOUT;
+        let response = self
+            .inner
+            .unary(
+                RouteHandle {
+                    channel: 0,
+                    epoch: 0,
+                },
+                body,
+                deadline,
+                None,
+            )
+            .await?;
+        let acknowledged = serde_json::from_slice::<serde_json::Value>(&response.body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("op")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|op| op == "host.shutdown")
+            })
+            .unwrap_or(false);
+        if !acknowledged {
+            return Err(CallError::local(
+                SendOutcome::Terminal,
+                "invalid_shutdown_response",
+                "host.shutdown response did not echo the operation",
+            ));
+        }
+        Ok(())
+    }
+
     /// Rejects new work, closes routes, settles pending calls, and joins I/O tasks.
     pub async fn close(&self) -> Result<(), ClientError> {
         let deadline = Instant::now() + CLIENT_SHUTDOWN_TIMEOUT;

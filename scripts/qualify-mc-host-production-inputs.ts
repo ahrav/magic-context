@@ -532,11 +532,7 @@ const CREDENTIALS_DOC = {
         ],
         node: {
             fields: ["path", "sha256"],
-            path_rules: [
-                "relative",
-                "no_parent_segments",
-                "no_symlink_escape",
-            ],
+            path_rules: ["relative", "no_parent_segments", "no_symlink_escape"],
         },
         extensions_ordered: true,
         rules: {
@@ -688,9 +684,7 @@ export function validateCredentialsDoc(
                 !(alias.canonical in harness.providers) ||
                 alias.alias_mechanism_supported !== false ||
                 alias.fallback !== "canonical_row" ||
-                !doc.unsupported_auth_mechanisms.includes(
-                    alias.alias_mechanism,
-                )
+                !doc.unsupported_auth_mechanisms.includes(alias.alias_mechanism)
             ) {
                 fail(
                     `${harnessName}: alias ${aliasName} must fall back to a qualified canonical row with an unsupported alias mechanism`,
@@ -1289,7 +1283,9 @@ function tinyFixtureHashBlacklist(
     try {
         collect(JSON.parse(readFileSync(path, "utf8")));
     } catch {
-        fail(`unreadable tiny-fixture manifest at ${TINY_FIXTURE_MANIFEST_PATH}`);
+        fail(
+            `unreadable tiny-fixture manifest at ${TINY_FIXTURE_MANIFEST_PATH}`,
+        );
     }
     if (mode === "production") {
         const fixturePath = join(rootDir, QUALIFICATION_FIXTURE_MANIFEST_PATH);
@@ -1458,7 +1454,10 @@ function validateQualifiedArtifact(
     ) {
         fail(`inputs.${key}: size_bytes must be a positive integer`);
     }
-    if (typeof artifact.sha256 !== "string" || !SHA256_RE.test(artifact.sha256)) {
+    if (
+        typeof artifact.sha256 !== "string" ||
+        !SHA256_RE.test(artifact.sha256)
+    ) {
         fail(`inputs.${key}: sha256 must be 64 lowercase hex`);
     }
     if (isPlaceholderSha256(artifact.sha256)) {
@@ -1691,16 +1690,11 @@ export function validateSourceManifest(
     } as const;
     for (const name of ["opencode", "pi"] as const) {
         const harness = m.harnesses[name];
-        assertExactKeys(
-            harness,
-            ["package", "version"],
-            `harnesses.${name}`,
-            ["unqualified_reason"],
-        );
+        assertExactKeys(harness, ["package", "version"], `harnesses.${name}`, [
+            "unqualified_reason",
+        ]);
         if (harness.package !== expectPackage[name]) {
-            fail(
-                `harnesses.${name}: package must be ${expectPackage[name]}`,
-            );
+            fail(`harnesses.${name}: package must be ${expectPackage[name]}`);
         }
         if (harness.version === null) {
             if (!isFilledText(harness.unqualified_reason)) {
@@ -1730,7 +1724,9 @@ function verifyArtifactBytes(
         mode,
     );
     if (!existsSync(path)) {
-        fail(`inputs.${key}: verify bytes missing at ${artifact.verify_local_path}`);
+        fail(
+            `inputs.${key}: verify bytes missing at ${artifact.verify_local_path}`,
+        );
     }
     // Production artifacts are hundreds of MB (ONNX model, ORT shared library):
     // compare the cheap size first, then hash in fixed-size chunks so peak
@@ -2897,7 +2893,9 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
     const cargoPath = join(rootDir, MC_HOST_CARGO_TOML_PATH);
     if (manifest.mode === "production") {
         if (!existsSync(cargoPath)) {
-            fail("crates/mc-host/Cargo.toml is required to qualify the ORT crate pins");
+            fail(
+                "crates/mc-host/Cargo.toml is required to qualify the ORT crate pins",
+            );
         }
         const cargo = readFileSync(cargoPath, "utf8");
         const qualified = [
