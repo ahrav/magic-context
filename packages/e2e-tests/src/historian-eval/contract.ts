@@ -717,6 +717,14 @@ function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTur
  * Exported for the fidelity tests: this rendering is the lint's whole
  * measurement surface, so its agreement with the harness is a contract.
  */
+/**
+ * Execution threshold the lane pins into every harness config, owned here
+ * rather than by the runner because the freeze lint has to reason about it: a
+ * trigger recipe is only valid relative to the threshold its runs will use.
+ * The runner imports this, so recipe and product cannot drift apart.
+ */
+export const EXECUTE_THRESHOLD_PERCENTAGE = 40;
+
 export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): string[] {
     const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
     // Built through the production text path, not from the raw authored strings:
@@ -876,6 +884,29 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     if (transcriptTokens + scenario.trigger.headroomMarginTokens > chunkBudget) {
         diagnostics.push(
             `${label}.transcript: exceeds-single-chunk-headroom (${transcriptTokens} + margin ${scenario.trigger.headroomMarginTokens} > ${chunkBudget})`,
+        );
+    }
+
+    // Trigger ordering (KTD3): the recipe only produces the run schedule it
+    // declares if ordinary turns stay BELOW the execution threshold and the
+    // spike crosses it. The numeric bounds on these fields do not imply that
+    // ordering, and either violation misaligns run rows against scripted
+    // outputs: a build turn at or above the threshold launches the historian
+    // during filler or authored turns, before `driveHistorianRun` starts
+    // counting, while a spike below it never launches and the scenario ends as
+    // `run-never-fired`.
+    const thresholdPercentage = (tokens: number): number =>
+        (tokens / scenario.trigger.modelContextLimit) * 100;
+    const buildPercentage = thresholdPercentage(scenario.trigger.usageTokensPerTurn);
+    const spikePercentage = thresholdPercentage(scenario.trigger.spikeUsageTokens);
+    if (buildPercentage >= EXECUTE_THRESHOLD_PERCENTAGE) {
+        diagnostics.push(
+            `${label}.trigger.usageTokensPerTurn: build-turn-crosses-threshold (${buildPercentage.toFixed(2)}% >= ${EXECUTE_THRESHOLD_PERCENTAGE}%)`,
+        );
+    }
+    if (spikePercentage < EXECUTE_THRESHOLD_PERCENTAGE) {
+        diagnostics.push(
+            `${label}.trigger.spikeUsageTokens: spike-below-threshold (${spikePercentage.toFixed(2)}% < ${EXECUTE_THRESHOLD_PERCENTAGE}%)`,
         );
     }
 

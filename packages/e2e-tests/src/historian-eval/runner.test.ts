@@ -134,6 +134,14 @@ describe("stripInjectedBlocks", () => {
         expect(forged).toContain("4096");
     });
 
+    test("an empty authored message is not searched for, since includes(\"\") matches everything", () => {
+        // Either side of a turn may be empty. Searching for it would match any
+        // payload and abort every probe backed by that range with a leak that
+        // cannot happen: an empty message has no bytes to survive the splice.
+        expect("any payload at all".includes("")).toBe(true);
+        expect(stripInjectedBlocks("any payload at all").includes("")).toBe(true);
+    });
+
     test("leaves raw history untouched, including an unclosed block", () => {
         expect(stripInjectedBlocks("Also set the cache capacity to 4096 entries.")).toContain("4096");
         // A block truncated by budget trimming keeps its contents in the

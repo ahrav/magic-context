@@ -356,6 +356,27 @@ describe("parseScenario", () => {
 });
 
 describe("lintScenario", () => {
+    test("flags a trigger recipe whose build turns cross the execution threshold", () => {
+        const raw = validScenarioRaw();
+        // 50% of the context limit on every ordinary turn: the historian would
+        // launch during filler or authored turns, before driveHistorianRun
+        // starts counting, misaligning run rows against scripted outputs.
+        (raw.trigger as Record<string, unknown>).usageTokensPerTurn = 100_000;
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(
+            diagnostics.some((entry) => entry.includes("build-turn-crosses-threshold")),
+        ).toBe(true);
+    });
+
+    test("flags a trigger recipe whose spike never crosses the execution threshold", () => {
+        const raw = validScenarioRaw();
+        // Below 40%, so no run ever launches and the scenario can only end as
+        // run-never-fired.
+        (raw.trigger as Record<string, unknown>).spikeUsageTokens = 10_000;
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics.some((entry) => entry.includes("spike-below-threshold"))).toBe(true);
+    });
+
     test("accepts a well-formed scenario carrying each of the seven hard-negative families", () => {
         const raw = validScenarioRaw();
         raw.families = [...HARD_NEGATIVE_FAMILIES];

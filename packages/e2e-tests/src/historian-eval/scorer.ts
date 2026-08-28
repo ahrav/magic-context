@@ -77,6 +77,13 @@ export interface ScenarioScore {
     falseAuthoritativeMatches: string[];
     structuralFindings: string[];
     probeVerdicts: ProbeVerdict[];
+    /**
+     * System identity of the run this score came from, or null when the score
+     * has no run record behind it (the raw-output seam). Retained so
+     * `buildLaneReport` can prove one report describes one system rather than
+     * trusting the label its caller passes (KD4/KTD7).
+     */
+    system: SystemVersionTuple | null;
 }
 
 export type RawOutputStageResult =
@@ -244,8 +251,9 @@ function assembleScore(args: {
     structuralFindings: string[];
     probeVerdicts: ProbeVerdict[];
     allAttemptsInvalid: boolean;
+    system: SystemVersionTuple | null;
 }): ScenarioScore {
-    const { scenarioId, facts, structuralFindings, probeVerdicts, allAttemptsInvalid } = args;
+    const { scenarioId, facts, structuralFindings, probeVerdicts, allAttemptsInvalid, system } = args;
     const failReasons = new Set<FailReason>();
     if (allAttemptsInvalid) failReasons.add("invalid-output");
     if (facts.falseAuthoritativeMatches.length > 0) failReasons.add("false-authoritative");
@@ -253,20 +261,25 @@ function assembleScore(args: {
     if (structuralFindings.length > 0) failReasons.add("structural");
     if (probeVerdicts.some((verdict) => verdict.outcome === "fail")) failReasons.add("probe");
 
-    // Trimmed-by-injection-budget outranks probe-derived FAILs ONLY —
-    // charging an injection-budget loss to the historian would violate R6.
-    // Every fail reason derived from evidence independent of the probe tier
-    // stands: false-authoritative (always run-fatal, R8/KTD8), recall,
-    // structural, and invalid-output all come from the facts read or the
-    // persisted rows, so a trimmed probe must not convert them to ERROR.
+    // A trimmed probe cannot be scored — charging an injection-budget loss to
+    // the historian would violate R6 — but it outranks no other evidence at
+    // all, so conversion requires that there be none.
+    //
+    // `failReasons` is coarse: one aggregate `"probe"` entry covers every
+    // failing verdict. Allowing conversion whenever the only reason was
+    // `"probe"` therefore still suppressed a genuinely failed probe whenever a
+    // DIFFERENT, fully injected probe happened to be trimmed alongside it —
+    // biasing exactly the probe results this rule exists to protect. Requiring
+    // an empty reason set covers the probe-versus-probe case as well as
+    // false-authoritative, recall, structural, and invalid-output.
     const trimmed = probeVerdicts.find((verdict) => verdict.outcome === "error-trimmed");
-    const onlyProbeDerivedFails = [...failReasons].every((reason) => reason === "probe");
-    if (trimmed !== undefined && onlyProbeDerivedFails) {
+    if (trimmed !== undefined && failReasons.size === 0) {
         return {
             ...errorScore(
                 scenarioId,
                 "trimmed-by-injection-budget",
                 `probe ${trimmed.probeId}: gold claim promoted but absent from the injected set`,
+                system,
             ),
             probeVerdicts,
         };
@@ -287,6 +300,7 @@ function assembleScore(args: {
         falseAuthoritativeMatches: facts.falseAuthoritativeMatches,
         structuralFindings,
         probeVerdicts,
+        system,
     };
 }
 
@@ -401,6 +415,7 @@ export function scoreRawOutput(
                 ),
                 probeVerdicts: [],
                 allAttemptsInvalid: false,
+                system: null,
             }),
         };
     } finally {
@@ -408,7 +423,12 @@ export function scoreRawOutput(
     }
 }
 
-function errorScore(scenarioId: string, reason: string, detail: string | null): ScenarioScore {
+function errorScore(
+    scenarioId: string,
+    reason: string,
+    detail: string | null,
+    system: SystemVersionTuple | null = null,
+): ScenarioScore {
     return {
         scenarioId,
         verdict: "ERROR",
@@ -424,6 +444,7 @@ function errorScore(scenarioId: string, reason: string, detail: string | null): 
         falseAuthoritativeMatches: [],
         structuralFindings: [],
         probeVerdicts: [],
+        system,
     };
 }
 
@@ -458,6 +479,7 @@ function recordIntegrityError(
             record.scenarioId,
             "record-schema-unsupported",
             `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
+            record.system,
         );
     }
     if (record.scenarioId !== scenario.id) {
@@ -465,6 +487,7 @@ function recordIntegrityError(
             record.scenarioId,
             "record-scenario-mismatch",
             `run record names scenario ${record.scenarioId}, scored against ${scenario.id}`,
+            record.system,
         );
     }
     const fingerprint = scenarioFingerprint(scenario);
@@ -473,6 +496,7 @@ function recordIntegrityError(
             record.scenarioId,
             "record-scenario-mismatch",
             `run record fingerprint ${record.scenarioFingerprint} does not match scenario ${scenario.id} (${fingerprint})`,
+            record.system,
         );
     }
     if (record.expectedHistorianRuns !== scenario.trigger.expectedHistorianRuns) {
@@ -480,6 +504,7 @@ function recordIntegrityError(
             record.scenarioId,
             "record-scenario-mismatch",
             `run record declares ${record.expectedHistorianRuns} historian run(s); scenario declares ${scenario.trigger.expectedHistorianRuns}`,
+            record.system,
         );
     }
     const indices = record.historianRuns.map((run) => run.runIndex);
@@ -489,6 +514,7 @@ function recordIntegrityError(
             record.scenarioId,
             "record-runs-incomplete",
             `run record declares ${record.expectedHistorianRuns} historian run(s) but carries indices [${indices.join(", ")}]`,
+            record.system,
         );
     }
     return null;
@@ -514,6 +540,7 @@ function probeCoverageError(
             record.scenarioId,
             "record-probes-incomplete",
             `scenario declares probes [${declared.join(", ")}]; run record carries [${recorded.join(", ")}]`,
+            record.system,
         );
     }
     return null;
@@ -527,7 +554,7 @@ function probeCoverageError(
  */
 export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: HistorianEvalScenario): ScenarioScore {
     if (record.error !== null) {
-        return errorScore(record.scenarioId, record.error.reason, record.error.detail);
+        return errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
     }
     const integrityError = recordIntegrityError(record, scenario);
     if (integrityError !== null) return integrityError;
@@ -549,6 +576,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             structuralFindings: [],
             probeVerdicts: [],
             allAttemptsInvalid: true,
+            system: record.system,
         });
     }
 
@@ -570,6 +598,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             record.scenarioId,
             "unreadable-snapshot",
             `context DB snapshot ${record.contextDbSnapshotPath} could not be opened: ${errorMessage(error)}`,
+            record.system,
         );
     }
     try {
@@ -587,10 +616,16 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 record.scenarioId,
                 "unreadable-snapshot",
                 `context DB snapshot ${record.contextDbSnapshotPath} could not be queried: ${errorMessage(error)}`,
+                record.system,
             );
         }
         if (visible === null) {
-            return errorScore(record.scenarioId, "stale-snapshot", "claim snapshot stale after the injection read's retry");
+            return errorScore(
+                record.scenarioId,
+                "stale-snapshot",
+                "claim snapshot stale after the injection read's retry",
+                record.system,
+            );
         }
 
         // Bind the record to THIS snapshot, not merely to this scenario. Facts
@@ -616,6 +651,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 record.scenarioId,
                 "unreadable-snapshot",
                 `context DB snapshot ${record.contextDbSnapshotPath} could not resolve recorded claims: ${errorMessage(error)}`,
+                record.system,
             );
         }
         if (absent.length > 0) {
@@ -623,6 +659,45 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 record.scenarioId,
                 "record-snapshot-mismatch",
                 `run record names ${absent.length} injected claim(s) with no row in its snapshot: [${absent.slice(0, 5).join(", ")}]`,
+                record.system,
+            );
+        }
+
+        // The other direction: every claim visible here must appear in the
+        // recorded set. Existence alone accepts omissions, and an omission is
+        // not inert — a record truncated to `injectedClaims: []` scores facts
+        // from the intact snapshot while exact and multiple-choice comparisons
+        // never consult that array, so the lost injection evidence would PASS
+        // unnoticed. Checked against `visible` rather than by row existence
+        // because this direction is about what the record failed to record.
+        const recordedLocators = new Set(record.injectedClaims.map((claim) => claim.revisionLocator));
+        const unrecorded = visible
+            .filter((item) => !recordedLocators.has(item.revisionLocator))
+            .map((item) => item.publicClaimId);
+        if (unrecorded.length > 0) {
+            return errorScore(
+                record.scenarioId,
+                "record-snapshot-mismatch",
+                `snapshot exposes ${unrecorded.length} injection-visible claim(s) the run record never recorded: [${unrecorded.slice(0, 5).join(", ")}]`,
+                record.system,
+            );
+        }
+
+        // Same locator must name the same claim in both. A cross-attempt pair
+        // whose locators happen to coincide is still a different claim.
+        const recordedById = new Map(record.injectedClaims.map((claim) => [claim.revisionLocator, claim]));
+        const divergent = visible
+            .filter((item) => {
+                const recorded = recordedById.get(item.revisionLocator);
+                return recorded !== undefined && recorded.publicClaimId !== item.publicClaimId;
+            })
+            .map((item) => item.revisionLocator);
+        if (divergent.length > 0) {
+            return errorScore(
+                record.scenarioId,
+                "record-snapshot-mismatch",
+                `run record and snapshot disagree on the claim behind ${divergent.length} locator(s): [${divergent.slice(0, 5).join(", ")}]`,
+                record.system,
             );
         }
 
@@ -644,6 +719,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             ],
             probeVerdicts,
             allAttemptsInvalid: false,
+            system: record.system,
         });
     } finally {
         db.close();
@@ -673,10 +749,47 @@ export interface LaneReport {
     runFatal: boolean;
 }
 
+/**
+ * The one system every scored record agrees on, or a thrown mismatch.
+ *
+ * A report is a claim about one system; scores from different commits or model
+ * pairs combined into it produce plausible aggregates that describe no run that
+ * ever happened. The caller's `options.system` is a label, so it is checked
+ * against the evidence rather than believed. Scores with no run record behind
+ * them (the raw-output seam) carry no system and constrain nothing.
+ */
+function resolveReportSystem(
+    scores: readonly ScenarioScore[],
+    supplied: SystemVersionTuple | undefined,
+): SystemVersionTuple | null {
+    const canonical = (system: SystemVersionTuple): string => JSON.stringify(system);
+    let agreed: SystemVersionTuple | null = null;
+    for (const score of scores) {
+        if (score.system === null) continue;
+        if (agreed === null) {
+            agreed = score.system;
+            continue;
+        }
+        if (canonical(agreed) !== canonical(score.system)) {
+            throw new Error(
+                `historian-eval report: scores span more than one system (${canonical(agreed)} vs ${canonical(score.system)})`,
+            );
+        }
+    }
+    if (supplied !== undefined && agreed !== null && canonical(supplied) !== canonical(agreed)) {
+        throw new Error(
+            `historian-eval report: supplied system ${canonical(supplied)} does not match the scored records' ${canonical(agreed)}`,
+        );
+    }
+    return agreed ?? supplied ?? null;
+}
+
 export function buildLaneReport(
     scores: readonly ScenarioScore[],
     options: { releaseVersion?: string; system?: SystemVersionTuple } = {},
-): LaneReport {    const sorted = [...scores].sort((a, b) => a.scenarioId.localeCompare(b.scenarioId));
+): LaneReport {
+    const system = resolveReportSystem(scores, options.system);
+    const sorted = [...scores].sort((a, b) => a.scenarioId.localeCompare(b.scenarioId));
     const errors = sorted.filter((score) => score.verdict === "ERROR");
     const scored = sorted.filter((score) => score.verdict !== "ERROR");
 
@@ -701,7 +814,7 @@ export function buildLaneReport(
     return {
         schema: LANE_REPORT_SCHEMA,
         releaseVersion: options.releaseVersion ?? null,
-        system: options.system ?? null,
+        system,
         scenarios: sorted,
         aggregate: {
             total: sorted.length,

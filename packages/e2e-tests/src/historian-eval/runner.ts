@@ -32,6 +32,7 @@ import { openTestDb } from "../test-db";
 import { TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
+    EXECUTE_THRESHOLD_PERCENTAGE,
     matchesGold,
     scenarioFingerprint,
     type HistorianEvalScenario,
@@ -76,9 +77,6 @@ const TITLE_SYSTEM_MARKER = requireSignature(INTERNAL_OPENCODE_AGENT_SIGNATURES,
 
 /** Build turns before the spike; the v3 protected-tail boundary needs mass. */
 const MIN_BUILD_TURNS = 10;
-
-/** Threshold the lane pins; also feeds the padding math in paddingTurnCount. */
-const EXECUTE_THRESHOLD_PERCENTAGE = 40;
 
 const POISON_TEXT = "HISTORIAN-EVAL-POISON: unscripted main-agent turn reached the default response";
 
@@ -1340,6 +1338,11 @@ class ScenarioRunner {
             for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
                 const authored = this.scenario.transcript.turns[turn];
                 for (const raw of [authored.user, authored.assistant]) {
+                    // Either side of a turn may be empty, and `includes("")` is
+                    // always true — which would abort every probe backed by
+                    // such a range with a leak that cannot happen. An empty
+                    // message has no raw bytes to survive the splice.
+                    if (raw.trim().length === 0) continue;
                     if (rawHistory.includes(raw)) {
                         throw new RunAbort(
                             "gold-range-leak",

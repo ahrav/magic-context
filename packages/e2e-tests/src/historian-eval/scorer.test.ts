@@ -719,6 +719,63 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a trimmed probe never swallows a different probe's genuine failure", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const trimmedLocator = fixture.injectedClaims.find((claim) => claim.content.includes("4096"))
+                ?.revisionLocator;
+            // probe-capacity is trimmed (its gold claim was promoted but is not
+            // in its injected set) while probe-store fails on its own merits and
+            // is fully injected. `failReasons` collapses both into one "probe"
+            // entry, so a rule keyed on that aggregate converts the whole
+            // scenario to ERROR and drops the real failure.
+            record.probes = record.probes.map((exchange) => {
+                if (exchange.probeId === "probe-capacity") {
+                    return {
+                        ...exchange,
+                        answerRaw: "wrong",
+                        injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
+                            (locator) => locator !== trimmedLocator,
+                        ),
+                    };
+                }
+                if (exchange.probeId === "probe-store") return { ...exchange, answerRaw: "redis" };
+                return exchange;
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("FAIL");
+            expect(score.failReasons).toEqual(["probe"]);
+            expect(score.probeVerdicts.some((verdict) => verdict.outcome === "error-trimmed")).toBe(true);
+            expect(score.probeVerdicts.some((verdict) => verdict.outcome === "fail")).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a record that lost its injected-claim evidence is ERROR, not a PASS off the intact snapshot", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            // Only exact and multiple-choice probes, whose passing comparisons
+            // never consult record.injectedClaims — so an emptied array would
+            // otherwise go unnoticed while facts score from the snapshot.
+            const base = validScenario();
+            const scenario: HistorianEvalScenario = {
+                ...base,
+                probes: base.probes.filter((probe) => probe.answerType !== "claim-id"),
+            };
+            const record = makeRecord(fixture, scenario);
+            expect(scoreRunRecord(record, scenario).verdict).toBe("PASS");
+
+            const score = scoreRunRecord({ ...record, injectedClaims: [] }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an unsupported run-record schema is ERROR before any gold is compared", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -913,6 +970,7 @@ describe("buildLaneReport", () => {
             falseAuthoritativeMatches: [],
             structuralFindings: [],
             probeVerdicts: [],
+            system: null,
         };
     }
 
@@ -956,6 +1014,34 @@ describe("buildLaneReport", () => {
         expect(first.runFatal).toBe(false);
         expect(first.scenarios.map((score) => score.scenarioId)).toEqual(["hse-a", "hse-b"]);
         expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    });
+
+    test("a report cannot span two systems, and cannot be labelled with a system the scores contradict", () => {
+        const system = {
+            repoCommitSha: "a".repeat(40),
+            historianModelId: "anthropic/claude-sonnet-4-5",
+            probeModelId: "anthropic/claude-sonnet-4-5",
+            parserImpl: "ts" as const,
+            chunkTokenBudget: 100_000,
+        };
+        const other = { ...system, repoCommitSha: "b".repeat(40) };
+
+        // Derived from the scores, not from the caller's label.
+        expect(buildLaneReport([{ ...passScore("hse-a"), system }]).system).toEqual(system);
+
+        expect(() =>
+            buildLaneReport([
+                { ...passScore("hse-a"), system },
+                { ...passScore("hse-b"), system: other },
+            ]),
+        ).toThrow(/span more than one system/);
+
+        expect(() => buildLaneReport([{ ...passScore("hse-a"), system }], { system: other })).toThrow(
+            /does not match the scored records/,
+        );
+
+        // A score with no run record behind it constrains nothing.
+        expect(buildLaneReport([passScore("hse-a")], { system }).system).toEqual(system);
     });
 
     test("exit-code mapping (KTD8): green 0, red 1, false-authoritative run-fatal 2", () => {
