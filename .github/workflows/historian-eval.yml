@@ -13,11 +13,13 @@ on:
   workflow_dispatch:
     inputs:
       scenarios:
-        description: Corpus to run (release directory or dev split)
+        # Only committed corpora are offered. A frozen release adds its own
+        # choice here and a matching case arm below; advertising a release
+        # directory that does not exist yet just fails the corpus gate.
+        description: Corpus to run (dev split, or a frozen release once one exists)
         type: choice
         options:
           - dev
-          - releases/v1
         default: dev
   schedule:
     # Weekly, offset from the retrieval-benchmark schedule.
@@ -76,14 +78,15 @@ jobs:
           # `inputs.*` into shell source would let a crafted dispatch value
           # execute with the API key in scope.
           CORPUS_INPUT: ${{ inputs.scenarios }}
-        # Schedule runs carry no inputs; default to the dev split until the
-        # operator freezes releases/v1 (then flip the default here and in the
-        # dispatch input above). The resolved values are literals from the
-        # closed case arms, so exporting them through GITHUB_ENV is safe.
+        # Schedule runs carry no inputs and take the dev split. Freezing a
+        # release adds its `--release` arm here, its choice in the dispatch
+        # input above, and flips this default — the arms and the offered
+        # choices stay one-to-one, which is what makes validating against the
+        # closed set meaningful. The resolved values are literals from those
+        # arms, so exporting them through GITHUB_ENV is safe.
         run: |
           case "${CORPUS_INPUT:-dev}" in
-            dev)         SELECT_FLAG=--scenarios; SELECT_PATH=packages/e2e-tests/historian-eval/dev ;;
-            releases/v1) SELECT_FLAG=--release;   SELECT_PATH=packages/e2e-tests/historian-eval/releases/v1 ;;
+            dev) SELECT_FLAG=--scenarios; SELECT_PATH=packages/e2e-tests/historian-eval/dev ;;
             *) echo "unknown corpus: $CORPUS_INPUT" >&2; exit 1 ;;
           esac
           echo "SELECT_FLAG=$SELECT_FLAG" >> "$GITHUB_ENV"

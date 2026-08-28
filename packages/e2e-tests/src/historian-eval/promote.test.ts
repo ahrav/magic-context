@@ -307,6 +307,45 @@ describe("promoteRelease", () => {
 
             writeFileSync(evidencePath, original);
             expect(() => loadRelease(releaseDir)).not.toThrow();
+
+            // A green entry that marks an unconditional class inapplicable
+            // never exercised it.
+            const inapplicableMandatory = readEvidence();
+            for (const result of inapplicableMandatory.scenarios[0].results) {
+                if (result.mutationClass === "dropped-gold-fact") result.applicable = false;
+            }
+            writeEvidence(inapplicableMandatory);
+            expect(() => loadRelease(releaseDir)).toThrow(/inapplicable-class-dropped-gold-fact/);
+
+            writeFileSync(evidencePath, original);
+        });
+    });
+
+    test("the privacy gate scans approvals, not just scenarios", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const approvals = approvalsFor(scenarios);
+            // `approver` is free-form and is published verbatim in
+            // manifest.json, so it has to clear the same gate as the corpus.
+            (approvals[0] as { approver: string }).approver = "operator-a (/home/operator/id_rsa)";
+            expect(() =>
+                promoteRelease({ scenarios, approvals, releasesRoot: root, releaseVersion: "v1" }),
+            ).toThrow(/privacy\.[a-z-]+: approvals\[0\]/);
+            expect(existsSync(join(root, "v1"))).toBe(false);
+
+            // And the operator-supplied token list reaches approvals too.
+            const tokenApprovals = approvalsFor(scenarios);
+            (tokenApprovals[1] as { approver: string }).approver = "acme-internal-reviewer";
+            expect(() =>
+                promoteRelease({
+                    scenarios,
+                    approvals: tokenApprovals,
+                    releasesRoot: root,
+                    releaseVersion: "v1",
+                    forbiddenTokens: ["acme-internal"],
+                }),
+            ).toThrow(/privacy\.forbidden-token: approvals\[1\]/);
+            expect(existsSync(join(root, "v1"))).toBe(false);
         });
     });
 

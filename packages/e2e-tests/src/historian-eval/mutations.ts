@@ -369,6 +369,24 @@ function checkRequiredClassCoverage(entry: ScenarioMutationEvidence, label: stri
             evidenceFail(`${label}.results: unexpected-class-${mutationClass}-in-green-entry`);
         }
     }
+    // These five classes are unconditional in `runScenarioMutationBattery`, so
+    // a green entry that marks any of them inapplicable never exercised it.
+    // Without this, a forged entry can carry all seven labels, flip these to
+    // `applicable: false`, leave one false-authoritative class applicable, and
+    // still satisfy the label-and-count check.
+    const alwaysApplicable = [
+        "wrong-category",
+        "dropped-gold-fact",
+        "near-miss-perturbation",
+        "structural-overlap",
+        "probe-wrong-answer",
+    ] as const;
+    for (const mutationClass of alwaysApplicable) {
+        const result = entry.results.find((candidate) => candidate.mutationClass === mutationClass);
+        if (result !== undefined && !result.applicable) {
+            evidenceFail(`${label}.results: inapplicable-class-${mutationClass}`);
+        }
+    }
     // The same invariant the battery asserts when it emits `battery-coverage`:
     // every scenario declares a hard-negative family, so a green entry in
     // which neither false-authoritative class was applicable means the

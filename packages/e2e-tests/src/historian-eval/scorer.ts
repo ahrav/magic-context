@@ -221,11 +221,23 @@ function structuralFindingsFromRows(
  * healing.
  */
 function healingFindings(record: HistorianEvalRunRecord): string[] {
-    const finalRun = record.historianRuns[record.historianRuns.length - 1];
+    const runs = record.historianRuns;
+    const finalRun = runs[runs.length - 1];
     if (!finalRun) return [];
     const findings: string[] = [];
-    if (finalRun.discardedLast) {
-        findings.push("healing: final run discarded its provisional last compartment and no later run healed it");
+    // Every discard needs a LATER SUCCESSFUL run to re-derive the range.
+    // Reading only the last array entry misses a successful run that
+    // discarded followed by a rejected run: the rejected artifact carries
+    // `discardedLast: false`, so the provisional range from the last real
+    // publish silently looks healed.
+    for (const [index, run] of runs.entries()) {
+        if (!run.discardedLast) continue;
+        const healed = runs.slice(index + 1).some((later) => later.status === "success");
+        if (!healed) {
+            findings.push(
+                `healing: run ${run.runIndex} discarded its provisional last compartment and no later successful run healed it`,
+            );
+        }
     }
     if (
         !finalRun.discardedLast &&
@@ -488,8 +500,22 @@ export function scoreRunRecord(
             `historian-eval scorer: ${scenario.id} fingerprint drift; run record recorded ${record.scenarioFingerprint} but the scenario now fingerprints ${expectedFingerprint}`,
         );
     }
+    // A declared run that never happened is an ERROR in a live run, so a
+    // record truncated to fewer runs must not be scoreable either. The
+    // fingerprint describes the scenario, not the record, so it cannot catch
+    // this.
+    if (record.expectedHistorianRuns !== scenario.trigger.expectedHistorianRuns) {
+        throw new Error(
+            `historian-eval scorer: ${scenario.id} declares ${scenario.trigger.expectedHistorianRuns} historian run(s) but the record declares ${record.expectedHistorianRuns}`,
+        );
+    }
     if (record.error !== null) {
         return errorScore(record.scenarioId, record.error.reason, record.error.detail);
+    }
+    if (record.historianRuns.length !== record.expectedHistorianRuns) {
+        throw new Error(
+            `historian-eval scorer: ${scenario.id} declares ${record.expectedHistorianRuns} historian run(s) but the record carries ${record.historianRuns.length}`,
+        );
     }
     if (classifyTerminalRuns(record.historianRuns).kind === "validation-exhausted") {
         return assembleScore({

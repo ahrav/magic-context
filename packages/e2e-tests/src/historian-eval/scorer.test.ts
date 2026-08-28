@@ -207,8 +207,10 @@ function makeRecord(
             parserImpl: "ts",
             chunkTokenBudget: null,
         },
-        expectedHistorianRuns: 1,
-        historianRuns: [goldenRun()],
+        expectedHistorianRuns: scenario.trigger.expectedHistorianRuns,
+        historianRuns: Array.from({ length: scenario.trigger.expectedHistorianRuns }, (_, index) =>
+            goldenRun({ runIndex: index + 1 }),
+        ),
         authoredTurnOrdinals: [
             [1, 2],
             [3, 4],
@@ -409,7 +411,10 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = scenarioWithoutProbes();
             const record = makeRecord(fixture, scenario, {
-                historianRuns: [goldenRun({ emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 })],
+                historianRuns: [
+                    goldenRun(),
+                    goldenRun({ runIndex: 2, emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 }),
+                ],
             });
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.failReasons).toContain("structural");
@@ -428,6 +433,57 @@ describe("scoreRunRecord", () => {
             });
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.failReasons).toContain("structural");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("refuses a run record truncated to fewer historian runs than declared", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario, { historianRuns: [goldenRun()] });
+            // A declared run that never happened is an ERROR in a live run, so
+            // a record missing one must not be scoreable either. The
+            // fingerprint cannot catch this: it describes the scenario.
+            expect(() => scoreRunRecord(record, scenario, { recordDir: fixture.dir })).toThrow(
+                /declares 2 historian run\(s\) but the record carries 1/,
+            );
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a discard healed by no later SUCCESSFUL run is reported, even when a later run failed", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = scenarioWithoutProbes();
+            // Run 1 published and discarded its provisional compartment; run 2
+            // was rejected, so its artifact carries `discardedLast: false`.
+            // Reading only the last entry would call the range healed.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ discardedLast: true }),
+                    goldenRun({ runIndex: 2, status: "failed", failureReason: "validation: rejected" }),
+                ],
+            });
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
+            expect(score.failReasons).toContain("structural");
+            expect(score.structuralFindings.some((finding) => finding.includes("run 1"))).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a discard followed by a later successful run is healed", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = scenarioWithoutProbes();
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [goldenRun({ discardedLast: true }), goldenRun({ runIndex: 2, status: "success" })],
+            });
+            const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
+            expect(score.structuralFindings).toEqual([]);
         } finally {
             fixture.cleanup();
         }

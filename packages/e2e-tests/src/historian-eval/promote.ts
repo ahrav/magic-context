@@ -191,13 +191,19 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     }
 
     // Privacy gate FIRST — before any parser, because schema diagnostics
-    // interpolate scenario ids and field paths.
+    // interpolate scenario ids and field paths. Every caller-supplied value
+    // that reaches the frozen tree is scanned, approvals included: `approver`
+    // is free-form and is published verbatim in `manifest.json`, so an email
+    // address, secret, or absolute path there would otherwise be frozen
+    // unexamined.
     const privacyDiagnostics: string[] = [];
-    for (const [index, raw] of input.scenarios.entries()) {
+    const scanCallerInput = (raw: unknown, label: string): void => {
         for (const violation of scanForSensitiveContent(raw, { forbiddenTokens: input.forbiddenTokens })) {
-            privacyDiagnostics.push(`privacy.${violation.category}: scenarios[${index}] ${violation.path}`);
+            privacyDiagnostics.push(`privacy.${violation.category}: ${label} ${violation.path}`);
         }
-    }
+    };
+    for (const [index, raw] of input.scenarios.entries()) scanCallerInput(raw, `scenarios[${index}]`);
+    for (const [index, raw] of input.approvals.entries()) scanCallerInput(raw, `approvals[${index}]`);
     if (privacyDiagnostics.length > 0) fail(privacyDiagnostics.sort());
 
     const scenarios = input.scenarios.map((raw, index) => parseScenario(raw, `scenarios[${index}]`));

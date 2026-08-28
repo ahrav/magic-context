@@ -289,10 +289,28 @@ function allUserText(body: Record<string, unknown>): string {
 }
 
 /** Ordinal range the historian request covers, parsed from `<new_messages>`. */
+/**
+ * Framing ordinals from the `<new_messages>` block only. Scanning the whole
+ * serialized request would read bracket syntax out of authored content —
+ * `items[0]`, a literal `[404]` — as ordinals, and in scripted mode that
+ * bogus min/max is handed to the output builder, which for `[0]` emits a
+ * compartment starting at zero and fails validation on an otherwise valid
+ * scenario.
+ */
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const text = JSON.stringify(body.messages ?? "");
-    if (!text.includes("<new_messages>")) return null;
-    const ordinals = [...text.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
+    const open = text.indexOf("<new_messages>");
+    if (open < 0) return null;
+    const close = text.indexOf("</new_messages>", open);
+    const block = text.slice(open, close < 0 ? undefined : close);
+    // Anchored to the line-leading ordinal marker production emits
+    // (`formatBlock`: `[n] U: ...` or `[n-m] A: ...`, compact single-letter
+    // roles), so bracket syntax inside a rendered turn's own text cannot
+    // masquerade as framing. Text is JSON-serialized, so a line break is the
+    // two characters `\` and `n`.
+    const ordinals = [...block.matchAll(/(?:^|\\n)\[(\d+)(?:-(\d+))?\]\s[A-Za-z]{1,2}:/g)].flatMap((match) =>
+        [match[1], match[2]].filter((value) => value !== undefined).map(Number),
+    );
     if (ordinals.length === 0) return null;
     return { start: Math.min(...ordinals), end: Math.max(...ordinals) };
 }
@@ -330,6 +348,11 @@ class ScenarioRunner {
     // record still carries whatever the run produced before the abort (R6).
     private collectedRuns: HistorianRunArtifact[] = [];
     private collectedProbes: ProbeExchange[] = [];
+    // Authoritative claim read, taken before the probe tier can abort. A
+    // false-authoritative promotion is run-fatal (R8/KTD8), so the evidence
+    // for it must survive a probe-stage infrastructure ERROR.
+    private capturedClaims: { nowMs: number; injectedClaims: InjectedClaimRecord[]; perGoldPredicate: PerGoldPredicateCount[] } | null =
+        null;
     private sessionId = "";
 
     constructor(
@@ -399,12 +422,16 @@ class ScenarioRunner {
         } catch {
             snapshotPath = "";
         }
+        // A claim read that already happened is evidence, and a
+        // false-authoritative promotion in it is run-fatal regardless of why
+        // the run later aborted.
+        const captured = this.capturedClaims;
         return {
             ...this.baseRecord(),
-            projectIdentity: "",
-            nowMs: Date.now(),
-            perGoldPredicate: [],
-            injectedClaims: [],
+            projectIdentity: captured === null ? "" : resolveProjectIdentity(this.harness?.opencode.env.workdir ?? ""),
+            nowMs: captured?.nowMs ?? Date.now(),
+            perGoldPredicate: captured?.perGoldPredicate ?? [],
+            injectedClaims: captured?.injectedClaims ?? [],
             probes: this.collectedProbes,
             verifiedClaimCount: 0,
             contextDbSnapshotPath: snapshotPath,
@@ -527,20 +554,27 @@ class ScenarioRunner {
         // the injection-dependent probe tier runs. See verification-bridge.ts.
         const verifiedClaimCount = this.runVerificationBridge(harness);
 
-        const probes = await this.driveProbes(harness, sessionId);
-
-        // Pin the clock before the authoritative snapshot read so re-scoring
-        // is time-independent (KTD1).
+        // Read the authoritative claim state BEFORE the probe tier. A probe
+        // stage can abort (`probe-envelope-malformed`, `gold-range-leak`,
+        // `probe-gold-uncovered`), and reading afterwards means such an abort
+        // discards an already-observed false-authoritative promotion — the one
+        // outcome that must never be downgraded to an ordinary ERROR. Probes
+        // ask questions and do not mutate claims, so the read is equivalent
+        // here. The clock is pinned with it so re-scoring stays
+        // time-independent (KTD1).
         const nowMs = Date.now();
-        const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
+        const captured = this.captureClaimState(harness, nowMs);
+        this.capturedClaims = { nowMs, ...captured };
+
+        const probes = await this.driveProbes(harness, sessionId);
         const snapshotPath = this.snapshotContextDb(harness);
 
         return {
             ...this.baseRecord(),
             projectIdentity: resolveProjectIdentity(harness.opencode.env.workdir),
             nowMs,
-            perGoldPredicate,
-            injectedClaims,
+            perGoldPredicate: captured.perGoldPredicate,
+            injectedClaims: captured.injectedClaims,
             probes,
             verifiedClaimCount,
             contextDbSnapshotPath: snapshotPath,
@@ -1037,11 +1071,18 @@ class ScenarioRunner {
         return extractAnswerEnvelope(extractLatestAssistantText(messagesRes.data));
     }
 
-    /** Gold claims a probe's leakage/coverage gates must protect (KTD6). */
+    /**
+     * Gold claims a probe's leakage/coverage gates must protect (KTD6).
+     *
+     * Scoped to the claim the probe actually draws its answer from. Returning
+     * every expected claim lets an unrelated claim's uncovered raw range or
+     * surviving visibility turn a valid probe into an infrastructure ERROR,
+     * even though that claim cannot supply the answer.
+     */
     private probeGoldClaims(probe: Probe): typeof this.scenario.gold.expectedClaims {
-        return probe.answerType === "claim-id"
-            ? this.scenario.gold.expectedClaims.filter((claim) => claim.id === probe.expectedClaimRef)
-            : this.scenario.gold.expectedClaims;
+        const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
+        if (reference === undefined) return this.scenario.gold.expectedClaims;
+        return this.scenario.gold.expectedClaims.filter((claim) => claim.id === reference);
     }
 
     /**
