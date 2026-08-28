@@ -162,7 +162,7 @@ describe("seedGoldMemories", () => {
         }
     });
 
-    it("surfaces duplicate content and leaves the first insert intact", () => {
+    it("resolves duplicate content onto the live claim and leaves its revision intact", () => {
         const root = mkdtempSync(join(tmpdir(), "oracle-duplicate-"));
         const dataDir = join(root, "data");
         const workdir = join(root, "work");
@@ -171,28 +171,38 @@ describe("seedGoldMemories", () => {
         try {
             mkdirSync(workdir, { recursive: true });
             initializeIsolatedContextDb(dataDir);
-            expect(() =>
-                seedGoldMemories({
-                    workdir,
-                    dbPath,
-                    verification: "candidate",
-                    rows: [
-                        { category: "PROJECT_RULES", content: "Duplicate gold fact." },
-                        { category: "PROJECT_RULES", content: "  duplicate   GOLD fact.  " },
-                    ],
-                }),
-            ).toThrow(/UNIQUE constraint failed/);
+            // The second row normalizes to the first row's hash in the same
+            // (project, category) slot, so the claims kernel attaches its
+            // provenance as independent evidence instead of opening a rival claim.
+            const rows = seedGoldMemories({
+                workdir,
+                dbPath,
+                verification: "candidate",
+                rows: [
+                    { category: "PROJECT_RULES", content: "Duplicate gold fact." },
+                    { category: "PROJECT_RULES", content: "  duplicate   GOLD fact.  " },
+                ],
+            });
 
-            const db = openTestDb(dbPath, { readonly: true });
-            try {
-                const normalizedHash = computeNormalizedHash("Duplicate gold fact.");
-                const row = db
-                    .prepare("SELECT COUNT(*) AS count FROM memories WHERE normalized_hash = ?")
-                    .get(normalizedHash) as { count: number };
-                expect(row.count).toBe(1);
-            } finally {
-                db.close();
-            }
+            expect(rows).toHaveLength(2);
+            expect(new Set(rows.map((row) => row.publicClaimId)).size).toBe(1);
+            // Evidence attaches without superseding the claim, so the surviving
+            // revision is still the first row's content at revision 1.
+            expect(rows.map((row) => row.revision)).toEqual([1, 1]);
+            expect(rows.map((row) => row.content)).toEqual([
+                "Duplicate gold fact.",
+                "Duplicate gold fact.",
+            ]);
+            const expectedHash = computeNormalizedHash("Duplicate gold fact.");
+            expect(rows.map((row) => row.normalizedHash)).toEqual([
+                expectedHash,
+                expectedHash,
+            ]);
+
+            const identity = resolveProjectIdentity(realpathSync(workdir));
+            expect(surfaceClaimIds(dbPath, identity, "explicit_search")).toEqual([
+                rows[0]?.publicClaimId,
+            ]);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
