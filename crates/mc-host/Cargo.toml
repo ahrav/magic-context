@@ -6,6 +6,13 @@ license = "MIT"
 publish = false
 description = "Directly linked host for Magic Context, Synapse, and Broca components."
 
+[features]
+bench-topology = []
+
+[[example]]
+name = "synapse_perf"
+required-features = ["bench-topology"]
+
 [lints.clippy]
 # Shared integration helpers are intentionally compiled into independent test targets.
 duplicate_mod = "allow"

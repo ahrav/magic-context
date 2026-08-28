@@ -27,7 +27,7 @@
     "dev:dashboard": "bun run --cwd packages/dashboard dev",
     "build:rust": "cargo build --workspace",
     "test:rust": "sh scripts/test-rust.sh",
-    "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --manifest-path packages/dashboard/db-adapter/Cargo.toml --all --check && cargo clippy --manifest-path packages/dashboard/db-adapter/Cargo.toml --all-targets -- -D warnings",
+    "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p mc-host --all-targets --features bench-topology -- -D warnings && cargo fmt --manifest-path packages/dashboard/db-adapter/Cargo.toml --all --check && cargo clippy --manifest-path packages/dashboard/db-adapter/Cargo.toml --all-targets -- -D warnings",
     "fmt:rust": "cargo fmt",
     "release:contract": "bun scripts/generate-mc-host-release-manifest.ts",
     "release:contract:check": "bun scripts/generate-mc-host-release-manifest.ts --check",
