@@ -9,6 +9,7 @@ import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
 import { readProjectIdentityMap } from "./memory/claim-memory-render";
 import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-operation-contract";
+import { CLAIM_POLICY_VERSION } from "./memory/claim-visibility-policy";
 import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import {
@@ -18,7 +19,11 @@ import {
     isEmbeddingEnabled,
 } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
-import { readAntiMemory } from "./memory/storage-anti-memory";
+import {
+    listActiveAntiMemoryPublicIds,
+    readAntiMemories,
+    readAntiMemory,
+} from "./memory/storage-anti-memory";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
@@ -81,6 +86,12 @@ const MESSAGE_SOURCE_BOOST = 1.15;
 const GIT_COMMIT_SOURCE_BOOST = 1.2;
 const PRIMER_SOURCE_BOOST = 1.25;
 const ANTI_MEMORY_SEMANTIC_THRESHOLD = 0.7;
+/** Ceiling on candidate texts sent to the embedding provider per search.
+ *  Anti-memory passage vectors are computed live (nothing persists them),
+ *  and this lane runs on the per-user-prompt auto-search path, so the batch
+ *  must not scale with the record population. Lexically matched candidates
+ *  keep priority; the remainder of the budget goes to the newest records. */
+const ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES = 32;
 
 interface MessageSearchRow {
     messageOrdinal?: number | string;
@@ -822,7 +833,19 @@ async function searchAntiMemories(args: {
         args.db,
         workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
     );
+    // Bounded candidate listing first: hydrating current state for the whole
+    // project claim set just to keep the anti-memory category would make this
+    // per-prompt lane O(all active claims). The id list is capped like every
+    // sibling lane and scopes the provider read below to anti-memory claims.
+    const candidateIds = listActiveAntiMemoryPublicIds(
+        args.db,
+        projectIds,
+        MAX_LANE_CANDIDATES,
+        Date.now(),
+    );
+    if (candidateIds.length === 0) return [];
     const state = readProjectMemoryCurrentState(args.db, {
+        publicClaimIds: candidateIds,
         projectIds,
         workspaceAuthorization: {
             ownProjectIds,
@@ -834,6 +857,11 @@ async function searchAntiMemories(args: {
         lifecycleStates: ["active"],
     });
     if (state.status !== "ok") return [];
+    const antiMemoryItems = state.items.filter((item) => item.category === ANTI_MEMORY_CATEGORY);
+    const records = readAntiMemories(
+        args.db,
+        antiMemoryItems.map((item) => item.publicClaimId),
+    );
     const normalizedQuery = args.query.trim().toLowerCase();
     const queryTokens = tokenizeKeywordNeedle(normalizedQuery);
     const candidates: Array<{
@@ -841,18 +869,47 @@ async function searchAntiMemories(args: {
         text: string;
         lexicalScore: number | null;
     }> = [];
-    for (const item of state.items) {
-        if (item.category !== ANTI_MEMORY_CATEGORY) continue;
-        if (
-            args.surface === "auto_search" &&
-            (item.dispositions.stale || item.dispositions.disputed || item.dispositions.superseded)
-        ) {
-            continue;
+    for (const item of antiMemoryItems) {
+        if (args.surface === "auto_search") {
+            // The state read above uses the explicit-search surface (the only
+            // surface whose candidate query includes anti-memory), so the
+            // automatic-surface policy gates must be re-applied here. A
+            // projection written under a newer policy version fails closed —
+            // its stored bits are not trustworthy — and anything below the
+            // automatic eligibility bar (effective VERIFIED+ with a present,
+            // supported policy subject) must not be auto-injected into user
+            // prompts. Dispositions are re-checked from the authoritative
+            // facts because the projection can lag a policy-unaware writer.
+            if (item.policy.policyVersion > CLAIM_POLICY_VERSION) continue;
+            if (!item.policy.autoEligible) continue;
+            if (
+                item.dispositions.stale ||
+                item.dispositions.disputed ||
+                item.dispositions.superseded
+            ) {
+                continue;
+            }
         }
-        const record = readAntiMemory(args.db, item.publicClaimId);
-        if (record === null) continue;
-        const text =
-            `${record.payload.trigger}\n${record.payload.rejectedStrategy}\n${record.content}`.toLowerCase();
+        const record = records.get(item.publicClaimId);
+        if (record === undefined) continue;
+        // Match against payload values only. The rendered `record.content`
+        // carries constant field labels ("Rejected strategy", "Root cause",
+        // …) whose tokens would let unrelated prompts match every record.
+        const text = [
+            record.payload.trigger,
+            record.payload.rejectedStrategy,
+            record.payload.rejectionReason,
+            record.payload.saferAlternative,
+            record.payload.preconditions,
+            record.payload.attemptedApproach,
+            record.payload.observedFailure,
+            record.payload.rootCause,
+            record.payload.recovery,
+            record.payload.nonApplicableWhen,
+        ]
+            .filter((value): value is string => value !== null)
+            .join("\n")
+            .toLowerCase();
         const exact = text.includes(normalizedQuery);
         const textTokens = new Set(tokenizeKeywordNeedle(text));
         const matched = queryTokens.filter((token) => textTokens.has(token)).length;
@@ -879,25 +936,50 @@ async function searchAntiMemories(args: {
         candidates.push({ result, text, lexicalScore });
     }
 
+    // The embedding batch is a live provider call on the per-prompt path, so
+    // it is capped independently of the candidate ceiling: lexically matched
+    // candidates first (strongest score first), then the newest remaining
+    // records. State items arrive ordered by ascending claim id, so a higher
+    // candidate index means a newer record.
     const semanticQueryEmbedding = args.surface === "auto_search" ? args.queryEmbedding : null;
-    const vectors =
+    const embedIndices =
         semanticQueryEmbedding && candidates.length > 0
-            ? await args
-                  .embedPassages(
-                      candidates.map((candidate) => candidate.text),
-                      args.signal,
-                      "passage",
-                  )
-                  .catch((error) => {
-                      log(
-                          `[search] anti-memory embedding failed: ${error instanceof Error ? error.message : String(error)}`,
-                      );
-                      return [];
+            ? candidates
+                  .map((_, index) => index)
+                  .sort((left, right) => {
+                      const leftScore = candidates[left].lexicalScore;
+                      const rightScore = candidates[right].lexicalScore;
+                      if ((leftScore !== null) !== (rightScore !== null)) {
+                          return leftScore !== null ? -1 : 1;
+                      }
+                      if (leftScore !== null && rightScore !== null && leftScore !== rightScore) {
+                          return rightScore - leftScore;
+                      }
+                      return right - left;
                   })
+                  .slice(0, ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES)
             : [];
+    const vectorByCandidate = new Map<number, Float32Array | null>();
+    if (semanticQueryEmbedding && embedIndices.length > 0) {
+        const vectors = await args
+            .embedPassages(
+                embedIndices.map((index) => candidates[index].text),
+                args.signal,
+                "passage",
+            )
+            .catch((error) => {
+                log(
+                    `[search] anti-memory embedding failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                return [];
+            });
+        embedIndices.forEach((candidateIndex, vectorIndex) => {
+            vectorByCandidate.set(candidateIndex, vectors[vectorIndex] ?? null);
+        });
+    }
     const ranked: AntiMemorySearchResult[] = [];
     for (const [index, candidate] of candidates.entries()) {
-        const vector = vectors[index] ?? null;
+        const vector = vectorByCandidate.get(index) ?? null;
         const semanticScore =
             semanticQueryEmbedding && vector
                 ? normalizeCosineScore(cosineSimilarity(semanticQueryEmbedding, vector))

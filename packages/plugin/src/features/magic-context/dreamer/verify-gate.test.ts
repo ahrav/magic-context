@@ -188,6 +188,56 @@ describe("claim-current verify gate", () => {
         }
     });
 
+    test("excludes a demoted anti-memory from every subsequent verification scope", async () => {
+        const db = freshDb();
+        const dir = projectDir();
+        try {
+            const anti = seedAntiMemory(db);
+            const claim = getProjectMemoryClaimByPublicId(db, anti);
+            if (!claim) throw new Error("missing anti-memory claim");
+            // The archive verdict for an anti-memory records outcome "stale"
+            // and leaves the record lifecycle-active until its TTL lapses.
+            // The gate must treat that as terminal, not as never-verified.
+            recordProjectMemoryVerification(
+                db,
+                { producer: "gate-test", operationKey: `demote-${anti}` },
+                {
+                    token: computeProjectMemoryMutationToken(db, anti),
+                    revisionLocator: `${anti}/r${claim.revision}/${claim.contentDigest}`,
+                    outcome: "stale",
+                    verifier: "gate-test",
+                    nowMs: 2_000,
+                },
+            );
+            __setVerificationPathsTestHooks({
+                execFile: async () => Promise.reject(new Error("git unavailable")),
+            });
+
+            const incremental = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 3_000,
+            });
+            expect(incremental.inScopeIds).toEqual([]);
+
+            seedTaskScheduleState(db, PROJECT, "verify-broad", null, null, "0 3 * * 0");
+            const state = getTaskScheduleState(db, PROJECT, "verify-broad");
+            if (!state) throw new Error("missing schedule state");
+            writeTaskScheduleState(db, { ...state, lastBroadRunAt: 2_500 });
+            const broad = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                forceBroad: true,
+                now: 3_000,
+            });
+            expect(broad.inScopeIds).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("broad cycle skips claims verified after cycle start and drains older claims", async () => {
         const db = freshDb();
         const dir = projectDir();

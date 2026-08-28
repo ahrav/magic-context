@@ -27,6 +27,7 @@ import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import {
     boundDynamicField,
     MAX_AUTO_HINT_TOKENS,
+    renderAntiMemoryWarningLine,
 } from "../../features/magic-context/search-bounds";
 import { formatAge } from "../../shared/format-age";
 import { estimateTokens } from "../../shared/token-estimator";
@@ -57,10 +58,16 @@ function warningField(text: string): string {
 function renderCompactAntiMemoryWarning(
     result: Extract<UnifiedSearchResult, { source: "anti_memory" }>,
 ): string {
-    const alternative = result.saferAlternative
-        ? ` Safer alternative: ${warningField(result.saferAlternative)}.`
-        : "";
-    return `⚠ Previously rejected: ${warningField(result.rejectedStrategy)}. Reason: ${warningField(result.rejectionReason)}.${alternative} Verify before proceeding: confirm the rejection no longer applies to ${warningField(result.trigger)}.`;
+    // Same contract sentence as explicit search (`renderAntiMemoryWarning`),
+    // with tighter per-field caps and no locator citation: the hint budget is
+    // ~200 tokens and the agent is nudged toward ctx_search for the full record.
+    return renderAntiMemoryWarningLine({
+        trigger: result.trigger,
+        rejectedStrategy: result.rejectedStrategy,
+        rejectionReason: result.rejectionReason,
+        saferAlternative: result.saferAlternative,
+        boundField: warningField,
+    });
 }
 
 function renderFragment(result: UnifiedSearchResult, charCap: number, nowMs: number): string {
@@ -180,4 +187,32 @@ export function buildAutoSearchHint(
     options: AutoSearchHintOptions = {},
 ): string | null {
     return packAutoSearchHint(results, options).text;
+}
+
+export interface AntiMemoryWarningDelivery {
+    /** Delivered warning results, in delivery order. */
+    warningResults: Extract<UnifiedSearchResult, { source: "anti_memory" }>[];
+    /** Claim identity + normalized hash bindings for the persisted hint
+     *  decision. A non-empty list marks the decision non-replayable: warning
+     *  delivery always requires a fresh search rather than stored text. */
+    memoryFragments: Array<{ id: number; hash: string }>;
+}
+
+/** One definition of "which delivered fragments are anti-memory warnings and
+ * what identity binds them", shared by the OpenCode and Pi auto-search
+ * runners so the deliver-or-replay contract cannot drift between harnesses. */
+export function collectAntiMemoryWarningFragments(
+    delivered: readonly UnifiedSearchResult[],
+): AntiMemoryWarningDelivery {
+    const warningResults = delivered.filter(
+        (result): result is Extract<UnifiedSearchResult, { source: "anti_memory" }> =>
+            result.source === "anti_memory",
+    );
+    return {
+        warningResults,
+        memoryFragments: warningResults.map((result) => ({
+            id: result.claimId,
+            hash: result.normalizedHash,
+        })),
+    };
 }

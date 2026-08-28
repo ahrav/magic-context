@@ -21,7 +21,7 @@ import {
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { recordClaimUsage } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
+import { recordDeliveredAntiMemoryUsage } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import {
 	parseLocatorShapedQuery,
 	resolveClaimsByLocatorsForSearch,
@@ -183,12 +183,7 @@ export function createCtxSearchTool(
 				results: Awaited<ReturnType<typeof unifiedSearch>>,
 			) => {
 				const packed = packSearchResults(query, results, sessionId);
-				recordClaimUsage(deps.db, {
-					publicClaimIds: packed.delivered.flatMap((result) =>
-						result.source === "anti_memory" ? [result.publicClaimId] : [],
-					),
-					kind: "retrieved",
-				});
+				recordDeliveredAntiMemoryUsage(deps.db, packed.delivered);
 				return packed.text;
 			};
 

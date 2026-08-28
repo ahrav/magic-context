@@ -46,6 +46,29 @@ export function boundDynamicField(text: string): string {
     return truncateUtf8Bytes(text, MAX_RENDER_FIELD_BYTES);
 }
 
+/**
+ * The one anti-memory warning sentence every surface renders. Callers supply
+ * their own field-bounding function (explicit search uses the full
+ * `boundDynamicField` cap; the compact auto-search hint applies a tighter
+ * per-field character cap) and an optional locator citation. Keeping the
+ * sentence here — the shared bounds module both renderers already import —
+ * means the warning contract cannot drift between surfaces.
+ */
+export function renderAntiMemoryWarningLine(args: {
+    trigger: string;
+    rejectedStrategy: string;
+    rejectionReason: string;
+    saferAlternative: string | null | undefined;
+    boundField: (text: string) => string;
+    citation?: string;
+}): string {
+    const alternative = args.saferAlternative
+        ? ` Safer alternative: ${args.boundField(args.saferAlternative)}.`
+        : "";
+    const citation = args.citation ? ` (see ${args.citation})` : "";
+    return `⚠ Previously rejected: ${args.boundField(args.rejectedStrategy)}. Reason: ${args.boundField(args.rejectionReason)}.${alternative} Verify before proceeding: confirm the rejection no longer applies to ${args.boundField(args.trigger)}.${citation}`;
+}
+
 export type QueryBoundsViolation = "bytes" | "tokens" | "atoms";
 
 export interface QueryBoundsDetail {

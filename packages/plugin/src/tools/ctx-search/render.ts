@@ -17,6 +17,7 @@ import {
     binarySearchLargestFit,
     boundDynamicField,
     MAX_RENDERED_RESULT_TOKENS,
+    renderAntiMemoryWarningLine,
 } from "../../features/magic-context/search-bounds";
 import { formatAge } from "../../shared/format-age";
 import { estimateTokens } from "../../shared/token-estimator";
@@ -27,10 +28,14 @@ const MESSAGE_EXPAND_HINT =
     "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.";
 
 export function renderAntiMemoryWarning(result: AntiMemorySearchResult): string {
-    const alternative = result.saferAlternative
-        ? ` Safer alternative: ${boundDynamicField(result.saferAlternative)}.`
-        : "";
-    return `⚠ Previously rejected: ${boundDynamicField(result.rejectedStrategy)}. Reason: ${boundDynamicField(result.rejectionReason)}.${alternative} Verify before proceeding: confirm the rejection no longer applies to ${boundDynamicField(result.trigger)}. (see ${result.publicClaimId})`;
+    return renderAntiMemoryWarningLine({
+        trigger: result.trigger,
+        rejectedStrategy: result.rejectedStrategy,
+        rejectionReason: result.rejectionReason,
+        saferAlternative: result.saferAlternative,
+        boundField: boundDynamicField,
+        citation: result.publicClaimId,
+    });
 }
 
 function formatResult(
@@ -218,13 +223,4 @@ export function packSearchResults(
         omittedCount: results.length,
         reason: "packer-empty",
     };
-}
-
-export function formatSearchResults(
-    query: string,
-    results: UnifiedSearchResult[],
-    currentSessionId: string,
-    nowMs: number = Date.now(),
-): string {
-    return packSearchResults(query, results, currentSessionId, nowMs).text;
 }

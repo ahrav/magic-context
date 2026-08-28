@@ -27,7 +27,6 @@ import {
     type PolicyDecision,
     type PolicySupport,
 } from "./claim-visibility-policy.ts";
-import { ANTI_MEMORY_CATEGORY } from "./constants.ts";
 
 export interface PolicySubjectRow {
     revisionId: number;
@@ -239,50 +238,6 @@ export function recordDispositionEventInCurrentTransaction(
             input.nowMs ?? Date.now(),
         );
     return Number(result.lastInsertRowid);
-}
-
-export interface RetireAntiMemoryByHumanInput {
-    publicClaimId: string;
-    authority: { kind: "human"; actor: string };
-    reason: string;
-    nowMs?: number;
-}
-
-export function retireAntiMemoryByHumanInCurrentTransaction(
-    db: Database,
-    input: RetireAntiMemoryByHumanInput,
-): number | null {
-    if (input.authority?.kind !== "human" || input.authority.actor.trim().length === 0) {
-        throw new Error("anti-memory retirement requires human authority");
-    }
-    const target = db
-        .prepare(
-            `SELECT revisions.id AS revisionId, claims.project_id AS projectId, attrs.category
-               FROM claim_public_ids public
-               JOIN claims ON claims.id = public.claim_id
-               JOIN claim_revisions revisions ON revisions.id = claims.current_revision_id
-               JOIN claim_memory_revision_attributes attrs ON attrs.revision_id = revisions.id
-              WHERE public.public_id = ?`,
-        )
-        .get(input.publicClaimId) as
-        | { revisionId: number; projectId: number; category: string }
-        | undefined;
-    if (!target || target.category !== ANTI_MEMORY_CATEGORY) {
-        throw new Error("anti-memory retirement target not found");
-    }
-    // `rejected` means a human rejected this claim, distinct from the stored
-    // domain fact that the approach itself was rejected.
-    const eventId = recordDispositionEventInCurrentTransaction(db, {
-        revisionId: target.revisionId,
-        projectId: target.projectId,
-        disposition: "rejected",
-        action: "assert",
-        actor: input.authority.actor,
-        reason: input.reason,
-        nowMs: input.nowMs,
-    });
-    refreshEffectivePolicyInCurrentTransaction(db, target.revisionId, { nowMs: input.nowMs });
-    return eventId;
 }
 
 export interface RecordApprovalActionInput {

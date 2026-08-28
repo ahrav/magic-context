@@ -430,10 +430,8 @@ export function extendAntiMemoryTtl(
     });
 }
 
-export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryRecord | null {
-    const row = db
-        .prepare(
-            `SELECT claims.id AS claimId, revisions.revision, revisions.content, revisions.content_sha256 AS contentDigest,
+const ANTI_MEMORY_ROW_COLUMNS = `claims.id AS claimId, public.public_id AS publicClaimId,
+                    revisions.revision, revisions.content, revisions.content_sha256 AS contentDigest,
                     attrs.category, attrs.normalized_hash AS normalizedHash,
                     attrs.importance, attrs.memory_scope AS memoryScope, attrs.sharing,
                     attrs.expires_at AS expiresAt,
@@ -443,41 +441,33 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
                     payload.preconditions, payload.attempted_approach AS attemptedApproach,
                     payload.observed_failure AS observedFailure,
                     payload.root_cause AS rootCause, payload.recovery,
-                    payload.non_applicable_when AS nonApplicableWhen
-               FROM claim_public_ids public
+                    payload.non_applicable_when AS nonApplicableWhen`;
+
+const ANTI_MEMORY_ROW_JOINS = `FROM claim_public_ids public
                JOIN claims ON claims.id = public.claim_id
                JOIN claim_revisions revisions ON revisions.id = claims.current_revision_id
                JOIN claim_memory_revision_attributes attrs ON attrs.revision_id = revisions.id
-               LEFT JOIN claim_anti_memory_revision_payloads payload ON payload.revision_id = revisions.id
-              WHERE public.public_id = ?`,
-        )
-        .get(publicClaimId) as
-        | (Omit<AntiMemoryRecord, "publicClaimId" | "revisionLocator" | "payload"> &
-              StoredAntiMemoryPayload & { trigger: string | null })
-        | undefined;
-    if (!row || row.category !== ANTI_MEMORY_CATEGORY) return null;
+               LEFT JOIN claim_anti_memory_revision_payloads payload ON payload.revision_id = revisions.id`;
+
+type AntiMemoryRow = Omit<AntiMemoryRecord, "revisionLocator" | "payload"> &
+    StoredAntiMemoryPayload & { trigger: string | null };
+
+/** Payload fields are returned exactly as stored. Normalization is a
+ * write-side contract (`normalizePayload` runs in every create/revise path);
+ * re-normalizing at read time would make the returned payload diverge from
+ * the stored `content`/`contentDigest` for records written under an earlier
+ * normalization scheme. */
+function antiMemoryRecordFromRow(row: AntiMemoryRow): AntiMemoryRecord {
     if (row.trigger === null) {
         throw new ClaimGraphCorruptionError(
-            `anti-memory ${publicClaimId} current revision has no payload row`,
+            `anti-memory ${row.publicClaimId} current revision has no payload row`,
         );
     }
-    const payload = normalizePayload({
-        trigger: row.trigger,
-        rejectedStrategy: row.rejectedStrategy,
-        rejectionReason: row.rejectionReason,
-        saferAlternative: row.saferAlternative,
-        preconditions: row.preconditions,
-        attemptedApproach: row.attemptedApproach,
-        observedFailure: row.observedFailure,
-        rootCause: row.rootCause,
-        recovery: row.recovery,
-        nonApplicableWhen: row.nonApplicableWhen,
-    });
     return {
         claimId: row.claimId,
-        publicClaimId,
+        publicClaimId: row.publicClaimId,
         revisionLocator: formatRevisionLocator({
-            publicClaimId,
+            publicClaimId: row.publicClaimId,
             revision: row.revision,
             contentDigest: row.contentDigest,
         }),
@@ -490,6 +480,85 @@ export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryR
         memoryScope: "project",
         sharing: "private",
         expiresAt: row.expiresAt,
-        payload,
+        payload: {
+            trigger: row.trigger,
+            rejectedStrategy: row.rejectedStrategy,
+            rejectionReason: row.rejectionReason,
+            saferAlternative: row.saferAlternative,
+            preconditions: row.preconditions,
+            attemptedApproach: row.attemptedApproach,
+            observedFailure: row.observedFailure,
+            rootCause: row.rootCause,
+            recovery: row.recovery,
+            nonApplicableWhen: row.nonApplicableWhen,
+        },
     };
+}
+
+export function readAntiMemory(db: Database, publicClaimId: string): AntiMemoryRecord | null {
+    const row = db
+        .prepare(
+            // Interpolation is a compile-time column/join list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT ${ANTI_MEMORY_ROW_COLUMNS}
+               ${ANTI_MEMORY_ROW_JOINS}
+              WHERE public.public_id = ?`,
+        )
+        .get(publicClaimId) as AntiMemoryRow | undefined;
+    if (!row || row.category !== ANTI_MEMORY_CATEGORY) return null;
+    return antiMemoryRecordFromRow(row);
+}
+
+/** Batched current-revision payload read for the search lane: one query for
+ * the whole candidate set instead of one `readAntiMemory` per record. */
+export function readAntiMemories(
+    db: Database,
+    publicClaimIds: readonly string[],
+): Map<string, AntiMemoryRecord> {
+    const records = new Map<string, AntiMemoryRecord>();
+    if (publicClaimIds.length === 0) return records;
+    const rows = db
+        .prepare(
+            // Interpolation is a compile-time placeholder list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT ${ANTI_MEMORY_ROW_COLUMNS}
+               ${ANTI_MEMORY_ROW_JOINS}
+              WHERE public.public_id IN (${publicClaimIds.map(() => "?").join(", ")})`,
+        )
+        .all(...publicClaimIds) as AntiMemoryRow[];
+    for (const row of rows) {
+        if (row.category !== ANTI_MEMORY_CATEGORY) continue;
+        records.set(row.publicClaimId, antiMemoryRecordFromRow(row));
+    }
+    return records;
+}
+
+/** Bounded candidate listing for the search lane: active, unexpired
+ * anti-memory public ids only, newest claims first. Keeps the current-state
+ * hydration that follows scoped to at most `limit` anti-memory claims
+ * instead of the whole project claim set. */
+export function listActiveAntiMemoryPublicIds(
+    db: Database,
+    projectIds: readonly number[],
+    limit: number,
+    nowMs: number,
+): string[] {
+    if (projectIds.length === 0 || limit <= 0) return [];
+    const rows = db
+        .prepare(
+            // Interpolation is a compile-time placeholder list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT public.public_id AS publicId
+               FROM claim_memory_current_heads heads
+               JOIN claim_public_ids public ON public.claim_id = heads.claim_id
+               JOIN claim_memory_revision_attributes attrs ON attrs.revision_id = heads.revision_id
+              WHERE heads.project_id IN (${projectIds.map(() => "?").join(", ")})
+                AND heads.category = ?
+                AND heads.lifecycle_state = 'active'
+                AND (attrs.expires_at IS NULL OR attrs.expires_at > ?)
+              ORDER BY heads.claim_id DESC
+              LIMIT ?`,
+        )
+        .all(...projectIds, ANTI_MEMORY_CATEGORY, nowMs, limit) as Array<{ publicId: string }>;
+    return rows.map((row) => row.publicId);
 }

@@ -11,9 +11,19 @@ import {
     MAX_RENDERED_RESULT_TOKENS,
 } from "../../features/magic-context/search-bounds";
 import { estimateTokens } from "../../shared/token-estimator";
-import { formatSearchResults, packSearchResults } from "./render";
+import { packSearchResults } from "./render";
 
 const SESSION = "session-1";
+
+/** Text-only view of the packer, kept as a local helper so the rendering
+ *  contract tests below stay focused on the emitted text. */
+function formatSearchResults(
+    query: string,
+    results: UnifiedSearchResult[],
+    currentSessionId: string,
+): string {
+    return packSearchResults(query, results, currentSessionId).text;
+}
 
 function memoryResult(id: number, content: string): MemorySearchResult {
     return {
@@ -63,7 +73,7 @@ describe("boundDynamicField", () => {
     });
 });
 
-describe("formatSearchResults", () => {
+describe("packed search text rendering", () => {
     it("freezes the historical under-budget shape", () => {
         const results: UnifiedSearchResult[] = [
             memoryResult(7, "always use bd for tracking"),
@@ -177,22 +187,20 @@ describe("formatSearchResults", () => {
 });
 
 describe("packSearchResults", () => {
-    it("returns text byte-identical to formatSearchResults for under-budget results", () => {
+    it("packs under-budget results with full delivery accounting", () => {
         const results: UnifiedSearchResult[] = [
             memoryResult(7, "always use bd for tracking"),
             messageResult(42, "we discussed queue saturation"),
         ];
         const packed = packSearchResults("queue", results, SESSION);
-        expect(packed.text).toBe(formatSearchResults("queue", results, SESSION));
         expect(packed.delivered).toEqual(results);
         expect(packed.omittedCount).toBe(0);
         expect(packed.reason).toBe("delivered");
         expect(packed.tokenCount).toBe(estimateTokens(packed.text));
     });
 
-    it("returns text byte-identical to formatSearchResults for empty results", () => {
+    it("reports empty results with the empty reason", () => {
         const packed = packSearchResults("nothing", [], SESSION);
-        expect(packed.text).toBe(formatSearchResults("nothing", [], SESSION));
         expect(packed.delivered).toEqual([]);
         expect(packed.omittedCount).toBe(0);
         expect(packed.reason).toBe("empty-results");
@@ -206,7 +214,6 @@ describe("packSearchResults", () => {
             memoryResult(index + 1, `${filler} tail-${index}`),
         );
         const packed = packSearchResults("big", results, SESSION);
-        expect(packed.text).toBe(formatSearchResults("big", results, SESSION));
         expect(packed.reason).toBe("delivered");
         expect(packed.tokenCount).toBe(estimateTokens(packed.text));
         expect(packed.tokenCount).toBeLessThanOrEqual(MAX_RENDERED_RESULT_TOKENS);

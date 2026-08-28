@@ -2051,6 +2051,33 @@ export function recordClaimUsage(
     }).immediate();
 }
 
+/**
+ * Count each DELIVERED anti-memory warning exactly once as `retrieved`.
+ *
+ * The shared search resolver deliberately counts only `memory`-source usage,
+ * so warning retrieval telemetry is a delivery-surface obligation. Every
+ * surface that renders packed results (explicit tools, auto-search runners)
+ * must call this one entry point instead of restating the filter, or a new
+ * consumer silently loses warning counters.
+ */
+export function recordDeliveredAntiMemoryUsage(
+    db: Database,
+    delivered: readonly { source: string; publicClaimId?: string }[],
+    nowMs?: number,
+): void {
+    const publicClaimIds = delivered.flatMap((result) =>
+        result.source === "anti_memory" && result.publicClaimId !== undefined
+            ? [result.publicClaimId]
+            : [],
+    );
+    if (publicClaimIds.length === 0) return;
+    recordClaimUsage(db, {
+        publicClaimIds,
+        kind: "retrieved",
+        ...(nowMs === undefined ? {} : { nowMs }),
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Consumer checkpoints and outbox pruning (KTD13, R20)
 // ---------------------------------------------------------------------------

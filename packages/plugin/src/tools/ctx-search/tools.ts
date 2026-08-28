@@ -4,7 +4,7 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { recordClaimUsage } from "../../features/magic-context/memory/storage-claim-operations";
+import { recordDeliveredAntiMemoryUsage } from "../../features/magic-context/memory/storage-claim-operations";
 import {
     parseLocatorShapedQuery,
     resolveClaimsByLocatorsForSearch,
@@ -156,12 +156,7 @@ export async function executeCtxSearch(
 
     const completeFrom = (results: UnifiedSearchResult[]): CtxSearchExecution => {
         const packed = packSearchResults(query, results, toolContext.sessionID);
-        recordClaimUsage(deps.db, {
-            publicClaimIds: packed.delivered.flatMap((result) =>
-                result.source === "anti_memory" ? [result.publicClaimId] : [],
-            ),
-            kind: "retrieved",
-        });
+        recordDeliveredAntiMemoryUsage(deps.db, packed.delivered);
         return {
             status: "complete",
             text: packed.text,

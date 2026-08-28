@@ -94,8 +94,17 @@ export async function partitionVerifyScope(args: {
 }): Promise<VerifyGateResult> {
     const runStartedAt = args.now ?? Date.now();
     const active = readDreamerProjectClaims(args.db, args.projectIdentity, "verification");
-    const candidates = active.filter(
-        (claim) => claim.category === ANTI_MEMORY_CATEGORY || mappedFiles(claim).length > 0,
+    // Anti-memories carry no mapped files, so they qualify by category — but a
+    // `stale` latest outcome is the demotion verdict verification itself
+    // recorded (the record stays lifecycle-active until its TTL expires so
+    // explicit search can still show it labeled). Without this exclusion a
+    // demoted anti-memory reads as never-verified (`verifiedAt() === 0`) and
+    // re-enters every subsequent batch, re-asking the model a question it
+    // already answered until the TTL lapses.
+    const candidates = active.filter((claim) =>
+        claim.category === ANTI_MEMORY_CATEGORY
+            ? claim.verification.latestOutcome !== "stale"
+            : mappedFiles(claim).length > 0,
     );
 
     if (args.forceBroad) {

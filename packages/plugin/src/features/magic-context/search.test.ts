@@ -30,7 +30,10 @@ import {
     computeProjectMemoryMutationToken,
     setProjectMemoryClaimLifecycle,
 } from "./memory/storage-claim-operations";
-import { retireAntiMemoryByHumanInCurrentTransaction } from "./memory/storage-claim-policy";
+import {
+    recordDispositionEventInCurrentTransaction,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "./memory/storage-claim-policy";
 import { ensureProject } from "./memory/storage-claims";
 import { ensureMessagesIndexed } from "./message-index";
 import {
@@ -296,13 +299,26 @@ describe("unifiedSearch", () => {
             matchType: "exact",
         });
 
-        db.transaction(() =>
-            retireAntiMemoryByHumanInCurrentTransaction(db, {
-                publicClaimId: anti.publicClaimId,
-                authority: { kind: "human", actor: "user:test" },
+        // A human-rejected disposition hides the record from every surface.
+        const target = db
+            .prepare(
+                `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                   FROM claim_public_ids public
+                   JOIN claims ON claims.id = public.claim_id
+                  WHERE public.public_id = ?`,
+            )
+            .get(anti.publicClaimId) as { revisionId: number; projectId: number };
+        db.transaction(() => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: target.revisionId,
+                projectId: target.projectId,
+                disposition: "rejected",
+                action: "assert",
+                actor: "user:test",
                 reason: "false warning",
-            }),
-        ).immediate();
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, target.revisionId);
+        }).immediate();
         expect(
             await unifiedSearch(db, "session-anti", project, "Redis session caching", {
                 sources: ["memory"],

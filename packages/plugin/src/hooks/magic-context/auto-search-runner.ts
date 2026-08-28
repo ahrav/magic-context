@@ -23,7 +23,7 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { recordClaimUsage } from "../../features/magic-context/memory/storage-claim-operations";
+import { recordDeliveredAntiMemoryUsage } from "../../features/magic-context/memory/storage-claim-operations";
 import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
 import type {
     UnifiedSearchOptions,
@@ -38,7 +38,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { packAutoSearchHint } from "./auto-search-hint";
+import { collectAntiMemoryWarningFragments, packAutoSearchHint } from "./auto-search-hint";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -448,11 +448,9 @@ export async function runAutoSearchHint(args: {
     const payload = `\n\n${hintText}`;
     // Any anti-memory fragment marks the persisted decision as non-replayable.
     // Warning delivery always requires a fresh search rather than stored text.
-    const warningResults = delivery.delivered.filter((result) => result.source === "anti_memory");
-    const memoryFragments = warningResults.map((result) => ({
-        id: result.claimId,
-        hash: result.normalizedHash,
-    }));
+    const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
+        delivery.delivered,
+    );
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
@@ -467,10 +465,7 @@ export async function runAutoSearchHint(args: {
     // decisions replay only when they contain no anti-memory fragment.
     if (outcome.kind === "appended" && warningResults.length > 0) {
         appendReminderToUserMessageById(messages, userMsgId, payload);
-        recordClaimUsage(db, {
-            publicClaimIds: warningResults.map((result) => result.publicClaimId),
-            kind: "retrieved",
-        });
+        recordDeliveredAntiMemoryUsage(db, warningResults);
     } else {
         replayHintIfEligible(outcome.decision);
     }

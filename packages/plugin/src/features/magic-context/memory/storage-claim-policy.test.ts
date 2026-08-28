@@ -24,7 +24,6 @@ import {
     recordDispositionEventInCurrentTransaction,
     recordEnforcementArtifactInCurrentTransaction,
     refreshEffectivePolicyInCurrentTransaction,
-    retireAntiMemoryByHumanInCurrentTransaction,
     revokeEnforcementArtifactInCurrentTransaction,
 } from "./storage-claim-policy";
 import { ensureProject } from "./storage-claims";
@@ -157,7 +156,7 @@ function approve(fx: Fixture, revisionId: number, identity: string) {
 }
 
 describe("claim policy storage kernel", () => {
-    test("anti-memory retirement requires human authority and remains joinable to usage", () => {
+    test("anti-memory rejected disposition remains joinable to usage", () => {
         const db = createDirectTestDatabase().db;
         try {
             const result = createAntiMemory(
@@ -184,27 +183,29 @@ describe("claim policy storage kernel", () => {
             );
             const publicClaimId = (result.result.payload as { claim: { publicClaimId: string } })
                 .claim.publicClaimId;
-            expect(() =>
-                db
-                    .transaction(() =>
-                        retireAntiMemoryByHumanInCurrentTransaction(db, {
-                            publicClaimId,
-                            authority: { kind: "agent", actor: "agent:test" } as never,
-                            reason: "self-clear",
-                        }),
-                    )
-                    .immediate(),
-            ).toThrow(/human authority/);
+            const target = db
+                .prepare(
+                    `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                       FROM claim_public_ids public
+                       JOIN claims ON claims.id = public.claim_id
+                      WHERE public.public_id = ?`,
+                )
+                .get(publicClaimId) as { revisionId: number; projectId: number };
 
             recordClaimUsage(db, { publicClaimIds: [publicClaimId], kind: "retrieved" });
             const eventId = db
-                .transaction(() =>
-                    retireAntiMemoryByHumanInCurrentTransaction(db, {
-                        publicClaimId,
-                        authority: { kind: "human", actor: "user:test" },
+                .transaction(() => {
+                    const id = recordDispositionEventInCurrentTransaction(db, {
+                        revisionId: target.revisionId,
+                        projectId: target.projectId,
+                        disposition: "rejected",
+                        action: "assert",
+                        actor: "user:test",
                         reason: "false warning",
-                    }),
-                )
+                    });
+                    refreshEffectivePolicyInCurrentTransaction(db, target.revisionId);
+                    return id;
+                })
                 .immediate();
             expect(eventId).toBeGreaterThan(0);
             expect(
